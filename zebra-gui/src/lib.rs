@@ -73,7 +73,62 @@ use std::{
     time::{Duration, Instant},
     u32,
 };
-use winit::{dpi::Size, keyboard::KeyCode};
+use softer_gui::{
+    AXIS_MOUSE_X, AXIS_MOUSE_Y, AXIS_ROTATE, AXIS_SCROLL_H, AXIS_SCROLL_V, AXIS_ZOOM,
+    BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, CP_COPY, CP_CUT, CP_PASTE, Event, EVENT_AXES, EVENT_BUTTONS,
+    EVENT_CLOSE, EVENT_COPYPASTE, EVENT_RENDER, EVENT_TEXT, SCROLL_STEP,
+};
+
+/// Key identities are Linux evdev scancodes -- what softer_gui reports on every
+/// platform, and what its own `KEY_*` constants use. Only the keys this UI binds
+/// are named; the crate names a handful of these already, but spelling the whole
+/// set out in one table beats importing half of it and defining the rest.
+#[allow(dead_code)]
+pub mod keys {
+    pub const KEY_ESC: u32       = 1;
+    pub const KEY_0: u32         = 11;
+    pub const KEY_MINUS: u32     = 12;
+    pub const KEY_EQUAL: u32     = 13;
+    pub const KEY_BACKSPACE: u32 = 14;
+    pub const KEY_TAB: u32       = 15;
+    pub const KEY_J: u32         = 36;
+    pub const KEY_ENTER: u32     = 28;
+    pub const KEY_LEFTCTRL: u32  = 29;
+    pub const KEY_A: u32         = 30;
+    pub const KEY_X: u32         = 45;
+    pub const KEY_C: u32         = 46;
+    pub const KEY_LEFTSHIFT: u32 = 42;
+    pub const KEY_RIGHTSHIFT: u32 = 54;
+    pub const KEY_SPACE: u32     = 57;
+    pub const KEY_F3: u32        = 61;
+    pub const KEY_F4: u32        = 62;
+    pub const KEY_F5: u32        = 63;
+    pub const KEY_F8: u32        = 66;
+    pub const KEY_RIGHTCTRL: u32 = 97;
+    pub const KEY_HOME: u32      = 102;
+    pub const KEY_UP: u32        = 103;
+    pub const KEY_PAGEUP: u32    = 104;
+    pub const KEY_LEFT: u32      = 105;
+    pub const KEY_RIGHT: u32     = 106;
+    pub const KEY_END: u32       = 107;
+    pub const KEY_DOWN: u32      = 108;
+    pub const KEY_PAGEDOWN: u32  = 109;
+    pub const KEY_DELETE: u32    = 111;
+}
+
+/// The shape the pointer should take over a widget. softer_gui can hide the
+/// cursor but not restyle it, so nothing consumes this yet -- it is kept because
+/// the widgets know which shape they want, and that is the hard half to recover
+/// if the API arrives later.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CursorIcon {
+    #[default]
+    Default,
+    Pointer,
+    Text,
+    EwResize,
+    NwseResize,
+}
 
 use rustybuzz::{shape, Face as RbFace, UnicodeBuffer};
 #[allow(unused_imports)]
@@ -701,8 +756,6 @@ struct InputCtx {
     mouse_moved:                 bool,
     should_process_mouse_events: bool,
 
-    inflight_mouse_events:    Vec::<(winit::event::MouseButton, winit::event::ElementState)>,
-    inflight_keyboard_events: Vec::<(winit::keyboard::KeyCode,  winit::event::ElementState)>,
     inflight_text_input:      Vec<char>,
 
     this_mouse_pos: (isize, isize),
@@ -726,40 +779,46 @@ const MOUSE_LEFT:   usize = 1 << 0;
 const MOUSE_MIDDLE: usize = 1 << 1;
 const MOUSE_RIGHT:  usize = 1 << 2;
 
+fn mouse_mask(button: u32) -> usize {
+    match button {
+        BTN_LEFT   => MOUSE_LEFT,
+        BTN_MIDDLE => MOUSE_MIDDLE,
+        BTN_RIGHT  => MOUSE_RIGHT,
+        _ => 0,
+    }
+}
+
+/// Split an evdev code into which of the two 128-bit halves holds it and the bit
+/// within that half. Codes at or past 256 (the `BTN_*` block starts at 0x110)
+/// have no bit here; the mouse mask tracks those separately.
+fn key_bit(key: u32) -> Option<(bool, u128)> {
+    if key < 128       { Some((false, 1u128 << key)) }
+    else if key < 256  { Some((true,  1u128 << (key - 128))) }
+    else               { None }
+}
+
 impl InputCtx {
-    fn key_pressed(&self, key: winit::keyboard::KeyCode) -> bool {
-        if let Some(key) = 1u128.checked_shl(key as u32) {
-            return self.keys_pressed1 & key == key;
-        }
-        else if let Some(key) = 1u128.checked_shl(key as u32 - 128) {
-            return self.keys_pressed2 & key == key;
-        }
-        else {
-            return false;
+    fn key_pressed(&self, key: u32) -> bool {
+        match key_bit(key) {
+            Some((false, bit)) => self.keys_pressed1 & bit == bit,
+            Some((true,  bit)) => self.keys_pressed2 & bit == bit,
+            None => false,
         }
     }
 
-    fn key_held(&self, key: winit::keyboard::KeyCode) -> bool {
-        if let Some(key) = 1u128.checked_shl(key as u32) {
-            return self.keys_down1 & key == key;
-        }
-        else if let Some(key) = 1u128.checked_shl(key as u32 - 128) {
-            return self.keys_down2 & key == key;
-        }
-        else {
-            return false;
+    fn key_held(&self, key: u32) -> bool {
+        match key_bit(key) {
+            Some((false, bit)) => self.keys_down1 & bit == bit,
+            Some((true,  bit)) => self.keys_down2 & bit == bit,
+            None => false,
         }
     }
 
-    fn key_released(&self, key: winit::keyboard::KeyCode) -> bool {
-        if let Some(key) = 1u128.checked_shl(key as u32) {
-            return self.keys_released1 & key == key;
-        }
-        else if let Some(key) = 1u128.checked_shl(key as u32 - 128) {
-            return self.keys_released2 & key == key;
-        }
-        else {
-            return false;
+    fn key_released(&self, key: u32) -> bool {
+        match key_bit(key) {
+            Some((false, bit)) => self.keys_released1 & bit == bit,
+            Some((true,  bit)) => self.keys_released2 & bit == bit,
+            None => false,
         }
     }
 
@@ -771,41 +830,21 @@ impl InputCtx {
         return (self.this_mouse_pos.0 - self.last_mouse_pos.0, self.this_mouse_pos.1 - self.last_mouse_pos.1);
     }
 
-    fn mouse_pressed(&self, button: winit::event::MouseButton) -> bool {
-        let button = match button {
-            winit::event::MouseButton::Left   => MOUSE_LEFT,
-            winit::event::MouseButton::Middle => MOUSE_MIDDLE,
-            winit::event::MouseButton::Right  => MOUSE_RIGHT,
-            _ => 0,
-        };
-
-        return (self.mouse_pressed & button) != 0;
+    fn mouse_pressed(&self, button: u32) -> bool {
+        return (self.mouse_pressed & mouse_mask(button)) != 0;
     }
 
-    fn mouse_held(&self, button: winit::event::MouseButton) -> bool {
-        let button = match button {
-            winit::event::MouseButton::Left   => MOUSE_LEFT,
-            winit::event::MouseButton::Middle => MOUSE_MIDDLE,
-            winit::event::MouseButton::Right  => MOUSE_RIGHT,
-            _ => 0,
-        };
-
-        return (self.mouse_down & button) != 0;
+    fn mouse_held(&self, button: u32) -> bool {
+        return (self.mouse_down & mouse_mask(button)) != 0;
     }
 
-    fn mouse_released(&self, button: winit::event::MouseButton) -> bool {
-        let button = match button {
-            winit::event::MouseButton::Left   => MOUSE_LEFT,
-            winit::event::MouseButton::Middle => MOUSE_MIDDLE,
-            winit::event::MouseButton::Right  => MOUSE_RIGHT,
-            _ => 0,
-        };
-
-        return (self.mouse_released & button) != 0;
+    fn mouse_released(&self, button: u32) -> bool {
+        return (self.mouse_released & mouse_mask(button)) != 0;
     }
 
     fn get_from_clipboard(&self) -> String {
-        // Try xclip first (works reliably on X11), then xsel, then copypasta.
+        // Try xclip first (works reliably on X11), then xsel. softer_gui reports the
+        // copy/paste *intent* only, so fetching the selection stays our job.
         if let Ok(output) = std::process::Command::new("xclip").args(["-selection", "clipboard", "-o"]).output() {
             if output.status.success() {
                 return String::from_utf8_lossy(&output.stdout).into_owned();
@@ -816,18 +855,12 @@ impl InputCtx {
                 return String::from_utf8_lossy(&output.stdout).into_owned();
             }
         }
-        use copypasta::{ClipboardContext, ClipboardProvider};
-        let Ok(mut clipboard) = ClipboardContext::new() else {
-            return String::new();
-        };
-        let Ok(text) = clipboard.get_contents() else {
-            return String::new();
-        };
-        return text;
+        return String::new();
     }
 
     fn send_to_clipboard(&self, text: &str) -> bool {
-        // Try xclip first (works reliably on X11), then xsel, then copypasta.
+        // Try xclip first (works reliably on X11), then xsel. softer_gui reports the
+        // copy/paste *intent* only, so fetching the selection stays our job.
         if let Ok(mut child) = std::process::Command::new("xclip").args(["-selection", "clipboard"]).stdin(std::process::Stdio::piped()).spawn() {
             if let Some(mut stdin) = child.stdin.take() {
                 use std::io::Write;
@@ -846,11 +879,7 @@ impl InputCtx {
                 if status.success() { return true; }
             }
         }
-        use copypasta::{ClipboardContext, ClipboardProvider};
-        let Ok(mut clipboard) = ClipboardContext::new() else {
-            return false;
-        };
-        clipboard.set_contents(text.to_owned()).is_ok()
+        return false;
     }
 }
 
@@ -973,19 +1002,6 @@ pub fn loop_curve(t: f64) -> (f64, f64) {
     (x, y)
 }
 
-#[allow(unused_variables)]
-fn okay_but_is_it_wayland(elwt: &winit::event_loop::ActiveEventLoop) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        use winit::platform::wayland::ActiveEventLoopExtWayland;
-        elwt.is_wayland()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
-}
-
 // pub static SOURCE_SERIF: &[u8] = include_bytes!("../assets/source_serif_4.ttf");
 pub static INTER: &[u8] = include_bytes!("../assets/Inter-VariableFont_opsz,wght.ttf");
 pub static ICONS: &[u8] = include_bytes!("../assets/fontello.ttf");
@@ -997,8 +1013,20 @@ pub static FONT_PIXEL_GOHU_14: &[u8] = include_bytes!("../assets/gohufont-uni-14
 
 include!(concat!(env!("OUT_DIR"), "/window_icon.rs")); // Written by build.rs from assets/favicon.png
 
-fn window_icon() -> Option<winit::window::Icon> {
-    winit::window::Icon::from_rgba(WINDOW_ICON_RGBA.to_vec(), WINDOW_ICON_W, WINDOW_ICON_H).ok()
+/// build.rs emits the favicon as a flat RGBA byte blob; softer_gui wants square
+/// ARGB words. Returns the side alongside the pixels because a non-square icon
+/// has none, and `IconImage::new` would reject it.
+fn window_icon_argb() -> Option<(u32, Vec<u32>)> {
+    if WINDOW_ICON_W != WINDOW_ICON_H || WINDOW_ICON_W == 0 { return None; }
+    let n = (WINDOW_ICON_W as usize) * (WINDOW_ICON_H as usize);
+    if WINDOW_ICON_RGBA.len() != n * 4 { return None; }
+
+    let mut argb = Vec::with_capacity(n);
+    for px in WINDOW_ICON_RGBA.chunks_exact(4) {
+        let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
+        argb.push((a << 24) | (r << 16) | (g << 8) | b);
+    }
+    Some((WINDOW_ICON_W, argb))
 }
 
 const GLOBAL_AUDIO_SCALE_FACTOR: f32 = 0.316; // 0.316 ~= perceptually "half volume"
@@ -1074,7 +1102,6 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
     let mut viz_state = viz_gui_init(fake_data);
 
     // Create window + event loop.
-    let event_loop = winit::event_loop::EventLoop::new().unwrap();
 
     let mut frame_stats = [FrameStat::_0; 512];
     let mut frame_stat_o = 0;
@@ -1114,11 +1141,12 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
         });
     }
 
-    let mut cached_square_width = 0;
-    let mut render_target_0_alloc_layout = Layout::new::<u32>();
-    let mut render_target_0 = std::ptr::null_mut();
-    let mut saved_tile_hashes = Vec::new();
-    let mut whole_screen_hash = 0u64;
+    // No render target of our own any more: the tiles are rasterised straight into
+    // softer_gui's back buffer. One tile-hash set per buffer, plus the generation
+    // they belong to, so a realloc drops both.
+    let mut tile_cache_generation = u64::MAX;
+    let mut tile_hashes: [Vec<u64>; 2] = [Vec::new(), Vec::new()];
+    let mut whole_screen_hash = [0u64; 2];
     let mut did_window_resize = true;
 
     // staking day cosmetics
@@ -1131,8 +1159,6 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
         mouse_moved: false,
         should_process_mouse_events: true,
 
-        inflight_mouse_events:    Vec::new(),
-        inflight_keyboard_events: Vec::new(),
         inflight_text_input:      Vec::new(),
 
         this_mouse_pos: (0, 0),
@@ -1203,1269 +1229,1073 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
 
     // let mut t: f64 = 0.0;
 
-    let mut window: Option<Rc<winit::window::Window>> = None;
-    let mut softbuffer_context: Option<softbuffer::Context<Rc<winit::window::Window>>> = None;
-    let mut softbuffer_surface: Option<softbuffer::Surface<Rc<winit::window::Window>, Rc<winit::window::Window>>> = None;
-    let mut softbuffer_surface_size: (usize, usize) = (0, 0);
-
-    let mut modifiers = winit::keyboard::ModifiersState::default();
+    // Resize is a size change on the RENDER event, not an event of its own.
+    let mut last_window_size: (usize, usize) = (0, 0);
 
     #[allow(deprecated)]
-    event_loop.run(move |event, elwt: &winit::event_loop::ActiveEventLoop| {
+    // softer_gui delivers one totally ordered stream of input and frame
+    // boundaries. A submitted frame's completion is the RENDER for the next, so
+    // there is no deadline to chase, nothing to sleep on, and no separate vsync.
+    let title = {
+        let t = WINDOW_TITLE.lock().unwrap();
+        if t.is_empty() { "Zcash Crosslink Visualizer".to_string() } else { t.clone() }
+    };
+    let mut gui = match softer_gui::open(&title, "org.zfnd.crosslink_visualizer", 1600, 900) {
+        Some(gui) => gui,
+        None => { eprintln!("could not open a window"); return; }
+    };
+    if let Some((side, argb)) = window_icon_argb() {
+        if let Some(image) = softer_gui::icon::IconImage::new(side, &argb) {
+            gui.set_icon(&[image]);
+        }
+    }
+
+    setup_audio();
+
+    let mut ev = Event::default();
+
+    // A submitted frame's completion is the RENDER for the next one. Tracking that
+    // as a "did we submit" flag is not enough: the chain also goes quiet when a
+    // frame is skipped for backpressure, and a flag that never re-arms wedges the
+    // loop for good. Watch the clock instead -- if no RENDER has arrived for two
+    // frame periods, ask for one. `request_frame` is a no-op inside softer_gui
+    // while a present is in flight or a RENDER is pending, so asking costs nothing.
+    let mut last_render = Instant::now();
+
+    // The last absolute button snapshot, so a new one can be diffed into edges.
+    // Keys are evdev codes under 256; the BTN_* block sits above that and is
+    // tracked in the mouse mask instead.
+    let (mut was_down1, mut was_down2, mut was_mouse) = (0u128, 0u128, 0usize);
+
+    'app: loop {
+        // A timeout, not a plain wait: the business layer (new blocks, wallet
+        // updates) is polled, not pushed, so a parked pace chain still has to
+        // come back and look. 16 ms matches the old ControlFlow::Poll cadence.
+        gui.wait_ms(16);
+
         #[cfg(feature = "audio")]
         audio::set_master_volume(ui.global_audio_volume * GLOBAL_AUDIO_SCALE_FACTOR);
 
-        match event {
-            winit::event::Event::Resumed => { // Runs at startup and is where we have to do init.
-                let window_attributes = winit::window::WindowAttributes::default()
-                    .with_maximized({
-                        #[cfg(target_os = "windows")]      if DEV_WIN32_WINDOW_ARRANGEMENT { false } else { true }
-                        #[cfg(not(target_os = "windows"))] true
-                    })
-                    .with_title({
-                        let title = WINDOW_TITLE.lock().unwrap();
-                        if title.is_empty() { "Zcash Crosslink Visualizer".to_string() } else { title.clone() }
-                    })
-                    .with_inner_size(Size::Physical(winit::dpi::PhysicalSize { width: 1600, height: 900 }))
-                    .with_window_icon(window_icon());
+        // Restart a parked chain and let the frame decide whether to draw. The
+        // "did anything happen" probe is deliberately NOT called here: it drains
+        // zebrad's channel and resets the animation timer, so asking twice per
+        // tick would consume the very work the frame is about to look for.
+        if last_render.elapsed() > Duration::from_millis(32) { gui.request_frame(); }
 
-                // On Windows the title-bar icon and the taskbar icon are separate slots
-                #[cfg(target_os = "windows")]
-                let window_attributes = {
-                    use winit::platform::windows::WindowAttributesExtWindows;
-                    window_attributes.with_taskbar_icon(window_icon())
-                };
+        while gui.next_event(&mut ev) {
+            match ev.kind {
+                EVENT_CLOSE => break 'app,
 
-                let twindow = Rc::new(elwt.create_window(window_attributes).unwrap());
-                let context = softbuffer::Context::new(twindow.clone()).unwrap();
-                let surface = softbuffer::Surface::new(&context, twindow.clone()).unwrap();
+                EVENT_TEXT => {
+                    input_ctx.inflight_text_input.extend(
+                        ev.text().iter().copied().filter(|c| *c >= ' ' && *c != '\u{7f}')
+                    );
+                }
 
-                // @Dev @Debug: Position windows for side-by-side debugging
-                #[cfg(target_os = "windows")] if DEV_WIN32_WINDOW_ARRANGEMENT {
-                    unsafe extern "system" {
-                        fn GetConsoleWindow() -> *mut core::ffi::c_void;
-                        fn SetWindowPos(hwnd: isize, insert_after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
-                        fn GetSystemMetrics(index: i32) -> i32;
+                EVENT_COPYPASTE => match ev.action {
+                    // softer_gui recognises the chord and reports the intent; the
+                    // selection itself is still ours to fetch.
+                    CP_PASTE => {
+                        let text = input_ctx.get_from_clipboard();
+                        input_ctx.inflight_text_input.extend(text.chars().filter(|c| *c >= ' ' && *c != '\u{7f}'));
                     }
-                    const SM_CXSCREEN: i32 = 0;
-                    const SM_CYSCREEN: i32 = 1;
+                    CP_COPY | CP_CUT => {}   // the widgets act on their own selection
+                    _ => {}
+                },
+
+                EVENT_AXES => {
+                    for a in ev.axes() {
+                        match a.axis {
+                            // 24.8 fixed point, absolute.
+                            AXIS_MOUSE_X => {
+                                input_ctx.this_mouse_pos.0 = (a.delta >> 8) as isize;
+                                input_ctx.mouse_moved = true;
+                                input_ctx.should_process_mouse_events = true;
+                            }
+                            AXIS_MOUSE_Y => {
+                                input_ctx.this_mouse_pos.1 = (a.delta >> 8) as isize;
+                                input_ctx.mouse_moved = true;
+                                input_ctx.should_process_mouse_events = true;
+                            }
+                            // In notches, not pixels: every consumer of scroll_delta
+                            // is scaled for the one-unit-per-wheel-click the winit
+                            // layer used to feed it.
+                            AXIS_SCROLL_H => input_ctx.scroll_delta.0 += a.delta as f64 / SCROLL_STEP as f64,
+                            AXIS_SCROLL_V => input_ctx.scroll_delta.1 += a.delta as f64 / SCROLL_STEP as f64,
+                            // Pinch-zoom is 16.16 and a real gesture here, so it no
+                            // longer has to be faked out of a wheel delta.
+                            AXIS_ZOOM => input_ctx.zoom_delta += a.delta as f64 / 65536.0 * 10.0,
+                            AXIS_ROTATE => {}
+                            _ => {}
+                        }
+                    }
+                }
+
+                EVENT_BUTTONS => {
+                    // An absolute snapshot of every key and button. Edges are the
+                    // difference from the previous one, OR-ed together so a press
+                    // and release inside a single frame both survive to be read.
+                    let (mut now1, mut now2) = (0u128, 0u128);
+                    for code in 0u32..256 {
+                        if !ev.button(code) { continue; }
+                        match key_bit(code) {
+                            Some((false, bit)) => now1 |= bit,
+                            Some((true,  bit)) => now2 |= bit,
+                            None => {}
+                        }
+                    }
+                    input_ctx.keys_pressed1  |= now1 & !was_down1;
+                    input_ctx.keys_released1 |= was_down1 & !now1;
+                    input_ctx.keys_pressed2  |= now2 & !was_down2;
+                    input_ctx.keys_released2 |= was_down2 & !now2;
+                    input_ctx.keys_down1 = now1;
+                    input_ctx.keys_down2 = now2;
+                    was_down1 = now1;
+                    was_down2 = now2;
+
+                    let mut now_mouse = 0usize;
+                    for code in [BTN_LEFT, BTN_MIDDLE, BTN_RIGHT] {
+                        if ev.button(code) { now_mouse |= mouse_mask(code); }
+                    }
+                    input_ctx.mouse_pressed  |= now_mouse & !was_mouse;
+                    input_ctx.mouse_released |= was_mouse & !now_mouse;
+                    input_ctx.mouse_down = now_mouse;
+                    was_mouse = now_mouse;
+                }
+
+                EVENT_RENDER => {
+                    last_render = Instant::now();
+                    if ev.width as usize != last_window_size.0 || ev.height as usize != last_window_size.1 {
+                        last_window_size = (ev.width as usize, ev.height as usize);
+                        did_window_resize = true;
+                    }
+                    if gui.take_full_redraw() { did_window_resize = true; }
+
                     unsafe {
 
-                        let right = DEV_WIN32_WINDOW_RIGHT.load(Ordering::Relaxed);
+                        let mut is_anything_happening_at_all_in_any_way = false;
 
-                        let screen_w = GetSystemMetrics(SM_CXSCREEN);
-                        let screen_h = GetSystemMetrics(SM_CYSCREEN);
+                        is_anything_happening_at_all_in_any_way |= did_window_resize;
+                        is_anything_happening_at_all_in_any_way |= ui.debug;
+                        is_anything_happening_at_all_in_any_way |= input_ctx.mouse_moved;
+                        is_anything_happening_at_all_in_any_way |= input_ctx.scroll_delta != (0.0, 0.0);
+                        is_anything_happening_at_all_in_any_way |= input_ctx.zoom_delta != 0.0;
+                        is_anything_happening_at_all_in_any_way |= current_animation_t.is_some();
 
-                        // Gui
-                        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-                        if let Ok(wh) = twindow.window_handle() {
-                            if let RawWindowHandle::Win32(h) = wh.as_raw() {
-                                let hwnd = h.hwnd.get() as isize;
-                                let win_w = screen_w / 2;
-                                let win_h = screen_h / 2;
-                                let (x, y) = if right {
-                                    (screen_w - win_w, screen_h - win_h) // bottom-right
+                        did_window_resize = false;
+
+                        input_ctx.text_input = if input_ctx.inflight_text_input.is_empty() {
+                            None
+                        } else {
+                            Some(input_ctx.inflight_text_input.clone())
+                        };
+
+                        is_anything_happening_at_all_in_any_way |= !input_ctx.inflight_text_input.is_empty();
+
+                     // is_anything_happening_at_all_in_any_way |= input_ctx.mouse_down     != 0;
+                        is_anything_happening_at_all_in_any_way |= input_ctx.mouse_pressed  != 0;
+                        is_anything_happening_at_all_in_any_way |= input_ctx.mouse_released != 0;
+
+                     // is_anything_happening_at_all_in_any_way |= (input_ctx.keys_down1     | input_ctx.keys_down2)     != 0;
+                        is_anything_happening_at_all_in_any_way |= (input_ctx.keys_pressed1  | input_ctx.keys_pressed2)  != 0;
+                        is_anything_happening_at_all_in_any_way |= (input_ctx.keys_released1 | input_ctx.keys_released2) != 0;
+
+                        input_ctx.inflight_text_input.clear();
+
+                        // TODO: Poll Business for spontanious events. E.g. animations are still playing. Or, we recieved new blocks to display et cetera.
+                        is_anything_happening_at_all_in_any_way |= viz_gui_anything_happened_at_all(&mut viz_state);
+
+                        if is_anything_happening_at_all_in_any_way == false ||
+                           ev.width == 0 || ev.height == 0 { // Nothing to render.
+                            last_call_to_present_instant = Instant::now();
+                            continue;
+                        }
+
+                        // Note(Sam): Single threaded time is too long right now. 3 ms! So w cannot perform the wakeup here. It is too early. Optimistic wakeup should be at most 100 us early.
+                        // { // Tell workers: WAKE UP WAKE UP WAKE UP!!!
+                        //     while (*p_thread_context).workers_that_have_passed_the_wake_up_gate.load(Ordering::Relaxed) != (*p_thread_context).thread_count - 1 { spin_loop(); }
+                        //     (*p_thread_context).workers_that_have_passed_the_wake_up_gate.store(0, Ordering::Relaxed);
+                        //     (*p_thread_context).wake_up_gate.store(0, Ordering::Relaxed);
+                        //     (*p_thread_context).wake_up_barrier.wait();
+                        //     (*p_thread_context).is_last_time = false;
+                        //     (*p_thread_context).begin_work_gate.store(0, Ordering::Relaxed);
+                        //     (*p_thread_context).wake_up_gate.store(1, Ordering::Release);
+                        // }
+
+                        let target_frame_time_us = (1000000000.0 / (frame_interval_milli_hertz as f64)) as usize;
+                        let begin_frame_instant = Instant::now();
+
+                        // softer_gui's back buffer is the layout this renderer already wanted: square,
+                        // power-of-two, 0xAARRGGBB, stride == side. So the tiles are rasterised straight
+                        // into it and the frame ends with no copy at all -- the full-screen blit this
+                        // used to do was ~5.7 MB a frame at 1600x900.
+                        let mut fb = gui.get_framebuffer();
+                        if !fb.ok() { continue; }   // backpressure: both buffers still held by the display server
+                        let fb_side = fb.side;
+                        let render_target_0 = fb.pixels as *mut u8;
+                        let final_output_blit_buffer = render_target_0;   // same memory; the debug overlay draws here
+                        let draw_area_pixel_wide = fb_side;
+                        let tiles_wide = fb_side >> RENDER_TILE_SHIFT;
+                        let (window_width, window_height) = (fb.width, fb.height);
+                        if window_width == 0 || window_height == 0 { continue; }
+
+                        // Two buffers alternate, so "this tile is unchanged" has to mean unchanged
+                        // relative to what THIS buffer already holds, not to the last frame drawn.
+                        // `fb.key` is (generation << 1 | index) and is stable per buffer until a
+                        // realloc, which is exactly the identity the tile cache needs.
+                        let fb_index = (fb.key & 1) as usize;
+                        let fb_generation = fb.key >> 1;
+                        if tile_cache_generation != fb_generation || tile_hashes[fb_index].len() != tiles_wide*tiles_wide {
+                            tile_cache_generation = fb_generation;
+                            tile_hashes = [vec![0u64; tiles_wide*tiles_wide], vec![0u64; tiles_wide*tiles_wide]];
+                            whole_screen_hash = [0; 2];
+                        }
+                        let saved_tile_hashes = &mut tile_hashes[fb_index];
+
+                        let mut dt = 1000.0 / (frame_interval_milli_hertz as f64);
+                        {
+                            let cpu_dt = prev_frame_time_total_us as f64 / 1000000.0;
+                            if cpu_dt > dt*2.0 { dt = cpu_dt; }
+                        }
+
+                        draw_ctx.window_width = window_width as isize;
+                        draw_ctx.window_height = window_height as isize;
+                        *draw_ctx.draw_command_count = 0;
+                        *draw_ctx.glyph_bitmap_run_allocator_position = 0;
+                        // free unused fonts, except not our special ones
+                        {
+                            let mut put = 0;
+                            for i in 0..*draw_ctx.font_tracker_count {
+                                let take_ptr = draw_ctx.font_tracker_buffer.add(i);
+                                if (*take_ptr).how_many_times_was_i_used == 0 && ((*take_ptr).ttf_file == DEJA_VU_SANS_MONO || (*take_ptr).ttf_file == INTER) {
+                                    std::ptr::drop_in_place(take_ptr);
                                 } else {
-                                    (0,                screen_h - win_h) // bottom-left
-                                };
-                                SetWindowPos(hwnd, 0, x, y, win_w, win_h, 0);
+                                    let put_ptr = draw_ctx.font_tracker_buffer.add(put);
+                                    if put_ptr != take_ptr {
+                                        std::ptr::copy_nonoverlapping(take_ptr, put_ptr, 1);
+                                    }
+                                    (*put_ptr).how_many_times_was_i_used = 0;
+                                    put += 1;
+                                }
+                            }
+                            *draw_ctx.font_tracker_count = put;
+                        }
+
+                        // if input_ctx.key_pressed(KeyCode::Space) {
+                        //     println!("woosh");
+                        //     play_sound(SOUND_UI_WOOSH, 0.5+0.1*rand::random::<f32>(), 1.0+0.5*rand::random::<f32>());
+                        // }
+
+                        // clear screen
+                        {
+                            let put = draw_ctx.draw_command_buffer.add(*draw_ctx.draw_command_count);
+                            *draw_ctx.draw_command_count += 1;
+                            assert!(*draw_ctx.draw_command_count <= DRAW_CALL_MAX);
+                            *put = DrawCommand::ClearScreenToColor { color: 0x080808 /* @todo colors */};
+                        }
+
+                        ui.input = &input_ctx;
+                        ui.draw  = &draw_ctx;
+                        ui.dpi_scale = 1.0;   // @todo(sam): no scale-factor query in softer_gui yet
+                        ui.delta = dt as f32;
+                        
+                        // NOTE(Giovanni): Timer thingy //
+                        //{
+                        //    let timer = Timer::scope_("viz_gui_draw_the_stuff_for_the_things", true);
+                               viz_gui_draw_the_stuff_for_the_things(&mut viz_state, &mut ui, &mut draw_ctx, dt as f32, &input_ctx);
+                        //}
+                        //////////////////////////////////
+                        {
+                            let should_quit = ui_update(&mut ui, &mut data, &mut viz_state, wallet_state.clone());
+                            if should_quit {
+                                break 'app;
                             }
                         }
 
-                        // Console
-                        const SWP_NOSIZE: u32 = 0x0001;
-                        let hwnd = GetConsoleWindow();
-                        if !hwnd.is_null() {
-                            let x = if right { screen_w / 2 } else { 0 };
-                            SetWindowPos(hwnd as isize, 0, x, 0, 0, 0, SWP_NOSIZE);
+                        {
+                            let new_height = viz_state.bc_finalized_tip_height;
+                            let new_pi= (new_height / UI_COPY_STAKING_PERIOD) * 2 + (new_height % UI_COPY_STAKING_PERIOD > UI_COPY_STAKING_DAY_WINDOW) as u64;
+                            let old_pi= (last_frame_finalized_bc_height / UI_COPY_STAKING_PERIOD) * 2 + (last_frame_finalized_bc_height % UI_COPY_STAKING_PERIOD > UI_COPY_STAKING_DAY_WINDOW) as u64;
+                            last_frame_finalized_bc_height = new_height;
+
+                            let debug_do_anyway = ui.debug && input_ctx.key_pressed(keys::KEY_F4);
+                            if (new_pi as i64 - old_pi as i64).abs() == 1 || debug_do_anyway {
+                                current_animation_id = new_pi;
+                                current_animation_t = Some(0.0);
+                                if debug_do_anyway {
+                                    current_animation_id = debug_next_animation_id;
+                                    debug_next_animation_id += 1;
+                                }
+                            }
+                            if let Some(t) = current_animation_t.as_mut() {
+                                let old_t = *t;
+                                *t += dt;
+                                let t = *t;
+
+                                let music_random = (1+current_animation_id).wrapping_mul(11583847947735601999);
+                                let voice_random = (1+current_animation_id).wrapping_mul(13723614751765347379);
+
+                                let music_sound;
+                                let music_volume;
+                                let music_visual_delay;
+                                let music_sound_delay;
+                                let voice_sound;
+                                let voice_volume;
+
+                                if current_animation_id & 1 == 0 {
+                                    let music_index = music_random % 6;
+                                    let voice_index = voice_random % 10;
+
+                                    match music_index {
+                                        5 => {
+                                            music_sound = SOUND_EPIC_TRANSITION1;
+                                            music_volume = 1.0;
+                                            music_visual_delay = 0.5;
+                                            music_sound_delay = 1.0;
+                                        }
+                                        4 => {
+                                            music_sound = SOUND_DAMATIC_HORN3;
+                                            music_volume = 1.0;
+                                            music_visual_delay = 1.5;
+                                            music_sound_delay = 2.0;
+                                        }
+                                        3 => {
+                                            music_sound = SOUND_DAMATIC_HORN2;
+                                            music_volume = 1.0;
+                                            music_visual_delay = 1.5;
+                                            music_sound_delay = 2.0;
+                                        }
+                                        2 => {
+                                            music_sound = SOUND_DRUM_FADEIN1;
+                                            music_volume = 1.2;
+                                            music_visual_delay = 7.0;
+                                            music_sound_delay = 7.0;
+                                        }
+                                        1 => {
+                                            music_sound = SOUND_TRUMPET_FANFARE1;
+                                            music_volume = 1.0;
+                                            music_visual_delay = 12.5;
+                                            music_sound_delay = 13.5;
+                                        }
+                                        _ => {
+                                            music_sound = SOUND_DAMATIC_HORN1;
+                                            music_volume = 1.0;
+                                            music_visual_delay = 0.5;
+                                            music_sound_delay = 1.0;
+                                        }
+                                    }
+
+                                    match voice_index {
+                                        9 => {
+                                            voice_sound = SOUND_LOCK_AND_EARN1;
+                                            voice_volume = 1.4;
+                                        }
+                                        8 => {
+                                            voice_sound = SOUND_CLAIM_YOUR_REWARDS1;
+                                            voice_volume = 1.4;
+                                        }
+                                        7 => {
+                                            voice_sound = SOUND_SUBMIT_STAKING_TRANSACTIONS2;
+                                            voice_volume = 1.4;
+                                        }
+                                        6 => {
+                                            voice_sound = SOUND_NOW_STAKING_DAY3;
+                                            voice_volume = 1.4;
+                                        }
+                                        5 => {
+                                            voice_sound = SOUND_NOW_STAKING_DAY2;
+                                            voice_volume = 1.4;
+                                        }
+                                        4 => {
+                                            voice_sound = SOUND_TOKENS_AWAIT_STAKING1;
+                                            voice_volume = 1.8;
+                                        }
+                                        3 => {
+                                            voice_sound = SOUND_UNLEASH_YOUR_CAPITAL1;
+                                            voice_volume = 1.8;
+                                        }
+                                        2 => {
+                                            voice_sound = SOUND_SUBMIT_STAKING_TRANSACTIONS1;
+                                            voice_volume = 1.8;
+                                        }
+                                        1 => {
+                                            voice_sound = SOUND_IT_IS_TIME_TO_STAKE1;
+                                            voice_volume = 1.8;
+                                        }
+                                        _ => {
+                                            voice_sound = SOUND_NOW_STAKING_DAY1;
+                                            voice_volume = 1.8;
+                                        }
+                                    }
+                                }
+                                else {
+                                    let music_index = music_random % 7;
+                                    let voice_index = voice_random % 6;
+                                    match music_index {
+                                        6 => {
+                                            music_sound = SOUND_CELLO_DRONE1;
+                                            music_volume = 2.0;
+                                            music_visual_delay = 12.5;
+                                            music_sound_delay = 13.5;
+                                        }
+                                        5 => {
+                                            music_sound = SOUND_SOFT_CELLO1;
+                                            music_volume = 1.0;
+                                            music_visual_delay = 3.5;
+                                            music_sound_delay = 4.5;
+                                        }
+                                        4 => {
+                                            music_sound = SOUND_EPIC_TRANSITION1;
+                                            music_volume = 1.0;
+                                            music_visual_delay = 0.5;
+                                            music_sound_delay = 1.0;
+                                        }
+                                        3 => {
+                                            music_sound = SOUND_DAMATIC_HORN3;
+                                            music_volume = 1.0;
+                                            music_visual_delay = 1.5;
+                                            music_sound_delay = 2.0;
+                                        }
+                                        2 => {
+                                            music_sound = SOUND_DAMATIC_HORN2;
+                                            music_volume = 1.0;
+                                            music_visual_delay = 1.5;
+                                            music_sound_delay = 2.0;
+                                        }
+                                        1 => {
+                                            music_sound = SOUND_DRUM_FADEIN1;
+                                            music_volume = 1.2;
+                                            music_visual_delay = 7.0;
+                                            music_sound_delay = 7.0;
+                                        }
+                                        _ => {
+                                            music_sound = SOUND_GONG1;
+                                            music_volume = 1.5;
+                                            music_visual_delay = 0.2;
+                                            music_sound_delay = 0.5;
+                                        }
+                                    }
+
+                                    match voice_index {
+                                        5 => {
+                                            voice_sound = SOUND_STAKING_DAY_OVER6;
+                                            voice_volume = 1.2;
+                                        }
+                                        4 => {
+                                            voice_sound = SOUND_STAKING_DAY_OVER5;
+                                            voice_volume = 1.0;
+                                        }
+                                        3 => {
+                                            voice_sound = SOUND_STAKING_DAY_OVER4;
+                                            voice_volume = 1.2;
+                                        }
+                                        2 => {
+                                            voice_sound = SOUND_STAKING_DAY_OVER3;
+                                            voice_volume = 1.2;
+                                        }
+                                        1 => {
+                                            voice_sound = SOUND_STAKING_DAY_OVER2;
+                                            voice_volume = 1.2;
+                                        }
+                                        _ => {
+                                            voice_sound = SOUND_STAKING_DAY_OVER1;
+                                            voice_volume = 1.2;
+                                        }
+                                    }
+                                }
+
+                                let global_sound_volume = 0.7;
+
+                                if old_t < 0.001 && t >= 0.001 {
+                                    play_sound(music_sound, global_sound_volume*music_volume, 1.0);
+                                }
+                                if old_t < music_sound_delay && t >= music_sound_delay {
+                                    play_sound(voice_sound, global_sound_volume*voice_volume, 1.0);
+                                }
+
+                                let text_h = (window_height as f32 / 3.0).min(window_width as f32 / 12.0);
+
+                                let text_string = if current_animation_id & 1 != 0 { "Staking Day has Ended" } else { "Staking Day has Begun" };
+                                let text_y = cubic_hold((t - music_visual_delay) as f32 / 5.0, 0.1, 0.7, 0.4)*1.4 * (window_height as f32 + text_h + 30.0) - (text_h + 30.0) * 1.4;
+
+                                let text_w = draw_ctx.measure_text_line(FontKind::Normal, text_h, text_string);
+                                let text_x = window_width as f32 / 2.0 - text_w / 2.0;
+                                draw_ctx.rectangle_r(text_x - 20.0, text_y - 20.0, text_x + text_w + 20.0, text_y + text_h + 20.0, 30, 0x70_000000);
+                                draw_ctx.text_line(FontKind::Normal, text_x, text_y, text_h, text_string, 0xffffffff);
+
+                                if t > 60.0 { current_animation_t = None; }
+                            }
                         }
 
-                    }
-                }
+                        // @todo(sam): softer_gui has no cursor-shape call yet, so the widgets'
+                        // choice is tracked but not applied. Add `set_cursor` to the crate.
+                        if ui.prev_cursor != ui.cursor {
+                            ui.prev_cursor = ui.cursor;
+                        }
 
-                window = Some(twindow);
-                softbuffer_context = Some(context);
-                softbuffer_surface = Some(surface);
-                softbuffer_surface_size = (0, 0);
+                        input_ctx.mouse_moved = false;
+                        input_ctx.last_mouse_pos = input_ctx.this_mouse_pos;
+                        input_ctx.scroll_delta = (0.0, 0.0);
+                        input_ctx.zoom_delta = 0.0;
 
-                setup_audio();
-            },
-            event => {
-                if let Some(window) = window.as_mut() {
-                    let softbuffer_context = softbuffer_context.as_mut().unwrap();
-                    let softbuffer_surface = softbuffer_surface.as_mut().unwrap();
-                    match event {
-                        winit::event::Event::WindowEvent { window_id: _window_id, event } => {
-                            // println!("Event! :) {:?}", event);
-                            match event {
-                                winit::event::WindowEvent::CursorEntered { device_id: _ } => {
-                                    input_ctx.should_process_mouse_events = true;
-                                },
-                                winit::event::WindowEvent::CursorLeft { device_id: _ } => {
-                                    input_ctx.should_process_mouse_events = false;
-                                    input_ctx.mouse_down = 0;
-                                    input_ctx.mouse_pressed = 0;
-                                    input_ctx.mouse_released = 0;
-                                    input_ctx.inflight_mouse_events.clear();
-                                },
-                                winit::event::WindowEvent::CursorMoved { device_id, position } => {
-                                    input_ctx.this_mouse_pos = (position.x as isize, position.y as isize);
-                                    input_ctx.mouse_moved    = true;
-                                },
-                                winit::event::WindowEvent::PinchGesture { device_id, delta, phase } => {
-                                    input_ctx.zoom_delta += delta * 10.0;
-                                }
-                                winit::event::WindowEvent::MouseWheel { device_id, delta, phase } => {
-                                    #[cfg(target_os = "macos")]
-                                    {
-                                        match delta {
-                                            winit::event::MouseScrollDelta::LineDelta(x, y) => {
-                                                input_ctx.zoom_delta -= y as f64 * 0.4;
-                                            }
-                                            winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                                                input_ctx.scroll_delta.0 += pos.x * 2.0;
-                                                input_ctx.scroll_delta.1 += pos.y * 2.0;
-                                            }
-                                        }
-                                    }
-                                    #[cfg(not(target_os = "macos"))]
-                                    {
-                                        match delta {
-                                            winit::event::MouseScrollDelta::LineDelta(x, y) => {
-                                                input_ctx.zoom_delta += y as f64 * 1.0;
-                                            }
-                                            // GRRRRRR. NO PINCH SUPPORT ON WINDOWS OR LINUX. THANK YOU WINIT DEVS.
-                                            winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                                                input_ctx.zoom_delta += pos.y * 0.05;
-                                            }
-                                        }
-                                    }
-                                }
-                                winit::event::WindowEvent::MouseInput { device_id, state, button } => {
-                                    if input_ctx.should_process_mouse_events {
-                                        input_ctx.inflight_mouse_events.push((button, state));
-                                    }
-                                },
-                                winit::event::WindowEvent::ModifiersChanged(m) => {
-                                    modifiers = m.state();
-                                },
-                                winit::event::WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
+                        assert!(*draw_ctx.glyph_bitmap_run_allocator_position < GLYPH_RUN_MAX);
+                        assert!(*draw_ctx.draw_command_count <= DRAW_CALL_MAX);
+                        if *draw_ctx.draw_command_count == DRAW_CALL_MAX { println!("WARNING, we are at max capacity for draw commands."); }
+                        prev_frame_time_single_threaded_us = begin_frame_instant.elapsed().as_micros() as usize;
 
-                                    let ctrl  = modifiers.control_key() || modifiers.super_key();
+                        // Note(Sam): We want to do this earlier but we are too slow. See comment above.
+                        { // Tell workers: WAKE UP WAKE UP WAKE UP!!!
+                            while (*p_thread_context).workers_that_have_passed_the_wake_up_gate.load(Ordering::Relaxed) != (*p_thread_context).thread_count - 1 { spin_loop(); }
+                            (*p_thread_context).workers_that_have_passed_the_wake_up_gate.store(0, Ordering::Relaxed);
+                            (*p_thread_context).wake_up_gate.store(0, Ordering::Relaxed);
+                            (*p_thread_context).wake_up_barrier.wait();
+                            (*p_thread_context).is_last_time = false;
+                            (*p_thread_context).begin_work_gate.store(0, Ordering::Relaxed);
+                            (*p_thread_context).wake_up_gate.store(1, Ordering::Release);
+                        }
 
-                                    let is_paste = {
 
-                                        use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-                                        let key   = event.key_without_modifiers();
+                        #[derive(Clone, Copy)]
+                        struct ExecuteCommandBufferOnTilesCtx {
+                            render_target_0: *mut u8,
+                            render_target_stride: usize,
+                            window_width: usize,
+                            window_height: usize,
+                            saved_tile_hashes: *mut u64,
+                            draw_ctx: *const DrawCtx,
+                        }
+                        let ups = ExecuteCommandBufferOnTilesCtx {
+                            render_target_0,
+                            render_target_stride: draw_area_pixel_wide,
+                            window_width,
+                            window_height,
+                            saved_tile_hashes: saved_tile_hashes.as_mut_ptr(),
+                            draw_ctx: &draw_ctx,
+                        };
+                        dennis_parallel_for(p_thread_context, true, tiles_wide*tiles_wide, &ups as *const ExecuteCommandBufferOnTilesCtx as usize,
+                            |thread_id: usize, work_id: usize, work_count: usize, user_pointer: usize| {
+                                unsafe {
+                                    let ctx = *(user_pointer as *const ExecuteCommandBufferOnTilesCtx);
+                                    let pixel_row_shift = ctx.render_target_stride.trailing_zeros() as usize;
+                                    let intra_row_mask = ctx.render_target_stride.wrapping_sub(1);
+                                    debug_assert!(work_count.count_ones() == 1);
+                                    let tile_row_shift = work_count.trailing_zeros() / 2;
+                                    let tile_x = work_id & (1usize << tile_row_shift).wrapping_sub(1);
+                                    let tile_y = work_id >> tile_row_shift;
 
-                                        let shift = modifiers.shift_key();
+                                    let tile_pixel_x = (tile_x << RENDER_TILE_SHIFT) as u32;
+                                    let tile_pixel_x2 = ((tile_x+1) << RENDER_TILE_SHIFT) as u32;
+                                    let tile_pixel_y = (tile_y << RENDER_TILE_SHIFT) as u32;
+                                    let tile_pixel_y2 = ((tile_y+1) << RENDER_TILE_SHIFT) as u32;
+                                    if tile_pixel_x as usize >= ctx.window_width { return; }
+                                    if tile_pixel_y as usize >= ctx.window_height { return; }
 
-                                        let ctrl_v       = ctrl  && matches!(key, winit::keyboard::Key::Character(ref s) if s.eq_ignore_ascii_case("v"));
-                                        let shift_insert = shift && (key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Insert));
+                                    let debug_pixel = (*(*ctx.draw_ctx).debug_pixel_inspector).unwrap_or((usize::MAX, usize::MAX));
 
-                                        ctrl_v || shift_insert
-                                    };
+                                    let mut scissor_x1: isize = 0;
+                                    let mut scissor_y1: isize = 0;
+                                    let mut scissor_x2: isize = ctx.window_width  as isize;
+                                    let mut scissor_y2: isize = ctx.window_height as isize;
 
-                                    if event.state.is_pressed() && is_paste {
-                                        input_ctx.inflight_text_input.extend(&input_ctx.get_from_clipboard().chars().collect::<Vec<char>>());
-                                    } else {
-                                        if !ctrl && let Some(text) = event.text && event.state.is_pressed() {
-                                            input_ctx.inflight_text_input.extend(text.chars().filter(|c| *c >= ' ' && *c != 0x7f as char));
-                                        }
-
-                                        match event.physical_key {
-                                            winit::keyboard::PhysicalKey::Code(kc) => if kc >= winit::keyboard::KeyCode::Eject && kc <= winit::keyboard::KeyCode::Undo {
-                                                // println!("Skipping key: {:?}", kc);
-                                            } else {
-                                                input_ctx.inflight_keyboard_events.push((kc, event.state));
-                                            }
-
-                                            _ => {},
-                                        }
-                                    }
-                                },
-                                winit::event::WindowEvent::Moved(_)   |
-                                winit::event::WindowEvent::Resized(_) => {
-                                    did_window_resize = true;
-
-                                    // Ensure our RedrawRequested handler will actually run on Windows
-                                    frame_is_actually_queued_by_us = true;
-
-                                    // Produce a frame for this size
-                                    window.request_redraw();
-                                },
-                                winit::event::WindowEvent::RedrawRequested => {
-                                    if frame_is_actually_queued_by_us || okay_but_is_it_wayland(elwt) {
-                                        unsafe {
-                                            let mut is_anything_happening_at_all_in_any_way = false;
-
-                                            is_anything_happening_at_all_in_any_way |= did_window_resize;
-                                            is_anything_happening_at_all_in_any_way |= ui.debug;
-                                            is_anything_happening_at_all_in_any_way |= input_ctx.mouse_moved;
-                                            is_anything_happening_at_all_in_any_way |= input_ctx.scroll_delta != (0.0, 0.0);
-                                            is_anything_happening_at_all_in_any_way |= input_ctx.zoom_delta != 0.0;
-                                            is_anything_happening_at_all_in_any_way |= current_animation_t.is_some();
-
-                                            input_ctx.mouse_pressed  = 0;
-                                            input_ctx.mouse_released = 0;
-                                            input_ctx.keys_pressed1  = 0;
-                                            input_ctx.keys_pressed2  = 0;
-                                            input_ctx.keys_released1 = 0;
-                                            input_ctx.keys_released2 = 0;
-                                            did_window_resize = false;
-
-                                            for (button, state) in &input_ctx.inflight_mouse_events {
-                                                let button = match button {
-                                                    winit::event::MouseButton::Left   => MOUSE_LEFT,
-                                                    winit::event::MouseButton::Middle => MOUSE_MIDDLE,
-                                                    winit::event::MouseButton::Right  => MOUSE_RIGHT,
-                                                    _ => { continue; },
-                                                };
-
-                                                if state.is_pressed() {
-                                                    input_ctx.mouse_down     |=  button;
-                                                    input_ctx.mouse_pressed  |=  button;
-                                                }
-                                                else {
-                                                    input_ctx.mouse_down     &= !button;
-                                                    input_ctx.mouse_released |=  button;
-                                                }
-                                            }
-                                            for (key, state) in &input_ctx.inflight_keyboard_events {
-                                                if let Some(key) = 1u128.checked_shl(*key as u32) {
-                                                    if state.is_pressed() {
-                                                        input_ctx.keys_down1     |=  key;
-                                                        input_ctx.keys_pressed1  |=  key;
-                                                    }
-                                                    else {
-                                                        input_ctx.keys_down1     &= !key;
-                                                        input_ctx.keys_released1 |=  key;
-                                                    }
-                                                } else if let Some(key) = 1u128.checked_shl(*key as u32 - 128) {
-                                                    if state.is_pressed() {
-                                                        input_ctx.keys_down2     |=  key;
-                                                        input_ctx.keys_pressed2  |=  key;
-                                                    }
-                                                    else {
-                                                        input_ctx.keys_down2     &= !key;
-                                                        input_ctx.keys_released2 |=  key;
-                                                    }
-                                                }
-                                            }
-                                            input_ctx.text_input = if input_ctx.inflight_text_input.is_empty() {
-                                                None
-                                            } else {
-                                                Some(input_ctx.inflight_text_input.clone())
-                                            };
-
-                                            is_anything_happening_at_all_in_any_way |= !input_ctx.inflight_text_input.is_empty();
-
-                                         // is_anything_happening_at_all_in_any_way |= input_ctx.mouse_down     != 0;
-                                            is_anything_happening_at_all_in_any_way |= input_ctx.mouse_pressed  != 0;
-                                            is_anything_happening_at_all_in_any_way |= input_ctx.mouse_released != 0;
-
-                                         // is_anything_happening_at_all_in_any_way |= (input_ctx.keys_down1     | input_ctx.keys_down2)     != 0;
-                                            is_anything_happening_at_all_in_any_way |= (input_ctx.keys_pressed1  | input_ctx.keys_pressed2)  != 0;
-                                            is_anything_happening_at_all_in_any_way |= (input_ctx.keys_released1 | input_ctx.keys_released2) != 0;
-
-                                            input_ctx.inflight_mouse_events.clear();
-                                            input_ctx.inflight_keyboard_events.clear();
-                                            input_ctx.inflight_text_input.clear();
-
-                                            // TODO: Poll Business for spontanious events. E.g. animations are still playing. Or, we recieved new blocks to display et cetera.
-                                            is_anything_happening_at_all_in_any_way |= viz_gui_anything_happened_at_all(&mut viz_state);
-
-                                            let (window_width, window_height) = {
-                                                let size = window.inner_size();
-                                                (size.width as usize, size.height as usize)
-                                            };
-
-                                            if is_anything_happening_at_all_in_any_way == false ||
-                                               window_width <= 0 || window_height <= 0 { // Nothing to render.
-                                                last_call_to_present_instant = Instant::now();
-                                                frame_is_actually_queued_by_us = false;
-                                                if okay_but_is_it_wayland(elwt) {
-                                                    wayland_dropped_a_frame_on_purpose_counter = 2;
-                                                }
+                                    let mut got_hash = 0u64;
+                                    for should_draw in 0..2 {
+                                        let should_draw = should_draw == 1;
+                                        if should_draw {
+                                            let saved = ctx.saved_tile_hashes.byte_add(8*work_id);
+                                            if got_hash == *saved && TURN_OFF_HASH_BASED_LAZY_RENDER == 0 {
                                                 return;
+                                            } else {
+                                                *saved = got_hash;
                                             }
-
-                                            // Note(Sam): Single threaded time is too long right now. 3 ms! So w cannot perform the wakeup here. It is too early. Optimistic wakeup should be at most 100 us early.
-                                            // { // Tell workers: WAKE UP WAKE UP WAKE UP!!!
-                                            //     while (*p_thread_context).workers_that_have_passed_the_wake_up_gate.load(Ordering::Relaxed) != (*p_thread_context).thread_count - 1 { spin_loop(); }
-                                            //     (*p_thread_context).workers_that_have_passed_the_wake_up_gate.store(0, Ordering::Relaxed);
-                                            //     (*p_thread_context).wake_up_gate.store(0, Ordering::Relaxed);
-                                            //     (*p_thread_context).wake_up_barrier.wait();
-                                            //     (*p_thread_context).is_last_time = false;
-                                            //     (*p_thread_context).begin_work_gate.store(0, Ordering::Relaxed);
-                                            //     (*p_thread_context).wake_up_gate.store(1, Ordering::Release);
-                                            // }
-
-                                            let target_frame_time_us = (1000000000.0 / (frame_interval_milli_hertz as f64)) as usize;
-                                            let begin_frame_instant = Instant::now();
-
-                                            if softbuffer_surface_size != (window_width, window_height) {
-                                                softbuffer_surface.resize((window_width as u32).try_into().unwrap(), (window_height as u32).try_into().unwrap()).unwrap();
-                                                softbuffer_surface_size = (window_width, window_height);
-                                            }
-
-                                            let mut buffer = softbuffer_surface.buffer_mut().unwrap();
-                                            let final_output_blit_buffer = buffer.as_mut_ptr() as *mut u8;
-                                            let window_square: usize = window_width.max(window_height);
-                                            let tiles_wide = ((window_square + RENDER_TILE_SIZE - 1) / RENDER_TILE_SIZE).next_power_of_two();
-                                            let draw_area_pixel_wide = tiles_wide * RENDER_TILE_SIZE;
-                                            if cached_square_width != draw_area_pixel_wide {
-                                                if render_target_0 != std::ptr::null_mut() {
-                                                    dealloc(render_target_0, render_target_0_alloc_layout);
+                                        }
+                                        let mut hasher = ahash::AHasher::default();
+                                        let draw_commands = (*ctx.draw_ctx).draw_command_buffer;
+                                        let draw_command_count = *(*ctx.draw_ctx).draw_command_count;
+                                        for cmd_i in 0..draw_command_count {
+                                            match *draw_commands.byte_add(size_of::<DrawCommand>()*cmd_i) {
+                                                DrawCommand::ClearScreenToColor { color } => {
+                                                    hasher.write_u64(0x83459345890234);
+                                                    hasher.write_u32(color);
+                                                    if should_draw == false { continue; }
+                                                    let mut row_pixels = ctx.render_target_0.byte_add(((tile_pixel_x + (tile_pixel_y << pixel_row_shift)) as usize) << 2);
+                                                    for _y in tile_pixel_y..tile_pixel_y2 {
+                                                        let mut cursor_pixels = row_pixels;
+                                                        for _x in tile_pixel_x..tile_pixel_x2 {
+                                                            *(cursor_pixels as *mut u32) = color;
+                                                            cursor_pixels = cursor_pixels.byte_add(4);
+                                                        }
+                                                        row_pixels = row_pixels.byte_add(4 << pixel_row_shift);
+                                                    }
                                                 }
-                                                cached_square_width = draw_area_pixel_wide;
-                                                render_target_0_alloc_layout = Layout::array::<u32>((draw_area_pixel_wide*draw_area_pixel_wide) as usize).unwrap().align_to(4096).unwrap();
-                                                render_target_0 = alloc(render_target_0_alloc_layout);
-                                                saved_tile_hashes = vec![0u64; tiles_wide*tiles_wide];
-                                            }
+                                                DrawCommand::Scissor { x1, y1, x2, y2 } => {
+                                                    hasher.write_u64(0x897235923645643);
+                                                    hasher.write_isize(x1);
+                                                    hasher.write_isize(x2);
+                                                    hasher.write_isize(y1);
+                                                    hasher.write_isize(y2);
+                                                    if should_draw == false { continue; }
+                                                    scissor_x1 = x1;
+                                                    scissor_y1 = y1;
+                                                    scissor_x2 = x2;
+                                                    scissor_y2 = y2;
+                                                }
+                                                DrawCommand::RoundedRectangle {
+                                                    x: ofx,
+                                                    x2: ofx2,
+                                                    y: ofy,
+                                                    y2: ofy2,
+                                                    radius_tl,
+                                                    radius_tr,
+                                                    radius_bl,
+                                                    radius_br,
+                                                    color
+                                                } => {
+                                                    let radius_tl = radius_tl as f32;
+                                                    let radius_tr = radius_tr as f32;
+                                                    let radius_bl = radius_bl as f32;
+                                                    let radius_br = radius_br as f32;
 
-                                            let mut dt = 1000.0 / (frame_interval_milli_hertz as f64);
-                                            {
-                                                let cpu_dt = prev_frame_time_total_us as f64 / 1000000.0;
-                                                if cpu_dt > dt*2.0 { dt = cpu_dt; }
-                                            }
+                                                    // let radius_t = radius_tl.min(radius_tr);
+                                                    // let radius_t = radius_tl.min(radius_tr);
 
-                                            draw_ctx.window_width = window_width as isize;
-                                            draw_ctx.window_height = window_height as isize;
-                                            *draw_ctx.draw_command_count = 0;
-                                            *draw_ctx.glyph_bitmap_run_allocator_position = 0;
-                                            // free unused fonts, except not our special ones
-                                            {
-                                                let mut put = 0;
-                                                for i in 0..*draw_ctx.font_tracker_count {
-                                                    let take_ptr = draw_ctx.font_tracker_buffer.add(i);
-                                                    if (*take_ptr).how_many_times_was_i_used == 0 && ((*take_ptr).ttf_file == DEJA_VU_SANS_MONO || (*take_ptr).ttf_file == INTER) {
-                                                        std::ptr::drop_in_place(take_ptr);
+
+                                                    let ix = (ofx.floor() as u32).max(tile_pixel_x);
+                                                    let ix2 = (ofx2.ceil() as u32).min(tile_pixel_x2);
+                                                    let iy = (ofy.floor() as u32).max(tile_pixel_y);
+                                                    let iy2 = (ofy2.ceil() as u32).min(tile_pixel_y2);
+                                                    if ix >= ix2 || iy >= iy2 { continue; }
+                                                    hasher.write_u64(0x854893982097);
+                                                    // hasher.write_u32(ofx.max(tile_pixel_x as f32 - radius).to_bits());
+                                                    // hasher.write_u32(ofx2.min(tile_pixel_x2 as f32 + radius).to_bits());
+                                                    // hasher.write_u32(ofy.max(tile_pixel_y as f32 - radius).to_bits());
+                                                    // hasher.write_u32(ofy2.min(tile_pixel_y2 as f32 + radius).to_bits());
+                                                    hasher.write_u32(ofx.to_bits());
+                                                    hasher.write_u32(ofx2.to_bits());
+                                                    hasher.write_u32(ofy.to_bits());
+                                                    hasher.write_u32(ofy2.to_bits());
+                                                    hasher.write_u32(radius_tl.to_bits());
+                                                    hasher.write_u32(radius_tr.to_bits());
+                                                    hasher.write_u32(radius_bl.to_bits());
+                                                    hasher.write_u32(radius_br.to_bits());
+                                                    hasher.write_u32(color);
+                                                    if should_draw == false { continue; }
+                                                    if scissor_x1 >= scissor_x2 { continue; }
+                                                    if scissor_y1 >= scissor_y2 { continue; }
+                                                    let mut row_pixels = ctx.render_target_0.byte_add(((ix + (iy << pixel_row_shift)) as usize) << 2);
+                                                    let color_alpha = (color >> 24) as f32 / 255.0;
+                                                    for _y in iy..iy2 {
+                                                        let _fy = _y as f32;
+                                                        let row_alpha = (1.0 - (ofy - _fy).clamp(0.0, 1.0)) * (ofy2 - _fy).clamp(0.0, 1.0);
+                                                        let mut cursor_pixels = row_pixels;
+                                                        for _x in ix..ix2 {
+                                                            let _fx = _x as f32;
+                                                            let mut cover_alpha = (1.0 - (ofx - _fx).clamp(0.0, 1.0)) * (ofx2 - _fx).clamp(0.0, 1.0) * row_alpha;
+                                                            // top left
+                                                            {
+                                                                let lx = _fx-ofx2+radius_tl;
+                                                                let ly = ofy-(_fy+1.0)+radius_tl;
+                                                                let v1 = lx*lx.abs()+ly*ly.abs();
+                                                                let new_alpha = radius_tl - v1.sqrt();
+                                                                cover_alpha = select_float(v1 >= 0.0, cover_alpha.min(new_alpha), cover_alpha,);
+                                                            }
+                                                            // top right
+                                                            {
+                                                                let lx = ofx-(_fx+1.0)+radius_tr;
+                                                                let ly = ofy-(_fy+1.0)+radius_tr;
+                                                                let v1 = lx*lx.abs()+ly*ly.abs();
+                                                                let new_alpha = radius_tr - v1.sqrt();
+                                                                cover_alpha = select_float(v1 >= 0.0, cover_alpha.min(new_alpha), cover_alpha,);
+                                                            }
+                                                            // bottom left
+                                                            {
+                                                                let lx = _fx-ofx2+radius_bl;
+                                                                let ly = _fy-ofy2+radius_bl;
+                                                                let v1 = lx*lx.abs()+ly*ly.abs();
+                                                                let new_alpha = radius_bl - v1.sqrt();
+                                                                cover_alpha = select_float(v1 >= 0.0, cover_alpha.min(new_alpha), cover_alpha,);
+                                                            }
+                                                            // bottom right
+                                                            {
+                                                                let lx = ofx-(_fx+1.0)+radius_br;
+                                                                let ly = _fy-ofy2+radius_br;
+                                                                let v1 = lx*lx.abs()+ly*ly.abs();
+                                                                let new_alpha = radius_br - v1.sqrt();
+                                                                cover_alpha = select_float(v1 >= 0.0, cover_alpha.min(new_alpha), cover_alpha,);
+                                                            }
+                                                            let pixel_alpha = color_alpha * cover_alpha;
+
+                                                            if (_x as isize) >= scissor_x1 && (_x as isize) < scissor_x2 &&
+                                                               (_y as isize) >= scissor_y1 && (_y as isize) < scissor_y2 {  // @Scissor
+                                                                *(cursor_pixels as *mut u32) = blend_u32(*(cursor_pixels as *mut u32), color,  (pixel_alpha * 255.0).round() as u32);
+                                                            }
+                                                            cursor_pixels = cursor_pixels.byte_add(4);
+                                                        }
+                                                        row_pixels = row_pixels.byte_add(4 << pixel_row_shift);
+                                                    }
+                                                },
+                                                DrawCommand::TextRow { y, glyph_row_shift, color, font_tracker_id, font_row_index, glyph_bitmap_run, glyph_bitmap_run_len } => {
+                                                    if (y as u32) < tile_pixel_y || (y as u32) >= tile_pixel_y2 { continue; }
+                                                    if (y as isize) < scissor_y1 || (y as isize) >= scissor_y2 { continue; } // @Scissor
+
+                                                    let font_tracker = &*(*ctx.draw_ctx).font_tracker_buffer.add(font_tracker_id as usize);
+                                                    let bitmap_widths = font_tracker.cached_bitmap_widths.as_ptr();
+                                                    let row_bitmaps = font_tracker.row_buffers[font_row_index as usize].as_ptr();
+
+                                                    for i in 0..glyph_bitmap_run_len {
+                                                        let (lookup_index, start_x) = *glyph_bitmap_run.add(i);
+                                                        let width = *bitmap_widths.add(lookup_index as usize) as usize;
+
+                                                        if (start_x as isize + width as isize - 1) < tile_pixel_x as isize { continue; }
+                                                        if (start_x as isize) >= tile_pixel_x2 as isize { break; }
+                                                        hasher.write_u64(0x8936730958944);
+                                                        hasher.write_u16(lookup_index);
+                                                        hasher.write_i16(start_x);
+                                                        hasher.write_u16(y);
+                                                        hasher.write_usize(row_bitmaps as usize);
+                                                        hasher.write_usize(bitmap_widths as usize);
+                                                        hasher.write_u32(color);
+                                                        // TODO rethink, font id?
+                                                        if should_draw == false { continue; }
+                                                        if scissor_x1 >= scissor_x2 { continue; }
+                                                        if scissor_y1 >= scissor_y2 { continue; }
+
+                                                        let mut copy_data = row_bitmaps.byte_add((lookup_index as usize) << glyph_row_shift);
+                                                        let mut put_data = ctx.render_target_0.byte_add((y as usize) << (pixel_row_shift+2)).byte_offset(start_x as isize *4);
+
+                                                        let mut x1 = start_x as isize;
+                                                        let x2 = (start_x as isize + width as isize).min(tile_pixel_x2 as isize);
+                                                        if x1 < tile_pixel_x as isize {
+                                                            copy_data = copy_data.byte_add((tile_pixel_x as isize - x1) as usize);
+                                                            put_data = put_data.byte_add((tile_pixel_x as isize - x1) as usize * 4);
+                                                            x1 = tile_pixel_x as isize;
+                                                        }
+                                                        let len = x2 - x1;
+                                                        if len <= 0 { continue; }
+                                                        for _x in x1..x2 {
+                                                            let blend = *copy_data as u32;
+                                                            copy_data = copy_data.byte_add(1);
+                                                            if (_x as isize) >= scissor_x1 && (_x as isize) < scissor_x2 { // @Scissor
+                                                                *(put_data as *mut u32) = blend_u32(*(put_data as *mut u32), color, blend);
+                                                            }
+                                                            put_data = put_data.byte_add(4);
+                                                        }
+                                                    }
+                                                },
+                                                DrawCommand::PixelLineXDef { x1, y1, x2, y2, color, thickness, } => {
+                                                    if thickness <= 1.0 {
+                                                        let x1 = x1.round() as isize;
+                                                        let y1 = y1.round() as isize;
+                                                        let x2 = x2.round() as isize;
+                                                        let y2 = y2.round() as isize;
+                                                        let start_x = (x1 as isize).max(tile_pixel_x as isize);
+                                                        let end_x = (x2 as isize).min(tile_pixel_x2 as isize);
+                                                        if start_x >= end_x { continue; }
+                                                        let dy = (y2 as f32 - y1 as f32) / x2.wrapping_sub(x1) as f32;
+                                                        hasher.write_u64(0x75634593484);
+                                                        hasher.write_isize(x1);
+                                                        hasher.write_isize(x2);
+                                                        hasher.write_isize(y1);
+                                                        hasher.write_isize(y2);
+                                                        hasher.write_u32(color);
+                                                        hasher.write_u32(dy.to_bits());
+                                                        if should_draw == false { continue; }
+                                                        for real_x in start_x..end_x {
+                                                            let fy = y1 as f32 + dy * (real_x - x1 as isize) as f32;
+                                                            let iy1 = fy.floor() as isize;
+                                                            let iy2 = iy1+1;
+                                                            let coverage1 = (iy2 as f32 - fy).clamp(0.0, thickness);
+                                                            let coverage2 = thickness - coverage1;
+                                                            let blend1 = 255.0 * linear_to_srgb_one_channel_float(coverage1);
+                                                            let blend2 = 255.0 * linear_to_srgb_one_channel_float(coverage2);
+
+                                                            if iy1 >= tile_pixel_y as isize && iy1 < tile_pixel_y2 as isize {
+                                                                let pixel = ctx.render_target_0.byte_add(((real_x + (iy1 << pixel_row_shift)) as usize) << 2);
+                                                                let this_color = blend_u32(*(pixel as *mut u32), color, blend1 as u32);
+                                                                *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
+                                                            }
+                                                            if iy2 >= tile_pixel_y as isize && iy2 < tile_pixel_y2 as isize {
+                                                                let pixel = ctx.render_target_0.byte_add(((real_x + (iy2 << pixel_row_shift)) as usize) << 2);
+                                                                let this_color = blend_u32(*(pixel as *mut u32), color, blend2 as u32);
+                                                                *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
+                                                            }
+                                                        }
                                                     } else {
-                                                        let put_ptr = draw_ctx.font_tracker_buffer.add(put);
-                                                        if put_ptr != take_ptr {
-                                                            std::ptr::copy_nonoverlapping(take_ptr, put_ptr, 1);
-                                                        }
-                                                        (*put_ptr).how_many_times_was_i_used = 0;
-                                                        put += 1;
-                                                    }
-                                                }
-                                                *draw_ctx.font_tracker_count = put;
-                                            }
+                                                        // x1 is known to be less than x2 but this does not apply to y.
+                                                        let by_min = y1.min(y2);
+                                                        let by_max = y1.max(y2);
+                                                        let ix1 = ((x1 - (thickness / 2.0)).floor() as isize - 1).max(tile_pixel_x as isize);
+                                                        let ix2 = ((x2 + (thickness / 2.0)).ceil() as isize + 1).min(tile_pixel_x2 as isize);
+                                                        let iy1 = ((by_min - (thickness / 2.0)).floor() as isize - 1).max(tile_pixel_y as isize);
+                                                        let iy2 = ((by_max + (thickness / 2.0)).ceil() as isize + 1).min(tile_pixel_y2 as isize);
+                                                        if ix1 >= ix2 || iy1 >= iy2 { continue; }
 
-                                            // if input_ctx.key_pressed(KeyCode::Space) {
-                                            //     println!("woosh");
-                                            //     play_sound(SOUND_UI_WOOSH, 0.5+0.1*rand::random::<f32>(), 1.0+0.5*rand::random::<f32>());
-                                            // }
+                                                        hasher.write_u64(0x75345834958);
+                                                        hasher.write_u32(x1.to_bits());
+                                                        hasher.write_u32(x2.to_bits());
+                                                        hasher.write_u32(y1.to_bits());
+                                                        hasher.write_u32(y2.to_bits());
+                                                        hasher.write_u32(thickness.to_bits());
+                                                        hasher.write_u32(color);
+                                                        if should_draw == false { continue; }
 
-                                            // clear screen
-                                            {
-                                                let put = draw_ctx.draw_command_buffer.add(*draw_ctx.draw_command_count);
-                                                *draw_ctx.draw_command_count += 1;
-                                                assert!(*draw_ctx.draw_command_count <= DRAW_CALL_MAX);
-                                                *put = DrawCommand::ClearScreenToColor { color: 0x080808 /* @todo colors */};
-                                            }
-
-                                            ui.input = &input_ctx;
-                                            ui.draw  = &draw_ctx;
-                                            ui.dpi_scale = window.scale_factor() as f32;
-                                            ui.delta = dt as f32;
-                                            
-                                            // NOTE(Giovanni): Timer thingy //
-                                            //{
-                                            //    let timer = Timer::scope_("viz_gui_draw_the_stuff_for_the_things", true);
-                                                   viz_gui_draw_the_stuff_for_the_things(&mut viz_state, &mut ui, &mut draw_ctx, dt as f32, &input_ctx);
-                                            //}
-                                            //////////////////////////////////
-                                            {
-                                                let should_quit = ui_update(&mut ui, &mut data, &mut viz_state, wallet_state.clone());
-                                                if should_quit {
-                                                    elwt.exit();
-                                                }
-                                            }
-
-                                            {
-                                                let new_height = viz_state.bc_finalized_tip_height;
-                                                let new_pi= (new_height / UI_COPY_STAKING_PERIOD) * 2 + (new_height % UI_COPY_STAKING_PERIOD > UI_COPY_STAKING_DAY_WINDOW) as u64;
-                                                let old_pi= (last_frame_finalized_bc_height / UI_COPY_STAKING_PERIOD) * 2 + (last_frame_finalized_bc_height % UI_COPY_STAKING_PERIOD > UI_COPY_STAKING_DAY_WINDOW) as u64;
-                                                last_frame_finalized_bc_height = new_height;
-
-                                                let debug_do_anyway = ui.debug && input_ctx.key_pressed(KeyCode::F4);
-                                                if (new_pi as i64 - old_pi as i64).abs() == 1 || debug_do_anyway {
-                                                    current_animation_id = new_pi;
-                                                    current_animation_t = Some(0.0);
-                                                    if debug_do_anyway {
-                                                        current_animation_id = debug_next_animation_id;
-                                                        debug_next_animation_id += 1;
-                                                    }
-                                                }
-                                                if let Some(t) = current_animation_t.as_mut() {
-                                                    let old_t = *t;
-                                                    *t += dt;
-                                                    let t = *t;
-
-                                                    let music_random = (1+current_animation_id).wrapping_mul(11583847947735601999);
-                                                    let voice_random = (1+current_animation_id).wrapping_mul(13723614751765347379);
-
-                                                    let music_sound;
-                                                    let music_volume;
-                                                    let music_visual_delay;
-                                                    let music_sound_delay;
-                                                    let voice_sound;
-                                                    let voice_volume;
-
-                                                    if current_animation_id & 1 == 0 {
-                                                        let music_index = music_random % 6;
-                                                        let voice_index = voice_random % 10;
-
-                                                        match music_index {
-                                                            5 => {
-                                                                music_sound = SOUND_EPIC_TRANSITION1;
-                                                                music_volume = 1.0;
-                                                                music_visual_delay = 0.5;
-                                                                music_sound_delay = 1.0;
+                                                        let dx = (x2 - x1) / (y2 - y1);
+                                                        for iy in iy1..iy2 {
+                                                            let fx = x1 as f32 + dx * (iy - y1 as isize) as f32;
+                                                            let h = (thickness / 2.0 + 1.0) / f32::sin(f32::atan(1.0/dx.abs()));
+                                                            let cull_ix1;
+                                                            let cull_ix2;
+                                                            if h.is_normal() {
+                                                                cull_ix1 = (fx - h).floor() as isize;
+                                                                cull_ix2 = (fx + h).ceil() as isize;
+                                                            } else {
+                                                                cull_ix1 = 0;
+                                                                cull_ix2 = 9999999999;
                                                             }
-                                                            4 => {
-                                                                music_sound = SOUND_DAMATIC_HORN3;
-                                                                music_volume = 1.0;
-                                                                music_visual_delay = 1.5;
-                                                                music_sound_delay = 2.0;
-                                                            }
-                                                            3 => {
-                                                                music_sound = SOUND_DAMATIC_HORN2;
-                                                                music_volume = 1.0;
-                                                                music_visual_delay = 1.5;
-                                                                music_sound_delay = 2.0;
-                                                            }
-                                                            2 => {
-                                                                music_sound = SOUND_DRUM_FADEIN1;
-                                                                music_volume = 1.2;
-                                                                music_visual_delay = 7.0;
-                                                                music_sound_delay = 7.0;
-                                                            }
-                                                            1 => {
-                                                                music_sound = SOUND_TRUMPET_FANFARE1;
-                                                                music_volume = 1.0;
-                                                                music_visual_delay = 12.5;
-                                                                music_sound_delay = 13.5;
-                                                            }
-                                                            _ => {
-                                                                music_sound = SOUND_DAMATIC_HORN1;
-                                                                music_volume = 1.0;
-                                                                music_visual_delay = 0.5;
-                                                                music_sound_delay = 1.0;
-                                                            }
-                                                        }
-
-                                                        match voice_index {
-                                                            9 => {
-                                                                voice_sound = SOUND_LOCK_AND_EARN1;
-                                                                voice_volume = 1.4;
-                                                            }
-                                                            8 => {
-                                                                voice_sound = SOUND_CLAIM_YOUR_REWARDS1;
-                                                                voice_volume = 1.4;
-                                                            }
-                                                            7 => {
-                                                                voice_sound = SOUND_SUBMIT_STAKING_TRANSACTIONS2;
-                                                                voice_volume = 1.4;
-                                                            }
-                                                            6 => {
-                                                                voice_sound = SOUND_NOW_STAKING_DAY3;
-                                                                voice_volume = 1.4;
-                                                            }
-                                                            5 => {
-                                                                voice_sound = SOUND_NOW_STAKING_DAY2;
-                                                                voice_volume = 1.4;
-                                                            }
-                                                            4 => {
-                                                                voice_sound = SOUND_TOKENS_AWAIT_STAKING1;
-                                                                voice_volume = 1.8;
-                                                            }
-                                                            3 => {
-                                                                voice_sound = SOUND_UNLEASH_YOUR_CAPITAL1;
-                                                                voice_volume = 1.8;
-                                                            }
-                                                            2 => {
-                                                                voice_sound = SOUND_SUBMIT_STAKING_TRANSACTIONS1;
-                                                                voice_volume = 1.8;
-                                                            }
-                                                            1 => {
-                                                                voice_sound = SOUND_IT_IS_TIME_TO_STAKE1;
-                                                                voice_volume = 1.8;
-                                                            }
-                                                            _ => {
-                                                                voice_sound = SOUND_NOW_STAKING_DAY1;
-                                                                voice_volume = 1.8;
+                                                            for ix in ix1.max(cull_ix1)..ix2.min(cull_ix2) {
+                                                                let pixel = ctx.render_target_0.byte_add(((ix + (iy << pixel_row_shift)) as usize) << 2);
+                                                                let coverage = (1.0 - sd_segment((ix as f32, iy as f32), (x1, y1), (x2, y2), thickness / 2.0)).clamp(0.0, 1.0);
+                                                                let this_color = blend_u32(*(pixel as *mut u32), color, (coverage * 255.0) as u32);
+                                                                *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
                                                             }
                                                         }
                                                     }
-                                                    else {
-                                                        let music_index = music_random % 7;
-                                                        let voice_index = voice_random % 6;
-                                                        match music_index {
-                                                            6 => {
-                                                                music_sound = SOUND_CELLO_DRONE1;
-                                                                music_volume = 2.0;
-                                                                music_visual_delay = 12.5;
-                                                                music_sound_delay = 13.5;
+                                                },
+                                                DrawCommand::PixelLineYDef { x1, y1, x2, y2, color, thickness, } => {
+                                                    if thickness <= 1.0 {
+                                                        let x1 = x1.round() as i16;
+                                                        let y1 = y1.round() as i16;
+                                                        let x2 = x2.round() as i16;
+                                                        let y2 = y2.round() as i16;
+                                                        let start_y = (y1 as isize).max(tile_pixel_y as isize);
+                                                        let end_y = (y2 as isize).min(tile_pixel_y2 as isize);
+                                                        if start_y >= end_y { continue; }
+                                                        let dx = (x2 as f32 - x1 as f32) / y2.wrapping_sub(y1) as f32;
+                                                        hasher.write_u64(0x83248923897);
+                                                        hasher.write_i16(x1);
+                                                        hasher.write_i16(x2);
+                                                        hasher.write_i16(y1);
+                                                        hasher.write_i16(y2);
+                                                        hasher.write_u32(color);
+                                                        hasher.write_u32(dx.to_bits());
+                                                        if should_draw == false { continue; }
+                                                        for real_y in start_y..end_y {
+                                                            let fx = x1 as f32 + dx * (real_y - y1 as isize) as f32;
+                                                            let ix1 = fx.floor() as isize;
+                                                            let ix2 = ix1+1;
+                                                            let coverage1 = (ix2 as f32 - fx).clamp(0.0, thickness);
+                                                            let coverage2 = thickness - coverage1;
+                                                            let blend1 = 255.0 * linear_to_srgb_one_channel_float(coverage1);
+                                                            let blend2 = 255.0 * linear_to_srgb_one_channel_float(coverage2);
+
+                                                            if ix1 >= tile_pixel_x as isize && ix1 < tile_pixel_x2 as isize {
+                                                                let pixel = ctx.render_target_0.byte_add(((ix1 + (real_y << pixel_row_shift)) as usize) << 2);
+                                                                let this_color = blend_u32(*(pixel as *mut u32), color, blend1 as u32);
+                                                                *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
                                                             }
-                                                            5 => {
-                                                                music_sound = SOUND_SOFT_CELLO1;
-                                                                music_volume = 1.0;
-                                                                music_visual_delay = 3.5;
-                                                                music_sound_delay = 4.5;
-                                                            }
-                                                            4 => {
-                                                                music_sound = SOUND_EPIC_TRANSITION1;
-                                                                music_volume = 1.0;
-                                                                music_visual_delay = 0.5;
-                                                                music_sound_delay = 1.0;
-                                                            }
-                                                            3 => {
-                                                                music_sound = SOUND_DAMATIC_HORN3;
-                                                                music_volume = 1.0;
-                                                                music_visual_delay = 1.5;
-                                                                music_sound_delay = 2.0;
-                                                            }
-                                                            2 => {
-                                                                music_sound = SOUND_DAMATIC_HORN2;
-                                                                music_volume = 1.0;
-                                                                music_visual_delay = 1.5;
-                                                                music_sound_delay = 2.0;
-                                                            }
-                                                            1 => {
-                                                                music_sound = SOUND_DRUM_FADEIN1;
-                                                                music_volume = 1.2;
-                                                                music_visual_delay = 7.0;
-                                                                music_sound_delay = 7.0;
-                                                            }
-                                                            _ => {
-                                                                music_sound = SOUND_GONG1;
-                                                                music_volume = 1.5;
-                                                                music_visual_delay = 0.2;
-                                                                music_sound_delay = 0.5;
+                                                            if ix2 >= tile_pixel_x as isize && ix2 < tile_pixel_x2 as isize {
+                                                                let pixel = ctx.render_target_0.byte_add(((ix2 + (real_y << pixel_row_shift)) as usize) << 2);
+                                                                let this_color = blend_u32(*(pixel as *mut u32), color, blend2 as u32);
+                                                                *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
                                                             }
                                                         }
+                                                    } else {
+                                                        // y1 is known to be less than y2 but this does not apply to x.
+                                                        let bx_min = x1.min(x2);
+                                                        let bx_max = x1.max(x2);
+                                                        let ix1 = ((bx_min - (thickness / 2.0)).floor() as isize - 1).max(tile_pixel_x as isize);
+                                                        let ix2 = ((bx_max + (thickness / 2.0)).ceil() as isize + 1).min(tile_pixel_x2 as isize);
+                                                        let iy1 = ((y1 - (thickness / 2.0)).floor() as isize - 1).max(tile_pixel_y as isize);
+                                                        let iy2 = ((y2 + (thickness / 2.0)).ceil() as isize + 1).min(tile_pixel_y2 as isize);
+                                                        if ix1 >= ix2 || iy1 >= iy2 { continue; }
 
-                                                        match voice_index {
-                                                            5 => {
-                                                                voice_sound = SOUND_STAKING_DAY_OVER6;
-                                                                voice_volume = 1.2;
+                                                        hasher.write_u64(0x75345834958);
+                                                        hasher.write_u32(x1.to_bits());
+                                                        hasher.write_u32(x2.to_bits());
+                                                        hasher.write_u32(y1.to_bits());
+                                                        hasher.write_u32(y2.to_bits());
+                                                        hasher.write_u32(thickness.to_bits());
+                                                        hasher.write_u32(color);
+                                                        if should_draw == false { continue; }
+
+                                                        let dx = (x2 - x1) / (y2 - y1);
+                                                        for iy in iy1..iy2 {
+                                                            let fx = x1 as f32 + dx * (iy - y1 as isize) as f32;
+                                                            let h = (thickness / 2.0 + 1.0) / f32::sin(f32::atan(1.0/dx.abs()));
+                                                            let cull_ix1;
+                                                            let cull_ix2;
+                                                            if h.is_normal() {
+                                                                cull_ix1 = (fx - h).floor() as isize;
+                                                                cull_ix2 = (fx + h).ceil() as isize;
+                                                            } else {
+                                                                cull_ix1 = 0;
+                                                                cull_ix2 = 9999999999;
                                                             }
-                                                            4 => {
-                                                                voice_sound = SOUND_STAKING_DAY_OVER5;
-                                                                voice_volume = 1.0;
-                                                            }
-                                                            3 => {
-                                                                voice_sound = SOUND_STAKING_DAY_OVER4;
-                                                                voice_volume = 1.2;
-                                                            }
-                                                            2 => {
-                                                                voice_sound = SOUND_STAKING_DAY_OVER3;
-                                                                voice_volume = 1.2;
-                                                            }
-                                                            1 => {
-                                                                voice_sound = SOUND_STAKING_DAY_OVER2;
-                                                                voice_volume = 1.2;
-                                                            }
-                                                            _ => {
-                                                                voice_sound = SOUND_STAKING_DAY_OVER1;
-                                                                voice_volume = 1.2;
+                                                            for ix in ix1.max(cull_ix1)..ix2.min(cull_ix2) {
+                                                                let pixel = ctx.render_target_0.byte_add(((ix + (iy << pixel_row_shift)) as usize) << 2);
+                                                                let coverage = (1.0 - sd_segment((ix as f32, iy as f32), (x1, y1), (x2, y2), thickness / 2.0)).clamp(0.0, 1.0);
+                                                                let this_color = blend_u32(*(pixel as *mut u32), color, (coverage * 255.0) as u32);
+                                                                *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
                                                             }
                                                         }
                                                     }
-
-                                                    let global_sound_volume = 0.7;
-
-                                                    if old_t < 0.001 && t >= 0.001 {
-                                                        play_sound(music_sound, global_sound_volume*music_volume, 1.0);
-                                                    }
-                                                    if old_t < music_sound_delay && t >= music_sound_delay {
-                                                        play_sound(voice_sound, global_sound_volume*voice_volume, 1.0);
-                                                    }
-
-                                                    let text_h = (window_height as f32 / 3.0).min(window_width as f32 / 12.0);
-
-                                                    let text_string = if current_animation_id & 1 != 0 { "Staking Day has Ended" } else { "Staking Day has Begun" };
-                                                    let text_y = cubic_hold((t - music_visual_delay) as f32 / 5.0, 0.1, 0.7, 0.4)*1.4 * (window_height as f32 + text_h + 30.0) - (text_h + 30.0) * 1.4;
-
-                                                    let text_w = draw_ctx.measure_text_line(FontKind::Normal, text_h, text_string);
-                                                    let text_x = window_width as f32 / 2.0 - text_w / 2.0;
-                                                    draw_ctx.rectangle_r(text_x - 20.0, text_y - 20.0, text_x + text_w + 20.0, text_y + text_h + 20.0, 30, 0x70_000000);
-                                                    draw_ctx.text_line(FontKind::Normal, text_x, text_y, text_h, text_string, 0xffffffff);
-
-                                                    if t > 60.0 { current_animation_t = None; }
-                                                }
-                                            }
-
-                                            if (ui.prev_cursor != ui.cursor) {
-                                                ui.prev_cursor  = ui.cursor.clone();
-                                                window.set_cursor(ui.cursor.clone());
-                                            }
-
-                                            input_ctx.mouse_moved = false;
-                                            input_ctx.last_mouse_pos = input_ctx.this_mouse_pos;
-                                            input_ctx.scroll_delta = (0.0, 0.0);
-                                            input_ctx.zoom_delta = 0.0;
-
-                                            assert!(*draw_ctx.glyph_bitmap_run_allocator_position < GLYPH_RUN_MAX);
-                                            assert!(*draw_ctx.draw_command_count <= DRAW_CALL_MAX);
-                                            if *draw_ctx.draw_command_count == DRAW_CALL_MAX { println!("WARNING, we are at max capacity for draw commands."); }
-                                            prev_frame_time_single_threaded_us = begin_frame_instant.elapsed().as_micros() as usize;
-
-                                            // Note(Sam): We want to do this earlier but we are too slow. See comment above.
-                                            { // Tell workers: WAKE UP WAKE UP WAKE UP!!!
-                                                while (*p_thread_context).workers_that_have_passed_the_wake_up_gate.load(Ordering::Relaxed) != (*p_thread_context).thread_count - 1 { spin_loop(); }
-                                                (*p_thread_context).workers_that_have_passed_the_wake_up_gate.store(0, Ordering::Relaxed);
-                                                (*p_thread_context).wake_up_gate.store(0, Ordering::Relaxed);
-                                                (*p_thread_context).wake_up_barrier.wait();
-                                                (*p_thread_context).is_last_time = false;
-                                                (*p_thread_context).begin_work_gate.store(0, Ordering::Relaxed);
-                                                (*p_thread_context).wake_up_gate.store(1, Ordering::Release);
-                                            }
-
-
-                                            #[derive(Clone, Copy)]
-                                            struct ExecuteCommandBufferOnTilesCtx {
-                                                render_target_0: *mut u8,
-                                                render_target_stride: usize,
-                                                window_width: usize,
-                                                window_height: usize,
-                                                saved_tile_hashes: *mut u64,
-                                                draw_ctx: *const DrawCtx,
-                                            }
-                                            let ups = ExecuteCommandBufferOnTilesCtx {
-                                                render_target_0,
-                                                render_target_stride: draw_area_pixel_wide,
-                                                window_width,
-                                                window_height,
-                                                saved_tile_hashes: saved_tile_hashes.as_mut_ptr(),
-                                                draw_ctx: &draw_ctx,
-                                            };
-                                            dennis_parallel_for(p_thread_context, false, tiles_wide*tiles_wide, &ups as *const ExecuteCommandBufferOnTilesCtx as usize,
-                                                |thread_id: usize, work_id: usize, work_count: usize, user_pointer: usize| {
-                                                    unsafe {
-                                                        let ctx = *(user_pointer as *const ExecuteCommandBufferOnTilesCtx);
-                                                        let pixel_row_shift = ctx.render_target_stride.trailing_zeros() as usize;
-                                                        let intra_row_mask = ctx.render_target_stride.wrapping_sub(1);
-                                                        debug_assert!(work_count.count_ones() == 1);
-                                                        let tile_row_shift = work_count.trailing_zeros() / 2;
-                                                        let tile_x = work_id & (1usize << tile_row_shift).wrapping_sub(1);
-                                                        let tile_y = work_id >> tile_row_shift;
-
-                                                        let tile_pixel_x = (tile_x << RENDER_TILE_SHIFT) as u32;
-                                                        let tile_pixel_x2 = ((tile_x+1) << RENDER_TILE_SHIFT) as u32;
-                                                        let tile_pixel_y = (tile_y << RENDER_TILE_SHIFT) as u32;
-                                                        let tile_pixel_y2 = ((tile_y+1) << RENDER_TILE_SHIFT) as u32;
-                                                        if tile_pixel_x as usize >= ctx.window_width { return; }
-                                                        if tile_pixel_y as usize >= ctx.window_height { return; }
-
-                                                        let debug_pixel = (*(*ctx.draw_ctx).debug_pixel_inspector).unwrap_or((usize::MAX, usize::MAX));
-
-                                                        let mut scissor_x1: isize = 0;
-                                                        let mut scissor_y1: isize = 0;
-                                                        let mut scissor_x2: isize = ctx.window_width  as isize;
-                                                        let mut scissor_y2: isize = ctx.window_height as isize;
-
-                                                        let mut got_hash = 0u64;
-                                                        for should_draw in 0..2 {
-                                                            let should_draw = should_draw == 1;
-                                                            if should_draw {
-                                                                let saved = ctx.saved_tile_hashes.byte_add(8*work_id);
-                                                                if got_hash == *saved && TURN_OFF_HASH_BASED_LAZY_RENDER == 0 {
-                                                                    return;
-                                                                } else {
-                                                                    *saved = got_hash;
-                                                                }
-                                                            }
-                                                            let mut hasher = ahash::AHasher::default();
-                                                            let draw_commands = (*ctx.draw_ctx).draw_command_buffer;
-                                                            let draw_command_count = *(*ctx.draw_ctx).draw_command_count;
-                                                            for cmd_i in 0..draw_command_count {
-                                                                match *draw_commands.byte_add(size_of::<DrawCommand>()*cmd_i) {
-                                                                    DrawCommand::ClearScreenToColor { color } => {
-                                                                        hasher.write_u64(0x83459345890234);
-                                                                        hasher.write_u32(color);
-                                                                        if should_draw == false { continue; }
-                                                                        let mut row_pixels = ctx.render_target_0.byte_add(((tile_pixel_x + (tile_pixel_y << pixel_row_shift)) as usize) << 2);
-                                                                        for _y in tile_pixel_y..tile_pixel_y2 {
-                                                                            let mut cursor_pixels = row_pixels;
-                                                                            for _x in tile_pixel_x..tile_pixel_x2 {
-                                                                                *(cursor_pixels as *mut u32) = color;
-                                                                                cursor_pixels = cursor_pixels.byte_add(4);
-                                                                            }
-                                                                            row_pixels = row_pixels.byte_add(4 << pixel_row_shift);
-                                                                        }
-                                                                    }
-                                                                    DrawCommand::Scissor { x1, y1, x2, y2 } => {
-                                                                        hasher.write_u64(0x897235923645643);
-                                                                        hasher.write_isize(x1);
-                                                                        hasher.write_isize(x2);
-                                                                        hasher.write_isize(y1);
-                                                                        hasher.write_isize(y2);
-                                                                        if should_draw == false { continue; }
-                                                                        scissor_x1 = x1;
-                                                                        scissor_y1 = y1;
-                                                                        scissor_x2 = x2;
-                                                                        scissor_y2 = y2;
-                                                                    }
-                                                                    DrawCommand::RoundedRectangle {
-                                                                        x: ofx,
-                                                                        x2: ofx2,
-                                                                        y: ofy,
-                                                                        y2: ofy2,
-                                                                        radius_tl,
-                                                                        radius_tr,
-                                                                        radius_bl,
-                                                                        radius_br,
-                                                                        color
-                                                                    } => {
-                                                                        let radius_tl = radius_tl as f32;
-                                                                        let radius_tr = radius_tr as f32;
-                                                                        let radius_bl = radius_bl as f32;
-                                                                        let radius_br = radius_br as f32;
-
-                                                                        // let radius_t = radius_tl.min(radius_tr);
-                                                                        // let radius_t = radius_tl.min(radius_tr);
-
-
-                                                                        let ix = (ofx.floor() as u32).max(tile_pixel_x);
-                                                                        let ix2 = (ofx2.ceil() as u32).min(tile_pixel_x2);
-                                                                        let iy = (ofy.floor() as u32).max(tile_pixel_y);
-                                                                        let iy2 = (ofy2.ceil() as u32).min(tile_pixel_y2);
-                                                                        if ix >= ix2 || iy >= iy2 { continue; }
-                                                                        hasher.write_u64(0x854893982097);
-                                                                        // hasher.write_u32(ofx.max(tile_pixel_x as f32 - radius).to_bits());
-                                                                        // hasher.write_u32(ofx2.min(tile_pixel_x2 as f32 + radius).to_bits());
-                                                                        // hasher.write_u32(ofy.max(tile_pixel_y as f32 - radius).to_bits());
-                                                                        // hasher.write_u32(ofy2.min(tile_pixel_y2 as f32 + radius).to_bits());
-                                                                        hasher.write_u32(ofx.to_bits());
-                                                                        hasher.write_u32(ofx2.to_bits());
-                                                                        hasher.write_u32(ofy.to_bits());
-                                                                        hasher.write_u32(ofy2.to_bits());
-                                                                        hasher.write_u32(radius_tl.to_bits());
-                                                                        hasher.write_u32(radius_tr.to_bits());
-                                                                        hasher.write_u32(radius_bl.to_bits());
-                                                                        hasher.write_u32(radius_br.to_bits());
-                                                                        hasher.write_u32(color);
-                                                                        if should_draw == false { continue; }
-                                                                        if scissor_x1 >= scissor_x2 { continue; }
-                                                                        if scissor_y1 >= scissor_y2 { continue; }
-                                                                        let mut row_pixels = ctx.render_target_0.byte_add(((ix + (iy << pixel_row_shift)) as usize) << 2);
-                                                                        let color_alpha = (color >> 24) as f32 / 255.0;
-                                                                        for _y in iy..iy2 {
-                                                                            let _fy = _y as f32;
-                                                                            let row_alpha = (1.0 - (ofy - _fy).clamp(0.0, 1.0)) * (ofy2 - _fy).clamp(0.0, 1.0);
-                                                                            let mut cursor_pixels = row_pixels;
-                                                                            for _x in ix..ix2 {
-                                                                                let _fx = _x as f32;
-                                                                                let mut cover_alpha = (1.0 - (ofx - _fx).clamp(0.0, 1.0)) * (ofx2 - _fx).clamp(0.0, 1.0) * row_alpha;
-                                                                                // top left
-                                                                                {
-                                                                                    let lx = _fx-ofx2+radius_tl;
-                                                                                    let ly = ofy-(_fy+1.0)+radius_tl;
-                                                                                    let v1 = lx*lx.abs()+ly*ly.abs();
-                                                                                    let new_alpha = radius_tl - v1.sqrt();
-                                                                                    cover_alpha = select_float(v1 >= 0.0, cover_alpha.min(new_alpha), cover_alpha,);
-                                                                                }
-                                                                                // top right
-                                                                                {
-                                                                                    let lx = ofx-(_fx+1.0)+radius_tr;
-                                                                                    let ly = ofy-(_fy+1.0)+radius_tr;
-                                                                                    let v1 = lx*lx.abs()+ly*ly.abs();
-                                                                                    let new_alpha = radius_tr - v1.sqrt();
-                                                                                    cover_alpha = select_float(v1 >= 0.0, cover_alpha.min(new_alpha), cover_alpha,);
-                                                                                }
-                                                                                // bottom left
-                                                                                {
-                                                                                    let lx = _fx-ofx2+radius_bl;
-                                                                                    let ly = _fy-ofy2+radius_bl;
-                                                                                    let v1 = lx*lx.abs()+ly*ly.abs();
-                                                                                    let new_alpha = radius_bl - v1.sqrt();
-                                                                                    cover_alpha = select_float(v1 >= 0.0, cover_alpha.min(new_alpha), cover_alpha,);
-                                                                                }
-                                                                                // bottom right
-                                                                                {
-                                                                                    let lx = ofx-(_fx+1.0)+radius_br;
-                                                                                    let ly = _fy-ofy2+radius_br;
-                                                                                    let v1 = lx*lx.abs()+ly*ly.abs();
-                                                                                    let new_alpha = radius_br - v1.sqrt();
-                                                                                    cover_alpha = select_float(v1 >= 0.0, cover_alpha.min(new_alpha), cover_alpha,);
-                                                                                }
-                                                                                let pixel_alpha = color_alpha * cover_alpha;
-
-                                                                                if (_x as isize) >= scissor_x1 && (_x as isize) < scissor_x2 &&
-                                                                                   (_y as isize) >= scissor_y1 && (_y as isize) < scissor_y2 {  // @Scissor
-                                                                                    *(cursor_pixels as *mut u32) = blend_u32(*(cursor_pixels as *mut u32), color,  (pixel_alpha * 255.0).round() as u32);
-                                                                                }
-                                                                                cursor_pixels = cursor_pixels.byte_add(4);
-                                                                            }
-                                                                            row_pixels = row_pixels.byte_add(4 << pixel_row_shift);
-                                                                        }
-                                                                    },
-                                                                    DrawCommand::TextRow { y, glyph_row_shift, color, font_tracker_id, font_row_index, glyph_bitmap_run, glyph_bitmap_run_len } => {
-                                                                        if (y as u32) < tile_pixel_y || (y as u32) >= tile_pixel_y2 { continue; }
-                                                                        if (y as isize) < scissor_y1 || (y as isize) >= scissor_y2 { continue; } // @Scissor
-
-                                                                        let font_tracker = &*(*ctx.draw_ctx).font_tracker_buffer.add(font_tracker_id as usize);
-                                                                        let bitmap_widths = font_tracker.cached_bitmap_widths.as_ptr();
-                                                                        let row_bitmaps = font_tracker.row_buffers[font_row_index as usize].as_ptr();
-
-                                                                        for i in 0..glyph_bitmap_run_len {
-                                                                            let (lookup_index, start_x) = *glyph_bitmap_run.add(i);
-                                                                            let width = *bitmap_widths.add(lookup_index as usize) as usize;
-
-                                                                            if (start_x as isize + width as isize - 1) < tile_pixel_x as isize { continue; }
-                                                                            if (start_x as isize) >= tile_pixel_x2 as isize { break; }
-                                                                            hasher.write_u64(0x8936730958944);
-                                                                            hasher.write_u16(lookup_index);
-                                                                            hasher.write_i16(start_x);
-                                                                            hasher.write_u16(y);
-                                                                            hasher.write_usize(row_bitmaps as usize);
-                                                                            hasher.write_usize(bitmap_widths as usize);
-                                                                            hasher.write_u32(color);
-                                                                            // TODO rethink, font id?
-                                                                            if should_draw == false { continue; }
-                                                                            if scissor_x1 >= scissor_x2 { continue; }
-                                                                            if scissor_y1 >= scissor_y2 { continue; }
-
-                                                                            let mut copy_data = row_bitmaps.byte_add((lookup_index as usize) << glyph_row_shift);
-                                                                            let mut put_data = ctx.render_target_0.byte_add((y as usize) << (pixel_row_shift+2)).byte_offset(start_x as isize *4);
-
-                                                                            let mut x1 = start_x as isize;
-                                                                            let x2 = (start_x as isize + width as isize).min(tile_pixel_x2 as isize);
-                                                                            if x1 < tile_pixel_x as isize {
-                                                                                copy_data = copy_data.byte_add((tile_pixel_x as isize - x1) as usize);
-                                                                                put_data = put_data.byte_add((tile_pixel_x as isize - x1) as usize * 4);
-                                                                                x1 = tile_pixel_x as isize;
-                                                                            }
-                                                                            let len = x2 - x1;
-                                                                            if len <= 0 { continue; }
-                                                                            for _x in x1..x2 {
-                                                                                let blend = *copy_data as u32;
-                                                                                copy_data = copy_data.byte_add(1);
-                                                                                if (_x as isize) >= scissor_x1 && (_x as isize) < scissor_x2 { // @Scissor
-                                                                                    *(put_data as *mut u32) = blend_u32(*(put_data as *mut u32), color, blend);
-                                                                                }
-                                                                                put_data = put_data.byte_add(4);
-                                                                            }
-                                                                        }
-                                                                    },
-                                                                    DrawCommand::PixelLineXDef { x1, y1, x2, y2, color, thickness, } => {
-                                                                        if thickness <= 1.0 {
-                                                                            let x1 = x1.round() as isize;
-                                                                            let y1 = y1.round() as isize;
-                                                                            let x2 = x2.round() as isize;
-                                                                            let y2 = y2.round() as isize;
-                                                                            let start_x = (x1 as isize).max(tile_pixel_x as isize);
-                                                                            let end_x = (x2 as isize).min(tile_pixel_x2 as isize);
-                                                                            if start_x >= end_x { continue; }
-                                                                            let dy = (y2 as f32 - y1 as f32) / x2.wrapping_sub(x1) as f32;
-                                                                            hasher.write_u64(0x75634593484);
-                                                                            hasher.write_isize(x1);
-                                                                            hasher.write_isize(x2);
-                                                                            hasher.write_isize(y1);
-                                                                            hasher.write_isize(y2);
-                                                                            hasher.write_u32(color);
-                                                                            hasher.write_u32(dy.to_bits());
-                                                                            if should_draw == false { continue; }
-                                                                            for real_x in start_x..end_x {
-                                                                                let fy = y1 as f32 + dy * (real_x - x1 as isize) as f32;
-                                                                                let iy1 = fy.floor() as isize;
-                                                                                let iy2 = iy1+1;
-                                                                                let coverage1 = (iy2 as f32 - fy).clamp(0.0, thickness);
-                                                                                let coverage2 = thickness - coverage1;
-                                                                                let blend1 = 255.0 * linear_to_srgb_one_channel_float(coverage1);
-                                                                                let blend2 = 255.0 * linear_to_srgb_one_channel_float(coverage2);
-
-                                                                                if iy1 >= tile_pixel_y as isize && iy1 < tile_pixel_y2 as isize {
-                                                                                    let pixel = ctx.render_target_0.byte_add(((real_x + (iy1 << pixel_row_shift)) as usize) << 2);
-                                                                                    let this_color = blend_u32(*(pixel as *mut u32), color, blend1 as u32);
-                                                                                    *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
-                                                                                }
-                                                                                if iy2 >= tile_pixel_y as isize && iy2 < tile_pixel_y2 as isize {
-                                                                                    let pixel = ctx.render_target_0.byte_add(((real_x + (iy2 << pixel_row_shift)) as usize) << 2);
-                                                                                    let this_color = blend_u32(*(pixel as *mut u32), color, blend2 as u32);
-                                                                                    *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
-                                                                                }
-                                                                            }
-                                                                        } else {
-                                                                            // x1 is known to be less than x2 but this does not apply to y.
-                                                                            let by_min = y1.min(y2);
-                                                                            let by_max = y1.max(y2);
-                                                                            let ix1 = ((x1 - (thickness / 2.0)).floor() as isize - 1).max(tile_pixel_x as isize);
-                                                                            let ix2 = ((x2 + (thickness / 2.0)).ceil() as isize + 1).min(tile_pixel_x2 as isize);
-                                                                            let iy1 = ((by_min - (thickness / 2.0)).floor() as isize - 1).max(tile_pixel_y as isize);
-                                                                            let iy2 = ((by_max + (thickness / 2.0)).ceil() as isize + 1).min(tile_pixel_y2 as isize);
-                                                                            if ix1 >= ix2 || iy1 >= iy2 { continue; }
-
-                                                                            hasher.write_u64(0x75345834958);
-                                                                            hasher.write_u32(x1.to_bits());
-                                                                            hasher.write_u32(x2.to_bits());
-                                                                            hasher.write_u32(y1.to_bits());
-                                                                            hasher.write_u32(y2.to_bits());
-                                                                            hasher.write_u32(thickness.to_bits());
-                                                                            hasher.write_u32(color);
-                                                                            if should_draw == false { continue; }
-
-                                                                            let dx = (x2 - x1) / (y2 - y1);
-                                                                            for iy in iy1..iy2 {
-                                                                                let fx = x1 as f32 + dx * (iy - y1 as isize) as f32;
-                                                                                let h = (thickness / 2.0 + 1.0) / f32::sin(f32::atan(1.0/dx.abs()));
-                                                                                let cull_ix1;
-                                                                                let cull_ix2;
-                                                                                if h.is_normal() {
-                                                                                    cull_ix1 = (fx - h).floor() as isize;
-                                                                                    cull_ix2 = (fx + h).ceil() as isize;
-                                                                                } else {
-                                                                                    cull_ix1 = 0;
-                                                                                    cull_ix2 = 9999999999;
-                                                                                }
-                                                                                for ix in ix1.max(cull_ix1)..ix2.min(cull_ix2) {
-                                                                                    let pixel = ctx.render_target_0.byte_add(((ix + (iy << pixel_row_shift)) as usize) << 2);
-                                                                                    let coverage = (1.0 - sd_segment((ix as f32, iy as f32), (x1, y1), (x2, y2), thickness / 2.0)).clamp(0.0, 1.0);
-                                                                                    let this_color = blend_u32(*(pixel as *mut u32), color, (coverage * 255.0) as u32);
-                                                                                    *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    },
-                                                                    DrawCommand::PixelLineYDef { x1, y1, x2, y2, color, thickness, } => {
-                                                                        if thickness <= 1.0 {
-                                                                            let x1 = x1.round() as i16;
-                                                                            let y1 = y1.round() as i16;
-                                                                            let x2 = x2.round() as i16;
-                                                                            let y2 = y2.round() as i16;
-                                                                            let start_y = (y1 as isize).max(tile_pixel_y as isize);
-                                                                            let end_y = (y2 as isize).min(tile_pixel_y2 as isize);
-                                                                            if start_y >= end_y { continue; }
-                                                                            let dx = (x2 as f32 - x1 as f32) / y2.wrapping_sub(y1) as f32;
-                                                                            hasher.write_u64(0x83248923897);
-                                                                            hasher.write_i16(x1);
-                                                                            hasher.write_i16(x2);
-                                                                            hasher.write_i16(y1);
-                                                                            hasher.write_i16(y2);
-                                                                            hasher.write_u32(color);
-                                                                            hasher.write_u32(dx.to_bits());
-                                                                            if should_draw == false { continue; }
-                                                                            for real_y in start_y..end_y {
-                                                                                let fx = x1 as f32 + dx * (real_y - y1 as isize) as f32;
-                                                                                let ix1 = fx.floor() as isize;
-                                                                                let ix2 = ix1+1;
-                                                                                let coverage1 = (ix2 as f32 - fx).clamp(0.0, thickness);
-                                                                                let coverage2 = thickness - coverage1;
-                                                                                let blend1 = 255.0 * linear_to_srgb_one_channel_float(coverage1);
-                                                                                let blend2 = 255.0 * linear_to_srgb_one_channel_float(coverage2);
-
-                                                                                if ix1 >= tile_pixel_x as isize && ix1 < tile_pixel_x2 as isize {
-                                                                                    let pixel = ctx.render_target_0.byte_add(((ix1 + (real_y << pixel_row_shift)) as usize) << 2);
-                                                                                    let this_color = blend_u32(*(pixel as *mut u32), color, blend1 as u32);
-                                                                                    *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
-                                                                                }
-                                                                                if ix2 >= tile_pixel_x as isize && ix2 < tile_pixel_x2 as isize {
-                                                                                    let pixel = ctx.render_target_0.byte_add(((ix2 + (real_y << pixel_row_shift)) as usize) << 2);
-                                                                                    let this_color = blend_u32(*(pixel as *mut u32), color, blend2 as u32);
-                                                                                    *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
-                                                                                }
-                                                                            }
-                                                                        } else {
-                                                                            // y1 is known to be less than y2 but this does not apply to x.
-                                                                            let bx_min = x1.min(x2);
-                                                                            let bx_max = x1.max(x2);
-                                                                            let ix1 = ((bx_min - (thickness / 2.0)).floor() as isize - 1).max(tile_pixel_x as isize);
-                                                                            let ix2 = ((bx_max + (thickness / 2.0)).ceil() as isize + 1).min(tile_pixel_x2 as isize);
-                                                                            let iy1 = ((y1 - (thickness / 2.0)).floor() as isize - 1).max(tile_pixel_y as isize);
-                                                                            let iy2 = ((y2 + (thickness / 2.0)).ceil() as isize + 1).min(tile_pixel_y2 as isize);
-                                                                            if ix1 >= ix2 || iy1 >= iy2 { continue; }
-
-                                                                            hasher.write_u64(0x75345834958);
-                                                                            hasher.write_u32(x1.to_bits());
-                                                                            hasher.write_u32(x2.to_bits());
-                                                                            hasher.write_u32(y1.to_bits());
-                                                                            hasher.write_u32(y2.to_bits());
-                                                                            hasher.write_u32(thickness.to_bits());
-                                                                            hasher.write_u32(color);
-                                                                            if should_draw == false { continue; }
-
-                                                                            let dx = (x2 - x1) / (y2 - y1);
-                                                                            for iy in iy1..iy2 {
-                                                                                let fx = x1 as f32 + dx * (iy - y1 as isize) as f32;
-                                                                                let h = (thickness / 2.0 + 1.0) / f32::sin(f32::atan(1.0/dx.abs()));
-                                                                                let cull_ix1;
-                                                                                let cull_ix2;
-                                                                                if h.is_normal() {
-                                                                                    cull_ix1 = (fx - h).floor() as isize;
-                                                                                    cull_ix2 = (fx + h).ceil() as isize;
-                                                                                } else {
-                                                                                    cull_ix1 = 0;
-                                                                                    cull_ix2 = 9999999999;
-                                                                                }
-                                                                                for ix in ix1.max(cull_ix1)..ix2.min(cull_ix2) {
-                                                                                    let pixel = ctx.render_target_0.byte_add(((ix + (iy << pixel_row_shift)) as usize) << 2);
-                                                                                    let coverage = (1.0 - sd_segment((ix as f32, iy as f32), (x1, y1), (x2, y2), thickness / 2.0)).clamp(0.0, 1.0);
-                                                                                    let this_color = blend_u32(*(pixel as *mut u32), color, (coverage * 255.0) as u32);
-                                                                                    *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    },
-                                                                }
-                                                            }
-                                                            got_hash = hasher.finish();
-                                                        }
-                                                    }
-                                                });
-
-                                            let need_buffer_flip;
-                                            {
-                                                let mut hasher = ahash::AHasher::default();
-                                                hasher.write_usize(window_width);
-                                                hasher.write_usize(window_height);
-                                                for th in &saved_tile_hashes { hasher.write_u64(*th); }
-                                                let new_hash = hasher.finish();
-                                                need_buffer_flip = whole_screen_hash != new_hash;
-                                                whole_screen_hash = new_hash;
-                                            }
-
-                                            prev_frame_time_us = begin_frame_instant.elapsed().as_micros() as usize;
-
-                                            struct EndOfFrameBlitCtx {
-                                                render_target_0: *mut u8,
-                                                display_buffer: *mut u8,
-                                                render_target_stride: usize,
-                                                display_buffer_stride: usize,
-                                                row_count: usize,
-                                            }
-                                            let mut ups = EndOfFrameBlitCtx {
-                                                render_target_0,
-                                                display_buffer: final_output_blit_buffer,
-                                                render_target_stride: draw_area_pixel_wide,
-                                                display_buffer_stride: window_width,
-                                                row_count: window_height,
-                                            };
-                                            // Note(Sam): We need to call dennis_parallel_for with is_last_time true in order for the threads to go to sleep. Therefore if we don't want to do work we pass work_count=0.
-                                            dennis_parallel_for(p_thread_context, true, (need_buffer_flip as usize)*((window_height + 32 - 1) / 32), &ups as *const EndOfFrameBlitCtx as usize,
-                                            |thread_id: usize, work_id: usize, work_count: usize, user_pointer: usize| {
-                                                unsafe {
-                                                    let p_thread_context = user_pointer as *mut EndOfFrameBlitCtx;
-                                                    let render_target_0 = (*p_thread_context).render_target_0;
-                                                    let display_buffer = (*p_thread_context).display_buffer;
-
-                                                    let row_count = (*p_thread_context).row_count;
-
-                                                    let render_target_stride = (*p_thread_context).render_target_stride;
-                                                    let display_buffer_stride = (*p_thread_context).display_buffer_stride;
-
-                                                    let mut local_row_count = row_count / work_count;
-                                                    let start_row = work_id * local_row_count;
-                                                    if work_id == work_count - 1 {
-                                                        local_row_count = row_count - start_row;
-                                                    }
-
-                                                    for row in start_row..start_row+local_row_count {
-                                                        let pixel_src = render_target_0.byte_add(row*render_target_stride*4) as *mut u8;
-                                                        let pixel_dst = display_buffer.byte_add(row*display_buffer_stride*4) as *mut u8;
-                                                        copy_nonoverlapping(pixel_src, pixel_dst, display_buffer_stride*4);
-                                                    }
-                                                }
-                                            });
-
-                                            prev_frame_time_total_us = begin_frame_instant.elapsed().as_micros() as usize;
-                                            frame_stats[frame_stat_o % frame_stats.len()].single_threaded_time_us = prev_frame_time_single_threaded_us as usize;
-                                            frame_stats[frame_stat_o % frame_stats.len()].work_time_us = prev_frame_time_us as usize;
-                                            frame_stats[frame_stat_o % frame_stats.len()].full_time_us = prev_frame_time_total_us as usize;
-                                            frame_stat_o += 1;
-
-                                            prev_frame_time_single_thread_us_max_5_seconds = prev_frame_time_single_thread_us_max_5_seconds.max(prev_frame_time_single_threaded_us);
-                                            prev_frame_time_total_us_max_5_seconds = prev_frame_time_total_us_max_5_seconds.max(prev_frame_time_total_us);
-
-                                            if let Some((x, y)) = *draw_ctx.debug_pixel_inspector {
-                                                let pixel_src = render_target_0.byte_add((x+y*draw_area_pixel_wide)*4);
-                                                *draw_ctx.debug_pixel_inspector_last_color = *(pixel_src as *mut u32);
-                                            }
-
-                                            if ui.debug {
-                                                *draw_ctx.draw_command_count = 0;
-                                                draw_ctx.text_line(FontKind::Mono, 8.0, 8.0, 13.0,
-                                                    &format!(
-                                                        "Rate: {} hz | (us) deadline: {} internal:{:>5} total:{:>5} max(5s):{:>5}",
-                                                        frame_interval_milli_hertz as f32 / 1000.0,
-                                                        target_frame_time_us,
-                                                        prev_frame_time_us,
-                                                        prev_frame_time_total_us,
-                                                        prev_frame_time_total_us_max_5_seconds
-                                                    ),
-                                                    if prev_frame_time_total_us_max_5_seconds < target_frame_time_us { 0xff_00ff00 } else { 0xff_ff5500 },
-                                                );
-                                                draw_ctx.text_line(FontKind::Mono, 8.0, 20.0, 13.0,
-                                                    &format!(
-                                                        "SINGLE THREAD PART: (us) {:>5} max(5s):{:>5}",
-                                                        prev_frame_time_single_threaded_us,
-                                                        prev_frame_time_single_thread_us_max_5_seconds
-                                                    ),
-                                                    0xff_00ff00,
-                                                );
-
-                                                // Force a non measured render buffer reset if the real code is not active to save CPU.
-                                                if need_buffer_flip == false
-                                                {
-                                                    for row in 0..window_height {
-                                                        let pixel_src = render_target_0.byte_add(row*draw_area_pixel_wide*4) as *mut u8;
-                                                        let pixel_dst = final_output_blit_buffer.byte_add(row*window_width*4) as *mut u8;
-                                                        copy_nonoverlapping(pixel_src, pixel_dst, window_width*4);
-                                                    }
-                                                }
-
-                                                // draw those commands *manually*
-                                                for cmd_i in 0..*draw_ctx.draw_command_count {
-                                                    match *draw_ctx.draw_command_buffer.add(cmd_i) {
-                                                        DrawCommand::TextRow { y, glyph_row_shift, color, font_tracker_id, font_row_index, glyph_bitmap_run, glyph_bitmap_run_len } => {
-                                                            let font_tracker = &*draw_ctx.font_tracker_buffer.add(font_tracker_id as usize);
-                                                            let bitmap_widths = font_tracker.cached_bitmap_widths.as_ptr();
-                                                            let row_bitmaps = font_tracker.row_buffers[font_row_index as usize].as_ptr();
-
-                                                            for i in 0..glyph_bitmap_run_len {
-                                                                let (lookup_index, start_x) = *glyph_bitmap_run.add(i);
-                                                                let width = *bitmap_widths.add(lookup_index as usize) as usize;
-
-                                                                let mut copy_data = row_bitmaps.byte_add((lookup_index as usize) << glyph_row_shift);
-                                                                let mut put_data = final_output_blit_buffer.byte_add(y as usize *window_width*4).byte_offset(start_x as isize *4);
-
-                                                                let mut x1 = start_x as isize;
-                                                                let x2 = (start_x as isize + width as isize).min(window_width as isize);
-                                                                if x1 < 0 {
-                                                                    copy_data = copy_data.byte_add((0 - x1) as usize);
-                                                                    put_data = put_data.byte_add((0 - x1) as usize * 4);
-                                                                    x1 = 0;
-                                                                }
-                                                                if x1 >= x2 { continue; }
-                                                                let len = x2 - x1;
-                                                                debug_assert!(len != 0);
-                                                                for _ in 0..len {
-                                                                    let blend = *copy_data as u32;
-                                                                    copy_data = copy_data.byte_add(1);
-                                                                    *(put_data as *mut u32) = blend_u32(*(put_data as *mut u32), color, blend);
-                                                                    put_data = put_data.byte_add(4);
-                                                                }
-                                                            }
-                                                        },
-                                                        _ => panic!("ehm what?"),
-                                                    }
-                                                }
-
-
-                                                for (i, stat) in frame_stats.iter().enumerate() {
-                                                    if !ui.frame_graph {
-                                                        break;
-                                                    }
-                                                    let thick = 2;
-                                                    let y = 40 + thick*i;
-                                                    let single_w = (stat.single_threaded_time_us / 10).min(window_width);
-                                                    let work_w = (stat.work_time_us / 10).min(window_width);
-                                                    let full_w = (stat.full_time_us / 10).min(window_width);
-                                                    let full_w = full_w.max(work_w) - work_w;
-                                                    let work_w = work_w.max(single_w) - single_w;
-                                                    let single_color = if stat.full_time_us < target_frame_time_us { 0xbb77ee } else { 0xffbb33 };
-                                                    let work_color = if stat.full_time_us < target_frame_time_us { 0x2266ee } else { 0xee2222 };
-                                                    let full_color = if stat.full_time_us < target_frame_time_us { 0x1133ff } else { 0x991111 };
-                                                    for t in 0..thick {
-                                                        if y+t >= window_height { continue; }
-                                                        let mut put_ptr = final_output_blit_buffer.byte_add((y+t)*window_width*4) as *mut u32;
-                                                        for x in 0..single_w {
-                                                            *put_ptr = blend_u32(*put_ptr, single_color, 128);
-                                                            put_ptr = put_ptr.byte_add(4);
-                                                        }
-                                                        for x in 0..work_w {
-                                                            *put_ptr = blend_u32(*put_ptr, work_color, 128);
-                                                            put_ptr = put_ptr.byte_add(4);
-                                                        }
-                                                        for x in 0..full_w {
-                                                            *put_ptr = blend_u32(*put_ptr, full_color, 128);
-                                                            put_ptr = put_ptr.byte_add(4);
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            if prev_frame_time_total_us_max_5_seconds_last_reset.elapsed().as_secs() >= 5 {
-                                                prev_frame_time_single_thread_us_max_5_seconds = 0;
-                                                prev_frame_time_total_us_max_5_seconds = 0;
-                                                prev_frame_time_total_us_max_5_seconds_last_reset = Instant::now();
-                                            }
-
-                                            // frame pace is not interesting for profiling
-                                            let frame_pace_us = last_call_to_present_instant.elapsed().as_micros() as u64;
-                                            last_call_to_present_instant = Instant::now();
-
-                                            let need_buffer_flip = need_buffer_flip || ui.debug;
-                                            if need_buffer_flip {
-                                                if okay_but_is_it_wayland(elwt) {
-                                                    window.pre_present_notify();
-                                                }
-                                                buffer.present().unwrap();
-                                            }
-                                            frame_is_actually_queued_by_us = false;
-                                            if okay_but_is_it_wayland(elwt) {
-                                                if need_buffer_flip {
-                                                    window.request_redraw();
-                                                } else {
-                                                    wayland_dropped_a_frame_on_purpose_counter = 2;
-                                                }
+                                                },
                                             }
                                         }
+                                        got_hash = hasher.finish();
                                     }
-                                },
-                                winit::event::WindowEvent::CloseRequested => {
-                                    elwt.exit();
-                                },
-                                _ => {},
-                            }
-                        },
-                        winit::event::Event::AboutToWait => {
-                            if let Some(monitor) = window.current_monitor() {
-                                if let Some(refresh_rate) = monitor.refresh_rate_millihertz() {
-                                    frame_interval_milli_hertz = refresh_rate;
                                 }
-                            }
-                            if okay_but_is_it_wayland(elwt) {
-                                if wayland_dropped_a_frame_on_purpose_counter == 2 {
-                                    wayland_dropped_a_frame_on_purpose_counter = 1;
-                                    elwt.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(Instant::now() + Duration::from_secs(1000) / frame_interval_milli_hertz));
-                                } else if wayland_dropped_a_frame_on_purpose_counter == 1 {
-                                    wayland_dropped_a_frame_on_purpose_counter = 0;
-                                    window.request_redraw();
-                                    elwt.set_control_flow(winit::event_loop::ControlFlow::Wait);
-                                } else {
-                                    elwt.set_control_flow(winit::event_loop::ControlFlow::Wait);
-                                }
-                            } else {
-                                let now = Instant::now();
-                                if now >= next_frame_deadline {
-                                    if last_call_to_present_instant > next_frame_deadline {
-                                    } else {
-                                        frame_is_actually_queued_by_us = true;
-                                        window.request_redraw();
-                                    }
-                                    if now - next_frame_deadline > Duration::from_millis(250) {
-                                        next_frame_deadline = Instant::now() + Duration::from_secs(1000) / frame_interval_milli_hertz;
-                                    } else {
-                                        while now >= next_frame_deadline {
-                                            next_frame_deadline += Duration::from_secs(1000) / frame_interval_milli_hertz;
+                            });
+
+                        let need_buffer_flip;
+                        {
+                            let mut hasher = ahash::AHasher::default();
+                            hasher.write_usize(window_width);
+                            hasher.write_usize(window_height);
+                            for th in saved_tile_hashes.iter() { hasher.write_u64(*th); }
+                            let new_hash = hasher.finish();
+                            need_buffer_flip = whole_screen_hash[fb_index] != new_hash;
+                            whole_screen_hash[fb_index] = new_hash;
+                        }
+
+                        prev_frame_time_us = begin_frame_instant.elapsed().as_micros() as usize;
+
+                        prev_frame_time_total_us = begin_frame_instant.elapsed().as_micros() as usize;
+                        frame_stats[frame_stat_o % frame_stats.len()].single_threaded_time_us = prev_frame_time_single_threaded_us as usize;
+                        frame_stats[frame_stat_o % frame_stats.len()].work_time_us = prev_frame_time_us as usize;
+                        frame_stats[frame_stat_o % frame_stats.len()].full_time_us = prev_frame_time_total_us as usize;
+                        frame_stat_o += 1;
+
+                        prev_frame_time_single_thread_us_max_5_seconds = prev_frame_time_single_thread_us_max_5_seconds.max(prev_frame_time_single_threaded_us);
+                        prev_frame_time_total_us_max_5_seconds = prev_frame_time_total_us_max_5_seconds.max(prev_frame_time_total_us);
+
+                        if let Some((x, y)) = *draw_ctx.debug_pixel_inspector {
+                            let pixel_src = render_target_0.byte_add((x+y*draw_area_pixel_wide)*4);
+                            *draw_ctx.debug_pixel_inspector_last_color = *(pixel_src as *mut u32);
+                        }
+
+                        if ui.debug {
+                            *draw_ctx.draw_command_count = 0;
+                            draw_ctx.text_line(FontKind::Mono, 8.0, 8.0, 13.0,
+                                &format!(
+                                    "Rate: {} hz | (us) deadline: {} internal:{:>5} total:{:>5} max(5s):{:>5}",
+                                    frame_interval_milli_hertz as f32 / 1000.0,
+                                    target_frame_time_us,
+                                    prev_frame_time_us,
+                                    prev_frame_time_total_us,
+                                    prev_frame_time_total_us_max_5_seconds
+                                ),
+                                if prev_frame_time_total_us_max_5_seconds < target_frame_time_us { 0xff_00ff00 } else { 0xff_ff5500 },
+                            );
+                            draw_ctx.text_line(FontKind::Mono, 8.0, 20.0, 13.0,
+                                &format!(
+                                    "SINGLE THREAD PART: (us) {:>5} max(5s):{:>5}",
+                                    prev_frame_time_single_threaded_us,
+                                    prev_frame_time_single_thread_us_max_5_seconds
+                                ),
+                                0xff_00ff00,
+                            );
+
+                            // draw those commands *manually*
+                            for cmd_i in 0..*draw_ctx.draw_command_count {
+                                match *draw_ctx.draw_command_buffer.add(cmd_i) {
+                                    DrawCommand::TextRow { y, glyph_row_shift, color, font_tracker_id, font_row_index, glyph_bitmap_run, glyph_bitmap_run_len } => {
+                                        let font_tracker = &*draw_ctx.font_tracker_buffer.add(font_tracker_id as usize);
+                                        let bitmap_widths = font_tracker.cached_bitmap_widths.as_ptr();
+                                        let row_bitmaps = font_tracker.row_buffers[font_row_index as usize].as_ptr();
+
+                                        for i in 0..glyph_bitmap_run_len {
+                                            let (lookup_index, start_x) = *glyph_bitmap_run.add(i);
+                                            let width = *bitmap_widths.add(lookup_index as usize) as usize;
+
+                                            let mut copy_data = row_bitmaps.byte_add((lookup_index as usize) << glyph_row_shift);
+                                            let mut put_data = final_output_blit_buffer.byte_add(y as usize *fb_side*4).byte_offset(start_x as isize *4);
+
+                                            let mut x1 = start_x as isize;
+                                            let x2 = (start_x as isize + width as isize).min(window_width as isize);
+                                            if x1 < 0 {
+                                                copy_data = copy_data.byte_add((0 - x1) as usize);
+                                                put_data = put_data.byte_add((0 - x1) as usize * 4);
+                                                x1 = 0;
+                                            }
+                                            if x1 >= x2 { continue; }
+                                            let len = x2 - x1;
+                                            debug_assert!(len != 0);
+                                            for _ in 0..len {
+                                                let blend = *copy_data as u32;
+                                                copy_data = copy_data.byte_add(1);
+                                                *(put_data as *mut u32) = blend_u32(*(put_data as *mut u32), color, blend);
+                                                put_data = put_data.byte_add(4);
+                                            }
                                         }
-                                    }
-                                } else {
-                                    std::thread::sleep(next_frame_deadline.saturating_duration_since(now));
+                                    },
+                                    _ => panic!("ehm what?"),
                                 }
-                                elwt.set_control_flow(winit::event_loop::ControlFlow::Poll);
                             }
-                        },
-                        _ => (),
+
+
+                            for (i, stat) in frame_stats.iter().enumerate() {
+                                if !ui.frame_graph {
+                                    break;
+                                }
+                                let thick = 2;
+                                let y = 40 + thick*i;
+                                let single_w = (stat.single_threaded_time_us / 10).min(window_width);
+                                let work_w = (stat.work_time_us / 10).min(window_width);
+                                let full_w = (stat.full_time_us / 10).min(window_width);
+                                let full_w = full_w.max(work_w) - work_w;
+                                let work_w = work_w.max(single_w) - single_w;
+                                let single_color = if stat.full_time_us < target_frame_time_us { 0xbb77ee } else { 0xffbb33 };
+                                let work_color = if stat.full_time_us < target_frame_time_us { 0x2266ee } else { 0xee2222 };
+                                let full_color = if stat.full_time_us < target_frame_time_us { 0x1133ff } else { 0x991111 };
+                                for t in 0..thick {
+                                    if y+t >= window_height { continue; }
+                                    let mut put_ptr = final_output_blit_buffer.byte_add((y+t)*fb_side*4) as *mut u32;
+                                    for x in 0..single_w {
+                                        *put_ptr = blend_u32(*put_ptr, single_color, 128);
+                                        put_ptr = put_ptr.byte_add(4);
+                                    }
+                                    for x in 0..work_w {
+                                        *put_ptr = blend_u32(*put_ptr, work_color, 128);
+                                        put_ptr = put_ptr.byte_add(4);
+                                    }
+                                    for x in 0..full_w {
+                                        *put_ptr = blend_u32(*put_ptr, full_color, 128);
+                                        put_ptr = put_ptr.byte_add(4);
+                                    }
+                                }
+                            }
+                        }
+
+                        if prev_frame_time_total_us_max_5_seconds_last_reset.elapsed().as_secs() >= 5 {
+                            prev_frame_time_single_thread_us_max_5_seconds = 0;
+                            prev_frame_time_total_us_max_5_seconds = 0;
+                            prev_frame_time_total_us_max_5_seconds_last_reset = Instant::now();
+                        }
+
+                        // frame pace is not interesting for profiling
+                        let frame_pace_us = last_call_to_present_instant.elapsed().as_micros() as u64;
+                        last_call_to_present_instant = Instant::now();
+
+                        let need_buffer_flip = need_buffer_flip || ui.debug;
+                        if need_buffer_flip {
+                            gui.submit();   // one present per vblank; this is what paces the next RENDER
+                        }
+
+                        // Past every reader of this frame's input: clear the edges the next batch of
+                        // EVENT_BUTTONS will re-accumulate. `*_down` is level state and stays.
+                        input_ctx.mouse_pressed  = 0;
+                        input_ctx.mouse_released = 0;
+                        input_ctx.keys_pressed1  = 0;
+                        input_ctx.keys_pressed2  = 0;
+                        input_ctx.keys_released1 = 0;
+                        input_ctx.keys_released2 = 0;
                     }
                 }
-            },
+
+                _ => {}
+            }
         }
-    }).unwrap();
+    }
 }
 
 #[cfg(test)]

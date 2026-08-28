@@ -247,13 +247,10 @@ opt-level = 3
 [profile.dev.package.orchard]
 opt-level = 3
 
-[profile.dev.package.softbuffer]
-opt-level = 3
-
 [profile.dev.package.swash]
 opt-level = 3
 
-[profile.dev.package.winit]
+[profile.dev.package.softer_gui]
 opt-level = 3
 
 [profile.dev.package.rustybuzz]
@@ -303,7 +300,8 @@ lto = "thin"
 # The linter should ignore these expected config flags/values
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(tokio_unstable)', # Used by tokio-console
-    'cfg(zcash_unstable, values("zfuture", "nu6.1", "nu7"))' # Used in Zebra and librustzcash
+    'cfg(zcash_unstable, values("zfuture", "nu6.1", "nu7"))', # Used in Zebra and librustzcash
+    'cfg(cosmo)' # Set by cosmo-build's per-architecture builds under -F ape
 ] }
 
 # High-risk code
@@ -369,3 +367,14 @@ rev = "7bf2611bd9a52b438300c640e142ad5c1298b05b"
 # Widen libsqlite3-sys requirement to be compatible with rusqlite 0.37
 [patch.crates-io.sqlx-sqlite]
 path = "../patches/sqlx-sqlite-0.8.6"
+
+# cosmo-build 5.0.0 asks for `sha2 = "0.11"`, which excludes the `0.11.0-pre.4`
+# that librustzcash's bip32 pins exactly, so the two cannot resolve together.
+# Drop this once a cosmo-build release carries the relaxed requirement.
+[patch.crates-io.cosmo-build]
+path = "../../cargo_cosmo/crates/cosmo-build"
+
+# Same checkout, for the epoll/eventfd shims: cosmopolitan provides neither, and
+# without them nothing using tokio's reactor can link as an APE.
+[patch.crates-io.cosmo-compat]
+path = "../../cargo_cosmo/crates/cosmo-compat"

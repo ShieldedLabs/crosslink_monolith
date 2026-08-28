@@ -13,7 +13,7 @@
 # We first set default values for build arguments used across the stages.
 # Each stage must define the build arguments (ARGs) it uses.
 
-ARG RUST_VERSION=1.91.0
+ARG RUST_VERSION=1.94.0
 
 ARG FEATURES="default-release-binaries"
 
@@ -25,8 +25,8 @@ ARG CARGO_HOME="${HOME}/.cargo"
 ARG CARGO_TARGET_DIR="${HOME}/target"
 
 # This stage prepares Zebra's build deps and captures build args as env vars.
-# rust:1.91.0-trixie
-FROM rust:${RUST_VERSION}-trixie@sha256:a0dba1c1b2c90585fc44421b55ddf8063323760dc644ba1d35f5b389ad3e8e14 AS deps
+# rust:1.94.0-trixie
+FROM rust:${RUST_VERSION}-trixie@sha256:f17e723020f87c1b4ac4ff6d73c9dfbb7d5cb978754c76641e47337d65f61e12 AS deps
 SHELL ["/bin/bash", "-xo", "pipefail", "-c"]
 
 # Make the build platform available as a variable

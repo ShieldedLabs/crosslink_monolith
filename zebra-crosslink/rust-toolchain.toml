@@ -1,3 +1,6 @@
 [toolchain]
 # Keep in sync with RUST_VERSION in docker/Dockerfile.
-channel = "1.91.0"
+# 1.94: zebra-gui's platform layer is softer_gui, which is edition 2024 and
+# declares rust-version 1.94. cosmo-build drives its own pinned nightly for the
+# APE builds, so that does not force the workspace off stable.
+channel = "1.94.0"

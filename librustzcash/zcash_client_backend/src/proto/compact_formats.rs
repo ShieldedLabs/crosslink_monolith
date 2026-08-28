@@ -15,10 +15,11 @@ pub struct ChainMetadata {
 /// A compact representation of a Zcash block.
 ///
 /// CompactBlock is a packaging of ONLY the data from a block that's needed to:
-///    1. Detect a payment to your Shielded address
-///    2. Detect a spend of your Shielded notes
-///    3. Update your witnesses to generate new spend proofs.
-///    4. Spend UTXOs associated to t-addresses of your wallet.
+///
+/// 1. Detect a payment to your Shielded address
+/// 1. Detect a spend of your Shielded notes
+/// 1. Update your witnesses to generate new spend proofs.
+/// 1. Spend UTXOs associated to t-addresses of your wallet.
 ///
 /// Currently, the `header` field should always be unset (empty). In the future,
 /// the presence or absence of header data may be made dependent on request
@@ -70,8 +71,8 @@ pub struct CompactTx {
     /// stateless server and a transaction with transparent inputs, this will be
     /// unset because the calculation requires reference to prior transactions.
     /// If there are no transparent inputs, the fee will be calculable as:
-    ///     valueBalanceSapling + valueBalanceOrchard + valueBalanceIronwood
-    ///     + sum(vPubNew) - sum(vPubOld) - sum(tOut)
+    /// valueBalanceSapling + valueBalanceOrchard + valueBalanceIronwood
+    /// + sum(vPubNew) - sum(vPubOld) - sum(tOut)
     #[prost(uint32, tag = "3")]
     pub fee: u32,
     #[prost(message, repeated, tag = "4")]

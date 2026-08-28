@@ -6,6 +6,9 @@ use std::{env, fs, path::PathBuf};
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
+    #[cfg(feature = "ape")]
+    apeify();
+
     #[cfg(windows)]
     embed_icon_resource(&manifest_dir.parent().unwrap().join("packaging/icons/zebra-crosslink.ico"));
 
@@ -52,5 +55,83 @@ fn embed_icon_resource(ico: &std::path::Path) {
 
     if let Err(err) = embed_resource::compile(&rc, embed_resource::NONE).manifest_optional() {
         println!("cargo:warning=application icon not embedded: {err}");
+    }
+}
+
+/// Build the crate again, once per architecture, and fuse the two ELFs into one
+/// Actually Portable Executable.
+///
+/// cosmo-build drives the *link* through cosmocc but leaves C compilation to
+/// cc-rs, and this tree has plenty of it (clay-rs compiles clay.h; wallet pulls
+/// bundled rusqlite, secp256k1 and zcash_script). cc-rs picks its compiler from
+/// the target triple, and nothing on the host answers to `*-unknown-cosmo`, so
+/// it is pointed at cosmocc's own cross compilers here. Setting them before
+/// `apeify()` is what makes them stick: cosmo-build scrubs the toolchain
+/// variables from the nested cargo's environment but passes everything else
+/// through, and by the time that cargo runs a build script cosmocc is unpacked.
+#[cfg(feature = "ape")]
+fn apeify() {
+    // Same default as cosmo-build's own Cache::locate.
+    let cosmo_home = env::var_os("COSMO_HOME").map(PathBuf::from).unwrap_or_else(|| {
+        let base = env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env::var("HOME").expect("HOME")).join(".cache"));
+        base.join("cargo-cosmo")
+    });
+    let bin = cosmo_home.join("cosmocc").join("bin");
+
+    // `<triple>-cc` / `-c++` are cosmocross, a plain shell script that adds the
+    // things a bare `<arch>-linux-cosmo-gcc` has no idea about: -nostdinc, the
+    // cosmopolitan include root, the normalize.inc prologue, -fno-pie and the
+    // per-arch register reservations. Driving the raw gcc instead fails on
+    // `#include <string.h>`, and hand-copying that flag set here would be a
+    // second copy of cosmocc's own logic to keep in step.
+    //
+    // `ar` has no such driver and is a bare APE: no ELF magic and no shebang, so
+    // the kernel refuses to execve it and cc-rs gets "Exec format error". It gets
+    // a wrapper that hands it to /bin/sh, the same route cosmo-build's linker
+    // shim takes.
+    let wrappers = PathBuf::from(env::var("OUT_DIR").unwrap()).join("cosmocc-wrappers");
+    fs::create_dir_all(&wrappers).unwrap();
+
+    for (triple, arch) in [
+        ("x86_64-unknown-cosmo",  "x86_64"),
+        ("aarch64-unknown-cosmo", "aarch64"),
+    ] {
+        let cc  = bin.join(format!("{triple}-cc"));
+        let cxx = bin.join(format!("{triple}-c++"));
+        let ar  = shell_wrapper(&wrappers, &bin.join(format!("{arch}-linux-cosmo-ar")));
+
+        // cc-rs accepts the triple with either dashes or underscores; set both so
+        // it does not matter which spelling it looks up first.
+        for key in [triple.to_string(), triple.replace('-', "_")] {
+            set_if_unset(&format!("CC_{key}"),  &cc);
+            set_if_unset(&format!("CXX_{key}"), &cxx);
+            set_if_unset(&format!("AR_{key}"),  &ar);
+        }
+    }
+
+    cosmo_build::apeify();
+}
+
+/// Write a shell script next to `dir` that runs `real` through /bin/sh, and hand
+/// back its path. Needed for cosmocc's APE tools, which cannot be execve'd.
+#[cfg(feature = "ape")]
+fn shell_wrapper(dir: &std::path::Path, real: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join(real.file_name().unwrap());
+    fs::write(&path, format!("#!/bin/sh\nexec /bin/sh {} \"$@\"\n", real.display())).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Leave an explicit override alone; a caller who set `CC_<triple>` meant it.
+#[cfg(feature = "ape")]
+fn set_if_unset(key: &str, value: &std::path::Path) {
+    if env::var_os(key).is_none() {
+        // Safety: build scripts are single-threaded at this point; nothing else
+        // in this process reads the environment concurrently.
+        unsafe { env::set_var(key, value); }
     }
 }

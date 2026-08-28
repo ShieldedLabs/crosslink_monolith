@@ -5,7 +5,7 @@ use std::{collections::HashMap, hash::Hash, sync::Mutex};
 use chrono::{DateTime, Utc};
 use wallet::BlockHeight;
 // use twox_hash::XxHash3_64;
-use winit::event::MouseButton;
+use crate::{keys::*, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 
 use super::*;
 
@@ -1679,7 +1679,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         viz_state.camera_x = e_lerp(viz_state.camera_x, 0.0, dt);
     }
 
-    if ui.mouse_pressed_id == ui::Id::VIZ_GUI && input_ctx.mouse_held(MouseButton::Left) {
+    if ui.mouse_pressed_id == ui::Id::VIZ_GUI && input_ctx.mouse_held(BTN_LEFT) {
         if input_ctx.mouse_delta() != (0, 0) {
             viz_state.follow_tip = false;
         }
@@ -1733,7 +1733,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     let mut minimap_scrub_this_frame = false;
     if !ui.capture || inside_any_minimap {
         if (ui.mouse_pressed_id == ui::Id::CHAIN_MINIMAP_POW || ui.mouse_pressed_id == ui::Id::CHAIN_MINIMAP_POS)
-            && input_ctx.mouse_held(MouseButton::Left)
+            && input_ctx.mouse_held(BTN_LEFT)
         {
             if ui.mouse_pressed_id == ui::Id::CHAIN_MINIMAP_POS {
                 let (bft_min, bft_max) = bft_minimap_height_span(viz_state);
@@ -1754,7 +1754,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             }
         }
         if ui.mouse_pressed_id == ui::Id::default()
-            && input_ctx.mouse_pressed(MouseButton::Left)
+            && input_ctx.mouse_pressed(BTN_LEFT)
             && inside_pow_minimap
         {
             let (h_min, h_max) = chain_minimap_height_span(viz_state);
@@ -1765,7 +1765,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             minimap_scrub_this_frame = true;
         }
         if ui.mouse_pressed_id == ui::Id::default()
-            && input_ctx.mouse_pressed(MouseButton::Left)
+            && input_ctx.mouse_pressed(BTN_LEFT)
             && inside_pos_minimap
         {
             let (bft_min, bft_max) = bft_minimap_height_span(viz_state);
@@ -1777,7 +1777,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         }
     }
     if !ui.capture {
-        if ui.mouse_pressed_id == ui::Id::default() && input_ctx.mouse_pressed(MouseButton::Left) && !inside_any_minimap {
+        if ui.mouse_pressed_id == ui::Id::default() && input_ctx.mouse_pressed(BTN_LEFT) && !inside_any_minimap {
             ui.mouse_pressed_id = ui::Id::VIZ_GUI;
         }
     }
@@ -1890,12 +1890,12 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         if on_screen_bc.block.this_hash == hovered_block || viz_blocks.contains(&on_screen_bc.block.this_hash) {
             on_screen_bc.t_roundness = 0.3;
             on_screen_bc.t_darkness = 0.2;
-            if input_ctx.key_pressed(KeyCode::Space) {
+            if input_ctx.key_pressed(KEY_SPACE) {
                 on_screen_bc.x = 0.0;
                 on_screen_bc.y = 0.0;
                 on_screen_bc.alpha = 0.0;
             }
-            if input_ctx.mouse_pressed(MouseButton::Left) && !minimap_scrub_this_frame {
+            if input_ctx.mouse_pressed(BTN_LEFT) && !minimap_scrub_this_frame {
                 viz_state.follow_tip = false;
                 viz_state.camera_x = on_screen_bc.t_x;
                 viz_state.camera_y = on_screen_bc.t_y;
@@ -1942,13 +1942,13 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         if on_screen_bft.block.this_hash == hovered_block || viz_blocks.contains(&on_screen_bft.block.this_hash) {
             on_screen_bft.t_roundness = 0.3;
             on_screen_bft.t_darkness = 0.2;
-            if input_ctx.key_pressed(KeyCode::Space) {
+            if input_ctx.key_pressed(KEY_SPACE) {
                 on_screen_bft.x = 0.0;
                 on_screen_bft.y = 0.0;
                 on_screen_bft.alpha = 0.0;
             }
             // same deal as PoW branch above, bft click to recenter should not piggyback on minimap press
-            if input_ctx.mouse_pressed(MouseButton::Left) && !minimap_scrub_this_frame {
+            if input_ctx.mouse_pressed(BTN_LEFT) && !minimap_scrub_this_frame {
                 viz_state.follow_tip = false;
                 viz_state.camera_x = on_screen_bft.t_x;
                 viz_state.camera_y = on_screen_bft.t_y;
@@ -2277,7 +2277,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         { play_sound(SOUND_UI_HOVER, 0.5, 1.0); }
     }
 
-    if !ui.capture && input_ctx.mouse_pressed(MouseButton::Left) && !minimap_scrub_this_frame {
+    if !ui.capture && input_ctx.mouse_pressed(BTN_LEFT) && !minimap_scrub_this_frame {
         viz_state.inspecting_block_hash = hovered_block;
         viz_state.inspecting_block_screen_x = hovered_block_screen_x;
         viz_state.inspecting_block_screen_y = hovered_block_screen_y;
@@ -2291,7 +2291,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         input_ctx.scroll_delta != (0.0, 0.0) || input_ctx.zoom_delta != 0.0;
     ui.suppress_scroll_for_clay = ((inside_any_minimap && wheelish) || minimap_wheel_scrubbed)
         || ((ui.mouse_pressed_id == ui::Id::CHAIN_MINIMAP_POW || ui.mouse_pressed_id == ui::Id::CHAIN_MINIMAP_POS)
-            && input_ctx.mouse_held(MouseButton::Left))
+            && input_ctx.mouse_held(BTN_LEFT))
         || (in_center_column && wheelish && !ui.capture);
 }
 

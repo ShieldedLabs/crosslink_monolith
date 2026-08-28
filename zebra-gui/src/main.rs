@@ -1,5 +1,12 @@
 use std::sync::{Arc, Mutex};
 
+// Nothing calls into it: linking it is the point. cosmo-build's linker shim
+// passes `--wrap` for the 123 libc entry points std uses, and cosmo-compat is
+// what defines the matching `__wrap_*`. Without this the rlib is never
+// referenced and the link fails on undefined `__wrap_mmap` and friends.
+#[cfg(cosmo)]
+extern crate cosmo_compat as _;
+
 use wallet::{WalletRosterMember, WalletTx, WalletTxKind};
 
 fn main() {

@@ -150,6 +150,15 @@ impl fmt::Display for Network {
     }
 }
 
+/// Prints a checkpoint list as its size and reach instead of every entry.
+struct CheckpointSummary<'a>(&'a crate::parameters::checkpoint::list::CheckpointList);
+
+impl fmt::Debug for CheckpointSummary<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} up to {:?}", self.0.len(), self.0.max_height())
+    }
+}
+
 impl std::fmt::Debug for Network {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -158,13 +167,29 @@ impl std::fmt::Debug for Network {
                 .debug_struct("Regtest")
                 .field("activation_heights", params.activation_heights())
                 .field("funding_streams", params.funding_streams())
-                .field("lockbox_disbursements", &params.lockbox_disbursements())
-                .field("checkpoints", &params.checkpoints())
-                .finish(),
+                .field("lockbox_disbursements", &params.lockbox_disbursements().len())
+                .field("checkpoints", &CheckpointSummary(&params.checkpoints()))
+                .finish_non_exhaustive(),
             Self::Testnet(params) if params.is_default_testnet() => {
                 write!(f, "{self}")
             }
-            Self::Testnet(params) => f.debug_tuple("ConfiguredTestnet").field(params).finish(),
+            // Named fields rather than the whole `Parameters`. Every Crosslink
+            // network is a configured testnet, so this arm is what a tracing span
+            // carrying a `Network` prints -- and `Parameters` holds the checkpoint
+            // list, thousands of hashes long, which buried every such line. What
+            // identifies the network is kept; what is merely long is counted.
+            Self::Testnet(params) => f
+                .debug_struct("ConfiguredTestnet")
+                .field("network_name", &params.network_name())
+                .field("network_magic", &params.network_magic())
+                .field("genesis_hash", &params.genesis_hash())
+                .field("activation_heights", params.activation_heights())
+                .field("target_difficulty_limit", &params.target_difficulty_limit())
+                .field("disable_pow", &params.disable_pow())
+                .field("funding_streams", &params.funding_streams().len())
+                .field("lockbox_disbursements", &params.lockbox_disbursements().len())
+                .field("checkpoints", &CheckpointSummary(&params.checkpoints()))
+                .finish_non_exhaustive(),
         }
     }
 }

@@ -340,10 +340,13 @@ pub fn fmt_prefixed_byte_str_rev(f: &mut std::fmt::Formatter<'_>, pre: &str, byt
 }
 
 impl std::fmt::Debug for IdentityKeyPair {
+    // Redacted, like Display: this type reaches a log whenever something prints a
+    // struct that holds it -- `{:?}` on a connection, for one -- and a secret key
+    // in a log is a secret key in every paste of that log. The old body also
+    // dropped its `format!` on the floor, so the prefix never reached the writer.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        format!("IdentityKeyPair {{ magic1: {}, private: \"", self.magic1);
-        fmt_byte_str(f, &self.private)?;
-        fmt_prefixed_byte_str(f, "\", public: \"",                &self.public)?;
+        write!(f, "IdentityKeyPair {{ magic1: {}, private: REDACTED, public: \"", self.magic1)?;
+        fmt_byte_str(f, &self.public)?;
         write!(f, "\" }}")
     }
 }

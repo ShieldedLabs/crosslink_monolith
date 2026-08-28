@@ -73,6 +73,12 @@ new-net = []
 default-release-binaries = ["release_max_level_info", "progress-bar", "prometheus", "sentry", "opentelemetry"]
 viz_gui = ["zebra-crosslink/viz_gui"]
 
+# Build a fat x86-64 + arm64 Actually Portable Executable instead of a native
+# binary. build.rs runs the whole build once more per architecture and fuses the
+# halves with apelink; the result lands in target/cosmo/<profile>/zebrad.com.
+# Combines with viz_gui: build.rs forwards that to the nested builds.
+ape = ["dep:cosmo-build"]
+
 
 # Default features for official ZF binary release builds
 default = ["default-release-binaries", "internal-miner"]
@@ -167,6 +173,14 @@ comparison-interpreter = ["zebra-script/comparison-interpreter"]
 
 [dependencies]
 wallet = { path = "../../wallet" }
+
+# Not used directly, and renamed only because the workspace already depends on
+# indexmap 2.x: this reaches the separate 1.x copy that halo2_proofs pulls in.
+# indexmap 1.x decides whether `std` exists by probing the sysroot from its build
+# script, which cannot succeed for a -Zbuild-std custom target like the cosmo
+# ones; it then drops IndexMap's default hasher and `new`, and halo2_proofs stops
+# compiling. Naming the feature here settles it by unification, on any target.
+indexmap1 = { package = "indexmap", version = "1", features = ["std"] }
 zcash_address = { workspace = true }
 zebra-chain = { path = "../zebra-chain", version = "11.3.0" }
 zebra-consensus = { path = "../zebra-consensus", version = "14.0.1" }
@@ -286,8 +300,15 @@ console-subscriber = { workspace = true, optional = true }
 
 derive-new.workspace = true
 
+# Translates the libc entry points std calls, whose constants rustc bakes in for
+# Linux but cosmopolitan resolves at load time.
+[target.'cfg(cosmo)'.dependencies]
+cosmo-compat = "5"
+
 [build-dependencies]
 vergen-git2 = { workspace = true, features = ["cargo", "rustc"] }
+# Only fetched, compiled or run when -F ape is on.
+cosmo-build = { version = "5", optional = true }
 # test feature lightwalletd-grpc-tests
 tonic-prost-build = { workspace = true, optional = true }
 
