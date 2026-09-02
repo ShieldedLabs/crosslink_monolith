@@ -319,6 +319,31 @@ impl RoundData {
     }
 }
 
+fn has_matching_prevote_pol(
+    rounds_data: &[RoundData],
+    height: u64,
+    round: u32,
+    value_id: ValueId,
+    threshold: u64,
+) -> bool {
+    let Some(round_data) = rounds_data
+        .iter()
+        .find(|round_data| round_data.height == height && round_data.round == round)
+    else {
+        return false;
+    };
+
+    round_data
+        .msg_val_sigs
+        .iter()
+        .zip(&round_data.roster)
+        .filter_map(|(votes, member)| {
+            (votes[0].0 == value_id && votes[0].1 != TMSig::NIL).then_some(member.stake)
+        })
+        .sum::<u64>()
+        >= threshold
+}
+
 enum TMMsgData {
     Proposal(BlockValue, i64),
     Prevote(ValueId),
@@ -990,6 +1015,20 @@ impl TMState {
             let on_roster = roster_i_from_pub_key(&roster[..active_roster_len(roster)], self.my_pub_key).is_some();
             let counts = self.rounds_data[i].counts.clone();
             let has_enough_info_to_determine_validity = self.rounds_data[i].has_enough_info_to_determine_validity();
+            let proposal_valid_round_has_pol = self.rounds_data[i]
+                .proposal_valid_round
+                .try_into()
+                .ok()
+                .map(|valid_round| {
+                    has_matching_prevote_pol(
+                        &self.rounds_data,
+                        self.rounds_data[i].height,
+                        valid_round,
+                        self.rounds_data[i].proposal_id,
+                        big_threshold,
+                    )
+                })
+                .unwrap_or(false);
 
             // TODO: don't spam "while" messages repeatedly
             let is_current_height_and_round = (self.height, self.round) == (self.rounds_data[i].height, self.rounds_data[i].round);
@@ -1034,7 +1073,7 @@ impl TMState {
             if (on_roster &&
                 is_current_height_and_round &&
                 has_enough_info_to_determine_validity &&
-                big_threshold <= counts.yes_prevotes &&
+                proposal_valid_round_has_pol &&
                 self.step == TMStep::Propose &&
                 0 <= self.rounds_data[i].proposal_valid_round && self.rounds_data[i].proposal_valid_round < self.round as i64) // we have received the proposal value
             {
@@ -3109,6 +3148,41 @@ use helpers::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn valid_round_pol_counts_only_matching_value_prevotes() {
+        let value = ValueId([7; 32]);
+        let other = ValueId([8; 32]);
+        let roster = vec![
+            SortedRosterMember {
+                pub_key: PubKeyID([1; 32]),
+                stake: 4,
+                cumulative_stake: 4,
+            },
+            SortedRosterMember {
+                pub_key: PubKeyID([2; 32]),
+                stake: 3,
+                cumulative_stake: 7,
+            },
+        ];
+        let mut round_data = RoundData {
+            height: 90_732,
+            round: 12,
+            roster,
+            msg_val_sigs: vec![
+                [(value, TMSig([1; 64])), (ValueId::NIL, TMSig::NIL)],
+                [(value, TMSig([2; 64])), (ValueId::NIL, TMSig::NIL)],
+            ],
+            msg_nil_sigs: vec![[TMSig::NIL; 2]; 2],
+            ..RoundData::EMPTY
+        };
+
+        assert!(has_matching_prevote_pol(&[round_data.clone()], 90_732, 12, value, 7));
+        round_data.msg_val_sigs[1][0].0 = other;
+        assert!(!has_matching_prevote_pol(&[round_data.clone()], 90_732, 12, value, 7));
+        assert!(has_matching_prevote_pol(&[round_data.clone()], 90_732, 12, value, 4));
+        assert!(!has_matching_prevote_pol(&[round_data], 90_732, 11, value, 4));
+    }
 
     // #[ignore]
     // #[test]
