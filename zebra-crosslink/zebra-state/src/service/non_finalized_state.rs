@@ -29,7 +29,10 @@ mod chain;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use chain::{BondStatusInChain, Chain, SpendingTransactionId};
+pub(crate) use chain::{Chain, SpendingTransactionId};
+// Public because it appears in the signature of the exported `update_bonds_with_pos_issuance`,
+// so an outside caller cannot name the argument type without it.
+pub use chain::BondStatusInChain;
 
 /// The state of the chains in memory, including queued blocks.
 ///

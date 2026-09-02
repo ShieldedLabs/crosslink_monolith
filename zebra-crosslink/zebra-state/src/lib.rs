@@ -62,7 +62,7 @@ pub use service::{
     check,
     finalized_state::FinalizedState,
     init, init_read_only,
-    non_finalized_state::NonFinalizedState,
+    non_finalized_state::{BondStatusInChain, NonFinalizedState},
     spawn_init, spawn_init_read_only,
     watch_receiver::WatchReceiver,
     OutputLocation, TransactionIndex, TransactionLocation,

@@ -1716,8 +1716,8 @@ async fn total_issuance_from_key(
                 );
             }
 
-            if delegation_bonds.len() > 0 {
-                let reward_store_for_revert = zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds);
+            if delegation_bonds.values().any(|(_, status)| *status == zebra_state::BondStatusInChain::Active) {
+                zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds);
             }
 
             for (ufvk_i, scan_ctx) in scan_ctxs.iter().enumerate() {
