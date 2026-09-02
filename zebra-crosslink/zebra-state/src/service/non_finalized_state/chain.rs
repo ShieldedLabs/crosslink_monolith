@@ -492,8 +492,8 @@ impl Chain {
         let mut unbonding_amounts: Vec<([u8; 32], u64)> = Vec::new();
         for tx in block.block.transactions.iter() {
             if let Some(staking_action) = tx.staking_action() {
-                if staking_action.kind == StakingActionKind::BeginDelegationUnbonding {
-                    let bond_key = staking_action.arg32_0;
+                if staking_action.kind() == StakingActionKind::BeginDelegationUnbonding {
+                    let bond_key = staking_action.bond_key();
                     let (bond, _status) = self.delegation_bonds.get(&bond_key)
                         .expect("bond must exist when unbonding");
                     unbonding_amounts.push((bond_key, bond.amount.into()));
@@ -1898,9 +1898,9 @@ impl Chain {
         if position == RevertPosition::Root { return; }
         use zcash_primitives::transaction::StakingActionKind;
 
-        let bond_key = staking_action.arg32_0;
+        let bond_key = staking_action.bond_key();
 
-        match staking_action.kind {
+        match staking_action.kind() {
             StakingActionKind::CreateNewDelegationBond => {
                 // Remove the bond that was created
                 assert!(
@@ -2183,7 +2183,7 @@ impl Chain {
                     continue;
                 };
 
-                let changes = apply_staking_action_to_open_runs(&mut open_runs, &slashed_finalizers, height, action.kind, action.arg32_0, action.arg32_2);
+                let changes = apply_staking_action_to_open_runs(&mut open_runs, &slashed_finalizers, height, action.kind(), action.bond_key(), action.target_finalizer_pk());
                 for change in changes {
                     let SlashRunChange::Close(key, end) = change else {
                         continue;

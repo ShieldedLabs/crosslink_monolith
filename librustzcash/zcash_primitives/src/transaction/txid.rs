@@ -99,7 +99,7 @@ fn ironwood_v6_domain() -> (ValuePool, OrchardTxVersion) {
     (ValuePool::Ironwood, OrchardTxVersion::V6)
 }
 
-const ZCASH_CROSSLINK_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxCrosslinkHash"; // ALT: "Stake"
+use super::ZCASH_CROSSLINK_HASH_PERSONALIZATION;
 
 fn hasher(personal: &[u8; 16]) -> StateWrite {
     StateWrite(Params::new().hash_length(32).personal(personal).to_state())
@@ -392,13 +392,9 @@ impl<A: Authorization> TransactionDigest<A> for TxIdDigester {
     }
 
     fn digest_crosslink(&self, staking_action: &Option<StakingAction>) -> Self::CrosslinkDigest {
-        if let Some(staking_action) = staking_action {
-            let mut h = hasher(ZCASH_CROSSLINK_HASH_PERSONALIZATION);
-            staking_action.hash_to_state(&mut h);
-            Some(h.finalize())
-        } else {
-            None
-        }
+        // The staking-action leaf: H(tag || variant body). `None` becomes 32 nil
+        // bytes when the leaf is written into the txid tree (see `to_hash_v6`).
+        staking_action.map(|sa| sa.tree_hash())
     }
 
     #[cfg(zcash_unstable = "zfuture")]
@@ -475,9 +471,10 @@ pub(crate) fn to_hash_v6(
     sapling_digest: Option<Blake2bHash>,
     orchard_digest: Option<Blake2bHash>,
     ironwood_digest: Option<Blake2bHash>,
-    // Crosslink: `None` for a plain v6 transaction; `Some` only for VCrosslink, whose txid
-    // commits to the staking action appended after the v6 body.
-    crosslink_digest: Option<Blake2bHash>,
+    // Crosslink: outer `None` for a plain v6 transaction, whose txid is unchanged.
+    // `Some` only for VCrosslink, which always writes a 32-byte staking-action leaf:
+    // the inner hash, or 32 nil bytes when the transaction has no staking action.
+    crosslink_leaf: Option<Option<Blake2bHash>>,
 ) -> Blake2bHash {
     let mut personal = [0; 16];
     personal[..12].copy_from_slice(ZCASH_TX_PERSONALIZATION_PREFIX);
@@ -516,8 +513,13 @@ pub(crate) fn to_hash_v6(
     .unwrap();
     // Crosslink extras follow the complete v6 body, mirroring the wire order. A plain v6
     // transaction passes `None` and contributes nothing here, so its txid is unchanged.
-    if let Some(crosslink_digest) = crosslink_digest {
-        h.write_all(crosslink_digest.as_bytes()).unwrap();
+    // A VCrosslink transaction always contributes exactly 32 bytes: the staking-action
+    // leaf hash, or 32 nil bytes when it carries no staking action.
+    if let Some(crosslink_leaf) = crosslink_leaf {
+        match crosslink_leaf {
+            Some(d) => h.write_all(d.as_bytes()).unwrap(),
+            None => h.write_all(&[0u8; 32]).unwrap(),
+        }
     }
 
     #[cfg(zcash_unstable = "zfuture")]
@@ -548,7 +550,7 @@ pub fn to_txid(
             digests.orchard_digest,
             digests.ironwood_digest,
             if matches!(txversion, TxVersion::VCrosslink) {
-                digests.crosslink_digest
+                Some(digests.crosslink_digest)
             } else {
                 None
             },
@@ -685,11 +687,10 @@ impl TransactionDigest<Authorized> for BlockTxCommitmentDigester {
     }
 
     fn digest_crosslink(&self, staking_action: &Option<StakingAction>) -> Self::CrosslinkDigest {
-        let mut h = hasher(ZCASH_CROSSLINK_HASH_PERSONALIZATION);
-        if let Some(staking_action) = staking_action {
-            staking_action.hash_to_state(&mut h);
+        match staking_action {
+            Some(sa) => sa.tree_hash(),
+            None => hasher(ZCASH_CROSSLINK_HASH_PERSONALIZATION).finalize(),
         }
-        h.finalize()
     }
 
 

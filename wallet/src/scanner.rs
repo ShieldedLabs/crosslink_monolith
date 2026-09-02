@@ -77,11 +77,9 @@ pub fn scan_tx(info: &mut ScanInfo, utxos: &mut HashSet<(PubKeyID, u32)>, tx_byt
 
 
     if let Some(staking_action) = tx.staking_action() {
-        if staking_action.kind == StakingActionKind::CreateNewDelegationBond {
-            let staking_action = StakingAction_CreateNewDelegationBond::try_from_union(&staking_action).unwrap();
-
+        if let StakingAction::CreateNewDelegationBond { amount_zats, unique_pubkey, .. } = staking_action {
             if contains_my_t_spend {
-                println!("found staking action paid for by our transparent: {:?}", staking_action.unique_pubkey);
+                println!("found staking action paid for by our transparent: {:?}", unique_pubkey);
             }
             let mut is_my_staking_action = contains_my_t_spend;
 
@@ -99,7 +97,7 @@ pub fn scan_tx(info: &mut ScanInfo, utxos: &mut HashSet<(PubKeyID, u32)>, tx_byt
                             action.cv_net(),
                             &action.encrypted_note().out_ciphertext
                         ) {
-                            println!("found staking action paid for by our orchard: {:?}", staking_action.unique_pubkey);
+                            println!("found staking action paid for by our orchard: {:?}", unique_pubkey);
                             is_my_staking_action = true;
                             break 'actions;
                         }
@@ -111,8 +109,8 @@ pub fn scan_tx(info: &mut ScanInfo, utxos: &mut HashSet<(PubKeyID, u32)>, tx_byt
             if is_my_staking_action {
                 new_info = true;
                 info.bonds.push(ScanBond {
-                    pk: PubKeyID(staking_action.unique_pubkey),
-                    initial_val: staking_action.amount_zats,
+                    pk: PubKeyID(unique_pubkey),
+                    initial_val: amount_zats,
                     create_txid: PubKeyID(<[u8;32]>::from(txid_lrz)),
                     create_height: height,
                 });

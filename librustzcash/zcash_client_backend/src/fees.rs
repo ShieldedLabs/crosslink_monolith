@@ -47,6 +47,7 @@ impl FeeRule for StandardFeeRule {
         sapling_output_count: usize,
         orchard_action_count: usize,
         ironwood_action_count: usize,
+        staking_action_count: usize,
     ) -> Result<Zatoshis, Self::Error> {
         #[allow(deprecated)]
         match self {
@@ -59,6 +60,7 @@ impl FeeRule for StandardFeeRule {
                 sapling_output_count,
                 orchard_action_count,
                 ironwood_action_count,
+                staking_action_count,
             ),
         }
     }
@@ -240,6 +242,7 @@ pub fn canonical_crossing_fee<P: consensus::Parameters>(
         0,
         CANONICAL_CROSSING_ORCHARD_ACTIONS,
         CANONICAL_CROSSING_IRONWOOD_ACTIONS,
+        0,
     )
 }
 

@@ -37,6 +37,7 @@ impl super::FeeRule for FeeRule {
         _sapling_output_count: usize,
         _orchard_action_count: usize,
         _ironwood_action_count: usize,
+        _staking_action_count: usize,
     ) -> Result<Zatoshis, Self::Error> {
         Ok(self.fixed_fee)
     }

@@ -1699,15 +1699,15 @@ pub fn update_chain_tip_with_delegation_bond(
 ) -> Result<(), ValidateContextError> {
     use zcash_primitives::transaction::StakingActionKind;
 
-    let bond_key = staking_action.arg32_0;
+    let bond_key = staking_action.bond_key();
 
-    match staking_action.kind {
+    match staking_action.kind() {
         StakingActionKind::CreateNewDelegationBond => {
             // Extract bond data
             // Note: amount validation should have been done during contextual validation
-            let amount = zebra_chain::amount::Amount::try_from(staking_action.amount_zats)
+            let amount = zebra_chain::amount::Amount::try_from(staking_action.amount_zats())
                 .expect("bond amount should have been validated");
-            let target_finalizer = staking_action.arg32_2;
+            let target_finalizer = staking_action.target_finalizer_pk();
 
             let bond = finalized_state::disk_format::DelegationBond::new(
                 amount,
@@ -1775,6 +1775,16 @@ pub fn update_chain_tip_with_delegation_bond(
                 bond.target_finalizer
             };
 
+            // The transaction names both endpoints and contextual validation
+            // checked `from` against the bond's current target, so by the time a
+            // block is applied the two must agree — the retarget chain is fully
+            // derivable by replaying transactions in either direction.
+            assert_eq!(
+                staking_action.from_finalizer_address().expect("retarget carries from").pub_key.0,
+                old_target,
+                "retarget from_finalizer should have been validated against the bond's current target"
+            );
+
             // Record the pre-block target for this bond (only if not already recorded in this block)
             // This allows us to restore the original target on revert
             let retargets_this_block = bond_retargets.last_mut()
@@ -1782,7 +1792,7 @@ pub fn update_chain_tip_with_delegation_bond(
             retargets_this_block.entry(bond_key).or_insert(old_target);
 
             // Update only target_finalizer (not created_at or amount)
-            let new_target = staking_action.arg32_2;
+            let new_target = staking_action.target_finalizer_pk();
             let (bond, _status) = delegation_bonds.get_mut(&bond_key)
                 .expect("bond must exist in chain");
             bond.target_finalizer = new_target;

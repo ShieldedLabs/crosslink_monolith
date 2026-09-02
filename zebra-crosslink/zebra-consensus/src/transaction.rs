@@ -314,6 +314,11 @@ where
             // Check staking day window (staking actions only allowed during specific block ranges)
             Self::check_staking_day_window(&tx, req.height)?;
 
+            // The target finalizer address must be a valid capability (its embedded
+            // signature verifies); rejecting here keeps doomed actions out of the
+            // mempool, and the state contextual check enforces the same rule on blocks.
+            Self::check_staking_target_capability(&tx)?;
+
             // Check staking action delay (applies to both mempool and block transactions)
             Self::check_staking_action_delay(&tx, req.height, state.clone()).await?;
 
@@ -441,13 +446,13 @@ where
         };
 
         // Only check delay for actions that modify existing bonds
-        match staking_action.kind {
+        match staking_action.kind() {
             StakingActionKind::BeginDelegationUnbonding
             | StakingActionKind::WithdrawDelegationBond => {}
             _ => return Ok(()),
         }
 
-        let bond_key = staking_action.arg32_0;
+        let bond_key = staking_action.bond_key();
 
         // Query the state for bond info
         let query = state.oneshot(zs::Request::BondInfo(bond_key));
@@ -483,6 +488,27 @@ where
         Ok(())
     }
 
+    /// Checks that a staking action's target finalizer address, when it carries one,
+    /// is a valid capability: the address embeds the finalizer key's signature over
+    /// the standard message. Stateless, so it runs for mempool and block paths alike.
+    fn check_staking_target_capability(tx: &Transaction) -> Result<(), TransactionError> {
+        if let Some(staking_action) = tx.staking_action() {
+            // Retarget's claimed current target must be a valid capability too;
+            // whether it matches the bond's actual target is a contextual check
+            // in zebra-state (validate_delegation_bonds).
+            for addr in [staking_action.target_finalizer_address(), staking_action.from_finalizer_address()] {
+                if let Some(addr) = addr {
+                    if !addr.verify() {
+                        return Err(TransactionError::StakingActionInvalidFinalizerAddress {
+                            pub_key: addr.pub_key.0,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Checks that staking actions are only performed within the allowed staking window.
     ///
     /// Staking actions are only valid when `block_height % STAKING_PERIOD < STAKING_DAY_WINDOW`.
@@ -503,7 +529,7 @@ where
         };
 
         // RetargetDelegationBond is exempt from staking day restrictions
-        if staking_action.kind == StakingActionKind::RetargetDelegationBond {
+        if staking_action.kind() == StakingActionKind::RetargetDelegationBond {
             return Ok(());
         }
 

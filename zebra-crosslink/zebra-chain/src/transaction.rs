@@ -1653,10 +1653,10 @@ impl Transaction {
                 ..
             } => {
                 if let Some(staking_action) = staking_action {
-                    if staking_action.kind == StakingActionKind::CreateNewDelegationBond {
-                        ValueBalance::from_staking_bonded_amount(Amount::new(staking_action.amount_zats as i64).neg())
-                    } else if staking_action.kind == StakingActionKind::WithdrawDelegationBond {
-                        ValueBalance::from_staking_unbonded_amount(Amount::new(staking_action.amount_zats as i64).constrain().unwrap())
+                    if staking_action.kind() == StakingActionKind::CreateNewDelegationBond {
+                        ValueBalance::from_staking_bonded_amount(Amount::new(staking_action.amount_zats() as i64).neg())
+                    } else if staking_action.kind() == StakingActionKind::WithdrawDelegationBond {
+                        ValueBalance::from_staking_unbonded_amount(Amount::new(staking_action.amount_zats() as i64).constrain().unwrap())
                     } else {
                         ValueBalance::zero() // Note(Sam): I would have liked to have the transfer between bonded and unbonded pools to occur here but I do not think it is possible.
                     }

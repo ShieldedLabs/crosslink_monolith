@@ -28,12 +28,31 @@ pub fn validate_delegation_bonds(
     // Track bonds created and modified within this block
     let mut block_new_bonds = HashMap::new();
     let mut block_unbonding_bonds = HashMap::new();
+    // bond_key -> target after in-block retargets, so a second retarget in the
+    // same block validates its `from` against the first one's `to`
+    let mut block_retargets: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
 
     for transaction in &semantically_verified.block.transactions {
         if let Some(staking_action) = transaction.staking_action() {
-            let bond_key = staking_action.arg32_0;
+            let bond_key = staking_action.bond_key();
 
-            match staking_action.kind {
+            // The target finalizer is a capability: the address embeds the
+            // finalizer key's signature over the standard message, and an action
+            // whose signature doesn't verify is consensus-invalid. This is what
+            // stops stake being pointed at a key nobody controls. Retarget's
+            // `from_finalizer` must verify too.
+            for addr in [staking_action.target_finalizer_address(), staking_action.from_finalizer_address()] {
+                if let Some(addr) = addr {
+                    if !addr.verify() {
+                        return Err(ValidateContextError::InvalidDelegationBond(format!(
+                            "invalid finalizer address capability: {:?}",
+                            addr.pub_key
+                        )));
+                    }
+                }
+            }
+
+            match staking_action.kind() {
                 StakingActionKind::CreateNewDelegationBond => {
                     // Check that bond doesn't already exist
                     validate_create_new_bond(
@@ -45,14 +64,14 @@ pub fn validate_delegation_bonds(
 
                     // Track this new bond for subsequent validation in this block
                     let amount =
-                        zebra_chain::amount::Amount::try_from(staking_action.amount_zats)
+                        zebra_chain::amount::Amount::try_from(staking_action.amount_zats())
                             .map_err(|e| {
                                 ValidateContextError::InvalidDelegationBond(format!(
                                     "invalid bond amount: {:?}",
                                     e
                                 ))
                             })?;
-                    let target_finalizer = staking_action.arg32_2;
+                    let target_finalizer = staking_action.target_finalizer_pk();
                     let bond = DelegationBond::new(
                         amount,
                         target_finalizer,
@@ -80,7 +99,7 @@ pub fn validate_delegation_bonds(
                     // Check that bond exists, is unbonding, and withdrawal amount matches bond amount
                     validate_bond_for_withdrawal(
                         bond_key,
-                        staking_action.amount_zats,
+                        staking_action.amount_zats(),
                         non_finalized_chain,
                     )?;
                 }
@@ -92,6 +111,39 @@ pub fn validate_delegation_bonds(
                         non_finalized_chain,
                         finalized_state,
                     )?;
+
+                    // `from_finalizer` must name the bond's actual current
+                    // target (in-block retargets and creates included). This
+                    // keeps every bond's target derivable by replaying
+                    // transactions forward or backward.
+                    let from_pk = staking_action
+                        .from_finalizer_address()
+                        .expect("retarget carries from_finalizer")
+                        .pub_key
+                        .0;
+                    let current_target = block_retargets
+                        .get(&bond_key)
+                        .copied()
+                        .or_else(|| block_new_bonds.get(&bond_key).map(|b| b.target_finalizer))
+                        .or_else(|| {
+                            non_finalized_chain
+                                .delegation_bonds
+                                .get(&bond_key)
+                                .map(|(b, _status)| b.target_finalizer)
+                        })
+                        .or_else(|| {
+                            finalized_state
+                                .delegation_bond(&bond_key)
+                                .map(|b| b.target_finalizer)
+                        })
+                        .expect("bond exists: validate_bond_for_retarget passed");
+                    if from_pk != current_target {
+                        return Err(ValidateContextError::InvalidDelegationBond(format!(
+                            "retarget from_finalizer {:?} does not match bond's current target {:?}: {:?}",
+                            from_pk, current_target, bond_key
+                        )));
+                    }
+                    block_retargets.insert(bond_key, staking_action.target_finalizer_pk());
                 }
                 // Other staking actions don't affect delegation bonds
                 _ => {}

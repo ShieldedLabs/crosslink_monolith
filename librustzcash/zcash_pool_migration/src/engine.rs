@@ -1533,6 +1533,7 @@ fn canonical_fees<P: zcash_protocol::consensus::Parameters>(
         0,
         PREP_TX_ACTIONS,
         0,
+        0,
     )?;
     let transfer_fee_buffer = fee_rule.fee_required(
         params,
@@ -1543,6 +1544,7 @@ fn canonical_fees<P: zcash_protocol::consensus::Parameters>(
         0,
         CROSSING_SOURCE_ACTIONS,
         CROSSING_DESTINATION_ACTIONS,
+        0,
     )?;
     Ok((prep_tx_fee, transfer_fee_buffer))
 }

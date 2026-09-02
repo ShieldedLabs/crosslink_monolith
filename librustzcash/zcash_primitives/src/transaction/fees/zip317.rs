@@ -164,6 +164,7 @@ impl super::FeeRule for FeeRule {
         sapling_output_count: usize,
         orchard_action_count: usize,
         ironwood_action_count: usize,
+        staking_action_count: usize,
     ) -> Result<Zatoshis, Self::Error> {
         let mut t_in_total_size: usize = 0;
         let mut unknown_p2sh_outpoints = vec![];
@@ -193,7 +194,10 @@ impl super::FeeRule for FeeRule {
             + orchard_action_count
             + ironwood_action_count;
 
-        (self.marginal_fee * max(self.grace_actions, logical_actions))
+        // The staking action is a logical action outside the grace allowance: it
+        // always costs a full marginal fee on top of the standard fee, so its
+        // price tracks the marginal fee under any future dynamic-fee rule.
+        (self.marginal_fee * (max(self.grace_actions, logical_actions) + staking_action_count))
             .ok_or_else(|| BalanceError::Overflow.into())
     }
 }

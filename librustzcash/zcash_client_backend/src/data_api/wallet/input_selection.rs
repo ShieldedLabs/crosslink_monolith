@@ -1744,6 +1744,7 @@ where
                 sapling_output_count,
                 orchard_action_count,
                 ironwood_action_count,
+                0,
             )
             .map(|fee| (fee, None)),
         Address::Transparent(_) => fee_rule
@@ -1756,6 +1757,7 @@ where
                 sapling_output_count,
                 orchard_action_count,
                 ironwood_action_count,
+                0,
             )
             .map(|fee| (fee, None)),
         Address::Unified(_) => fee_rule
@@ -1772,6 +1774,7 @@ where
                 sapling_output_count,
                 orchard_action_count,
                 ironwood_action_count,
+                0,
             )
             .map(|fee| (fee, None)),
         // Paying a TEX recipient requires a second, purely transparent transaction that
@@ -1794,6 +1797,7 @@ where
                 sapling_output_count,
                 orchard_action_count,
                 ironwood_action_count,
+                0,
             )
             .and_then(|tr0_fee| {
                 let tr1_fee = fee_rule.fee_required(
@@ -1801,6 +1805,7 @@ where
                     BlockHeight::from(target_height),
                     [InputSize::Known(P2PKH_STANDARD_INPUT_SIZE)],
                     [P2PKH_STANDARD_OUTPUT_SIZE],
+                    0,
                     0,
                     0,
                     0,
@@ -2201,6 +2206,7 @@ impl<DbT: InputSource> ShieldingSelector for GreedyInputSelector<DbT> {
                 sapling_output_count,
                 orchard_action_count,
                 ironwood_action_count,
+                0,
             )
             // The `InputSelectorError::Change` variant is the only existing
             // carrier capable of holding an arbitrary fee-rule error

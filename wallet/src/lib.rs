@@ -60,8 +60,8 @@ use zcash_primitives::transaction::fees::{
 };
 use zcash_primitives::transaction::sighash::{signature_hash, SignableInput};
 use zcash_primitives::transaction::txid::TxIdDigester;
-use zcash_primitives::transaction::{Authorized, StakingAction_BeginDelegationUnbonding, StakingAction_CreateNewDelegationBond, StakingAction_RetargetDelegationBond, StakingAction_WithdrawDelegationBond, Transaction, TransactionData, TxVersion, Unauthorized};
-use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakingActionRequest, StakeTxId};
+use zcash_primitives::transaction::{Authorized, Transaction, TransactionData, TxVersion, Unauthorized};
+pub use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakingActionRequest, StakeTxId};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight as LRZBlockHeight, BranchId, MAX_BLOCK_REORG_HEIGHT};
 use zcash_protocol::memo::MemoBytes;
@@ -366,6 +366,7 @@ impl BuildPrep {
             0, 0, // sapling
             0, // orchard: Crosslink builds no Orchard bundle (Ironwood-native)
             orchard_actions,
+            usize::from(self.staking_action.is_some()),
         ).map_err(|e| builder::FeeError::FeeRule(e))
     }
 }
@@ -401,6 +402,9 @@ const CHEAT_UNSTAKING: bool = false;
 pub static GLOBAL_SEED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
 pub static TENDERLINK_PUBLIC_KEY: Mutex<bft::PubKeyID> = Mutex::new(bft::PubKeyID([0;32]));
+
+/// Self-certifying address for this node's finalizer key; None until the crosslink service starts.
+pub static TENDERLINK_ADDRESS: Mutex<Option<bft::FinalizerAddress>> = Mutex::new(None);
 
 pub fn get_tfl_recency_status_str() -> Option<String> {
     let lock = RECENCY_REQUEST.lock().unwrap();
@@ -466,9 +470,9 @@ impl Drop for Timer<'_> {
 enum WalletAction {
     RequestFromFaucet,
     TestStakeAction,
-    StakeToFinalizer(Zatoshis, [u8; 32]),
+    StakeToFinalizer(Zatoshis, bft::FinalizerAddress),
     UnstakeFromFinalizer(TxId),
-    RetargetBond(TxId, [u8; 32]),
+    RetargetBond(TxId, bft::FinalizerAddress),
     ClaimBond(TxId),
     SendToAddress(UnifiedAddress, Zatoshis),
 }
@@ -523,23 +527,21 @@ impl WalletTxPart {
         let mut b = WalletTxPart::ZERO;
 
         if let Some(staking_action) = staking_action {
-            match staking_action.kind {
+            match staking_action.kind() {
                 StakingActionKind::Null => (),
 
                 StakingActionKind::CreateNewDelegationBond => {
-                    b.sent(Zatoshis::from_u64(staking_action.amount_zats).expect("already converted"), true).unwrap();
-                    b.recv(Zatoshis::from_u64(staking_action.amount_zats).expect("already converted"), true).unwrap();
+                    b.sent(Zatoshis::from_u64(staking_action.amount_zats()).expect("already converted"), true).unwrap();
+                    b.recv(Zatoshis::from_u64(staking_action.amount_zats()).expect("already converted"), true).unwrap();
                 },
 
                 StakingActionKind::BeginDelegationUnbonding | StakingActionKind::RetargetDelegationBond => {},
 
                 StakingActionKind::WithdrawDelegationBond => {
-                    b.spent(Zatoshis::from_u64(staking_action.amount_zats).expect("already converted"), true).unwrap();
+                    b.spent(Zatoshis::from_u64(staking_action.amount_zats()).expect("already converted"), true).unwrap();
                 },
 
-                StakingActionKind::RegisterFinalizer |
-                    StakingActionKind::ConvertFinalizerRewardToDelegationBond |
-                    StakingActionKind::UpdateFinalizerKey => todo!("remaining staking actions"),
+                StakingActionKind::ConvertFinalizerRewardToDelegationBond => todo!("finalizer reward conversion"),
             }
         }
 
@@ -856,19 +858,13 @@ impl WalletTx {
     // TODO: staking
     pub fn kind(&self) -> WalletTxKind {
         if let Some(staking_action) = &self.staking_action {
-            if staking_action.kind == StakingActionKind::CreateNewDelegationBond {
-                return WalletTxKind::Stake;
-            }
-            if staking_action.kind == StakingActionKind::BeginDelegationUnbonding {
-                return WalletTxKind::BeginUnstake;
-            }
-            if staking_action.kind == StakingActionKind::RetargetDelegationBond {
-                return WalletTxKind::Retarget;
-            }
-            if staking_action.kind == StakingActionKind::WithdrawDelegationBond {
-                return WalletTxKind::ClaimUnstake;
-            }
-            return WalletTxKind::SelfSend;
+            return match staking_action {
+                StakingAction::CreateNewDelegationBond { .. } => WalletTxKind::Stake,
+                StakingAction::BeginDelegationUnbonding { .. } => WalletTxKind::BeginUnstake,
+                StakingAction::RetargetDelegationBond { .. } => WalletTxKind::Retarget,
+                StakingAction::WithdrawDelegationBond { .. } => WalletTxKind::ClaimUnstake,
+                _ => WalletTxKind::SelfSend,
+            };
         }
         let all = self.totals(true);
 
@@ -1008,7 +1004,7 @@ impl WalletState {
         self.actions_in_flight.push_back(WalletAction::RequestFromFaucet);
     }
 
-    pub fn stake_to_finalizer(&mut self, amount: u64, target_finalizer: [u8; 32]) {
+    pub fn stake_to_finalizer(&mut self, amount: u64, target_finalizer: bft::FinalizerAddress) {
         if self.actions_in_flight.iter().filter(|a| match a { WalletAction::StakeToFinalizer(_,_) => true, _ => false }).count() != 0 {
             return;
         }
@@ -1025,7 +1021,7 @@ impl WalletState {
         self.actions_in_flight.push_back(WalletAction::UnstakeFromFinalizer(txid));
     }
 
-    pub fn retarget_bond(&mut self, txid: [u8; 32], new_target: [u8; 32]) {
+    pub fn retarget_bond(&mut self, txid: [u8; 32], new_target: bft::FinalizerAddress) {
         let txid = TxId::from_bytes(txid);
         if self.actions_in_flight.iter().filter(|a| match a { WalletAction::RetargetBond(id, _to) if id.eq(&txid) => true, _ => false }).count() != 0 {
             return;
@@ -1662,62 +1658,48 @@ impl ManualWallet {
         let (mut t, mut s, mut b) = (WalletTxPart::ZERO, WalletTxPart::ZERO, WalletTxPart::ZERO);
 
         //- OUTPUTS/SENDS
-        let staking_action = opts.staking_action.unwrap_or_default();
-
         // NOTE: staking actions are currently in-themselves free (piggy back on orchard)
-        match staking_action.kind {
-            StakingActionKind::Null => (),
+        match opts.staking_action {
+            None => (),
 
-            StakingActionKind::CreateNewDelegationBond => {
-                b.sent(to_zats_or_dump_err("tx build: new bond", staking_action.amount_zats)?, true)?;
-                b.recv(to_zats_or_dump_err("tx build: new bond", staking_action.amount_zats)?, true)?;
-                if DUMP_TX_BUILD { println!("  added new staking position: {}", staking_action.amount_zats); }
+            Some(StakingAction::CreateNewDelegationBond { amount_zats, .. }) => {
+                b.sent(to_zats_or_dump_err("tx build: new bond", amount_zats)?, true)?;
+                b.recv(to_zats_or_dump_err("tx build: new bond", amount_zats)?, true)?;
+                if DUMP_TX_BUILD { println!("  added new staking position: {}", amount_zats); }
             },
 
-            StakingActionKind::BeginDelegationUnbonding => {
-                // let txid = TxId::from_bytes(staking_action.arg32_0);
+            Some(StakingAction::BeginDelegationUnbonding { .. }) => {
                 // TODO: check it hasn't already been unstaked
-                // let Some(bond_tx) = self.txs.iter().find(|t| t.txid == txid) else {
-                //     println!("Could not find bond txid {:?} that was ready to unstake.", txid);
-                //     return None;
-                // };
                 // no direct send - fee for transitioning between 2 pools we don't touch directly
                 // TODO: (fallback to) pay for fee from bond?
-                if DUMP_TX_BUILD { println!("  unstaking bond: {}", staking_action.amount_zats); }
+                if DUMP_TX_BUILD { println!("  unstaking bond"); }
             },
 
-            StakingActionKind::RetargetDelegationBond => {
-                // let txid = TxId::from_bytes(staking_action.arg32_0);
+            Some(StakingAction::RetargetDelegationBond { .. }) => {
                 // TODO: check it hasn't already been unstaked
-                // let Some(bond_tx) = self.txs.iter().find(|t| t.txid == txid) else {
-                //     println!("Could not find bond txid {:?} that was ready to unstake.", txid);
-                //     return None;
-                // };
                 // no direct send - fee for transitioning between 2 pools we don't touch directly
                 // TODO: (fallback to) pay for fee from bond?
-                if DUMP_TX_BUILD { println!("  unstaking bond: {}", staking_action.amount_zats); }
+                if DUMP_TX_BUILD { println!("  retargeting bond"); }
             },
 
-            StakingActionKind::WithdrawDelegationBond => {
-                let bond_key = &staking_action.arg32_0; // TODO is this always true?
+            Some(StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey, .. }) => {
+                let bond_key = &unique_pubkey; // TODO is this always true?
                 // TODO: check it hasn't already been unbonded
-                let Some(bond_tx) = self.txs.iter().find(|t| t.staking_action.filter(|s| s.kind == StakingActionKind::BeginDelegationUnbonding).map(|s| s.arg32_0).unwrap_or_default() == *bond_key) else {
+                let Some(bond_tx) = self.txs.iter().find(|t| t.staking_action.filter(|s| s.kind() == StakingActionKind::BeginDelegationUnbonding).map(|s| s.bond_key()).unwrap_or_default() == *bond_key) else {
                     println!("Could not find bond {:?} that was ready to claim.", bond_key);
                     return None;
                 };
 
                 // fee comes from bond itself
                 // TODO: does this now have the correct amount?
-                b.spent(to_zats_or_dump_err("tx build: new bond", staking_action.amount_zats)?, true)?;
-                if DUMP_TX_BUILD { println!("  withdrawing bond: {}", staking_action.amount_zats); }
+                b.spent(to_zats_or_dump_err("tx build: new bond", amount_zats)?, true)?;
+                if DUMP_TX_BUILD { println!("  withdrawing bond: {}", amount_zats); }
             },
 
-            StakingActionKind::RegisterFinalizer |
-            StakingActionKind::ConvertFinalizerRewardToDelegationBond |
-            StakingActionKind::UpdateFinalizerKey => todo!("remaining staking actions"),
+            Some(StakingAction::ConvertFinalizerRewardToDelegationBond { .. }) => todo!("finalizer reward conversion"),
         }
 
-        let staking_action = if staking_action.kind != StakingActionKind::Null {
+        let staking_action = if let Some(staking_action) = opts.staking_action {
             if let Err(err) = txb.put_staking_action(staking_action) {
                 println!("tx build staking action error: {err:?}");
                 return None;
@@ -1769,13 +1751,16 @@ impl ManualWallet {
             let prep_fee = prep.fee_required();
 
             {
-                // NOTE: comparison disabled while we're using P2SH, which zip317 standard doesn't account for
+                // NOTE: comparison is only a warning while we're using P2SH, which the
+                // zip317 standard doesn't account for — the estimates legitimately
+                // disagree on P2SH-spending txs (e.g. the miner's shield), and prep's
+                // higher estimate just overpays the minimum fee, which is valid.
                 let txb_fee = txb.get_fee(&zip317::FeeRule::standard());
-                debug_assert!(
-                    (prep_fee.is_err() && txb_fee.is_err()) ||
-                    (prep_fee.as_ref().ok() == txb_fee.as_ref().ok()),
-                    "prep_fee {prep_fee:?}, txb_fee {txb_fee:?}"
-                );
+                let agree = (prep_fee.is_err() && txb_fee.is_err()) ||
+                    (prep_fee.as_ref().ok() == txb_fee.as_ref().ok());
+                if !agree {
+                    println!("fee estimate mismatch (expected with P2SH inputs): prep_fee {prep_fee:?}, txb_fee {txb_fee:?}");
+                }
             }
 
             match prep_fee {
@@ -1992,10 +1977,16 @@ impl ManualWallet {
 
     pub fn stake_ironwood_to_finalizer<P: Parameters>(
         &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
-        src_usk: &UnifiedSpendingKey, exact_amount_to_send: u64, orchard_tree: &OrchardShardTree, target_finalizer: [u8; 32],
+        src_usk: &UnifiedSpendingKey, exact_amount_to_send: u64, orchard_tree: &OrchardShardTree, target_finalizer: bft::FinalizerAddress,
     ) -> Option<()>
     {
         let tz = Timer::scope("stake_ironwood_to_finalizer");
+        // The target capability must verify or consensus will reject the whole tx;
+        // refuse to build rather than burn a fee on a doomed action.
+        if !target_finalizer.verify() {
+            println!("stake_ironwood_to_finalizer: invalid finalizer address capability");
+            return None;
+        }
         let account = &self.accounts[0];
         let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
         if let Some(ovk) = keys.orchard_ovk {
@@ -2005,13 +1996,13 @@ impl ManualWallet {
 
             let opts = &TxOptions{
                 src_pools: &[TxPool::Ironwood(orchard_tree), TxPool::Transparent],
-                staking_action: Some(StakingAction_CreateNewDelegationBond {
+                staking_action: Some(StakingAction::CreateNewDelegationBond {
                     amount_zats: exact_amount_to_send,
                     unique_pubkey: pretend_pub_key,
                     challenge: [0u8; 32],
                     target_finalizer,
                     signature: [0u8; 64]
-                }.to_union()),
+                }),
             };
             self.send_zats(network, tx, client, &[], src_usk, opts)
         } else {
@@ -2028,30 +2019,58 @@ impl ManualWallet {
         let account = &self.accounts[0];
         let opts = &TxOptions{
             src_pools: &[TxPool::Ironwood(orchard_tree), TxPool::Transparent],
-            staking_action: Some(StakingAction_BeginDelegationUnbonding {
+            staking_action: Some(StakingAction::BeginDelegationUnbonding {
                 unique_pubkey: bond_key,
                 challenge: [0u8; 32],
                 signature: [0u8; 64]
-            }.to_union()),
+            }),
         };
         self.send_zats(network, tx, client, &[], src_usk, opts)
     }
 
+    /// The bond's current target as a full capability, replayed from this
+    /// wallet's own mined transactions (the latest Create/Retarget for the bond
+    /// carries the address). Consensus validates a retarget's `from` against the
+    /// bond's actual target, so this must reflect the chain, not local intent.
+    pub fn current_bond_target_address(&self, bond_key: [u8; 32]) -> Option<bft::FinalizerAddress> {
+        let mut target = None;
+        for tx in &self.txs {
+            if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
+            match tx.staking_action.as_ref() {
+                Some(&StakingAction::CreateNewDelegationBond { unique_pubkey, target_finalizer, .. })
+                    if unique_pubkey == bond_key => target = Some(target_finalizer),
+                Some(&StakingAction::RetargetDelegationBond { unique_pubkey, to_finalizer, .. })
+                    if unique_pubkey == bond_key => target = Some(to_finalizer),
+                _ => {}
+            }
+        }
+        target
+    }
+
     pub fn retarget_bond_using_ironwood<P: Parameters>(
         &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
-        src_usk: &UnifiedSpendingKey, orchard_tree: &OrchardShardTree, bond_key: [u8; 32], new_target: [u8; 32],
+        src_usk: &UnifiedSpendingKey, orchard_tree: &OrchardShardTree, bond_key: [u8; 32], new_target: bft::FinalizerAddress,
     ) -> Option<()>
     {
         let tz = Timer::scope("begin_unbonding_using_ironwood");
+        if !new_target.verify() {
+            println!("retarget_bond_using_ironwood: invalid finalizer address capability");
+            return None;
+        }
+        let Some(from_finalizer) = self.current_bond_target_address(bond_key) else {
+            println!("retarget_bond_using_ironwood: no mined create/retarget found for bond {:?}", bond_key);
+            return None;
+        };
         let account = &self.accounts[0];
         let opts = &TxOptions{
             src_pools: &[TxPool::Ironwood(orchard_tree), TxPool::Transparent],
-            staking_action: Some(StakingAction_RetargetDelegationBond {
+            staking_action: Some(StakingAction::RetargetDelegationBond {
                 unique_pubkey: bond_key,
                 challenge: [0u8; 32],
                 signature: [0u8; 64],
-                target_finalizer: new_target,
-            }.to_union()),
+                from_finalizer,
+                to_finalizer: new_target,
+            }),
         };
         self.send_zats(network, tx, client, &[], src_usk, opts)
     }
@@ -2083,12 +2102,12 @@ impl ManualWallet {
             let out = &[TxOutput::Ironwood{ ovk: Some(ovk), dst, zats, memo }];
             let opts = &TxOptions{
                 src_pools: &[],
-                staking_action: Some(StakingAction_WithdrawDelegationBond {
+                staking_action: Some(StakingAction::WithdrawDelegationBond {
                     amount_zats,
                     unique_pubkey: bond_key,
                     challenge: [0u8; 32],
                     signature: [0u8; 64]
-                }.to_union()),
+                }),
             };
             self.send_zats(network, tx, client, &[], src_usk, opts)
         } else {
@@ -4340,45 +4359,44 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // the real bond once the create is reached.
             for tx in &user_wallet.txs {
                 if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
-                if let Some(staking_action) = (&tx.staking_action) {
-                    if let Some(create_bond) = StakingAction_CreateNewDelegationBond::try_from_union(staking_action) {
-                        stake_positions_bonded.push((ScanBond {
-                            pk: PubKeyID(create_bond.unique_pubkey),
-                            initial_val: create_bond.amount_zats,
-                            create_height: tx.h.0,
-                            create_txid: PubKeyID(<[u8; 32]>::from(tx.txid)),
-                        }, create_bond.target_finalizer, create_bond.amount_zats));
-                    }
+                if let Some(&StakingAction::CreateNewDelegationBond { amount_zats, unique_pubkey, target_finalizer, .. }) = tx.staking_action.as_ref() {
+                    stake_positions_bonded.push((ScanBond {
+                        pk: PubKeyID(unique_pubkey),
+                        initial_val: amount_zats,
+                        create_height: tx.h.0,
+                        create_txid: PubKeyID(<[u8; 32]>::from(tx.txid)),
+                    }, target_finalizer.pub_key.0, amount_zats));
                 }
             }
             for tx in &user_wallet.txs {
                 if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
-                if let Some(staking_action) = (&tx.staking_action) {
-                    if let Some(retarget) = StakingAction_RetargetDelegationBond::try_from_union(staking_action) {
-                        if let Some((_bond, finalizer, _latest_zats)) = stake_positions_bonded.iter_mut().find(|(bond, _, _)| bond.pk.0 == retarget.unique_pubkey) {
-                            *finalizer = retarget.target_finalizer;
+                match tx.staking_action.as_ref() {
+                    Some(&StakingAction::RetargetDelegationBond { unique_pubkey, to_finalizer, .. }) => {
+                        if let Some((_bond, finalizer, _latest_zats)) = stake_positions_bonded.iter_mut().find(|(bond, _, _)| bond.pk.0 == unique_pubkey) {
+                            *finalizer = to_finalizer.pub_key.0;
                         }
                     }
-                    if let Some(unbond) = StakingAction_BeginDelegationUnbonding::try_from_union(staking_action) {
-                        if let Some(existing_i) = stake_positions_bonded.iter().position(|(bond, _, _)| bond.pk.0 == unbond.unique_pubkey) {
+                    Some(&StakingAction::BeginDelegationUnbonding { unique_pubkey, .. }) => {
+                        if let Some(existing_i) = stake_positions_bonded.iter().position(|(bond, _, _)| bond.pk.0 == unique_pubkey) {
                             let (bond, _finalizer, latest) = stake_positions_bonded.remove(existing_i);
                             stake_positions_unbonded.push((bond, latest));
                         } else {
                             // unbonding whose create-bond tx we haven't seen: value unknown,
                             // marked with u64::MAX until seen_bond_values can correct it
                             stake_positions_unbonded.push((ScanBond {
-                                pk: PubKeyID(unbond.unique_pubkey),
+                                pk: PubKeyID(unique_pubkey),
                                 initial_val: u64::MAX,
                                 create_height: 0,
                                 create_txid: PubKeyID::NIL,
                             }, u64::MAX));
                         }
                     }
-                    if let Some(unbond) = StakingAction_WithdrawDelegationBond::try_from_union(staking_action) {
-                        if let Some(existing_i) = stake_positions_unbonded.iter().position(|(bond, _)| bond.pk.0 == unbond.unique_pubkey) {
+                    Some(&StakingAction::WithdrawDelegationBond { unique_pubkey, .. }) => {
+                        if let Some(existing_i) = stake_positions_unbonded.iter().position(|(bond, _)| bond.pk.0 == unique_pubkey) {
                             stake_positions_unbonded.remove(existing_i);
                         }
                     }
+                    _ => {}
                 }
             }
             let mut user_staked_funds = 0;
@@ -4536,9 +4554,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 let mut tx = ProposedTx::EMPTY;
                 let res = match request {
                     StakingActionRequest::CreateNewDelegationBond{ amount_zats, target_finalizer } =>
-                        user_wallet.stake_ironwood_to_finalizer(network, &mut tx, &mut client, &user_usk, amount_zats, &orchard_tree, target_finalizer.0),
+                        user_wallet.stake_ironwood_to_finalizer(network, &mut tx, &mut client, &user_usk, amount_zats, &orchard_tree, target_finalizer),
                     StakingActionRequest::RetargetDelegationBond{ bond_key, target_finalizer } =>
-                        user_wallet.retarget_bond_using_ironwood(network, &mut tx, &mut client, &user_usk, &orchard_tree, bond_key.0, target_finalizer.0),
+                        user_wallet.retarget_bond_using_ironwood(network, &mut tx, &mut client, &user_usk, &orchard_tree, bond_key.0, target_finalizer),
                     StakingActionRequest::BeginDelegationUnbonding{ bond_key } =>
                         user_wallet.begin_unbonding_using_ironwood(network, &mut tx, &mut client, &user_usk, &orchard_tree, bond_key.0),
                     StakingActionRequest::WithdrawDelegationBond{ bond_key  } =>

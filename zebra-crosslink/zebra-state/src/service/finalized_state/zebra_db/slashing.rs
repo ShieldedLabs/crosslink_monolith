@@ -115,11 +115,10 @@ pub fn apply_staking_action_to_open_runs(
         }
         BeginDelegationUnbonding => close_slash_run(open, bond, height, &mut out),
         // WithdrawDelegationBond: the run already closed at unbonding.
-        // Register/Convert/UpdateFinalizerKey are deliberately ignored (decided
-        // 2026-07-02): the bond state machine doesn't implement them either, so
-        // they cannot create, retarget, or re-key a bond today. If they are ever
-        // implemented, they need arms here in the same change or the burn set
-        // under-counts.
+        // Convert is deliberately ignored (decided 2026-07-02): the bond state
+        // machine doesn't implement it either, so it cannot create or retarget a
+        // bond today. When it is implemented, it needs an arm here in the same
+        // change or the burn set under-counts.
         _ => {}
     }
     out
@@ -290,7 +289,7 @@ impl ZebraDb {
                     continue;
                 };
                 for change in apply_staking_action_to_open_runs(
-                    open, slashed, height, action.kind, action.arg32_0, action.arg32_2,
+                    open, slashed, height, action.kind(), action.bond_key(), action.target_finalizer_pk(),
                 ) {
                     match change {
                         SlashRunChange::Open(key) => {

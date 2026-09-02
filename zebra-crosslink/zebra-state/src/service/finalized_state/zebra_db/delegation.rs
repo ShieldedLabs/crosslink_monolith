@@ -162,15 +162,15 @@ impl DiskWriteBatch {
         for (transaction_index, transaction) in finalized.block.transactions.iter().enumerate() {
             // Check if transaction has a staking action
             if let Some(staking_action) = transaction.staking_action() {
-                let bond_key = staking_action.arg32_0;
+                let bond_key = staking_action.bond_key();
                 let transaction_location =
                     TransactionLocation::from_usize(*height, transaction_index);
 
-                match staking_action.kind {
+                match staking_action.kind() {
                     StakingActionKind::CreateNewDelegationBond => {
                         // Extract bond data
-                        let amount = Amount::try_from(staking_action.amount_zats)?;
-                        let target_finalizer = staking_action.arg32_2;
+                        let amount = Amount::try_from(staking_action.amount_zats())?;
+                        let target_finalizer = staking_action.target_finalizer_pk();
 
                         let bond =
                             DelegationBond::new(amount, target_finalizer, transaction_location);
@@ -188,7 +188,7 @@ impl DiskWriteBatch {
                     }
                     StakingActionKind::RetargetDelegationBond => {
                         // Update the bond's target_finalizer
-                        let new_target = staking_action.arg32_2;
+                        let new_target = staking_action.target_finalizer_pk();
                         self.prepare_retarget_delegation_bond(
                             &db.db,
                             db,

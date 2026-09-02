@@ -536,6 +536,7 @@ where
             sapling_output_count(0)?,
             orchard_action_count(0)?,
             ironwood_action_count(OutputManifest::ZERO)?,
+            0, // change computation never carries a staking action
         )
         .map_err(|fee_error| ChangeError::StrategyError(E::from(fee_error)))?;
 
@@ -665,6 +666,7 @@ where
                         sapling_output_count(target_change_counts.sapling())?,
                         orchard_action_count(target_change_counts.orchard())?,
                         ironwood_action_count(target_change_counts)?,
+                        0,
                     )
                     .map_err(|fee_error| ChangeError::StrategyError(E::from(fee_error)))?,
             );
@@ -710,6 +712,7 @@ where
                             0
                         })?,
                         ironwood_action_count(OutputManifest::for_pool(change_pool, split_count))?,
+                        0,
                     )
                     .map_err(|fee_error| ChangeError::StrategyError(E::from(fee_error)))?
             } else {

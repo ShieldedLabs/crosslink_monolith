@@ -32,5 +32,10 @@ pub trait FeeRule {
         sapling_output_count: usize,
         orchard_action_count: usize,
         ironwood_action_count: usize,
+        // Crosslink: a staking action counts as one logical action, but is never
+        // covered by the grace allowance — it always adds a full marginal fee on
+        // top of the standard fee (so 15000 for a base tx today, and it scales
+        // automatically if a dynamic-fee update changes the marginal fee).
+        staking_action_count: usize,
     ) -> Result<Zatoshis, Self::Error>;
 }

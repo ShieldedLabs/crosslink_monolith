@@ -1262,6 +1262,9 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         let tfl_handle9 = internal_handle.clone();
 
         *wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap() = my_public_key;
+        let my_finalizer_address = FinalizerAddress::create(&my_private_key);
+        info!("finalizer address: {}", my_finalizer_address.encode());
+        *wallet::TENDERLINK_ADDRESS.lock().unwrap() = Some(my_finalizer_address);
 
         // TODO(Sam): Fill this out.
         let mut ingest_data_for_tenderlink: Vec<tenderlink::RoundData> = Vec::new();
@@ -1919,7 +1922,7 @@ async fn tfl_service_incoming_request(
             let request: zcash_primitives::transaction::StakingActionRequest = serde_json::from_str(&cmd).map_err(|err| {
                 TFLServiceError::Misc(format!(
                     "staking command must be a JSON StakingActionRequest, e.g. \
-                     {{\"CreateNewDelegationBond\":{{\"amount_zats\":100000,\"target_finalizer\":\"<hex32>\"}}}}: {err}"
+                     {{\"CreateNewDelegationBond\":{{\"amount_zats\":100000,\"target_finalizer\":\"<zfin address>\"}}}}: {err}"
                 ))
             })?;
 

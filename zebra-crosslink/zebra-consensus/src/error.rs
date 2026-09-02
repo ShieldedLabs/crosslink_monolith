@@ -306,6 +306,13 @@ pub enum TransactionError {
     StakingActionBondNotFound { bond_key: [u8; 32] },
 
     #[error(
+        "staking action target finalizer address is not a valid capability: the embedded \
+         signature does not verify for pub key {pub_key:?}"
+    )]
+    #[non_exhaustive]
+    StakingActionInvalidFinalizerAddress { pub_key: [u8; 32] },
+
+    #[error(
         "staking action outside staking window: block {block_height} is not within the staking window \
          (staking allowed when block_height % {period} < {window})"
     )]

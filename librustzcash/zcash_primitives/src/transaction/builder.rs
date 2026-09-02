@@ -646,6 +646,7 @@ impl<P: consensus::Parameters> DeferredPcztBuilder<P> {
                     orchard::bundle::BundleVersion::ironwood_v3(),
                 )
                 .map_err(FeeError::Bundle)?,
+                0, // the PCZT path carries no staking action
             )
             .map_err(FeeError::FeeRule)
     }
@@ -1305,8 +1306,8 @@ impl<P: consensus::Parameters, U> Builder<P, U> {
                         .map_err(|_| BalanceError::Overflow)
                 },
             )?,
-            -self.staking_action.filter(|s| s.kind == StakingActionKind::CreateNewDelegationBond).map_or_else(|| ZatBalance::zero(), |s| ZatBalance::from_u64(s.amount_zats).unwrap()),
-            self.staking_action.filter(|s| s.kind == StakingActionKind::WithdrawDelegationBond).map_or_else(|| ZatBalance::zero(), |s| ZatBalance::from_u64(s.amount_zats).unwrap()),
+            -self.staking_action.filter(|s| s.kind() == StakingActionKind::CreateNewDelegationBond).map_or_else(|| ZatBalance::zero(), |s| ZatBalance::from_u64(s.amount_zats()).unwrap()),
+            self.staking_action.filter(|s| s.kind() == StakingActionKind::WithdrawDelegationBond).map_or_else(|| ZatBalance::zero(), |s| ZatBalance::from_u64(s.amount_zats()).unwrap()),
             #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
             -ZatBalance::from(self.zip233_amount),
         ];
@@ -1375,6 +1376,7 @@ impl<P: consensus::Parameters, U> Builder<P, U> {
                     })
                     .map_err(FeeError::Bundle)?,
                 ironwood_actions,
+                usize::from(self.staking_action.is_some()),
             )
             .map_err(FeeError::FeeRule)
     }

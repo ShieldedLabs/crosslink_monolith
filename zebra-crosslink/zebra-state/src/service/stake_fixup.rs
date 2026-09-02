@@ -206,9 +206,9 @@ pub fn fixup_aggregated_stakes(
                             &mut rule.open_runs,
                             &rule.finalizers,
                             height,
-                            staking_action.kind,
-                            staking_action.arg32_0,
-                            staking_action.arg32_2,
+                            staking_action.kind(),
+                            staking_action.bond_key(),
+                            staking_action.target_finalizer_pk(),
                         ) {
                             if let SlashRunChange::Close(key, end) = change {
                                 if end.0 > rule.window_start {

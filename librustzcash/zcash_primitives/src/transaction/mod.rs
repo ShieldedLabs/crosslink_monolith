@@ -14,7 +14,7 @@ pub mod txid;
 pub mod tests;
 
 use crate::encoding::{ReadBytesExt, WriteBytesExt};
-use crate::bft::PubKeyID;
+use crate::bft::{FinalizerAddress, PubKeyID};
 use blake2b_simd::Hash as Blake2bHash;
 use core::convert::TryFrom;
 use core::fmt::Debug;
@@ -1390,9 +1390,7 @@ pub enum StakingActionKind {
     WithdrawDelegationBond,
     RetargetDelegationBond,
 
-    RegisterFinalizer,
     ConvertFinalizerRewardToDelegationBond,
-    UpdateFinalizerKey,
 }
 impl From<StakingActionKind> for u8 {
     fn from(v: StakingActionKind) -> u8 {
@@ -1402,9 +1400,7 @@ impl From<StakingActionKind> for u8 {
             StakingActionKind::BeginDelegationUnbonding => 2,
             StakingActionKind::WithdrawDelegationBond => 3,
             StakingActionKind::RetargetDelegationBond => 4,
-            StakingActionKind::RegisterFinalizer => 5,
-            StakingActionKind::ConvertFinalizerRewardToDelegationBond => 6,
-            StakingActionKind::UpdateFinalizerKey => 7,
+            StakingActionKind::ConvertFinalizerRewardToDelegationBond => 5,
         }
     }
 }
@@ -1417,9 +1413,7 @@ impl TryFrom<u8> for StakingActionKind {
             2 => Ok(StakingActionKind::BeginDelegationUnbonding),
             3 => Ok(StakingActionKind::WithdrawDelegationBond),
             4 => Ok(StakingActionKind::RetargetDelegationBond),
-            5 => Ok(StakingActionKind::RegisterFinalizer),
-            6 => Ok(StakingActionKind::ConvertFinalizerRewardToDelegationBond),
-            7 => Ok(StakingActionKind::UpdateFinalizerKey),
+            5 => Ok(StakingActionKind::ConvertFinalizerRewardToDelegationBond),
             _ => Err(()),
         }
     }
@@ -1485,109 +1479,6 @@ impl RosterMember {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct StakingAction_CreateNewDelegationBond {
-    pub amount_zats: u64,
-    pub unique_pubkey: [u8; 32],
-    pub challenge: [u8; 32],
-    pub target_finalizer: [u8; 32],
-    pub signature: [u8; 64],
-}
-
-impl StakingAction_CreateNewDelegationBond {
-    pub fn to_union(&self) -> StakingAction {
-        StakingAction { kind: StakingActionKind::CreateNewDelegationBond, amount_zats: self.amount_zats, arg32_0: self.unique_pubkey, arg32_1: self.challenge, arg32_2: self.target_finalizer, arg64_0: self.signature, ..Default::default() }
-    }
-    pub fn try_from_union(union: &StakingAction) -> Option<StakingAction_CreateNewDelegationBond> {
-        if union.kind == StakingActionKind::CreateNewDelegationBond {
-            Some(StakingAction_CreateNewDelegationBond {
-                amount_zats: union.amount_zats,
-                unique_pubkey: union.arg32_0,
-                challenge: union.arg32_1,
-                target_finalizer: union.arg32_2,
-                signature: union.arg64_0,
-            })
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct StakingAction_BeginDelegationUnbonding {
-    pub unique_pubkey: [u8; 32],
-    pub challenge: [u8; 32],
-    pub signature: [u8; 64],
-}
-
-impl StakingAction_BeginDelegationUnbonding {
-    pub fn to_union(&self) -> StakingAction {
-        StakingAction { kind: StakingActionKind::BeginDelegationUnbonding, arg32_0: self.unique_pubkey, arg32_1: self.challenge, arg64_0: self.signature, ..Default::default() }
-    }
-    pub fn try_from_union(union: &StakingAction) -> Option<StakingAction_BeginDelegationUnbonding> {
-        if union.kind == StakingActionKind::BeginDelegationUnbonding {
-            Some(StakingAction_BeginDelegationUnbonding {
-                unique_pubkey: union.arg32_0,
-                challenge: union.arg32_1,
-                signature: union.arg64_0,
-            })
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct StakingAction_RetargetDelegationBond {
-    pub unique_pubkey: [u8; 32],
-    pub challenge: [u8; 32],
-    pub signature: [u8; 64],
-    pub target_finalizer: [u8; 32],
-}
-
-impl StakingAction_RetargetDelegationBond {
-    pub fn to_union(&self) -> StakingAction {
-        StakingAction { kind: StakingActionKind::RetargetDelegationBond, arg32_0: self.unique_pubkey, arg32_1: self.challenge, arg64_0: self.signature, arg32_2: self.target_finalizer, ..Default::default() }
-    }
-    pub fn try_from_union(union: &StakingAction) -> Option<StakingAction_RetargetDelegationBond> {
-        if union.kind == StakingActionKind::RetargetDelegationBond {
-            Some(StakingAction_RetargetDelegationBond {
-                unique_pubkey: union.arg32_0,
-                challenge: union.arg32_1,
-                signature: union.arg64_0,
-                target_finalizer: union.arg32_2,
-            })
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct StakingAction_WithdrawDelegationBond {
-    pub amount_zats: u64,
-    pub unique_pubkey: [u8; 32],
-    pub challenge: [u8; 32],
-    pub signature: [u8; 64],
-}
-
-impl StakingAction_WithdrawDelegationBond {
-    pub fn to_union(&self) -> StakingAction {
-        StakingAction { kind: StakingActionKind::WithdrawDelegationBond, amount_zats: self.amount_zats, arg32_0: self.unique_pubkey, arg32_1: self.challenge, arg64_0: self.signature, ..Default::default() }
-    }
-    pub fn try_from_union(union: &StakingAction) -> Option<StakingAction_WithdrawDelegationBond> {
-        if union.kind == StakingActionKind::WithdrawDelegationBond {
-            Some(StakingAction_WithdrawDelegationBond {
-                amount_zats: union.amount_zats,
-                unique_pubkey: union.arg32_0,
-                challenge: union.arg32_1,
-                signature: union.arg64_0,
-            })
-        } else {
-            None
-        }
-    }
-}
 
 /// The number of blocks between the start of one staking day and the start of the next.
 /// A new staking day starts every N blocks.
@@ -1605,140 +1496,187 @@ pub const STAKING_DAY_WINDOW: u32 = 70;
 // but it would require chasing BFT fat pointers. For now, this is the simple answer.
 pub const SLASH_ANALYSIS_WINDOW: u32 = 2 * STAKING_PERIOD;
 
+/// Blake2b-256 personalization for the staking-action leaf of the transaction
+/// hash tree (also used by the txid/auth digests in `txid.rs`).
+pub const ZCASH_CROSSLINK_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxCrosslinkHash"; // ALT: "Stake"
+
 // TODO(code org): should this be under zcash_protocol?
+//
+// `target_finalizer` is a full [FinalizerAddress] capability, not a bare key:
+// the wire format carries its 96 bytes and consensus rejects the action unless
+// the embedded signature verifies, so nobody can stake to a key that no
+// finalizer ever minted an address for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
-pub struct StakingAction {
-    pub kind: StakingActionKind,
-    pub amount_zats: u64,
-    pub arg32_0: [u8; 32],
-    pub arg32_1: [u8; 32],
-    pub arg32_2: [u8; 32],
-    pub arg32_3: [u8; 32],
-    #[serde(with = "serde_big_array::BigArray")]
-    pub arg64_0: [u8; 64],
-    #[serde(with = "serde_big_array::BigArray")]
-    pub arg64_1: [u8; 64],
-}
-impl Default for StakingAction {
-    fn default() -> Self {
-        StakingAction { kind: 0u8.try_into().unwrap(), amount_zats: 0, arg32_0: [0; 32], arg32_1: [0; 32], arg32_2: [0; 32], arg32_3: [0; 32], arg64_0: [0; 64], arg64_1: [0; 64] }
-    }
+pub enum StakingAction {
+    CreateNewDelegationBond {
+        amount_zats: u64,
+        unique_pubkey: [u8; 32],
+        challenge: [u8; 32],
+        target_finalizer: FinalizerAddress,
+        #[serde(with = "serde_big_array::BigArray")]
+        signature: [u8; 64],
+    },
+    BeginDelegationUnbonding {
+        unique_pubkey: [u8; 32],
+        challenge: [u8; 32],
+        #[serde(with = "serde_big_array::BigArray")]
+        signature: [u8; 64],
+    },
+    WithdrawDelegationBond {
+        amount_zats: u64,
+        unique_pubkey: [u8; 32],
+        challenge: [u8; 32],
+        #[serde(with = "serde_big_array::BigArray")]
+        signature: [u8; 64],
+    },
+    // Retarget names both endpoints, and consensus validates `from_finalizer`
+    // against the bond's current target. With both ends in the transaction, the
+    // current target of every bond can be derived by replaying transactions
+    // forward *or* backward — a revert needs no state lookup.
+    RetargetDelegationBond {
+        unique_pubkey: [u8; 32],
+        challenge: [u8; 32],
+        #[serde(with = "serde_big_array::BigArray")]
+        signature: [u8; 64],
+        from_finalizer: FinalizerAddress,
+        to_finalizer: FinalizerAddress,
+    },
+    ConvertFinalizerRewardToDelegationBond {
+        unique_pubkey: [u8; 32],
+        challenge: [u8; 32],
+        #[serde(with = "serde_big_array::BigArray")]
+        signature: [u8; 64],
+        this_finalizer: [u8; 32],
+        amount_zats: u64,
+        second_challenge: [u8; 32],
+        #[serde(with = "serde_big_array::BigArray")]
+        finalizer_signature: [u8; 64],
+    },
 }
 
 impl StakingAction {
-    fn hash_to_state(&self, writer: &mut crate::encoding::StateWrite) -> Option<()> {
-        if self.kind == StakingActionKind::CreateNewDelegationBond {
-            writer.write_u8(u8::from(self.kind)).ok()?;
-            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
-            writer.write_all(&self.arg32_1).ok()?; // challenge
-            writer.write_all(&self.arg64_0).ok()?; // signature
-            writer.write_all(&self.arg32_2).ok()?; // target finalizer
-            writer.write_u64_le(self.amount_zats).ok()?;
-            return Some(());
+    pub fn kind(&self) -> StakingActionKind {
+        match self {
+            StakingAction::CreateNewDelegationBond { .. } => StakingActionKind::CreateNewDelegationBond,
+            StakingAction::BeginDelegationUnbonding { .. } => StakingActionKind::BeginDelegationUnbonding,
+            StakingAction::WithdrawDelegationBond { .. } => StakingActionKind::WithdrawDelegationBond,
+            StakingAction::RetargetDelegationBond { .. } => StakingActionKind::RetargetDelegationBond,
+            StakingAction::ConvertFinalizerRewardToDelegationBond { .. } => StakingActionKind::ConvertFinalizerRewardToDelegationBond,
         }
-        if self.kind == StakingActionKind::BeginDelegationUnbonding {
-            writer.write_u8(u8::from(self.kind)).ok()?;
-            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
-            writer.write_all(&self.arg32_1).ok()?; // challenge
-            writer.write_all(&self.arg64_0).ok()?; // signature
-            return Some(());
-        }
-        if self.kind == StakingActionKind::WithdrawDelegationBond {
-            writer.write_u8(u8::from(self.kind)).ok()?;
-            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
-            writer.write_all(&self.arg32_1).ok()?; // challenge
-            writer.write_all(&self.arg64_0).ok()?; // signature
-            writer.write_u64_le(self.amount_zats).ok()?;
-            return Some(());
-        }
-        if self.kind == StakingActionKind::RetargetDelegationBond {
-            writer.write_u8(u8::from(self.kind)).ok()?;
-            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
-            writer.write_all(&self.arg32_1).ok()?; // challenge
-            writer.write_all(&self.arg64_0).ok()?; // signature
-            writer.write_all(&self.arg32_2).ok()?; // target finalizer
-            return Some(());
-        }
-        if self.kind == StakingActionKind::RegisterFinalizer {
-            writer.write_u8(u8::from(self.kind)).ok()?;
-            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
-            writer.write_all(&self.arg32_1).ok()?; // challenge
-            writer.write_all(&self.arg64_0).ok()?; // signature
-            return Some(());
-        }
-        if self.kind == StakingActionKind::ConvertFinalizerRewardToDelegationBond {
-            writer.write_u8(u8::from(self.kind)).ok()?;
-            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
-            writer.write_all(&self.arg32_1).ok()?; // challenge
-            writer.write_all(&self.arg64_0).ok()?; // signature
-            writer.write_all(&self.arg32_2).ok()?; // this finalizer
-            writer.write_u64_le(self.amount_zats).ok()?;
-            writer.write_all(&self.arg32_3).ok()?; // second challenge
-            writer.write_all(&self.arg64_1).ok()?; // finalizer signature
-            return Some(());
-        }
-        if self.kind == StakingActionKind::UpdateFinalizerKey {
-            writer.write_u8(u8::from(self.kind)).ok()?;
-            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
-            writer.write_all(&self.arg32_1).ok()?; // challenge
-            writer.write_all(&self.arg64_0).ok()?; // signature
-            writer.write_all(&self.arg32_2).ok()?; // this finalizer
-            writer.write_all(&self.arg32_3).ok()?; // second challenge
-            writer.write_all(&self.arg64_1).ok()?; // finalizer signature
-            return Some(());
-        }
-        None
     }
 
-    // TODO: fold in existing
-    pub fn str_from_addr(addr: [u8; 32]) -> std::string::String {
-        let mut str = std::string::String::with_capacity(64);
-        for i in 0..32 {
-            str.push_str(&format!("{:02x}", addr[31-i]));
+    /// The bond this action operates on: `unique_pubkey` in every variant.
+    pub fn bond_key(&self) -> [u8; 32] {
+        match self {
+            StakingAction::CreateNewDelegationBond { unique_pubkey, .. }
+            | StakingAction::BeginDelegationUnbonding { unique_pubkey, .. }
+            | StakingAction::WithdrawDelegationBond { unique_pubkey, .. }
+            | StakingAction::RetargetDelegationBond { unique_pubkey, .. }
+            | StakingAction::ConvertFinalizerRewardToDelegationBond { unique_pubkey, .. } => *unique_pubkey,
         }
-        str
-    }
-    pub fn addr_from_str_bytes(data: &[u8]) -> Option<[u8; 32]> {
-        const VALS: [u8; 256] = {
-            let mut v = [0xff; 256];
-            v[b'0' as usize] = 0x0;
-            v[b'1' as usize] = 0x1;
-            v[b'2' as usize] = 0x2;
-            v[b'3' as usize] = 0x3;
-            v[b'4' as usize] = 0x4;
-            v[b'5' as usize] = 0x5;
-            v[b'6' as usize] = 0x6;
-            v[b'7' as usize] = 0x7;
-            v[b'8' as usize] = 0x8;
-            v[b'9' as usize] = 0x9;
-            v[b'a' as usize] = 0xa;
-            v[b'b' as usize] = 0xb;
-            v[b'c' as usize] = 0xc;
-            v[b'd' as usize] = 0xd;
-            v[b'e' as usize] = 0xe;
-            v[b'f' as usize] = 0xf;
-            v
-        };
-        let mut buf = [0u8; 32];
-        for i in 0..32 {
-            let a = data.get(2*i)?;
-            let b = data.get(2*i + 1)?;
-            let a = VALS[*a as usize];
-            if a == 0xff {
-                return None;
-            }
-            let b = VALS[*b as usize];
-            if b == 0xff {
-                return None;
-            }
-            buf[31-i] = (a << 4) | b
-        }
-        Some(buf)
     }
 
-    pub fn read<R: Read>(
-        mut reader: R,
-    ) -> io::Result<Option<StakingAction>> {
+    /// Zero for kinds that don't carry an amount.
+    pub fn amount_zats(&self) -> u64 {
+        match self {
+            StakingAction::CreateNewDelegationBond { amount_zats, .. }
+            | StakingAction::WithdrawDelegationBond { amount_zats, .. }
+            | StakingAction::ConvertFinalizerRewardToDelegationBond { amount_zats, .. } => *amount_zats,
+            _ => 0,
+        }
+    }
+
+    /// The finalizer public key this action points stake at: the capability's
+    /// key for Create/Retarget, `this_finalizer` for the finalizer-reward
+    /// actions, nil for actions that target none.
+    pub fn target_finalizer_pk(&self) -> [u8; 32] {
+        match self {
+            StakingAction::CreateNewDelegationBond { target_finalizer, .. } => target_finalizer.pub_key.0,
+            StakingAction::RetargetDelegationBond { to_finalizer, .. } => to_finalizer.pub_key.0,
+            StakingAction::ConvertFinalizerRewardToDelegationBond { this_finalizer, .. } => *this_finalizer,
+            _ => [0; 32],
+        }
+    }
+
+    /// The [FinalizerAddress] capability stake ends up pointed at, for the
+    /// actions that carry one. Consensus rejects those actions unless `verify()`
+    /// passes (Retarget's `from_finalizer` must verify too — see
+    /// [StakingAction::from_finalizer_address]).
+    pub fn target_finalizer_address(&self) -> Option<FinalizerAddress> {
+        match self {
+            StakingAction::CreateNewDelegationBond { target_finalizer, .. } => Some(*target_finalizer),
+            StakingAction::RetargetDelegationBond { to_finalizer, .. } => Some(*to_finalizer),
+            _ => None,
+        }
+    }
+
+    /// Retarget's claimed current target. Consensus validates it two ways: the
+    /// capability itself must verify, and its key must equal the bond's actual
+    /// current target in state.
+    pub fn from_finalizer_address(&self) -> Option<FinalizerAddress> {
+        match self {
+            StakingAction::RetargetDelegationBond { from_finalizer, .. } => Some(*from_finalizer),
+            _ => None,
+        }
+    }
+
+    /// The wire body: everything after the tag byte. These are also the exact
+    /// bytes committed to by [StakingAction::tree_hash], so wire and hash can
+    /// never disagree.
+    pub fn write_body<W: Write>(&self, mut writer: W) -> io::Result<()> {
+        match self {
+            StakingAction::CreateNewDelegationBond { amount_zats, unique_pubkey, challenge, target_finalizer, signature } => {
+                writer.write_all(unique_pubkey)?;
+                writer.write_all(challenge)?;
+                writer.write_all(signature)?;
+                target_finalizer.write(&mut writer)?;
+                writer.write_u64_le(*amount_zats)
+            }
+            StakingAction::BeginDelegationUnbonding { unique_pubkey, challenge, signature } => {
+                writer.write_all(unique_pubkey)?;
+                writer.write_all(challenge)?;
+                writer.write_all(signature)
+            }
+            StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey, challenge, signature } => {
+                writer.write_all(unique_pubkey)?;
+                writer.write_all(challenge)?;
+                writer.write_all(signature)?;
+                writer.write_u64_le(*amount_zats)
+            }
+            StakingAction::RetargetDelegationBond { unique_pubkey, challenge, signature, from_finalizer, to_finalizer } => {
+                writer.write_all(unique_pubkey)?;
+                writer.write_all(challenge)?;
+                writer.write_all(signature)?;
+                from_finalizer.write(&mut writer)?;
+                to_finalizer.write(&mut writer)
+            }
+            StakingAction::ConvertFinalizerRewardToDelegationBond { unique_pubkey, challenge, signature, this_finalizer, amount_zats, second_challenge, finalizer_signature } => {
+                writer.write_all(unique_pubkey)?;
+                writer.write_all(challenge)?;
+                writer.write_all(signature)?;
+                writer.write_all(this_finalizer)?;
+                writer.write_u64_le(*amount_zats)?;
+                writer.write_all(second_challenge)?;
+                writer.write_all(finalizer_signature)
+            }
+        }
+    }
+
+    /// The transaction hash-tree leaf for this action: a flat blake2b-256
+    /// (crosslink personalization) of the tag byte followed by the variant
+    /// body. A transaction with no staking action contributes 32 nil bytes to
+    /// the tree instead — see `to_hash_v6` in `txid.rs`.
+    pub fn tree_hash(&self) -> blake2b_simd::Hash {
+        let mut h = blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(ZCASH_CROSSLINK_HASH_PERSONALIZATION)
+            .to_state();
+        h.write_u8(u8::from(self.kind())).expect("hashing never fails");
+        self.write_body(&mut h).expect("hashing never fails");
+        h.finalize()
+    }
+
+    pub fn read<R: Read>(mut reader: R) -> io::Result<Option<StakingAction>> {
         let tag = reader.read_u8()?;
         if tag == 0 {
             return Ok(None);
@@ -1751,83 +1689,53 @@ impl StakingAction {
             ));
         };
 
-        if kind == StakingActionKind::CreateNewDelegationBond {
-            let mut ret = StakingAction::default();
-            ret.kind = kind;
-            reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
-            reader.read_exact(&mut ret.arg32_1)?; // challenge
-            reader.read_exact(&mut ret.arg64_0)?; // signature
-            reader.read_exact(&mut ret.arg32_2)?; // target finalizer
-            let mut buf = [0u8; 8];
-            reader.read_exact(&mut buf)?;
-            ret.amount_zats = u64::from_le_bytes(buf);
-            return Ok(Some(ret));
+        let mut b32_0 = [0u8; 32];
+        let mut b32_1 = [0u8; 32];
+        let mut b64_0 = [0u8; 64];
+        reader.read_exact(&mut b32_0)?; // unique pubkey
+        reader.read_exact(&mut b32_1)?; // challenge
+        reader.read_exact(&mut b64_0)?; // signature
+
+        match kind {
+            StakingActionKind::CreateNewDelegationBond => {
+                let target_finalizer = FinalizerAddress::read(&mut reader)?;
+                let amount_zats = reader.read_u64_le()?;
+                Ok(Some(StakingAction::CreateNewDelegationBond {
+                    amount_zats, unique_pubkey: b32_0, challenge: b32_1, target_finalizer, signature: b64_0,
+                }))
+            }
+            StakingActionKind::BeginDelegationUnbonding => {
+                Ok(Some(StakingAction::BeginDelegationUnbonding {
+                    unique_pubkey: b32_0, challenge: b32_1, signature: b64_0,
+                }))
+            }
+            StakingActionKind::WithdrawDelegationBond => {
+                let amount_zats = reader.read_u64_le()?;
+                Ok(Some(StakingAction::WithdrawDelegationBond {
+                    amount_zats, unique_pubkey: b32_0, challenge: b32_1, signature: b64_0,
+                }))
+            }
+            StakingActionKind::RetargetDelegationBond => {
+                let from_finalizer = FinalizerAddress::read(&mut reader)?;
+                let to_finalizer = FinalizerAddress::read(&mut reader)?;
+                Ok(Some(StakingAction::RetargetDelegationBond {
+                    unique_pubkey: b32_0, challenge: b32_1, signature: b64_0, from_finalizer, to_finalizer,
+                }))
+            }
+            StakingActionKind::ConvertFinalizerRewardToDelegationBond => {
+                let mut this_finalizer = [0u8; 32];
+                let mut second_challenge = [0u8; 32];
+                let mut finalizer_signature = [0u8; 64];
+                reader.read_exact(&mut this_finalizer)?;
+                let amount_zats = reader.read_u64_le()?;
+                reader.read_exact(&mut second_challenge)?;
+                reader.read_exact(&mut finalizer_signature)?;
+                Ok(Some(StakingAction::ConvertFinalizerRewardToDelegationBond {
+                    unique_pubkey: b32_0, challenge: b32_1, signature: b64_0, this_finalizer, amount_zats, second_challenge, finalizer_signature,
+                }))
+            }
+            StakingActionKind::Null => unreachable!("tag 0 returned above"),
         }
-        if kind == StakingActionKind::BeginDelegationUnbonding {
-            let mut ret = StakingAction::default();
-            ret.kind = kind;
-            reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
-            reader.read_exact(&mut ret.arg32_1)?; // challenge
-            reader.read_exact(&mut ret.arg64_0)?; // signature
-            return Ok(Some(ret));
-        }
-        if kind == StakingActionKind::WithdrawDelegationBond {
-            let mut ret = StakingAction::default();
-            ret.kind = kind;
-            reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
-            reader.read_exact(&mut ret.arg32_1)?; // challenge
-            reader.read_exact(&mut ret.arg64_0)?; // signature
-            let mut buf = [0u8; 8];
-            reader.read_exact(&mut buf)?;
-            ret.amount_zats = u64::from_le_bytes(buf);
-            return Ok(Some(ret));
-        }
-        if kind == StakingActionKind::RetargetDelegationBond {
-            let mut ret = StakingAction::default();
-            ret.kind = kind;
-            reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
-            reader.read_exact(&mut ret.arg32_1)?; // challenge
-            reader.read_exact(&mut ret.arg64_0)?; // signature
-            reader.read_exact(&mut ret.arg32_2)?; // target finalizer
-            return Ok(Some(ret));
-        }
-        if kind == StakingActionKind::RegisterFinalizer {
-            let mut ret = StakingAction::default();
-            ret.kind = kind;
-            reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
-            reader.read_exact(&mut ret.arg32_1)?; // challenge
-            reader.read_exact(&mut ret.arg64_0)?; // signature
-            return Ok(Some(ret));
-        }
-        if kind == StakingActionKind::ConvertFinalizerRewardToDelegationBond {
-            let mut ret = StakingAction::default();
-            ret.kind = kind;
-            reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
-            reader.read_exact(&mut ret.arg32_1)?; // challenge
-            reader.read_exact(&mut ret.arg64_0)?; // signature
-            reader.read_exact(&mut ret.arg32_2)?; // this finalizer
-            let mut buf = [0u8; 8];
-            reader.read_exact(&mut buf)?;
-            ret.amount_zats = u64::from_le_bytes(buf);
-            reader.read_exact(&mut ret.arg32_3)?; // second challenge
-            reader.read_exact(&mut ret.arg64_1)?; // finalizer signature
-            return Ok(Some(ret));
-        }
-        if kind == StakingActionKind::UpdateFinalizerKey {
-            let mut ret = StakingAction::default();
-            ret.kind = kind;
-            reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
-            reader.read_exact(&mut ret.arg32_1)?; // challenge
-            reader.read_exact(&mut ret.arg64_0)?; // signature
-            reader.read_exact(&mut ret.arg32_2)?; // this finalizer
-            reader.read_exact(&mut ret.arg32_3)?; // second challenge
-            reader.read_exact(&mut ret.arg64_1)?; // finalizer signature
-            return Ok(Some(ret));
-        }
-        return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("Kind is not implemented: {:?}", kind),
-        ));
     }
 
     pub fn write<W: Write>(
@@ -1835,71 +1743,8 @@ impl StakingAction {
         mut writer: W,
     ) -> io::Result<()> {
         if let Some(staking_action) = staking_action {
-            if staking_action.kind == StakingActionKind::CreateNewDelegationBond {
-                writer.write_u8(u8::from(staking_action.kind))?;
-                writer.write_all(&staking_action.arg32_0)?; // unique pubkey
-                writer.write_all(&staking_action.arg32_1)?; // challenge
-                writer.write_all(&staking_action.arg64_0)?; // signature
-                writer.write_all(&staking_action.arg32_2)?; // target finalizer
-                writer.write_u64_le(staking_action.amount_zats)?;
-                return Ok(());
-            }
-            if staking_action.kind == StakingActionKind::BeginDelegationUnbonding {
-                writer.write_u8(u8::from(staking_action.kind))?;
-                writer.write_all(&staking_action.arg32_0)?; // unique pubkey
-                writer.write_all(&staking_action.arg32_1)?; // challenge
-                writer.write_all(&staking_action.arg64_0)?; // signature
-                return Ok(());
-            }
-            if staking_action.kind == StakingActionKind::WithdrawDelegationBond {
-                writer.write_u8(u8::from(staking_action.kind))?;
-                writer.write_all(&staking_action.arg32_0)?; // unique pubkey
-                writer.write_all(&staking_action.arg32_1)?; // challenge
-                writer.write_all(&staking_action.arg64_0)?; // signature
-                writer.write_u64_le(staking_action.amount_zats)?;
-                return Ok(());
-            }
-            if staking_action.kind == StakingActionKind::RetargetDelegationBond {
-                writer.write_u8(u8::from(staking_action.kind))?;
-                writer.write_all(&staking_action.arg32_0)?; // unique pubkey
-                writer.write_all(&staking_action.arg32_1)?; // challenge
-                writer.write_all(&staking_action.arg64_0)?; // signature
-                writer.write_all(&staking_action.arg32_2)?; // target finalizer
-                return Ok(());
-            }
-            if staking_action.kind == StakingActionKind::RegisterFinalizer {
-                writer.write_u8(u8::from(staking_action.kind))?;
-                writer.write_all(&staking_action.arg32_0)?; // unique pubkey
-                writer.write_all(&staking_action.arg32_1)?; // challenge
-                writer.write_all(&staking_action.arg64_0)?; // signature
-                return Ok(());
-            }
-            if staking_action.kind == StakingActionKind::ConvertFinalizerRewardToDelegationBond {
-                writer.write_u8(u8::from(staking_action.kind))?;
-                writer.write_all(&staking_action.arg32_0)?; // unique pubkey
-                writer.write_all(&staking_action.arg32_1)?; // challenge
-                writer.write_all(&staking_action.arg64_0)?; // signature
-                writer.write_all(&staking_action.arg32_2)?; // this finalizer
-                writer.write_u64_le(staking_action.amount_zats)?;
-                writer.write_all(&staking_action.arg32_3)?; // second challenge
-                writer.write_all(&staking_action.arg64_1)?; // finalizer signature
-                return Ok(());
-            }
-            if staking_action.kind == StakingActionKind::UpdateFinalizerKey {
-                writer.write_u8(u8::from(staking_action.kind))?;
-                writer.write_all(&staking_action.arg32_0)?; // unique pubkey
-                writer.write_all(&staking_action.arg32_1)?; // challenge
-                writer.write_all(&staking_action.arg64_0)?; // signature
-                writer.write_all(&staking_action.arg32_2)?; // this finalizer
-                writer.write_all(&staking_action.arg32_3)?; // second challenge
-                writer.write_all(&staking_action.arg64_1)?; // finalizer signature
-                return Ok(());
-            }
-
-            return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("Kind is not implemented: {:?}", staking_action.kind),
-            ));
+            writer.write_u8(u8::from(staking_action.kind()))?;
+            staking_action.write_body(writer)
         } else {
             writer.write_u8(0)
         }
@@ -1921,71 +1766,57 @@ impl std::fmt::Display for StakingAction {
             fmter.field(name, &le_str);
         };
 
-        fmter.field("kind", match self.kind {
-            StakingActionKind::Null => &"Null",
-            StakingActionKind::CreateNewDelegationBond => &"CreateNewDelegationBond",
-            StakingActionKind::BeginDelegationUnbonding => &"BeginDelegationUnbonding",
-            StakingActionKind::WithdrawDelegationBond => &"WithdrawDelegationBond",
-            StakingActionKind::RetargetDelegationBond => &"RetargetDelegationBond",
-            StakingActionKind::RegisterFinalizer => &"RegisterFinalizer",
-            StakingActionKind::ConvertFinalizerRewardToDelegationBond => &"ConvertFinalizerRewardToDelegationBond",
-            StakingActionKind::UpdateFinalizerKey => &"UpdateFinalizerKey",
-        });
-
-        if self.kind == StakingActionKind::CreateNewDelegationBond {
-            fmt_le_bytes(fmter, "unique_public_key", &self.arg32_0);
-            fmt_le_bytes(fmter, "challenge", &self.arg32_1);
-            fmt_le_bytes(fmter, "signature", &self.arg64_0);
-            fmt_le_bytes(fmter, "target_finalizer", &self.arg32_2);
-            fmter.field("amount_zats", &self.amount_zats);
-        }
-        if self.kind == StakingActionKind::BeginDelegationUnbonding {
-            fmt_le_bytes(fmter, "unique_public_key", &self.arg32_0);
-            fmt_le_bytes(fmter, "challenge", &self.arg32_1);
-            fmt_le_bytes(fmter, "signature", &self.arg64_0);
-        }
-        if self.kind == StakingActionKind::WithdrawDelegationBond {
-            fmt_le_bytes(fmter, "unique_public_key", &self.arg32_0);
-            fmt_le_bytes(fmter, "challenge", &self.arg32_1);
-            fmt_le_bytes(fmter, "signature", &self.arg64_0);
-            fmter.field("amount_zats", &self.amount_zats);
-        }
-        if self.kind == StakingActionKind::RetargetDelegationBond {
-            fmt_le_bytes(fmter, "unique_public_key", &self.arg32_0);
-            fmt_le_bytes(fmter, "challenge", &self.arg32_1);
-            fmt_le_bytes(fmter, "signature", &self.arg64_0);
-            fmt_le_bytes(fmter, "target_finalizer", &self.arg32_2);
-        }
-        if self.kind == StakingActionKind::RegisterFinalizer {
-            fmt_le_bytes(fmter, "unique_public_key", &self.arg32_0);
-            fmt_le_bytes(fmter, "challenge", &self.arg32_1);
-            fmt_le_bytes(fmter, "signature", &self.arg64_0);
-        }
-        if self.kind == StakingActionKind::ConvertFinalizerRewardToDelegationBond {
-            fmt_le_bytes(fmter, "unique_public_key", &self.arg32_0);
-            fmt_le_bytes(fmter, "challenge", &self.arg32_1);
-            fmt_le_bytes(fmter, "signature", &self.arg64_0);
-            fmt_le_bytes(fmter, "this_finalizer", &self.arg32_2);
-            fmter.field("amount_zats", &self.amount_zats);
-            fmt_le_bytes(fmter, "second_challenge", &self.arg32_3);
-            fmt_le_bytes(fmter, "finalizer_signature", &self.arg64_1);
-        }
-        if self.kind == StakingActionKind::UpdateFinalizerKey {
-            fmt_le_bytes(fmter, "unique_public_key", &self.arg32_0);
-            fmt_le_bytes(fmter, "challenge", &self.arg32_1);
-            fmt_le_bytes(fmter, "signature", &self.arg64_0);
-            fmt_le_bytes(fmter, "this_finalizer", &self.arg32_2);
-            fmt_le_bytes(fmter, "second_challenge", &self.arg32_3);
-            fmt_le_bytes(fmter, "finalizer_signature", &self.arg64_1);
+        match self {
+            StakingAction::CreateNewDelegationBond { amount_zats, unique_pubkey, challenge, target_finalizer, signature } => {
+                fmter.field("kind", &"CreateNewDelegationBond");
+                fmt_le_bytes(fmter, "unique_public_key", unique_pubkey);
+                fmt_le_bytes(fmter, "challenge", challenge);
+                fmt_le_bytes(fmter, "signature", signature);
+                fmter.field("target_finalizer", &target_finalizer.encode());
+                fmter.field("amount_zats", amount_zats);
+            }
+            StakingAction::BeginDelegationUnbonding { unique_pubkey, challenge, signature } => {
+                fmter.field("kind", &"BeginDelegationUnbonding");
+                fmt_le_bytes(fmter, "unique_public_key", unique_pubkey);
+                fmt_le_bytes(fmter, "challenge", challenge);
+                fmt_le_bytes(fmter, "signature", signature);
+            }
+            StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey, challenge, signature } => {
+                fmter.field("kind", &"WithdrawDelegationBond");
+                fmt_le_bytes(fmter, "unique_public_key", unique_pubkey);
+                fmt_le_bytes(fmter, "challenge", challenge);
+                fmt_le_bytes(fmter, "signature", signature);
+                fmter.field("amount_zats", amount_zats);
+            }
+            StakingAction::RetargetDelegationBond { unique_pubkey, challenge, signature, from_finalizer, to_finalizer } => {
+                fmter.field("kind", &"RetargetDelegationBond");
+                fmt_le_bytes(fmter, "unique_public_key", unique_pubkey);
+                fmt_le_bytes(fmter, "challenge", challenge);
+                fmt_le_bytes(fmter, "signature", signature);
+                fmter.field("from_finalizer", &from_finalizer.encode());
+                fmter.field("to_finalizer", &to_finalizer.encode());
+            }
+            StakingAction::ConvertFinalizerRewardToDelegationBond { unique_pubkey, challenge, signature, this_finalizer, amount_zats, second_challenge, finalizer_signature } => {
+                fmter.field("kind", &"ConvertFinalizerRewardToDelegationBond");
+                fmt_le_bytes(fmter, "unique_public_key", unique_pubkey);
+                fmt_le_bytes(fmter, "challenge", challenge);
+                fmt_le_bytes(fmter, "signature", signature);
+                fmt_le_bytes(fmter, "this_finalizer", this_finalizer);
+                fmter.field("amount_zats", amount_zats);
+                fmt_le_bytes(fmter, "second_challenge", second_challenge);
+                fmt_le_bytes(fmter, "finalizer_signature", finalizer_signature);
+            }
         }
         fmter.finish()
     }
 }
 
+// `target_finalizer` is the full capability, carried in JSON as the zfin string
+// a human copies around; a bare public key is no longer accepted anywhere.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum StakingActionRequest {
-    CreateNewDelegationBond{ amount_zats: u64, target_finalizer: PubKeyID },
-    RetargetDelegationBond{ bond_key: PubKeyID, target_finalizer: PubKeyID },
+    CreateNewDelegationBond{ amount_zats: u64, target_finalizer: FinalizerAddress },
+    RetargetDelegationBond{ bond_key: PubKeyID, target_finalizer: FinalizerAddress },
     BeginDelegationUnbonding{ bond_key: PubKeyID  },
     WithdrawDelegationBond{ bond_key: PubKeyID  },
 }

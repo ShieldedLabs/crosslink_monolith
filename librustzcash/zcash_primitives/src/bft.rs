@@ -587,6 +587,136 @@ impl TMSig {
 }
 impl std::fmt::Debug for TMSig { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "Sig{", &self.0[..2])?; write!(f, "}}") } }
 
+/// The fixed message every finalizer address signs.
+pub const FINALIZER_ADDRESS_MSG: &[u8] = b"Zcash Crosslink Finalizer Address v1";
+
+/// A self-certifying finalizer address: the finalizer's public key plus that key's
+/// signature over [FINALIZER_ADDRESS_MSG]. The address is a cryptographic capability —
+/// a valid signature proves the address was minted by the holder of the key, so a
+/// mistyped or fabricated key can't be staked to.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct FinalizerAddress {
+    pub pub_key: PubKeyID,
+    pub sig: TMSig,
+}
+// The in-memory cap is exactly its 96 payload bytes; everything else (signed
+// message, prefix) is implicit. The string form inflates by a fixed amount only:
+// "zfinv1" + 128 base64url chars = 134.
+const _: () = assert!(std::mem::size_of::<FinalizerAddress>() == 96);
+
+// base64url alphabet (RFC 4648 §5): '-' and '_' instead of '+' and '/', so the
+// string survives URLs and double-click selection. No checksum on purpose — the
+// payload carries an ed25519 signature over the whole capability, so any
+// corruption already fails verify(); a checksum would only re-detect it.
+// The prefix carries the format version so future encodings can coexist:
+// a v2 address starts "zfinv2" and old software cleanly rejects it.
+const FINALIZER_ADDRESS_PREFIX: &str = "zfinv1";
+const PRE: usize = FINALIZER_ADDRESS_PREFIX.len();
+const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const B64_VALS: [u8; 256] = {
+    let mut v = [0xff; 256];
+    let mut i = 0;
+    while i < 64 { v[B64_CHARS[i] as usize] = i as u8; i += 1; }
+    v
+};
+
+impl FinalizerAddress {
+    pub fn create(private_key: &SigningKey) -> Self {
+        let pub_key = PubKeyID(<[u8; 32]>::from(VerificationKeyBytes::from(private_key)));
+        let sig = TMSig(private_key.sign(FINALIZER_ADDRESS_MSG).to_bytes());
+        Self { pub_key, sig }
+    }
+
+    pub fn verify(&self) -> bool {
+        self.sig.verify(self.pub_key, FINALIZER_ADDRESS_MSG).is_ok()
+    }
+
+    /// `zfinv1` + 128 base64url chars = 134 chars, always. The payload is 96 bytes:
+    /// 32-byte public key then 64-byte signature (so no '=' padding: 96 % 3 == 0).
+    /// The prefix marks it as a finalizer address to human eyes, versions the
+    /// encoding, and keeps it disjoint from every ZIP 316 encoding.
+    pub fn encode(&self) -> std::string::String {
+        let mut buf = [0u8; 96];
+        buf[..32].copy_from_slice(&self.pub_key.0);
+        buf[32..].copy_from_slice(&self.sig.0);
+
+        let mut out = [0u8; PRE + 128];
+        out[..PRE].copy_from_slice(FINALIZER_ADDRESS_PREFIX.as_bytes());
+        for i in 0..32 {
+            let g = &buf[3*i..3*i + 3];
+            let o = &mut out[PRE + 4*i..PRE + 4*i + 4];
+            o[0] = B64_CHARS[(g[0] >> 2) as usize];
+            o[1] = B64_CHARS[((g[0] << 4 | g[1] >> 4) & 63) as usize];
+            o[2] = B64_CHARS[((g[1] << 2 | g[2] >> 6) & 63) as usize];
+            o[3] = B64_CHARS[(g[2] & 63) as usize];
+        }
+        std::string::String::from_utf8(out.to_vec()).expect("base64url output is ASCII")
+    }
+
+    /// Parses [FinalizerAddress::encode]'s format. Structural only — call
+    /// [FinalizerAddress::verify] (or use [FinalizerAddress::decode_and_verify])
+    /// to check the capability.
+    pub fn decode(s: &str) -> Option<Self> {
+        let s = s.as_bytes();
+        if s.len() != PRE + 128 || &s[..PRE] != FINALIZER_ADDRESS_PREFIX.as_bytes() { return None; }
+
+        let mut buf = [0u8; 96];
+        for i in 0..32 {
+            let c = &s[PRE + 4*i..PRE + 4*i + 4];
+            let a = B64_VALS[c[0] as usize];
+            let b = B64_VALS[c[1] as usize];
+            let c2 = B64_VALS[c[2] as usize];
+            let d = B64_VALS[c[3] as usize];
+            if a | b | c2 | d == 0xff { return None; }
+            let g = &mut buf[3*i..3*i + 3];
+            g[0] = a << 2 | b >> 4;
+            g[1] = b << 4 | c2 >> 2;
+            g[2] = c2 << 6 | d;
+        }
+        let mut pk = [0u8; 32];
+        let mut sig = [0u8; 64];
+        pk.copy_from_slice(&buf[..32]);
+        sig.copy_from_slice(&buf[32..]);
+        Some(Self { pub_key: PubKeyID(pk), sig: TMSig(sig) })
+    }
+
+    /// The one-call path: decode + verify, handing back the proven key.
+    pub fn decode_and_verify(s: &str) -> Option<PubKeyID> {
+        let addr = Self::decode(s)?;
+        if addr.verify() { Some(addr.pub_key) } else { None }
+    }
+
+    /// Raw wire form: 96 bytes, public key then signature. Structural only —
+    /// consensus calls [FinalizerAddress::verify] separately.
+    pub fn write<W: std::io::Write>(&self, mut writer: W) -> std::io::Result<()> {
+        writer.write_all(&self.pub_key.0)?;
+        writer.write_all(&self.sig.0)
+    }
+
+    pub fn read<R: std::io::Read>(mut reader: R) -> std::io::Result<Self> {
+        let mut pk = [0u8; 32];
+        let mut sig = [0u8; 64];
+        reader.read_exact(&mut pk)?;
+        reader.read_exact(&mut sig)?;
+        Ok(Self { pub_key: PubKeyID(pk), sig: TMSig(sig) })
+    }
+}
+
+// Serde uses the zfin string form, so JSON carrying a finalizer address (e.g. a
+// staking RPC request) looks like the address a human copies around. Parse is
+// structural; consumers still call verify().
+impl serde::Serialize for FinalizerAddress {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.encode().serialize(serializer)
+    }
+}
+impl<'de> serde::Deserialize<'de> for FinalizerAddress {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = std::borrow::Cow::<'de, str>::deserialize(deserializer)?;
+        Self::decode(s.as_ref()).ok_or_else(|| serde::de::Error::custom("invalid finalizer address (want zfinv1 + 128 base64url chars)"))
+    }
+}
+
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub struct HashKey(pub [u8; 32]);
 impl HashKey { const NIL: Self = Self([0;32]); }

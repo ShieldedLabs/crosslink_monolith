@@ -35,6 +35,9 @@ pub struct UiData {
     pub send_address:  String,
     pub send_amount_index: usize,
     pub stake_address: String,
+    // ed25519-verify of the pasted address, cached so it doesn't rerun every frame
+    pub stake_address_checked: String,
+    pub stake_address_cap: Option<wallet::bft::FinalizerAddress>,
     pub stake_amount_index: usize,
     pub recv_address:  String,
 
@@ -2126,44 +2129,11 @@ pub fn ui_left_pane(ui: &mut Context,
                         //     ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
                         // }
 
-                        pub fn addr_from_str_bytes(data: &[u8]) -> Option<[u8; 32]> {
-                            const VALS: [u8; 256] = {
-                                let mut v = [0xff; 256];
-                                v[b'0' as usize] = 0x0;
-                                v[b'1' as usize] = 0x1;
-                                v[b'2' as usize] = 0x2;
-                                v[b'3' as usize] = 0x3;
-                                v[b'4' as usize] = 0x4;
-                                v[b'5' as usize] = 0x5;
-                                v[b'6' as usize] = 0x6;
-                                v[b'7' as usize] = 0x7;
-                                v[b'8' as usize] = 0x8;
-                                v[b'9' as usize] = 0x9;
-                                v[b'a' as usize] = 0xa;
-                                v[b'b' as usize] = 0xb;
-                                v[b'c' as usize] = 0xc;
-                                v[b'd' as usize] = 0xd;
-                                v[b'e' as usize] = 0xe;
-                                v[b'f' as usize] = 0xf;
-                                v
-                            };
-                            let mut buf = [0u8; 32];
-                            for i in 0..32 {
-                                let a = data.get(2*i)?;
-                                let b = data.get(2*i + 1)?;
-                                let a = VALS[*a as usize];
-                                if a == 0xff {
-                                    return None;
-                                }
-                                let b = VALS[*b as usize];
-                                if b == 0xff {
-                                    return None;
-                                }
-                                buf[31-i] = (a << 4) | b
-                            }
-                            Some(buf)
+                        if data.stake_address != data.stake_address_checked {
+                            data.stake_address_checked = data.stake_address.clone();
+                            data.stake_address_cap = wallet::bft::FinalizerAddress::decode(&data.stake_address).filter(|a| a.verify());
                         }
-                        let hex_dest = addr_from_str_bytes(data.stake_address.as_bytes());
+                        let hex_dest = data.stake_address_cap;
 
                         let can = is_staking_day && !waiting_for_stake_to_finalizer && hex_dest.is_some();
 
@@ -2267,44 +2237,11 @@ pub fn ui_left_pane(ui: &mut Context,
                         ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
                     }
 
-                    pub fn addr_from_str_bytes(data: &[u8]) -> Option<[u8; 32]> {
-                        const VALS: [u8; 256] = {
-                            let mut v = [0xff; 256];
-                            v[b'0' as usize] = 0x0;
-                            v[b'1' as usize] = 0x1;
-                            v[b'2' as usize] = 0x2;
-                            v[b'3' as usize] = 0x3;
-                            v[b'4' as usize] = 0x4;
-                            v[b'5' as usize] = 0x5;
-                            v[b'6' as usize] = 0x6;
-                            v[b'7' as usize] = 0x7;
-                            v[b'8' as usize] = 0x8;
-                            v[b'9' as usize] = 0x9;
-                            v[b'a' as usize] = 0xa;
-                            v[b'b' as usize] = 0xb;
-                            v[b'c' as usize] = 0xc;
-                            v[b'd' as usize] = 0xd;
-                            v[b'e' as usize] = 0xe;
-                            v[b'f' as usize] = 0xf;
-                            v
-                        };
-                        let mut buf = [0u8; 32];
-                        for i in 0..32 {
-                            let a = data.get(2*i)?;
-                            let b = data.get(2*i + 1)?;
-                            let a = VALS[*a as usize];
-                            if a == 0xff {
-                                return None;
-                            }
-                            let b = VALS[*b as usize];
-                            if b == 0xff {
-                                return None;
-                            }
-                            buf[31-i] = (a << 4) | b
-                        }
-                        Some(buf)
+                    if data.stake_address != data.stake_address_checked {
+                        data.stake_address_checked = data.stake_address.clone();
+                        data.stake_address_cap = wallet::bft::FinalizerAddress::decode(&data.stake_address).filter(|a| a.verify());
                     }
-                    let hex_dest = addr_from_str_bytes(data.stake_address.as_bytes());
+                    let hex_dest = data.stake_address_cap;
 
                     let can = hex_dest.is_some();
                     let label = "Retarget";
@@ -3119,19 +3056,19 @@ pub fn ui_left_pane(ui: &mut Context,
 
                                             if sent_stake {
                                                 for bond in &staked_roster_bonded {
-                                                    if bond.0 == staking_action.arg32_0 {
+                                                    if bond.0 == staking_action.bond_key() {
                                                         // TODO: split mono
-                                                        break 'get_label if bond.1 != staking_action.arg32_2 {
-                                                            frame_strf!(data, "{} @ {} to {} (moved to {}), now {} cTAZ", label, tx_h.0, display_str(&chunkify(&staking_action.arg32_2)), display_str(&chunkify(&bond.1)), str_from_ctaz(bond.2))
+                                                        break 'get_label if bond.1 != staking_action.target_finalizer_pk() {
+                                                            frame_strf!(data, "{} @ {} to {} (moved to {}), now {} cTAZ", label, tx_h.0, display_str(&chunkify(&staking_action.target_finalizer_pk())), display_str(&chunkify(&bond.1)), str_from_ctaz(bond.2))
                                                         } else {
-                                                            frame_strf!(data, "{} @ {} to {}, now {} cTAZ", label, tx_h.0, display_str(&chunkify(&staking_action.arg32_2)), str_from_ctaz(bond.2))
+                                                            frame_strf!(data, "{} @ {} to {}, now {} cTAZ", label, tx_h.0, display_str(&chunkify(&staking_action.target_finalizer_pk())), str_from_ctaz(bond.2))
                                                         };
                                                     }
                                                 }
 
                                                 for bond in &staked_roster_unbonded {
-                                                    if bond.0 == staking_action.arg32_0 {
-                                                        break 'get_label frame_strf!(data, "{} @ {} to {} (unstaked), now {} cTAZ", label, tx_h.0, display_str(&chunkify(&staking_action.arg32_2)), str_from_ctaz(bond.2))
+                                                    if bond.0 == staking_action.bond_key() {
+                                                        break 'get_label frame_strf!(data, "{} @ {} to {} (unstaked), now {} cTAZ", label, tx_h.0, display_str(&chunkify(&staking_action.target_finalizer_pk())), str_from_ctaz(bond.2))
                                                     }
                                                 }
                                             }
@@ -3161,7 +3098,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                             if let Some(withdrawal) = withdrawal {
                                                 let (b, h) = withdrawal;
                                                 break 'get_label if sent_stake {
-                                                    frame_strf!(data, "{} @ {} to {}, claimed @ {} for {} cTAZ", label, tx_h.0, display_str(&chunkify(&staking_action.arg32_2)), h, str_from_ctaz(b.spent_zats.into_u64()))
+                                                    frame_strf!(data, "{} @ {} to {}, claimed @ {} for {} cTAZ", label, tx_h.0, display_str(&chunkify(&staking_action.target_finalizer_pk())), h, str_from_ctaz(b.spent_zats.into_u64()))
                                                 } else {
                                                     frame_strf!(data, "{} @ {}, claimed @ {} for {} cTAZ", label, tx_h.0, h, str_from_ctaz(b.spent_zats.into_u64()))
                                                 };
@@ -3169,7 +3106,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
                                             // fallback if not found anywhere, not ideal
                                             if sent_stake {
-                                                frame_strf!(data, "{} @ {} to {}", label, tx_h.0, display_str(&chunkify(&staking_action.arg32_2)))
+                                                frame_strf!(data, "{} @ {} to {}", label, tx_h.0, display_str(&chunkify(&staking_action.target_finalizer_pk())))
                                             } else {
                                                 frame_strf!(data, "{} @ {}", label, tx_h.0)
                                             }
@@ -3438,10 +3375,12 @@ pub fn ui_right_pane(ui: &mut Context,
             ..Decl
         }) {
 
-            let mut recv_address = String::new();
-            for b in wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap().0.iter().rev() {
-                recv_address.push_str(&format!("{:02x}", b));
-            }
+            // The full self-certifying address (pub key + signature); before the
+            // crosslink service publishes it, fall back to an all-zero address so
+            // the truncated [xxxxxxxx..xxxxxxxx] display below stays in bounds.
+            let recv_address = wallet::TENDERLINK_ADDRESS.lock().unwrap()
+                .unwrap_or(wallet::bft::FinalizerAddress { pub_key: wallet::bft::PubKeyID::NIL, sig: wallet::bft::TMSig::NIL })
+                .encode();
 
             let width = ui.scale(160.0);
             let radius = ui.scale(16.0);
