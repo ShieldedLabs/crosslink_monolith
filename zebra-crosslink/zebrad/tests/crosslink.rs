@@ -399,7 +399,12 @@ fn crosslink_test_basic_finality() {
     let mut gen =
         BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
 
-    let miner_addr2 = zcash_keys::address::Address::Tex([1; 20]);
+    // A second, distinct, valid transparent P2PKH miner (a different coinbase => different
+    // block hashes, so the fork actually competes). Tex addresses are rejected by the
+    // Ironwood v6 coinbase builder ("Address not supported for miner rewards").
+    let miner_addr2 = zcash_keys::address::Address::Transparent(
+        zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
+    );
     let n = 18; // TODO: this fails with higher numbers due to block verification
     let mut pow = vec![gen.tip.clone()];
     let mut side: Vec<Arc<Block>> = vec![];
@@ -589,7 +594,12 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
     let bft = next_pos(pos_h, fat_ptr, &pow[9..12], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
-    let miner_addr2 = zcash_keys::address::Address::Tex([1; 20]);
+    // A second, distinct, valid transparent P2PKH miner (a different coinbase => different
+    // block hashes, so the fork actually competes). Tex addresses are rejected by the
+    // Ironwood v6 coinbase builder ("Address not supported for miner rewards").
+    let miner_addr2 = zcash_keys::address::Address::Transparent(
+        zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
+    );
     for _ in 10..18 {
         tf.push_instr_load_pow(&genb.next_block(&miner_addr2), SHOULD_FAIL);
     }
@@ -634,7 +644,12 @@ fn crosslink_pow_switch_to_finalized_chain_fork_even_though_longer_chain_exists(
     tf.push_instr_expect_pow_chain_length(19, 0);
 
     // small sidechain
-    let miner_addr2 = zcash_keys::address::Address::Tex([1; 20]);
+    // A second, distinct, valid transparent P2PKH miner (a different coinbase => different
+    // block hashes, so the fork actually competes). Tex addresses are rejected by the
+    // Ironwood v6 coinbase builder ("Address not supported for miner rewards").
+    let miner_addr2 = zcash_keys::address::Address::Transparent(
+        zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
+    );
     for _ in 10..13 {
         pow.push(genb.next_block(&miner_addr2));
         tf.push_instr_load_pow(&genb.tip, 0);
@@ -664,6 +679,10 @@ struct BlockGen {
     // NOTE: these roots need updating if we include shielded transactions
     sapling_root: sapling::tree::Root,
     orchard_root: orchard::tree::Root,
+    // Ironwood (NU6.3) note-commitment root. Its type is orchard::tree::Root and its value is
+    // ignored by the chain-history commitment before NU6.3 (which regtest never reaches), so an
+    // empty tree root is correct for every block we generate.
+    ironwood_root: orchard::tree::Root,
 
     history_tree: HistoryTree,
 
@@ -683,6 +702,7 @@ impl BlockGen {
             network: Network::new_regtest(Default::default()),
             sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
             orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+            ironwood_root: orchard::tree::NoteCommitmentTree::default().root(),
             history_tree: HistoryTree::default(),
             tip,
         }
@@ -705,9 +725,11 @@ impl BlockGen {
         let history_tree = HistoryTree::default();
         let time = chrono::DateTime::<Utc>::from_timestamp(1758127904, 0).expect("valid time");
 
-        // NOTE: the first block after genesis appears to need this specific difficulty
+        // Regtest difficulty is constant; Ironwood v6 expects the same threshold for the
+        // first block after genesis as for every later block (the old special-cased value is
+        // now rejected as InvalidDifficultyThreshold).
         let difficulty_threshold =
-            CompactDifficulty::from_bytes_in_display_order(&[0x20, 0x0c, 0xa6, 0x3f]).unwrap();
+            CompactDifficulty::from_bytes_in_display_order(&[0x20, 0x0f, 0x0f, 0x0f]).unwrap();
 
         let tip = BlockGen::create_block(
             &network,
@@ -724,6 +746,7 @@ impl BlockGen {
             history_tree,
             sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
             orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+            ironwood_root: orchard::tree::NoteCommitmentTree::default().root(),
             tip,
         }
     }
@@ -738,30 +761,32 @@ impl BlockGen {
         difficulty_threshold: CompactDifficulty,
         extra_txs: &[Arc<Transaction>],
     ) -> Arc<zebra_chain::block::Block> {
-        let coinbase_outputs =
-            zebra_rpc::methods::types::get_block_template::standard_coinbase_outputs(
-                network,
-                height,
-                miner_addr,
-                // NOTE: NU6 onward requires coinbase outputs == subsidy + fees exactly,
-                // so extra_txs must be zero-fee for this 0 to stay correct
-                zebra_chain::amount::Amount::new(0),
-            );
-
-        let coinbase_tx = if true {
-            zebra_chain::transaction::Transaction::new_v4_coinbase(
-                height,
-                coinbase_outputs,
-                Vec::new(),
-            )
-        } else {
-            zebra_chain::transaction::Transaction::new_v5_coinbase(
-                network,
-                height,
-                coinbase_outputs,
-                Vec::new(),
-            )
+        // Build the coinbase the same way the production miner path does. Ironwood v6 removed
+        // the old `standard_coinbase_outputs` / `Transaction::new_v*_coinbase` helpers, so we go
+        // MinerParams -> TransactionTemplate::new_coinbase -> deserialize. This is
+        // network-agnostic (not regtest-specific), which is what the fuzzer needs too. Extra txs
+        // must be zero-fee: NU6 onward requires coinbase outputs == subsidy + fees exactly, so the
+        // coinbase fee is 0.
+        use zebra_rpc::methods::types::get_block_template::MinerParams;
+        use zebra_rpc::methods::types::transaction::TransactionTemplate;
+        let mining_config = zebra_rpc::config::mining::Config {
+            miner_address: Some(miner_addr.to_zcash_address(network)),
+            ..Default::default()
         };
+        let miner_params = MinerParams::new(network, mining_config).expect("valid miner params");
+        // `data()` is the public derive_getters accessor for the template's serialized bytes; no
+        // rpc-crate change is needed to reach the built coinbase transaction.
+        let coinbase_tx: Transaction = TransactionTemplate::new_coinbase(
+            network,
+            height,
+            &miner_params,
+            zebra_chain::amount::Amount::zero(),
+        )
+        .expect("valid coinbase template")
+        .data()
+        .as_ref()
+        .zcash_deserialize_into()
+        .expect("coinbase template deserializes");
 
         let mut transactions: Vec<Arc<Transaction>> = Vec::with_capacity(1 + extra_txs.len());
         transactions.push(coinbase_tx.into());
@@ -829,8 +854,11 @@ impl BlockGen {
             .push(
                 &self.network,
                 self.tip.clone(),
-                &self.sapling_root,
-                &self.orchard_root,
+                zebra_chain::primitives::zcash_history::BlockCommitmentTreeRoots {
+                    sapling: &self.sapling_root,
+                    orchard: &self.orchard_root,
+                    ironwood: &self.ironwood_root,
+                },
             )
             .unwrap();
 
@@ -876,7 +904,12 @@ fn crosslink_gen_pow_fork() {
     }
     tf.push_instr_expect_pow_chain_length(7, 0);
 
-    let miner_addr2 = zcash_keys::address::Address::Tex([1; 20]);
+    // A second, distinct, valid transparent P2PKH miner (a different coinbase => different
+    // block hashes, so the fork actually competes). Tex addresses are rejected by the
+    // Ironwood v6 coinbase builder ("Address not supported for miner rewards").
+    let miner_addr2 = zcash_keys::address::Address::Transparent(
+        zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
+    );
     for _ in 4..8 {
         tf.push_instr_load_pow(&genb.next_block(&miner_addr2), 0);
     }
@@ -903,12 +936,17 @@ fn crosslink_gen_pow_fork() {
 // UTXOs or shielded proofs: `has_inputs_and_outputs` waives the inputs/outputs rule for
 // it. The amount must be 0 unless the bond is funded: the per-tx value balance must be
 // non-negative, and coinbase outputs can't fund it before they mature (100 blocks).
+// `target_finalizer` is a FinalizerAddress (a signed capability), not a bare key: consensus
+// verifies its embedded signature (delegation.rs `addr.verify()`), so it must be minted from a
+// real signing key via `FinalizerAddress::create`. The roster is keyed on its pub_key
+// (`target_finalizer_pk`). The bond's own `signature` is not consensus-checked, so a placeholder
+// is fine.
 fn staking_tx_create_bond(
     bond_key: [u8; 32],
-    target_finalizer: [u8; 32],
+    target_finalizer: zcash_primitives::bft::FinalizerAddress,
     amount_zats: u64,
 ) -> Arc<Transaction> {
-    use zcash_primitives::transaction::StakingAction_CreateNewDelegationBond;
+    use zcash_primitives::transaction::StakingAction;
 
     Arc::new(Transaction::VCrosslink {
         // must match NetworkUpgrade::current at the block's height (default regtest
@@ -920,16 +958,14 @@ fn staking_tx_create_bond(
         outputs: Vec::new(),
         sapling_shielded_data: None,
         orchard_shielded_data: None,
-        staking_action: Some(
-            StakingAction_CreateNewDelegationBond {
-                amount_zats,
-                unique_pubkey: bond_key,
-                challenge: [0; 32],
-                target_finalizer,
-                signature: [0; 64],
-            }
-            .to_union(),
-        ),
+        ironwood_shielded_data: None,
+        staking_action: Some(StakingAction::CreateNewDelegationBond {
+            amount_zats,
+            unique_pubkey: bond_key,
+            bond_salt: [0; 32],
+            target_finalizer,
+            signature: [0; 64],
+        }),
     })
 }
 
@@ -944,11 +980,16 @@ fn crosslink_pow_block_with_staking_tx() {
         BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
     tf.push_instr_load_pow(&gen.tip, 0);
 
+    // A validly-minted finalizer target (its embedded signature must verify in consensus).
+    let target = zcash_primitives::bft::FinalizerAddress::create(
+        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").1,
+    );
+
     // height 2 is the first height whose commitment is the ZIP-244 hashBlockCommitments
     // (height 1 carries the reserved all-zero commitment), so this exercises both the
     // merkle root and the auth-data commitment accounting for the extra transaction
     let block_with_tx =
-        gen.next_block_with_txs(&miner_addr, &[staking_tx_create_bond([0xcd; 32], [0xab; 32], 0)]);
+        gen.next_block_with_txs(&miner_addr, &[staking_tx_create_bond([0xcd; 32], target, 0)]);
     assert_eq!(block_with_tx.transactions.len(), 2);
     tf.push_instr_load_pow(&block_with_tx, 0);
 
@@ -962,7 +1003,7 @@ fn crosslink_pow_block_with_staking_tx() {
     let mut tampered = gen.next_block(&miner_addr).as_ref().clone();
     tampered
         .transactions
-        .push(staking_tx_create_bond([0xee; 32], [0xab; 32], 0));
+        .push(staking_tx_create_bond([0xee; 32], target, 0));
     tf.push_instr_load_pow(&tampered, SHOULD_FAIL);
     tf.push_instr_expect_pow_chain_length(5, 0);
 
@@ -1082,14 +1123,17 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
 
-    let (_, _prv_key, pub_key) =
+    let (_, prv_key, pub_key) =
         zebra_crosslink::rng_private_public_key_from_address("some_pub_key".as_bytes());
+    // The roster is keyed on the finalizer address's pub_key (target_finalizer_pk), which is
+    // pub_key here, so EXPECT_ROSTER_INCLUDES(pub_key) below matches.
+    let target = zcash_primitives::bft::FinalizerAddress::create(&prv_key);
 
     // NOTE: the bond must be in the height-1 block: the BFT block over headers 1..=3
     // finalizes height 1, and the roster snapshot taken at finalization only sees bonds
     // already in the finalized state. Amount 0 as the bond can't be funded (see
     // staking_tx_create_bond).
-    let staking_tx = staking_tx_create_bond([0xcd; 32], pub_key.0, 0);
+    let staking_tx = staking_tx_create_bond([0xcd; 32], target, 0);
     let mut gen = BlockGen::init_at_genesis_plus_1_with_txs(
         network,
         BlockGen::REGTEST_GENESIS_HASH,
