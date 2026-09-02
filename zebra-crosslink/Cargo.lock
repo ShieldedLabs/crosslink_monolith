@@ -10008,6 +10008,7 @@ dependencies = [
  "zcash_keys",
  "zcash_primitives",
  "zcash_script",
+ "zcash_transparent",
  "zebra-chain",
  "zebra-consensus",
  "zebra-crosslink",

@@ -60,6 +60,12 @@ features = [
 name = "zebrad-tests"
 path = "tests/main.rs"
 
+# Crosslink test-format integration tests. Kept as their own target (autotests = false)
+# rather than a module of tests/main.rs: each test boots a full node and exits the process.
+[[test]]
+name = "crosslink"
+path = "tests/crosslink.rs"
+
 [features]
 
 # No-op, kept for compatibility with build scripts that still pass `--features new-net`.
@@ -322,6 +328,7 @@ tokio-stream = { workspace = true }
 
 zcash_keys = { workspace = true }
 zcash_primitives = { workspace = true }
+zcash_transparent = { workspace = true }
 
 # test feature lightwalletd-grpc-tests
 prost = { workspace = true }
