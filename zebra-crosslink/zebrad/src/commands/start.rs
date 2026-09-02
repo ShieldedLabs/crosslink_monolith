@@ -477,19 +477,6 @@ impl StartCmd {
         read_only_state_service.log_db_metrics();
 
         // Drive the finalizer-slashing bond index: catch up the backlog at startup, then keep up live.
-        {
-            let slashed_finalizers: std::collections::BTreeSet<[u8; 32]> = config
-                .crosslink
-                .hardforks
-                .iter()
-                .flat_map(|hf| hf.terminated_finalizers.iter().map(|f| f.0))
-                .collect();
-            tokio::spawn(zebra_state::drive_slash_index(
-                read_only_state_service.db_clone(),
-                slashed_finalizers,
-            ));
-        }
-
         let state = ServiceBuilder::new()
             .buffer(Self::state_buffer_bound())
             .service(state_service);

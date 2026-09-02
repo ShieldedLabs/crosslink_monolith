@@ -1,592 +1,84 @@
-//! Bond histories
-
-// To burn the bonds of a finalizer `T` slashed at activation height `A`, we must
-// find every bond delegated to `T` at any point in the window `[A - W, A)`. This
-// includes bonds still pointing at `T` (sitting ducks) and bonds that retargeted
-// or unbonded away from `T` inside the analysis window (cockroaches/fleers). The
-// staking action that moves a bond records only its *new* target, so we scan the
-// chain and reconstruct bonds' target histories. We could persist every bond's
-// history (which we eventually want, to avoid re-scanning when a new social slash
-// is added) but for now we persist only bonds that delegated to slashed
-// finalizers, so the index stays small.
-//
-// The scan is NOT one-shot. Scanning ~200k blocks can take hours, so it must run
-// at startup (long before any activation height) and be pausable/resumable, then
-// keep up live as finalization advances. So it is incremental: a persisted
-// watermark (`SlashIndexMeta.next_height`) records the first finalized height not
-// yet incorporated, and [`ZebraDb::advance_slash_index`] processes a bounded
-// chunk of blocks at a time, writing the interval rows AND the new watermark in
-// one atomic batch. The bulk is a chunked catch-up at startup
-// ([`ZebraDb::catch_up_slash_index`]); the remainder is the same `advance` call
-// driven per finalization. A full rescan (reset to genesis) happens only when the
-// configured slashed set changes. Between updates it answers
-// [`ZebraDb::bonds_burned_by`] for any window at or below the watermark.
+//! Hardfork slash burns.
+//!
+//! To burn the bonds of a finalizer `T` slashed at activation height `A`, we must
+//! find every bond delegated to `T` at any point in the window `(A - W, A]`. This
+//! includes bonds still pointing at `T` (sitting ducks) and bonds that retargeted
+//! or unbonded away from `T` inside the window (cockroaches/fleers).
+//!
+//! Because a Retarget action names both its `from` and `to` finalizers, the whole
+//! computation is lazy and local: wait until the activation block, then combine
+//! the current bond state (which names every bond still parked on, or unbonding
+//! from, a terminated finalizer) with a read of the W blocks below activation
+//! (whose Retarget `from`s name every bond that left one inside the window).
+//! No genesis scan, no persistent index, no background catch-up.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
-use zebra_chain::block::Height;
+use zebra_chain::block::{Block, Height};
 
 pub use zcash_primitives::transaction::SLASH_ANALYSIS_WINDOW;
-pub use zcash_primitives::transaction::StakingActionKind;
 
-use crate::{
-    service::finalized_state::{
-        disk_db::{DiskWriteBatch, WriteDisk},
-        disk_format::{slashing::{SlashIndexMeta, SlashedBondKey}, BondKey, MAX_ON_DISK_HEIGHT},
-        zebra_db::ZebraDb,
-        TypedColumnFamily,
-    },
-    HashOrHeight,
+use crate::service::{
+    finalized_state::disk_format::{BondKey, DelegationBond},
+    non_finalized_state::BondStatusInChain,
 };
 
-pub const SLASHED_BOND_INTERVALS: &str = "slashed_bond_intervals";
-pub const SLASHED_BOND_INDEX_META: &str = "slashed_bond_index_meta";
-
-pub type SlashedBondIntervalsCf<'cf> = TypedColumnFamily<'cf, SlashedBondKey, Height>;
-pub type SlashedBondIndexMetaCf<'cf> = TypedColumnFamily<'cf, (), SlashIndexMeta>;
-
-/// in-memory currently-open runs, used while scanning.
-/// `bond -> (slashed finalizer it currently points at, height the run began)`.
-/// Holds only bonds currently delegated to a slashed finalizer.
-/// Carried across `advance` calls and reconstructable from the index on restart
-/// (see [`ZebraDb::load_open_slash_runs`]).
-pub type OpenSlashRuns = HashMap<BondKey, ([u8; 32], Height)>;
-
-/// Each staking action modifies or creates an interval.
-/// You can apply these modifications to a persistent database, or in-memory nonfinalized scanning.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SlashRunChange {
-    Open(SlashedBondKey), // begin a run; persisted as a sentinel-ended (still-open) row
-    Close(SlashedBondKey, Height), // End a run that spanned >= 1 block, end height (exclusive)
-    Drop(SlashedBondKey), // run opened & closed within one block; not persisted
-}
-
-// Retarget/unbond: Close the run, or drop it if it never spanned a block.
-fn close_slash_run(
-    open: &mut OpenSlashRuns,
-    bond: BondKey,
-    height: Height,
-    out: &mut Vec<SlashRunChange>,
-) {
-    if let Some((finalizer, start)) = open.remove(&bond) {
-        let key = SlashedBondKey { finalizer, start, bond };
-        out.push(if start.0 < height.0 {
-            SlashRunChange::Close(key, height)
-        } else {
-            SlashRunChange::Drop(key)
-        });
-    }
-}
-
-// bond arrived at a finalizer; open a run, but only if that finalizer is slashed
-fn open_slash_run(
-    open: &mut OpenSlashRuns,
+/// The burn set for a hardfork activating at `activation`: every bond delegated
+/// to a finalizer in `slashed` at any point in `(activation - W, activation]`.
+///
+/// `bonds` is the bond state *after* the activation block's staking actions (the
+/// live commit path burns after applying the block), and `window_blocks` yields
+/// the blocks at heights `(activation - W, activation]`, in any order — no state
+/// is threaded between them.
+///
+/// Every delegation stretch onto a slashed finalizer is caught by exactly one of
+/// two checks:
+/// - the stretch reaches the present: the bond still targets `T` in `bonds`,
+///   either Active or Unbonding (unbonding keeps the target; its `created_at`
+///   was rewritten to the unbonding location, which dates the stretch's end, so
+///   a bond that unbonded at or before the window start is spared);
+/// - the stretch ended with an in-window Retarget: that action's `from` is `T`.
+/// A stretch that *began* in the window needs no check of its own — it either
+/// still stands (first case) or ended by retarget (second) or by unbonding
+/// (first, via the kept target). Withdrawal can't end an in-window stretch:
+/// withdrawing takes longer than W after unbonding.
+pub fn slash_burn_set(
+    bonds: &HashMap<BondKey, (DelegationBond, BondStatusInChain)>,
+    window_blocks: impl IntoIterator<Item = Arc<Block>>,
     slashed: &BTreeSet<[u8; 32]>,
-    bond: BondKey,
-    target: [u8; 32],
-    height: Height,
-    out: &mut Vec<SlashRunChange>,
-) {
-    if slashed.contains(&target) {
-        open.insert(bond, (target, height));
-        out.push(SlashRunChange::Open(SlashedBondKey { finalizer: target, start: height, bond }));
-    }
-}
+    activation: Height,
+) -> BTreeSet<BondKey> {
+    use zcash_primitives::transaction::StakingAction;
 
-// replay a staking action against the open-run set, returning the interval-row edits it implies
-// Create-/retarget-to-slashed: Open()
-// Unbond /retarget-away: Close()
-// A run that opens and closes in one block is dropped
-pub fn apply_staking_action_to_open_runs(
-    open: &mut OpenSlashRuns,
-    slashed: &BTreeSet<[u8; 32]>,
-    height: Height,
-    kind: StakingActionKind,
-    bond: BondKey,
-    target: [u8; 32],
-) -> Vec<SlashRunChange> {
-    use StakingActionKind::*;
-    let mut out = Vec::new();
-    match kind {
-        CreateNewDelegationBond => open_slash_run(open, slashed, bond, target, height, &mut out),
-        RetargetDelegationBond => {
-            close_slash_run(open, bond, height, &mut out);
-            open_slash_run(open, slashed, bond, target, height, &mut out);
+    let window_start = activation.0.saturating_sub(SLASH_ANALYSIS_WINDOW);
+    let mut burned = BTreeSet::new();
+
+    for (bond_key, (bond, status)) in bonds {
+        if !slashed.contains(&bond.target_finalizer) {
+            continue;
         }
-        BeginDelegationUnbonding => close_slash_run(open, bond, height, &mut out),
-        // WithdrawDelegationBond: the run already closed at unbonding.
-        // Convert is deliberately ignored (decided 2026-07-02): the bond state
-        // machine doesn't implement it either, so it cannot create or retarget a
-        // bond today. When it is implemented, it needs an arm here in the same
-        // change or the burn set under-counts.
-        _ => {}
-    }
-    out
-}
-
-impl ZebraDb {
-    pub(crate) fn slashed_bond_intervals_cf(&self) -> SlashedBondIntervalsCf<'_> {
-        SlashedBondIntervalsCf::new(&self.db, SLASHED_BOND_INTERVALS)
-            .expect("column family was created when database was created")
-    }
-
-    pub(crate) fn slashed_bond_index_meta_cf(&self) -> SlashedBondIndexMetaCf<'_> {
-        SlashedBondIndexMetaCf::new(&self.db, SLASHED_BOND_INDEX_META)
-            .expect("column family was created when database was created")
-    }
-
-    /// Bonds delegated to `finalizer` anywhere in `[activation - window_len, activation)`.
-    /// Only complete once `activation <= slash_index_next_height()`.
-    // @Todo @Refactor: batch process multiple finalizers?
-    pub fn bonds_burned_by(&self, finalizer: &[u8; 32], activation: Height) -> BTreeSet<BondKey> {
-        let window_len = SLASH_ANALYSIS_WINDOW; // Could be a parameter in future, etc etc
-        let window_start = activation.0.saturating_sub(window_len);
-
-        // All runs for `finalizer` that began before `activation`.
-        let lower = SlashedBondKey {
-            finalizer: *finalizer,
-            start: Height(0),
-            bond: [0; 32],
+        let in_window = match status {
+            BondStatusInChain::Active => true,
+            BondStatusInChain::Unbonding => bond.created_at.height.0 > window_start,
+            BondStatusInChain::Withdrawn | BondStatusInChain::Burned => false,
         };
-        let upper = SlashedBondKey {
-            finalizer: *finalizer,
-            start: activation,
-            bond: [0; 32],
-        };
-
-        let cf = self.slashed_bond_intervals_cf();
-        let mut burned = BTreeSet::new();
-        for (key, end) in cf.zs_forward_range_iter(lower..upper) {
-            // The scan already bounds start < activation; a run [start, end)
-            // overlaps [window_start, activation) iff it also ends after the
-            // window's first height. Open runs (end == MAX) always do.
-            if end.0 > window_start {
-                burned.insert(key.bond);
-            }
-        }
-
-        burned
-    }
-    /// Bonds delegated to any of `finalizers` anywhere in `[activation - window_len, activation)`.
-    /// Only complete once `activation <= slash_index_next_height()`.
-    // @Todo @Refactor: delete this wrapper and make bonds_burned_by batch process?
-    pub fn bonds_burned_by_any(&self, finalizers: &[[u8; 32]], activation: Height) -> BTreeSet<BondKey> {
-        let mut burned = BTreeSet::new();
-        for finalizer in finalizers {
-            burned.extend(self.bonds_burned_by(finalizer, activation));
-        }
-        burned
-    }
-
-    /// First finalized height not yet scanned into the index (0 = nothing yet).
-    pub fn slash_index_next_height(&self) -> Height {
-        self.slashed_bond_index_meta_cf()
-            .zs_get(&())
-            .map(|meta| meta.next_height)
-            .unwrap_or(Height(0))
-    }
-
-    /// Rebuilds the open-run set (sentinel-ended rows) from the index, e.g. on restart.
-    pub fn load_open_slash_runs(&self) -> OpenSlashRuns {
-        self.slashed_bond_intervals_cf()
-            .zs_items_in_range_ordered(..)
-            .into_iter()
-            .filter(|(_, end)| *end == MAX_ON_DISK_HEIGHT)
-            .map(|(key, _)| (key.bond, (key.finalizer, key.start)))
-            .collect()
-    }
-
-    /// Open-run set to resume from; resets the index to genesis if the slashed set changed.
-    pub fn prepare_slash_index(&self, slashed: &BTreeSet<[u8; 32]>) -> OpenSlashRuns {
-        let want: Vec<[u8; 32]> = slashed.iter().copied().collect();
-        match self.slashed_bond_index_meta_cf().zs_get(&()) {
-            Some(meta) if meta.slashed == want => self.load_open_slash_runs(),
-            _ => {
-                self.reset_slash_index(slashed);
-                OpenSlashRuns::new()
-            }
+        if in_window {
+            burned.insert(*bond_key);
         }
     }
 
-    /// Clears the index and sets the watermark back to genesis for `slashed`.
-    pub fn reset_slash_index(&self, slashed: &BTreeSet<[u8; 32]>) {
-        let keys: Vec<SlashedBondKey> = self
-            .slashed_bond_intervals_cf()
-            .zs_items_in_range_ordered(..)
-            .into_keys()
-            .collect();
-
-        let intervals = self
-            .db
-            .cf_handle(SLASHED_BOND_INTERVALS)
-            .expect("column family exists");
-        let meta_cf = self
-            .db
-            .cf_handle(SLASHED_BOND_INDEX_META)
-            .expect("column family exists");
-
-        let mut batch = DiskWriteBatch::new();
-        for key in keys {
-            batch.zs_delete(&intervals, key);
-        }
-        batch.zs_insert(
-            &meta_cf,
-            (),
-            SlashIndexMeta {
-                next_height: Height(0),
-                slashed: slashed.iter().copied().collect(),
-            },
-        );
-        self.db
-            .write(batch)
-            .expect("resetting the slash index should succeed");
-    }
-
-    /// incorporate a bounded chunk of finalized blocks, starting at the watermark,
-    /// updating `open` and writing the interval rows and the advanced watermark
-    /// in a single atomic batch.
-    ///
-    /// Returns the new watermark (first not-yet-incorporated height).
-    /// Idempotently resumable: on restart, reload `open` via [`ZebraDb::load_open_slash_runs`] and call again.
-    ///
-    /// A run is opened (sentinel-ended row) the moment a bond targets a slashed
-    /// finalizer and closed (real end) when it leaves; a run that opens and closes
-    /// in the same block is dropped, collapsing same-block churn to the net
-    /// end-of-block target.
-    pub fn advance_slash_index(
-        &self,
-        slashed: &BTreeSet<[u8; 32]>,
-        open: &mut OpenSlashRuns,
-        max_blocks: u32,
-    ) -> Height {
-        let from = self.slash_index_next_height().0;
-        let Some(tip) = self.finalized_tip_height() else {
-            return Height(from);
-        };
-        if from > tip.0 {
-            return Height(from);
-        }
-        let to = tip.0.min(from.saturating_add(max_blocks.saturating_sub(1)));
-
-        let intervals = self
-            .db
-            .cf_handle(SLASHED_BOND_INTERVALS)
-            .expect("column family exists");
-        let meta_cf = self
-            .db
-            .cf_handle(SLASHED_BOND_INDEX_META)
-            .expect("column family exists");
-        let mut batch = DiskWriteBatch::new();
-
-        for h in from..=to {
-            let height = Height(h);
-            let Some(block) = self.block(HashOrHeight::Height(height)) else {
-                continue;
-            };
-
-            for tx in block.transactions.iter() {
-                let Some(action) = tx.staking_action() else {
-                    continue;
-                };
-                for change in apply_staking_action_to_open_runs(
-                    open, slashed, height, action.kind(), action.bond_key(), action.target_finalizer_pk(),
-                ) {
-                    match change {
-                        SlashRunChange::Open(key) => {
-                            batch.zs_insert(&intervals, key, MAX_ON_DISK_HEIGHT)
-                        }
-                        SlashRunChange::Close(key, end) => batch.zs_insert(&intervals, key, end),
-                        SlashRunChange::Drop(key) => batch.zs_delete(&intervals, key),
-                    }
+    for block in window_blocks {
+        for tx in block.transactions.iter() {
+            if let Some(StakingAction::RetargetDelegationBond { unique_pubkey, from_finalizer, .. }) =
+                tx.staking_action()
+            {
+                if slashed.contains(&from_finalizer.pub_key.0) {
+                    burned.insert(*unique_pubkey);
                 }
             }
         }
-
-        let next = Height(to + 1);
-        batch.zs_insert(
-            &meta_cf,
-            (),
-            SlashIndexMeta {
-                next_height: next,
-                slashed: slashed.iter().copied().collect(),
-            },
-        );
-        self.db
-            .write(batch)
-            .expect("writing a slash index chunk should succeed");
-
-        next
     }
 
-    /// intended for bulk catch-up at startup
-    pub fn catch_up_slash_index(&self, slashed: &BTreeSet<[u8; 32]>, max_blocks: u32) {
-        let mut open = self.prepare_slash_index(slashed);
-        while let Some(tip) = self.finalized_tip_height() {
-            if self.slash_index_next_height().0 > tip.0 {
-                break;
-            }
-            self.advance_slash_index(slashed, &mut open, max_blocks);
-        }
-    }
-
-    /// One resumable step: prepare (reset if the slashed set changed), then advance one chunk.
-    pub fn advance_slash_index_step(&self, slashed: &BTreeSet<[u8; 32]>, max_blocks: u32) -> Height {
-        let mut open = self.prepare_slash_index(slashed);
-        self.advance_slash_index(slashed, &mut open, max_blocks)
-    }
-}
-
-/// Background driver: catch the index up to the finalized tip, then keep up as it advances.
-/// The heavy scan runs in chunks on a blocking thread and resumes across restarts via the watermark.
-pub async fn drive_slash_index(db: ZebraDb, slashed: BTreeSet<[u8; 32]>) {
-    if slashed.is_empty() {
-        return;
-    }
-    const CHUNK: u32 = 1000;
-    loop {
-        let db = db.clone();
-        let slashed = slashed.clone();
-        let caught_up = match tokio::task::spawn_blocking(move || {
-            let next = db.advance_slash_index_step(&slashed, CHUNK);
-            db.finalized_tip_height().map_or(true, |tip| next.0 > tip.0)
-        })
-        .await
-        {
-            Ok(caught_up) => caught_up,
-            Err(_) => return,
-        };
-        if caught_up {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
-        service::finalized_state::STATE_COLUMN_FAMILIES_IN_CODE,
-        Config,
-    };
-    use zebra_chain::parameters::Network::Mainnet;
-
-    fn new_ephemeral_db() -> ZebraDb {
-        ZebraDb::new(
-            &Config::ephemeral(),
-            STATE_DATABASE_KIND,
-            &state_database_format_version_in_code(),
-            &Mainnet,
-            true,
-            STATE_COLUMN_FAMILIES_IN_CODE.iter().map(ToString::to_string),
-            false,
-        ).expect("opening an ephemeral database should succeed")
-    }
-
-    fn put(db: &ZebraDb, finalizer: [u8; 32], start: u32, bond: [u8; 32], end: Height) {
-        db.slashed_bond_intervals_cf()
-            .new_batch_for_writing()
-            .zs_insert(
-                &SlashedBondKey {
-                    finalizer,
-                    start: Height(start),
-                    bond,
-                },
-                &end,
-            )
-            .write_batch()
-            .expect("write should succeed");
-    }
-
-    fn set(finalizers: &[[u8; 32]]) -> BTreeSet<[u8; 32]> {
-        finalizers.iter().copied().collect()
-    }
-
-    /// The overlap query returns exactly the bonds delegated to the finalizer
-    /// within `[A - W, A)`: sitting ducks, fleers that left inside the window, and
-    /// bonds that joined inside the window — but not bonds that left at or before
-    /// the window start, started at/after activation, or pointed elsewhere.
-    #[test]
-    fn burned_by_overlap() {
-        let db = new_ephemeral_db();
-        let t = [1u8; 32];
-        let other = [2u8; 32];
-        let b = |n: u8| [n; 32];
-
-        put(&db, t, 500, b(1), MAX_ON_DISK_HEIGHT); // sitting duck (open across window)
-        put(&db, t, 600, b(2), Height(800)); // fled inside window
-        put(&db, t, 400, b(3), Height(650)); // fled before window start
-        put(&db, t, 900, b(4), Height(950)); // joined inside window
-        put(&db, t, 1000, b(5), MAX_ON_DISK_HEIGHT); // started at activation
-        put(&db, other, 600, b(6), MAX_ON_DISK_HEIGHT); // different finalizer
-        put(&db, t, 500, b(7), Height(700)); // fled exactly at window start
-        put(&db, t, 700, b(8), MAX_ON_DISK_HEIGHT); // joined exactly at window start
-
-        let burned = db.bonds_burned_by(&t, Height(1000));
-
-        let expected: BTreeSet<BondKey> = [b(1), b(2), b(4), b(8)].into_iter().collect();
-        assert_eq!(burned, expected);
-    }
-
-    /// The open-run set is reconstructed from sentinel-ended rows only.
-    #[test]
-    fn open_runs_are_reconstructed() {
-        let db = new_ephemeral_db();
-        let t = [1u8; 32];
-        let b = |n: u8| [n; 32];
-
-        put(&db, t, 100, b(1), MAX_ON_DISK_HEIGHT); // open
-        put(&db, t, 200, b(2), Height(250)); // closed
-        put(&db, t, 300, b(3), MAX_ON_DISK_HEIGHT); // open
-
-        let open = db.load_open_slash_runs();
-
-        let expected: OpenSlashRuns =
-            [(b(1), (t, Height(100))), (b(3), (t, Height(300)))].into_iter().collect();
-        assert_eq!(open, expected);
-    }
-
-    /// `prepare` reuses progress when the slashed set is unchanged, but resets the
-    /// index (clears rows, watermark back to genesis) when it changes.
-    #[test]
-    fn prepare_resets_only_when_slashed_set_changes() {
-        let db = new_ephemeral_db();
-        let t = [1u8; 32];
-        let u = [9u8; 32];
-
-        db.reset_slash_index(&set(&[t]));
-        put(&db, t, 100, [1u8; 32], MAX_ON_DISK_HEIGHT);
-        // Pretend the scan progressed.
-        db.slashed_bond_index_meta_cf()
-            .new_batch_for_writing()
-            .zs_insert(&(), &SlashIndexMeta { next_height: Height(500), slashed: vec![t] })
-            .write_batch()
-            .expect("write should succeed");
-
-        // Same set: progress and rows are preserved.
-        let open = db.prepare_slash_index(&set(&[t]));
-        assert_eq!(open.len(), 1);
-        assert_eq!(db.slash_index_next_height(), Height(500));
-
-        // Different set: full reset.
-        let open = db.prepare_slash_index(&set(&[t, u]));
-        assert!(open.is_empty());
-        assert_eq!(db.slash_index_next_height(), Height(0));
-        assert!(db.load_open_slash_runs().is_empty());
-    }
-
-    // --- pure reducer: membership logic shared between the disk db scan and the nonfinalized inmemory (F, A) tail ---
-
-    // create->slashed opens a run; retargeting away to an unslashed finalizer closes it with a real end and opens nothing new.
-    #[test]
-    fn reducer_open_then_retarget_away_closes() {
-        let t = [1u8; 32];
-        let other = [2u8; 32];
-        let slashed = set(&[t]);
-        let b = [7u8; 32];
-        let mut open = OpenSlashRuns::new();
-
-        let c = apply_staking_action_to_open_runs(
-            &mut open, &slashed, Height(100),
-            StakingActionKind::CreateNewDelegationBond, b, t,
-        );
-        assert_eq!(
-            c,
-            vec![SlashRunChange::Open(SlashedBondKey { finalizer: t, start: Height(100), bond: b })]
-        );
-        assert_eq!(open.get(&b), Some(&(t, Height(100))));
-
-        let c = apply_staking_action_to_open_runs(
-            &mut open, &slashed, Height(150),
-            StakingActionKind::RetargetDelegationBond, b, other,
-        );
-        assert_eq!(
-            c,
-            vec![SlashRunChange::Close(
-                SlashedBondKey { finalizer: t, start: Height(100), bond: b },
-                Height(150),
-            )]
-        );
-        assert!(open.is_empty());
-    }
-
-    /// a run that opens and closes in the same block is dropped, not persisted.
-    #[test]
-    fn reducer_same_block_churn_drops() {
-        let t = [1u8; 32];
-        let other = [2u8; 32];
-        let slashed = set(&[t]);
-        let b = [7u8; 32];
-        let mut open = OpenSlashRuns::new();
-
-        apply_staking_action_to_open_runs(
-            &mut open, &slashed, Height(100),
-            StakingActionKind::CreateNewDelegationBond, b, t,
-        );
-        let c = apply_staking_action_to_open_runs(
-            &mut open, &slashed, Height(100),
-            StakingActionKind::RetargetDelegationBond, b, other,
-        );
-        assert_eq!(
-            c,
-            vec![SlashRunChange::Drop(SlashedBondKey { finalizer: t, start: Height(100), bond: b })]
-        );
-        assert!(open.is_empty());
-    }
-
-    /// retargeting from one slashed finalizer to another closes the old run and opens a new one
-    #[test]
-    fn reducer_retarget_between_slashed() {
-        let t = [1u8; 32];
-        let u = [3u8; 32];
-        let slashed = set(&[t, u]);
-        let b = [7u8; 32];
-        let mut open = OpenSlashRuns::new();
-
-        apply_staking_action_to_open_runs(
-            &mut open, &slashed, Height(100),
-            StakingActionKind::CreateNewDelegationBond, b, t,
-        );
-        let c = apply_staking_action_to_open_runs(
-            &mut open, &slashed, Height(160),
-            StakingActionKind::RetargetDelegationBond, b, u,
-        );
-        assert_eq!(
-            c,
-            vec![
-                SlashRunChange::Close(
-                    SlashedBondKey { finalizer: t, start: Height(100), bond: b },
-                    Height(160),
-                ),
-                SlashRunChange::Open(SlashedBondKey { finalizer: u, start: Height(160), bond: b }),
-            ]
-        );
-        assert_eq!(open.get(&b), Some(&(u, Height(160))));
-    }
-
-    /// unbonding closes an open run
-    #[test]
-    fn reducer_unbond_closes() {
-        let t = [1u8; 32];
-        let slashed = set(&[t]);
-        let b = [7u8; 32];
-        let mut open = OpenSlashRuns::new();
-
-        apply_staking_action_to_open_runs(
-            &mut open, &slashed, Height(100),
-            StakingActionKind::CreateNewDelegationBond, b, t,
-        );
-        let c = apply_staking_action_to_open_runs(
-            &mut open, &slashed, Height(200),
-            StakingActionKind::BeginDelegationUnbonding, b, [0u8; 32],
-        );
-        assert_eq!(
-            c,
-            vec![SlashRunChange::Close(
-                SlashedBondKey { finalizer: t, start: Height(100), bond: b },
-                Height(200),
-            )]
-        );
-        assert!(open.is_empty());
-    }
+    burned
 }

@@ -23,10 +23,7 @@ use crate::{
         burn_delegation_bonds,
         finalized_state::{
             disk_format::{AggregatedStakes, BondKey, DelegationBond, TransactionLocation},
-            slashing::{
-                apply_staking_action_to_open_runs, OpenSlashRuns, SlashRunChange,
-                SLASH_ANALYSIS_WINDOW,
-            },
+            slashing::{slash_burn_set, SLASH_ANALYSIS_WINDOW},
             ZebraDb, STATE_COLUMN_FAMILIES_IN_CODE,
         },
         non_finalized_state::BondStatusInChain,
@@ -120,11 +117,9 @@ pub fn fixup_aggregated_stakes(
     }
 
     // At a rule's activation height A, the live commit path burns every bond
-    // that delegated to a terminated finalizer anywhere in [A - W, A), computed
-    // from the slash index plus a replay of its unindexed tail
-    // (`Chain::slash_window_burns`). This replay starts at genesis, so it sees
-    // every delegation run directly and needs no index: closed runs are burned
-    // as they close, still-open runs are swept at activation.
+    // that delegated to a terminated finalizer anywhere in (A - W, A], computed
+    // lazily at activation from the bond state plus the window's Retarget
+    // `from`s (`slash_burn_set`). The replay does exactly the same.
     let mut slash_rules: Vec<SlashRule> = config
         .hardfork_schedule
         .rules()
@@ -138,10 +133,7 @@ pub fn fixup_aggregated_stakes(
                 u32::try_from(rule.pow_activation_height).expect("at most the tip height");
             SlashRule {
                 activation,
-                window_start: activation.saturating_sub(SLASH_ANALYSIS_WINDOW),
                 finalizers: rule.terminated_finalizers.iter().map(|f| f.0).collect(),
-                open_runs: OpenSlashRuns::new(),
-                burned: BTreeSet::new(),
             }
         })
         .collect();
@@ -195,28 +187,6 @@ pub fn fixup_aggregated_stakes(
                         TransactionLocation::from_usize(height, transaction_index),
                     )?;
 
-                    // A rule's burn set is computed from the blocks strictly
-                    // below its activation, so this block feeds only the rules
-                    // still ahead of it.
-                    for rule in slash_rules
-                        .iter_mut()
-                        .filter(|rule| rule.activation > h)
-                    {
-                        for change in apply_staking_action_to_open_runs(
-                            &mut rule.open_runs,
-                            &rule.finalizers,
-                            height,
-                            staking_action.kind(),
-                            staking_action.bond_key(),
-                            staking_action.target_finalizer_pk(),
-                        ) {
-                            if let SlashRunChange::Close(key, end) = change {
-                                if end.0 > rule.window_start {
-                                    rule.burned.insert(key.bond);
-                                }
-                            }
-                        }
-                    }
                 }
             }
 
@@ -231,16 +201,13 @@ pub fn fixup_aggregated_stakes(
             // actions and rewards (`NonFinalizedState::commit_new_chain`), so
             // the burned bonds still collect this block's reward and this
             // block's snapshot already excludes them.
-            for rule in slash_rules
-                .iter_mut()
-                .filter(|rule| rule.activation == h)
-            {
-                let mut burn_set = std::mem::take(&mut rule.burned);
-                for (bond, (_, start)) in rule.open_runs.iter() {
-                    if start.0 < h {
-                        burn_set.insert(*bond);
-                    }
-                }
+            for rule in slash_rules.iter().filter(|rule| rule.activation == h) {
+                let window_start = h.saturating_sub(SLASH_ANALYSIS_WINDOW);
+                let window_blocks = ((window_start + 1)..=h).map(|wh| {
+                    db.block(HashOrHeight::Height(Height(wh)))
+                        .expect("every height at or below the activation is finalized")
+                });
+                let burn_set = slash_burn_set(&bonds, window_blocks, &rule.finalizers, height);
                 burn_delegation_bonds(&mut bonds, &burn_set);
                 println!(
                     "applied hardfork slash burns at height {h}: {} bond(s) burned for {} \
@@ -333,10 +300,7 @@ pub fn fixup_aggregated_stakes(
 /// runs on its terminated finalizers tracked from genesis.
 struct SlashRule {
     activation: u32,
-    window_start: u32,
     finalizers: BTreeSet<[u8; 32]>,
-    open_runs: OpenSlashRuns,
-    burned: BTreeSet<BondKey>,
 }
 
 fn format_stakes(stakes: &[([u8; 32], u64)]) -> String {

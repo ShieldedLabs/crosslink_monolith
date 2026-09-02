@@ -63,7 +63,6 @@ pub use disk_format::{
     FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex, TransactionLocation,
     MAX_ON_DISK_HEIGHT,
 };
-pub use zebra_db::slashing::drive_slash_index;
 pub use zebra_db::ZebraDb;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -117,7 +116,9 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "delegation_bond_by_key",
     "bond_status_by_key",
     "aggregated_stakes_by_hash",
-    // Bond histories delegated to slashed finalizers. This will evolve in the future
+    // Legacy slash-index column families, empty and unused since Retarget actions
+    // began carrying their `from` finalizer (burn sets are computed lazily at
+    // activation now); still registered so existing databases open.
     "slashed_bond_intervals",
     "slashed_bond_index_meta",
 ];

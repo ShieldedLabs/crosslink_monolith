@@ -2142,76 +2142,36 @@ impl Chain {
         Ok(())
     }
 
-    // Correct regardless of how far the slash index has advanced: heights the index
-    // hasn't reached are replayed here, from this chain or the finalized db. The
-    // readiness gate in `send_ready_non_finalized_queued` only bounds how long that
-    // replay is — it is a perf guard, not a correctness requirement.
+    // Lazy burn-set computation at activation: the chain's bond state (which at
+    // this point includes the activation block's own staking actions) plus a
+    // read of the W blocks below activation, each block from this chain or the
+    // finalized db. See `slash_burn_set` for why those two sources are complete.
     pub fn slash_window_burns(&self, db: &crate::service::finalized_state::ZebraDb, finalizers: &[[u8; 32]], activation: Height) -> BTreeSet<BondKey> {
-        pub use crate::service::finalized_state::slashing::{apply_staking_action_to_open_runs, OpenSlashRuns, SlashRunChange};
-        let window_len: u32 = crate::service::finalized_state::SLASH_ANALYSIS_WINDOW;
-        let window_start = activation.0.saturating_sub(window_len);
+        use crate::service::finalized_state::slashing::{slash_burn_set, SLASH_ANALYSIS_WINDOW};
 
         let slashed_finalizers: std::collections::BTreeSet<[u8; 32]> = finalizers.iter().copied().collect();
+        let window_start = activation.0.saturating_sub(SLASH_ANALYSIS_WINDOW);
 
-        // The index driver advances concurrently, so the read order below matters.
-        // Watermark first (earliest → widest replay), open runs second, and the
-        // interval query LAST (see the end of this function): a run the driver
-        // closes between these reads is then missing from `open_runs` and its
-        // close-action replay no-ops, but the closed interval is already on disk
-        // by the time we query it. Both sources feed one set with the same overlap
-        // predicate, so double coverage is harmless; only under-coverage isn't.
-        let     starting_from = db.slash_index_next_height().0;
-        let mut open_runs     = db.load_open_slash_runs();
-        // The index covers the union of every rule's terminated finalizers, but this
-        // activation burns only for `finalizers`. Drop the other rules' runs, or their
-        // bonds get burned here — at the wrong activation height — via the replayed
-        // Close events and the sitting-duck sweep below, both of which consume
-        // `open_runs` without checking whose finalizer a run points at.
-        open_runs.retain(|_, (run_finalizer, _)| slashed_finalizers.contains(run_finalizer));
-
-        let mut burned = BTreeSet::new();
-        for h in  ((starting_from) .. (activation.0)) {
+        let window_blocks = ((window_start + 1)..=activation.0).map(|h| {
             let height = Height(h);
-            // Heights at or below the finalized tip come from the db (the index may
-            // lag finalization); heights above it are in this chain, whose blocks
-            // are contiguous from the finalized tip up past A-1.
-            let block = self.block(crate::HashOrHeight::Height(height)).map(|cvb| cvb.block.clone())
+            self.block(crate::HashOrHeight::Height(height)).map(|cvb| cvb.block.clone())
                 .or_else(|| db.block(crate::HashOrHeight::Height(height)))
-                .expect("every height below activation is finalized or in this chain");
-            for tx in block.transactions.iter() {
-                let Some(action) = tx.staking_action() else {
-                    continue;
-                };
+                .expect("every height at or below activation is finalized or in this chain")
+        });
 
-                let changes = apply_staking_action_to_open_runs(&mut open_runs, &slashed_finalizers, height, action.kind(), action.bond_key(), action.target_finalizer_pk());
-                for change in changes {
-                    let SlashRunChange::Close(key, end) = change else {
-                        continue;
-                    };
-
-                    if end.0 > window_start {
-                        burned.insert(key.bond);
-                    }
-                }
-            }
-        }
-
-        // Detect sitting duck bonds still open on a slashed finalizer at activation
-        for (bond, (_, start)) in open_runs.iter() {
-            if start.0 < activation.0 {
-                burned.insert(*bond);
-            }
-        }
-
-        // Finalized portion, from the index — queried last (see read-order note above).
-        burned.extend(db.bonds_burned_by_any(finalizers, activation));
-
-        burned
+        slash_burn_set(&self.inner.delegation_bonds, window_blocks, &slashed_finalizers, activation)
     }
 
     // burn at activation and record the pre-burn status so reorg can revert
     pub(crate) fn apply_slash_burns(&mut self, db: &crate::service::finalized_state::ZebraDb, finalizers: &[[u8; 32]], activation: Height) {
         let burn_set = self.slash_window_burns(db, finalizers, activation);
+        tracing::info!(
+            "hardfork slash burns at height {}: burned {} bond(s) for {} terminated finalizer(s): {:?}",
+            activation.0,
+            burn_set.len(),
+            finalizers.len(),
+            burn_set.iter().map(hex::encode).collect::<Vec<_>>(),
+        );
         let reverts = crate::service::burn_delegation_bonds(&mut self.inner.delegation_bonds, &burn_set);
         if let Some(last) = self.inner.bond_burns.last_mut() {
             last.extend(reverts);
