@@ -1191,3 +1191,117 @@ fn zip_0233() {
         );
     }
 }
+
+#[cfg(test)]
+mod staking_action {
+    use super::TestUnauthorized;
+    use crate::bft::{FinalizerAddress, PubKeyID, TMSig};
+    use crate::transaction::{
+        sighash::{signature_hash, SignableInput},
+        txid::{to_txid, BlockTxCommitmentDigester, TxIdDigester},
+        Authorized, StakingAction, TransactionData, TransactionDigest, TxVersion,
+    };
+    use alloc::vec::Vec;
+    use zcash_protocol::consensus::{BlockHeight, BranchId};
+
+    const PUBKEY: [u8; 32] = [0xab; 32];
+    const SALT: [u8; 32] = [0x5a; 32];
+
+    fn create_action(bond_salt: [u8; 32]) -> StakingAction {
+        StakingAction::CreateNewDelegationBond {
+            amount_zats: 100_000,
+            unique_pubkey: PUBKEY,
+            bond_salt,
+            target_finalizer: FinalizerAddress {
+                pub_key: PubKeyID([0xf0; 32]),
+                sig: TMSig([0u8; 64]),
+            },
+            signature: [0u8; 64],
+        }
+    }
+
+    fn crosslink_digest(action: &StakingAction) -> [u8; 32] {
+        let digest = <TxIdDigester as TransactionDigest<Authorized>>::digest_crosslink(
+            &TxIdDigester,
+            &Some(*action),
+        );
+
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(digest.expect("a create action always digests").as_bytes());
+        bytes
+    }
+
+    fn block_commitment_digest(action: &StakingAction) -> [u8; 32] {
+        let digest = <BlockTxCommitmentDigester as TransactionDigest<Authorized>>::digest_crosslink(
+            &BlockTxCommitmentDigester,
+            &Some(*action),
+        );
+
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(digest.as_bytes());
+        bytes
+    }
+
+    /// Recovery reads the salt back off the chain, so the wire must carry it intact.
+    #[test]
+    fn salt_survives_the_wire() {
+        let action = create_action(SALT);
+
+        let mut bytes = Vec::new();
+        StakingAction::write(&Some(action), &mut bytes).expect("serializes");
+
+        let read = StakingAction::read(&mut bytes.as_slice())
+            .expect("deserializes")
+            .expect("staking action present");
+
+        assert_eq!(read, action);
+    }
+
+    /// A scrambled salt costs the owner the bond, which is why it must stay inside the txid
+    /// digest: covered by the txid, no third party can reach it.
+    #[test]
+    fn salt_reaches_the_txid_digest() {
+        assert_ne!(
+            crosslink_digest(&create_action(SALT)),
+            crosslink_digest(&create_action([0x5b; 32])),
+        );
+    }
+
+    /// Filling in the signature must not move the txid, or the bond signature would have to
+    /// sign itself; the block commitment must still cover it, or a relayer could strip it.
+    #[test]
+    fn signature_is_outside_the_txid_but_inside_the_block_commitment() {
+        let unsigned = create_action(SALT);
+        let mut signed = unsigned;
+        signed.set_signature([0x5c; 64]);
+
+        assert_eq!(crosslink_digest(&unsigned), crosslink_digest(&signed));
+        assert_ne!(
+            block_commitment_digest(&unsigned),
+            block_commitment_digest(&signed),
+        );
+    }
+
+    /// ZIP 244: with no transparent inputs, the shielded sighash is the txid. That holds only
+    /// if the sighash commits to everything the txid does, Ironwood bundle and staking action
+    /// included, so this guards against either being left outside every signature.
+    #[test]
+    fn shielded_sighash_equals_txid_without_transparent_inputs() {
+        let tx = TransactionData::<TestUnauthorized>::from_parts(
+            TxVersion::VCrosslink,
+            BranchId::Nu6_3,
+            0,
+            BlockHeight::from_u32(5),
+            None,
+            None,
+            None,
+            None,
+            Some(create_action(SALT)),
+        );
+        let txid_parts = tx.digest(TxIdDigester);
+        let sighash = signature_hash(&tx, &SignableInput::Shielded, &txid_parts);
+        let txid = to_txid(tx.version(), tx.consensus_branch_id(), &txid_parts);
+
+        assert_eq!(sighash.as_ref(), txid.as_ref());
+    }
+}

@@ -15,7 +15,7 @@ use crate::{
     transaction::{
         sighash::SignableInput,
         txid::{
-            hash_transparent_txid_data, to_hash, transparent_outputs_hash,
+            hash_transparent_txid_data, to_hash_v6, transparent_outputs_hash,
             transparent_prevout_hash, transparent_sequence_hash,
             ZCASH_TRANSPARENT_HASH_PERSONALIZATION,
         },
@@ -186,8 +186,9 @@ pub fn vcrosslink_signature_hash<
         txid_parts.transparent_digests.is_some()
     );
 
-    to_hash(
-        tx.version,
+    // Mirrors the txid: a VCrosslink transaction commits to its Ironwood bundle and its
+    // staking action, and anything the sighash leaves out is bound by no signature at all.
+    to_hash_v6(
         tx.consensus_branch_id,
         txid_parts.header_digest,
         transparent_sig_digest(
@@ -198,12 +199,7 @@ pub fn vcrosslink_signature_hash<
         ),
         txid_parts.sapling_digest,
         txid_parts.orchard_digest,
-        txid_parts.crosslink_digest,
-        #[cfg(zcash_unstable = "zfuture")]
-        tx.tze_bundle
-            .as_ref()
-            .zip(txid_parts.tze_digests.as_ref())
-            .map(|(bundle, tze_digests)| tze_input_sigdigests(bundle, signable_input, tze_digests))
-            .as_ref(),
+        txid_parts.ironwood_digest,
+        Some(txid_parts.crosslink_digest),
     )
 }
