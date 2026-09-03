@@ -3188,6 +3188,54 @@ pub(crate) fn get_transaction<P: Parameters>(
     .transpose()
 }
 
+/// Returns the create action of the delegation bond identified by `bond_key`, from whichever
+/// stored transaction carries it.
+///
+/// Every stored transaction with raw data is parsed, so this is linear in wallet history;
+/// bonds are rare enough that indexing them is not worth a schema migration. A row that does
+/// not parse is skipped rather than failing the lookup, so one unreadable unrelated
+/// transaction cannot block every bond operation.
+pub(crate) fn get_bond_create_action<P: Parameters>(
+    conn: &rusqlite::Connection,
+    params: &P,
+    bond_key: [u8; 32],
+) -> Result<Option<zcash_primitives::transaction::StakingAction>, SqliteClientError> {
+    let mut stmt = conn.prepare(
+        "SELECT raw, mined_height, expiry_height FROM transactions WHERE raw IS NOT NULL",
+    )?;
+    let mut rows = stmt.query([])?;
+
+    while let Some(row) = rows.next()? {
+        let raw: Vec<u8> = row.get(0)?;
+        let mined: Option<u32> = row.get(1)?;
+        let expiry: Option<u32> = row.get(2)?;
+        let parsed = parse_tx(
+            params,
+            &raw,
+            mined.map(BlockHeight::from),
+            expiry.map(BlockHeight::from),
+        );
+        let Ok((_, tx)) = parsed else {
+            continue;
+        };
+
+        let Some(action) = tx.staking_action() else {
+            continue;
+        };
+        if !matches!(
+            action,
+            zcash_primitives::transaction::StakingAction::CreateNewDelegationBond { .. }
+        ) {
+            continue;
+        }
+        if action.unique_pubkey() == bond_key {
+            return Ok(Some(action));
+        }
+    }
+
+    Ok(None)
+}
+
 /// Returns the memo for a sent note, if the sent note is known to the wallet.
 pub(crate) fn get_sent_memo(
     conn: &rusqlite::Connection,

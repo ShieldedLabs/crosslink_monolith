@@ -1336,6 +1336,13 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> WalletRea
             .map(|res| res.map(|(_, tx)| tx))
     }
 
+    fn get_bond_create_action(
+        &self,
+        bond_key: [u8; 32],
+    ) -> Result<Option<zcash_primitives::transaction::StakingAction>, Self::Error> {
+        wallet::get_bond_create_action(self.conn.borrow(), &self.params, bond_key)
+    }
+
     fn get_sapling_nullifiers(
         &self,
         query: NullifierQuery,
@@ -3968,6 +3975,74 @@ mod tests {
             st.wallet().get_wallet_recover_until().unwrap(),
             Some(zcash_protocol::consensus::BlockHeight::from_u32(123456))
         );
+    }
+
+    /// The proposal path signs a later action on a bond with a key derived from the terms of
+    /// its create action, which it finds by scanning the stored raw transactions.
+    #[test]
+    fn get_bond_create_action_finds_a_stored_create() {
+        use zcash_primitives::bft::{FinalizerAddress, PubKeyID, TMSig};
+        use zcash_primitives::transaction::{
+            Authorized, StakingAction, TransactionData, TxVersion,
+        };
+        use zcash_protocol::consensus::{BlockHeight, BranchId};
+        use zcash_protocol::local_consensus::LocalNetwork;
+
+        let mut st = TestBuilder::new()
+            .with_data_store_factory(TestDbFactory::default())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+
+        let create = StakingAction::CreateNewDelegationBond {
+            amount_zats: 100_000,
+            unique_pubkey: [0xab; 32],
+            bond_salt: [0x5a; 32],
+            target_finalizer: FinalizerAddress {
+                pub_key: PubKeyID([0xf0; 32]),
+                sig: TMSig([0u8; 64]),
+            },
+            signature: [0u8; 64],
+        };
+        let tx = TransactionData::<Authorized>::from_parts(
+            TxVersion::VCrosslink,
+            BranchId::Nu6_3,
+            0,
+            BlockHeight::from_u32(5),
+            None,
+            None,
+            None,
+            None,
+            Some(create),
+        )
+        .freeze()
+        .unwrap();
+        crate::wallet::put_tx_data(st.wallet().conn(), &tx, None, None, None, BlockHeight::from_u32(1))
+            .unwrap();
+
+        // The stored transaction is read back under the branch for its height, so the scan
+        // needs a network where that height is inside NU6.3; the fixture network never is.
+        let nu6_3_from_genesis = LocalNetwork {
+            overwinter: Some(BlockHeight::from_u32(1)),
+            sapling: Some(BlockHeight::from_u32(1)),
+            blossom: Some(BlockHeight::from_u32(1)),
+            heartwood: Some(BlockHeight::from_u32(1)),
+            canopy: Some(BlockHeight::from_u32(1)),
+            nu5: Some(BlockHeight::from_u32(1)),
+            nu6: Some(BlockHeight::from_u32(1)),
+            nu6_1: Some(BlockHeight::from_u32(1)),
+            nu6_2: Some(BlockHeight::from_u32(1)),
+            nu6_3: Some(BlockHeight::from_u32(1)),
+            #[cfg(zcash_unstable = "nu7")]
+            nu7: None,
+        };
+
+        let found = crate::wallet::get_bond_create_action(st.wallet().conn(), &nu6_3_from_genesis, [0xab; 32])
+            .unwrap();
+        assert_eq!(found, Some(create));
+
+        let other = crate::wallet::get_bond_create_action(st.wallet().conn(), &nu6_3_from_genesis, [0xac; 32])
+            .unwrap();
+        assert_eq!(other, None);
     }
 
     #[test]

@@ -2533,8 +2533,8 @@ where
         }
     }
 
-    if let Some(sa) = &staking_action {
-        builder.put_staking_action(sa.clone());
+    if let Some(sa) = staking_action {
+        builder.put_staking_action(sa);
     }
 
     Ok(BuildState {
@@ -2653,10 +2653,46 @@ where
     let orchard_saks = &[spending_keys.usk.orchard().into()];
     #[cfg(not(feature = "orchard"))]
     let orchard_saks = &[];
+    // A create action carries its own derivation inputs; a later action on a bond derives
+    // from the terms of its create action, looked up in the wallet's history.
+    let staking_signing_key = match staking_action {
+        None => None,
+        Some(action) => {
+            let create = match action {
+                StakingAction::CreateNewDelegationBond { .. } => Some(action),
+                _ => match wallet_db.get_bond_create_action(action.unique_pubkey()) {
+                    Ok(found) => found,
+                    Err(e) => return Err(Error::DataSource(e)),
+                },
+            };
+            let Some(StakingAction::CreateNewDelegationBond {
+                target_finalizer,
+                amount_zats,
+                bond_salt,
+                unique_pubkey,
+                ..
+            }) = create
+            else {
+                return Err(Error::BondSigningKeyNotDerivable);
+            };
+            let recovered = spending_keys.usk.bond().recover_signing_key(
+                &target_finalizer.pub_key.0,
+                amount_zats,
+                &bond_salt,
+                unique_pubkey,
+            );
+            let Some(signing_key) = recovered else {
+                return Err(Error::BondSigningKeyNotDerivable);
+            };
+            Some(signing_key)
+        }
+    };
+
     let build_result = build_state.builder.build(
         &transparent_signing_set,
         sapling_extsks,
         orchard_saks,
+        staking_signing_key,
         OsRng,
         spend_prover,
         output_prover,

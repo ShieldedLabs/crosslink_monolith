@@ -95,6 +95,11 @@ pub enum Error<DataSourceError, CommitmentTreeError, SelectionError, FeeError, C
     /// a type for which a key required to construct the transaction is not available.
     KeyNotAvailable(PoolType),
 
+    /// The signing key for a staking action could not be derived: either no transaction
+    /// carrying the bond's create action is known to the wallet, or the bond does not belong
+    /// to this account.
+    BondSigningKeyNotDerivable,
+
     /// A note being spent does not correspond to either the internal or external
     /// full viewing key for an account.
     NoteMismatch(NoteId),
@@ -307,6 +312,10 @@ where
             Error::KeyNotAvailable(pool) => write!(
                 f,
                 "A key required for transaction construction was not available for pool type {pool}"
+            ),
+            Error::BondSigningKeyNotDerivable => write!(
+                f,
+                "Cannot derive the signing key for this staking action: the bond's create action is not known to the wallet, or the bond does not belong to this account"
             ),
             Error::NoteMismatch(n) => write!(
                 f,

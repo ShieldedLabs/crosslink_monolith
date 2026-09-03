@@ -3366,6 +3366,13 @@ impl WalletRead for MockWalletDb {
         Ok(None)
     }
 
+    fn get_bond_create_action(
+        &self,
+        _bond_key: [u8; 32],
+    ) -> Result<Option<zcash_primitives::transaction::StakingAction>, Self::Error> {
+        Ok(None)
+    }
+
     fn get_sapling_nullifiers(
         &self,
         _query: NullifierQuery,

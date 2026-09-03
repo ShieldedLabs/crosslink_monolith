@@ -2316,6 +2316,16 @@ pub trait WalletRead {
     /// available.
     fn get_transaction(&self, txid: TxId) -> Result<Option<Transaction>, Self::Error>;
 
+    /// Returns the create action of the delegation bond identified by `bond_key`, if a
+    /// transaction carrying it is known to the wallet with its raw data available.
+    ///
+    /// A bond's later actions are signed with a key derived from its create action's terms, so
+    /// this is what lets them be signed without the create transaction being in hand.
+    fn get_bond_create_action(
+        &self,
+        bond_key: [u8; 32],
+    ) -> Result<Option<zcash_primitives::transaction::StakingAction>, Self::Error>;
+
     /// Returns the nullifiers for Sapling notes that the wallet is tracking, along with their
     /// associated account IDs, that are either unspent or have not yet been confirmed as spent (in
     /// that a spending transaction known to the wallet has not yet been included in a block).
