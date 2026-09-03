@@ -65,6 +65,8 @@ pub enum TFLServiceRequest {
     WalletStakingAction(StakingActionRequest),
     /// Query wallet staking positions grouped by finalizer
     WalletStakingPositions,
+    /// Send a basic shielded value transfer from the wallet: (value in zatoshis, unified address)
+    WalletBasicSend(u64, String),
 }
 
 /// Types of responses that can be returned by the TFLService.
@@ -102,6 +104,8 @@ pub enum TFLServiceResponse {
     WalletStakingAction(Result<String, String>),
     /// Query wallet staking positions grouped by finalizer
     WalletStakingPositions(WalletStakingPositions),
+    /// Send a basic shielded value transfer from the wallet
+    WalletBasicSend(Result<String, String>),
 }
 
 /// Errors that can occur when interacting with the TFLService.

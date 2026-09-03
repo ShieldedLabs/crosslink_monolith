@@ -122,6 +122,9 @@ pub static GUI_ENABLE_MINE: Mutex<bool> = Mutex::new(true);
 
 pub static STAKING_STAGE: Mutex<Option<(StakingActionRequest, tokio::sync::oneshot::Sender<Result<String, String>>)>> = Mutex::new(None);
 
+/// Staged basic send requested over RPC: (value in zatoshis, unified address string, result channel).
+pub static BASIC_SEND_STAGE: Mutex<Option<(u64, String, tokio::sync::oneshot::Sender<Result<String, String>>)>> = Mutex::new(None);
+
 pub static STAKING_POSITIONS: Mutex<zcash_primitives::bft::WalletStakingPositions> = Mutex::new((BTreeMap::new(), Vec::new()));
 
 #[derive(Clone)]
@@ -3516,6 +3519,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let mut proposed_send = ProposedTx::EMPTY;
 
     let mut rpc_stake: Option<(ProposedTx, tokio::sync::oneshot::Sender<Result<String, String>>)> = None;
+    let mut rpc_send:  Option<(ProposedTx, tokio::sync::oneshot::Sender<Result<String, String>>)> = None;
 
     let mut wallet_state_push_time = Instant::now();
 
@@ -4609,6 +4613,33 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
+        if rpc_send.is_none() {
+            let staged_send = BASIC_SEND_STAGE.lock().unwrap().take();
+            if let Some((value_zats, address, sender)) = staged_send {
+                // The address arrives as a string and is decoded here rather than at the RPC
+                // boundary because this loop is what knows the network the wallet was built for.
+                let ua  = UnifiedAddress::decode(network, &address);
+                let dst = if let Ok(ua) = &ua { ua.orchard().copied() } else { None };
+
+                if let Some(dst) = dst {
+                    let mut tx = ProposedTx::EMPTY;
+                    let ok = user_wallet.send_ironwood_to_ironwood_zats(network, &mut tx, &mut client, &user_usk,
+                                                                       value_zats, &orchard_tree, dst, MemoBytes::empty()).is_some();
+                    if ok {
+                        println!("prepared notes for RPC-requested send of {value_zats} zats");
+                        just_init_new_tx = true;
+                        rpc_send = Some((tx, sender));
+                    } else {
+                        let _ = sender.send(Err("failed to create send transaction from notes".to_string()));
+                    }
+                } else if ua.is_err() {
+                    let _ = sender.send(Err(format!("invalid unified address: {address}")));
+                } else {
+                    let _ = sender.send(Err(format!("unified address has no Ironwood receiver: {address}")));
+                }
+            }
+        }
+
         // @todo(judah): I'm thinking the weird frame hitch we get in the UI is caused by this loop,
         // since it's probably waiting for the wallet_state mutex to unlock.
         let mut retries_this_round = 6;
@@ -4816,6 +4847,23 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     _ => {
                         println!("RPC staking progress: {}, {:?}", tx_progress.h, tx.tx_res);
                         rpc_stake = Some((tx, sender))
+                    }
+                }
+            }
+
+            if let Some((mut tx, sender)) = rpc_send.take() {
+                let tx_progress = continue_proposed_tx(&mut user_wallet, network, &mut tx, &mut client, "rpc send", DUMP_TX_SEND).await;
+                match tx_progress.h {
+                    BlockHeight::INVALID => {
+                        let _ = sender.send(Err("failed to build send transaction".to_string()));
+                    }
+                    BlockHeight::SENT => {
+                        let _ = sender.send(Ok(format!("{{ \"txid\": {} }}", tx_progress.txid)));
+                    }
+
+                    _ => {
+                        println!("RPC send progress: {}, {:?}", tx_progress.h, tx.tx_res);
+                        rpc_send = Some((tx, sender))
                     }
                 }
             }

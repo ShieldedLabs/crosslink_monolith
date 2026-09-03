@@ -1898,6 +1898,31 @@ async fn tfl_service_incoming_request(
             }
         })),
 
+        // As with staking, only the wallet can fund and build the transaction, so the request is
+        // staged for the wallet loop and we wait on the channel it answers with.
+        TFLServiceRequest::WalletBasicSend(value_zats, address) => Ok(TFLServiceResponse::WalletBasicSend({
+            let rx = {
+                let mut lock = wallet::BASIC_SEND_STAGE.lock().unwrap();
+                match *lock {
+                    None => {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        *lock = Some((value_zats, address, tx));
+                        rx
+                    }
+                    Some(_) => {
+                        return Err(TFLServiceError::Misc(
+                            "Another send in progress, please try again soon".to_string(),
+                        ))
+                    }
+                }
+            };
+
+            match rx.await {
+                Ok(result) => result,
+                Err(err) => return Err(TFLServiceError::Misc(format!("{err}"))),
+            }
+        })),
+
         TFLServiceRequest::WalletStakingPositions => Ok(TFLServiceResponse::WalletStakingPositions(wallet::STAKING_POSITIONS.lock().unwrap().clone())),
 
         // workshop - mining & staking via PoW

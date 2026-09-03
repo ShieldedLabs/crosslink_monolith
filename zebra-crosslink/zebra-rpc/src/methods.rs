@@ -158,6 +158,10 @@ pub(super) const PARAM_REQUEST_DESC: &str = "The request object containing the p
 pub(super) const PARAM_STRING_DESC: &str = "A Crosslink staking command string.";
 pub(super) const PARAM_STAKING_ACTION_DESC: &str =
     "The staking action to submit from the attached wallet.";
+pub(super) const PARAM_VALUE_ZATS_DESC: &str =
+    "The exact value to send, in zatoshis.";
+pub(super) const PARAM_DST_ADDRESS_DESC: &str =
+    "The unified address to send to; it must have an Ironwood receiver.";
 pub(super) const PARAM_BOND_KEY_DESC: &str = "The 32-byte delegation bond key, hex-encoded.";
 pub(super) const PARAM_HASH_DESC: &str = "The block or transaction hash, hex-encoded.";
 pub(super) const PARAM_UFVK_STRS_DESC: &str =
@@ -620,6 +624,20 @@ pub trait Rpc {
     /// finalizer, withdrawable bonds as a flat list
     #[method(name = "wallet_staking_positions")]
     async fn wallet_staking_positions(&self) -> Result<serde_json::Value>;
+
+    /// Send `value_zats` zatoshis from the wallet to a unified address, returning the txid.
+    ///
+    /// Unlike the GUI's send buttons the value is not quantized; it is an exact zatoshi amount.
+    /// Blocks until the transaction is built and submitted.
+    ///
+    /// ## Example Usage
+    /// ```shell
+    /// curl -X POST -H "Content-Type: application/json" -d \
+    /// '{ "jsonrpc": "2.0", "method": "wallet_basic_send", "params": [12345678, "utest1..."], "id": 1 }' \
+    /// http://127.0.0.1:8232
+    /// ```
+    #[method(name = "wallet_basic_send")]
+    async fn wallet_basic_send(&self, value_zats: u64, dst_address: String) -> Result<String>;
 
     /// Returns the requested block header by hash or height, as a [`GetBlockHeader`] JSON string.
     /// If the block is not in Zebra's state,
@@ -2526,6 +2544,32 @@ where
             Err(err) => Err(ErrorObject::owned(
                     server::error::LegacyCode::Verify.into(),
                     format!("Staking positions query failed: {err}"),
+                    None::<()>,
+            )),
+        }
+    }
+
+    async fn wallet_basic_send(&self, value_zats: u64, dst_address: String) -> Result<String> {
+        let res = self
+            .tfl_service
+            .clone()
+            .ready()
+            .await
+            .unwrap()
+            .call(TFLServiceRequest::WalletBasicSend(value_zats, dst_address.clone()))
+            .await;
+
+        match res {
+            Ok(TFLServiceResponse::WalletBasicSend(Ok(res))) => Ok(res),
+            Ok(TFLServiceResponse::WalletBasicSend(Err(err))) => Err(ErrorObject::owned(
+                    server::error::LegacyCode::Verify.into(),
+                    format!("Send of {value_zats} zats to \"{dst_address}\" failed: {err}"),
+                    None::<()>,
+            )),
+            Ok(_) => unreachable!("unmatched response to a WalletBasicSend request"),
+            Err(err) => Err(ErrorObject::owned(
+                    server::error::LegacyCode::Verify.into(),
+                    format!("Send of {value_zats} zats to \"{dst_address}\" failed: {err}"),
                     None::<()>,
             )),
         }
