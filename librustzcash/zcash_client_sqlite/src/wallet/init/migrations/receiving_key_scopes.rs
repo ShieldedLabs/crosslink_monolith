@@ -412,6 +412,7 @@ mod tests {
                 &transparent_signing_set,
                 &[],
                 &[],
+                None,
                 OsRng,
                 &prover,
                 &prover,

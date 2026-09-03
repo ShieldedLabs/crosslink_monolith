@@ -245,6 +245,7 @@ impl TransactionTemplate<NegativeOrZero> {
             &Default::default(),
             Default::default(),
             Default::default(),
+            None,
             OsRng,
             &sapling_prover,
             &sapling_prover,

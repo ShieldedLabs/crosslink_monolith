@@ -102,6 +102,9 @@ pub enum Error<FE> {
     /// The builder was constructed without support for the Sapling pool, but a Sapling
     /// spend or output was added.
     SaplingBuilderNotAvailable,
+    /// A staking action was added but no signing key was supplied to `build`, so the action
+    /// would go out unsigned and be rejected by consensus.
+    StakingSigningKeyNotAvailable,
     /// The builder was constructed with a target height before NU5 activation, but an Orchard
     /// spend or output was added.
     OrchardBuilderNotAvailable,
@@ -156,6 +159,10 @@ impl<FE: fmt::Display> fmt::Display for Error<FE> {
             Error::SaplingBuilderNotAvailable => write!(
                 f,
                 "Cannot create Sapling transactions without a Sapling anchor"
+            ),
+            Error::StakingSigningKeyNotAvailable => write!(
+                f,
+                "Cannot build a staking action without the bond signing key"
             ),
             Error::OrchardBuilderNotAvailable => write!(
                 f,
@@ -1265,7 +1272,7 @@ impl<P: consensus::Parameters, U> Builder<P, U> {
         self.transparent_builder.add_output(to, value)
     }
 
-    /// Adds a transparent address to send funds to.
+    /// Signed in [`Self::build`] by the bond key the action names.
     pub fn put_staking_action(
         &mut self,
         staking_action: StakingAction,
@@ -1408,6 +1415,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
         transparent_signing_set: &TransparentSigningSet,
         sapling_extsks: &[sapling::zip32::ExtendedSpendingKey],
         orchard_saks: &[orchard::keys::SpendAuthorizingKey],
+        staking_signing_key: Option<ed25519_zebra::SigningKey>,
         rng: R,
         spend_prover: &SP,
         output_prover: &OP,
@@ -1427,6 +1435,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
                     |b, _, _| Ok(b.clone().map_authorization(transparent::builder::Coinbase)),
                     &[],
                     &[],
+                    None,
                     rng,
                     spend_prover,
                     output_prover,
@@ -1443,6 +1452,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
                     },
                     sapling_extsks,
                     orchard_saks,
+                    staking_signing_key,
                     rng,
                     spend_prover,
                     output_prover,
@@ -1472,6 +1482,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
         >,
         sapling_extsks: &[sapling::zip32::ExtendedSpendingKey],
         orchard_saks: &[orchard::keys::SpendAuthorizingKey],
+        staking_signing_key: Option<ed25519_zebra::SigningKey>,
         mut rng: R,
         spend_prover: &SP,
         output_prover: &OP,
@@ -1632,6 +1643,16 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
         let shielded_sig_commitment =
             signature_hash(&unauthed_tx, &SignableInput::Shielded, &txid_parts);
 
+        // The txid digest zeroes the signature fields, so filling arg64_0 here does not move
+        // the commitment the other signatures are about to sign.
+        let mut staking_action = unauthed_tx.staking_action;
+        if let Some(action) = &mut staking_action {
+            let Some(signing_key) = staking_signing_key else {
+                return Err(Error::StakingSigningKeyNotAvailable);
+            };
+            action.set_signature(signing_key.sign(shielded_sig_commitment.as_ref()).to_bytes());
+        }
+
         let sapling_asks = sapling_extsks
             .iter()
             .map(|extsk| extsk.expsk.ask.clone())
@@ -1721,7 +1742,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
             sapling_bundle,
             orchard_bundle,
             ironwood_bundle,
-            staking_action: unauthed_tx.staking_action,
+            staking_action,
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle,
         };
@@ -1932,6 +1953,7 @@ mod testing {
                 transparent_signing_set,
                 sapling_extsks,
                 orchard_saks,
+                None,
                 FakeCryptoRng(rng),
                 &MockSpendProver,
                 &MockOutputProver,

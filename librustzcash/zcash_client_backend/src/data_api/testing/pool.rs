@@ -7150,6 +7150,7 @@ fn build_transparent_coinbase_tx(
             &[],
             // unused internally
             &[],
+            None,
             OsRng,
             &LocalTxProver::bundled(),
             &LocalTxProver::bundled(),

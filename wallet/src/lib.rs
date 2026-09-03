@@ -68,6 +68,8 @@ use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::{ZatBalance, Zatoshis};
 use zcash_protocol::{PoolType, ShieldedProtocol, TxId};
 use zcash_primitives::transaction::builder::BundlePadding;
+use zcash_primitives::ed25519_zebra::SigningKey;
+use zcash_keys::keys::BondSpendingKey;
 use zcash_transparent::{
     address::TransparentAddress,
     builder::{SpendInfo, TransparentInputInfo, TransparentSigningSet},
@@ -332,6 +334,7 @@ struct BuildPrep {
     o_outputs: Vec<ProposedOrchardOutput>,
 
     staking_action: Option<StakingAction>,
+    staking_signing_key: Option<SigningKey>,
 }
 impl BuildPrep {
     fn fee_required(&self) -> Result<Zatoshis, builder::FeeError<zip317::FeeError>> {
@@ -1084,6 +1087,7 @@ enum TxOutput {
 struct TxOptions<'a> {
     src_pools: &'a [TxPool<'a>], // in descending preference order
     staking_action: Option<StakingAction>,
+    staking_signing_key: Option<SigningKey>,
 }
 impl<'a> TxOptions<'a> {
     // TODO: reconsider
@@ -1096,6 +1100,7 @@ impl<'a> Default for TxOptions<'a> {
             // TODO: does a default anchor make sense for shielded pools?
             src_pools: &[], //TxOptions::DEFAULT_SRC_POOLS,
             staking_action: None,
+            staking_signing_key: None,
         }
     }
 }
@@ -1472,7 +1477,7 @@ impl ManualWallet {
             block_h, build_config,
             t_keys, s_keys, o_keys,
             t_inputs, t_outputs, o_inputs, o_outputs,
-            staking_action,
+            staking_action, staking_signing_key,
         } = prep;
 
         let mut txb = TxBuilder::new(network, LRZBlockHeight::from_u32(block_h), build_config);
@@ -1528,6 +1533,7 @@ impl ManualWallet {
             &t_keys,
             &s_keys,
             &o_keys,
+            staking_signing_key,
             rng,
             &prover,
             &prover,
@@ -1646,6 +1652,7 @@ impl ManualWallet {
             o_inputs: Vec::new(),
             o_outputs: Vec::new(),
             staking_action: None,
+            staking_signing_key: None,
         };
 
         let mut txb = TxBuilder::new(
@@ -1705,6 +1712,7 @@ impl ManualWallet {
                 return None;
             }
             prep.staking_action = Some(staking_action);
+            prep.staking_signing_key = opts.staking_signing_key;
             tx.tx.staking_action = Some(staking_action);
             Some(staking_action)
         } else {
@@ -1975,6 +1983,22 @@ impl ManualWallet {
     }
 
 
+    /// The signing key for one of our bonds, recovered from its create action in our history.
+    fn bond_signing_key(&self, bond_key: [u8; 32], bond_sk: &BondSpendingKey) -> Option<SigningKey> {
+        for wallet_tx in &self.txs {
+            let Some(StakingAction::CreateNewDelegationBond {
+                unique_pubkey, bond_salt, target_finalizer, amount_zats, ..
+            }) = wallet_tx.staking_action else { continue; };
+            if unique_pubkey != bond_key {
+                continue;
+            }
+            return bond_sk.recover_signing_key(
+                &target_finalizer.pub_key.0, amount_zats, &bond_salt, unique_pubkey);
+        }
+        println!("Could not find the create action for bond {:?}", bond_key);
+        None
+    }
+
     pub fn stake_ironwood_to_finalizer<P: Parameters>(
         &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
         src_usk: &UnifiedSpendingKey, exact_amount_to_send: u64, orchard_tree: &OrchardShardTree, target_finalizer: bft::FinalizerAddress,
@@ -1991,18 +2015,24 @@ impl ManualWallet {
         let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
         if let Some(ovk) = keys.orchard_ovk {
             use rand::RngCore;
-            let mut pretend_pub_key = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut pretend_pub_key);
+            let mut bond_salt = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut bond_salt);
+
+            let signing_key = src_usk.bond().derive_signing_key(
+                &target_finalizer.pub_key.0, exact_amount_to_send, &bond_salt);
+            let unique_pubkey = <[u8; 32]>::from(
+                zcash_primitives::ed25519_zebra::VerificationKeyBytes::from(&signing_key));
 
             let opts = &TxOptions{
                 src_pools: &[TxPool::Ironwood(orchard_tree), TxPool::Transparent],
                 staking_action: Some(StakingAction::CreateNewDelegationBond {
                     amount_zats: exact_amount_to_send,
-                    unique_pubkey: pretend_pub_key,
-                    challenge: [0u8; 32],
+                    unique_pubkey,
+                    bond_salt,
                     target_finalizer,
                     signature: [0u8; 64]
                 }),
+                staking_signing_key: Some(signing_key),
             };
             self.send_zats(network, tx, client, &[], src_usk, opts)
         } else {
@@ -2016,14 +2046,15 @@ impl ManualWallet {
     ) -> Option<()>
     {
         let tz = Timer::scope("begin_unbonding_using_ironwood");
+        let signing_key = self.bond_signing_key(bond_key, src_usk.bond())?;
         let account = &self.accounts[0];
         let opts = &TxOptions{
             src_pools: &[TxPool::Ironwood(orchard_tree), TxPool::Transparent],
             staking_action: Some(StakingAction::BeginDelegationUnbonding {
                 unique_pubkey: bond_key,
-                challenge: [0u8; 32],
                 signature: [0u8; 64]
             }),
+            staking_signing_key: Some(signing_key),
         };
         self.send_zats(network, tx, client, &[], src_usk, opts)
     }
@@ -2057,6 +2088,7 @@ impl ManualWallet {
             println!("retarget_bond_using_ironwood: invalid finalizer address capability");
             return None;
         }
+        let signing_key = self.bond_signing_key(bond_key, src_usk.bond())?;
         let Some(from_finalizer) = self.current_bond_target_address(bond_key) else {
             println!("retarget_bond_using_ironwood: no mined create/retarget found for bond {:?}", bond_key);
             return None;
@@ -2066,11 +2098,11 @@ impl ManualWallet {
             src_pools: &[TxPool::Ironwood(orchard_tree), TxPool::Transparent],
             staking_action: Some(StakingAction::RetargetDelegationBond {
                 unique_pubkey: bond_key,
-                challenge: [0u8; 32],
                 signature: [0u8; 64],
                 from_finalizer,
                 to_finalizer: new_target,
             }),
+            staking_signing_key: Some(signing_key),
         };
         self.send_zats(network, tx, client, &[], src_usk, opts)
     }
@@ -2081,6 +2113,7 @@ impl ManualWallet {
     ) -> Option<()>
     {
         let tz = Timer::scope("claim_bond_using_ironwood");
+        let signing_key = self.bond_signing_key(bond_key, src_usk.bond())?;
         let account = &self.accounts[0];
         let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
         let (_t_addr, _p2sh, ua) = addrs_from_account(account, 0).unwrap(); // @Hack
@@ -2105,9 +2138,9 @@ impl ManualWallet {
                 staking_action: Some(StakingAction::WithdrawDelegationBond {
                     amount_zats,
                     unique_pubkey: bond_key,
-                    challenge: [0u8; 32],
                     signature: [0u8; 64]
                 }),
+                staking_signing_key: Some(signing_key),
             };
             self.send_zats(network, tx, client, &[], src_usk, opts)
         } else {
