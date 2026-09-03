@@ -44,6 +44,8 @@ fn verification_errors_have_high_misbehavior_score() {
         TransactionError::Ed25519(zebra_chain::primitives::ed25519::Error::InvalidSignature),
         TransactionError::RedJubjub(zebra_chain::primitives::redjubjub::Error::InvalidSignature),
         TransactionError::RedPallas(zebra_chain::primitives::reddsa::Error::InvalidSignature),
+        TransactionError::StakingActionBondKeyInvalid { bond_key: [0; 32] },
+        TransactionError::StakingActionSignatureInvalid { bond_key: [0; 32] },
     ] {
         assert_eq!(error.mempool_misbehavior_score(), 100, "{error:?}");
     }

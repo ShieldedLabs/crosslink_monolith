@@ -55,7 +55,7 @@ pub const STATE_DATABASE_KIND: &str = "state";
 ///
 /// Instead of using this constant directly, use [`constants::state_database_format_version_in_code()`]
 /// or [`config::database_format_version_on_disk()`] to get the full semantic format version.
-const DATABASE_FORMAT_VERSION: u64 = 28;
+const DATABASE_FORMAT_VERSION: u64 = 31;
 
 /// The database format minor version, incremented each time the on-disk database format has a
 /// significant data format change.
@@ -66,6 +66,16 @@ const DATABASE_FORMAT_VERSION: u64 = 28;
 /// - breaking changes with compatibility code in all supported Zebra versions.
 ///
 /// Version history:
+/// - 31.0.0: Crosslink staking action signatures. The txid digest now zeroes a staking
+///   action's signature fields, so every stored transaction carrying a staking action gets a
+///   new txid and block hashes containing one change with it. Requires a resync.
+/// - 30.0.0: Crosslink staking actions drop their `challenge` fields: the create action's
+///   `bond_salt` takes the freed slot and the finalizer kinds lose their second challenge, so
+///   every staking action's wire layout and txid change. Requires a resync.
+/// - 29.0.0: Crosslink delegation bond keys. `CreateNewDelegationBond` staking actions gain a
+///   32-byte `bond_salt`, in both their wire encoding and their txid digest, so a stored block
+///   holding a create-bond transaction written by an earlier format neither deserializes nor
+///   hashes to its recorded txid. No compatibility code: requires a resync.
 /// - 28.0.0: the NU6.3 Ironwood shielded pool. Adds the `ironwood_*` column families (initially
 ///   empty) and widens the chain value pool `ValueBalance` serialization from 40 to 48 bytes for
 ///   the `ironwood` pool (read code accepts 32/40/48-byte records). Also widens the history-tree
@@ -74,7 +84,7 @@ const DATABASE_FORMAT_VERSION: u64 = 28;
 ///   the current width). New CFs are created and the wider records are read in place when the
 ///   database is opened, so this is a major bump that is restorable from the previous major
 ///   database format version (no resync, no data migration).
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.

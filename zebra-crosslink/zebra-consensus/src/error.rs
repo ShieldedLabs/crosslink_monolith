@@ -322,6 +322,12 @@ pub enum TransactionError {
         period: u32,
         window: u32,
     },
+
+    #[error("staking action bond key is not usable as a bond key (undecodable or small order): {bond_key:?}")]
+    StakingActionBondKeyInvalid { bond_key: [u8; 32] },
+
+    #[error("staking action signature does not verify against bond key {bond_key:?}")]
+    StakingActionSignatureInvalid { bond_key: [u8; 32] },
 }
 
 impl From<ValidateContextError> for TransactionError {
@@ -452,6 +458,8 @@ impl TransactionError {
             | Halo2VerificationFailed
             | OrchardProofSize
             | IronwoodProofSize
+            | StakingActionBondKeyInvalid { .. }
+            | StakingActionSignatureInvalid { .. }
             | BothVPubsNonZero
             | DisabledAddToSproutPool
             | NegativeOrchardValueBalance

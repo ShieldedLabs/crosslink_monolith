@@ -898,3 +898,42 @@ pub fn consensus_branch_id(
 
     Ok(())
 }
+
+/// Every staking action must be signed by the bond key it names, over the shielded sighash.
+///
+/// That sighash commits to the spent outputs (ZIP 244 S.2), so the caller passes the sighasher
+/// it built once those were resolved; that is why this runs after them rather than beside the
+/// height-only staking checks.
+pub fn staking_action_signature(
+    tx: &Transaction,
+    sighasher: &zebra_chain::transaction::SigHasher,
+) -> Result<(), TransactionError> {
+    use zebra_chain::primitives::ed25519::{Signature, VerificationKey};
+    use zebra_chain::transaction::HashType;
+
+    let Some(action) = tx.staking_action() else {
+        return Ok(());
+    };
+    let bond_key = action.unique_pubkey();
+
+    let Ok(verification_key) = VerificationKey::try_from(bond_key) else {
+        return Err(TransactionError::StakingActionBondKeyInvalid { bond_key });
+    };
+
+    let sighash = sighasher.sighash(HashType::ALL, None);
+
+    // ZIP 215 verification accepts small-order keys, and under one the all-zero signature
+    // verifies over any message, so a bond with such a key could be spent by anyone. That
+    // property is the test: a key the zero signature verifies under is not a bond key.
+    let zero_signature = Signature::from([0u8; 64]);
+    if verification_key.verify(&zero_signature, sighash.as_ref()).is_ok() {
+        return Err(TransactionError::StakingActionBondKeyInvalid { bond_key });
+    }
+
+    let signature = Signature::from(action.signature());
+    if verification_key.verify(&signature, sighash.as_ref()).is_err() {
+        return Err(TransactionError::StakingActionSignatureInvalid { bond_key });
+    }
+
+    Ok(())
+}

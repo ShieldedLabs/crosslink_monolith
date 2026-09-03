@@ -1099,7 +1099,11 @@ fn dispatch_version_verification(
             verify_v5_transaction(tx, nu, script_verifier, cached_ffi_transaction)
         }
         // Crosslink carries the v6 body, so it takes the v6 verification path.
-        Transaction::V6 { .. } | Transaction::VCrosslink { .. } => {
+        Transaction::V6 { .. } => {
+            verify_v6_transaction(tx, nu, script_verifier, cached_ffi_transaction)
+        }
+        Transaction::VCrosslink { .. } => {
+            check::staking_action_signature(tx, cached_ffi_transaction.sighasher())?;
             verify_v6_transaction(tx, nu, script_verifier, cached_ffi_transaction)
         }
     }

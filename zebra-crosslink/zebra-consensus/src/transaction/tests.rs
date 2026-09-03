@@ -4683,3 +4683,135 @@ fn script_sig_args_expected_values() {
         .expect("1-of-1 multisig should be a standard script kind");
     assert_eq!(check::script_sig_args_expected(&ms_kind), Some(2));
 }
+
+/// The bond signature check, end to end through zebra's own sighash.
+mod staking_signature {
+    use std::sync::Arc;
+
+    use zcash_primitives::ed25519_zebra::{Signature, SigningKey, VerificationKey, VerificationKeyBytes};
+    use zcash_primitives::bft::{FinalizerAddress, PubKeyID, TMSig};
+    use zcash_primitives::transaction::StakingAction;
+    use zebra_chain::{
+        block,
+        parameters::NetworkUpgrade,
+        transaction::{HashType, LockTime, SigHasher, Transaction},
+    };
+
+    use crate::{error::TransactionError, transaction::check};
+
+    const NU: NetworkUpgrade = NetworkUpgrade::Nu6_3;
+    const FINALIZER: [u8; 32] = [0xf0; 32];
+    const SALT: [u8; 32] = [0x5a; 32];
+    const AMOUNT: u64 = 100_000;
+
+    fn tx_with(staking_action: Option<StakingAction>) -> Transaction {
+        Transaction::VCrosslink {
+            network_upgrade: NU,
+            lock_time: LockTime::Height(block::Height(0)),
+            expiry_height: block::Height(0),
+            inputs: vec![],
+            outputs: vec![],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+            staking_action,
+        }
+    }
+
+    fn sighasher(tx: &Transaction) -> SigHasher {
+        SigHasher::new(tx, NU, Arc::new(vec![])).expect("convertible")
+    }
+
+    fn sighash(tx: &Transaction) -> [u8; 32] {
+        sighasher(tx).sighash(HashType::ALL, None).0
+    }
+
+    /// An unsigned create action and the key that owns it. Any keypair will do here: how a
+    /// wallet derives one is zcash_keys business, the check only cares that they match.
+    fn create_action(seed: [u8; 32]) -> (StakingAction, SigningKey) {
+        let signing_key = SigningKey::from(seed);
+        let unique_pubkey = <[u8; 32]>::from(VerificationKeyBytes::from(&signing_key));
+
+        let action = StakingAction::CreateNewDelegationBond {
+            amount_zats: AMOUNT,
+            unique_pubkey,
+            bond_salt: SALT,
+            target_finalizer: FinalizerAddress {
+                pub_key: PubKeyID(FINALIZER),
+                sig: TMSig([0u8; 64]),
+            },
+            signature: [0u8; 64],
+        };
+
+        (action, signing_key)
+    }
+
+    fn signed_with(mut action: StakingAction, key: &SigningKey) -> Transaction {
+        let unsigned = tx_with(Some(action));
+        action.set_signature(key.sign(&sighash(&unsigned)).to_bytes());
+        tx_with(Some(action))
+    }
+
+    fn check(tx: &Transaction) -> Result<(), TransactionError> {
+        check::staking_action_signature(tx, &sighasher(tx))
+    }
+
+    #[test]
+    fn signed_by_the_bond_key_passes() {
+        let (action, key) = create_action([0xa1; 32]);
+        assert!(check(&signed_with(action, &key)).is_ok());
+    }
+
+    /// Filling in the signature must not move the sighash, or signing would be circular.
+    #[test]
+    fn filling_the_signature_does_not_move_the_sighash() {
+        let (action, key) = create_action([0xa1; 32]);
+        assert_eq!(sighash(&tx_with(Some(action))), sighash(&signed_with(action, &key)));
+    }
+
+    #[test]
+    fn unsigned_is_rejected() {
+        let (action, _) = create_action([0xa1; 32]);
+        let err = check(&tx_with(Some(action))).unwrap_err();
+        assert!(matches!(err, TransactionError::StakingActionSignatureInvalid { .. }));
+    }
+
+    #[test]
+    fn signed_by_another_key_is_rejected() {
+        let (action, _) = create_action([0xa1; 32]);
+        let (_, other_key) = create_action([0xb2; 32]);
+        let err = check(&signed_with(action, &other_key)).unwrap_err();
+        assert!(matches!(err, TransactionError::StakingActionSignatureInvalid { .. }));
+    }
+
+    /// ZIP 215 accepts small-order keys, and under one the all-zero signature verifies over
+    /// any message, so a bond with such a key could be spent by anyone. Both halves are
+    /// asserted: the premise, so the check cannot silently stop firing, and the rejection.
+    #[test]
+    fn small_order_bond_keys_are_rejected() {
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+
+        for key in [identity, [0u8; 32]] {
+            let (action, _) = create_action([0xa1; 32]);
+            let StakingAction::CreateNewDelegationBond {
+                amount_zats, bond_salt, target_finalizer, signature, ..
+            } = action else { unreachable!("create_action builds a create") };
+            let action = StakingAction::CreateNewDelegationBond {
+                amount_zats, unique_pubkey: key, bond_salt, target_finalizer, signature,
+            };
+            let tx = tx_with(Some(action));
+
+            let vk = VerificationKey::try_from(key).expect("decodes under ZIP 215");
+            assert!(vk.verify(&Signature::from([0u8; 64]), &sighash(&tx)).is_ok());
+
+            let err = check(&tx).unwrap_err();
+            assert!(matches!(err, TransactionError::StakingActionBondKeyInvalid { .. }));
+        }
+    }
+
+    #[test]
+    fn transactions_without_a_staking_action_are_not_checked() {
+        assert!(check(&tx_with(None)).is_ok());
+    }
+}
