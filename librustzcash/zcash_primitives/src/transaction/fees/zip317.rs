@@ -222,6 +222,7 @@ mod tests {
                 0,
                 orchard_action_count,
                 ironwood_action_count,
+                0,
             )
             .unwrap()
     }
