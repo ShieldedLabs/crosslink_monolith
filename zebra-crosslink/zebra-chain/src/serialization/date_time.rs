@@ -56,6 +56,20 @@ impl DateTime32 {
             .expect("unexpected out of range chrono::DateTime")
     }
 
+    /// Returns the current *apparent* time, under debug time dilation.
+    ///
+    /// For the clock reads that decide or check a block header's timestamp. See
+    /// [`zebra_debug_time`] for why transport must keep using [`DateTime32::now`].
+    ///
+    /// # Panics
+    ///
+    /// If the number of seconds since the UNIX epoch is greater than `u32::MAX`.
+    pub fn now_dilated() -> DateTime32 {
+        zebra_debug_time::now()
+            .try_into()
+            .expect("unexpected out of range chrono::DateTime")
+    }
+
     /// Returns the duration elapsed between `earlier` and this time,
     /// or `None` if `earlier` is later than this time.
     pub fn checked_duration_since(&self, earlier: DateTime32) -> Option<Duration32> {

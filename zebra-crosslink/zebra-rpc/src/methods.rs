@@ -1536,7 +1536,7 @@ where
             (size_on_disk, tip, value_balance, difficulty)
         };
 
-        let now = Utc::now();
+        let now = zebra_debug_time::now();
         let (estimated_height, verification_progress) = self
             .latest_chain_tip
             .best_tip_height_and_block_time()
@@ -3578,7 +3578,9 @@ where
             // `OptionFuture::None`.
             let duration_until_max_time = max_time.saturating_duration_since(cur_time);
             let wait_for_max_time: OptionFuture<_> = if duration_until_max_time.seconds() > 0 {
-                Some(tokio::time::sleep(duration_until_max_time.to_std()))
+                // An apparent-time deadline slept on a real timer: under debug time
+                // dilation the two run at different rates.
+                Some(zebra_debug_time::sleep(duration_until_max_time.to_std()))
             } else {
                 None
             }

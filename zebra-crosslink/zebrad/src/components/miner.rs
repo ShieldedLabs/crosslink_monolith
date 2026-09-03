@@ -20,7 +20,7 @@ use zebra_chain::{
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
     diagnostic::task::WaitForPanics,
-    parameters::Network,
+    parameters::{Network, NetworkUpgrade},
     serialization::{AtLeastOne, ZcashSerialize},
     shutdown::is_shutting_down,
     work::equihash::{Solution, SolverCancelled},
@@ -40,7 +40,14 @@ use zebra_rpc::{
 };
 use zebra_state::WatchReceiver;
 
-use crate::components::metrics::Config;
+use zebra_rpc::config::mining::Config as MiningConfig;
+
+// Every duration below is measured in *chain* time, not wall-clock time: they exist
+// because a tip only changes so often and a template is only worth rebuilding so often.
+// So they are waited on with the `zebra_debug_time` timers, which tick in chain time, and
+// never with `tokio::time` directly. Waiting out `BLOCK_TEMPLATE_REFRESH_LIMIT` in real
+// seconds puts a hard floor of one block every two seconds under any dilation multiplier —
+// which is exactly what a fast-forwarded test network is trying to get below.
 
 /// The amount of time we wait between block template retries.
 pub const BLOCK_TEMPLATE_WAIT_TIME: Duration = Duration::from_secs(20);
@@ -71,7 +78,7 @@ pub fn spawn_init<
     SyncStatus,
 >(
     network: &Network,
-    config: &Config,
+    mining_config: &MiningConfig,
     rpc: RpcImpl<
         Mempool,
         TFLService,
@@ -132,7 +139,7 @@ where
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
     // TODO: spawn an entirely new executor here, so mining is isolated from higher priority tasks.
-    tokio::spawn(init(network.clone(), config.clone(), rpc).in_current_span())
+    tokio::spawn(init(network.clone(), mining_config.clone(), rpc).in_current_span())
 }
 
 /// Initialize the miner based on its config.
@@ -152,7 +159,7 @@ pub async fn init<
     AddressBook,
 >(
     network: Network,
-    _config: Config,
+    mining_config: MiningConfig,
     rpc: RpcImpl<
         Mempool,
         TFLService,
@@ -211,18 +218,31 @@ where
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
-    // TODO: change this to `config.internal_miner_threads` once mining tasks are cancelled when the best tip changes (#8797)
-    let configured_threads = 1;
+    // Upstream hard-codes this to 1, citing #8797: solvers must be cancelled when the best
+    // tip changes, or the extra threads mine a chain that is already dead. They are —
+    // `cancel_fn` below fires on every template change, and a new tip always changes the
+    // template — so this is the operator's choice to make.
+    let configured_threads = mining_config.internal_miner_threads.max(1);
     // If we can't detect the number of cores, use the configured number.
     let available_threads = available_parallelism()
         .map(usize::from)
         .unwrap_or(configured_threads);
 
     // Use the minimum of the configured and available threads.
-    let solver_count = min(configured_threads, available_threads);
+    let mut solver_count = min(configured_threads, available_threads);
+    let low_priority = mining_config.internal_miner_low_priority;
+
+    // A network with proof-of-work disabled needs no solvers at all -- see `mine_a_block`.
+    // Extra ones would only race to produce siblings of a block that costs nothing to make.
+    let skip_pow = network.disable_pow();
+    if skip_pow {
+        solver_count = 1;
+    }
 
     info!(
         ?solver_count,
+        ?low_priority,
+        ?skip_pow,
         "launching mining tasks with parallel solvers"
     );
 
@@ -247,7 +267,14 @@ where
             .expect("just limited to u8::MAX");
 
         let solver = tokio::task::spawn(
-            run_mining_solver(solver_id, template_receiver.clone(), rpc.clone()).in_current_span(),
+            run_mining_solver(
+                solver_id,
+                low_priority,
+                skip_pow,
+                template_receiver.clone(),
+                rpc.clone(),
+            )
+            .in_current_span(),
         );
         abort_handles.push(solver.abort_handle());
 
@@ -369,7 +396,7 @@ where
                 info!("mining disabled");
                 let _ = template_sender.send(None);
             }
-            sleep(BLOCK_TEMPLATE_REFRESH_LIMIT).await;
+            zebra_debug_time::sleep(BLOCK_TEMPLATE_REFRESH_LIMIT).await;
             continue;
         }
 
@@ -388,7 +415,7 @@ where
 
             // Skip the wait if we got an error because we are shutting down.
             if !is_shutting_down() {
-                sleep(BLOCK_TEMPLATE_WAIT_TIME).await;
+                zebra_debug_time::sleep(BLOCK_TEMPLATE_WAIT_TIME).await;
             }
 
             continue;
@@ -421,9 +448,21 @@ where
         )?;
 
         // If the template has actually changed, send an updated template.
+        //
+        // A moved timestamp on its own is not a change worth acting on: the solver is
+        // cancelled whenever a new template arrives, so republishing for the clock alone
+        // throws away every hash computed since the last poll. That is a slow drip
+        // normally and a flood under debug time dilation, where the template's time
+        // advances by the multiplier on every poll. The block keeps the timestamp it was
+        // built with, which stays valid — anything that would invalidate it (a new tip,
+        // new transactions) changes another header field and does cancel the solve.
         template_sender.send_if_modified(|old_block| {
-            if old_block.as_ref().map(|b| b.header.clone()) == Some(block.header.clone()) {
-                return false;
+            if let Some(old_header) = old_block.as_ref().map(|b| b.header.clone()) {
+                let mut new_header = zebra_chain::block::Header::clone(&block.header);
+                new_header.time = old_header.time;
+                if new_header == *old_header {
+                    return false;
+                }
             }
             *old_block = Some(Arc::new(block));
             true
@@ -432,7 +471,7 @@ where
         // If the blockchain is changing rapidly, limit how often we'll update the template.
         // But if we're shutting down, do that immediately.
         if !template_sender.is_closed() && !is_shutting_down() {
-            sleep(BLOCK_TEMPLATE_REFRESH_LIMIT).await;
+            zebra_debug_time::sleep(BLOCK_TEMPLATE_REFRESH_LIMIT).await;
         }
     }
 
@@ -457,6 +496,8 @@ pub async fn run_mining_solver<
     AddressBook,
 >(
     solver_id: u8,
+    low_priority: bool,
+    skip_pow: bool,
     mut template_receiver: WatchReceiver<Option<Arc<Block>>>,
     rpc: RpcImpl<
         Mempool,
@@ -516,8 +557,24 @@ where
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
+    // Paces block production on a network with proof-of-work disabled. See below.
+    let mut block_pace: Option<tokio::time::Interval> = None;
+
     // Shut down the task when the template sender is dropped, or Zebra shuts down.
     while template_receiver.has_changed().is_ok() && !is_shutting_down() {
+        // With proof-of-work disabled a block costs nothing to produce, so nothing paces the
+        // chain: left alone the miner emits blocks as fast as the commit pipeline accepts
+        // them, chain time falls behind the heights, and every timestamp ends up clamped to
+        // median-time-past + 1. Pace it explicitly instead, at the one-block-per-target-
+        // spacing the work used to buy -- in *chain* time, so a dilated clock scales it down.
+        //
+        // It ticks rather than sleeping a fixed amount after each block: a fixed sleep adds
+        // the commit-and-new-template latency on top of the spacing, and the chain then runs
+        // slower than asked.
+        if let Some(pace) = block_pace.as_mut() {
+            pace.tick().await;
+        }
+
         // Get the latest block template, and mark the current value as seen.
         // We mark the value first to avoid missed updates.
         template_receiver.mark_as_seen();
@@ -540,7 +597,7 @@ where
 
             // Skip the wait if we didn't get a template because we are shutting down.
             if !is_shutting_down() {
-                sleep(BLOCK_TEMPLATE_WAIT_TIME).await;
+                zebra_debug_time::sleep(BLOCK_TEMPLATE_WAIT_TIME).await;
             }
 
             continue;
@@ -576,7 +633,7 @@ where
         };
 
         // Mine at least one block using the equihash solver.
-        let Ok(blocks) = mine_a_block(solver_id, template, cancel_fn).await else {
+        let Ok(blocks) = mine_a_block(solver_id, low_priority, skip_pow, template, cancel_fn).await else {
             // If the solver was cancelled, we're either shutting down, or we have a new template.
             if solver_id == 0 {
                 info!(
@@ -599,7 +656,7 @@ where
             // If the blockchain is changing rapidly, limit how often we'll update the template.
             // But if we're shutting down, do that immediately.
             if template_receiver.has_changed().is_ok() && !is_shutting_down() {
-                sleep(BLOCK_TEMPLATE_REFRESH_LIMIT).await;
+                zebra_debug_time::sleep(BLOCK_TEMPLATE_REFRESH_LIMIT).await;
             }
 
             continue;
@@ -626,6 +683,12 @@ where
                         "successfully mined a new block",
                     );
                     any_success = true;
+                    // One solver run can yield several valid solutions, and at the difficulty
+                    // floor -- where a fast-forwarded test network sits -- most of them are.
+                    // They are all siblings at the same height, so at most one can ever win;
+                    // submitting the rest only makes every node on the network verify and
+                    // commit blocks it will immediately discard. Stop at the one that stuck.
+                    break;
                 }
                 Err(error) => info!(
                     ?height,
@@ -643,17 +706,49 @@ where
             // If the blockchain is changing rapidly, limit how often we'll update the template.
             // But if we're shutting down, do that immediately.
             if template_receiver.has_changed().is_ok() && !is_shutting_down() {
-                sleep(BLOCK_TEMPLATE_REFRESH_LIMIT).await;
+                zebra_debug_time::sleep(BLOCK_TEMPLATE_REFRESH_LIMIT).await;
             }
             continue;
         }
 
+        if skip_pow && block_pace.is_none() {
+            let spacing = NetworkUpgrade::target_spacing_for_height(rpc.network(), height)
+                .to_std()
+                .unwrap_or(Duration::from_secs(1));
+            let mut pace = zebra_debug_time::interval(spacing);
+            // The first tick is immediate; spend it here so the tick at the top of the next
+            // iteration is the one that waits.
+            pace.tick().await;
+            block_pace = Some(pace);
+        }
+
         // Wait for the new block to verify, and the RPC task to pick up a new template.
         // But don't wait too long, we could have mined on a fork.
-        tokio::select! {
-            shutdown_result = template_receiver.changed() => shutdown_result?,
-            _ = sleep(BLOCK_MINING_WAIT_TIME) => {}
+        //
+        // Templates at or below the height we just won are skipped rather than accepted:
+        // while our block is still being committed the template task keeps serving the old
+        // tip, and taking one of those starts a full solver run on a height we have already
+        // beaten. On a fast chain that was throwing away most of the mining -- 1.6 solves
+        // per height. Waiting for a strictly higher template is what this wait was always
+        // for; it just used to end on the first template of any height.
+        let deadline = zebra_debug_time::deadline(BLOCK_MINING_WAIT_TIME);
+        loop {
+            let mined_a_stale_height = tokio::select! {
+                shutdown_result = template_receiver.changed() => {
+                    shutdown_result?;
+                    template_receiver
+                        .cloned_watch_data()
+                        .and_then(|block| block.coinbase_height())
+                        .is_none_or(|next_height| next_height <= height)
+                }
+                // Don't wait past the deadline: we could have mined on a fork, in which case
+                // no higher template is coming.
+                _ = tokio::time::sleep_until(deadline) => false,
+            };
 
+            if !mined_a_stale_height {
+                break;
+            }
         }
     }
 
@@ -669,6 +764,8 @@ where
 /// See [`run_mining_solver()`] for more details.
 pub async fn mine_a_block<F>(
     solver_id: u8,
+    low_priority: bool,
+    skip_pow: bool,
     template: Arc<Block>,
     cancel_fn: F,
 ) -> Result<AtLeastOne<Block>, SolverCancelled>
@@ -685,13 +782,38 @@ where
     *header.nonce.first_mut().unwrap() = solver_id;
     *header.nonce.last_mut().unwrap() = solver_id;
 
-    // Mine one or more blocks using the solver, in a low-priority blocking thread.
+    // A network with proof-of-work disabled never checks the solution or the difficulty of
+    // the blocks it accepts, so searching for a real one is pure cost -- and on this machine
+    // it is the single most expensive thing the node does. Stamp the same null solution a
+    // block *proposal* carries and hand the block straight back. `run_mining_solver` paces
+    // the resulting free blocks to the target spacing, which is the job the work was doing.
+    if skip_pow {
+        header.solution = Solution::for_proposal();
+
+        let mut block = (*template).clone();
+        block.header = Arc::new(header);
+
+        return Ok(vec![block]
+            .try_into()
+            .expect("a one-element vec is an AtLeastOne"));
+    }
+
+    // Mine one or more blocks using the solver, in a blocking thread. That thread runs at
+    // the lowest OS priority unless the operator turned that off: on a busy node the
+    // scheduler gives a nice-19 solver a small fraction of a core, which is right for a
+    // real node and wrong for a test network built to run fast.
     let span = Span::current();
     let solved_headers =
         tokio::task::spawn_blocking(move || span.in_scope(move || {
-            let miner_thread_handle = ThreadBuilder::default().name("zebra-miner").priority(ThreadPriority::Min).spawn(move |priority_result| {
+            // Asking for a *higher* priority needs CAP_SYS_NICE, so the fast path just
+            // leaves the thread at the runtime's default rather than requesting anything.
+            let mut builder = ThreadBuilder::default().name("zebra-miner");
+            if low_priority {
+                builder = builder.priority(ThreadPriority::Min);
+            }
+            let miner_thread_handle = builder.spawn(move |priority_result| {
                 if let Err(error) = priority_result {
-                    info!(?error, "could not set miner to run at a low priority: running at default priority");
+                    info!(?error, "could not set the miner thread priority: running at default priority");
                 }
 
                 Solution::solve(header, cancel_fn)

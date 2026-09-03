@@ -178,6 +178,7 @@ zebra-state = { path = "../zebra-state", version = "12.0.1" }
 # "comparison-interpreter" feature. (Feature unification will take care of
 # enabling it in the other imports of zcash-script.)
 zebra-script = { path = "../zebra-script", version = "10.1.2" }
+zebra-debug-time = { workspace = true, features = ["timers"] }
 zcash_script = { workspace = true }
 zebra-crosslink = { path = "../zebra-crosslink", version = "1.0.0-beta.46" }
 

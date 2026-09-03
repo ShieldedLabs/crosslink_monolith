@@ -116,7 +116,7 @@ pub async fn show_block_chain_progress(
     // The last time we downloaded and verified at least one block.
     //
     // Initialized to the start time to simplify the code.
-    let mut last_state_change_time = Utc::now();
+    let mut last_state_change_time = zebra_debug_time::now();
     let mut last_state_change_instant = Instant::now();
 
     // The state tip height, when we last downloaded and verified at least one block.
@@ -132,7 +132,9 @@ pub async fn show_block_chain_progress(
     let mut is_chain_metrics_chan_closed = false;
 
     loop {
-        let now = Utc::now();
+        // Apparent time: fed to `estimate_network_chain_tip_height`, which compares it
+        // against header timestamps.
+        let now = zebra_debug_time::now();
         let instant_now = Instant::now();
 
         let is_syncer_stopped = sync_status.is_close_to_tip();

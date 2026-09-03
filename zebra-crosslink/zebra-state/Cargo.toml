@@ -88,6 +88,7 @@ serde_json = { workspace = true, optional = true }
 
 zebra-node-services = { path = "../zebra-node-services", version = "9.1.2" }
 zebra-chain = { path = "../zebra-chain", version = "11.3.0", features = ["async-error"] }
+zebra-debug-time.workspace = true
 
 # prod feature progress-bar
 howudoin = { workspace = true, optional = true }

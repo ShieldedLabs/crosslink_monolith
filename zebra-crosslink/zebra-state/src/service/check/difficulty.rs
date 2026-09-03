@@ -12,7 +12,7 @@ use chrono::{DateTime, Duration, Utc};
 use zebra_chain::{
     block::{self, Block},
     parameters::{Network, NetworkUpgrade, POW_AVERAGING_WINDOW},
-    work::difficulty::{CompactDifficulty, ExpandedDifficulty, ParameterDifficulty as _, U256},
+    work::difficulty::{CompactDifficulty, ExpandedDifficulty, ParameterDifficulty as _},
     BoundedVec,
 };
 
@@ -249,21 +249,14 @@ impl AdjustedDifficulty {
                 return self.network.target_difficulty_limit();
             };
 
-        // Since the PoWLimits are `2^251 − 1` for Testnet, and `2^243 − 1` for
-        // Mainnet, the sum of 17 `ExpandedDifficulty` will be less than or equal
-        // to: `(2^251 − 1) * 17 = 2^255 + 2^251 - 17`. Therefore, the sum can
-        // not overflow a u256 value.
-        let total: ExpandedDifficulty = averaging_window_thresholds
-            .iter()
-            .map(|compact| {
-                compact
-                    .to_expanded()
-                    .expect("difficulty thresholds in previously verified blocks are valid")
-            })
-            .sum();
-
-        let divisor: U256 = POW_AVERAGING_WINDOW.into();
-        total / divisor
+        // `ExpandedDifficulty::mean` accumulates in 512 bits: with the shipped
+        // PoWLimits 17 thresholds fit in a u256, but a testnet configured with a
+        // much easier `target_difficulty_limit` overflows one.
+        ExpandedDifficulty::mean(averaging_window_thresholds.iter().map(|compact| {
+            compact
+                .to_expanded()
+                .expect("difficulty thresholds in previously verified blocks are valid")
+        }))
     }
 
     /// Calculate the bounded median timespan. The median timespan is the

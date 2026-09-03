@@ -871,13 +871,13 @@ impl StartCmd {
         #[cfg(all(feature = "internal-miner", feature = "viz_gui"))]
         let miner_task_handle = {
             info!("spawning Zcash miner");
-            components::miner::spawn_init(&config.network.network, &config.metrics, rpc_impl)
+            components::miner::spawn_init(&config.network.network, &config.mining, rpc_impl)
         };
 
         #[cfg(all(feature = "internal-miner", not(feature = "viz_gui")))]
         let miner_task_handle = if config.mining.is_internal_miner_enabled() {
             info!("spawning Zcash miner");
-            components::miner::spawn_init(&config.network.network, &config.metrics, rpc_impl)
+            components::miner::spawn_init(&config.network.network, &config.mining, rpc_impl)
         } else {
             tokio::spawn(std::future::pending().in_current_span())
         };

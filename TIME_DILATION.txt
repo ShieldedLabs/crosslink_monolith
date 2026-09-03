@@ -1,0 +1,192 @@
+TIME DILATION — running a crosslink test network faster than real time
+======================================================================
+
+A test network cannot wait a real week to see what the chain does after a week.
+Two independent things let you compress that wait, and it is worth keeping them
+apart in your head, because they do different jobs:
+
+  1. THE CLOCK.  `zebra-debug-time` remaps the wall clock every node reads, so
+     the chain believes time is passing `multiplier` times faster.  This is what
+     makes anything measured in *chain time* arrive sooner.
+
+  2. THE BLOCK RATE.  How fast heights actually arrive.  The clock alone does
+     NOT speed this up — the difficulty adjustment simply lowers difficulty to
+     match, and if difficulty is already on the floor, nothing happens at all.
+
+You pick a tier below depending on how realistic the test has to be.  All
+measurements are from a 12-core box running both nodes, release build, with a
+25-second target block spacing (POST_BLOSSOM_POW_TARGET_SPACING in this fork).
+
+
+THE CONFIG
+----------
+
+Clock, in every node's config, identical on all of them:
+
+    [debug_time_dilation]
+    start_unix_time = 1788400000     # real unix time when the clock speeds up
+    multiplier      = 100            # apparent seconds per real second after it
+
+Time runs normally until `start_unix_time`, then `multiplier` times faster.  The
+map is continuous — no jump — and is a pure function of (config, real clock), so
+separate machines with NTP-synced clocks agree without talking to each other.
+Off unless `multiplier >= 2` and `start_unix_time > 0`.  The node prints a
+DEBUG TIME DILATION banner at startup when it is on.
+
+Mining, per node:
+
+    [mining]
+    internal_miner               = true
+    internal_miner_threads       = 1      # parallel equihash solvers
+    internal_miner_low_priority  = false  # true (default) = lowest OS priority
+
+Network parameters, identical on all nodes — these change consensus:
+
+    [network.testnet_parameters]
+    # Easier minimum difficulty, giving the DAA room to fall.  This is the
+    # largest compact-representable target; the default is (1<<251)-1, so this
+    # is 16x easier.  Without it the chain sits on the difficulty floor and the
+    # clock multiplier buys you no extra blocks at all.
+    target_difficulty_limit = "7fffff0000000000000000000000000000000000000000000000000000000000"
+
+    # No proof-of-work at all.  Upstream Zebra option, not a crosslink one.
+    disable_pow = true
+
+
+THE TIERS
+---------
+
+TIER 1 — REALISTIC.  PoW on, every node mining.
+    Real equihash, real difficulty adjustment, real forks and reorgs between
+    competing miners.  This is the tier to use when the thing under test could
+    plausibly care about any of that.
+    Multiplier: useful up to about 5 on this hardware.  Beyond that the DAA
+    asks for blocks faster than the miners can produce them, difficulty pins to
+    the floor, and only chain time keeps accelerating.
+    Measured: ~5 s/block, i.e. about 5x.  Ceiling is equihash — it is
+    memory-bound and does not scale past ~2 solver threads per box.
+
+TIER 2 — FAST.  PoW off (`disable_pow = true`), one node mining.
+    The miner stamps the null solution a block *proposal* carries and produces
+    blocks for free; validation skips the solution and the difficulty check, so
+    every node accepts them.  Block production is then paced explicitly at one
+    block per target spacing of *chain* time, which the multiplier divides —
+    so the multiplier directly sets the block rate.
+    Multiplier: useful up to about 100.
+    Measured: 0.30 s/block at 100x, i.e. about 83x.
+
+TIER 3 — CEILING.  As tier 2, multiplier above 100.
+    Chain *time* keeps scaling without limit (400x verified), but the block
+    rate stops improving: the per-block commit-and-new-template pipeline takes
+    about 0.28 s and nothing below that is reachable today.
+    Measured: 0.276 s/block at 400x, i.e. about 90x.
+
+    What is in that 0.28 s, for whoever picks this up next: `getblocktemplate`
+    is bimodal, 3 ms or 300 ms and nothing between.  The 300 ms is waiting on
+    the crosslink mutex `internal_handle.internal`, which `tfl_service_main_loop`
+    (zebra-crosslink/src/lib.rs) takes every MAIN_LOOP_SLEEP_INTERVAL (125 ms)
+    and holds *across* StateRequest::BlockHeader / ::Block awaits.  The same
+    lock is taken with `blocking_lock()` by the fat-pointer gate inside every
+    block commit.  Moving those state reads out of the lock is the next ~1.5x.
+    Do NOT "fix" this by caching a fat-pointer snapshot: the gate permanently
+    rejects a pointer older than its parent's (child_rank >= parent_rank), so a
+    stale one silently loses blocks.  Second, smaller lever: IDLE_MS = 100 in
+    zebra-state/src/new_network.rs quantises every commit by up to 100 ms.
+
+Between tiers, roughly:
+
+    tier          multiplier   s/block   effective speed-up
+    1 realistic       <= 5       ~5.0        ~5x
+    2 fast            ~100       ~0.30      ~83x
+    3 ceiling         >100       ~0.28      ~90x   (chain time unbounded)
+
+
+RULES
+-----
+
+Every node must carry the identical `[debug_time_dilation]` block, including
+across restarts.  A node that forgets it sees the chain's timestamps as hours in
+the future and rejects every block: "block time is more than 2 hours in the
+future".  The failure is asymmetric and quiet — that node's own blocks are still
+*accepted* by the dilated ones, clamped up to median-time-past + 1, so a
+misconfigured network does not partition cleanly, it just crawls.  Diagnose by
+comparing `getblocktemplate.curtime` between nodes.
+
+Clock skew is multiplied too.  Zcash rejects headers more than two hours ahead
+of local time, so the usable multiplier is bounded by 7200 / skew_in_seconds.
+
+`disable_pow` and `target_difficulty_limit` are consensus parameters, not
+per-node preferences: all nodes on the network must agree, and you cannot change
+either one mid-chain — blocks already mined under the old setting will not
+validate under the new one.  Changing them means wiping the datadirs.
+
+Going back to an undilated network also means wiping: the chain's timestamps are
+hours or days ahead, and mining would sit clamped at median-time-past + 1 until
+real time caught up.
+
+Only consensus and business logic read the dilated clock — block timestamps and
+the checks on them, the block template, tip-distance estimates, mempool entry
+times.  Transport keeps the real clock: peer attestations, address-book
+liveness, handshakes, and every Instant-based timeout.  `rg zebra_debug_time::`
+lists every clock read that was opted in.
+
+
+MEASURING
+---------
+
+Do NOT derive a block rate from the `tip height: Some(N)` log line.  It is
+printed on a 2-second console-status timer, so any rate computed from it is
+silently floored at 2.00 s/block.  Sample heights over a window instead:
+
+    H1=$(zebrad-rpc getblockchaininfo | jq .blocks); T1=$(date +%s)
+    sleep 100
+    H2=$(zebrad-rpc getblockchaininfo | jq .blocks); T2=$(date +%s)
+    # s/block = (T2-T1) / (H2-H1)
+
+Also benchmark release builds only.  `[profile.dev] opt-level = 0` applies to
+every workspace crate, and a debug node is roughly ten times slower at this.
+
+
+WORKED EXAMPLE — the hardfork bond-burn test, in 12 minutes
+-----------------------------------------------------------
+
+The user-led hardfork burns every bond that was delegated to a terminated
+finalizer at any point in the 300-block window before activation.  Testing that
+means reaching an activation height with bonds of several shapes in place, which
+on an undilated chain is a long afternoon.  In tier 2 at 50x it is one coffee.
+
+Setup: both nodes carry
+
+    [[crosslink.hardforks]]
+    pow_activation_height  = 1500
+    bft_certificate_height = 30
+    terminated_finalizers  = ["12db8198060e969700d35e6a7bfacfb76cab2e5fe1423245241d799bd1f85221"]
+
+That finalizer, "F", is a throwaway that never runs — its key is the ed25519 key
+for the seed [0x42; 32], so a `zfinv1` address can be minted for it offline and
+staked to without any node holding it.  Note the config wants the pubkey in
+*display* order, which is the raw key reversed; the `zfinv1` address carries the
+raw key.  (`PubKeyID`'s serde reverses; the "My root public key is ..." banner
+does not.)
+
+The run, at 50x with PoW off and one node mining, ~0.5 s/block:
+
+    height  182  bond A created, staked to F
+    height  196  bond B created, staked to F
+    height  213  bond C created, staked to node one's finalizer
+    height 1217  bond B retargeted to node one — inside the window (1200, 1500]
+    height 1500  hardfork activates
+
+Result, logged identically by both nodes:
+
+    hardfork slash burns at height 1500: burned 2 bond(s) for 1 terminated
+    finalizer(s): ["8144cfcd...", "8151258a..."]
+
+which are bonds A and B.  A was a sitting duck; B fled inside the window and was
+caught by its Retarget's `from` field; C never touched F and survived.  Twelve
+real minutes from genesis, against roughly ten hours undilated.
+
+The one thing to be careful of is that the *retarget* has to land inside the
+window.  Do it too early and B legitimately does not burn, and you have tested
+nothing.  Poll `getblockchaininfo` for the height and fire the retarget when it
+is in range, rather than sleeping a wall-clock guess.

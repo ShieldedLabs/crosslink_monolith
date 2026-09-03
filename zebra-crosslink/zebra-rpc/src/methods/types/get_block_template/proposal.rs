@@ -116,9 +116,9 @@ impl BlockTemplateTimeSource {
             MinTime => template.min_time,
             MaxTime => template.max_time,
             Clamped(time) => (*time).clamp(template.min_time, template.max_time),
-            ClampedNow => DateTime32::now().clamp(template.min_time, template.max_time),
+            ClampedNow => DateTime32::now_dilated().clamp(template.min_time, template.max_time),
             Raw(time) => *time,
-            RawNow => DateTime32::now(),
+            RawNow => DateTime32::now_dilated(),
         }
     }
 

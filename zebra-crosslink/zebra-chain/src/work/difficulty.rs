@@ -21,7 +21,7 @@ use hex::{FromHex, ToHex};
 
 use crate::{block, parameters::Network, serialization::BytesInDisplayOrder, BoxError};
 
-pub use crate::work::u256::U256;
+pub use crate::work::u256::{U256, U512};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
@@ -562,6 +562,34 @@ impl From<U256> for ExpandedDifficulty {
 impl From<ExpandedDifficulty> for U256 {
     fn from(value: ExpandedDifficulty) -> Self {
         value.0
+    }
+}
+
+impl ExpandedDifficulty {
+    /// The arithmetic mean of `thresholds`, accumulated in 512 bits.
+    ///
+    /// The spec's `MeanTarget()` sums the 17-block averaging window, and with the
+    /// PoWLimits Zcash ships (2^243 - 1 on Mainnet, 2^251 - 1 on Testnet) that sum
+    /// cannot overflow 256 bits — so the obvious implementation just adds `U256`s.
+    /// A custom testnet may configure `target_difficulty_limit` far easier than
+    /// that (up to ~2^255, the largest compact-representable target) to give itself
+    /// difficulty headroom to be fast-forwarded, and 17 of those *do* overflow.
+    /// Widening the accumulator changes no result the 256-bit sum could produce;
+    /// the mean always fits back into 256 bits.
+    pub fn mean(thresholds: impl IntoIterator<Item = ExpandedDifficulty>) -> ExpandedDifficulty {
+        let mut total = U512::zero();
+        let mut count = 0u64;
+
+        for threshold in thresholds {
+            let [a, b, c, d] = threshold.0 .0;
+            total += U512([a, b, c, d, 0, 0, 0, 0]);
+            count += 1;
+        }
+
+        assert!(count > 0, "the mean of no difficulty thresholds is undefined");
+        let mean = total / U512::from(count);
+
+        ExpandedDifficulty(U256([mean.0[0], mean.0[1], mean.0[2], mean.0[3]]))
     }
 }
 

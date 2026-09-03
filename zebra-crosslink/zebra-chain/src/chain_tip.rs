@@ -125,7 +125,10 @@ pub trait ChainTip {
         let estimator =
             NetworkChainTipHeightEstimator::new(current_block_time, current_height, network);
 
-        let distance_to_tip = estimator.estimate_height_at(Utc::now()) - current_height;
+        // Apparent time: this is compared against the tip's *header* timestamp, which
+        // is stamped from the same dilated clock.
+        let distance_to_tip =
+            estimator.estimate_height_at(zebra_debug_time::now()) - current_height;
 
         Some((distance_to_tip, current_height))
     }

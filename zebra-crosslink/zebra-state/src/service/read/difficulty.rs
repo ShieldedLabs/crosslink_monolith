@@ -206,7 +206,7 @@ fn difficulty_time_and_history_tree(
         .map(|block| (block.header.difficulty_threshold, block.header.time))
         .collect();
 
-    let cur_time = DateTime32::now();
+    let cur_time = DateTime32::now_dilated();
 
     // > For each block other than the genesis block , nTime MUST be strictly greater than
     // > the median-time-past of that block.

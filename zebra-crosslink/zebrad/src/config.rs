@@ -94,6 +94,12 @@ pub struct ZebradConfig {
     pub zcashd_compat: crate::components::zcashd_compat::Config,
     /// CrossLink configuration
     pub crosslink: zebra_crosslink::config::Config,
+
+    /// Debug-only wall-clock dilation, for fast-forwarding a test network.
+    ///
+    /// Off unless `multiplier` is 2 or more. Every node on the network must
+    /// carry identical settings; see [`zebra_debug_time`].
+    pub debug_time_dilation: zebra_debug_time::Config,
 }
 
 impl ZebradConfig {
@@ -248,6 +254,19 @@ impl ZebradConfig {
             zebra_chain::parameters::HardForkSchedule::new(user_hardforks)
         };
         config.crosslink.hardforks = schedule.rules().to_vec();
+
+        // Install the debug clock before anything reads it. Every command loads its
+        // config through here, so this is the one place it can be done once.
+        zebra_debug_time::install(&config.debug_time_dilation);
+        if zebra_debug_time::is_active() {
+            let cfg = &config.debug_time_dilation;
+            eprintln!(
+                "DEBUG TIME DILATION: {}x from unix time {} -- apparent time is now {}",
+                cfg.multiplier,
+                cfg.start_unix_time,
+                zebra_debug_time::now(),
+            );
+        }
 
         // if let zcash_protocol::consensus::Network::TestNetwork(_) = config.network.network
         Ok(config)

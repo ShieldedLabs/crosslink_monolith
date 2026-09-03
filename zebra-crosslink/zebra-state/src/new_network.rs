@@ -1434,6 +1434,9 @@ pub fn sync(
     let mut XXX_tick_loop_counter = 0usize;
 
     let mut next_status       = std::time::Instant::now();
+    // The tip hash in the last STATUS we sent, so a new one can be advertised immediately
+    // instead of waiting out the heartbeat.
+    let mut last_status_tip: Option<Hash> = None;
     let mut next_dl_init      = std::time::Instant::now();
     let mut next_peer_gossip  = std::time::Instant::now();
     let mut next_peer_connect = std::time::Instant::now();
@@ -1824,8 +1827,18 @@ pub fn sync(
         }
         blocks_to_send.clear();
 
-        if std::time::Instant::now() >= next_status { 'send_status: {
+        // A new tip is news: tell peers now rather than at the next heartbeat. STATUS is the
+        // only thing that advertises our tip, so on a fast chain a peer spent up to
+        // `status_interval` mining a fork it could not know was already lost -- we measured
+        // three wasted blocks per height on a sub-second chain. The heartbeat stays as the
+        // floor for *re-*announcing an unchanged tip, and the tick rate bounds how often this
+        // can fire, so it cannot become a flood.
+        let tip_for_status = read_state.best_tip().map(|(_, hash)| hash);
+        let tip_is_news = tip_for_status.is_some() && tip_for_status != last_status_tip;
+
+        if tip_is_news || std::time::Instant::now() >= next_status { 'send_status: {
             next_status = std::time::Instant::now() + status_interval;
+            last_status_tip = tip_for_status;
 
             // Our chain tree, as of right now. Built here and dropped at the end of the block, so
             // it cannot go stale and nothing has to keep it up to date.
@@ -2826,7 +2839,7 @@ pub fn sync(
                 let cheap_result = if let Some(cheap) = cheap_checks_memo.get(&hash) {
                     Ok(cheap.clone())
                 } else {
-                    let res = (verify_fns.check_header)(&block_arc.header, &network, block::Height(height), chrono::Utc::now(), check_pow)
+                    let res = (verify_fns.check_header)(&block_arc.header, &network, block::Height(height), zebra_debug_time::now(), check_pow)
                         .and_then(|()| (verify_fns.check_body)(&block_arc, &network));
                     if let Ok(cheap) = &res {
                         cheap_checks_memo.insert(hash, cheap.clone());

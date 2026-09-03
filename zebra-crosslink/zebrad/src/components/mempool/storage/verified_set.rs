@@ -189,7 +189,7 @@ impl VerifiedSet {
 
         self.transactions_serialized_size += transaction.transaction.size;
         self.total_cost += transaction.cost();
-        transaction.time = Some(chrono::Utc::now());
+        transaction.time = Some(zebra_debug_time::now());
         transaction.height = height;
         self.transactions.insert(tx_id, transaction);
 

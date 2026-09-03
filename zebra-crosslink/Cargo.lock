@@ -9546,6 +9546,7 @@ dependencies = [
  "zcash_protocol",
  "zcash_script",
  "zcash_transparent",
+ "zebra-debug-time",
  "zebra-test",
 ]
 
@@ -9595,6 +9596,7 @@ dependencies = [
  "zcash_script",
  "zcash_transparent",
  "zebra-chain",
+ "zebra-debug-time",
  "zebra-node-services",
  "zebra-script",
  "zebra-state",
@@ -9655,6 +9657,15 @@ dependencies = [
  "zebra-test",
  "zerocopy",
  "zerocopy-derive",
+]
+
+[[package]]
+name = "zebra-debug-time"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -9792,6 +9803,7 @@ dependencies = [
  "zcash_transparent",
  "zebra-chain",
  "zebra-consensus",
+ "zebra-debug-time",
  "zebra-network",
  "zebra-node-services",
  "zebra-script",
@@ -9873,6 +9885,7 @@ dependencies = [
  "zcash_primitives",
  "zcash_protocol",
  "zebra-chain",
+ "zebra-debug-time",
  "zebra-node-services",
  "zebra-test",
 ]
@@ -10010,6 +10023,7 @@ dependencies = [
  "zebra-chain",
  "zebra-consensus",
  "zebra-crosslink",
+ "zebra-debug-time",
  "zebra-network",
  "zebra-node-services",
  "zebra-rpc",

@@ -15,3 +15,9 @@ use uint::construct_uint;
 construct_uint! {
     pub struct U256(4);
 }
+
+construct_uint! {
+    /// Only for accumulators that must not overflow a [`U256`]; see
+    /// [`ExpandedDifficulty::mean`](crate::work::difficulty::ExpandedDifficulty::mean).
+    pub struct U512(8);
+}

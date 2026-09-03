@@ -1,0 +1,25 @@
+[package]
+name = "zebra-debug-time"
+version = "0.1.0"
+authors.workspace = true
+description = "Debug-only wall-clock dilation, shared by everything that timestamps or verifies a block"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "../README.md"
+homepage.workspace = true
+keywords.workspace = true
+categories = ["date-and-time"]
+
+[features]
+default = []
+
+# Timers that sleep and tick in chain time. Off by default so the crates that only need
+# the clock -- zebra-chain among them -- don't pull tokio in.
+timers = ["dep:tokio"]
+
+[dependencies]
+chrono = { workspace = true, features = ["clock", "std"] }
+serde = { workspace = true, features = ["serde_derive"] }
+tokio = { workspace = true, features = ["time"], optional = true }

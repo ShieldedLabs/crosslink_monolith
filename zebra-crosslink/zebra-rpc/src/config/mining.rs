@@ -31,7 +31,7 @@ pub(crate) const MAX_USER_COINBASE_DATA_LEN: usize =
 
 /// Mining configuration section.
 #[serde_as]
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// Address for receiving miner subsidy and tx fees.
@@ -60,6 +60,48 @@ pub struct Config {
     /// The internal miner is off by default.
     #[serde(default)]
     pub internal_miner: bool,
+
+    /// How many parallel equihash solvers the internal miner runs.
+    ///
+    /// Clamped to the number of cores. Each solver uses one core and 144 MB of RAM, and
+    /// searches its own nonce range, so solutions arrive roughly `n` times as fast.
+    ///
+    /// One by default, which is what upstream hard-coded. Worth raising only on a test
+    /// network you are deliberately trying to run fast.
+    #[serde(default = "default_internal_miner_threads")]
+    pub internal_miner_threads: usize,
+
+    /// Run the internal miner's solver threads at the lowest OS priority.
+    ///
+    /// On by default: a real node must not let mining starve consensus, networking or
+    /// the state. But on a busy node the solver then gets whatever is left over — on a
+    /// saturated 12-core box we measured one solver receiving 0.57 of a core — so a test
+    /// network that wants blocks quickly should turn this off.
+    #[serde(default = "default_internal_miner_low_priority")]
+    pub internal_miner_low_priority: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            miner_address: None,
+            extra_coinbase_data: None,
+            miner_memo: None,
+            internal_miner: false,
+            internal_miner_threads: default_internal_miner_threads(),
+            internal_miner_low_priority: default_internal_miner_low_priority(),
+        }
+    }
+}
+
+/// The default for [`Config::internal_miner_threads`].
+fn default_internal_miner_threads() -> usize {
+    1
+}
+
+/// The default for [`Config::internal_miner_low_priority`].
+fn default_internal_miner_low_priority() -> bool {
+    true
 }
 
 impl Config {

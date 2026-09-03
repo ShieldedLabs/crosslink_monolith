@@ -94,6 +94,8 @@ zcash_address.workspace = true
 zcash_transparent = { workspace = true }
 sinsemilla = { workspace = true }
 
+zebra-debug-time.workspace = true
+
 # Time
 chrono = { workspace = true, features = ["clock", "std", "serde"] }
 humantime = { workspace = true }

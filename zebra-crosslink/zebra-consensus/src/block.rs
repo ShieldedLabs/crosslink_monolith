@@ -265,7 +265,7 @@ where
             // quick checks first.
 
             // Quick field validity and structure checks
-            let now = Utc::now();
+            let now = zebra_debug_time::now();
             check::time_is_valid_at(&block.header, now, &height, &hash)
                 .map_err(VerifyBlockError::Time)?;
             let coinbase_tx = check::coinbase_is_first(&block)?;
