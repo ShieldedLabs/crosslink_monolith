@@ -394,7 +394,9 @@ impl<A: Authorization> TransactionDigest<A> for TxIdDigester {
     fn digest_crosslink(&self, staking_action: &Option<StakingAction>) -> Self::CrosslinkDigest {
         // The staking-action leaf: H(tag || variant body). `None` becomes 32 nil
         // bytes when the leaf is written into the txid tree (see `to_hash_v6`).
-        staking_action.map(|sa| sa.tree_hash())
+        // ZIP 244 shape: the txid excludes the bond signature, so it can sign the sighash
+        // without signing itself. BlockTxCommitmentDigester hashes the signed form.
+        staking_action.map(|sa| sa.unsigned().tree_hash())
     }
 
     #[cfg(zcash_unstable = "zfuture")]

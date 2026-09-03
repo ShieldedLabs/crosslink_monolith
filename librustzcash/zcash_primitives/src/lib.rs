@@ -22,6 +22,7 @@ extern crate std;
 #[macro_use]
 extern crate alloc;
 
+pub use ed25519_zebra;
 pub mod block;
 pub mod bft;
 pub(crate) mod encoding;

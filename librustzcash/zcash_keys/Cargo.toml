@@ -69,6 +69,9 @@ byteorder = { workspace = true, optional = true }
 
 # - Digests
 blake2b_simd = { workspace = true }
+# Crosslink: BondSpendingKey derivation and its ed25519 bond keys.
+blake3 = "1.8.2"
+ed25519-zebra = "4.0.3"
 
 # - Zcashd compatibility
 bip0039 = { workspace = true, optional = true }

@@ -1511,21 +1511,22 @@ pub enum StakingAction {
     CreateNewDelegationBond {
         amount_zats: u64,
         unique_pubkey: [u8; 32],
-        challenge: [u8; 32],
+        /// Distinguishes two bonds this account creates on identical terms, which would
+        /// otherwise derive one key and be rejected as a duplicate. Carried here so a wallet
+        /// restored from seed can rederive the key from the chain alone.
+        bond_salt: [u8; 32],
         target_finalizer: FinalizerAddress,
         #[serde(with = "serde_big_array::BigArray")]
         signature: [u8; 64],
     },
     BeginDelegationUnbonding {
         unique_pubkey: [u8; 32],
-        challenge: [u8; 32],
         #[serde(with = "serde_big_array::BigArray")]
         signature: [u8; 64],
     },
     WithdrawDelegationBond {
         amount_zats: u64,
         unique_pubkey: [u8; 32],
-        challenge: [u8; 32],
         #[serde(with = "serde_big_array::BigArray")]
         signature: [u8; 64],
     },
@@ -1535,7 +1536,6 @@ pub enum StakingAction {
     // forward *or* backward — a revert needs no state lookup.
     RetargetDelegationBond {
         unique_pubkey: [u8; 32],
-        challenge: [u8; 32],
         #[serde(with = "serde_big_array::BigArray")]
         signature: [u8; 64],
         from_finalizer: FinalizerAddress,
@@ -1543,12 +1543,10 @@ pub enum StakingAction {
     },
     ConvertFinalizerRewardToDelegationBond {
         unique_pubkey: [u8; 32],
-        challenge: [u8; 32],
         #[serde(with = "serde_big_array::BigArray")]
         signature: [u8; 64],
         this_finalizer: [u8; 32],
         amount_zats: u64,
-        second_challenge: [u8; 32],
         #[serde(with = "serde_big_array::BigArray")]
         finalizer_signature: [u8; 64],
     },
@@ -1577,6 +1575,55 @@ impl StakingAction {
     }
 
     /// Zero for kinds that don't carry an amount.
+    /// The bond key this action names, which is the key that must have signed it.
+    pub fn unique_pubkey(&self) -> [u8; 32] {
+        match self {
+            StakingAction::CreateNewDelegationBond { unique_pubkey, .. }
+            | StakingAction::BeginDelegationUnbonding { unique_pubkey, .. }
+            | StakingAction::WithdrawDelegationBond { unique_pubkey, .. }
+            | StakingAction::RetargetDelegationBond { unique_pubkey, .. }
+            | StakingAction::ConvertFinalizerRewardToDelegationBond { unique_pubkey, .. } => {
+                *unique_pubkey
+            }
+        }
+    }
+
+    /// The bond signature, over the transaction's shielded sighash.
+    pub fn signature(&self) -> [u8; 64] {
+        match self {
+            StakingAction::CreateNewDelegationBond { signature, .. }
+            | StakingAction::BeginDelegationUnbonding { signature, .. }
+            | StakingAction::WithdrawDelegationBond { signature, .. }
+            | StakingAction::RetargetDelegationBond { signature, .. }
+            | StakingAction::ConvertFinalizerRewardToDelegationBond { signature, .. } => *signature,
+        }
+    }
+
+    /// Sets the bond signature.
+    pub fn set_signature(&mut self, sig: [u8; 64]) {
+        match self {
+            StakingAction::CreateNewDelegationBond { signature, .. }
+            | StakingAction::BeginDelegationUnbonding { signature, .. }
+            | StakingAction::WithdrawDelegationBond { signature, .. }
+            | StakingAction::RetargetDelegationBond { signature, .. }
+            | StakingAction::ConvertFinalizerRewardToDelegationBond { signature, .. } => {
+                *signature = sig
+            }
+        }
+    }
+
+    /// This action with its bond signature cleared.
+    ///
+    /// The txid hashes this form, so the signature can sign the sighash without signing
+    /// itself; the block commitment hashes the signed form, so a relayer cannot strip it.
+    /// Only the bond signature is cleared: `finalizer_signature` is not verified by consensus
+    /// yet, and a field no signature covers must stay inside the txid to remain tamper-evident.
+    pub fn unsigned(&self) -> Self {
+        let mut unsigned = *self;
+        unsigned.set_signature([0u8; 64]);
+        unsigned
+    }
+
     pub fn amount_zats(&self) -> u64 {
         match self {
             StakingAction::CreateNewDelegationBond { amount_zats, .. }
@@ -1625,38 +1672,33 @@ impl StakingAction {
     /// never disagree.
     pub fn write_body<W: Write>(&self, mut writer: W) -> io::Result<()> {
         match self {
-            StakingAction::CreateNewDelegationBond { amount_zats, unique_pubkey, challenge, target_finalizer, signature } => {
+            StakingAction::CreateNewDelegationBond { amount_zats, unique_pubkey, bond_salt, target_finalizer, signature } => {
                 writer.write_all(unique_pubkey)?;
-                writer.write_all(challenge)?;
                 writer.write_all(signature)?;
+                writer.write_all(bond_salt)?;
                 target_finalizer.write(&mut writer)?;
                 writer.write_u64_le(*amount_zats)
             }
-            StakingAction::BeginDelegationUnbonding { unique_pubkey, challenge, signature } => {
+            StakingAction::BeginDelegationUnbonding { unique_pubkey, signature } => {
                 writer.write_all(unique_pubkey)?;
-                writer.write_all(challenge)?;
                 writer.write_all(signature)
             }
-            StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey, challenge, signature } => {
+            StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey, signature } => {
                 writer.write_all(unique_pubkey)?;
-                writer.write_all(challenge)?;
                 writer.write_all(signature)?;
                 writer.write_u64_le(*amount_zats)
             }
-            StakingAction::RetargetDelegationBond { unique_pubkey, challenge, signature, from_finalizer, to_finalizer } => {
+            StakingAction::RetargetDelegationBond { unique_pubkey, signature, from_finalizer, to_finalizer } => {
                 writer.write_all(unique_pubkey)?;
-                writer.write_all(challenge)?;
                 writer.write_all(signature)?;
                 from_finalizer.write(&mut writer)?;
                 to_finalizer.write(&mut writer)
             }
-            StakingAction::ConvertFinalizerRewardToDelegationBond { unique_pubkey, challenge, signature, this_finalizer, amount_zats, second_challenge, finalizer_signature } => {
+            StakingAction::ConvertFinalizerRewardToDelegationBond { unique_pubkey, signature, this_finalizer, amount_zats, finalizer_signature } => {
                 writer.write_all(unique_pubkey)?;
-                writer.write_all(challenge)?;
                 writer.write_all(signature)?;
                 writer.write_all(this_finalizer)?;
                 writer.write_u64_le(*amount_zats)?;
-                writer.write_all(second_challenge)?;
                 writer.write_all(finalizer_signature)
             }
         }
@@ -1690,48 +1732,46 @@ impl StakingAction {
         };
 
         let mut b32_0 = [0u8; 32];
-        let mut b32_1 = [0u8; 32];
         let mut b64_0 = [0u8; 64];
         reader.read_exact(&mut b32_0)?; // unique pubkey
-        reader.read_exact(&mut b32_1)?; // challenge
         reader.read_exact(&mut b64_0)?; // signature
 
         match kind {
             StakingActionKind::CreateNewDelegationBond => {
+                let mut bond_salt = [0u8; 32];
+                reader.read_exact(&mut bond_salt)?;
                 let target_finalizer = FinalizerAddress::read(&mut reader)?;
                 let amount_zats = reader.read_u64_le()?;
                 Ok(Some(StakingAction::CreateNewDelegationBond {
-                    amount_zats, unique_pubkey: b32_0, challenge: b32_1, target_finalizer, signature: b64_0,
+                    amount_zats, unique_pubkey: b32_0, bond_salt, target_finalizer, signature: b64_0,
                 }))
             }
             StakingActionKind::BeginDelegationUnbonding => {
                 Ok(Some(StakingAction::BeginDelegationUnbonding {
-                    unique_pubkey: b32_0, challenge: b32_1, signature: b64_0,
+                    unique_pubkey: b32_0, signature: b64_0,
                 }))
             }
             StakingActionKind::WithdrawDelegationBond => {
                 let amount_zats = reader.read_u64_le()?;
                 Ok(Some(StakingAction::WithdrawDelegationBond {
-                    amount_zats, unique_pubkey: b32_0, challenge: b32_1, signature: b64_0,
+                    amount_zats, unique_pubkey: b32_0, signature: b64_0,
                 }))
             }
             StakingActionKind::RetargetDelegationBond => {
                 let from_finalizer = FinalizerAddress::read(&mut reader)?;
                 let to_finalizer = FinalizerAddress::read(&mut reader)?;
                 Ok(Some(StakingAction::RetargetDelegationBond {
-                    unique_pubkey: b32_0, challenge: b32_1, signature: b64_0, from_finalizer, to_finalizer,
+                    unique_pubkey: b32_0, signature: b64_0, from_finalizer, to_finalizer,
                 }))
             }
             StakingActionKind::ConvertFinalizerRewardToDelegationBond => {
                 let mut this_finalizer = [0u8; 32];
-                let mut second_challenge = [0u8; 32];
                 let mut finalizer_signature = [0u8; 64];
                 reader.read_exact(&mut this_finalizer)?;
                 let amount_zats = reader.read_u64_le()?;
-                reader.read_exact(&mut second_challenge)?;
                 reader.read_exact(&mut finalizer_signature)?;
                 Ok(Some(StakingAction::ConvertFinalizerRewardToDelegationBond {
-                    unique_pubkey: b32_0, challenge: b32_1, signature: b64_0, this_finalizer, amount_zats, second_challenge, finalizer_signature,
+                    unique_pubkey: b32_0, signature: b64_0, this_finalizer, amount_zats, finalizer_signature,
                 }))
             }
             StakingActionKind::Null => unreachable!("tag 0 returned above"),
@@ -1767,43 +1807,38 @@ impl std::fmt::Display for StakingAction {
         };
 
         match self {
-            StakingAction::CreateNewDelegationBond { amount_zats, unique_pubkey, challenge, target_finalizer, signature } => {
+            StakingAction::CreateNewDelegationBond { amount_zats, unique_pubkey, bond_salt, target_finalizer, signature } => {
                 fmter.field("kind", &"CreateNewDelegationBond");
                 fmt_le_bytes(fmter, "unique_public_key", unique_pubkey);
-                fmt_le_bytes(fmter, "challenge", challenge);
                 fmt_le_bytes(fmter, "signature", signature);
+                fmt_le_bytes(fmter, "bond_salt", bond_salt);
                 fmter.field("target_finalizer", &target_finalizer.encode());
                 fmter.field("amount_zats", amount_zats);
             }
-            StakingAction::BeginDelegationUnbonding { unique_pubkey, challenge, signature } => {
+            StakingAction::BeginDelegationUnbonding { unique_pubkey, signature } => {
                 fmter.field("kind", &"BeginDelegationUnbonding");
                 fmt_le_bytes(fmter, "unique_public_key", unique_pubkey);
-                fmt_le_bytes(fmter, "challenge", challenge);
                 fmt_le_bytes(fmter, "signature", signature);
             }
-            StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey, challenge, signature } => {
+            StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey, signature } => {
                 fmter.field("kind", &"WithdrawDelegationBond");
                 fmt_le_bytes(fmter, "unique_public_key", unique_pubkey);
-                fmt_le_bytes(fmter, "challenge", challenge);
                 fmt_le_bytes(fmter, "signature", signature);
                 fmter.field("amount_zats", amount_zats);
             }
-            StakingAction::RetargetDelegationBond { unique_pubkey, challenge, signature, from_finalizer, to_finalizer } => {
+            StakingAction::RetargetDelegationBond { unique_pubkey, signature, from_finalizer, to_finalizer } => {
                 fmter.field("kind", &"RetargetDelegationBond");
                 fmt_le_bytes(fmter, "unique_public_key", unique_pubkey);
-                fmt_le_bytes(fmter, "challenge", challenge);
                 fmt_le_bytes(fmter, "signature", signature);
                 fmter.field("from_finalizer", &from_finalizer.encode());
                 fmter.field("to_finalizer", &to_finalizer.encode());
             }
-            StakingAction::ConvertFinalizerRewardToDelegationBond { unique_pubkey, challenge, signature, this_finalizer, amount_zats, second_challenge, finalizer_signature } => {
+            StakingAction::ConvertFinalizerRewardToDelegationBond { unique_pubkey, signature, this_finalizer, amount_zats, finalizer_signature } => {
                 fmter.field("kind", &"ConvertFinalizerRewardToDelegationBond");
                 fmt_le_bytes(fmter, "unique_public_key", unique_pubkey);
-                fmt_le_bytes(fmter, "challenge", challenge);
                 fmt_le_bytes(fmter, "signature", signature);
                 fmt_le_bytes(fmter, "this_finalizer", this_finalizer);
                 fmter.field("amount_zats", amount_zats);
-                fmt_le_bytes(fmter, "second_challenge", second_challenge);
                 fmt_le_bytes(fmter, "finalizer_signature", finalizer_signature);
             }
         }

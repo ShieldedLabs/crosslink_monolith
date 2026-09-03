@@ -212,6 +212,14 @@ impl Era {
     }
 }
 
+mod bond;
+pub use bond::BondSpendingKey;
+
+/// Typecode under which the bond spending key is carried in the `unstable` USK encoding.
+///
+/// TODO(@Prod): placeholder at the top of the parseable range, not a registered value.
+const CROSSLINK_BOND_TYPECODE: u32 = 0x0200_0000;
+
 /// A set of spending keys that are all associated with a single ZIP-0032 account identifier.
 #[derive(Clone)]
 pub struct UnifiedSpendingKey {
@@ -221,6 +229,7 @@ pub struct UnifiedSpendingKey {
     sapling: sapling::ExtendedSpendingKey,
     #[cfg(feature = "orchard")]
     orchard: orchard::keys::SpendingKey,
+    bond: BondSpendingKey,
 }
 
 impl core::fmt::Debug for UnifiedSpendingKey {
@@ -242,8 +251,8 @@ impl UnifiedSpendingKey {
         seed: &[u8],
         _account: AccountId,
     ) -> Result<UnifiedSpendingKey, DerivationError> {
-        if seed.len() < 32 {
-            panic!("ZIP 32 seeds MUST be at least 32 bytes");
+        if seed.len() < 32 || seed.len() > 252 {
+            panic!("ZIP 32 seeds MUST be between 32 and 252 bytes");
         }
 
         UnifiedSpendingKey::from_checked_parts(
@@ -255,6 +264,8 @@ impl UnifiedSpendingKey {
             #[cfg(feature = "orchard")]
             orchard::keys::SpendingKey::from_zip32_seed(seed, _params.coin_type(), _account)
                 .map_err(DerivationError::Orchard)?,
+            BondSpendingKey::from_seed(seed, u32::from(_account))
+                .expect("seed length is checked at the top of from_seed and account ids are 31-bit"),
         )
     }
 
@@ -264,6 +275,7 @@ impl UnifiedSpendingKey {
         #[cfg(feature = "transparent-inputs")] transparent: ::transparent::keys::AccountPrivKey,
         #[cfg(feature = "sapling")] sapling: sapling::ExtendedSpendingKey,
         #[cfg(feature = "orchard")] orchard: orchard::keys::SpendingKey,
+        bond: BondSpendingKey,
     ) -> Result<UnifiedSpendingKey, DerivationError> {
         // Verify that FVK and IVK derivation succeed; we don't want to construct a USK
         // that can't derive transparent addresses.
@@ -277,6 +289,7 @@ impl UnifiedSpendingKey {
             sapling,
             #[cfg(feature = "orchard")]
             orchard,
+            bond,
         })
     }
 
@@ -309,6 +322,11 @@ impl UnifiedSpendingKey {
     #[cfg(feature = "orchard")]
     pub fn orchard(&self) -> &orchard::keys::SpendingKey {
         &self.orchard
+    }
+
+    /// The bond spending key: the account's authority over its delegation bonds.
+    pub fn bond(&self) -> &BondSpendingKey {
+        &self.bond
     }
 
     /// Returns a binary encoding of this key suitable for decoding with [`Self::from_bytes`].
@@ -355,6 +373,13 @@ impl UnifiedSpendingKey {
             result.write_all(&account_tkey_bytes).unwrap();
         }
 
+        {
+            let tc = Typecode::Unknown(CROSSLINK_BOND_TYPECODE);
+            CompactSize::write(&mut result, usize::try_from(tc).unwrap()).unwrap();
+            CompactSize::write(&mut result, self.bond.as_bytes().len()).unwrap();
+            result.write_all(self.bond.as_bytes()).unwrap();
+        }
+
         result
     }
 
@@ -380,7 +405,15 @@ impl UnifiedSpendingKey {
         let mut sapling = None;
         #[cfg(feature = "transparent-inputs")]
         let mut transparent = None;
+        let mut bond = None;
         loop {
+            // An encoding from before the bond component ends here with every pool key read
+            // and no bond; say so rather than reporting a truncated typecode.
+            if source.position() as usize >= encoded.len() && bond.is_none() {
+                return Err(DecodingError::InsufficientData(Typecode::Unknown(
+                    CROSSLINK_BOND_TYPECODE,
+                )));
+            }
             let tc = CompactSize::read_t::<_, u32>(&mut source)
                 .map_err(|_| DecodingError::ReadError("typecode"))
                 .and_then(|v| Typecode::try_from(v).map_err(|_| DecodingError::TypecodeInvalid))?;
@@ -445,6 +478,16 @@ impl UnifiedSpendingKey {
                         );
                     }
                 }
+                Typecode::Unknown(CROSSLINK_BOND_TYPECODE) => {
+                    if len != 32 {
+                        return Err(DecodingError::LengthMismatch(tc, len));
+                    }
+                    let mut key = [0u8; 32];
+                    source
+                        .read_exact(&mut key)
+                        .map_err(|_| DecodingError::InsufficientData(tc))?;
+                    bond = Some(BondSpendingKey::from_bytes(key));
+                }
                 _ => {
                     return Err(DecodingError::TypecodeInvalid);
                 }
@@ -465,7 +508,7 @@ impl UnifiedSpendingKey {
             #[cfg(not(feature = "transparent-inputs"))]
             let has_transparent = true;
 
-            if has_orchard && has_sapling && has_transparent {
+            if has_orchard && has_sapling && has_transparent && bond.is_some() {
                 return UnifiedSpendingKey::from_checked_parts(
                     #[cfg(feature = "transparent-inputs")]
                     transparent.unwrap(),
@@ -473,6 +516,7 @@ impl UnifiedSpendingKey {
                     sapling.unwrap(),
                     #[cfg(feature = "orchard")]
                     orchard.unwrap(),
+                    bond.unwrap(),
                 )
                 .map_err(|_| DecodingError::KeyDataInvalid(Typecode::P2pkh));
             }
@@ -2327,6 +2371,9 @@ mod tests {
                 #[cfg(feature = "transparent-inputs")]
                 let len = len + 2 + 74;
 
+                // Bond key: a five-byte CompactSize typecode, a one-byte length, 32 bytes.
+                let len = len + 5 + 1 + 32;
+
                 #[allow(clippy::let_and_return)]
                 len
             };
@@ -2342,6 +2389,8 @@ mod tests {
 
             #[cfg(feature = "transparent-inputs")]
             assert_eq!(decoded.transparent().to_bytes(), usk.transparent().to_bytes());
+
+            assert_eq!(decoded.bond().as_bytes(), usk.bond().as_bytes());
         }
     }
 
