@@ -2,9 +2,8 @@
 
 This document separates the four protocol quantities used by the Crosslink 2 construction
 from Zebra's irreversible state-commit boundary, legacy reorg-depth fallback, and
-consumer-specific meanings of "final". It records the current implementation at repository
-revision `8df720061d59aeedc486eea2559e7d19721f94be` and identifies decisions that must be made
-before consensus behavior changes.
+consumer-specific meanings of "final". It records the implementation as of this revision of
+the repository and identifies decisions that must be made before consensus behavior changes.
 
 A companion visual explanation is in
 [`FINALITY_DIAGRAM.html`](./FINALITY_DIAGRAM.html).
@@ -256,9 +255,8 @@ and must be specified and analyzed separately.
 
 ## 5. Zebra implementation inventory
 
-This inventory refers to symbols at analyzed revision
-`8df720061d59aeedc486eea2559e7d19721f94be`; symbol names are preferred over brittle working
-tree line numbers.
+This inventory refers to symbols in the tree this document ships with; symbol names are
+preferred over brittle working tree line numbers.
 
 ### 5.1 The overloaded marker and write paths
 
@@ -317,7 +315,7 @@ The overloaded value currently reaches:
 
 `TFLServiceInternal::final_change_tx` is created and
 `TFLServiceRequest::FinalBlockRx` returns subscribers. The RPC notification methods wait on
-those receivers, but no `final_change_tx.send(...)` site exists in the analyzed tree. This
+those receivers, but no `final_change_tx.send(...)` site exists in this tree. This
 surface is incomplete: a waiter can remain blocked even when the marker changes.
 
 ### 5.4 Current staking rewards
@@ -544,6 +542,6 @@ which ledger state is read to materialize that set.
 - [Shielded Labs warning about the adapted construction](https://github.com/ShieldedLabs/zebra-crosslink/blob/6d02a1b80f896d08f923e39b2505f0565efb5787/book/src/design/cl2-construction.md#L1-L14).
   Protocol definitions above are cited separately from the original pinned source.
 
-All implementation observations in §§5–6 are based on the analyzed monolith revision named at
-the start of §5. Re-check the cited symbols before using this document to plan changes on a
-newer revision.
+All implementation observations in §§5–6 describe the monolith tree this document ships
+with. Code can move without this file being updated, so re-check the cited symbols before
+using this document to plan changes.
