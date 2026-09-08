@@ -126,6 +126,9 @@ pub static STAKING_STAGE: Mutex<Option<(StakingActionRequest, tokio::sync::onesh
 pub static BASIC_SEND_STAGE: Mutex<Option<(u64, String, tokio::sync::oneshot::Sender<Result<String, String>>)>> = Mutex::new(None);
 
 pub static STAKING_POSITIONS: Mutex<zcash_primitives::bft::WalletStakingPositions> = Mutex::new((BTreeMap::new(), Vec::new()));
+/// Read by the `wallet_spendable_funds` RPC; kept fresh by `wallet_main` beside the balances
+/// it already computes for the GUI.
+pub static SPENDABLE_FUNDS: Mutex<Option<zcash_primitives::bft::WalletSpendableFunds>> = Mutex::new(None);
 
 #[derive(Clone)]
 pub struct RecencyRequestClosure(pub Arc<dyn Fn() -> Option<String> + Sync + Send + 'static>);
@@ -4571,6 +4574,14 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let new_wallet_state_push_time = Instant::now();
             // println!("\n################ Wallet state period: {:#?}\n", new_wallet_state_push_time.duration_since(wallet_state_push_time));
             wallet_state_push_time = new_wallet_state_push_time;
+            *SPENDABLE_FUNDS.lock().unwrap() = Some(zcash_primitives::bft::WalletSpendableFunds {
+                address: user_ua.encode(network),
+                spendable_zats: user_shielded_spendable_funds,
+                pending_zats: user_shielded_pending_funds,
+                unshielded_zats: user_unshielded_funds,
+                tip_height: user_wallet.chain_tip_h.0,
+            });
+
             // DO NOT DO ANY WORK AFTER THIS LOCK IS TAKEN
             let mut lock = wallet_state.lock().unwrap();
             lock.waiting_for_send = waiting_for_send;

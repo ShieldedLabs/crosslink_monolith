@@ -1072,6 +1072,25 @@ pub struct ScanBond {
     pub create_txid: PubKeyID, // typed for serialization
 }
 
+/// What `wallet_basic_send` can actually spend right now, and where to send it.
+///
+/// A note is only spendable once it is far enough behind the tip, so a wallet that has just
+/// been paid reports the value as pending rather than spendable: that gap is the usual reason
+/// a send fails, which is why this pairs with the send RPC.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WalletSpendableFunds {
+    /// The wallet's own unified address, the destination other wallets pay to.
+    pub address: std::string::String,
+    /// Shielded value that can be spent now.
+    pub spendable_zats: u64,
+    /// Shielded value received too recently to spend yet.
+    pub pending_zats: u64,
+    /// Transparent value, which `wallet_basic_send` does not spend from.
+    pub unshielded_zats: u64,
+    /// The wallet's view of the chain tip, so a caller can tell a stale answer from a real one.
+    pub tip_height: u32,
+}
+
 /// Wallet staking positions. The u64 paired with each bond is its last-observed on-chain
 /// value in zats, incl. accumulated rewards (initial_val until refreshed).
 /// Withdrawable bonds are no longer targeted at a finalizer, so they are a flat list.

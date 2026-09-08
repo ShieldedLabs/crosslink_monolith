@@ -8,7 +8,7 @@ use zebra_chain::block::{Hash as BlockHash, Height as BlockHeight};
 
 use serde_with::serde_as;
 
-pub use zcash_primitives::bft::{FinalizerRecencyStatus, TFLRecencyStatus, ScanBond, ScanInfo, WalletStakingPositions};
+pub use zcash_primitives::bft::{FinalizerRecencyStatus, TFLRecencyStatus, ScanBond, ScanInfo, WalletSpendableFunds, WalletStakingPositions};
 use zcash_primitives::transaction::StakingActionRequest;
 
 /// The finality status of a block
@@ -65,6 +65,8 @@ pub enum TFLServiceRequest {
     WalletStakingAction(StakingActionRequest),
     /// Query wallet staking positions grouped by finalizer
     WalletStakingPositions,
+    /// Query what the wallet can spend now, and its own address
+    WalletSpendableFunds,
     /// Send a basic shielded value transfer from the wallet: (value in zatoshis, unified address)
     WalletBasicSend(u64, String),
 }
@@ -104,6 +106,8 @@ pub enum TFLServiceResponse {
     WalletStakingAction(Result<String, String>),
     /// Query wallet staking positions grouped by finalizer
     WalletStakingPositions(WalletStakingPositions),
+    /// Query what the wallet can spend now; `None` until the wallet's first sync pass completes
+    WalletSpendableFunds(Option<WalletSpendableFunds>),
     /// Send a basic shielded value transfer from the wallet
     WalletBasicSend(Result<String, String>),
 }

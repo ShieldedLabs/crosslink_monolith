@@ -636,6 +636,21 @@ pub trait Rpc {
     #[method(name = "wallet_staking_positions")]
     async fn wallet_staking_positions(&self) -> Result<serde_json::Value>;
 
+    /// What the wallet can spend now, what is still maturing, and its own address.
+    ///
+    /// The companion query to `wallet_basic_send`: a send fails when `spendable_zats` is below
+    /// the value plus fee, and value just received sits in `pending_zats` until it is far
+    /// enough behind the tip.
+    ///
+    /// ## Example Usage
+    /// ```shell
+    /// curl -X POST -H "Content-Type: application/json" -d \
+    /// '{ "jsonrpc": "2.0", "method": "wallet_spendable_funds", "params": [], "id": 1 }' \
+    /// http://127.0.0.1:8232
+    /// ```
+    #[method(name = "wallet_spendable_funds")]
+    async fn wallet_spendable_funds(&self) -> Result<serde_json::Value>;
+
     /// Send `value_zats` zatoshis from the wallet to a unified address, returning the txid.
     ///
     /// Unlike the GUI's send buttons the value is not quantized; it is an exact zatoshi amount.
@@ -2582,6 +2597,35 @@ where
             Err(err) => Err(ErrorObject::owned(
                     server::error::LegacyCode::Verify.into(),
                     format!("Staking positions query failed: {err}"),
+                    None::<()>,
+            )),
+        }
+    }
+
+    async fn wallet_spendable_funds(&self) -> Result<serde_json::Value> {
+        let res = self
+            .tfl_service
+            .clone()
+            .ready()
+            .await
+            .unwrap()
+            .call(TFLServiceRequest::WalletSpendableFunds)
+            .await;
+
+        match res {
+            Ok(TFLServiceResponse::WalletSpendableFunds(Some(funds))) => {
+                Ok(serde_json::to_value(funds).expect("WalletSpendableFunds serializes"))
+            }
+            // The wallet loop has not completed a pass yet, so no answer would be truthful.
+            Ok(TFLServiceResponse::WalletSpendableFunds(None)) => Err(ErrorObject::owned(
+                    server::error::LegacyCode::InWarmup.into(),
+                    "Wallet has not finished its first sync pass".to_string(),
+                    None::<()>,
+            )),
+            Ok(_) => unreachable!("unmatched response to a WalletSpendableFunds request"),
+            Err(err) => Err(ErrorObject::owned(
+                    server::error::LegacyCode::Verify.into(),
+                    format!("Spendable funds query failed: {err}"),
                     None::<()>,
             )),
         }
