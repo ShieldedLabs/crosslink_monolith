@@ -438,7 +438,7 @@ impl Timeout {
 }
 
 
-const ROSTER_MAX_N: usize = 100;
+const ROSTER_MAX_N: usize = zcash_primitives::bft::ACTIVE_ROSTER_MAX_N;
 fn active_roster_len(roster: &[SortedRosterMember]) -> usize { usize::min(ROSTER_MAX_N, roster.len()) }
 fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
 

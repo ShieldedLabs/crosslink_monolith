@@ -1501,7 +1501,10 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     for round in &bft_state.rounds_data {
                         let is_my_height = round.height == bft_state.height;// && round.round == bft_state.round;
 
-                        for (roster_i, member) in round.roster.iter().enumerate() {
+                        // The vote arrays are sized to the *active* roster (the top
+                        // ACTIVE_ROSTER_MAX_N by stake); members past that have no slot.
+                        let active_n = round.msg_val_sigs.len().min(round.msg_nil_sigs.len());
+                        for (roster_i, member) in round.roster.iter().take(active_n).enumerate() {
                             use zcash_primitives::bft::TMSig;
                             use tenderlink::ConsensusCounts;
 

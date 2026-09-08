@@ -1880,6 +1880,14 @@ pub fn burn_delegation_bonds(delegation_bonds: &mut HashMap<BondKey, (Delegation
 /// same share. Its commission would go to the very same bank, so the bank is simply
 /// credited its whole share.
 ///
+/// Only finalizers in the active roster are paid into their banks. The roster is
+/// the top [`ACTIVE_ROSTER_MAX_N`] finalizers by total stake (bonds plus bank, ties
+/// to the larger key) as of this block's bond state, the same ordering tenderlink
+/// applies to the aggregated-stakes snapshot. A bond pointed at a finalizer outside
+/// the roster keeps its whole reward, and such a finalizer's bank (if it has one from
+/// earlier) neither weighs nor earns until it is back in. This keeps the number of
+/// banks bounded by the roster size instead of by the number of distinct targets.
+///
 /// Returns the amounts actually paid, per bond and per finalizer, so a revert can
 /// undo exactly what was done without recomputing. Both are empty when nothing is
 /// at stake.
@@ -1891,6 +1899,26 @@ pub fn update_bonds_with_pos_issuance(
 {
     use zebra_chain::amount::Amount;
     use crate::constants::FINALIZER_COMMISSION_DIVISOR;
+    use zcash_primitives::bft::ACTIVE_ROSTER_MAX_N;
+
+    // The active roster: rank every finalizer by what it would show in the
+    // aggregated-stakes snapshot (active bonds targeting it plus its bank).
+    let in_roster: std::collections::HashSet<[u8; 32]> = {
+        let mut stakes: HashMap<[u8; 32], u64> = HashMap::new();
+        for (bond, status) in delegation_bonds.values() {
+            if *status == non_finalized_state::BondStatusInChain::Active {
+                *stakes.entry(bond.target_finalizer).or_insert(0) += bond.amount.zatoshis() as u64;
+            }
+        }
+        for (finalizer, bank) in finalizer_rewards.iter() {
+            if *bank != 0 {
+                *stakes.entry(*finalizer).or_insert(0) += bank;
+            }
+        }
+        let mut ranked: Vec<(u64, [u8; 32])> = stakes.into_iter().map(|(k, v)| (v, k)).collect();
+        ranked.sort_by_key(|&(stake, key)| std::cmp::Reverse((stake, key)));
+        ranked.iter().take(ACTIVE_ROSTER_MAX_N).map(|&(_, key)| key).collect()
+    };
 
     /*
        Note(Sam): This is inspired from Andrews earlier code. We will use the fact the integer division only rounds
@@ -1913,7 +1941,7 @@ pub fn update_bonds_with_pos_issuance(
         }
     }
     for (finalizer, bank) in finalizer_rewards.iter() {
-        if *bank == 0 { continue; }
+        if *bank == 0 || !in_roster.contains(finalizer) { continue; }
         total_staked_zats += bank;
         if *bank > biggest || (*bank == biggest && max_staker.map_or(true, |(k, is_bank)| is_bank && *finalizer < k)) {
             max_staker = Some((*finalizer, true));
@@ -1934,11 +1962,12 @@ pub fn update_bonds_with_pos_issuance(
     fn pay(
         reward_per_bond: &mut Vec<([u8; 32], u64)>,
         commission_per_finalizer: &mut HashMap<[u8; 32], u64>,
+        in_roster: &std::collections::HashSet<[u8; 32]>,
         bond_key: [u8; 32],
         bond: &mut finalized_state::disk_format::DelegationBond,
         reward: u64,
     ) {
-        let commission = reward / FINALIZER_COMMISSION_DIVISOR;
+        let commission = if in_roster.contains(&bond.target_finalizer) { reward / FINALIZER_COMMISSION_DIVISOR } else { 0 };
         let to_bond = reward - commission;
         bond.amount = (bond.amount + Amount::new(to_bond as i64)).unwrap();
         reward_per_bond.push((bond_key, to_bond));
@@ -1956,11 +1985,11 @@ pub fn update_bonds_with_pos_issuance(
         if *bond_status == non_finalized_state::BondStatusInChain::Active && (*bond_key, false) != max_staker {
             let reward = share(bond.amount.zatoshis() as u64);
             so_far_payed_reward += reward;
-            pay(&mut reward_per_bond, &mut commission_per_finalizer, *bond_key, bond, reward);
+            pay(&mut reward_per_bond, &mut commission_per_finalizer, &in_roster, *bond_key, bond, reward);
         }
     }
     for (finalizer, bank) in finalizer_rewards.iter() {
-        if *bank != 0 && (*finalizer, true) != max_staker {
+        if *bank != 0 && in_roster.contains(finalizer) && (*finalizer, true) != max_staker {
             let reward = share(*bank);
             so_far_payed_reward += reward;
             *commission_per_finalizer.entry(*finalizer).or_insert(0) += reward;
@@ -1972,7 +2001,7 @@ pub fn update_bonds_with_pos_issuance(
     match max_staker {
         (bond_key, false) => {
             let (bond, _status) = delegation_bonds.get_mut(&bond_key).expect("checked earlier");
-            pay(&mut reward_per_bond, &mut commission_per_finalizer, bond_key, bond, remainder);
+            pay(&mut reward_per_bond, &mut commission_per_finalizer, &in_roster, bond_key, bond, remainder);
         }
         (finalizer, true) => {
             *commission_per_finalizer.entry(finalizer).or_insert(0) += remainder;

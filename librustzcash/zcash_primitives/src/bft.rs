@@ -702,6 +702,12 @@ impl FinalizerAddress {
     }
 }
 
+/// The active BFT roster is the top this-many finalizers by stake (ties broken by public
+/// key, larger first). Tenderlink votes with exactly this set, and PoS issuance credits
+/// commission only to finalizers inside it, so a bond pointed at a key outside the roster
+/// never opens a reward bank.
+pub const ACTIVE_ROSTER_MAX_N: usize = 100;
+
 /// Domain prefix of the message a finalizer signs to release reward-bank value into a
 /// bond (`StakingAction::ConvertFinalizerRewardToDelegationBond`).
 pub const FINALIZER_REWARD_CONVERSION_MSG: &[u8] = b"Zcash Crosslink Finalizer Reward Conversion v1";
