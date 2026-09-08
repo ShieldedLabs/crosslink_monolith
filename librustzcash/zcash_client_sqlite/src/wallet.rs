@@ -3222,10 +3222,7 @@ pub(crate) fn get_bond_create_action<P: Parameters>(
         let Some(action) = tx.staking_action() else {
             continue;
         };
-        if !matches!(
-            action,
-            zcash_primitives::transaction::StakingAction::CreateNewDelegationBond { .. }
-        ) {
+        if action.bond_terms().is_none() {
             continue;
         }
         if action.unique_pubkey() == bond_key {

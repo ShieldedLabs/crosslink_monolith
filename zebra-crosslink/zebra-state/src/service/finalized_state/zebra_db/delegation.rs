@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use zebra_chain::{amount::Amount, block, block::Height};
+use zebra_chain::{amount::{Amount, NonNegative}, block, block::Height};
 
 use crate::{
     request::FinalizedBlock,
@@ -24,6 +24,10 @@ pub const BOND_STATUS_BY_KEY: &str = "bond_status_by_key";
 /// The name of the aggregated stakes by hash column family.
 pub const AGGREGATED_STAKES_BY_HASH: &str = "aggregated_stakes_by_hash";
 
+/// The name of the finalizer reward bank column family: finalizer key -> unconverted
+/// commission. Only keys that have ever earned commission have a row.
+pub const FINALIZER_REWARD_BY_KEY: &str = "finalizer_reward_by_key";
+
 /// The type for reading delegation bonds from the database.
 pub type DelegationBondByKeyCf<'cf> = TypedColumnFamily<'cf, BondKey, DelegationBond>;
 
@@ -32,6 +36,9 @@ pub type BondStatusByKeyCf<'cf> = TypedColumnFamily<'cf, BondKey, BondStatus>;
 
 /// The type for reading aggregated stakes from the database.
 pub type AggregatedStakesByHashCf<'cf> = TypedColumnFamily<'cf, block::Hash, AggregatedStakes>;
+
+/// The type for reading finalizer reward banks from the database.
+pub type FinalizerRewardByKeyCf<'cf> = TypedColumnFamily<'cf, [u8; 32], Amount<NonNegative>>;
 
 impl ZebraDb {
     // Column family convenience methods
@@ -52,6 +59,29 @@ impl ZebraDb {
     pub(crate) fn aggregated_stakes_by_hash_cf(&self) -> AggregatedStakesByHashCf<'_> {
         AggregatedStakesByHashCf::new(&self.db, AGGREGATED_STAKES_BY_HASH)
             .expect("column family was created when database was created")
+    }
+
+    /// Returns a typed handle to the finalizer reward by key column family.
+    pub(crate) fn finalizer_reward_by_key_cf(&self) -> FinalizerRewardByKeyCf<'_> {
+        FinalizerRewardByKeyCf::new(&self.db, FINALIZER_REWARD_BY_KEY)
+            .expect("column family was created when database was created")
+    }
+
+    /// A finalizer's unconverted commission in the finalized state; zero if it has none.
+    pub fn finalizer_reward(&self, finalizer: &[u8; 32]) -> u64 {
+        self.finalizer_reward_by_key_cf()
+            .zs_get(finalizer)
+            .map(|a| a.into())
+            .unwrap_or(0)
+    }
+
+    /// Every finalizer reward bank, used to seed a non-finalized chain.
+    pub fn all_finalizer_rewards(&self) -> Vec<([u8; 32], u64)> {
+        self.finalizer_reward_by_key_cf()
+            .zs_items_in_range_ordered(..)
+            .into_iter()
+            .map(|(key, amount)| (key, amount.into()))
+            .collect()
     }
 
     // Read delegation bond methods
@@ -135,6 +165,8 @@ impl ZebraDb {
 pub struct BondBatchOverlay {
     bonds: HashMap<BondKey, DelegationBond>,
     statuses: HashMap<BondKey, BondStatus>,
+    /// Post-block bank balance of every finalizer this block touched.
+    banks: HashMap<[u8; 32], u64>,
 }
 
 impl DiskWriteBatch {
@@ -157,6 +189,9 @@ impl DiskWriteBatch {
         // retargets must see bonds created or modified earlier in this same block,
         // which aren't in the DB yet.
         let mut overlay = BondBatchOverlay::default();
+        // Finalizer banks this block changes (Convert debits, commission credits),
+        // read once from the db and written once at the end.
+        let mut banks: HashMap<[u8; 32], u64> = HashMap::new();
 
         // Iterate through all transactions in the block
         for (transaction_index, transaction) in finalized.block.transactions.iter().enumerate() {
@@ -197,11 +232,32 @@ impl DiskWriteBatch {
                             &mut overlay,
                         )?;
                     }
-                    // Other staking actions don't affect delegation bonds
-                    _ => {}
+                    StakingActionKind::ConvertFinalizerRewardToDelegationBond => {
+                        let finalizer = staking_action.target_finalizer_pk();
+                        let amount_zats = staking_action.amount_zats();
+                        let bank = banks.entry(finalizer).or_insert_with(|| db.finalizer_reward(&finalizer));
+                        *bank = bank.checked_sub(amount_zats).ok_or_else(|| {
+                            format!("finalizer {:?} bank cannot cover conversion of {amount_zats}", finalizer)
+                        })?;
+
+                        let bond = DelegationBond::new(Amount::try_from(amount_zats)?, finalizer, transaction_location);
+                        self.prepare_new_delegation_bond(&db.db, bond_key, bond, &mut overlay);
+                    }
+                    StakingActionKind::Null => {}
                 }
             }
         }
+
+        // Credit this block's commissions, then write every bank this block touched.
+        for (finalizer, commission) in &finalized.finalizer_rewards {
+            let bank = banks.entry(*finalizer).or_insert_with(|| db.finalizer_reward(finalizer));
+            *bank += commission;
+        }
+        let finalizer_reward_by_key_cf = db.db.cf_handle(FINALIZER_REWARD_BY_KEY).unwrap();
+        for (finalizer, bank) in &banks {
+            self.zs_insert(&finalizer_reward_by_key_cf, *finalizer, Amount::<NonNegative>::try_from(*bank)?);
+        }
+        overlay.banks = banks;
 
         // Apply bond rewards accumulated in the non-finalized state
         let delegation_bond_by_key_cf = db.db.cf_handle(DELEGATION_BOND_BY_KEY).unwrap();
@@ -236,8 +292,9 @@ impl DiskWriteBatch {
     }
 
     /// Prepare the aggregated-stakes snapshot for `hash` into this batch: the total
-    /// active bond amount per finalizer as of this block, i.e. the database's bond set
-    /// with this batch's own bond writes (`overlay`) applied on top.
+    /// active bond amount per finalizer as of this block, plus each finalizer's own
+    /// reward bank (a virtual bond on itself), i.e. the database's bond and bank sets
+    /// with this batch's own writes (`overlay`) applied on top.
     pub fn prepare_aggregated_stakes_batch(
         &mut self,
         db: &ZebraDb,
@@ -287,6 +344,19 @@ impl DiskWriteBatch {
             };
             let amount: u64 = bond.amount.into();
             *stakes_by_finalizer.entry(bond.target_finalizer).or_insert(0) += amount;
+        }
+
+        for (finalizer, bank) in db.all_finalizer_rewards() {
+            let bank = overlay.banks.get(&finalizer).copied().unwrap_or(bank);
+            if bank != 0 {
+                *stakes_by_finalizer.entry(finalizer).or_insert(0) += bank;
+            }
+        }
+        for (finalizer, bank) in &overlay.banks {
+            // banks first credited in this block have no db row yet
+            if *bank != 0 && !db.finalizer_reward_by_key_cf().zs_contains(finalizer) {
+                *stakes_by_finalizer.entry(*finalizer).or_insert(0) += bank;
+            }
         }
 
         let aggregated: Vec<([u8; 32], u64)> = stakes_by_finalizer.into_iter().collect();

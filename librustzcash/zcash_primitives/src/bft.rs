@@ -702,6 +702,49 @@ impl FinalizerAddress {
     }
 }
 
+/// Domain prefix of the message a finalizer signs to release reward-bank value into a
+/// bond (`StakingAction::ConvertFinalizerRewardToDelegationBond`).
+pub const FINALIZER_REWARD_CONVERSION_MSG: &[u8] = b"Zcash Crosslink Finalizer Reward Conversion v1";
+
+/// The exact bytes the finalizer signs: prefix, the new bond's key, the amount (LE).
+/// Standalone on purpose — no sighash — so the finalizer node can authorize a
+/// conversion without ever seeing the transaction. Single-use follows from the bond
+/// key: consensus rejects a second bond under the same key, so the same
+/// authorization cannot fund two bonds.
+pub fn finalizer_reward_conversion_msg(bond_key: &[u8; 32], amount_zats: u64) -> [u8; FINALIZER_REWARD_CONVERSION_MSG_LEN] {
+    let mut msg = [0u8; FINALIZER_REWARD_CONVERSION_MSG_LEN];
+    let n = FINALIZER_REWARD_CONVERSION_MSG.len();
+    msg[..n].copy_from_slice(FINALIZER_REWARD_CONVERSION_MSG);
+    msg[n..n + 32].copy_from_slice(bond_key);
+    msg[n + 32..].copy_from_slice(&amount_zats.to_le_bytes());
+    msg
+}
+pub const FINALIZER_REWARD_CONVERSION_MSG_LEN: usize = 46 + 32 + 8;
+const _: () = assert!(FINALIZER_REWARD_CONVERSION_MSG.len() == 46);
+
+pub fn sign_finalizer_reward_conversion(finalizer_key: &SigningKey, bond_key: &[u8; 32], amount_zats: u64) -> [u8; 64] {
+    finalizer_key.sign(&finalizer_reward_conversion_msg(bond_key, amount_zats)).to_bytes()
+}
+
+pub fn verify_finalizer_reward_conversion(finalizer: PubKeyID, bond_key: &[u8; 32], amount_zats: u64, sig: &[u8; 64]) -> bool {
+    TMSig(*sig).verify(finalizer, &finalizer_reward_conversion_msg(bond_key, amount_zats)).is_ok()
+}
+
+/// The node's finalizer key from its `explicit_bft_key_seed` string (or a bootstrap
+/// peer address). Lives here rather than in the node so a wallet holding the same
+/// seed derives the same key. `DefaultHasher::new()` is SipHash-1-3 with fixed zero
+/// keys, so this is stable across processes and builds.
+pub fn finalizer_key_from_seed(seed: &[u8]) -> (rand::rngs::StdRng, SigningKey, PubKeyID) {
+    use rand::SeedableRng;
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(seed);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(hasher.finish());
+    let private_key = SigningKey::new(&mut rng);
+    let pub_key = PubKeyID(<[u8; 32]>::from(VerificationKeyBytes::from(&private_key)));
+    (rng, private_key, pub_key)
+}
+
 // Serde uses the zfin string form, so JSON carrying a finalizer address (e.g. a
 // staking RPC request) looks like the address a human copies around. Parse is
 // structural; consumers still call verify().

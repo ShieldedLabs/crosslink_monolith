@@ -20,9 +20,10 @@ proptest! {
         let ironwood = value_balance1.ironwood + value_balance2.ironwood;
         let staking_bonded = value_balance1.staking_bonded + value_balance2.staking_bonded;
         let staking_unbonded = value_balance1.staking_unbonded + value_balance2.staking_unbonded;
+        let finalizer_rewards = value_balance1.finalizer_rewards + value_balance2.finalizer_rewards;
 
-        match (transparent, sprout, sapling, orchard, deferred, ironwood, staking_bonded, staking_unbonded) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(staking_bonded), Ok(staking_unbonded)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood, staking_bonded, staking_unbonded, finalizer_rewards) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(staking_bonded), Ok(staking_unbonded), Ok(finalizer_rewards)) => prop_assert_eq!(
                 value_balance1 + value_balance2,
                 Ok(ValueBalance {
                     transparent,
@@ -33,6 +34,7 @@ proptest! {
                     ironwood,
                     staking_bonded,
                     staking_unbonded,
+                    finalizer_rewards,
                 })
             ),
             _ => prop_assert!(
@@ -45,7 +47,8 @@ proptest! {
                         | ValueBalanceError::Deferred(_)
                         | ValueBalanceError::Ironwood(_)
                         | ValueBalanceError::StakingBonded(_)
-                        | ValueBalanceError::StakingUnbonded(_))
+                        | ValueBalanceError::StakingUnbonded(_)
+                        | ValueBalanceError::FinalizerRewards(_))
                 )
             ),
         }
@@ -65,9 +68,10 @@ proptest! {
         let ironwood = value_balance1.ironwood - value_balance2.ironwood;
         let staking_bonded = value_balance1.staking_bonded - value_balance2.staking_bonded;
         let staking_unbonded = value_balance1.staking_unbonded - value_balance2.staking_unbonded;
+        let finalizer_rewards = value_balance1.finalizer_rewards - value_balance2.finalizer_rewards;
 
-        match (transparent, sprout, sapling, orchard, deferred, ironwood, staking_bonded, staking_unbonded) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(staking_bonded), Ok(staking_unbonded)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood, staking_bonded, staking_unbonded, finalizer_rewards) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(staking_bonded), Ok(staking_unbonded), Ok(finalizer_rewards)) => prop_assert_eq!(
                 value_balance1 - value_balance2,
                 Ok(ValueBalance {
                     transparent,
@@ -78,6 +82,7 @@ proptest! {
                     ironwood,
                     staking_bonded,
                     staking_unbonded,
+                    finalizer_rewards,
                 })
             ),
             _ => prop_assert!(matches!(
@@ -89,7 +94,8 @@ proptest! {
                         | ValueBalanceError::Deferred(_)
                         | ValueBalanceError::Ironwood(_)
                         | ValueBalanceError::StakingBonded(_)
-                        | ValueBalanceError::StakingUnbonded(_))
+                        | ValueBalanceError::StakingUnbonded(_)
+                        | ValueBalanceError::FinalizerRewards(_))
                 )),
         }
     }
@@ -111,9 +117,10 @@ proptest! {
         let ironwood = value_balance1.ironwood + value_balance2.ironwood;
         let staking_bonded = value_balance1.staking_bonded + value_balance2.staking_bonded;
         let staking_unbonded = value_balance1.staking_unbonded + value_balance2.staking_unbonded;
+        let finalizer_rewards = value_balance1.finalizer_rewards + value_balance2.finalizer_rewards;
 
-        match (transparent, sprout, sapling, orchard, deferred, ironwood, staking_bonded, staking_unbonded) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(staking_bonded), Ok(staking_unbonded)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood, staking_bonded, staking_unbonded, finalizer_rewards) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(staking_bonded), Ok(staking_unbonded), Ok(finalizer_rewards)) => prop_assert_eq!(
                 collection.iter().sum::<Result<ValueBalance<NegativeAllowed>, ValueBalanceError>>(),
                 Ok(ValueBalance {
                     transparent,
@@ -124,6 +131,7 @@ proptest! {
                     ironwood,
                     staking_bonded,
                     staking_unbonded,
+                    finalizer_rewards,
                 })
             ),
             _ => prop_assert!(matches!(
@@ -135,7 +143,8 @@ proptest! {
                         | ValueBalanceError::Deferred(_)
                         | ValueBalanceError::Ironwood(_)
                         | ValueBalanceError::StakingBonded(_)
-                        | ValueBalanceError::StakingUnbonded(_))
+                        | ValueBalanceError::StakingUnbonded(_)
+                        | ValueBalanceError::FinalizerRewards(_))
                  ))
         }
     }

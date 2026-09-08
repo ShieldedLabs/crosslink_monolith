@@ -163,6 +163,7 @@ pub(super) const PARAM_VALUE_ZATS_DESC: &str =
 pub(super) const PARAM_DST_ADDRESS_DESC: &str =
     "The unified address to send to; it must have an Ironwood receiver.";
 pub(super) const PARAM_BOND_KEY_DESC: &str = "The 32-byte delegation bond key, hex-encoded.";
+pub(super) const PARAM_FINALIZER_DESC: &str = "The finalizer's 32-byte public key, hex-encoded.";
 pub(super) const PARAM_HASH_DESC: &str = "The block or transaction hash, hex-encoded.";
 pub(super) const PARAM_UFVK_STRS_DESC: &str =
     "Unified full viewing keys to scan, as encoded strings.";
@@ -287,6 +288,16 @@ pub trait Rpc {
     /// Bond information including amount and status, or null if the bond doesn't exist.
     #[method(name = "getbondinfo")]
     async fn get_bond_info(&self, bond_key: String) -> Result<Option<GetBondInfoResponse>>;
+
+    /// Returns a finalizer's unconverted reward-bank balance in zatoshis: the
+    /// commission it has earned on its delegators' block rewards and not yet
+    /// converted into a bond.
+    ///
+    /// # Parameters
+    ///
+    /// - `finalizer`: (string, required) The finalizer's 32-byte public key as hex.
+    #[method(name = "getfinalizerrewardbalance")]
+    async fn get_finalizer_reward_balance(&self, finalizer: String) -> Result<u64>;
 
     /// Requests a donation from an attached faucet
     ///
@@ -1705,6 +1716,33 @@ where
                 }))
             }
             zebra_state::ReadResponse::BondInfo(None) => Ok(None),
+            _ => unreachable!("Unexpected response from state service: {response:?}"),
+        }
+    }
+
+    async fn get_finalizer_reward_balance(&self, finalizer: String) -> Result<u64> {
+        let finalizer: [u8; 32] = Vec::from_hex(&finalizer)
+            .map_err(|_| ErrorObject::owned(
+                ErrorCode::InvalidParams.code(),
+                "invalid hex string for finalizer",
+                None::<()>,
+            ))?
+            .try_into()
+            .map_err(|_| ErrorObject::owned(
+                ErrorCode::InvalidParams.code(),
+                "finalizer must be exactly 32 bytes",
+                None::<()>,
+            ))?;
+
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(zebra_state::ReadRequest::FinalizerRewardBalance(finalizer))
+            .await
+            .map_misc_error()?;
+
+        match response {
+            zebra_state::ReadResponse::FinalizerRewardBalance(balance) => Ok(balance),
             _ => unreachable!("Unexpected response from state service: {response:?}"),
         }
     }

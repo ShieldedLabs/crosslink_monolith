@@ -18,6 +18,11 @@ pub use zebra_chain::transparent::MIN_TRANSPARENT_COINBASE_MATURITY;
 /// `zebra-checkpoints`) can use it without depending on `zebra-state`.
 pub const POS_BLOCK_REWARD_ZATS: u64 = 500_000_000; // TODO: directly contribute to "reward total" - currently dev fund 20% ignores this in its calculation
 
+/// Finalizer commission: each bond's share of the block reward is split, one part in
+/// `FINALIZER_COMMISSION_DIVISOR` (rounded down) going to the bond's target finalizer's
+/// reward bank and the rest to the bond.
+pub const FINALIZER_COMMISSION_DIVISOR: u64 = 10;
+
 /// The maximum chain reorganisation height.
 ///
 /// This threshold determines the maximum length of the best non-finalized chain.

@@ -147,6 +147,14 @@ pub struct ChainInner {
     /// Used for exact reverting without rounding issues.
     pub(crate) bond_rewards: Vec<Vec<(disk_format::BondKey, u64)>>,
 
+    /// Finalizer reward banks: unconverted commission per finalizer key, seeded from
+    /// the finalized state and updated by issuance and Convert actions in this chain.
+    pub(crate) finalizer_rewards: HashMap<[u8; 32], u64>,
+
+    /// Commission credited to each finalizer at each block height, the bank-side
+    /// twin of `bond_rewards`, for exact reverting.
+    pub(crate) finalizer_commissions: Vec<Vec<([u8; 32], u64)>>,
+
     /// Pre-block target finalizers for bonds that were retargeted at each block height.
     /// Indexed by block position in the chain (0 = first non-finalized block).
     /// Stores the target finalizer BEFORE the retarget, so we can restore it on revert.
@@ -309,6 +317,7 @@ impl Chain {
         history_tree: Arc<HistoryTree>,
         finalized_tip_chain_value_pools: ValueBalance<NonNegative>,
         finalized_bonds: impl IntoIterator<Item = (disk_format::BondKey, disk_format::DelegationBond, disk_format::BondStatus)>,
+        finalized_finalizer_rewards: impl IntoIterator<Item = ([u8; 32], u64)>,
     ) -> Self {
         // Passing the trees in a named struct (rather than four adjacent positional arguments, two
         // of them the same `Arc<orchard::tree::NoteCommitmentTree>` type) makes an orchard/ironwood
@@ -342,6 +351,8 @@ impl Chain {
             spent_utxos: Default::default(),
             delegation_bonds,
             bond_rewards: Vec::new(),
+            finalizer_rewards: finalized_finalizer_rewards.into_iter().collect(),
+            finalizer_commissions: Vec::new(),
             bond_retargets: Vec::new(),
             bond_burns: Vec::new(),
             sprout_anchors: MultiSet::new(),
@@ -438,9 +449,10 @@ impl Chain {
     }
 
     /// Pops the lowest height block of the non-finalized portion of a chain,
-    /// and returns it with its associated treestate, bond rewards, burned bonds, and unbonding amounts for that block.
+    /// and returns it with its associated treestate, bond rewards, finalizer commissions,
+    /// burned bonds, and unbonding amounts for that block.
     #[instrument(level = "debug", skip(self))]
-    pub(crate) fn pop_root(&mut self) -> (ContextuallyVerifiedBlock, Treestate, Vec<([u8; 32], u64)>, Vec<[u8; 32]>, Vec<([u8; 32], u64)>) {
+    pub(crate) fn pop_root(&mut self) -> (ContextuallyVerifiedBlock, Treestate, Vec<([u8; 32], u64)>, Vec<([u8; 32], u64)>, Vec<[u8; 32]>, Vec<([u8; 32], u64)>) {
         // Obtain the lowest height.
         let block_height = self.non_finalized_root_height();
 
@@ -470,6 +482,11 @@ impl Chain {
         // Extract bond rewards for this block BEFORE revert_chain_with discards them
         let bond_rewards = if !self.bond_rewards.is_empty() {
             self.bond_rewards.remove(0)
+        } else {
+            Vec::new()
+        };
+        let finalizer_commissions = if !self.finalizer_commissions.is_empty() {
+            self.finalizer_commissions.remove(0)
         } else {
             Vec::new()
         };
@@ -504,7 +521,7 @@ impl Chain {
         // Update cumulative data members (this no longer discards bond_rewards since we extracted them above)
         self.revert_chain_with(&block, RevertPosition::Root);
 
-        (block, treestate, bond_rewards, bond_burns, unbonding_amounts)
+        (block, treestate, bond_rewards, finalizer_commissions, bond_burns, unbonding_amounts)
     }
 
     /// Returns the block at the provided height and all of its descendant blocks.
@@ -1872,11 +1889,12 @@ impl Chain {
         _transaction_hash: &transaction::Hash,
         transaction_location: disk_format::TransactionLocation,
     ) -> Result<(), ValidateContextError> {
-        let ChainInner { chain_value_pools, delegation_bonds, bond_retargets, .. } = &mut self.inner;
+        let ChainInner { chain_value_pools, delegation_bonds, bond_retargets, finalizer_rewards, .. } = &mut self.inner;
         crate::service::update_chain_tip_with_delegation_bond(
             chain_value_pools,
             delegation_bonds,
             bond_retargets,
+            finalizer_rewards,
             staking_action,
             _transaction_hash,
             transaction_location
@@ -1938,7 +1956,17 @@ impl Chain {
                     "bond should be withdrawn if withdrawal was added to chain");
                 *status = BondStatusInChain::Unbonding;
             }
-            _ => {}
+            StakingActionKind::ConvertFinalizerRewardToDelegationBond => {
+                // Remove the bond and refund the bank; pools revert through the
+                // transaction's value balance like every other tx.
+                assert!(
+                    self.delegation_bonds.remove(&bond_key).is_some(),
+                    "bond must be present if it was added to chain"
+                );
+                *self.finalizer_rewards.entry(staking_action.target_finalizer_pk()).or_insert(0)
+                    += staking_action.amount_zats();
+            }
+            StakingActionKind::RetargetDelegationBond | StakingActionKind::Null => {}
         }
     }
 
@@ -2130,14 +2158,17 @@ impl Chain {
         let size = block.zcash_serialized_size();
         self.update_chain_tip_with(&(*chain_value_pool_change, height, size))?;
 
-        if self.delegation_bonds.iter().position(|(_, (_, status))| *status == BondStatusInChain::Active).is_none() {
-            self.bond_rewards.push(Vec::new());
-            // TODO handle this case, for prototyping this is whatever.
-        } else {
-            let bond_reward_total = crate::constants::POS_BLOCK_REWARD_ZATS;
-            let reward_store_for_revert = crate::service::update_bonds_with_pos_issuance(bond_reward_total, &mut self.inner.delegation_bonds);
-            self.inner.chain_value_pools.set_staking_bonded_amount((self.inner.chain_value_pools.staking_bonded_amount() + Amount::new(bond_reward_total as i64)).unwrap());
-            self.bond_rewards.push(reward_store_for_revert);
+        // Nothing at stake (no active bond, every bank empty) means no issuance this
+        // block; the two logs then hold empty entries. TODO: for prototyping this is whatever.
+        {
+            let ChainInner { delegation_bonds, finalizer_rewards, chain_value_pools, .. } = &mut self.inner;
+            let (bond_rewards, commissions) = crate::service::update_bonds_with_pos_issuance(crate::constants::POS_BLOCK_REWARD_ZATS, delegation_bonds, finalizer_rewards);
+            let to_bonds: u64 = bond_rewards.iter().map(|(_, r)| r).sum();
+            let commission_total: u64 = commissions.iter().map(|(_, c)| c).sum();
+            chain_value_pools.set_staking_bonded_amount((chain_value_pools.staking_bonded_amount() + Amount::new(to_bonds as i64)).unwrap());
+            chain_value_pools.set_finalizer_rewards_amount((chain_value_pools.finalizer_rewards_amount() + Amount::new(commission_total as i64)).unwrap());
+            self.bond_rewards.push(bond_rewards);
+            self.finalizer_commissions.push(commissions);
         }
         Ok(())
     }
@@ -2258,6 +2289,20 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                 let new_bonded = (current_bonded - Amount::try_from(reward_amount as i64).unwrap())
                     .expect("reverting reward should not underflow bonded pool");
                 self.chain_value_pools.set_staking_bonded_amount(new_bonded);
+            }
+
+            // Revert finalizer commissions from the banks and the pool
+            let commissions = self.finalizer_commissions.pop().expect("commissions must exist for tip block");
+            for (finalizer, commission) in commissions {
+                let bank = self.finalizer_rewards.get_mut(&finalizer)
+                    .expect("finalizer must have a bank if it was paid commission");
+                *bank = bank.checked_sub(commission)
+                    .expect("reverting commission should not underflow the finalizer bank");
+
+                let current = self.chain_value_pools.finalizer_rewards_amount();
+                let reverted = (current - Amount::try_from(commission as i64).unwrap())
+                    .expect("reverting commission should not underflow finalizer_rewards pool");
+                self.chain_value_pools.set_finalizer_rewards_amount(reverted);
             }
 
             // Revert bond retargets - restore old target_finalizer values

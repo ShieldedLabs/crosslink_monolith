@@ -547,7 +547,10 @@ impl WalletTxPart {
                     b.spent(Zatoshis::from_u64(staking_action.amount_zats()).expect("already converted"), true).unwrap();
                 },
 
-                StakingActionKind::ConvertFinalizerRewardToDelegationBond => todo!("finalizer reward conversion"),
+                // Funded by the finalizer's bank, not by us: the bond only arrives.
+                StakingActionKind::ConvertFinalizerRewardToDelegationBond => {
+                    b.recv(Zatoshis::from_u64(staking_action.amount_zats()).expect("already converted"), true).unwrap();
+                },
             }
         }
 
@@ -1706,7 +1709,10 @@ impl ManualWallet {
                 if DUMP_TX_BUILD { println!("  withdrawing bond: {}", amount_zats); }
             },
 
-            Some(StakingAction::ConvertFinalizerRewardToDelegationBond { .. }) => todo!("finalizer reward conversion"),
+            Some(StakingAction::ConvertFinalizerRewardToDelegationBond { amount_zats, .. }) => {
+                b.recv(to_zats_or_dump_err("tx build: convert finalizer reward", amount_zats)?, true)?;
+                if DUMP_TX_BUILD { println!("  converting finalizer reward into a bond: {}", amount_zats); }
+            },
         }
 
         let staking_action = if let Some(staking_action) = opts.staking_action {
@@ -1986,20 +1992,55 @@ impl ManualWallet {
     }
 
 
-    /// The signing key for one of our bonds, recovered from its create action in our history.
+    /// The signing key for one of our bonds, recovered from the action that created it
+    /// (Create or Convert) in our history.
     fn bond_signing_key(&self, bond_key: [u8; 32], bond_sk: &BondSpendingKey) -> Option<SigningKey> {
         for wallet_tx in &self.txs {
-            let Some(StakingAction::CreateNewDelegationBond {
-                unique_pubkey, bond_salt, target_finalizer, amount_zats, ..
-            }) = wallet_tx.staking_action else { continue; };
-            if unique_pubkey != bond_key {
+            let Some(action) = wallet_tx.staking_action else { continue; };
+            let Some((target_finalizer, amount_zats, bond_salt)) = action.bond_terms() else { continue; };
+            if action.unique_pubkey() != bond_key {
                 continue;
             }
-            return bond_sk.recover_signing_key(
-                &target_finalizer.pub_key.0, amount_zats, &bond_salt, unique_pubkey);
+            return bond_sk.recover_signing_key(&target_finalizer, amount_zats, &bond_salt, bond_key);
         }
         println!("Could not find the create action for bond {:?}", bond_key);
         None
+    }
+
+    /// Moves `amount_zats` of a finalizer's earned commission into a new bond we own,
+    /// targeting that same finalizer. We must hold the finalizer's key seed: the
+    /// conversion carries the finalizer's own authorization over (bond key, amount),
+    /// minted here. The bond key is derived exactly like a Create's so
+    /// `bond_signing_key` recovers it later from the mined action.
+    pub fn convert_finalizer_reward_using_ironwood<P: Parameters>(
+        &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
+        src_usk: &UnifiedSpendingKey, orchard_tree: &OrchardShardTree, amount_zats: u64, finalizer_key_seed: &str,
+    ) -> Option<()>
+    {
+        let tz = Timer::scope("convert_finalizer_reward_using_ironwood");
+        use rand::RngCore;
+        let (_, finalizer_key, finalizer) = bft::finalizer_key_from_seed(finalizer_key_seed.as_bytes());
+
+        let mut bond_salt = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bond_salt);
+        let signing_key = src_usk.bond().derive_signing_key(&finalizer.0, amount_zats, &bond_salt);
+        let unique_pubkey = <[u8; 32]>::from(
+            zcash_primitives::ed25519_zebra::VerificationKeyBytes::from(&signing_key));
+        let finalizer_signature = bft::sign_finalizer_reward_conversion(&finalizer_key, &unique_pubkey, amount_zats);
+
+        let opts = &TxOptions{
+            src_pools: &[TxPool::Ironwood(orchard_tree), TxPool::Transparent],
+            staking_action: Some(StakingAction::ConvertFinalizerRewardToDelegationBond {
+                unique_pubkey,
+                signature: [0u8; 64],
+                bond_salt,
+                this_finalizer: finalizer.0,
+                amount_zats,
+                finalizer_signature,
+            }),
+            staking_signing_key: Some(signing_key),
+        };
+        self.send_zats(network, tx, client, &[], src_usk, opts)
     }
 
     pub fn stake_ironwood_to_finalizer<P: Parameters>(
@@ -4396,13 +4437,15 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // the real bond once the create is reached.
             for tx in &user_wallet.txs {
                 if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
-                if let Some(&StakingAction::CreateNewDelegationBond { amount_zats, unique_pubkey, target_finalizer, .. }) = tx.staking_action.as_ref() {
+                // Create and Convert both mint a bond we own
+                let Some(action) = tx.staking_action.as_ref() else { continue; };
+                if let Some((target_finalizer, amount_zats, _salt)) = action.bond_terms() {
                     stake_positions_bonded.push((ScanBond {
-                        pk: PubKeyID(unique_pubkey),
+                        pk: PubKeyID(action.unique_pubkey()),
                         initial_val: amount_zats,
                         create_height: tx.h.0,
                         create_txid: PubKeyID(<[u8; 32]>::from(tx.txid)),
-                    }, target_finalizer.pub_key.0, amount_zats));
+                    }, target_finalizer, amount_zats));
                 }
             }
             for tx in &user_wallet.txs {
@@ -4598,6 +4641,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         user_wallet.begin_unbonding_using_ironwood(network, &mut tx, &mut client, &user_usk, &orchard_tree, bond_key.0),
                     StakingActionRequest::WithdrawDelegationBond{ bond_key  } =>
                         user_wallet.claim_bond_using_ironwood(network, &mut tx, &mut client, &user_usk, &orchard_tree, bond_key.0).await,
+                    StakingActionRequest::ConvertFinalizerRewardToDelegationBond{ amount_zats, finalizer_key_seed } =>
+                        user_wallet.convert_finalizer_reward_using_ironwood(network, &mut tx, &mut client, &user_usk, &orchard_tree, amount_zats, &finalizer_key_seed),
                 };
 
                 match res {

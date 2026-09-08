@@ -153,6 +153,7 @@ pub fn fixup_aggregated_stakes(
         tip_height.0,
     );
     let mut bonds: HashMap<BondKey, (DelegationBond, BondStatusInChain)> = HashMap::new();
+    let mut finalizer_rewards: HashMap<[u8; 32], u64> = HashMap::new();
     let mut fills: Vec<(Height, block::Hash, AggregatedStakes)> = Vec::new();
     let mut mismatches: u32 = 0;
 
@@ -182,6 +183,7 @@ pub fn fixup_aggregated_stakes(
                         &mut pools,
                         &mut bonds,
                         &mut retargets,
+                        &mut finalizer_rewards,
                         staking_action,
                         &transaction.hash(),
                         TransactionLocation::from_usize(height, transaction_index),
@@ -190,12 +192,7 @@ pub fn fixup_aggregated_stakes(
                 }
             }
 
-            if bonds
-                .values()
-                .any(|(_, status)| *status == BondStatusInChain::Active)
-            {
-                update_bonds_with_pos_issuance(POS_BLOCK_REWARD_ZATS, &mut bonds);
-            }
+            update_bonds_with_pos_issuance(POS_BLOCK_REWARD_ZATS, &mut bonds, &mut finalizer_rewards);
 
             // The live path burns after the activation block's own staking
             // actions and rewards (`NonFinalizedState::commit_new_chain`), so
@@ -223,6 +220,12 @@ pub fn fixup_aggregated_stakes(
             if *status == BondStatusInChain::Active {
                 let amount: u64 = bond.amount.into();
                 *stakes_by_finalizer.entry(bond.target_finalizer).or_insert(0) += amount;
+            }
+        }
+        // Each bank is a virtual bond on its own finalizer.
+        for (finalizer, bank) in &finalizer_rewards {
+            if *bank != 0 {
+                *stakes_by_finalizer.entry(*finalizer).or_insert(0) += bank;
             }
         }
         let mut computed: Vec<([u8; 32], u64)> = stakes_by_finalizer.into_iter().collect();

@@ -29,6 +29,9 @@ pub struct ValueBalance<C> {
     ironwood: Amount<C>,
     staking_bonded: Amount<C>,
     staking_unbonded: Amount<C>,
+    /// Crosslink: finalizer commissions, one tenth of every bond's block reward, held
+    /// per finalizer until converted into a bond (see `finalizer_reward_by_key`).
+    finalizer_rewards: Amount<C>,
 }
 
 impl<C> ValueBalance<C>
@@ -89,6 +92,25 @@ where
             staking_unbonded: staking_unbonded_amount,
             ..ValueBalance::zero()
         }
+    }
+
+    /// Creates a [`ValueBalance`] from the given finalizer_rewards amount.
+    pub fn from_finalizer_rewards_amount(finalizer_rewards_amount: Amount<C>) -> Self {
+        ValueBalance {
+            finalizer_rewards: finalizer_rewards_amount,
+            ..ValueBalance::zero()
+        }
+    }
+
+    /// Returns the finalizer_rewards amount.
+    pub fn finalizer_rewards_amount(&self) -> Amount<C> {
+        self.finalizer_rewards
+    }
+
+    /// Sets the finalizer_rewards amount without affecting other amounts.
+    pub fn set_finalizer_rewards_amount(&mut self, finalizer_rewards_amount: Amount<C>) -> &Self {
+        self.finalizer_rewards = finalizer_rewards_amount;
+        self
     }
 
     /// Get the transparent amount from the [`ValueBalance`].
@@ -199,6 +221,7 @@ where
             ironwood: zero,
             staking_bonded: zero,
             staking_unbonded: zero,
+            finalizer_rewards: zero,
         }
     }
 
@@ -234,6 +257,7 @@ where
             ironwood: self.ironwood.constrain().map_err(Ironwood)?,
             staking_bonded: self.staking_bonded.constrain().map_err(StakingBonded)?,
             staking_unbonded: self.staking_unbonded.constrain().map_err(StakingUnbonded)?,
+            finalizer_rewards: self.finalizer_rewards.constrain().map_err(FinalizerRewards)?,
         })
     }
 }
@@ -266,7 +290,8 @@ impl ValueBalance<NegativeAllowed> {
             + self.orchard
             + self.ironwood
             + self.staking_bonded
-            + self.staking_unbonded)?
+            + self.staking_unbonded
+            + self.finalizer_rewards)?
             .constrain::<NonNegative>()
     }
 }
@@ -435,15 +460,15 @@ impl ValueBalance<NonNegative> {
     /// To byte array
     ///
     /// Layout, 8 bytes per pool: transparent, sprout, sapling, orchard, deferred,
-    /// staking_bonded, staking_unbonded, ironwood.
+    /// staking_bonded, staking_unbonded, ironwood, finalizer_rewards.
     ///
     /// `ironwood` is appended *last*, after the two Crosslink staking pools, rather than at
     /// upstream's offset. Upstream writes `ironwood` at bytes[40..48], which is exactly where
     /// Crosslink already writes `staking_bonded`; adopting upstream's layout would silently
     /// reinterpret every existing Crosslink record's bonded stake as an Ironwood balance.
-    /// Appending instead keeps 32/40/56-byte records written by earlier Crosslink versions
+    /// Appending instead keeps 32/40/56/64-byte records written by earlier Crosslink versions
     /// parsable by [`Self::from_bytes`].
-    pub fn to_bytes(self) -> [u8; 64] {
+    pub fn to_bytes(self) -> [u8; 72] {
         match [
             self.transparent.to_bytes(),
             self.sprout.to_bytes(),
@@ -453,21 +478,22 @@ impl ValueBalance<NonNegative> {
             self.staking_bonded.to_bytes(),
             self.staking_unbonded.to_bytes(),
             self.ironwood.to_bytes(),
+            self.finalizer_rewards.to_bytes(),
         ]
         .concat()
         .try_into()
         {
             Ok(bytes) => bytes,
             _ => unreachable!(
-                "eight [u8; 8] should always concat with no error into a single [u8; 64]"
+                "nine [u8; 8] should always concat with no error into a single [u8; 72]"
             ),
         }
     }
 
     /// From byte array
     ///
-    /// Accepts 32-byte (pre-`deferred`), 40-byte (pre-`ironwood`), and 48-byte records; missing
-    /// trailing pools default to zero.
+    /// Accepts 32-byte (pre-`deferred`), 40-byte (pre-staking), 56-byte (pre-`ironwood`) and
+    /// 64-byte (pre-`finalizer_rewards`) records; missing trailing pools default to zero.
     #[allow(clippy::unwrap_in_result)]
     pub fn from_bytes(bytes: &[u8]) -> Result<ValueBalance<NonNegative>, ValueBalanceError> {
         let bytes_length = bytes.len();
@@ -477,7 +503,7 @@ impl ValueBalance<NonNegative> {
             // 48 is deliberately NOT accepted: an upstream 48-byte record has `ironwood` at
             // bytes[40..48], where a Crosslink record has `staking_bonded`, so the two layouts
             // are indistinguishable by length. Crosslink never writes 48-byte records.
-            32 | 40 | 56 | 64 => {}
+            32 | 40 | 56 | 64 | 72 => {}
             _ => return Err(Unparsable),
         };
 
@@ -511,7 +537,7 @@ impl ValueBalance<NonNegative> {
 
         let deferred = match bytes_length {
             32 => Amount::zero(),
-            40 | 56 | 64 => Amount::from_bytes(
+            40 | 56 | 64 | 72 => Amount::from_bytes(
                 bytes[32..40]
                     .try_into()
                     .expect("deferred amount should be parsable"),
@@ -522,7 +548,7 @@ impl ValueBalance<NonNegative> {
 
         let staking_bonded = match bytes_length {
             32 | 40 => Amount::zero(),
-            56 | 64 => Amount::from_bytes(
+            56 | 64 | 72 => Amount::from_bytes(
                 bytes[40..48]
                     .try_into()
                     .expect("staking_bonded amount should be parsable"),
@@ -533,7 +559,7 @@ impl ValueBalance<NonNegative> {
 
         let staking_unbonded = match bytes_length {
             32 | 40 => Amount::zero(),
-            56 | 64 => Amount::from_bytes(
+            56 | 64 | 72 => Amount::from_bytes(
                 bytes[48..56]
                     .try_into()
                     .expect("staking_unbonded amount should be parsable"),
@@ -544,12 +570,23 @@ impl ValueBalance<NonNegative> {
 
         let ironwood = match bytes_length {
             32 | 40 | 56 => Amount::zero(),
-            64 => Amount::from_bytes(
+            64 | 72 => Amount::from_bytes(
                 bytes[56..64]
                     .try_into()
                     .expect("ironwood amount should be parsable"),
             )
             .map_err(Ironwood)?,
+            _ => return Err(Unparsable),
+        };
+
+        let finalizer_rewards = match bytes_length {
+            32 | 40 | 56 | 64 => Amount::zero(),
+            72 => Amount::from_bytes(
+                bytes[64..72]
+                    .try_into()
+                    .expect("finalizer_rewards amount should be parsable"),
+            )
+            .map_err(FinalizerRewards)?,
             _ => return Err(Unparsable),
         };
 
@@ -562,6 +599,7 @@ impl ValueBalance<NonNegative> {
             ironwood,
             staking_bonded,
             staking_unbonded,
+            finalizer_rewards,
         })
     }
 }
@@ -596,6 +634,9 @@ pub enum ValueBalanceError {
     /// staking_unbonded amount error {0}
     StakingUnbonded(amount::Error),
 
+    /// finalizer_rewards amount error {0}
+    FinalizerRewards(amount::Error),
+
     /// ValueBalance is unparsable
     Unparsable,
 }
@@ -612,6 +653,7 @@ impl fmt::Display for ValueBalanceError {
             Total(e) => format!("total amount err: {e}"),
             StakingBonded(e) => format!("staking_bonded amount err: {e}"),
             StakingUnbonded(e) => format!("staking_unbonded amount err: {e}"),
+            FinalizerRewards(e) => format!("finalizer_rewards amount err: {e}"),
             Unparsable => "value balance is unparsable".to_string(),
         })
     }
@@ -633,6 +675,8 @@ where
             staking_bonded: (self.staking_bonded + rhs.staking_bonded).map_err(StakingBonded)?,
             staking_unbonded: (self.staking_unbonded + rhs.staking_unbonded)
                 .map_err(StakingUnbonded)?,
+            finalizer_rewards: (self.finalizer_rewards + rhs.finalizer_rewards)
+                .map_err(FinalizerRewards)?,
         })
     }
 }
@@ -686,6 +730,8 @@ where
             staking_bonded: (self.staking_bonded - rhs.staking_bonded).map_err(StakingBonded)?,
             staking_unbonded: (self.staking_unbonded - rhs.staking_unbonded)
                 .map_err(StakingUnbonded)?,
+            finalizer_rewards: (self.finalizer_rewards - rhs.finalizer_rewards)
+                .map_err(FinalizerRewards)?,
         })
     }
 }
@@ -758,6 +804,7 @@ where
             ironwood: self.ironwood.neg(),
             staking_bonded: self.staking_bonded.neg(),
             staking_unbonded: self.staking_unbonded.neg(),
+            finalizer_rewards: self.finalizer_rewards.neg(),
         }
     }
 }

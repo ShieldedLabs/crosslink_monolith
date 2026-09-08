@@ -369,6 +369,8 @@ pub enum FinalizableBlock {
         treestate: Treestate,
         /// Bond rewards accumulated for this block: (bond_key, reward_amount)
         bond_rewards: Vec<([u8; 32], u64)>,
+        /// Finalizer commissions accumulated for this block: (finalizer, commission)
+        finalizer_rewards: Vec<([u8; 32], u64)>,
         /// Bonds burned by finalizer slashing in this block: bond_key
         bond_burns: Vec<[u8; 32]>,
         /// Bond amounts for bonds being unbonded in this block: (bond_key, full_amount_with_rewards)
@@ -399,6 +401,8 @@ pub struct FinalizedBlock {
     pub(super) deferred_pool_balance_change: DeferredPoolBalanceChange,
     /// Bond rewards accumulated for this block: (bond_key, reward_amount)
     pub(super) bond_rewards: Vec<([u8; 32], u64)>,
+    /// Finalizer commissions accumulated for this block: (finalizer, commission)
+    pub(super) finalizer_rewards: Vec<([u8; 32], u64)>,
     /// Bonds burned by finalizer slashing in this block: bond_key
     pub(super) bond_burns: Vec<[u8; 32]>,
     /// Bond amounts for bonds being unbonded in this block: (bond_key, full_amount_with_rewards)
@@ -422,6 +426,7 @@ impl FinalizedBlock {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -432,6 +437,7 @@ impl FinalizedBlock {
         treestate: Treestate,
         deferred_pool_balance_change: DeferredPoolBalanceChange,
         bond_rewards: Vec<([u8; 32], u64)>,
+        finalizer_rewards: Vec<([u8; 32], u64)>,
         bond_burns: Vec<[u8; 32]>,
         unbonding_amounts: Vec<([u8; 32], u64)>,
     ) -> Self {
@@ -440,6 +446,7 @@ impl FinalizedBlock {
             treestate,
             deferred_pool_balance_change,
             bond_rewards,
+            finalizer_rewards,
             bond_burns,
             unbonding_amounts,
         )
@@ -451,6 +458,7 @@ impl FinalizedBlock {
         treestate: Treestate,
         deferred_pool_balance_change: DeferredPoolBalanceChange,
         bond_rewards: Vec<([u8; 32], u64)>,
+        finalizer_rewards: Vec<([u8; 32], u64)>,
         bond_burns: Vec<[u8; 32]>,
         unbonding_amounts: Vec<([u8; 32], u64)>,
     ) -> Self {
@@ -463,6 +471,7 @@ impl FinalizedBlock {
             treestate,
             deferred_pool_balance_change,
             bond_rewards,
+            finalizer_rewards,
             bond_burns,
             unbonding_amounts,
         }
@@ -471,11 +480,12 @@ impl FinalizedBlock {
 
 impl FinalizableBlock {
     /// Create a new [`FinalizableBlock`] given a [`ContextuallyVerifiedBlock`], treestate, bond rewards, and unbonding amounts.
-    pub fn new(contextually_verified: ContextuallyVerifiedBlock, treestate: Treestate, bond_rewards: Vec<([u8; 32], u64)>, bond_burns: Vec<[u8; 32]>, unbonding_amounts: Vec<([u8; 32], u64)>) -> Self {
+    pub fn new(contextually_verified: ContextuallyVerifiedBlock, treestate: Treestate, bond_rewards: Vec<([u8; 32], u64)>, finalizer_rewards: Vec<([u8; 32], u64)>, bond_burns: Vec<[u8; 32]>, unbonding_amounts: Vec<([u8; 32], u64)>) -> Self {
         Self::Contextual {
             contextually_verified,
             treestate,
             bond_rewards,
+            finalizer_rewards,
             bond_burns,
             unbonding_amounts,
         }
@@ -1029,6 +1039,11 @@ pub enum Request {
     /// * [`Response::BondInfo(Some(...))`](Response::BondInfo) if the bond exists;
     /// * [`Response::BondInfo(None)`](Response::BondInfo) otherwise.
     BondInfo([u8; 32]),
+
+    /// Looks up a finalizer's unconverted reward-bank balance by its public key.
+    ///
+    /// Returns [`Response::FinalizerRewardBalance`], zero for an unknown finalizer.
+    FinalizerRewardBalance([u8; 32]),
 }
 
 impl Request {
@@ -1062,6 +1077,7 @@ impl Request {
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
             Request::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
             Request::BondInfo(_) => "bond_info",
+            Request::FinalizerRewardBalance(_) => "finalizer_reward_balance",
         }
     }
 
@@ -1482,6 +1498,11 @@ pub enum ReadRequest {
     /// * [`ReadResponse::BondInfo(None)`](ReadResponse::BondInfo) otherwise.
     BondInfo([u8; 32]),
 
+    /// Looks up a finalizer's unconverted reward-bank balance by its public key.
+    ///
+    /// Returns [`ReadResponse::FinalizerRewardBalance`], zero for an unknown finalizer.
+    FinalizerRewardBalance([u8; 32]),
+
     /// Returns the tip of every non-finalized chain other than the best chain, with the height
     /// at which it leaves the best chain.
     ///
@@ -1565,6 +1586,7 @@ impl ReadRequest {
             ReadRequest::IsTransparentOutputSpent(_) => "is_transparent_output_spent",
             ReadRequest::NonFinalizedBlocksListener { .. } => "non_finalized_blocks_listener",
             ReadRequest::BondInfo(_) => "bond_info",
+            ReadRequest::FinalizerRewardBalance(_) => "finalizer_reward_balance",
             ReadRequest::SidechainForks => "sidechain_forks",
             ReadRequest::BlockSequence { .. } => "block_sequence",
         }
@@ -1633,6 +1655,7 @@ impl TryFrom<Request> for ReadRequest {
             ),
 
             Request::BondInfo(bond_key) => Ok(ReadRequest::BondInfo(bond_key)),
+            Request::FinalizerRewardBalance(finalizer) => Ok(ReadRequest::FinalizerRewardBalance(finalizer)),
         }
     }
 }

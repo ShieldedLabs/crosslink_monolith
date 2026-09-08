@@ -891,7 +891,8 @@ impl Service<Request> for StateService {
             | Request::FindBlockHashes { .. }
             | Request::FindBlockHeaders { .. }
             | Request::CheckBestChainTipNullifiersAndAnchors(_)
-            | Request::BondInfo(_) => {
+            | Request::BondInfo(_)
+            | Request::FinalizerRewardBalance(_) => {
                 // Redirect the request to the concurrent ReadStateService
                 let read_service = self.read_service.clone();
 
@@ -1426,6 +1427,19 @@ impl Service<ReadRequest> for ReadStateService {
                 unreachable!("should return early");
             }
 
+            ReadRequest::FinalizerRewardBalance(finalizer) => {
+                let balance = state
+                    .non_finalized_state_receiver
+                    .with_watch_data(|non_finalized_state| {
+                        non_finalized_state
+                            .best_chain()
+                            .map(|chain| chain.finalizer_rewards.get(&finalizer).copied().unwrap_or(0))
+                    })
+                    .unwrap_or_else(|| state.db.finalizer_reward(&finalizer));
+
+                Ok(ReadResponse::FinalizerRewardBalance(balance))
+            }
+
             ReadRequest::BondInfo(bond_key) => {
                 let bond_info = state
                     .non_finalized_state_receiver
@@ -1693,6 +1707,7 @@ pub fn update_chain_tip_with_delegation_bond(
     chain_value_pools: &mut zebra_chain::value_balance::ValueBalance<zebra_chain::amount::NonNegative>,
     delegation_bonds: &mut HashMap<finalized_state::disk_format::BondKey, (finalized_state::disk_format::DelegationBond, non_finalized_state::BondStatusInChain)>,
     bond_retargets: &mut Vec<HashMap<finalized_state::disk_format::BondKey, [u8; 32]>>,
+    finalizer_rewards: &mut HashMap<[u8; 32], u64>,
     staking_action: &zcash_primitives::transaction::StakingAction,
     _transaction_hash: &zebra_chain::transaction::Hash,
     transaction_location: finalized_state::disk_format::TransactionLocation,
@@ -1797,8 +1812,27 @@ pub fn update_chain_tip_with_delegation_bond(
                 .expect("bond must exist in chain");
             bond.target_finalizer = new_target;
         }
-        // Other staking actions don't affect delegation bonds
-        _ => {}
+        StakingActionKind::ConvertFinalizerRewardToDelegationBond => {
+            // The bank pays for the bond. Pool balances move through the transaction's
+            // own value balance (finalizer_rewards -> staking_bonded), so only the
+            // per-finalizer ledger and the bond set change here.
+            let finalizer = staking_action.target_finalizer_pk();
+            let amount_zats = staking_action.amount_zats();
+            let bank = finalizer_rewards.get_mut(&finalizer)
+                .expect("finalizer reward balance should have been validated");
+            *bank = bank.checked_sub(amount_zats)
+                .expect("finalizer reward balance should have been validated to cover the conversion");
+
+            let amount = zebra_chain::amount::Amount::try_from(amount_zats)
+                .expect("bond amount should have been validated");
+            let bond = finalized_state::disk_format::DelegationBond::new(amount, finalizer, transaction_location);
+            let previous = delegation_bonds.insert(bond_key, (bond, non_finalized_state::BondStatusInChain::Active));
+            assert!(
+                previous.is_none(),
+                "duplicate delegation bond should have been rejected during validation"
+            );
+        }
+        StakingActionKind::Null => {}
     }
 
     Ok(())
@@ -1820,57 +1854,119 @@ pub fn burn_delegation_bonds(delegation_bonds: &mut HashMap<BondKey, (Delegation
 }
 
 
-/// caller must ensure delegation_bonds is non-empty
+/// Pays one block's PoS issuance. Each active bond earns its stake-weighted share of
+/// `bond_reward_total`; of that share, one part in [`FINALIZER_COMMISSION_DIVISOR`]
+/// (rounded down) is the commission credited to the bond's target finalizer in
+/// `finalizer_rewards`, and the rest is added to the bond.
+///
+/// Every finalizer's reward bank is a virtual bond targeting that finalizer: it
+/// weighs in the stake total exactly like a bond of the same amount and earns the
+/// same share. Its commission would go to the very same bank, so the bank is simply
+/// credited its whole share.
+///
+/// Returns the amounts actually paid, per bond and per finalizer, so a revert can
+/// undo exactly what was done without recomputing. Both are empty when nothing is
+/// at stake.
 pub fn update_bonds_with_pos_issuance(
     bond_reward_total: u64,
-    delegation_bonds: &mut HashMap<finalized_state::disk_format::BondKey, (finalized_state::disk_format::DelegationBond, non_finalized_state::BondStatusInChain)>
-    ) -> Vec<([u8; 32], u64)>
+    delegation_bonds: &mut HashMap<finalized_state::disk_format::BondKey, (finalized_state::disk_format::DelegationBond, non_finalized_state::BondStatusInChain)>,
+    finalizer_rewards: &mut HashMap<[u8; 32], u64>,
+    ) -> (Vec<([u8; 32], u64)>, Vec<([u8; 32], u64)>)
 {
     use zebra_chain::amount::Amount;
+    use crate::constants::FINALIZER_COMMISSION_DIVISOR;
 
     /*
        Note(Sam): This is inspired from Andrews earlier code. We will use the fact the integer division only rounds
        down to make sure we do not accidentally mint zats. We first identify the biggest bond, this bond will recieve the remainder.
     */
+    // The stake set is the active bonds plus the non-empty banks. A bank and a bond
+    // can never share a key (bond keys are ed25519 keys minted by wallets, bank keys
+    // are finalizer keys), so one (key, is_bank) ordering picks the remainder holder
+    // deterministically: largest amount, ties to the smallest key, bonds before banks.
     let mut total_staked_zats = 0u64;
-    let max_staker = {
-        let mut iter = delegation_bonds.iter().filter(|(_, (_, status))| *status == non_finalized_state::BondStatusInChain::Active);
-        let first = iter.next().expect("is any checked already");
-        let mut max_staker = *first.0;
-        let mut biggest = first.1.0.amount.zatoshis() as u64;
-        total_staked_zats += first.1.0.amount.zatoshis() as u64;
-        for other in iter {
-            total_staked_zats += other.1.0.amount.zatoshis() as u64;
-            if other.1.0.amount.zatoshis() as u64 > biggest || (other.1.0.amount.zatoshis() as u64 == biggest && *other.0 < max_staker) {
-                max_staker = *other.0;
-                biggest = other.1.0.amount.zatoshis() as u64;
-            }
+    let mut max_staker: Option<([u8; 32], bool)> = None;
+    let mut biggest = 0u64;
+    for (bond_key, (bond, status)) in delegation_bonds.iter() {
+        if *status != non_finalized_state::BondStatusInChain::Active { continue; }
+        let amount = bond.amount.zatoshis() as u64;
+        total_staked_zats += amount;
+        if amount > biggest || (amount == biggest && max_staker.map_or(true, |(k, is_bank)| is_bank || *bond_key < k)) {
+            max_staker = Some((*bond_key, false));
+            biggest = amount;
         }
-        max_staker
+    }
+    for (finalizer, bank) in finalizer_rewards.iter() {
+        if *bank == 0 { continue; }
+        total_staked_zats += bank;
+        if *bank > biggest || (*bank == biggest && max_staker.map_or(true, |(k, is_bank)| is_bank && *finalizer < k)) {
+            max_staker = Some((*finalizer, true));
+            biggest = *bank;
+        }
+    }
+    let Some(max_staker) = max_staker else {
+        return (Vec::new(), Vec::new());
     };
 
     let mut so_far_payed_reward = 0u64;
 
+    // The split is per bond rather than off the top so a finalizer's commission is
+    // exactly the sum over its own delegators; the two vectors always sum to
+    // `bond_reward_total`.
     let mut reward_per_bond: Vec<([u8; 32], u64)> = Vec::new();
-    for (bond_key, (bond, bond_status)) in delegation_bonds.iter_mut() {
-        if *bond_status == non_finalized_state::BondStatusInChain::Active && *bond_key != max_staker {
-            let mul: u128 = (bond.amount.zatoshis() as u128) * (bond_reward_total as u128);
-            let reward = (mul / (total_staked_zats as u128)) as u64;
-            so_far_payed_reward += reward;
-
-            bond.amount = (bond.amount + Amount::new(reward as i64)).unwrap();
-            reward_per_bond.push((*bond_key, reward,));
+    let mut commission_per_finalizer: HashMap<[u8; 32], u64> = HashMap::new();
+    fn pay(
+        reward_per_bond: &mut Vec<([u8; 32], u64)>,
+        commission_per_finalizer: &mut HashMap<[u8; 32], u64>,
+        bond_key: [u8; 32],
+        bond: &mut finalized_state::disk_format::DelegationBond,
+        reward: u64,
+    ) {
+        let commission = reward / FINALIZER_COMMISSION_DIVISOR;
+        let to_bond = reward - commission;
+        bond.amount = (bond.amount + Amount::new(to_bond as i64)).unwrap();
+        reward_per_bond.push((bond_key, to_bond));
+        if commission > 0 {
+            *commission_per_finalizer.entry(bond.target_finalizer).or_insert(0) += commission;
         }
     }
 
-    // Biggest bond position gets the remainder.
-    {
-        let (bond, _status) = delegation_bonds.get_mut(&max_staker).expect("checked earlier");
-        let reward = bond_reward_total - so_far_payed_reward;
+    let share = |amount: u64| -> u64 {
+        let mul: u128 = (amount as u128) * (bond_reward_total as u128);
+        (mul / (total_staked_zats as u128)) as u64
+    };
 
-        bond.amount = (bond.amount + Amount::new(reward as i64)).unwrap();
-        reward_per_bond.push((max_staker, reward,));
+    for (bond_key, (bond, bond_status)) in delegation_bonds.iter_mut() {
+        if *bond_status == non_finalized_state::BondStatusInChain::Active && (*bond_key, false) != max_staker {
+            let reward = share(bond.amount.zatoshis() as u64);
+            so_far_payed_reward += reward;
+            pay(&mut reward_per_bond, &mut commission_per_finalizer, *bond_key, bond, reward);
+        }
+    }
+    for (finalizer, bank) in finalizer_rewards.iter() {
+        if *bank != 0 && (*finalizer, true) != max_staker {
+            let reward = share(*bank);
+            so_far_payed_reward += reward;
+            *commission_per_finalizer.entry(*finalizer).or_insert(0) += reward;
+        }
     }
 
-    reward_per_bond
+    // Biggest position gets the remainder.
+    let remainder = bond_reward_total - so_far_payed_reward;
+    match max_staker {
+        (bond_key, false) => {
+            let (bond, _status) = delegation_bonds.get_mut(&bond_key).expect("checked earlier");
+            pay(&mut reward_per_bond, &mut commission_per_finalizer, bond_key, bond, remainder);
+        }
+        (finalizer, true) => {
+            *commission_per_finalizer.entry(finalizer).or_insert(0) += remainder;
+        }
+    }
+
+    let commission_per_finalizer: Vec<([u8; 32], u64)> = commission_per_finalizer.into_iter().collect();
+    for (finalizer, commission) in &commission_per_finalizer {
+        *finalizer_rewards.entry(*finalizer).or_insert(0) += commission;
+    }
+
+    (reward_per_bond, commission_per_finalizer)
 }

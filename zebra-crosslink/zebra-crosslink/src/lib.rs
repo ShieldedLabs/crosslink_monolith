@@ -550,18 +550,12 @@ async fn tfl_final_block_height_hash_pre_locked(
 }
 
 // NAME: rng_sk_pk_from_addr
+// The derivation itself is shared with the wallet (see `bft::finalizer_key_from_seed`),
+// which needs the same key to authorize finalizer reward conversions.
 pub fn rng_private_public_key_from_address(
     addr: &[u8],
 ) -> (rand::rngs::StdRng, ed25519_zebra::SigningKey, PubKeyID) {
-// ) -> (rand::rngs::StdRng, ed25519_zebra::SigningKey, ed25519_zebra::VerificationKeyBytes) {
-    let mut hasher = DefaultHasher::new();
-    hasher.write(addr);
-    let seed = hasher.finish();
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let private_key = ed25519_zebra::SigningKey::new(&mut rng);
-    let public_key = ed25519_zebra::VerificationKeyBytes::from(&private_key);
-    let pub_key = PubKeyID(<[u8; 32]>::from(public_key));
-    (rng, private_key, pub_key)
+    zcash_primitives::bft::finalizer_key_from_seed(addr)
 }
 
 async fn push_new_bft_msg_flags(
@@ -1678,6 +1672,7 @@ async fn total_issuance_from_key(
     let call = internal_handle.call.clone();
 
     let mut delegation_bonds = HashMap::new();
+    let mut finalizer_rewards: HashMap<[u8; 32], u64> = HashMap::new();
     let mut utxos_per_ufvk = vec![HashSet::<(PubKeyID, u32)>::new(); ufvks.len()]; // NOTE: hashsets here are grow-only
 
     let mut scan_infos = Vec::<ScanInfo>::with_capacity(ufvks.len());
@@ -1731,6 +1726,7 @@ async fn total_issuance_from_key(
                     &mut zebra_chain::value_balance::ValueBalance::zero(),
                     &mut delegation_bonds,
                     &mut bond_retargets,
+                    &mut finalizer_rewards,
                     &staking_action,
                     &txid.0.into(),
                     zebra_state::TransactionLocation {
@@ -1740,9 +1736,7 @@ async fn total_issuance_from_key(
                 );
             }
 
-            if delegation_bonds.values().any(|(_, status)| *status == zebra_state::BondStatusInChain::Active) {
-                zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds);
-            }
+            zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds, &mut finalizer_rewards);
 
             for (ufvk_i, scan_ctx) in scan_ctxs.iter().enumerate() {
                 let utxos = &mut utxos_per_ufvk[ufvk_i];

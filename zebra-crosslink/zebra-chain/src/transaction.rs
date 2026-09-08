@@ -1657,6 +1657,15 @@ impl Transaction {
                         ValueBalance::from_staking_bonded_amount(Amount::new(staking_action.amount_zats() as i64).neg())
                     } else if staking_action.kind() == StakingActionKind::WithdrawDelegationBond {
                         ValueBalance::from_staking_unbonded_amount(Amount::new(staking_action.amount_zats() as i64).constrain().unwrap())
+                    } else if staking_action.kind() == StakingActionKind::ConvertFinalizerRewardToDelegationBond {
+                        // Unlike unbonding, the amount is in the action, so the pool-to-pool
+                        // move can be expressed here: the finalizer bank pays out (positive,
+                        // like an input) and the new bond takes it in (negative, like an
+                        // output). Net zero for the transaction's own balance.
+                        let amount = Amount::new(staking_action.amount_zats() as i64);
+                        let mut vb: ValueBalance<NegativeAllowed> = ValueBalance::from_finalizer_rewards_amount(amount.constrain().unwrap());
+                        vb.set_staking_bonded_amount(amount.neg());
+                        vb
                     } else {
                         ValueBalance::zero() // Note(Sam): I would have liked to have the transfer between bonded and unbonded pools to occur here but I do not think it is possible.
                     }

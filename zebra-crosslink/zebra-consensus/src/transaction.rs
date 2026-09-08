@@ -505,6 +505,23 @@ where
                     }
                 }
             }
+
+            // A reward conversion is the finalizer releasing its own bank value, so the
+            // finalizer must have authorized exactly this (bond key, amount) pair. The
+            // message is standalone (no sighash), see `bft::finalizer_reward_conversion_msg`.
+            // Whether the bank actually holds `amount_zats` is a contextual check in
+            // zebra-state.
+            if let zcash_primitives::transaction::StakingAction::ConvertFinalizerRewardToDelegationBond {
+                unique_pubkey, this_finalizer, amount_zats, finalizer_signature, ..
+            } = staking_action {
+                let ok = zcash_primitives::bft::verify_finalizer_reward_conversion(
+                    zcash_primitives::bft::PubKeyID(*this_finalizer), unique_pubkey, *amount_zats, finalizer_signature);
+                if !ok {
+                    return Err(TransactionError::StakingActionFinalizerAuthorizationInvalid {
+                        finalizer: *this_finalizer,
+                    });
+                }
+            }
         }
         Ok(())
     }

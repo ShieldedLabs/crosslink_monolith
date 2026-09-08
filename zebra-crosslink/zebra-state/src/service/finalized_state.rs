@@ -116,6 +116,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "delegation_bond_by_key",
     "bond_status_by_key",
     "aggregated_stakes_by_hash",
+    "finalizer_reward_by_key",
     // Legacy slash-index column families, empty and unused since Retarget actions
     // began carrying their `from` finalizer (burn sets are computed lazily at
     // activation now); still registered so existing databases open.
@@ -437,6 +438,7 @@ impl FinalizedState {
                 contextually_verified,
                 treestate,
                 bond_rewards,
+                finalizer_rewards,
                 bond_burns,
                 unbonding_amounts,
             } => {
@@ -449,6 +451,7 @@ impl FinalizedState {
                         treestate,
                         calculate_deferred_pool_balance_change(height, &self.network()),
                         bond_rewards,
+                        finalizer_rewards,
                         bond_burns,
                         unbonding_amounts,
                     ),

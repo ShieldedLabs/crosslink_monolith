@@ -114,6 +114,9 @@ pub enum Response {
 
     /// Response to [`Request::BondInfo`] with bond information.
     BondInfo(Option<BondInfoResponse>),
+
+    /// Response to [`Request::FinalizerRewardBalance`]: unconverted commission, in zatoshis.
+    FinalizerRewardBalance(u64),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -561,6 +564,9 @@ pub enum ReadResponse {
     /// Returns `None` if the bond does not exist.
     BondInfo(Option<BondInfoResponse>),
 
+    /// Response to [`ReadRequest::FinalizerRewardBalance`]: unconverted commission, in zatoshis.
+    FinalizerRewardBalance(u64),
+
     /// Response to [`ReadRequest::SidechainForks`], strongest fork first.
     SidechainForks(Vec<SidechainFork>),
 
@@ -709,6 +715,7 @@ impl TryFrom<ReadResponse> for Response {
             }
 
             ReadResponse::BondInfo(info) => Ok(Response::BondInfo(info)),
+            ReadResponse::FinalizerRewardBalance(balance) => Ok(Response::FinalizerRewardBalance(balance)),
         }
     }
 }

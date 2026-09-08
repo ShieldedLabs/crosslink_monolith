@@ -1541,10 +1541,20 @@ pub enum StakingAction {
         from_finalizer: FinalizerAddress,
         to_finalizer: FinalizerAddress,
     },
+    // Moves `amount_zats` out of `this_finalizer`'s reward bank into a brand new
+    // bond keyed by `unique_pubkey` and targeting `this_finalizer`. Two parties
+    // authorize it: the bond key signs the sighash like every other action, and
+    // the finalizer signs [bft::finalizer_reward_conversion_msg] over
+    // (`unique_pubkey`, `amount_zats`) — a standalone message, so the finalizer
+    // node can mint the authorization offline without seeing the transaction.
+    // The bond key is single-use (a duplicate bond is rejected), so the
+    // authorization cannot be replayed into a second bond.
     ConvertFinalizerRewardToDelegationBond {
         unique_pubkey: [u8; 32],
         #[serde(with = "serde_big_array::BigArray")]
         signature: [u8; 64],
+        /// Same role as in Create: lets a wallet rederive the bond key from the chain.
+        bond_salt: [u8; 32],
         this_finalizer: [u8; 32],
         amount_zats: u64,
         #[serde(with = "serde_big_array::BigArray")]
@@ -1588,6 +1598,19 @@ impl StakingAction {
         }
     }
 
+    /// The derivation terms of a bond-creating action — (target finalizer, amount, salt) —
+    /// which a wallet feeds back into its bond spending key to recover the bond signing
+    /// key. Create and Convert both mint a bond; the other kinds operate on one.
+    pub fn bond_terms(&self) -> Option<([u8; 32], u64, [u8; 32])> {
+        match self {
+            StakingAction::CreateNewDelegationBond { target_finalizer, amount_zats, bond_salt, .. } =>
+                Some((target_finalizer.pub_key.0, *amount_zats, *bond_salt)),
+            StakingAction::ConvertFinalizerRewardToDelegationBond { this_finalizer, amount_zats, bond_salt, .. } =>
+                Some((*this_finalizer, *amount_zats, *bond_salt)),
+            _ => None,
+        }
+    }
+
     /// The bond signature, over the transaction's shielded sighash.
     pub fn signature(&self) -> [u8; 64] {
         match self {
@@ -1616,8 +1639,8 @@ impl StakingAction {
     ///
     /// The txid hashes this form, so the signature can sign the sighash without signing
     /// itself; the block commitment hashes the signed form, so a relayer cannot strip it.
-    /// Only the bond signature is cleared: `finalizer_signature` is not verified by consensus
-    /// yet, and a field no signature covers must stay inside the txid to remain tamper-evident.
+    /// Only the bond signature is cleared: `finalizer_signature` signs a standalone message,
+    /// not the sighash, so it stays inside the txid and remains tamper-evident.
     pub fn unsigned(&self) -> Self {
         let mut unsigned = *self;
         unsigned.set_signature([0u8; 64]);
@@ -1694,9 +1717,10 @@ impl StakingAction {
                 from_finalizer.write(&mut writer)?;
                 to_finalizer.write(&mut writer)
             }
-            StakingAction::ConvertFinalizerRewardToDelegationBond { unique_pubkey, signature, this_finalizer, amount_zats, finalizer_signature } => {
+            StakingAction::ConvertFinalizerRewardToDelegationBond { unique_pubkey, signature, bond_salt, this_finalizer, amount_zats, finalizer_signature } => {
                 writer.write_all(unique_pubkey)?;
                 writer.write_all(signature)?;
+                writer.write_all(bond_salt)?;
                 writer.write_all(this_finalizer)?;
                 writer.write_u64_le(*amount_zats)?;
                 writer.write_all(finalizer_signature)
@@ -1765,13 +1789,15 @@ impl StakingAction {
                 }))
             }
             StakingActionKind::ConvertFinalizerRewardToDelegationBond => {
+                let mut bond_salt = [0u8; 32];
                 let mut this_finalizer = [0u8; 32];
                 let mut finalizer_signature = [0u8; 64];
+                reader.read_exact(&mut bond_salt)?;
                 reader.read_exact(&mut this_finalizer)?;
                 let amount_zats = reader.read_u64_le()?;
                 reader.read_exact(&mut finalizer_signature)?;
                 Ok(Some(StakingAction::ConvertFinalizerRewardToDelegationBond {
-                    unique_pubkey: b32_0, signature: b64_0, this_finalizer, amount_zats, finalizer_signature,
+                    unique_pubkey: b32_0, signature: b64_0, bond_salt, this_finalizer, amount_zats, finalizer_signature,
                 }))
             }
             StakingActionKind::Null => unreachable!("tag 0 returned above"),
@@ -1833,10 +1859,11 @@ impl std::fmt::Display for StakingAction {
                 fmter.field("from_finalizer", &from_finalizer.encode());
                 fmter.field("to_finalizer", &to_finalizer.encode());
             }
-            StakingAction::ConvertFinalizerRewardToDelegationBond { unique_pubkey, signature, this_finalizer, amount_zats, finalizer_signature } => {
+            StakingAction::ConvertFinalizerRewardToDelegationBond { unique_pubkey, signature, bond_salt, this_finalizer, amount_zats, finalizer_signature } => {
                 fmter.field("kind", &"ConvertFinalizerRewardToDelegationBond");
                 fmt_le_bytes(fmter, "unique_public_key", unique_pubkey);
                 fmt_le_bytes(fmter, "signature", signature);
+                fmt_le_bytes(fmter, "bond_salt", bond_salt);
                 fmt_le_bytes(fmter, "this_finalizer", this_finalizer);
                 fmter.field("amount_zats", amount_zats);
                 fmt_le_bytes(fmter, "finalizer_signature", finalizer_signature);
@@ -1854,6 +1881,10 @@ pub enum StakingActionRequest {
     RetargetDelegationBond{ bond_key: PubKeyID, target_finalizer: FinalizerAddress },
     BeginDelegationUnbonding{ bond_key: PubKeyID  },
     WithdrawDelegationBond{ bond_key: PubKeyID  },
+    /// `finalizer_key_seed` is the finalizer's `explicit_bft_key_seed` config string; the
+    /// wallet derives the finalizer signing key from it exactly as the node does
+    /// ([bft::finalizer_key_from_seed]) to mint the conversion authorization itself.
+    ConvertFinalizerRewardToDelegationBond{ amount_zats: u64, finalizer_key_seed: std::string::String },
 }
 
 #[cfg(any(test, feature = "test-dependencies"))]

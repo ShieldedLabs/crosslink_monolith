@@ -31,6 +31,9 @@ pub fn validate_delegation_bonds(
     // bond_key -> target after in-block retargets, so a second retarget in the
     // same block validates its `from` against the first one's `to`
     let mut block_retargets: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
+    // finalizer -> bank balance after in-block conversions; the block's own
+    // commission is paid after its transactions, so it never funds them
+    let mut block_banks: HashMap<[u8; 32], u64> = HashMap::new();
 
     for transaction in &semantically_verified.block.transactions {
         if let Some(staking_action) = transaction.staking_action() {
@@ -145,8 +148,55 @@ pub fn validate_delegation_bonds(
                     }
                     block_retargets.insert(bond_key, staking_action.target_finalizer_pk());
                 }
-                // Other staking actions don't affect delegation bonds
-                _ => {}
+                StakingActionKind::ConvertFinalizerRewardToDelegationBond => {
+                    // The finalizer's authorization signature was checked statelessly in
+                    // zebra-consensus; here: the new bond key is fresh, and the bank covers it.
+                    validate_create_new_bond(
+                        bond_key,
+                        &block_new_bonds,
+                        non_finalized_chain,
+                        finalized_state,
+                    )?;
+
+                    let amount_zats = staking_action.amount_zats();
+                    if amount_zats == 0 {
+                        return Err(ValidateContextError::InvalidDelegationBond(format!(
+                            "finalizer reward conversion of zero zats: {:?}",
+                            bond_key
+                        )));
+                    }
+                    let finalizer = staking_action.target_finalizer_pk();
+                    let bank = block_banks.entry(finalizer).or_insert_with(|| {
+                        // The chain's banks are seeded from the finalized state, so the
+                        // chain alone is authoritative for a fork; only a chain that is
+                        // being created fresh could lack the key, and then the db has it.
+                        non_finalized_chain
+                            .finalizer_rewards
+                            .get(&finalizer)
+                            .copied()
+                            .unwrap_or_else(|| finalized_state.finalizer_reward(&finalizer))
+                    });
+                    if *bank < amount_zats {
+                        return Err(ValidateContextError::InvalidDelegationBond(format!(
+                            "finalizer {:?} reward bank {} cannot cover conversion of {}: {:?}",
+                            finalizer, *bank, amount_zats, bond_key
+                        )));
+                    }
+                    *bank -= amount_zats;
+
+                    let amount = zebra_chain::amount::Amount::try_from(amount_zats)
+                        .map_err(|e| ValidateContextError::InvalidDelegationBond(format!("invalid bond amount: {:?}", e)))?;
+                    let bond = DelegationBond::new(
+                        amount,
+                        finalizer,
+                        crate::service::finalized_state::disk_format::TransactionLocation::from_usize(
+                            semantically_verified.height,
+                            0,
+                        ),
+                    );
+                    block_new_bonds.insert(bond_key, bond);
+                }
+                StakingActionKind::Null => {}
             }
         }
     }

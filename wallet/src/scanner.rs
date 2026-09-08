@@ -77,7 +77,10 @@ pub fn scan_tx(info: &mut ScanInfo, utxos: &mut HashSet<(PubKeyID, u32)>, tx_byt
 
 
     if let Some(staking_action) = tx.staking_action() {
-        if let StakingAction::CreateNewDelegationBond { amount_zats, unique_pubkey, .. } = staking_action {
+        // Create and Convert both mint a bond (Convert is funded by the finalizer bank,
+        // but the fee-paying notes are still ours)
+        if let Some((_target, amount_zats, _salt)) = staking_action.bond_terms() {
+            let unique_pubkey = staking_action.unique_pubkey();
             if contains_my_t_spend {
                 println!("found staking action paid for by our transparent: {:?}", unique_pubkey);
             }

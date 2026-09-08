@@ -297,6 +297,17 @@ impl DiskWriteBatch {
             new_value_pool.set_staking_bonded_amount(new_bonded);
         }
 
+        // Crosslink: the finalizer commissions minted alongside those rewards.
+        let total_commissions: u64 = finalized.finalizer_rewards.iter().map(|(_, amount)| amount).sum();
+        if total_commissions > 0 {
+            let current = new_value_pool.finalizer_rewards_amount();
+            let new_amount: Amount<NonNegative> = (current
+                + Amount::try_from(total_commissions as i64)
+                    .expect("finalizer commissions fit in an Amount"))
+            .expect("finalizer_rewards pool should not overflow from commissions");
+            new_value_pool.set_finalizer_rewards_amount(new_amount);
+        }
+
         // Crosslink: BeginDelegationUnbonding moves value from staking_bonded to
         // staking_unbonded. `chain_value_pool_change` only accounts for value entering or
         // leaving the chain, not transfers between pools, so it is applied here using the

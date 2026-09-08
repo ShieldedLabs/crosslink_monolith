@@ -23,7 +23,7 @@ use zebra_chain::{
 use crate::service::finalized_state::disk_format::{FromDisk, IntoDisk};
 
 impl IntoDisk for ValueBalance<NonNegative> {
-    type Bytes = [u8; 64];
+    type Bytes = [u8; 72];
 
     fn as_bytes(&self) -> Self::Bytes {
         self.to_bytes()
@@ -178,14 +178,22 @@ impl FromDisk for BlockInfo {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
         // A record is a serialized `ValueBalance` followed by a 4-byte block size, so its
         // length identifies the pool layout that wrote it. `ValueBalance` grew as pools were
-        // added: 40 bytes (pre-Crosslink), 56 bytes (Crosslink staking pools), and 64 bytes
-        // (Crosslink staking pools + the NU6.3 ironwood pool). The open ranges keep this
+        // added: 40 bytes (pre-Crosslink), 56 bytes (Crosslink staking pools), 64 bytes
+        // (+ the NU6.3 ironwood pool) and 72 bytes (+ finalizer rewards). The open ranges keep this
         // forward-compatible with any longer record a later version writes.
         //
         // NOTE: upstream's 52-byte layout (48-byte pool, ironwood at bytes[40..48]) is absent
         // on purpose -- Crosslink writes `staking_bonded` at that offset, so a 52-byte record
         // would be misread. See `ValueBalance::from_bytes`.
         match bytes.as_ref().len() {
+            // Crosslink with ironwood and finalizer rewards: 72-byte pool + 4-byte size.
+            76.. => {
+                let value_pools = ValueBalance::<NonNegative>::from_bytes(&bytes.as_ref()[0..72])
+                    .expect("must work for 72 bytes");
+                let size =
+                    u32::from_le_bytes(bytes.as_ref()[72..76].try_into().expect("must be 4 bytes"));
+                BlockInfo::new(value_pools, size)
+            }
             // Crosslink with ironwood: 64-byte pool + 4-byte size.
             68.. => {
                 let value_pools = ValueBalance::<NonNegative>::from_bytes(&bytes.as_ref()[0..64])
