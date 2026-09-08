@@ -161,6 +161,8 @@ pub struct ResponseFromZebra {
     pub ironwood_pool_balance: i64,
     pub staking_bonded_pool_balance: i64,
     pub staking_unbonded_pool_balance: i64,
+    /// Every finalizer's unconverted commission, (finalizer key, zatoshis), sorted by key.
+    pub finalizer_banks: Vec<([u8; 32], u64)>,
 
     pub peer_strings: Vec<String>,
 
@@ -201,6 +203,7 @@ impl ResponseFromZebra {
             ironwood_pool_balance: 0,
             staking_bonded_pool_balance: 0,
             staking_unbonded_pool_balance: 0,
+            finalizer_banks: Vec::new(),
             peer_strings: Vec::new(),
             pow_peer_count: 0,
             mempool_tx_strings: Vec::new(),
@@ -458,6 +461,7 @@ pub struct VizState {
     pub ironwood_pool_balance: i64,
     pub staking_bonded_pool_balance: i64,
     pub staking_unbonded_pool_balance: i64,
+    pub finalizer_banks: Vec<([u8; 32], u64)>,
 
     pub peer_strings: Vec<String>,
     pub pow_peer_count: usize,
@@ -730,6 +734,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         ironwood_pool_balance: 0,
         staking_bonded_pool_balance: 0,
         staking_unbonded_pool_balance: 0,
+        finalizer_banks: Vec::new(),
         peer_strings: Vec::new(),
         pow_peer_count: 0,
         mempool_tx_strings: Vec::new(),
@@ -870,6 +875,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         viz_state.ironwood_pool_balance = message.ironwood_pool_balance;
         viz_state.staking_bonded_pool_balance = message.staking_bonded_pool_balance;
         viz_state.staking_unbonded_pool_balance = message.staking_unbonded_pool_balance;
+        viz_state.finalizer_banks = message.finalizer_banks.clone();
 
         // At each height this message ACTUALLY served a best-chain block for, the
         // message is authoritative: an on-screen block there is best iff the message

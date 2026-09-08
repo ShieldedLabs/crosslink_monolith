@@ -1259,6 +1259,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         let my_finalizer_address = FinalizerAddress::create(&my_private_key);
         info!("finalizer address: {}", my_finalizer_address.encode());
         *wallet::TENDERLINK_ADDRESS.lock().unwrap() = Some(my_finalizer_address);
+        *wallet::TENDERLINK_SIGNING_KEY.lock().unwrap() = Some(my_private_key.clone());
 
         // TODO(Sam): Fill this out.
         let mut ingest_data_for_tenderlink: Vec<tenderlink::RoundData> = Vec::new();

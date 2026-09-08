@@ -52,6 +52,29 @@ pub struct UiData {
     pub jump_target_pos: bool,
 
     pub hovered_finalizer_pk: [u8; 32],
+
+    /// Every finalizer's unconverted commission (key, zats), copied from the viz state each frame.
+    pub finalizer_banks: Vec<([u8; 32], u64)>,
+    /// Text of the amount box in the Convert Commission modal, in cTAZ.
+    pub convert_amount: String,
+}
+
+pub fn bank_balance(banks: &[([u8; 32], u64)], pk: &[u8; 32]) -> u64 {
+    banks.iter().find(|(k, _)| k == pk).map_or(0, |(_, v)| *v)
+}
+
+/// "1.25" cTAZ -> zats; up to 8 decimal places, no sign, nothing else.
+pub fn parse_ctaz(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    let (whole, frac) = match s.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (s, ""),
+    };
+    if frac.len() > 8 || !whole.chars().all(|c| c.is_ascii_digit()) || !frac.chars().all(|c| c.is_ascii_digit()) { return None; }
+    let whole: u64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let frac: u64 = if frac.is_empty() { 0 } else { format!("{frac:0<8}").parse().ok()? };
+    whole.checked_mul(ONE_cTAZ)?.checked_add(frac)
 }
 
 
@@ -444,6 +467,7 @@ pub enum Modal {
     Stake,
     Unstake,
     Retarget,
+    ConvertRewards, // own finalizer commission -> bond
     User, // settings
 }
 
@@ -1463,7 +1487,8 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, bft_status: &wal
 
                     let online_str = ["OFFLINE", "ONLINE"][is_online as usize];
                     if is_real_finalizers{
-                        set_tooltip_text!(data, "{}  {}  {} cTAZ    {:.2}%", display_str(&chunkify(&finalizer.pub_key)), online_str, str_from_ctaz(finalizer.voting_power), 100.0*pct);
+                        let bank = bank_balance(&data.finalizer_banks, &finalizer.pub_key);
+                        set_tooltip_text!(data, "{}  {}  {} cTAZ    {:.2}%    commission bank: {} cTAZ", display_str(&chunkify(&finalizer.pub_key)), online_str, str_from_ctaz(finalizer.voting_power), 100.0*pct, str_from_ctaz(bank));
                     } else {
                         set_tooltip_text!(data, "Total: {}  {} cTAZ    {:.2}%", str_from_ctaz(finalizer.voting_power), online_str, 100.0*pct);
                     }
@@ -1577,6 +1602,7 @@ pub fn ui_left_pane(ui: &mut Context,
     let grey: (u8, u8, u8, u8) = WHITE.mul(deemph_mul);
 
     let is_staking_day = viz.bc_tip_height % UI_COPY_STAKING_PERIOD < UI_COPY_STAKING_DAY_WINDOW;
+    data.finalizer_banks = viz.finalizer_banks.clone();
 
     // USER STAKING POSITIONS
     // TODO: phillip audaciously deleted the accumulated bond amount field, bring that back
@@ -1656,7 +1682,7 @@ pub fn ui_left_pane(ui: &mut Context,
         if container_hovered { ui.capture = true; }
 
         let mut height = grow!(ui.scale(192.0), ui.scale(384.0));
-        if ui.modal == Modal::Stake || ui.modal == Modal::Send || ui.modal == Modal::Jump {
+        if ui.modal == Modal::Stake || ui.modal == Modal::Send || ui.modal == Modal::Jump || ui.modal == Modal::ConvertRewards {
             height = fit!();
         }
         if ui.modal == Modal::Unstake {
@@ -2059,6 +2085,68 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
                         } else {
                             ui.text("Loading...", TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                        }
+                    }
+                }
+
+                Modal::ConvertRewards => {
+                    title_bar(ui, true, "Convert Commission", id("Convert Rewards Title Bar"));
+
+                    let my_pk = wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap().0;
+                    let available = bank_balance(&data.finalizer_banks, &my_pk);
+
+                    ui.text(frame_strf!(data, "Available: {} cTAZ", str_from_ctaz(available)), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                    ui.text("Moves earned commission into a new bond targeting your own finalizer. Allowed at any height.", TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.6), align: AlignX::Center, ..TextDecl });
+
+                    // spacer
+                    if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(8.0)), ..Default::default() }) {}
+
+                    let convert_amount_id = id("Convert Amount Textbox");
+                    if let _ = elem().decl(Decl {
+                        width: grow!(),
+                        height: fit!(),
+                        ..Decl
+                    }) {
+                        data.convert_amount = ui.textbox(
+                            data,
+                            convert_amount_id,
+                            "Amount in cTAZ...",
+                            TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
+                        ).trim().to_string();
+                    }
+
+                    let parsed = parse_ctaz(&data.convert_amount);
+                    let waiting = wallet_state.lock().unwrap().waiting_for_stake_to_finalizer;
+                    let can = !waiting && parsed.map_or(false, |z| z > 0 && z <= available);
+
+                    if !data.convert_amount.is_empty() && parsed.is_none() {
+                        ui.text("Enter a number of cTAZ, e.g. 1.5", TextDecl { h: ui.scale(16.0), colour: (0xff, 0xaf, 0x0e, 0xff), align: AlignX::Center, ..TextDecl });
+                    } else if parsed.map_or(false, |z| z > available) {
+                        ui.text("More than the available commission.", TextDecl { h: ui.scale(16.0), colour: (0xff, 0xaf, 0x0e, 0xff), align: AlignX::Center, ..TextDecl });
+                    } else if waiting {
+                        ui.text("A staking transaction is already in flight.", TextDecl { h: ui.scale(16.0), colour: (0xff, 0xaf, 0x0e, 0xff), align: AlignX::Center, ..TextDecl });
+                    }
+
+                    // spacer
+                    if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(8.0)), ..Default::default() }) {}
+
+                    if let _ = elem().decl(Decl {
+                        child_gap, radius,
+                        id: id("Convert Buttons"),
+                        colour: MODAL_COL,
+                        width:  grow!(),
+                        height: fit!(),
+                        align: Center,
+                        direction: LeftToRight,
+                        ..Decl
+                    }) {
+                        if button(ui, "Convert", can) {
+                            wallet_state.lock().unwrap().convert_finalizer_reward(parsed.unwrap());
+                            ui.modal = Modal::None;
+                        }
+                        if button(ui, "Convert All", !waiting && available > 0) {
+                            wallet_state.lock().unwrap().convert_finalizer_reward(available);
+                            ui.modal = Modal::None;
                         }
                     }
                 }
@@ -3013,6 +3101,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                         WalletTxKind::BeginUnstake => ICON_LINK_EXT_ALT,
                                         WalletTxKind::Retarget     => ICON_MOVE,
                                         WalletTxKind::ClaimUnstake => ICON_UNLINK,
+                                        WalletTxKind::ConvertReward => ICON_LINK_1,
                                     }
                                 };
 
@@ -3046,6 +3135,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     WalletTxKind::BeginUnstake  => if tx_is_in_block { "Unstaked"  } else { "Unstaking..." },
                                     WalletTxKind::Retarget      => if tx_is_in_block { "Moved Delegation"  } else { "Moving Delegation..." },
                                     WalletTxKind::ClaimUnstake  => if tx_is_in_block { "Withdrawn"  } else { "Withdrawing..." },
+                                    WalletTxKind::ConvertReward => if tx_is_in_block { "Converted To Bond" } else { "Converting To Bond..." },
                                 };
 
                                 let label_str = 'get_label: {
@@ -3160,7 +3250,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 // @todo colors
                                 let colour = match tx.kind() {
                                     WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
-                                    WalletTxKind::Stake   => (0xff, 0xaf, 0x0e, 0xff),
+                                    WalletTxKind::Stake | WalletTxKind::ConvertReward => (0xff, 0xaf, 0x0e, 0xff),
                                     WalletTxKind::Receive | WalletTxKind::ClaimUnstake | WalletTxKind::Mine => (0x5a, 0xb5, 0x52, 0xff),
                                     WalletTxKind::Shield  => (0x33, 0x88, 0xde, 0xff),
                                     WalletTxKind::BeginUnstake => WHITE,
@@ -3173,7 +3263,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     WalletTxKind::BeginUnstake | WalletTxKind::Retarget => (false, "", 0), // fee-only
 
                                     WalletTxKind::Send  => (true, "-", all.sent_zats.into_u64().saturating_sub(all.recv_zats.into_u64())),
-                                    WalletTxKind::Stake => (true, "",  WalletTxPart::from_staking_action(tx.staking_action).recv_zats.into_u64()), // aka bond.recv_zats
+                                    // the bond value: for Convert it came from the bank, not from our notes
+                                    WalletTxKind::Stake | WalletTxKind::ConvertReward => (true, "",  WalletTxPart::from_staking_action(tx.staking_action).recv_zats.into_u64()), // aka bond.recv_zats
                                     WalletTxKind::Stake => (true, "",  all.sent_zats.into_u64().saturating_sub(all_no_bond.recv_zats.into_u64())), // aka bond.recv_zats
 
                                     WalletTxKind::SelfSend     => (true, "",  all.recv_zats.into_u64()),
@@ -3499,6 +3590,16 @@ pub fn ui_right_pane(ui: &mut Context,
             if button_ex(ui, "Copy Identity", true, true) {
                 ui.input().send_to_clipboard(&recv_address);
             }
+
+            // Our own commission bank -> a bond on ourselves. Allowed at any height,
+            // not just on Staking Day, so it is never gated on `is_staking_day`.
+            let my_bank = bank_balance(&data.finalizer_banks, &wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap().0);
+            if button_ex(ui, "Convert Rewards", true, true) {
+                ui.modal = Modal::ConvertRewards;
+            }
+            if ui.hovered(id("Convert Rewards")) {
+                set_tooltip_text!(data, "Commission bank: {} cTAZ. Convert it into a bond on your own finalizer.", str_from_ctaz(my_bank));
+            }
         }
 
         // Terminated finalizers are excluded from the two summary bars above the list
@@ -3707,15 +3808,18 @@ pub fn ui_right_pane(ui: &mut Context,
                                 format!("Never connected to this finalizer during this session")
                             };
 
+                            let bank = bank_balance(&data.finalizer_banks, &member.pub_key);
                             set_tooltip_text!(data,
                                               std::concat!("Finalizer {}:\n",
                                                            "  {:.2}% of stake\n",
+                                                           "  Commission bank: {} cTAZ\n",
                                                            "  No  Votes Across All Rounds In This Height: {}\n",
                                                            "  Yes Votes Across All Rounds In This Height: {}\n",
                                                            "  Highest Round This Finalizer Voted (Untrusted): {}\n",
                                                            "  {}"),
                                               wallet::bft::PubKeyID(member.pub_key),
                                               pct,
+                                              str_from_ctaz(bank),
                                               no_votes_across_all_round_in_this_height,
                                               yes_votes_across_all_round_in_this_height,
                                               highest_round_this_finalizer_voted,
@@ -3724,7 +3828,8 @@ pub fn ui_right_pane(ui: &mut Context,
                             data.tooltip_wrap = Wrap::None;
                             data.tooltip_font = Mono;
                         } else {
-                            set_tooltip_text!(data, "Finalizer {}:\n  {:.2}% of stake", wallet::bft::PubKeyID(member.pub_key), pct);
+                            let bank = bank_balance(&data.finalizer_banks, &member.pub_key);
+                            set_tooltip_text!(data, "Finalizer {}:\n  {:.2}% of stake\n  Commission bank: {} cTAZ", wallet::bft::PubKeyID(member.pub_key), pct, str_from_ctaz(bank));
                         }
                     }
                 }

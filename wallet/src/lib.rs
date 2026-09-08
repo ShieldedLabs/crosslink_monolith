@@ -412,6 +412,10 @@ pub static TENDERLINK_PUBLIC_KEY: Mutex<bft::PubKeyID> = Mutex::new(bft::PubKeyI
 /// Self-certifying address for this node's finalizer key; None until the crosslink service starts.
 pub static TENDERLINK_ADDRESS: Mutex<Option<bft::FinalizerAddress>> = Mutex::new(None);
 
+/// This node's finalizer signing key, so the in-process wallet can authorize converting the
+/// finalizer's own commission into a bond. None until the crosslink service starts.
+pub static TENDERLINK_SIGNING_KEY: Mutex<Option<SigningKey>> = Mutex::new(None);
+
 pub fn get_tfl_recency_status_str() -> Option<String> {
     let lock = RECENCY_REQUEST.lock().unwrap();
     let closure = lock.as_ref()?;
@@ -481,6 +485,8 @@ enum WalletAction {
     RetargetBond(TxId, bft::FinalizerAddress),
     ClaimBond(TxId),
     SendToAddress(UnifiedAddress, Zatoshis),
+    /// Convert this node's own finalizer commission into a bond.
+    ConvertFinalizerReward(Zatoshis),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -494,6 +500,8 @@ pub enum WalletTxKind {
     BeginUnstake,
     Retarget,
     ClaimUnstake,
+    /// Finalizer commission converted into a bond we own.
+    ConvertReward,
 }
 
 // #[derive(Debug, Clone, Copy, PartialEq)]
@@ -872,7 +880,7 @@ impl WalletTx {
                 StakingAction::BeginDelegationUnbonding { .. } => WalletTxKind::BeginUnstake,
                 StakingAction::RetargetDelegationBond { .. } => WalletTxKind::Retarget,
                 StakingAction::WithdrawDelegationBond { .. } => WalletTxKind::ClaimUnstake,
-                _ => WalletTxKind::SelfSend,
+                StakingAction::ConvertFinalizerRewardToDelegationBond { .. } => WalletTxKind::ConvertReward,
             };
         }
         let all = self.totals(true);
@@ -1028,6 +1036,17 @@ impl WalletState {
             return;
         }
         self.actions_in_flight.push_back(WalletAction::UnstakeFromFinalizer(txid));
+    }
+
+    /// Queue a conversion of `amount` zats of this node's finalizer commission into a new
+    /// bond. Shares `waiting_for_stake_to_finalizer` with staking: both build into the
+    /// same proposed-stake slot.
+    pub fn convert_finalizer_reward(&mut self, amount: u64) {
+        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::ConvertFinalizerReward(_) => true, _ => false }).count() != 0 {
+            return;
+        }
+        self.waiting_for_stake_to_finalizer = true;
+        self.actions_in_flight.push_back(WalletAction::ConvertFinalizerReward(Zatoshis::from_u64(amount).expect("Invalid amount given to convert_finalizer_reward")));
     }
 
     pub fn retarget_bond(&mut self, txid: [u8; 32], new_target: bft::FinalizerAddress) {
@@ -2008,25 +2027,25 @@ impl ManualWallet {
     }
 
     /// Moves `amount_zats` of a finalizer's earned commission into a new bond we own,
-    /// targeting that same finalizer. We must hold the finalizer's key seed: the
+    /// targeting that same finalizer. We must hold the finalizer's signing key: the
     /// conversion carries the finalizer's own authorization over (bond key, amount),
     /// minted here. The bond key is derived exactly like a Create's so
     /// `bond_signing_key` recovers it later from the mined action.
     pub fn convert_finalizer_reward_using_ironwood<P: Parameters>(
         &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
-        src_usk: &UnifiedSpendingKey, orchard_tree: &OrchardShardTree, amount_zats: u64, finalizer_key_seed: &str,
+        src_usk: &UnifiedSpendingKey, orchard_tree: &OrchardShardTree, amount_zats: u64, finalizer_key: &SigningKey,
     ) -> Option<()>
     {
         let tz = Timer::scope("convert_finalizer_reward_using_ironwood");
         use rand::RngCore;
-        let (_, finalizer_key, finalizer) = bft::finalizer_key_from_seed(finalizer_key_seed.as_bytes());
+        let finalizer = bft::PubKeyID(<[u8; 32]>::from(zcash_primitives::ed25519_zebra::VerificationKeyBytes::from(finalizer_key)));
 
         let mut bond_salt = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut bond_salt);
         let signing_key = src_usk.bond().derive_signing_key(&finalizer.0, amount_zats, &bond_salt);
         let unique_pubkey = <[u8; 32]>::from(
             zcash_primitives::ed25519_zebra::VerificationKeyBytes::from(&signing_key));
-        let finalizer_signature = bft::sign_finalizer_reward_conversion(&finalizer_key, &unique_pubkey, amount_zats);
+        let finalizer_signature = bft::sign_finalizer_reward_conversion(finalizer_key, &unique_pubkey, amount_zats);
 
         let opts = &TxOptions{
             src_pools: &[TxPool::Ironwood(orchard_tree), TxPool::Transparent],
@@ -2738,7 +2757,11 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
     let mut memo = EMPTY_MEMO_BYTES;
     let mut s = WalletTxPart::ZERO;
 
-    if let Some(bundle) = tx.orchard_bundle() {
+    // Ironwood-native, like the compact-block scan: our notes are in the Ironwood
+    // bundle. Reading the Orchard bundle here found nothing of ours, so the merge
+    // dropped every full download as "not our transaction" and re-requested it forever,
+    // and rescanned rows never got their staking action.
+    if let Some(bundle) = tx.ironwood_bundle() {
         for action in bundle.actions() {
             let action: &orchard::Action<_> = action; // type-check
             let domain = orchard::note_encryption::IronwoodDomain::for_action(action);
@@ -3046,7 +3069,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         -> Option<(HashMap<TxId, (Option<StakingAction>, Vec<String>)>, HashMap<TxId, (Option<StakingAction>, Vec<String>)>)> {
         fn try_get_orchard_memos(tx: &TransactionData<zcash_primitives::transaction::Authorized>, ivk: &orchard::keys::PreparedIncomingViewingKey) -> Vec<String> {
             let mut memos = Vec::new();
-            let Some(bundle) = tx.orchard_bundle() else { return memos; };
+            let Some(bundle) = tx.ironwood_bundle() else { return memos; };
 
             for action in bundle.actions() {
                 let domain = orchard::note_encryption::IronwoodDomain::for_action(action);
@@ -3066,7 +3089,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // TODO: this is primarily for syncing txs that our wallet didn't observe sending; we
             // can optimize ones we sent directly
             let mut memos = Vec::new();
-            let Some(bundle) = tx.orchard_bundle() else { return memos; };
+            let Some(bundle) = tx.ironwood_bundle() else { return memos; };
 
             for action in bundle.actions() {
                 let domain = orchard::note_encryption::IronwoodDomain::for_action(action);
@@ -4641,8 +4664,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         user_wallet.begin_unbonding_using_ironwood(network, &mut tx, &mut client, &user_usk, &orchard_tree, bond_key.0),
                     StakingActionRequest::WithdrawDelegationBond{ bond_key  } =>
                         user_wallet.claim_bond_using_ironwood(network, &mut tx, &mut client, &user_usk, &orchard_tree, bond_key.0).await,
-                    StakingActionRequest::ConvertFinalizerRewardToDelegationBond{ amount_zats, finalizer_key_seed } =>
-                        user_wallet.convert_finalizer_reward_using_ironwood(network, &mut tx, &mut client, &user_usk, &orchard_tree, amount_zats, &finalizer_key_seed),
+                    StakingActionRequest::ConvertFinalizerRewardToDelegationBond{ amount_zats, finalizer_key_seed } => {
+                        let (_, finalizer_key, _) = bft::finalizer_key_from_seed(finalizer_key_seed.as_bytes());
+                        user_wallet.convert_finalizer_reward_using_ironwood(network, &mut tx, &mut client, &user_usk, &orchard_tree, amount_zats, &finalizer_key)
+                    }
                 };
 
                 match res {
@@ -4771,6 +4796,17 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     let ok = user_wallet.retarget_bond_using_ironwood(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref(), new_target).is_some();
                     just_init_new_tx |= ok;
                     if DUMP_ACTIONS { println!("Try retarget: {ok:?}"); }
+                    ok
+                }
+
+                &WalletAction::ConvertFinalizerReward(amount) => {
+                    let finalizer_key = *TENDERLINK_SIGNING_KEY.lock().unwrap();
+                    let ok = match finalizer_key {
+                        Some(key) => user_wallet.convert_finalizer_reward_using_ironwood(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, amount.into_u64(), &key).is_some(),
+                        None => { println!("convert finalizer reward: this node's finalizer key is not available"); false }
+                    };
+                    just_init_new_tx |= ok;
+                    println!("Try convert finalizer reward: {ok:?}");
                     ok
                 }
 

@@ -100,6 +100,12 @@ pub async fn service_viz_requests(
             let ironwood_pool_balance = value_balance.ironwood_amount().zatoshis();
             let staking_bonded_pool_balance = value_balance.staking_bonded_amount().zatoshis();
             let staking_unbonded_pool_balance = value_balance.staking_unbonded_amount().zatoshis();
+            let finalizer_banks: Vec<([u8; 32], u64)> =
+                if let Ok(StateReadResponse::FinalizerRewardBalances(banks)) = (call.read_state)(StateReadRequest::FinalizerRewardBalances).await {
+                    banks
+                } else {
+                    Vec::new()
+                };
 
             let Ok(StateResponse::Tip(Some(tip_height_hash))) = (call.state)(StateRequest::Tip).await
             else {
@@ -414,6 +420,7 @@ pub async fn service_viz_requests(
                     response.ironwood_pool_balance = ironwood_pool_balance;
                     response.staking_bonded_pool_balance = staking_bonded_pool_balance;
                     response.staking_unbonded_pool_balance = staking_unbonded_pool_balance;
+                    response.finalizer_banks = finalizer_banks.clone();
 
                     response.start_bc_height = lo_height.0 as u64; // actual window start, may be below ack
                     // Clamped to the tip: the GUI derives its ack from on-screen block

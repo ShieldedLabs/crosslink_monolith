@@ -117,6 +117,9 @@ pub enum Response {
 
     /// Response to [`Request::FinalizerRewardBalance`]: unconverted commission, in zatoshis.
     FinalizerRewardBalance(u64),
+
+    /// Response to [`Request::FinalizerRewardBalances`]: (finalizer, zatoshis), non-zero banks only.
+    FinalizerRewardBalances(Vec<([u8; 32], u64)>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -567,6 +570,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::FinalizerRewardBalance`]: unconverted commission, in zatoshis.
     FinalizerRewardBalance(u64),
 
+    /// Response to [`ReadRequest::FinalizerRewardBalances`]: (finalizer, zatoshis), non-zero banks only.
+    FinalizerRewardBalances(Vec<([u8; 32], u64)>),
+
     /// Response to [`ReadRequest::SidechainForks`], strongest fork first.
     SidechainForks(Vec<SidechainFork>),
 
@@ -716,6 +722,7 @@ impl TryFrom<ReadResponse> for Response {
 
             ReadResponse::BondInfo(info) => Ok(Response::BondInfo(info)),
             ReadResponse::FinalizerRewardBalance(balance) => Ok(Response::FinalizerRewardBalance(balance)),
+            ReadResponse::FinalizerRewardBalances(banks) => Ok(Response::FinalizerRewardBalances(banks)),
         }
     }
 }

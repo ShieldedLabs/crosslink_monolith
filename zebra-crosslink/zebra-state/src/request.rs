@@ -1044,6 +1044,11 @@ pub enum Request {
     ///
     /// Returns [`Response::FinalizerRewardBalance`], zero for an unknown finalizer.
     FinalizerRewardBalance([u8; 32]),
+
+    /// Every finalizer reward bank with a non-zero balance.
+    ///
+    /// Returns [`Response::FinalizerRewardBalances`].
+    FinalizerRewardBalances,
 }
 
 impl Request {
@@ -1078,6 +1083,7 @@ impl Request {
             Request::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
             Request::BondInfo(_) => "bond_info",
             Request::FinalizerRewardBalance(_) => "finalizer_reward_balance",
+            Request::FinalizerRewardBalances => "finalizer_reward_balances",
         }
     }
 
@@ -1503,6 +1509,11 @@ pub enum ReadRequest {
     /// Returns [`ReadResponse::FinalizerRewardBalance`], zero for an unknown finalizer.
     FinalizerRewardBalance([u8; 32]),
 
+    /// Every finalizer reward bank with a non-zero balance.
+    ///
+    /// Returns [`ReadResponse::FinalizerRewardBalances`].
+    FinalizerRewardBalances,
+
     /// Returns the tip of every non-finalized chain other than the best chain, with the height
     /// at which it leaves the best chain.
     ///
@@ -1587,6 +1598,7 @@ impl ReadRequest {
             ReadRequest::NonFinalizedBlocksListener { .. } => "non_finalized_blocks_listener",
             ReadRequest::BondInfo(_) => "bond_info",
             ReadRequest::FinalizerRewardBalance(_) => "finalizer_reward_balance",
+            ReadRequest::FinalizerRewardBalances => "finalizer_reward_balances",
             ReadRequest::SidechainForks => "sidechain_forks",
             ReadRequest::BlockSequence { .. } => "block_sequence",
         }
@@ -1656,6 +1668,7 @@ impl TryFrom<Request> for ReadRequest {
 
             Request::BondInfo(bond_key) => Ok(ReadRequest::BondInfo(bond_key)),
             Request::FinalizerRewardBalance(finalizer) => Ok(ReadRequest::FinalizerRewardBalance(finalizer)),
+            Request::FinalizerRewardBalances => Ok(ReadRequest::FinalizerRewardBalances),
         }
     }
 }

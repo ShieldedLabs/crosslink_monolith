@@ -87,7 +87,7 @@ pub fn scan_tx(info: &mut ScanInfo, utxos: &mut HashSet<(PubKeyID, u32)>, tx_byt
             let mut is_my_staking_action = contains_my_t_spend;
 
             if is_my_staking_action {
-            } else if let Some(bundle) = tx.orchard_bundle() {
+            } else if let Some(bundle) = tx.ironwood_bundle() {
                 'actions: for action in bundle.actions() {
                     let action: &orchard::Action<_> = action; // type-check
                     let domain = orchard::note_encryption::OrchardDomain::for_action(action);

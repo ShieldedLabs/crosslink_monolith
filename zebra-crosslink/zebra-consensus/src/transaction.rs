@@ -545,8 +545,10 @@ where
             None => return Ok(()),
         };
 
-        // RetargetDelegationBond is exempt from staking day restrictions
-        if staking_action.kind() == StakingActionKind::RetargetDelegationBond {
+        // Retarget and finalizer reward conversion are exempt from staking day
+        // restrictions: neither moves value into or out of the staking pools from
+        // outside (conversion only re-labels value already at stake).
+        if matches!(staking_action.kind(), StakingActionKind::RetargetDelegationBond | StakingActionKind::ConvertFinalizerRewardToDelegationBond) {
             return Ok(());
         }
 

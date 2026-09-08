@@ -892,7 +892,8 @@ impl Service<Request> for StateService {
             | Request::FindBlockHeaders { .. }
             | Request::CheckBestChainTipNullifiersAndAnchors(_)
             | Request::BondInfo(_)
-            | Request::FinalizerRewardBalance(_) => {
+            | Request::FinalizerRewardBalance(_)
+            | Request::FinalizerRewardBalances => {
                 // Redirect the request to the concurrent ReadStateService
                 let read_service = self.read_service.clone();
 
@@ -1438,6 +1439,21 @@ impl Service<ReadRequest> for ReadStateService {
                     .unwrap_or_else(|| state.db.finalizer_reward(&finalizer));
 
                 Ok(ReadResponse::FinalizerRewardBalance(balance))
+            }
+
+            ReadRequest::FinalizerRewardBalances => {
+                let mut banks = state
+                    .non_finalized_state_receiver
+                    .with_watch_data(|non_finalized_state| {
+                        non_finalized_state
+                            .best_chain()
+                            .map(|chain| chain.finalizer_rewards.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>())
+                    })
+                    .unwrap_or_else(|| state.db.all_finalizer_rewards());
+                banks.retain(|(_, v)| *v != 0);
+                banks.sort();
+
+                Ok(ReadResponse::FinalizerRewardBalances(banks))
             }
 
             ReadRequest::BondInfo(bond_key) => {
