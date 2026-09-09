@@ -240,7 +240,7 @@ impl ZebradConfig {
         // to running with no config file.
         config.state
             .cache_dir
-            .push("zebra_crosslink_workshop_season_one_v3_ehtedht_cache_delete_me");
+            .push("crosslink_nightly_20260909");
 
         // Merge user-led hardforks with the ones shipped in the executable, validate
         // them, and store the canonical (sorted, deduplicated) list back. Building
