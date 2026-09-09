@@ -638,9 +638,10 @@ pub trait Rpc {
 
     /// What the wallet can spend now, what is still maturing, and its own address.
     ///
-    /// The companion query to `wallet_basic_send`: a send fails when `spendable_zats` is below
-    /// the value plus fee, and value just received sits in `pending_zats` until it is far
-    /// enough behind the tip.
+    /// The companion query to `wallet_basic_send`. `spendable_zats` is a floor: a send of that
+    /// much less the fee has the funds it needs, while a larger one may still succeed, because
+    /// the builder also draws on recent notes reported in `pending_zats`. Notes already consumed
+    /// by a send not yet seen in a block are held in `committed_zats`.
     ///
     /// ## Example Usage
     /// ```shell

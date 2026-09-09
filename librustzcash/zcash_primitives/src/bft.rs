@@ -1072,19 +1072,25 @@ pub struct ScanBond {
     pub create_txid: PubKeyID, // typed for serialization
 }
 
-/// What `wallet_basic_send` can actually spend right now, and where to send it.
+/// What `wallet_basic_send` can draw on right now, and where to send it.
 ///
-/// A note is only spendable once it is far enough behind the tip, so a wallet that has just
-/// been paid reports the value as pending rather than spendable: that gap is the usual reason
-/// a send fails, which is why this pairs with the send RPC.
+/// `spendable_zats` is a floor, not an exact predicate. It counts notes at least six blocks
+/// behind the tip, while the transaction builder anchors at `tip - 1` and so may also spend
+/// notes reported here as pending. A send of `spendable_zats` (less the fee) therefore has the
+/// funds it needs, but a larger one can still succeed.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WalletSpendableFunds {
     /// The wallet's own unified address, the destination other wallets pay to.
     pub address: std::string::String,
     /// Shielded value that can be spent now.
     pub spendable_zats: u64,
-    /// Shielded value received too recently to spend yet.
+    /// Shielded value received too recently to count toward `spendable_zats`. The builder may
+    /// still draw on it, since it anchors at `tip - 1`.
     pub pending_zats: u64,
+    /// Shielded value whose notes are already consumed by a send of ours that has been built
+    /// or broadcast but not yet seen in a block. Counted here rather than in `spendable_zats`
+    /// or `pending_zats`, because spending those notes again is rejected as a double spend.
+    pub committed_zats: u64,
     /// Transparent value, which `wallet_basic_send` does not spend from.
     pub unshielded_zats: u64,
     /// The wallet's view of the chain tip, so a caller can tell a stale answer from a real one.

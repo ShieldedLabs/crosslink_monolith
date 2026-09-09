@@ -4440,12 +4440,42 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let mut user_unshielded_funds = 0;
             let mut user_shielded_pending_funds = 0;
             let mut user_shielded_spendable_funds = 0;
+            let mut user_shielded_committed_funds = 0;
             for txo in &user_wallet.accounts[0].utxos {
                 user_unshielded_funds += txo.value.into_u64();
             }
+
+            // A note stays in `unspent_orchard_notes` until the wallet scans the block that
+            // spends it, so a send we have already built or broadcast still looks available.
+            // Counting those notes as spendable tells a caller it can spend the same note
+            // twice; the mempool then rejects the second transaction as a double spend.
+            // A user-wallet spend can be in flight in four places: the two proposals the GUI
+            // drives, and the two the RPCs drive.
+            let mut in_flight: [Option<&ProposedTx>; 4] = [Some(&proposed_send), Some(&proposed_stake), None, None];
+            if let Some((tx, _sender)) = rpc_send.as_ref()  { in_flight[2] = Some(tx); }
+            if let Some((tx, _sender)) = rpc_stake.as_ref() { in_flight[3] = Some(tx); }
+
+            let mut committed_nfs: Vec<orchard::note::Nullifier> = Vec::new();
+            for proposed in in_flight {
+                let Some(proposed) = proposed else { continue; };
+                if !proposed.is_in_progress() { continue; }
+                let Some(tx_res) = proposed.tx_res.as_ref() else { continue; };
+                let tx = tx_res.transaction();
+                // Ironwood notes are carried in their own bundle, so an Ironwood send has no
+                // orchard bundle at all; scan both so either pool's inputs are accounted for.
+                for bundle in [tx.orchard_bundle(), tx.ironwood_bundle()] {
+                    let Some(bundle) = bundle else { continue; };
+                    for action in bundle.actions() {
+                        committed_nfs.push(*action.nullifier());
+                    }
+                }
+            }
+
             for note in &user_wallet.accounts[0].unspent_orchard_notes {
                 let val = note.note.value().inner();
-                if note.recv_h < user_wallet.chain_tip_h.sat_sub(5) {
+                if committed_nfs.contains(&note.nf) {
+                    user_shielded_committed_funds += val;
+                } else if note.recv_h < user_wallet.chain_tip_h.sat_sub(5) {
                     user_shielded_spendable_funds += val;
                 } else {
                     user_shielded_pending_funds += val;
@@ -4578,6 +4608,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 address: user_ua.encode(network),
                 spendable_zats: user_shielded_spendable_funds,
                 pending_zats: user_shielded_pending_funds,
+                committed_zats: user_shielded_committed_funds,
                 unshielded_zats: user_unshielded_funds,
                 tip_height: user_wallet.chain_tip_h.0,
             });
