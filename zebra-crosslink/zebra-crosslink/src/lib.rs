@@ -65,6 +65,48 @@ pub static TEST_SHUTDOWN_FN: Mutex<fn()> = Mutex::new(|| ());
 pub static TEST_PARAMS: Mutex<Option<ZcashCrosslinkParameters>> = Mutex::new(None);
 pub static TEST_NAME: Mutex<&'static str> = Mutex::new("‰‰TEST_NAME_NOT_SET‰‰");
 
+/// Runtime-configurable failure handling, ported from reece_smith_merchant. A wrapped
+/// `Result`/`Option` panics only when `on_fail` carries `PANIC`, otherwise it is logged
+/// (`LOG`) or returned untouched. This lets one code path assert-fail for a human running a
+/// test yet hand the error back to the fuzzer grinding through malformed inputs, without
+/// duplicating the path.
+#[allow(dead_code)]
+pub mod uhh {
+    pub const LOG: u32 = 1 << 0;
+    pub const CALLSTACK: u32 = 1 << 1;
+    pub const PANIC: u32 = 1 << 2;
+}
+
+pub fn uhh<T, E: std::fmt::Debug>(result: Result<T, E>, on_fail: u32) -> Result<T, E> {
+    if let Err(e) = &result {
+        if on_fail & (uhh::LOG | uhh::PANIC) != 0 {
+            eprintln!("{:?}", e);
+        }
+        // CALLSTACK backtrace is not implemented (matches the source); never set it here.
+        if on_fail & uhh::PANIC != 0 {
+            panic!("error marked as unrecoverable");
+        }
+    }
+    result
+}
+
+pub fn uhh_option<T>(option: Option<T>, on_fail: u32) -> Option<T> {
+    if option.is_none() {
+        if on_fail & (uhh::LOG | uhh::PANIC) != 0 {
+            eprintln!("Option of '{}' was None.", std::any::type_name::<T>());
+        }
+        if on_fail & uhh::PANIC != 0 {
+            panic!("error marked as unrecoverable");
+        }
+    }
+    option
+}
+
+/// Failure mode for the test-format load path (see [`uhh`]). Normal tests keep `PANIC`, so
+/// malformed data aborts; the fuzzer clears `PANIC` so the same path recovers and keeps
+/// grinding.
+pub static TEST_ON_FAIL: Mutex<u32> = Mutex::new(uhh::PANIC);
+
 pub fn dump_test_instrs() {
     #![allow(clippy::print_stderr)]
 

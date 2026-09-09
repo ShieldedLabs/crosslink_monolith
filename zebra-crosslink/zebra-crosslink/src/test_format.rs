@@ -645,16 +645,18 @@ pub(crate) async fn handle_instr(
 }
 
 pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs: &[TFInstr]) {
+    // A failed deserialize is a hard error for a normal test but an expected input rejection
+    // for the fuzzer; `uhh_option` decides which via TEST_ON_FAIL (PANIC vs recover).
+    let on_fail = *TEST_ON_FAIL.lock().unwrap();
     for instr_i in 0..instrs.len() {
-        let instr_val = &instrs[instr_i];
         // info!(
         //     "Loading instruction {}: {} ({})",
         //     instr_i,
-        //     TFInstr::string_from_instr(bytes, instr_val),
-        //     instr_val.kind
+        //     TFInstr::string_from_instr(bytes, &instrs[instr_i]),
+        //     instrs[instr_i].kind
         // );
 
-        if let Some(instr) = tf_read_instr(bytes, &instrs[instr_i]) {
+        if let Some(instr) = uhh_option(tf_read_instr(bytes, &instrs[instr_i]), on_fail) {
             handle_instr(
                 &internal_handle,
                 bytes,
@@ -663,8 +665,6 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
                 instr_i,
             )
             .await;
-        } else {
-            panic!("Failed to read {}", TFInstr::str_from_kind(instr_val.kind));
         }
 
         *TEST_INSTR_C.lock().unwrap() = instr_i + 1; // accounts for end
@@ -698,9 +698,11 @@ pub(crate) async fn instr_reader(internal_handle: TFLServiceHandle) {
 
     let bytes = TEST_INSTR_BYTES.lock().unwrap().clone();
 
-    let tf = match TF::read_from_bytes(&bytes) {
+    // Normal tests PANIC on an unparseable envelope; the fuzzer recovers (TEST_ON_FAIL).
+    let on_fail = *TEST_ON_FAIL.lock().unwrap();
+    let tf = match uhh(TF::read_from_bytes(&bytes), on_fail) {
         Ok(tf) => tf,
-        Err(err) => panic!("Invalid test data: {}", err), // TODO: specifics
+        Err(_) => return, // uhh already panicked (PANIC) or logged (fuzzer)
     };
 
     *TEST_INSTRS.lock().unwrap() = tf.instrs.clone();
@@ -714,11 +716,16 @@ pub(crate) async fn instr_reader(internal_handle: TFLServiceHandle) {
         "didn't complete test {}",
         TEST_NAME.lock().unwrap()
     );
-    // make sure the test as a whole actually fails for failed instructions
+    // make sure the test as a whole actually fails for failed instructions.
+    // Include the recorded (instruction index, message) pairs in the message so a red test is
+    // self-describing: otherwise these are collected but discarded here, and diagnosing which
+    // instruction failed needs TEST_CHECK_ASSERT raised and a rebuild.
+    let failed_instrs = TEST_FAILED_INSTR_IDXS.lock().unwrap();
     assert!(
-        TEST_FAILED_INSTR_IDXS.lock().unwrap().is_empty(),
-        "failed test {}",
-        TEST_NAME.lock().unwrap()
+        failed_instrs.is_empty(),
+        "failed test {}: {:?}",
+        TEST_NAME.lock().unwrap(),
+        *failed_instrs
     );
     println!("Test done, shutting down");
     // #[cfg(feature = "viz_gui")]
