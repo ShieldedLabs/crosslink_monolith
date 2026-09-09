@@ -450,103 +450,12 @@ async fn _block_prev_hash_from_hash(call: &TFLServiceCalls, hash: ZebBlockHash) 
     }
 }
 
-async fn tfl_reorg_final_block_height_hash(
-    call: &TFLServiceCalls,
-) -> Option<(ZebBlockHeight, ZebBlockHash)> {
-    let locator = (call.state)(StateRequest::BlockLocator).await;
-
-    // NOTE: although this is a vector, the docs say it may skip some blocks
-    // so we can't just `.get(MAX_BLOCK_REORG_HEIGHT)`
-    if let Ok(StateResponse::BlockLocator(hashes)) = locator {
-        let result_1 = match hashes.last() {
-            Some(hash) => block_height_from_hash(call, *hash)
-                .await
-                .map(|height| (height, *hash)),
-            None => None,
-        };
-
-        /* Alternative implementations:
-        use std::ops::Sub;
-        use zebra_chain::block::HeightDiff as BlockHeightDiff;
-
-        let result_2 = if hashes.len() == 0 {
-            None
-        } else {
-            let tip_block_height = block_height_from_hash(call, *hashes.first().unwrap()).await;
-
-            if let Some(height) = tip_block_height {
-                if height < ZebBlockHeight(zebra_state::MAX_BLOCK_REORG_HEIGHT) {
-                    // not enough blocks for any to be finalized
-                    None // may be different from `locator.last()` in this case
-                } else {
-                    let pre_reorg_height = height
-                        .sub(BlockHeightDiff::from(zebra_state::MAX_BLOCK_REORG_HEIGHT))
-                        .unwrap();
-                    let final_block_req = StateRequest::BlockHeader(pre_reorg_height.into());
-                    let final_block_hdr = (call.state)(final_block_req).await;
-
-                    if let Ok(StateResponse::BlockHeader { height, hash, .. }) = final_block_hdr
-                    {
-                        Some((height, hash))
-                    } else {
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        };
-
-        let mut result_3 = None;
-        if hashes.len() > 0 {
-            let tip_block_hdr = block_height_from_hash(call, *hashes.first().unwrap()).await;
-
-            if let Some(height) = tip_block_hdr {
-                if height >= ZebBlockHeight(zebra_state::MAX_BLOCK_REORG_HEIGHT) {
-                    // not enough blocks for any to be finalized
-                    let pre_reorg_height = height
-                        .sub(BlockHeightDiff::from(zebra_state::MAX_BLOCK_REORG_HEIGHT))
-                        .unwrap();
-                    let final_block_req = StateRequest::BlockHeader(pre_reorg_height.into());
-                    let final_block_hdr = (call.state)(final_block_req).await;
-
-                    if let Ok(StateResponse::BlockHeader { height, hash, .. }) = final_block_hdr
-                    {
-                        result_3 = Some((height, hash))
-                    }
-                }
-            }
-        };
-        let result_3 = result_3;
-
-        //assert_eq!(result_1, result_2); // NOTE: possible race condition: only for testing
-        //assert_eq!(result_1, result_3); // NOTE: possible race condition: only for testing
-        // Sam: YES! Indeed there were race conditions.
-        */
-
-        result_1
-    } else {
-        None
-    }
-}
-
+/// Only Crosslink's own marker. A reorg-depth location is a different quantity and reporting
+/// one here would present a probabilistic guess as Crosslink finality; see FINALITY.md.
 async fn tfl_final_block_height_hash(
     internal_handle: &TFLServiceHandle,
 ) -> Option<(ZebBlockHeight, ZebBlockHash)> {
-    let mut internal = internal_handle.internal.lock().await;
-    tfl_final_block_height_hash_pre_locked(internal_handle, &mut internal).await
-}
-
-async fn tfl_final_block_height_hash_pre_locked(
-    internal_handle: &TFLServiceHandle,
-    internal: &mut TFLServiceInternal,
-) -> Option<(ZebBlockHeight, ZebBlockHash)> {
-    #[allow(unused_mut)]
-    if internal.latest_final_block.is_some() {
-        internal.latest_final_block
-    } else {
-        tfl_reorg_final_block_height_hash(&internal_handle.call).await
-    }
+    internal_handle.internal.lock().await.latest_final_block
 }
 
 // NAME: rng_sk_pk_from_addr
