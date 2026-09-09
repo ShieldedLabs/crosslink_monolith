@@ -455,6 +455,18 @@ async fn _block_prev_hash_from_hash(call: &TFLServiceCalls, hash: ZebBlockHash) 
     }
 }
 
+/// Record a new Crosslink finalization marker and publish the change.
+///
+/// Every write to `latest_final_block` goes through here, so the change notification has a
+/// single source and the CL2 update rule has one place to live once it is specified: the
+/// marker should advance only to a descendant, and a conflicting candidate is a safety
+/// hazard rather than a silent overwrite. Neither check exists yet; see FINALITY.md.
+fn set_final_block(internal: &mut TFLServiceInternal, height: ZebBlockHeight, hash: ZebBlockHash) {
+    internal.latest_final_block = Some((height, hash));
+    // Sending fails only when nothing is subscribed, which is the common case.
+    let _ = internal.final_change_tx.send((height, hash));
+}
+
 /// Only Crosslink's own marker. A reorg-depth location is a different quantity and reporting
 /// one here would present a probabilistic guess as Crosslink finality; see FINALITY.md.
 async fn tfl_final_block_height_hash(
@@ -684,7 +696,7 @@ async fn handle_new_decided_bft_block(
     internal.bft_block_hash_to_height.insert(new_block.blake3_hash(), insert_i as u64);
     internal.bft_blocks[insert_i] = new_block.clone();
     internal.fat_pointer_to_tip = fat_pointer.clone();
-    internal.latest_final_block = Some((new_final_height, new_final_hash));
+    set_final_block(&mut internal, new_final_height, new_final_hash);
 
     // Note(Sam): IT IS VERY IMPORTANT THAT WE DROP THE LOCK BECAUSE ZEBRA_STATE MAY CALL US BACK.
     // @Todo: once new_network syncs the BFT chain itself, this finalize becomes a message to
@@ -1279,7 +1291,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             internal.fat_pointer_to_tip = fat_pointer_to_tip;
             if new_final_hash != ZebBlockHash([0; 32]) {
                 internal.current_bc_final = Some((new_final_height, new_final_hash));
-                internal.latest_final_block = Some((new_final_height, new_final_hash));
+                set_final_block(&mut internal, new_final_height, new_final_hash);
             }
             roster
         };
@@ -2003,7 +2015,7 @@ async fn tfl_set_finality_by_hash(
         let new_height = block_height_from_hash(&internal_handle.call, hash).await;
 
         if let Some(height) = new_height {
-            internal.latest_final_block = Some((height, hash));
+            set_final_block(&mut internal, height, hash);
         }
 
         new_height
