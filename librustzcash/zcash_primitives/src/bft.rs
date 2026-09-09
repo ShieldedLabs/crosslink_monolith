@@ -118,7 +118,7 @@ impl HardForkConfig {
 ///
 /// A [BftBlock] may be constructed from a node's local view in order to create a new BFT proposal, or they may be constructed from unknown sources across a network protocol.
 ///
-/// To construct a [BftBlock] for a new BFT proposal, build a [Vec] of [BcBlockHeader] values, starting from the latest known PoW tip and traversing back in time (following [previous_block_hash](BcBlockHeader::previous_block_hash)) until exactly [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma) headers are collected, then pass this to [BftBlock::try_from].
+/// To construct a [BftBlock] for a new BFT proposal, build a [Vec] of exactly [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma) consecutive [BcBlockHeader] values in ascending height order, so that element zero is the deepest, then pass this to [BftBlock::try_from]. The specification requires these to be the tail of a bc-valid chain. The Zebra prototype does not always satisfy that: it clamps how far the finalization candidate may advance in a single step, and under that clamp it carries a mid-chain window instead of a tail.
 ///
 /// To construct from an untrusted source, call the same [BftBlock::try_from].
 ///
@@ -155,11 +155,13 @@ impl HardForkConfig {
 ///
 /// ## Design Notes
 ///
-/// This *assumes* is is more natural to fetch the latest BC tip in Zebra, then to iterate to parent blocks, appending each to the [Vec]. This means the in-memory header order is *reversed from the specification* [^1]:
+/// The in-memory header order *matches* the specification [^1]:
 ///
 /// > Each bft‑proposal has, in addition to origbft‑proposal fields, a headers_bc field containing a sequence of exactly σ bc‑headers (zero‑indexed, deepest first).
 ///
-/// The [TryFrom] impl performs internal validations and is the only way to construct a [BftBlock], whether locally generated or from an unknown source. This is the safest design, though potentially less efficient.
+/// That order is a property of the honest producer, not of this type. Nothing establishes it for a block from an unknown source: [BftBlock::try_from] checks only the header count, and the deserialization path does not call it.
+///
+/// The [TryFrom] impl performs internal validations and is intended to be the only way to construct a [BftBlock], whether locally generated or from an unknown source. This is the safest design, though potentially less efficient.
 ///
 /// # References
 ///
@@ -298,6 +300,14 @@ impl BftBlock {
 
 
     /// Refer to the [BcBlockHeader] that is the finalization candidate for this block
+    ///
+    /// This returns the deepest carried header, which is one block above the snapshot the
+    /// specification defines: `snapshot` is that header's *parent*. No caller in this tree
+    /// takes the parent, so the finalized point is currently one block shallower than the
+    /// specification intends. See the off-by-one discussion in FINALITY.md.
+    ///
+    /// Panics if the block carries no headers, which the placeholder entries used during
+    /// out-of-order BFT ingest do.
     pub fn finalization_candidate(&self) -> &BcBlockHeader {
         &self.headers.first().expect("Vec should never be empty")
     }

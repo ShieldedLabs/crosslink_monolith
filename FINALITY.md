@@ -67,8 +67,10 @@ has:
   makes only chains containing that point eligible for local activation;
 - a **physical database-commit boundary**, proposed as `state_commit_tip`, which advances only
   after the finalized-state write has succeeded; and
-- a **legacy reorg-depth marker**, roughly `tip − MAX_BLOCK_REORG_HEIGHT`, used when no
-  Crosslink marker exists.
+- a **legacy reorg-depth marker**, roughly `tip − MAX_BLOCK_REORG_HEIGHT`, formerly substituted
+  by the finality RPCs when no Crosslink marker existed. That substitution has been removed and
+  the marker now has no consumer, but the quantity remains distinct from the three above and is
+  listed here so that it is not reintroduced under a Crosslink name.
 
 Protocol `fin` and these Zebra quantities must not share an undocumented storage slot. In raw
 CL2, `fin` can remain fixed on a branch that raw `bc_best` no longer contains. In the current
@@ -271,9 +273,13 @@ by:
 The live path computes the hash of `new_block.headers[0]`: the first header itself, rather than
 `snapshot(new_block) = parent(new_block.headers[0])`.
 
-When this marker is absent, `tfl_final_block_height_hash_pre_locked` substitutes
-`tfl_reorg_final_block_height_hash`, a Zebra reorg-depth location derived from the state block
-locator. The API therefore changes semantics depending on whether Crosslink has produced a
+When this marker is absent, `tfl_final_block_height_hash` returns `None`. It previously
+substituted a Zebra reorg-depth location derived from the state block locator, so that the API
+changed semantics depending on whether Crosslink had produced a value; that substitution and
+its helper have been removed. Removing it was safe because the substitution reached only three
+readers, all RPC-facing: `tfl_block_finality_from_height_hash`, the `FinalBlockHeightHash`
+service request, and the `TxFinalityStatus` service request. Every consensus-, state-, and
+GUI-side reader takes `internal.latest_final_block` directly and never saw the substituted
 value.
 
 `TFLServiceInternal::current_bc_final` is initialized in
@@ -313,6 +319,24 @@ The overloaded value currently reaches:
 - BFT proposal and validation paths; and
 - the main-loop finality-gap diagnostic.
 
+"Reaches" above is deliberately loose, and the distinction matters when planning a rename or a
+change of derivation. The actual reads of `internal.latest_final_block` are only: the BFT
+proposal path, the main-loop diagnostic, and three sites in `viz2.rs` (the paging lower bound,
+the `terminated_finalizers_at` height input, and the GUI finalized tip). The others receive the
+same value by another route rather than by reading the slot:
+
+- `CrosslinkFinalizeBlock` is sent the local `new_final_hash`; the field is written from that
+  same local immediately before. Deleting the field would not change its behavior.
+- `finalizers_at_current_height` is a write target, populated from the aggregated stakes that
+  the `CrosslinkFinalizeBlock` call returns.
+- `terminated_finalizers_at` is passed a local height at three of its four call sites; only the
+  `viz2.rs` site reads the field.
+- The BFT validation path's read is dead: `already_finalized_hash` is captured and then
+  discarded by `let _ = already_finalized_hash;`, because the queue re-flush it once served has
+  been removed.
+
+By actual reads, the widest consumer of the slot is the visualizer, not consensus.
+
 `TFLServiceInternal::final_change_tx` is created and
 `TFLServiceRequest::FinalBlockRx` returns subscribers. The RPC notification methods wait on
 those receivers, but no `final_change_tx.send(...)` site exists in this tree. This
@@ -349,9 +373,37 @@ Any future consensus change must keep all three paths identical.
   `lca(snapshot(LF(H)), prune_σ(H))`; it takes a hash directly from the decided BFT block.
 - **Off-by-one snapshot.** Honest proposal construction obtains a deepest-first `σ`-header
   tail. `headers[0]` is one block after the snapshot, but Zebra stores that header's hash rather
-  than its parent. The stale `BftBlock` doc comment in
-  `librustzcash/zcash_primitives/src/bft.rs` incorrectly says the in-memory order is reversed
-  from the specification.
+  than its parent. The proposal path picks a candidate height, then issues `FindBlockHeaders`
+  with that block as the sole known hash. That request is specified to return the headers
+  *following* the intersection, ascending, and the implementation iterates an ascending range
+  from `intersection + 1`, so `headers[0]` is the block one above the candidate height and
+  `parent(headers[0])` is the candidate height itself. Storing `hash(headers[0])` therefore
+  finalizes one block shallower than intended.
+  The in-memory header order is consequently deepest-first, matching the specification, so the
+  `BftBlock` doc comment in `librustzcash/zcash_primitives/src/bft.rs` claiming the order is
+  reversed from the specification was not merely stale but inverted. Nothing enforces that
+  order: `BftBlock::try_from` checks only the header count and logs that its documented
+  validations are unimplemented, and the deserialization path used for network and PoS-store
+  blocks does not call `try_from` at all. Deepest-first is a property of the honest producer,
+  not of the type.
+- **The candidate height is clamped, and the clamp is not `prune_σ`.** The proposal path
+  computes `tip − σ` and then takes
+  `min(tip − σ, latest_final_block + 40)`. Only when that clamp does not bind is the stored
+  marker `prune_σ(tip) + 1`, i.e. `σ − 1` confirmations — two rather than three under
+  `PROTOTYPE_PARAMETERS`. Whenever `tip − σ > marker + 40`, which is the normal regime during
+  catch-up after a restart or a BFT stall, the candidate is `marker + 40` and the block is
+  finalized far deeper than `σ`. Any statement of the form "the proposal path finalizes at
+  `tip − σ`" is true only in the unclamped regime.
+- **Four sites derive the marker from `headers.first()`**, not three: the decide path, the BFT
+  validation path, the PoS-store restore path, and — separately — the historical replay
+  watermark `prev_finalized_bc_height` computed during restore. `BftBlock::finalization_candidate()`
+  is a fifth accessor with the same convention. The replay watermark is the one that makes a
+  change of derivation costly; see §9.4.
+- **Mixed conventions in the improvement test.** `is_improved_final` compares the candidate
+  height, a snapshot height, against the stored marker, which is a snapshot height plus one. A
+  new proposal is therefore admitted only when the snapshot advances by two or more blocks. The
+  test runs before the `+40` clamp is applied, so the clamp does not affect this conclusion.
+  The mismatch is a direct consequence of the off-by-one and disappears with it.
 - **Missing monotonicity and hazard record.** All marker writes are unconditional. There is no
   `fin ⪯ candidate` guard and no distinction between a benign candidate regression and a
   conflicting-candidate safety incident.
@@ -364,6 +416,12 @@ Any future consensus change must keep all three paths identical.
 - BFT validation does not implement Linearity or Tail Confirmation. It checks that the first
   carried header's block is locally present, but does not establish that all `σ` headers form a
   valid chain with valid PoW.
+- Tail Confirmation is additionally violated by construction whenever the `+40` candidate clamp
+  in §6.1 binds. The rule requires `B.headers_bc` to be the `σ`-block tail of a bc-valid chain,
+  but under the clamp the proposal carries a mid-chain window starting at `marker + 41`, which
+  is not a tail of anything. Implementing the rule as specified would reject the prototype's own
+  proposals during catch-up, so the clamp and the rule must be reconciled before either is
+  treated as settled.
 - The Extension rule is implemented by
   `call_from_state_to_crosslink_to_ask_about_fat_pointers`, including its defer/reject
   distinction.
@@ -390,9 +448,13 @@ warning at a hardcoded gap does not substitute for them.
 
 ### 6.5 Client exposure and API semantics
 
-There is no checkpoint/recency sync gate. Before the Crosslink marker exists, finality RPCs
-silently expose the legacy reorg-depth fallback. Existing GUI and RPC surfaces also conflate
-raw tip, confirmation, and finalization instead of defining each endpoint's contract.
+There is no checkpoint/recency sync condition on client exposure. Before the Crosslink marker
+exists, finality RPCs now report no value rather than silently exposing the legacy reorg-depth
+fallback; `get_tfl_final_block_hash` and `get_tfl_final_block_height_and_hash` return `null`,
+and the block- and transaction-finality methods collapse their error to `null` as well.
+Existing GUI and RPC surfaces still conflate raw tip, confirmation, and finalization instead of
+defining each endpoint's contract, and what these methods return once the marker *does* exist is
+still the legacy-fed slot, not `fin`.
 
 ### 6.6 Ordering and notification
 
@@ -423,7 +485,7 @@ No blanket "presentation uses `ba_μ`" rule is correct. Each consumer needs a co
 | raw best-tip display | `bc_best_tip` | current fork-choice result |
 | confirmed/bounded-available display | `bounded_available_tip` | bounded behavior during finalization stalls |
 | final display | `local_finalized_tip` | node-local monotone CL2 view |
-| `get_tfl_final_block_hash` and `get_tfl_final_block_height_and_hash` | `local_finalized_tip` | return no value until actual `fin` exists and exposure gating passes |
+| `get_tfl_final_block_hash` and `get_tfl_final_block_height_and_hash` | `local_finalized_tip` | partly implemented: they now return no value when the marker is absent, but when present it is still the legacy-fed slot, and the checkpoint/recency exposure condition of §6.5 does not exist |
 | block/transaction status | unresolved API contract | define distinct `Confirmed` and `Finalized` states before routing either |
 | finality-change notifications | `local_finalized_tip` transitions | publish only after the chosen public-finality contract is met |
 | visualization paging | operational paging cursor | do not overload a finality value merely to bound a window |
@@ -450,19 +512,30 @@ proof. The design must state separately:
 The first implementation patch should expose the semantic split without claiming that legacy
 writers already implement CL2:
 
-1. Rename `latest_final_block` to `local_finalized_tip` and document that it is the storage
-   slot intended for protocol `fin`, currently fed by legacy logic.
-2. Rename the main-loop `current_bc_tip` local to `bc_best_tip`.
-3. Make the final-block accessor return only the stored Crosslink value; do not substitute the
-   legacy reorg-depth marker.
-4. Add a distinct successful-commit marker if callers need to report database finalization;
+1. **Done.** Make the final-block accessor return only the stored Crosslink value; do not
+   substitute the legacy reorg-depth marker. `tfl_reorg_final_block_height_hash` and
+   `tfl_final_block_height_hash_pre_locked` then have no callers and were deleted with it.
+2. Add a distinct successful-commit marker if callers need to report database finalization;
    update it only after `CrosslinkFinalizeBlock` succeeds.
-5. Either publish `FinalBlockRx` changes at the documented transition point or remove the dead
+3. Either publish `FinalBlockRx` changes at the documented transition point or remove the dead
    notification API in separate code work.
+4. Rename the main-loop `current_bc_tip` local to `bc_best_tip`.
+5. Rename `latest_final_block` and document what feeds it.
 
 The accessor change is observable: before Crosslink produces a local finalized value, finality
-queries should return `None`, not label a Zebra reorg-depth point as Crosslink finality. A
-regression test should cover both the absent and explicitly present cases.
+queries return `None` rather than labelling a Zebra reorg-depth point as Crosslink finality. The
+regression test covering the absent and explicitly present cases has **not** been written; there
+is no test harness for these RPC methods.
+
+Step 5 is listed last because the obvious rename is not obviously correct, and the choice should
+be made from the read inventory in §5.3 rather than from the name `CrosslinkFinalizeBlock`. The
+slot is written from the same local that the state request is sent, so it is a *record of* what
+was force-finalized rather than an input to it; its actual readers are the BFT proposal path,
+the main-loop diagnostic, and the visualizer. It has no `candidate` computation, no monotonicity
+guard, and no `bc_best` update trigger, so naming it `local_finalized_tip` would assert a CL2
+quantity the code does not implement and would need a second rename once real `fin` exists.
+Whether to name it for its present role, or defer until the update trigger lands, is an open
+decision and should not be bundled with the mechanical steps above.
 
 Computing `candidate`, changing the update trigger, enforcing validity rules, implementing
 Stalled Mode, and changing chain eligibility or rewards are later behavior changes, not part of
@@ -528,7 +601,20 @@ which ledger state is read to materialize that set.
 - Decide whether and how to implement the Last Final Snapshot, Finality Depth, Linearity, and
   Tail Confirmation rules. These are consensus changes in the current prototype.
 - Decide how Stalled Mode behaves for Zebra transactions and block production.
-- Decide whether the one-block snapshot shift requires PoS-store migration or replay rules.
+- Decide whether the one-block snapshot shift requires PoS-store migration or replay rules. It
+  does require replay rules at minimum. The PoS store record is not a serialized `BftBlock`
+  alone: each record appends the block, the fat pointer, `finalizers_at_current_height`, and the
+  proposal signatures. The roster is marker-derived — it is the aggregated stakes that
+  `CrosslinkFinalizeBlock(hash(headers[0]))` returned — and restore reads it back verbatim
+  rather than recomputing it, so existing files carry old-derivation roster bytes that corrected
+  code will not correct. Meanwhile the replay watermark `prev_finalized_bc_height` *is*
+  recomputed from `headers.first()` during restore and feeds `terminated_finalizers_at`, whose
+  third argument is the marker height at every call site. Votes travel by roster index, so a
+  divergent roster re-indexes stored votes through seats that never voted; the code comment at
+  that site records this having already jailed and unjailed finalizers one certificate early at
+  a hardfork activation boundary. Nodes running the two derivations would also disagree about
+  which bc-block is finalized. The RocksDB side is unaffected: aggregated stakes are keyed by
+  block hash and written in the block's own batch, so both derivations' rows already exist.
 - Choose `μ` and whether it is node-configurable; default `μ = σ` follows the Book's
   recommendation.
 - Specify checkpoint/recency exposure gating independently of block validity.
