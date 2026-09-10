@@ -178,6 +178,72 @@ const REGTEST_POS_BLOCK_BYTES: &[&[u8]] = &[
 
 const REGTEST_POW_IDX_FINALIZED_BY_POS_BLOCK: &[usize] = &[1, 4, 6, 10, 13, 16, 18];
 
+/// Filename index of each block in `REGTEST_BLOCK_BYTES` / `REGTEST_POS_BLOCK_BYTES`. The two
+/// sets interleave as one 0..29 sequence, so the numbering only makes sense together.
+const POW_FILE_IDX: [usize; REGTEST_BLOCK_BYTES_N] = [
+    0, 1, 2, 3, 4, 6, 7, 9, 10, 12, 13, 14, 15, 17, 18, 19, 21, 22, 23, 25, 26, 28, 29,
+];
+const POS_FILE_IDX: [usize; 7] = [5, 8, 11, 16, 20, 24, 27];
+
+/// Rewrite the checked-in binaries in `crosslink-test-data` from the current block format.
+///
+/// A tool rather than a test, so it is `#[ignore]`d like `read_from_file` and runs only when
+/// named. The checked-in files predate Ironwood v6: the PoS blocks no longer deserialize and
+/// the PoW blocks carry pre-rework `hashBlockCommitments`.
+///
+/// Two invariants the consumers depend on, neither obvious from the data itself:
+/// only the clone advances at i == 2, so `pow[2]` and `pow[3]` are siblings at height 3 and
+/// the chain must not grow when index 3 arrives, which is what
+/// `crosslink_push_example_pow_chain_only`'s `2 + i - (i >= 3)` asserts; and each PoS block
+/// finalizes the PoW index named by `REGTEST_POW_IDX_FINALIZED_BY_POS_BLOCK`.
+///
+///     cargo nextest run -p zebrad --test crosslink regen_test_data --run-ignored only
+#[ignore]
+#[test]
+fn regen_test_data() {
+    let dir = PathBuf::from("../crosslink-test-data");
+    assert!(dir.is_dir(), "expected {dir:?} relative to the zebrad crate dir");
+
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    // A second valid P2PKH miner: a different coinbase gives a different block hash, so the
+    // sibling at height 3 actually competes.
+    let miner_addr2 = Address::Transparent(
+        zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
+    );
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+
+    let mut pow = vec![gen.tip.clone()];
+    let mut genb = gen.clone();
+    for i in 1..REGTEST_BLOCK_BYTES_N {
+        if i == 2 {
+            pow.push(genb.next_block(&miner_addr2));
+        } else {
+            pow.push(gen.next_block(&miner_addr));
+        }
+        genb = gen.clone();
+    }
+
+    for i in 0..REGTEST_BLOCK_BYTES_N {
+        let bytes = pow[i].zcash_serialize_to_vec().unwrap();
+        std::fs::write(dir.join(format!("test_pow_block_{}.bin", POW_FILE_IDX[i])), bytes).unwrap();
+    }
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+    for (i, &link) in REGTEST_POW_IDX_FINALIZED_BY_POS_BLOCK.iter().enumerate() {
+        let bft = next_pos(pos_h, fat_ptr, &pow[link..link + 3], &[]);
+        let bytes = bft.zcash_serialize_to_vec().unwrap();
+        std::fs::write(dir.join(format!("test_pos_block_{}.bin", POS_FILE_IDX[i])), bytes).unwrap();
+    }
+
+    println!(
+        "regenerated {} pow + {} pos blocks in {dir:?}",
+        REGTEST_BLOCK_BYTES_N,
+        POS_FILE_IDX.len()
+    );
+}
+
 #[test]
 fn crosslink_expect_pos_height_on_boot() {
     set_test_name(function_name!());
