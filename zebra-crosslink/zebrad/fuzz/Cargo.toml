@@ -1,0 +1,30 @@
+# Fuzz package for the real block-ingest path. Kept as its own detached workspace (the empty
+# [workspace] table below) so the main zebra-crosslink workspace stays stable-only: this crate
+# needs a nightly toolchain (rust-toolchain.toml) and libfuzzer-sys, which the workspace must not.
+[package]
+name = "zebrad-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+once_cell = "1"
+
+# The lib under test. Pulls in the real state + consensus + crosslink graph via zebrad::fuzz.
+[dependencies.zebrad]
+path = ".."
+
+[[bin]]
+name = "ingest"
+path = "fuzz_targets/ingest.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace. Do NOT add `[lints] workspace = true`: inheriting the
+# workspace `unsafe_code = "deny"` lint would reject libfuzzer-sys' generated unsafe main.
+[workspace]
