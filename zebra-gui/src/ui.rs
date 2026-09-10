@@ -4472,14 +4472,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             // spacer
             if let _ = elem().decl(Decl { height: grow!(), ..Decl }) {}
 
-            // "Reset View" button
+            // "Jump To Height..." button, and the reset/follow-tip pill
             if let _ = elem().decl(Decl { direction: TopToBottom, align: Bottom, width: grow!(), child_gap, ..Decl }) {
-                {
-                    let follow_id = id("Follow Tip");
-                    if ui.hovered(follow_id) { ui.capture = true; }
-                    ui.checkbox_pill(follow_id, &mut viz.follow_tip, "Follow Tip", fit!());
-                }
-
                 {
                     let label = "Jump To Height...";
                     let id = id(label);
@@ -4510,38 +4504,81 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     }
                 }
 
-                let label = "Reset View";
+                {
+                    let reset_label = "Reset View";
+                    let reset_id  = id(reset_label);
+                    let follow_id = id("Follow Tip");
 
-                let enabled = viz.camera_x != 0.0 || viz.camera_y != viz.bc_tip_y || viz.zoom != 0.0;
+                    let reset_enabled = !viz.follow_tip && (viz.camera_x != 0.0 || viz.camera_y != viz.bc_tip_y || viz.zoom != 0.0);
 
-                let id = id(label);
-                let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
-                let radius = ui.scale(20.0);
+                    let (reset_clicked, reset_colour, reset_text_colour) = ui.button_ex(
+                        true, BUTTON_GREY, reset_id, reset_enabled, winit::window::CursorIcon::Default);
+                    let (follow_clicked, follow_colour, follow_text_colour) = ui.button_ex(
+                        true, BUTTON_GREY.mul(if viz.follow_tip { 1.0 } else { 0.8 }), follow_id, true, winit::window::CursorIcon::Default);
 
-                if ui.hovered(id) {
-                    ui.capture = true;
-                }
+                    if ui.hovered(reset_id) || ui.hovered(follow_id) {
+                        ui.capture = true;
+                    }
 
-                // Button
-                if let _ = elem().decl(Decl {
-                    id,
-                    colour,
-                    padding,
-                    child_gap,
-                    radius: radius.dup4(),
-                    align: Center,
-                    width:  fit!(ui.scale(128.0)),
-                    height: fit!(radius * 2.0),
-                    ..Decl
-                }) {
-                    let button_text_h = ui.scale(16.0);
-                    ui.text(label, TextDecl { h: button_text_h, colour: text_colour, align: AlignX::Center, ..TextDecl });
-                }
+                    let radius   = ui.scale(20.0);
+                    let seam     = ui.scale(2.0);
+                    let follow_w = radius * 2.0;
 
-                if clicked {
-                    viz.camera_x = 0.0;
-                    viz.camera_y = viz.bc_tip_y;
-                    viz.zoom = 0.0;
+                    // One pill split off-centre: the wide left half resets the camera, the square
+                    // right half locks it to the tip. The container's own colour is visible only as
+                    // the seam between the two halves. The rounded-rectangle rasterizer mirrors corners
+                    // left-to-right, so each half names the corners opposite the ones it rounds.
+                    if let _ = elem().decl(Decl {
+                        colour: BUTTON_GREY.mul(0.45),
+                        child_gap: seam,
+                        radius: radius.dup4(),
+                        direction: LeftToRight,
+                        align: Center,
+                        width:  fit!(ui.scale(128.0)),
+                        height: fit!(radius * 2.0),
+                        ..Decl
+                    }) {
+                        if let _ = elem().decl(Decl {
+                            id: reset_id,
+                            colour: reset_colour,
+                            padding,
+                            radius: (0.0, radius, 0.0, radius),
+                            align: Center,
+                            width:  grow!(),
+                            height: grow!(),
+                            ..Decl
+                        }) {
+                            let button_text_h = ui.scale(16.0);
+                            ui.text(reset_label, TextDecl { h: button_text_h, colour: reset_text_colour, align: AlignX::Center, ..TextDecl });
+                        }
+
+                        if let _ = elem().decl(Decl {
+                            id: follow_id,
+                            colour: follow_colour,
+                            radius: (radius, 0.0, radius, 0.0),
+                            align: Center,
+                            width:  fixed!(follow_w),
+                            height: grow!(),
+                            ..Decl
+                        }) {
+                            if ui.hovered(follow_id) {
+                                set_tooltip_text!(data, "{}", if viz.follow_tip { "Following the chain tip" } else { "Not following the chain tip" });
+                            }
+
+                            let icon = if viz.follow_tip { ICON_LOCK_1 } else { ICON_LOCK_OPEN_1 };
+                            ui.text(icon, TextDecl { font: Icons, h: ui.scale(16.0), colour: follow_text_colour, align: AlignX::Center, ..TextDecl });
+                        }
+                    }
+
+                    if reset_clicked {
+                        viz.camera_x = 0.0;
+                        viz.camera_y = viz.bc_tip_y;
+                        viz.zoom = 0.0;
+                    }
+
+                    if follow_clicked {
+                        viz.follow_tip = !viz.follow_tip;
+                    }
                 }
             }
         }
