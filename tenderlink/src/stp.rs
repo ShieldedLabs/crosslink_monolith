@@ -616,6 +616,7 @@ pub struct ConnectionStateConnected {
     pub RTT_sample_counts: [u16; 16], // count of RTT measurements per ack
     pub RTT_sample_cursor: u64,
     pub RTT_mean: u16,
+    pub RTT_mean_cursor: u64, // RTT_sample_cursor value RTT_mean was last computed from
 
     pub ack_arrival_times: [u64; 16], // timestamp_ns of each ack arrival, ring buffer
     pub ack_pace_estimate: u16,       // median inter-ack gap in 0.1 ms units, clamped to RTT_mean*2
@@ -664,6 +665,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         RTT_sample_counts: [0; 16],
         RTT_sample_cursor: 0,
         RTT_mean: u16::MAX,
+        RTT_mean_cursor: 0,
         ack_arrival_times: [0; 16],
         ack_pace_estimate: 0,
         packets_waiting_ack_field: [0; PACKETS_WAITING_ACK_WORDS],
@@ -1754,10 +1756,13 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                             state.congestion_event_time_ns = current_time_now_ns.saturating_sub(state.app_limit_time_offset);
                         }
 
-                        {
-                            let old_k = CUBIC_K_RTT_MULTIPLIER * (state.RTT_mean as u64 * 100_000);
-                            let current_t = current_time_now_ns.saturating_sub(state.congestion_event_time_ns);
-                            let (old_rate, _) = cubic_rate(current_t, state.congestion_event_rate_upps, old_k);
+                        // The congestion curve is anchored to a K derived solely from RTT_mean, and the
+                        // RTT sample buckets are only written when an ack lands. Between acks the mean and
+                        // K are bit-identical, the re-anchor below solves for the anchor it already holds,
+                        // and none of this work is observable. Both are skipped unless a sample moved.
+                        if state.RTT_sample_cursor != state.RTT_mean_cursor {
+                            state.RTT_mean_cursor = state.RTT_sample_cursor;
+                            let previous_rtt_mean = state.RTT_mean;
 
                             let n = (state.RTT_sample_cursor as usize).min(16);
                             if n > 0 {
@@ -1770,28 +1775,35 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                 state.RTT_mean = (total_sum / total_count) as u16;
                             }
 
-                            let new_k = CUBIC_K_RTT_MULTIPLIER * (state.RTT_mean as u64 * 100_000);
-                            // First RTT received — backdate to R→P transition
-                            if state.RTT_mean != u16::MAX && old_k == CUBIC_K_RTT_MULTIPLIER * (u16::MAX as u64 * 100_000) {
-                                state.congestion_event_time_ns = current_time_now_ns.saturating_sub(new_k);
-                                if state.is_app_limited {
-                                    state.app_limit_time_offset = new_k;
-                                }
-                            }
-                            else if old_k > 0 && new_k > 0 {
-                                let mut lo = if new_k >= old_k { current_t } else { 0u64 };
-                                let mut hi = if new_k >= old_k { current_t * 2 + new_k } else { current_t };
-                                for _ in 0..64 {
-                                    let mid = lo + (hi - lo) / 2;
-                                    if cubic_rate(mid, state.congestion_event_rate_upps, new_k).0 >= old_rate {
-                                        hi = mid;
-                                    } else {
-                                        lo = mid + 1;
+                            if state.RTT_mean != previous_rtt_mean {
+                                let old_k = CUBIC_K_RTT_MULTIPLIER * (previous_rtt_mean as u64 * 100_000);
+                                let new_k = CUBIC_K_RTT_MULTIPLIER * (state.RTT_mean as u64 * 100_000);
+                                let current_t = current_time_now_ns.saturating_sub(state.congestion_event_time_ns);
+
+                                // First RTT received — backdate to R→P transition
+                                if previous_rtt_mean == u16::MAX {
+                                    state.congestion_event_time_ns = current_time_now_ns.saturating_sub(new_k);
+                                    if state.is_app_limited {
+                                        state.app_limit_time_offset = new_k;
                                     }
                                 }
-                                state.congestion_event_time_ns = current_time_now_ns.saturating_sub(hi);
-                                if state.is_app_limited {
-                                    state.app_limit_time_offset = hi;
+                                else if old_k > 0 && new_k > 0 {
+                                    // Move the anchor so the rate is continuous across the change in K.
+                                    let (old_rate, _) = cubic_rate(current_t, state.congestion_event_rate_upps, old_k);
+                                    let mut lo = if new_k >= old_k { current_t } else { 0u64 };
+                                    let mut hi = if new_k >= old_k { current_t * 2 + new_k } else { current_t };
+                                    for _ in 0..64 {
+                                        let mid = lo + (hi - lo) / 2;
+                                        if cubic_rate(mid, state.congestion_event_rate_upps, new_k).0 >= old_rate {
+                                            hi = mid;
+                                        } else {
+                                            lo = mid + 1;
+                                        }
+                                    }
+                                    state.congestion_event_time_ns = current_time_now_ns.saturating_sub(hi);
+                                    if state.is_app_limited {
+                                        state.app_limit_time_offset = hi;
+                                    }
                                 }
                             }
                         }
