@@ -583,7 +583,6 @@ impl StartCmd {
             let state = state.clone();
             let read_only_state_service = read_only_state_service.clone();
             zebra_crosslink::service::spawn_new_tfl_service(
-                is_regtest,
                 global_seed,
                 path_to_pos_store_file,
                 Arc::new(move |req| {

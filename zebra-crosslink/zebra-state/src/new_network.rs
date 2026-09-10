@@ -2858,8 +2858,6 @@ pub fn sync(
                         //                  re-offers the block anyway.
                         //   Some(false) -> permanently invalid.
                         //   Some(true)  -> proceed.
-                        // @Volatile: the 32265/32266 bypass is carried across verbatim from
-                        // service.rs. It is a height-keyed hole in a consensus gate.
                         let child_fat_pointer = block_arc.header.fat_pointer_to_bft_block.clone();
                         let parent_fat_pointer = read_state
                             .any_chain_block_header(parent_hash.into())
@@ -2872,9 +2870,7 @@ pub fn sync(
                             format!("{{hash:{} ovd:{} sigs:{}}}", hex::encode(&v[0..32]), hex::encode(&v[32..]), fp.signatures.len())
                         };
 
-                        let (gate, defer_msg) = if height == 32265 || height == 32266 {
-                            (Some(true), String::new())
-                        } else if let Some(parent_fp) = parent_fat_pointer {
+                        let (gate, defer_msg) = if let Some(parent_fp) = parent_fat_pointer {
                             let msg = format!("child fp {} / parent fp {} not resolvable yet", fp_brief(&child_fat_pointer), fp_brief(&parent_fp));
                             ((crosslink_gate)(parent_fp, child_fat_pointer, block::Height(height)), msg)
                         } else {

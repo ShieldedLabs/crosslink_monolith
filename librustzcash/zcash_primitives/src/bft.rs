@@ -385,6 +385,30 @@ impl std::fmt::Display for InvalidBftBlock {
 }
 impl std::error::Error for InvalidBftBlock {}
 
+/// Crosslink bootstrap heights.
+///
+/// BFT does not run from genesis. Three PoW heights define how it comes up, so that no node needs
+/// an operator-supplied starting roster:
+///
+/// - `h0`: staking actions become legal. In this prototype that is genesis (the new transaction
+///   format is on from the start), so there is no constant for it.
+/// - `h1` [`BOOTSTRAP_ROSTER_HEIGHT`]: the block whose aggregated stakes become the roster that
+///   votes on BFT height 0. Chosen halfway between the first and second staking day, i.e. after
+///   the first staking window has closed, so every bond from day one counts.
+/// - `h2` [`BOOTSTRAP_ACTIVATION_HEIGHT`]: when a node accepts any PoW block at this height it
+///   walks back that chain to its `h1` ancestor, finalizes it, and starts BFT with `h1`'s roster.
+///
+/// Every PoW block at or below `h2` must carry a nil fat pointer; only blocks above `h2` may point
+/// at a BFT block. `h2 - h1` exceeds the reorg limit, so by the time any `h2` block is accepted the
+/// `h1` ancestor is the same on every chain and its stakes are already in the finalized state.
+pub const BOOTSTRAP_ROSTER_HEIGHT: u32 = crate::transaction::STAKING_PERIOD / 2;
+/// See [`BOOTSTRAP_ROSTER_HEIGHT`].
+pub const BOOTSTRAP_ACTIVATION_HEIGHT: u32 = BOOTSTRAP_ROSTER_HEIGHT + 200;
+const _: () = assert!(
+    BOOTSTRAP_ACTIVATION_HEIGHT - BOOTSTRAP_ROSTER_HEIGHT > zcash_protocol::consensus::MAX_BLOCK_REORG_HEIGHT,
+    "the bootstrap roster block must be below the reorg limit when any activation-height block is accepted"
+);
+
 /// Zcash Crosslink protocol parameters
 ///
 /// This is provided as a trait so that downstream users can define or plug in their own alternative parameters.

@@ -119,7 +119,6 @@ impl fmt::Debug for TFLServiceCalls {
 ///
 /// [`TFLServiceHandle`] is a shallow handle that can be cloned and passed between threads.
 pub fn spawn_new_tfl_service(
-    is_regtest: bool,
     global_seed: [u8; 32],
     path_to_pos_store_file: PathBuf,
     state_service_call: StateServiceProcedure,
@@ -128,40 +127,10 @@ pub fn spawn_new_tfl_service(
     config: crate::config::Config,
     closure_from_state_to_here_mutex: Arc<std::sync::Mutex<Option<zebra_state::ClosureToCallIntoCrosslinkFromState>>>,
 ) -> (TFLServiceHandle, JoinHandle<Result<(), String>>) {
-    let (finalizers_at_current_height, finalizers_keys_to_names) = {
-        let mut array = Vec::with_capacity(config.bft_peers.len());
-        let mut map = std::collections::HashMap::with_capacity(config.bft_peers.len());
-
-        for (i, peer) in config.bft_peers.iter().enumerate() {
-            let (_, _, public_key) = rng_private_public_key_from_address(peer.as_bytes());
-            array.push(RosterMember { pub_key:public_key.0, voting_power: 1, txids: Vec::new() });
-            // array.push(crate::MalValidator::new(public_key, vec![StakeTxId{ txid: [0;32], zats:((i as u64) * 5) + 1 }])); // @Phillip @Testing
-            map.insert(public_key, peer.to_string());
-        }
-
-        if array.is_empty() {
-            let public_ip_string = config
-                .public_address
-                .clone()
-                .unwrap_or(String::from_str("/ip4/127.0.0.1/udp/45869/quic-v1").unwrap());
-            let bft_key_seed = config
-                .explicit_bft_key_seed
-                .clone()
-                .unwrap_or(public_ip_string);
-            // .unwrap_or(String::from_str("tester").unwrap());
-            info!("bft_key_seed: {}", bft_key_seed);
-            let (_, _, public_key) = rng_private_public_key_from_address(&bft_key_seed.as_bytes());
-            array.push(RosterMember { pub_key:public_key.0, voting_power: 1, txids: Vec::new() });
-            map.insert(public_key, bft_key_seed);
-        }
-
-        (array, map)
-    };
-
     let internal = Arc::new(Mutex::new(TFLServiceInternal {
         my_public_key: PubKeyID::NIL,
         latest_final_block: None,
-        tfl_is_activated: if is_regtest { true } else { false },
+        tfl_is_activated: false,
         final_change_tx: broadcast::channel(16).0,
         bft_msg_flags: 0,
         bft_err_flags: 0,
@@ -171,8 +140,8 @@ pub fn spawn_new_tfl_service(
         peer_strings: Vec::new(),
         our_set_bft_string: None,
         active_bft_string: None,
-        finalizers_at_current_height,
-        finalizers_keys_to_names,
+        // Empty until the bootstrap roster is taken from the chain (see `bootstrap_roster`).
+        finalizers_at_current_height: Vec::new(),
         current_bc_final: None,
         path_to_pos_store_file: path_to_pos_store_file.clone(),
         recency_status: TFLRecencyStatus::default(),

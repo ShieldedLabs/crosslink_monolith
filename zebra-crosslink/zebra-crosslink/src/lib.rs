@@ -176,9 +176,6 @@ use zebra_chain::block::{
 use zebra_node_services::mempool::{Request as MempoolRequest, Response as MempoolResponse};
 use zebra_state::{crosslink::*, Request as StateRequest, Response as StateResponse, ReadRequest as StateReadRequest, ReadResponse as StateReadResponse};
 
-/// Placeholder activation height for Crosslink functionality
-pub const TFL_ACTIVATION_HEIGHT: ZebBlockHeight = ZebBlockHeight(0);
-
 #[derive(Debug, Copy, Clone, EnumCount, EnumIter)]
 enum BFTMsgFlag {
     ConsensusReady,
@@ -267,6 +264,8 @@ impl std::hash::Hasher for Blake3HashFold {
 pub(crate) struct TFLServiceInternal {
     my_public_key: PubKeyID,
     latest_final_block: Option<(ZebBlockHeight, ZebBlockHash)>,
+    /// True once BFT is running: the bootstrap roster was taken from the chain and tenderlink
+    /// launched (see `bootstrap_roster`).
     tfl_is_activated: bool,
 
     // channels
@@ -289,7 +288,6 @@ pub(crate) struct TFLServiceInternal {
     peer_strings: Vec<String>,
 
     // TODO: 2 versions of this: ever-added (in sequence) & currently non-0
-    finalizers_keys_to_names: HashMap<PubKeyID, String>,
     finalizers_at_current_height: Vec<RosterMember>,
 
     recency_status: TFLRecencyStatus,
@@ -317,10 +315,17 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
     // `CrosslinkFinalizeBlock` arm in zebra-state's `service.rs`. Acquiring the lock by blocking
     // (rather than `try_lock`) means there is no spurious "lock busy" defer: the answer is always
     // the real decision, never a transient miss.
-    let internal = internal_handle.internal.blocking_lock();
-
     let parent_is_null = parent_fat_pointer == FatPointerToBftBlock::null();
     let child_is_null = child_fat_pointer == FatPointerToBftBlock::null();
+
+    // PERMANENT, from the block's own height: BFT does not exist at or below the bootstrap
+    // activation height, so a pointer there can never resolve to a legitimate block (see
+    // `BOOTSTRAP_ACTIVATION_HEIGHT`). Decided before taking the lock: nothing to resolve.
+    if !child_is_null && pow_block_height.0 <= BOOTSTRAP_ACTIVATION_HEIGHT {
+        return Some(false);
+    }
+
+    let internal = internal_handle.internal.blocking_lock();
 
     // PERMANENT, decided purely from the (immutable) pointer values, without resolving either
     // block: the child reverts to no BFT pointer while its parent had one. A null pointer can
@@ -1148,21 +1153,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
         use std::net::{Ipv6Addr, SocketAddr};
 
-        let mut static_keypair_maybe = None;
-        let mut endpoint_maybe = None;
-        let (a, b) = addr_string_to_stuff(&public_ip_string);
-        static_keypair_maybe = Some(a);
-        endpoint_maybe = Some(b);
-
-        let tfl_handle1 = internal_handle.clone();
-        let tfl_handle2 = internal_handle.clone();
-        let tfl_handle3 = internal_handle.clone();
-        let tfl_handle4 = internal_handle.clone();
-        let tfl_handle5 = internal_handle.clone();
-        let tfl_handle6 = internal_handle.clone();
-        let tfl_handle7 = internal_handle.clone();
-        let tfl_handle8 = internal_handle.clone();
-        let tfl_handle9 = internal_handle.clone();
+        let (static_keypair, endpoint) = addr_string_to_stuff(&public_ip_string);
 
         *wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap() = my_public_key;
         let my_finalizer_address = FinalizerAddress::create(&my_private_key);
@@ -1170,35 +1161,25 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         *wallet::TENDERLINK_ADDRESS.lock().unwrap() = Some(my_finalizer_address);
         *wallet::TENDERLINK_SIGNING_KEY.lock().unwrap() = Some(my_private_key.clone());
 
-        // TODO(Sam): Fill this out.
         let mut ingest_data_for_tenderlink: Vec<tenderlink::RoundData> = Vec::new();
 
         let mut i_bft_blocks: Vec<BftBlock> = Vec::new();
         let mut fat_pointer_to_tip: FatPointerToBftBlock = FatPointerToBftBlock::null();
-        let mut unsorted_roster = internal_handle
-            .internal
-            .lock()
-            .await
-            .finalizers_at_current_height
-            .clone();
+        // The roster that voted on the block about to be replayed. BFT genesis is decided by
+        // the nil validator set (see `build_bootstrap_genesis`), so replay starts empty; each
+        // stored block carries the roster it produced for the next height.
+        let mut unsorted_roster: Vec<RosterMember> = Vec::new();
 
         use tenderlink::FinalizerPeerAddress;
-        // Note(Sam): We do not support human names in the start config for now.
-        let finalizer_peer_addresses: Vec<FinalizerPeerAddress> = unsorted_roster
+        // `bft_peers` is only a list of addresses to seed connections from. Keys are learned on
+        // connect (tenderlink verifies the peer's key and rewrites its address map), so the hint
+        // here is deliberately nil: the roster comes from the chain, never from this list.
+        let finalizer_peer_addresses: Vec<FinalizerPeerAddress> = config
+            .bft_peers
             .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                let string = format!("{:?}", m);
-                let mut hasher = DefaultHasher::new();
-                hasher.write(string.as_bytes());
-                let seed = hasher.finish();
-                let string = format!("127.0.0.1:{}", seed % 4000);
-                let (a, b) =
-                    addr_string_to_stuff(&config.bft_peers.get(i).unwrap_or_else(|| &string));
-                FinalizerPeerAddress {
-                    bft_pk: PubKeyID(m.pub_key.into()),
-                    address: b,
-                }
+            .map(|peer| FinalizerPeerAddress {
+                bft_pk: PubKeyID::NIL,
+                address: addr_string_to_stuff(peer).1,
             })
             .collect();
 
@@ -1239,7 +1220,6 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
                 if block.previous_block_fat_ptr.points_at_block_hash() != fat_pointer_to_tip.points_at_block_hash() { break; }
 
-                let mut round_data = tenderlink::RoundData::EMPTY;
                 // Historical round replay: filter the roster exactly as the live path did at this
                 // height, so it matches the roster that actually voted on this decided block (the
                 // sigs/counts below are derived from it, and votes travel by roster index -- a
@@ -1251,7 +1231,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 // block itself, where the predicate flips inside the one-block gap).
                 let this_bft_height = ingest_data_for_tenderlink.len() as u64;
                 let this_terminated = terminated_finalizers_at(&config.hardforks, this_bft_height, prev_finalized_bc_height);
-                round_data.roster = tenderlink_roster_from_internal(&unsorted_roster, &this_terminated);
+                let roster = tenderlink_roster_from_internal(&unsorted_roster, &this_terminated);
                 // Advance the watermark to this block's candidate height for the next iteration.
                 // If the candidate can't be resolved (PoW DB behind the pos file, e.g. wiped and
                 // re-syncing), keep the last known height: monotone, and correct whenever the DB
@@ -1263,21 +1243,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                         prev_finalized_bc_height = h.0 as u64;
                     }
                 }
-                round_data.msg_val_sigs = round_data.roster.iter().map(|v| fat_pointer.signatures.iter().find(|s| s.pub_key == v.pub_key).map(|s| s.vote_signature).unwrap_or([0u8; 64])).map(|s| [(tenderlink::ValueId::NIL, TMSig::NIL), (tenderlink::ValueId(fat_pointer.points_at_block_hash().0), TMSig(s))]).collect();
-                round_data.msg_nil_sigs = vec![[TMSig::NIL; 2]; round_data.roster.len()];
-                round_data.counts.precommits = fat_pointer.signatures.len() as u64;
-                round_data.counts.yes_precommits = fat_pointer.signatures.len() as u64;
-                round_data.proposal_sigs_n = proposal_sigs_n as usize;
-                round_data.proposal_sigs = proposal_sigs;
-                round_data.proposal = tenderlink::BlockValue(block.zcash_serialize_to_vec().unwrap());
-                round_data.proposal_id = tenderlink::ValueId(fat_pointer.points_at_block_hash().0);
-                round_data.height = ingest_data_for_tenderlink.len() as u64;
-                round_data.round = fat_pointer.get_vote_template().round as u32;
-                // Vote namespacing: this loaded height's domain separator (inclusive of any
-                // hardfork scheduled at it). Nil when no hardforks apply -> backwards compatible.
-                round_data.vote_namespace = namespace_for_bft_height(&config.hardforks, round_data.height);
-
-                ingest_data_for_tenderlink.push(round_data);
+                ingest_data_for_tenderlink.push(decided_round_data(&config.hardforks, &block, &fat_pointer, roster, proposal_sigs, this_bft_height));
                 i_bft_blocks.push(block);
                 fat_pointer_to_tip = fat_pointer;
                 unsorted_roster = new_roster;
@@ -1291,9 +1257,9 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         if let Some(new_block) = i_bft_blocks.last() {
             new_final_hash.0 = BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0;
             new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
-//println!("Loaded at pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, unsorted_roster);
         }
 
+        let loaded_any = !i_bft_blocks.is_empty();
         let roster = {
             let mut internal = internal_handle.internal.lock().await;
 
@@ -1318,213 +1284,351 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             roster
         };
 
-        // CROSSLINK: the BFT chain is now loaded, which may make previously-deferred
-        // non-finalized PoW blocks' fat pointers resolvable. Trigger a re-flush of the
-        // non-finalized queue by issuing a finalize for the loaded tip. The finalize itself
-        // is a no-op once that tip is already finalized, but the state request handler
-        // re-flushes the queue regardless — so deferred blocks are re-evaluated now rather
-        // than waiting for the first new BFT decision (which may never come on an idle chain).
-        // The internal lock is released above, so the handler's callback into the fat-pointer
-        // closure will not deadlock.
-        // (Removed) This used to issue a no-op finalize of the loaded tip to re-flush the
-        // state's deferred queue at startup. new_network re-evaluates its own queue every tick.
-
-        // Vote namespacing: the startup height is the number of ingested (decided) rounds; its
-        // domain separator is computed before the call since `ingest_data_for_tenderlink` is
-        // moved into it below.
-        let initial_vote_namespace = namespace_for_bft_height(&config.hardforks, ingest_data_for_tenderlink.len() as u64);
-
-        tokio::spawn(tenderlink::entry_point(
+        // An empty store means this node has not bootstrapped yet: BFT genesis is built once the
+        // PoW chain reaches the activation height (see the main loop below). A loaded chain
+        // resumes tenderlink at its next height straight away.
+        let mut launch = Some(TenderlinkLaunch {
             my_private_key,
-            static_keypair_maybe,
-            endpoint_maybe,
-            roster,
+            static_keypair,
+            endpoint,
             finalizer_peer_addresses,
-            None,
-            tenderlink::ClosureToProposeNewBlock(Arc::new(move || {
-                let tfl_handle1 = tfl_handle1.clone();
-                Box::pin(async move {
-                    propose_new_bft_block(&tfl_handle1).await.map(|block| {
-                        tenderlink::BlockValue(block.zcash_serialize_to_vec().unwrap())
-                    })
-                })
-            })),
-            tenderlink::ClosureToValidateProposedBlock(Arc::new(move |block| {
-                let tfl_handle2 = tfl_handle2.clone();
-                Box::pin(async move {
-                    use bytes::Buf;
-                    use zebra_chain::serialization::ZcashDeserialize;
+        });
+        if loaded_any {
+            spawn_tenderlink(&internal_handle, launch.take().unwrap(), roster, ingest_data_for_tenderlink).await;
+        }
 
-                    if let Ok(bft_block) = BftBlock::zcash_deserialize(block.0.reader()) {
-                        validate_bft_block(&tfl_handle2, &bft_block).await
+        let mut run_instant = Instant::now();
+        let mut last_diagnostic_print = Instant::now();
+        let mut current_bc_tip: Option<(ZebBlockHeight, ZebBlockHash)> = None;
+
+        loop {
+            // Calculate this prior to message handling so that handlers can use it:
+            let new_bc_tip = if let Ok(StateResponse::Tip(val)) = (call.state)(StateRequest::Tip).await
+            {
+                val
+            } else {
+                None
+            };
+
+            tokio::time::sleep_until(run_instant).await;
+            run_instant += MAIN_LOOP_SLEEP_INTERVAL;
+
+            // Crosslink bootstrap: the first accepted PoW block at the activation height (h2)
+            // finalizes h1 through a deterministic genesis decision, and BFT starts at height 1
+            // with h1's roster. Done before taking the internal lock -- the finalize calls back
+            // into the fat-pointer gate, which blocks on that same lock.
+            if let (Some(_), Some((tip_height, _))) = (launch.as_ref(), new_bc_tip) {
+                if tip_height.0 >= BOOTSTRAP_ACTIVATION_HEIGHT {
+                    if let Some((roster, ingest)) = bootstrap_bft(&internal_handle).await {
+                        spawn_tenderlink(&internal_handle, launch.take().unwrap(), roster, ingest).await;
+                    }
+                }
+            }
+
+            // from this point onwards we must race to completion in order to avoid stalling incoming requests
+            // NOTE: split to avoid deadlock from non-recursive mutex - can we reasonably change type?
+            #[allow(unused_mut)]
+            let mut internal = internal_handle.internal.lock().await;
+
+            if last_diagnostic_print.elapsed() >= MAIN_LOOP_INFO_DUMP_INTERVAL {
+                last_diagnostic_print = Instant::now();
+                if let (Some((tip_height, _tip_hash)), Some((final_height, _final_hash))) =
+                    (current_bc_tip, internal.latest_final_block)
+                {
+                    if tip_height < final_height {
+                        info!(
+                            "Our PoW tip is {} blocks away from the latest final block.",
+                            final_height - tip_height
+                        );
                     } else {
-                        error!("Failed to deserialize Tenderlink payload.");
-                        (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None)
-                    }
-                })
-            })),
-            tenderlink::ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer, tender_proposal_sigs| {
-                let tfl_handle3 = tfl_handle3.clone();
-                Box::pin(async move {
-                    use bytes::Buf;
-                    use zebra_chain::serialization::ZcashDeserialize;
-
-                    let decided_block = BftBlock::zcash_deserialize(block.0.reader()).unwrap();
-                    let roster = handle_new_decided_bft_block(
-                        &tfl_handle3,
-                        &decided_block,
-                        &fat_pointer.into(),
-                        tender_proposal_sigs,
-                    )
-                    .await;
-                    // Vote namespacing: the next height is the decided block's height + 1; its
-                    // namespace is the cumulative hardfork hash inclusive of any hardfork scheduled
-                    // at that next height.
-                    let next_height = decided_block.height as u64 + 1;
-                    let namespace = namespace_for_bft_height(&tfl_handle3.config.hardforks, next_height);
-                    (roster, namespace)
-                })
-            })),
-            tenderlink::ClosureToUpdatePeers(Arc::new(move |all_peers| {
-                let tfl_handle = tfl_handle8.clone();
-                Box::pin(async move {
-                    let mut internal = tfl_handle.internal.lock().await;
-                    internal.peer_strings.truncate(0);
-
-                    for peer in &all_peers {
-                        internal.peer_strings.push(format!("{} {} ({})",
-                            if let Some(pubkey) = peer.root_public_bft_key { pubkey.to_string() } else { "unknown peer".to_string() },
-                            if peer.connected { "connected" } else { "disconnected" },
-                            peer.latest_status_request_height,
-                        ));
-                    }
-                })
-            })),
-            tenderlink::ClosureToAccessBft(Arc::new(move |bft_state: &tenderlink::TMState, bft_key_address_map: &tenderlink::BftAddressMap| {
-                let tfl_handle = tfl_handle9.clone();
-                Box::pin(async move {
-                    let now_utc = chrono::Utc::now().timestamp();
-                    let mut finalizer_statuses = Vec::<(PubKeyID, FinalizerRecencyStatus)>::new();
-
-                    // ~current height
-                    for round in &bft_state.rounds_data {
-                        let is_my_height = round.height == bft_state.height;// && round.round == bft_state.round;
-
-                        // The vote arrays are sized to the *active* roster (the top
-                        // ACTIVE_ROSTER_MAX_N by stake); members past that have no slot.
-                        let active_n = round.msg_val_sigs.len().min(round.msg_nil_sigs.len());
-                        for (roster_i, member) in round.roster.iter().take(active_n).enumerate() {
-                            use zcash_primitives::bft::TMSig;
-                            use tenderlink::ConsensusCounts;
-
-                            let st = if let Some(v) = finalizer_statuses.iter_mut().find(|(key, _st)| *key == member.pub_key) {
-                                v
-                            } else {
-                                let last_i = finalizer_statuses.len();
-                                finalizer_statuses.push((member.pub_key, FinalizerRecencyStatus::default()));
-                                &mut finalizer_statuses[last_i]
-                            };
-
-                            let cs = ConsensusCounts::from(&(round.msg_val_sigs[roster_i], round.msg_nil_sigs[roster_i], 1)); // simple (not weighted) counts
-                            if cs.anys > 0 {
-                                if is_my_height {
-                                    st.1.no_yes_votes_in_my_height[0][0] += cs.nil_prevotes;
-                                    st.1.no_yes_votes_in_my_height[0][1] += cs.yes_prevotes;
-                                    st.1.no_yes_votes_in_my_height[1][0] += cs.precommits.saturating_sub(cs.yes_precommits); // no explicit nil_precommits
-                                    st.1.no_yes_votes_in_my_height[1][1] += cs.yes_precommits;
-
-                                    st.1.highest_round_vote = st.1.highest_round_vote.max(round.round);
-                                }
-                            }
-
-                            if member.pub_key == bft_state.my_pub_key {
-                                st.1.last_direct_connection_utc = Some(now_utc);
-                            } else {
-                                let utc = bft_key_address_map.last_packet_utcs.get(&member.pub_key);
-                                st.1.last_direct_connection_utc = st.1.last_direct_connection_utc.max(utc.copied());
-                            }
+                        let behind = tip_height - final_height;
+                        if behind > 512 {
+                            warn!("WARNING! BFT-Finality is falling behind the PoW chain. Current gap to tip is {:?} blocks.", behind);
                         }
                     }
-
-                    // for data in &bft_state.recent_commit_round_cache {
-                    //     println!("LIVENESS recent_commit_round_cache: height: {}, round: {}", data.height, data.round);
-                    // }
-
-                    let mut internal = tfl_handle.internal.lock().await;
-                    internal.recency_status = TFLRecencyStatus {
-                        now_utc,
-                        my_height: bft_state.height,
-                        my_round:  bft_state.round,
-                        my_step: match bft_state.step {
-                            tenderlink::TMStep::Propose => 0,
-                            tenderlink::TMStep::Prevote => 1,
-                            tenderlink::TMStep::Precommit => 2,
-                        },
-                        my_locked_round: bft_state.locked_value_round.1,
-                        my_valid_round:  bft_state.valid_value_round.1,
-                        finalizer_statuses,
-                    };
-                })
-            })),
-            ingest_data_for_tenderlink,
-            initial_vote_namespace,
-        ));
-    }
-
-    let mut run_instant = Instant::now();
-    let mut last_diagnostic_print = Instant::now();
-    let mut current_bc_tip: Option<(ZebBlockHeight, ZebBlockHash)> = None;
-
-    loop {
-        // Calculate this prior to message handling so that handlers can use it:
-        let new_bc_tip = if let Ok(StateResponse::Tip(val)) = (call.state)(StateRequest::Tip).await
-        {
-            val
-        } else {
-            None
-        };
-
-        tokio::time::sleep_until(run_instant).await;
-        run_instant += MAIN_LOOP_SLEEP_INTERVAL;
-
-        // from this point onwards we must race to completion in order to avoid stalling incoming requests
-        // NOTE: split to avoid deadlock from non-recursive mutex - can we reasonably change type?
-        #[allow(unused_mut)]
-        let mut internal = internal_handle.internal.lock().await;
-
-        // Check TFL is activated before we do anything that assumes it
-        if !internal.tfl_is_activated {
-            if let Some((height, _hash)) = new_bc_tip {
-                if height < TFL_ACTIVATION_HEIGHT {
-                    continue;
-                } else {
-                    internal.tfl_is_activated = true;
-                    info!("activating TFL!");
                 }
             }
-        }
 
-        if last_diagnostic_print.elapsed() >= MAIN_LOOP_INFO_DUMP_INTERVAL {
-            last_diagnostic_print = Instant::now();
-            if let (Some((tip_height, _tip_hash)), Some((final_height, _final_hash))) =
-                (current_bc_tip, internal.latest_final_block)
-            {
-                if tip_height < final_height {
-                    info!(
-                        "Our PoW tip is {} blocks away from the latest final block.",
-                        final_height - tip_height
-                    );
+            current_bc_tip = new_bc_tip;
+        }
+    }
+}
+
+/// Everything tenderlink needs at launch that is fixed at startup, held until the node is ready
+/// to run BFT (a loaded chain, or the bootstrap genesis).
+struct TenderlinkLaunch {
+    my_private_key: ed25519_zebra::SigningKey,
+    static_keypair: tenderlink::stp::IdentityKeyPair,
+    endpoint: tenderlink::stp::STPAddress,
+    finalizer_peer_addresses: Vec<tenderlink::FinalizerPeerAddress>,
+}
+
+/// Start tenderlink at the height after `ingest` with `roster`, and mark TFL active. Refuses an
+/// empty roster: BFT height 1's roster is fixed by the stakes at h1, so nothing would ever change.
+async fn spawn_tenderlink(
+    internal_handle: &TFLServiceHandle,
+    launch: TenderlinkLaunch,
+    roster: Vec<tenderlink::SortedRosterMember>,
+    ingest_data_for_tenderlink: Vec<tenderlink::RoundData>,
+) {
+    let config = internal_handle.config.clone();
+    if roster.is_empty() {
+        error!(
+            "BFT height {} has an empty roster: no stake was bonded by the bootstrap roster height ({}). BFT will not run on this chain.",
+            ingest_data_for_tenderlink.len(), BOOTSTRAP_ROSTER_HEIGHT,
+        );
+        return;
+    }
+    info!("starting tenderlink at BFT height {} with {} finalizer(s)", ingest_data_for_tenderlink.len(), roster.len());
+    internal_handle.internal.lock().await.tfl_is_activated = true;
+
+    let TenderlinkLaunch { my_private_key, static_keypair, endpoint, finalizer_peer_addresses } = launch;
+    let static_keypair_maybe = Some(static_keypair);
+    let endpoint_maybe = Some(endpoint);
+
+    let tfl_handle1 = internal_handle.clone();
+    let tfl_handle2 = internal_handle.clone();
+    let tfl_handle3 = internal_handle.clone();
+    let tfl_handle8 = internal_handle.clone();
+    let tfl_handle9 = internal_handle.clone();
+
+    // Vote namespacing: the startup height is the number of ingested (decided) rounds; its
+    // domain separator is computed before the call since `ingest_data_for_tenderlink` is
+    // moved into it below.
+    let initial_vote_namespace = namespace_for_bft_height(&config.hardforks, ingest_data_for_tenderlink.len() as u64);
+
+    tokio::spawn(tenderlink::entry_point(
+        my_private_key,
+        static_keypair_maybe,
+        endpoint_maybe,
+        roster,
+        finalizer_peer_addresses,
+        None,
+        tenderlink::ClosureToProposeNewBlock(Arc::new(move || {
+            let tfl_handle1 = tfl_handle1.clone();
+            Box::pin(async move {
+                propose_new_bft_block(&tfl_handle1).await.map(|block| {
+                    tenderlink::BlockValue(block.zcash_serialize_to_vec().unwrap())
+                })
+            })
+        })),
+        tenderlink::ClosureToValidateProposedBlock(Arc::new(move |block| {
+            let tfl_handle2 = tfl_handle2.clone();
+            Box::pin(async move {
+                use bytes::Buf;
+                use zebra_chain::serialization::ZcashDeserialize;
+
+                if let Ok(bft_block) = BftBlock::zcash_deserialize(block.0.reader()) {
+                    validate_bft_block(&tfl_handle2, &bft_block).await
                 } else {
-                    let behind = tip_height - final_height;
-                    if behind > 512 {
-                        warn!("WARNING! BFT-Finality is falling behind the PoW chain. Current gap to tip is {:?} blocks.", behind);
+                    error!("Failed to deserialize Tenderlink payload.");
+                    (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None)
+                }
+            })
+        })),
+        tenderlink::ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer, tender_proposal_sigs| {
+            let tfl_handle3 = tfl_handle3.clone();
+            Box::pin(async move {
+                use bytes::Buf;
+                use zebra_chain::serialization::ZcashDeserialize;
+
+                let decided_block = BftBlock::zcash_deserialize(block.0.reader()).unwrap();
+                let roster = handle_new_decided_bft_block(
+                    &tfl_handle3,
+                    &decided_block,
+                    &fat_pointer.into(),
+                    tender_proposal_sigs,
+                )
+                .await;
+                // Vote namespacing: the next height is the decided block's height + 1; its
+                // namespace is the cumulative hardfork hash inclusive of any hardfork scheduled
+                // at that next height.
+                let next_height = decided_block.height as u64 + 1;
+                let namespace = namespace_for_bft_height(&tfl_handle3.config.hardforks, next_height);
+                (roster, namespace)
+            })
+        })),
+        tenderlink::ClosureToUpdatePeers(Arc::new(move |all_peers| {
+            let tfl_handle = tfl_handle8.clone();
+            Box::pin(async move {
+                let mut internal = tfl_handle.internal.lock().await;
+                internal.peer_strings.truncate(0);
+
+                for peer in &all_peers {
+                    internal.peer_strings.push(format!("{} {} ({})",
+                        if let Some(pubkey) = peer.root_public_bft_key { pubkey.to_string() } else { "unknown peer".to_string() },
+                        if peer.connected { "connected" } else { "disconnected" },
+                        peer.latest_status_request_height,
+                    ));
+                }
+            })
+        })),
+        tenderlink::ClosureToAccessBft(Arc::new(move |bft_state: &tenderlink::TMState, bft_key_address_map: &tenderlink::BftAddressMap| {
+            let tfl_handle = tfl_handle9.clone();
+            Box::pin(async move {
+                let now_utc = chrono::Utc::now().timestamp();
+                let mut finalizer_statuses = Vec::<(PubKeyID, FinalizerRecencyStatus)>::new();
+
+                // ~current height
+                for round in &bft_state.rounds_data {
+                    let is_my_height = round.height == bft_state.height;// && round.round == bft_state.round;
+
+                    // The vote arrays are sized to the *active* roster (the top
+                    // ACTIVE_ROSTER_MAX_N by stake); members past that have no slot.
+                    let active_n = round.msg_val_sigs.len().min(round.msg_nil_sigs.len());
+                    for (roster_i, member) in round.roster.iter().take(active_n).enumerate() {
+                        use zcash_primitives::bft::TMSig;
+                        use tenderlink::ConsensusCounts;
+
+                        let st = if let Some(v) = finalizer_statuses.iter_mut().find(|(key, _st)| *key == member.pub_key) {
+                            v
+                        } else {
+                            let last_i = finalizer_statuses.len();
+                            finalizer_statuses.push((member.pub_key, FinalizerRecencyStatus::default()));
+                            &mut finalizer_statuses[last_i]
+                        };
+
+                        let cs = ConsensusCounts::from(&(round.msg_val_sigs[roster_i], round.msg_nil_sigs[roster_i], 1)); // simple (not weighted) counts
+                        if cs.anys > 0 {
+                            if is_my_height {
+                                st.1.no_yes_votes_in_my_height[0][0] += cs.nil_prevotes;
+                                st.1.no_yes_votes_in_my_height[0][1] += cs.yes_prevotes;
+                                st.1.no_yes_votes_in_my_height[1][0] += cs.precommits.saturating_sub(cs.yes_precommits); // no explicit nil_precommits
+                                st.1.no_yes_votes_in_my_height[1][1] += cs.yes_precommits;
+
+                                st.1.highest_round_vote = st.1.highest_round_vote.max(round.round);
+                            }
+                        }
+
+                        if member.pub_key == bft_state.my_pub_key {
+                            st.1.last_direct_connection_utc = Some(now_utc);
+                        } else {
+                            let utc = bft_key_address_map.last_packet_utcs.get(&member.pub_key);
+                            st.1.last_direct_connection_utc = st.1.last_direct_connection_utc.max(utc.copied());
+                        }
                     }
                 }
-            }
-        }
 
-        current_bc_tip = new_bc_tip;
+                // for data in &bft_state.recent_commit_round_cache {
+                //     println!("LIVENESS recent_commit_round_cache: height: {}, round: {}", data.height, data.round);
+                // }
+
+                let mut internal = tfl_handle.internal.lock().await;
+                internal.recency_status = TFLRecencyStatus {
+                    now_utc,
+                    my_height: bft_state.height,
+                    my_round:  bft_state.round,
+                    my_step: match bft_state.step {
+                        tenderlink::TMStep::Propose => 0,
+                        tenderlink::TMStep::Prevote => 1,
+                        tenderlink::TMStep::Precommit => 2,
+                    },
+                    my_locked_round: bft_state.locked_value_round.1,
+                    my_valid_round:  bft_state.valid_value_round.1,
+                    finalizer_statuses,
+                };
+            })
+        })),
+        ingest_data_for_tenderlink,
+        initial_vote_namespace,
+    ));
+}
+
+/// The round data tenderlink keeps for an already-decided height, as the live path would have
+/// left it: precommit signatures placed by roster index, counts from the fat pointer.
+fn decided_round_data(
+    hardforks: &[crate::config::HardForkConfig],
+    block: &BftBlock,
+    fat_pointer: &FatPointerToBftBlock,
+    roster: Vec<SortedRosterMember>,
+    proposal_sigs: Vec<TMSig>,
+    bft_height: u64,
+) -> tenderlink::RoundData {
+    let mut round_data = tenderlink::RoundData::EMPTY;
+    round_data.msg_val_sigs = roster.iter().map(|v| fat_pointer.signatures.iter().find(|s| s.pub_key == v.pub_key).map(|s| s.vote_signature).unwrap_or([0u8; 64])).map(|s| [(tenderlink::ValueId::NIL, TMSig::NIL), (tenderlink::ValueId(fat_pointer.points_at_block_hash().0), TMSig(s))]).collect();
+    round_data.msg_nil_sigs = vec![[TMSig::NIL; 2]; roster.len()];
+    round_data.roster = roster;
+    round_data.counts.precommits = fat_pointer.signatures.len() as u64;
+    round_data.counts.yes_precommits = fat_pointer.signatures.len() as u64;
+    round_data.proposal_sigs_n = proposal_sigs.len();
+    round_data.proposal_sigs = proposal_sigs;
+    round_data.proposal = tenderlink::BlockValue(block.zcash_serialize_to_vec().unwrap());
+    round_data.proposal_id = tenderlink::ValueId(fat_pointer.points_at_block_hash().0);
+    round_data.height = bft_height;
+    round_data.round = fat_pointer.get_vote_template().round as u32;
+    // Vote namespacing: this height's domain separator (inclusive of any hardfork scheduled at
+    // it). Nil when no hardforks apply -> backwards compatible.
+    round_data.vote_namespace = namespace_for_bft_height(hardforks, bft_height);
+    round_data
+}
+
+/// The deterministic BFT genesis block: the decision that finalizes the bootstrap roster height
+/// (h1), which every node constructs identically from its own PoW chain instead of receiving.
+///
+/// It is shaped exactly as a proposer would shape it -- v2, headers from h1 for the confirmation
+/// depth, any hardforks scheduled at BFT height 0 -- so `validate_bft_block` accepts it unchanged.
+/// Its fat pointer names the block at height 0, round 0, and carries no signatures: the validator
+/// set for genesis is nil and the decision is valid by construction. BFT height 1 is the first
+/// real decision, and its previous-block pointer is this one.
+///
+/// None until the chain has the headers (the caller only asks once the tip is at or past the
+/// activation height, where h1 is finalized-by-depth, so the headers are the same on every node).
+async fn build_bootstrap_genesis(tfl_handle: &TFLServiceHandle) -> Option<(BftBlock, FatPointerToBftBlock)> {
+    let params = &PROTOTYPE_PARAMETERS;
+    let call = &tfl_handle.call;
+
+    let mut headers: Vec<BcBlockHeader> = Vec::with_capacity(params.bc_confirmation_depth_sigma as usize);
+    for h in BOOTSTRAP_ROSTER_HEIGHT..BOOTSTRAP_ROSTER_HEIGHT + params.bc_confirmation_depth_sigma as u32 {
+        match (call.state)(StateRequest::BlockHeader(ZebBlockHeight(h).into())).await {
+            Ok(StateResponse::BlockHeader { header, .. }) => headers.push(bc_hdr_to_lrz(&header)),
+            _ => return None,
+        }
     }
+
+    let mut block = match BftBlock::try_from(params, 0, FatPointerToBftBlock::null(), headers) {
+        Ok(block) => block,
+        Err(e) => {
+            error!("Unable to build the bootstrap genesis BFT block: {:?}", e);
+            return None;
+        }
+    };
+    block.version = 2;
+    let scheduled_hardforks: Vec<crate::config::HardForkConfig> = tfl_handle
+        .config
+        .hardforks
+        .iter()
+        .filter(|hf| hf.bft_certificate_height == 0)
+        .cloned()
+        .collect();
+    if let Some(last) = scheduled_hardforks.last() {
+        block.do_not_include_until_bc_height = last.pow_activation_height;
+        block.hardforks = scheduled_hardforks;
+    }
+
+    let fat_pointer = FatPointerToBftBlock::from_parts(block.blake3_hash(), 0, 0, &[]);
+    Some((block, fat_pointer))
+}
+
+/// Run the bootstrap: decide genesis (finalizing h1 on the PoW side and taking h1's aggregated
+/// stakes as the roster for height 1) and produce what tenderlink needs to start at height 1.
+/// Must not be called with the internal lock held.
+async fn bootstrap_bft(tfl_handle: &TFLServiceHandle) -> Option<(Vec<SortedRosterMember>, Vec<tenderlink::RoundData>)> {
+    let (genesis, fat_pointer) = build_bootstrap_genesis(tfl_handle).await?;
+    info!(
+        "crosslink bootstrap: PoW reached height {}; deciding BFT genesis {} which finalizes height {}",
+        BOOTSTRAP_ACTIVATION_HEIGHT, genesis.blake3_hash(), BOOTSTRAP_ROSTER_HEIGHT,
+    );
+    let roster = handle_new_decided_bft_block(tfl_handle, &genesis, &fat_pointer, Vec::new()).await;
+    let terminated = terminated_finalizers_at(&tfl_handle.config.hardforks, 0, 0);
+    let genesis_round = decided_round_data(
+        &tfl_handle.config.hardforks,
+        &genesis,
+        &fat_pointer,
+        tenderlink_roster_from_internal(&[], &terminated),
+        Vec::new(),
+        0,
+    );
+    Some((roster, vec![genesis_round]))
 }
 
 async fn tfl_block_finality_from_height_hash(
