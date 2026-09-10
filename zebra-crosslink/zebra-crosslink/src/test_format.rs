@@ -720,13 +720,21 @@ pub(crate) async fn instr_reader(internal_handle: TFLServiceHandle) {
     // Include the recorded (instruction index, message) pairs in the message so a red test is
     // self-describing: otherwise these are collected but discarded here, and diagnosing which
     // instruction failed needs TEST_CHECK_ASSERT raised and a rebuild.
-    let failed_instrs = TEST_FAILED_INSTR_IDXS.lock().unwrap();
-    assert!(
-        failed_instrs.is_empty(),
-        "failed test {}: {:?}",
-        TEST_NAME.lock().unwrap(),
-        *failed_instrs
-    );
+    //
+    // The lock MUST be released before TEST_SHUTDOWN_FN below: the shutdown path
+    // (crosslink shutdown fn -> dump_test_instrs) re-locks this same std Mutex on this thread,
+    // and std Mutex is not reentrant, so holding the guard across the shutdown call deadlocks
+    // every PASSING test at exit. (A failing test unwinds on the assert and drops the guard, so
+    // only green tests hang.) Hence the explicit scope -- do not lift the binding out of it.
+    {
+        let failed_instrs = TEST_FAILED_INSTR_IDXS.lock().unwrap();
+        assert!(
+            failed_instrs.is_empty(),
+            "failed test {}: {:?}",
+            TEST_NAME.lock().unwrap(),
+            *failed_instrs
+        );
+    }
     println!("Test done, shutting down");
     // #[cfg(feature = "viz_gui")]
     // tokio::time::sleep(Duration::from_secs(120)).await;
