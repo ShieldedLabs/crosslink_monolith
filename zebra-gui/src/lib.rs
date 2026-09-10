@@ -1926,6 +1926,12 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                                         let radius_bl = radius_bl as f32;
                                                                         let radius_br = radius_br as f32;
 
+                                                                        // The four corner tests below are mirrored left-to-right. Each is labelled and fed by the radius
+                                                                        // it is named for, but measures from the opposite vertical edge: radius_tl rounds the top-right
+                                                                        // corner, radius_tr the top-left, radius_bl the bottom-right, and radius_br the bottom-left.
+                                                                        // Correcting this flips every call site that passes unequal left and right radii, so those call
+                                                                        // sites must swap their radii in the same change.
+
                                                                         // let radius_t = radius_tl.min(radius_tr);
                                                                         // let radius_t = radius_tl.min(radius_tr);
 
