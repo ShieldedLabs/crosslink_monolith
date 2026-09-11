@@ -9658,6 +9658,7 @@ dependencies = [
  "insta",
  "jsonrpsee-types",
  "lazy_static",
+ "libc",
  "libnghttp2-sys",
  "log",
  "metrics",
