@@ -22,6 +22,11 @@ pub struct RequestToZebra {
     pub load_instrs_path: String,
     /// Path for zebra to serialize its current chains to as a .zeccltf. Empty = no request.
     pub serialize_instrs_path: String,
+    /// Path of a .zeccltf test-format file to *view* rather than load: its blocks are
+    /// drawn straight from the file, without the node accepting them. Empty = no request.
+    pub view_instrs_path: String,
+    /// Leave view mode and go back to drawing the node's own chains.
+    pub view_exit: bool,
     pub bc_want_below: u64, // camera can see missing best-chain coverage: serve a page of best-chain blocks below this height; 0 = nothing wanted
     pub bft_want_height: u64, // PoS jump or BFT fill: serve the PoW page around this BFT height's finalization candidate, pulling that BFT era with it; u64::MAX = nothing wanted
 }
@@ -34,6 +39,8 @@ impl RequestToZebra {
             bft_pause: false,
             load_instrs_path: String::new(),
             serialize_instrs_path: String::new(),
+            view_instrs_path: String::new(),
+            view_exit: false,
             bc_want_below: 0,
             bft_want_height: u64::MAX,
         }
@@ -187,6 +194,13 @@ pub struct ResponseFromZebra {
     /// blacklist). The right-hand pane excludes these from the normal list and
     /// shows them at the bottom with a cancel (X) icon.
     pub blacklisted_finalizers: Vec<Hash32>,
+
+    /// Drop every block currently on screen before merging this message. Sent when the
+    /// source of the picture changes -- entering or leaving view mode -- because the two
+    /// sources describe unrelated chains and merging them by hash would interleave them.
+    pub reset_blocks: bool,
+    /// This message describes a .zeccltf file rather than the node's own chains.
+    pub view_mode: bool,
 }
 impl ResponseFromZebra {
     pub fn _0() -> Self {
@@ -213,6 +227,8 @@ impl ResponseFromZebra {
             pos_tip_signers: Vec::new(),
             bft_recency: wallet::TFLRecencyStatus::default(),
             blacklisted_finalizers: Vec::new(),
+            reset_blocks: false,
+            view_mode: false,
         }
     }
 }
@@ -416,6 +432,12 @@ pub struct VizState {
     pub load_instrs_path_pending: String,
     /// Path the user asked zebra to serialize its chains to; sent once, then cleared.
     pub serialize_instrs_path_pending: String,
+    /// Path the user asked to view without the node accepting it; sent once, then cleared.
+    pub view_instrs_path_pending: String,
+    /// The user asked to leave view mode; sent once, then cleared.
+    pub view_exit_pending: bool,
+    /// The picture on screen came from a .zeccltf file, not from the node.
+    pub view_mode: bool,
     pub instr_strings: Vec<String>,
     pub instr_done_n: usize,
     pub instr_failed: Vec<(usize, String)>,
@@ -694,6 +716,9 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         bft_paused: false,
         load_instrs_path_pending: String::new(),
         serialize_instrs_path_pending: String::new(),
+        view_instrs_path_pending: String::new(),
+        view_exit_pending: false,
+        view_mode: false,
         instr_strings: Vec::new(),
         instr_done_n: 0,
         instr_failed: Vec::new(),
@@ -836,6 +861,28 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
             }
             continue;
         }
+
+        // The two picture sources -- the node's own chains and a .zeccltf file being
+        // viewed -- describe unrelated chains, so switching between them starts from an
+        // empty screen rather than merging the two by hash. The mode is on every message,
+        // not just the first one after the switch, so a message dropped while paused
+        // cannot lose the transition.
+        if message.reset_blocks || message.view_mode != viz_state.view_mode {
+            anything_happened = true;
+            viz_state.on_screen_bcs.clear();
+            viz_state.on_screen_bfts.clear();
+            viz_state.bc_best_heights.clear();
+            viz_state.bft_loaded_heights.clear();
+            viz_state.bc_ack_height = 0;
+            viz_state.bft_ack_height = 0;
+            viz_state.bc_wanted_page_end = 0;
+            viz_state.bft_wanted_jump = u64::MAX;
+            viz_state.bft_wanted_fill = u64::MAX;
+            viz_state.inspecting_block_hash = Hash32::from_u64(0);
+            viz_state.block_inspection = None;
+            viz_state.did_initial_tip_jump = false;
+        }
+        viz_state.view_mode = message.view_mode;
 
         anything_happened |= viz_state.bc_tip_height != message.bc_tip_height;
         viz_state.bc_tip_height = message.bc_tip_height;
@@ -1182,12 +1229,16 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
             bft_pause: viz_state.bft_paused,
             load_instrs_path: viz_state.load_instrs_path_pending.clone(),
             serialize_instrs_path: viz_state.serialize_instrs_path_pending.clone(),
+            view_instrs_path: viz_state.view_instrs_path_pending.clone(),
+            view_exit: viz_state.view_exit_pending,
             bc_want_below,
             bft_want_height,
         });
         if sent.is_ok() {
             viz_state.load_instrs_path_pending = String::new();
             viz_state.serialize_instrs_path_pending = String::new();
+            viz_state.view_instrs_path_pending = String::new();
+            viz_state.view_exit_pending = false;
         }
     }
 
@@ -1470,7 +1521,7 @@ fn draw_chain_minimap_overlay(
         if !bc.block.is_best_chain {
             continue;
         }
-        let fin = bc.block.this_height <= viz_state.bc_finalized_tip_height;
+        let fin = bc.block.is_finalized;
         best_by_h
             .entry(bc.block.this_height)
             .and_modify(|f| *f |= fin)
@@ -2048,7 +2099,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     for on_screen_bc in viz_state.on_screen_bcs.values() {
         let x = on_screen_bc.x;
         let y = on_screen_bc.y;
-        let finalized = on_screen_bc.block.is_best_chain && on_screen_bc.block.this_height <= viz_state.bc_finalized_tip_height;
+        let finalized = on_screen_bc.block.is_finalized;
         let base_color = if viz_blocks.last() == Some(&on_screen_bc.block.this_hash) {
             COLOR_BRIGHT
         } else if on_screen_bc.block.is_best_chain {

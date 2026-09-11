@@ -1161,6 +1161,330 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
     test_bytes(tf.write_to_bytes());
 }
 
+
+// ---------------------------------------------------------------------------------------
+// The scenes drawn in FINALITY_DIAGRAM.html, as test-format files.
+//
+// These exist to be looked at: load one with the GUI's "View (no consensus)" button and the
+// picture is built from the file's own blocks, so the third scene -- a best chain forking
+// below the finalized block -- can be seen even though this node refuses it. "Load into
+// zebra" runs the first two through the real admission path as well.
+//
+// Heights are chosen so this node's own finalized marker lands where the diagram writes
+// `fin`. The marker is `headers[0]` of the newest BFT block (FINALITY.md 6.1), so the BFT
+// chain in each scene stops at the block whose deepest header is the diagram's `fin`. The
+// drawing reaches the same block a different way -- `parent(S4.headers_bc[0])` with `LF`
+// two BFT blocks behind the one the tip cites -- and this tree has neither the LF lag nor
+// the `candidate` clamp, so matching the drawn arrows and matching the drawn marker are
+// different files. These match the marker. VIZ_GUI_FINALITY_RULES.md records the rest.
+// ---------------------------------------------------------------------------------------
+
+/// Where the scene files live: beside the other test-format data.
+fn diagram_scene_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../crosslink-test-data")
+        .join(name)
+}
+
+/// Re-stamps the generator's tip with a BFT pointer, giving that block a `context_bft`.
+/// Only the header's fat pointer changes, so the merkle root and the commitment still
+/// match the transaction list. The block hash does change, which is why this has to happen
+/// before the next block is generated from this one.
+fn point_tip_at_bft(gen: &mut BlockGen, fat_ptr: &FatPointerToBftBlock) -> Arc<Block> {
+    gen.tip = Arc::new(Block {
+        header: Arc::new(BlockHeader {
+            fat_pointer_to_bft_block: fat_ptr.clone(),
+            ..*gen.tip.header
+        }),
+        ..gen.tip.as_ref().clone()
+    });
+    gen.tip.clone()
+}
+
+/// A second valid transparent P2PKH miner, so a competing branch has different coinbases
+/// and therefore different block hashes. Tex addresses are rejected by the Ironwood v6
+/// coinbase builder ("Address not supported for miner rewards").
+fn diagram_fork_miner() -> Address {
+    Address::Transparent(zcash_transparent::address::TransparentAddress::PublicKeyHash(
+        [1u8; 20],
+    ))
+}
+
+/// Scene 1 of the diagram: one PoW chain of ten blocks, three BFT blocks over sliding
+/// sigma-windows, and the finalized marker on P5.
+///
+/// ```text
+///   PoW           BFT             file order
+///   P1..P5        -               P1..P5
+///   -             bft0 [P3,P4,P5] bft0
+///   P6 -> bft0    -               P6
+///   -             bft1 [P4,P5,P6] bft1
+///   P7 -> bft1    -               P7
+///   -             bft2 [P5,P6,P7] bft2
+///   P8..P10 -> bft2               P8, P9, P10
+/// ```
+///
+/// A BFT block can only carry headers of PoW blocks that already exist, and a PoW block
+/// can only point at a BFT block that already exists, so the two chains have to be
+/// interleaved this way; the diagram's `P10.context_bft = S6` with `S6` covering P8..P10
+/// is not constructible at all, since the pointer is inside the hashed header.
+///
+/// The diagram's `ba_mu = prune_sigma(P10) = P7` is not drawn by the GUI: nothing in this
+/// tree computes it (FINALITY.md 6.4).
+fn diagram_scene_1() -> (TF, Vec<Arc<Block>>) {
+    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+
+    // pow[i] is the block at height i + 1, so pow[4] is the diagram's P5.
+    let mut pow: Vec<Arc<Block>> = vec![gen.tip.clone()];
+    for _ in 2..=5 {
+        pow.push(gen.next_block(&miner_addr));
+    }
+    for block in &pow {
+        tf.push_instr_load_pow(block, 0);
+    }
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+
+    // bft0 over [P3,P4,P5]; P6 then cites it.
+    let bft0 = next_pos(pos_h, fat_ptr, &pow[2..5], &[]);
+    tf.push_instr_load_pos(&bft0, 0);
+    gen.next_block(&miner_addr);
+    pow.push(point_tip_at_bft(&mut gen, &bft0.0.fat_ptr));
+    tf.push_instr_load_pow(pow.last().unwrap(), 0);
+
+    // bft1 over [P4,P5,P6]; P7 then cites it.
+    let bft1 = next_pos(pos_h, fat_ptr, &pow[3..6], &[]);
+    tf.push_instr_load_pos(&bft1, 0);
+    gen.next_block(&miner_addr);
+    pow.push(point_tip_at_bft(&mut gen, &bft1.0.fat_ptr));
+    tf.push_instr_load_pow(pow.last().unwrap(), 0);
+
+    // bft2 over [P5,P6,P7]. Its deepest header is P5, so the finalized marker lands there.
+    let bft2 = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
+    tf.push_instr_load_pos(&bft2, 0);
+    for _ in 8..=10 {
+        gen.next_block(&miner_addr);
+        pow.push(point_tip_at_bft(&mut gen, &bft2.0.fat_ptr));
+        tf.push_instr_load_pow(pow.last().unwrap(), 0);
+    }
+
+    assert_eq!(pow.len(), 10);
+    assert_eq!(
+        zcash_primitives::block::BlockHash::from_header_data(
+            bft2.0.block.headers.first().unwrap()
+        )
+        .0,
+        pow[4].hash().0,
+        "the newest BFT block's deepest header must be P5, the diagram's fin"
+    );
+
+    (tf, pow)
+}
+
+/// Scene 2: the benign case, where a reorganization exposes an older BFT context so the
+/// derived candidate moves backward while the whole new best chain still contains `fin`.
+///
+/// Scene 1, then a branch off P7 whose blocks cite `bft1` rather than `bft2`. The diagram
+/// replaces P8-P10 with three Q blocks of higher work; regtest difficulty is constant, so
+/// here the branch wins by being one block longer instead, Q8..Q11.
+fn diagram_scene_2() -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
+    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let fork_addr = diagram_fork_miner();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+
+    let mut pow: Vec<Arc<Block>> = vec![gen.tip.clone()];
+    for _ in 2..=5 {
+        pow.push(gen.next_block(&miner_addr));
+    }
+    for block in &pow {
+        tf.push_instr_load_pow(block, 0);
+    }
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+
+    let bft0 = next_pos(pos_h, fat_ptr, &pow[2..5], &[]);
+    tf.push_instr_load_pos(&bft0, 0);
+    gen.next_block(&miner_addr);
+    pow.push(point_tip_at_bft(&mut gen, &bft0.0.fat_ptr));
+    tf.push_instr_load_pow(pow.last().unwrap(), 0);
+
+    let bft1 = next_pos(pos_h, fat_ptr, &pow[3..6], &[]);
+    tf.push_instr_load_pos(&bft1, 0);
+    gen.next_block(&miner_addr);
+    pow.push(point_tip_at_bft(&mut gen, &bft1.0.fat_ptr));
+    tf.push_instr_load_pow(pow.last().unwrap(), 0);
+
+    // The competing branch starts from P7, which already carries its bft1 pointer, so both
+    // branches descend from the same block.
+    let mut fork_gen = gen.clone();
+
+    let bft2 = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
+    tf.push_instr_load_pos(&bft2, 0);
+    for _ in 8..=10 {
+        gen.next_block(&miner_addr);
+        pow.push(point_tip_at_bft(&mut gen, &bft2.0.fat_ptr));
+        tf.push_instr_load_pow(pow.last().unwrap(), 0);
+    }
+
+    // Q8..Q11 cite bft1: an older context than P8..P10's bft2, which is what makes the
+    // derived candidate move backward. The Extension rule still holds -- their parent P7
+    // cites bft1 too, so the pointer never regresses along the branch.
+    let mut fork: Vec<Arc<Block>> = Vec::new();
+    for _ in 8..=11 {
+        fork_gen.next_block(&fork_addr);
+        fork.push(point_tip_at_bft(&mut fork_gen, &bft1.0.fat_ptr));
+        tf.push_instr_load_pow(fork.last().unwrap(), 0);
+    }
+
+    assert_eq!(pow.len(), 10);
+    assert_eq!(fork.len(), 4);
+    assert_eq!(
+        fork[0].header.previous_block_hash,
+        pow[6].hash(),
+        "the branch must fork from P7"
+    );
+
+    (tf, pow, fork)
+}
+
+/// Scene 3: the exceptional case, where the raw best chain forks below `fin`.
+///
+/// P1..P7 with the BFT chain finalizing P5, then C4..C8 forking from P3 -- one block
+/// longer than P4..P7, so it is the heaviest chain -- and citing `bft0`, whose own headers
+/// sit on the branch it conflicts with.
+///
+/// This node will not hold this state: `CrosslinkFinalizeBlock` collapses the
+/// non-finalized state onto the finalized branch, and a fork below the finalized block is
+/// refused on ingest. It is a view-only scene, and there is no test that runs it through
+/// the node, because the behaviour under test would be the refusal rather than the
+/// picture.
+fn diagram_scene_3(fork_flags: u32) -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
+    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let fork_addr = diagram_fork_miner();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+
+    let mut pow: Vec<Arc<Block>> = vec![gen.tip.clone()];
+    for _ in 2..=3 {
+        pow.push(gen.next_block(&miner_addr));
+    }
+    // The conflicting branch forks from P3, below everything the BFT chain finalizes.
+    let mut fork_gen = gen.clone();
+    for _ in 4..=5 {
+        pow.push(gen.next_block(&miner_addr));
+    }
+    for block in &pow {
+        tf.push_instr_load_pow(block, 0);
+    }
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+
+    let bft0 = next_pos(pos_h, fat_ptr, &pow[2..5], &[]);
+    tf.push_instr_load_pos(&bft0, 0);
+    gen.next_block(&miner_addr);
+    pow.push(point_tip_at_bft(&mut gen, &bft0.0.fat_ptr));
+    tf.push_instr_load_pow(pow.last().unwrap(), 0);
+
+    let bft1 = next_pos(pos_h, fat_ptr, &pow[3..6], &[]);
+    tf.push_instr_load_pos(&bft1, 0);
+    gen.next_block(&miner_addr);
+    pow.push(point_tip_at_bft(&mut gen, &bft1.0.fat_ptr));
+    tf.push_instr_load_pow(pow.last().unwrap(), 0);
+
+    // Finalizes P5. Everything after this conflicts with it.
+    let bft2 = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
+    tf.push_instr_load_pos(&bft2, 0);
+
+    let mut fork: Vec<Arc<Block>> = Vec::new();
+    for _ in 4..=8 {
+        fork_gen.next_block(&fork_addr);
+        fork.push(point_tip_at_bft(&mut fork_gen, &bft0.0.fat_ptr));
+        tf.push_instr_load_pow(fork.last().unwrap(), fork_flags);
+    }
+
+    assert_eq!(pow.len(), 7);
+    assert_eq!(fork.len(), 5);
+    assert_eq!(
+        fork[0].header.previous_block_hash,
+        pow[2].hash(),
+        "the conflicting branch must fork from P3"
+    );
+
+    (tf, pow, fork)
+}
+
+/// Writes the three diagram scenes to `crosslink-test-data/`. Boots nothing: the files are
+/// built from `BlockGen` alone, so this runs alongside anything else.
+#[test]
+fn crosslink_write_finality_diagram_scenes() {
+    let (tf1, pow1) = diagram_scene_1();
+    let (tf2, pow2, fork2) = diagram_scene_2();
+    let (tf3, pow3, fork3) = diagram_scene_3(0);
+
+    // The first two scenes share their common prefix exactly, so scene 2 really is scene 1
+    // plus a branch rather than a differently-generated chain.
+    assert_eq!(
+        pow1.iter().map(|b| b.hash()).collect::<Vec<_>>(),
+        pow2.iter().map(|b| b.hash()).collect::<Vec<_>>()
+    );
+    assert_eq!(pow3.len() + fork3.len(), 12);
+    assert_eq!(fork2.len(), 4);
+
+    for (tf, name) in [
+        (tf1, "finality_diagram_1_candidate.zeccltf"),
+        (tf2, "finality_diagram_2_benign_reorg.zeccltf"),
+        (tf3, "finality_diagram_3_conflicting_fork.zeccltf"),
+    ] {
+        let path = diagram_scene_path(name);
+        assert!(tf.write_to_file(&path), "could not write {}", path.display());
+    }
+}
+
+/// Scene 1 through the real admission path: the chain reaches P10 and the finalized marker
+/// sits on P5.
+#[test]
+fn crosslink_finality_diagram_1_candidate() {
+    set_test_name(function_name!());
+    let (mut tf, pow) = diagram_scene_1();
+
+    tf.push_instr_expect_pow_chain_length(11, 0);
+    tf.push_instr_expect_pos_chain_length(3, 0);
+    tf.push_instr_expect_pow_block_finality(&pow[4].hash(), Some(TFLBlockFinality::Finalized), 0);
+    tf.push_instr_expect_pow_block_finality(
+        &pow[5].hash(),
+        Some(TFLBlockFinality::NotYetFinalized),
+        0,
+    );
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// Scene 2 through the real admission path: the longer branch off P7 becomes the best
+/// chain, and the finalized marker does not move, because no BFT block decided.
+#[test]
+fn crosslink_finality_diagram_2_benign_reorg() {
+    set_test_name(function_name!());
+    let (mut tf, pow, _fork) = diagram_scene_2();
+
+    tf.push_instr_expect_pow_chain_length(12, 0);
+    tf.push_instr_expect_pos_chain_length(3, 0);
+    tf.push_instr_expect_pow_block_finality(&pow[4].hash(), Some(TFLBlockFinality::Finalized), 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 // TODO:
 // - reject signatures from outside the roster
 // - reject pos block with < 2/3rds roster stake
@@ -1172,3 +1496,19 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
 //   - repeat all signature tests but for the *next* pos block's fat pointer back
 // - reject pos block that does have the correct fat pointer *hash* to prev block
 // ...
+
+/// Scene 3 through the real admission path, which refuses it: the conflicting branch
+/// forks below the finalized block, so none of it is admitted and the best chain stays
+/// P7. The scene file itself carries no SHOULD_FAIL flags -- it is a picture for the
+/// GUI's "View (no consensus)" path, where the branch is drawn as the diagram draws it.
+#[test]
+fn crosslink_finality_diagram_3_conflicting_fork_is_refused() {
+    set_test_name(function_name!());
+    let (mut tf, pow, _fork) = diagram_scene_3(SHOULD_FAIL);
+
+    tf.push_instr_expect_pow_chain_length(8, 0);
+    tf.push_instr_expect_pos_chain_length(3, 0);
+    tf.push_instr_expect_pow_block_finality(&pow[4].hash(), Some(TFLBlockFinality::Finalized), 0);
+
+    test_bytes(tf.write_to_bytes());
+}

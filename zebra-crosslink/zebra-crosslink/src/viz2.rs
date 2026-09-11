@@ -47,10 +47,312 @@ const BC_PAGE_SIZE: u64 = 1024;
 /// PoW span references an absurd number of BFT blocks.
 const BFT_PAGE_SIZE: usize = 2048;
 
+fn pow_inspection(block: &Block) -> BlockInspection {
+    use zebra_chain::{transaction::Transaction, transparent};
+    BlockInspection::Pow(PowBlockInspection {
+        hash: Hash32::from_bytes(block.hash().0),
+        height: block.coinbase_height().map(|h| h.0 as u64),
+        parent_hash: Hash32::from_bytes(block.header.previous_block_hash.0),
+        time: block.header.time.timestamp(),
+        fat_pointer: block.header.fat_pointer_to_bft_block.to_string(),
+        transactions: block.transactions.iter().map(|tx| TxInspection {
+            hash: format!("{}", tx.hash()),
+            is_coinbase: matches!(tx.inputs().first(), Some(transparent::Input::Coinbase { .. })),
+            staking_action: match tx.as_ref() {
+                Transaction::VCrosslink { staking_action: Some(sa), .. } => Some(format!("{sa}")),
+                _ => None,
+            },
+        }).collect(),
+        serialized_hex: {
+            let mut bytes = Vec::new();
+            let _ = block.zcash_serialize(&mut bytes);
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        },
+    })
+}
+
+fn bft_inspection(b: &wallet::bft::BftBlock) -> BlockInspection {
+    BlockInspection::Bft(BftBlockInspection {
+        hash: Hash32::from_bytes(b.blake3_hash().0),
+        version: b.version,
+        height: b.height,
+        previous_hash: Hash32::from_bytes(b.previous_block_hash().0),
+        finalization_candidate_height: 0,
+        do_not_include_until_bc_height: b.do_not_include_until_bc_height,
+        hardforks: b.hardforks.iter().map(|hf| zebra_gui::HardforkInspection {
+            pow_activation_height: hf.pow_activation_height,
+            bft_certificate_height: hf.bft_certificate_height,
+            terminated_finalizers: hf.terminated_finalizers.iter().map(|id| Hash32::from_bytes(id.0)).collect(),
+        }).collect(),
+        pow_headers: b
+            .headers
+            .iter()
+            .enumerate()
+            .map(|(i, hdr)| BftPowHeaderInspection {
+                height: i as u32,
+                hash: Hash32::from_bytes(BlockHash::from_header_data(hdr).0),
+            })
+            .collect(),
+    })
+}
+
 fn work_from_difficulty(difficulty: zebra_chain::work::difficulty::CompactDifficulty) -> u64 {
     difficulty.to_work()
         .map(|w| u64::try_from(w.as_u128()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+/// A chain picture read straight out of a `.zeccltf` file, with no node involved.
+///
+/// The visualizer's usual source is this node's own state, so it can only draw what this
+/// node accepted. Several of the states worth drawing are ones it refuses: a best chain
+/// that forks below the finalized block is collapsed by `CrosslinkFinalizeBlock`, and
+/// `sidechain_forks` reads only non-finalized state, so nothing of that branch would
+/// survive to be served even if it had been admitted. Building the same GUI records from
+/// the file's own blocks makes those pictures visible without asking the node to believe
+/// them.
+///
+/// Every LOAD_POW and LOAD_POS in the file is drawn, including ones flagged SHOULD_FAIL:
+/// that flag says what the node does with a block, not whether the block can be drawn.
+struct VizScene {
+    bc_blocks: Vec<zebra_gui::BcBlock>,
+    bft_blocks: Vec<zebra_gui::BftBlock>,
+    bc_tip_height: u64,
+    bc_finalized_tip_height: u64,
+    bft_tip_height: u64,
+    instr_strings: Vec<String>,
+    pow_by_hash: std::collections::HashMap<Hash32, Arc<Block>>,
+    bft_by_hash: std::collections::HashMap<Hash32, wallet::bft::BftBlock>,
+}
+
+impl VizScene {
+    fn from_tf(bytes: &[u8], instrs: &[test_format::TFInstr]) -> VizScene {
+        use std::collections::{HashMap, HashSet};
+
+        let mut pow: Vec<Arc<Block>> = Vec::new();
+        let mut bft: Vec<wallet::bft::BftBlock> = Vec::new();
+        let mut instr_strings: Vec<String> = Vec::new();
+
+        for instr in instrs {
+            instr_strings.push(test_format::TFInstr::string_from_instr(bytes, instr));
+            match test_format::tf_read_instr(bytes, instr) {
+                Some(test_format::TestInstr::LoadPoW(block)) => pow.push(Arc::new(block)),
+                Some(test_format::TestInstr::LoadPoS((block, _fat_ptr))) => bft.push(block),
+                _ => {}
+            }
+        }
+
+        // Indexes over just this file. Nothing outside it exists, so a block whose parent
+        // is absent is a root and its chain simply starts there.
+        let mut pow_by_hash: HashMap<Hash32, Arc<Block>> = HashMap::new();
+        let mut height_of: HashMap<Hash32, u64> = HashMap::new();
+        for b in &pow {
+            let hash = Hash32::from_bytes(b.hash().0);
+            if let Some(height) = b.coinbase_height() {
+                height_of.insert(hash, height.0 as u64);
+            }
+            pow_by_hash.insert(hash, b.clone());
+        }
+
+        // Accumulated work along each block's own ancestry within the file, so the
+        // heaviest chain can be picked the way fork choice picks it. Iterated to a fixed
+        // point rather than recursed: the file's blocks come in whatever order the scene
+        // was written in, and a parent may be indexed after its child.
+        let mut total_work: HashMap<Hash32, u64> = HashMap::new();
+        loop {
+            let mut settled_one = false;
+            for (hash, b) in pow_by_hash.iter() {
+                if total_work.contains_key(hash) {
+                    continue;
+                }
+                let parent = Hash32::from_bytes(b.header.previous_block_hash.0);
+                let base = if pow_by_hash.contains_key(&parent) {
+                    match total_work.get(&parent) {
+                        Some(w) => *w,
+                        None => continue, // parent not settled yet; next pass
+                    }
+                } else {
+                    0
+                };
+                total_work.insert(
+                    *hash,
+                    base + work_from_difficulty(b.header.difficulty_threshold),
+                );
+                settled_one = true;
+            }
+            if !settled_one {
+                break;
+            }
+        }
+
+        // Heaviest chain, with height then hash breaking exact ties so one file always
+        // draws the same way.
+        let mut best_tip: Option<Hash32> = None;
+        let mut best_key: (u64, u64, [u8; 32]) = (0, 0, [0; 32]);
+        for (hash, work) in total_work.iter() {
+            let key = (*work, height_of.get(hash).copied().unwrap_or(0), hash.as_bytes());
+            if best_tip.is_none() || key > best_key {
+                best_tip = Some(*hash);
+                best_key = key;
+            }
+        }
+
+        let ancestry = |from: Option<Hash32>| -> HashSet<Hash32> {
+            let mut set = HashSet::new();
+            let mut walk = from;
+            while let Some(hash) = walk {
+                if !set.insert(hash) {
+                    break;
+                }
+                walk = pow_by_hash
+                    .get(&hash)
+                    .map(|b| Hash32::from_bytes(b.header.previous_block_hash.0));
+            }
+            set
+        };
+        let best_chain = ancestry(best_tip);
+
+        // The finalized marker this node would publish for these blocks: the newest BFT
+        // block's `headers[0]`. That is `latest_final_block`'s own derivation, off-by-one
+        // and all (FINALITY.md 6.1). The point is to show what this tree does, not what
+        // the construction says it should do.
+        let bft_tip_block = bft.iter().max_by_key(|b| b.height);
+        let finalized_hash = bft_tip_block
+            .and_then(|b| b.headers.first())
+            .map(|h| Hash32::from_bytes(BlockHash::from_header_data(h).0));
+        let finalized_chain = ancestry(finalized_hash);
+        let bc_finalized_tip_height = finalized_hash
+            .and_then(|h| height_of.get(&h).copied())
+            .unwrap_or(0);
+
+        // Which BFT block names each PoW block as its finalization candidate; the newest
+        // wins, matching the live path.
+        let mut pointed_at_by: HashMap<Hash32, u64> = HashMap::new();
+        for b in &bft {
+            if let Some(hdr) = b.headers.first() {
+                pointed_at_by.insert(
+                    Hash32::from_bytes(BlockHash::from_header_data(hdr).0),
+                    b.height as u64,
+                );
+            }
+        }
+
+        let hardfork_activation_heights: HashSet<u64> = bft
+            .iter()
+            .flat_map(|b| b.hardforks.iter().map(|hf| hf.pow_activation_height))
+            .collect();
+
+        let mut bc_blocks: Vec<zebra_gui::BcBlock> = Vec::new();
+        for b in &pow {
+            let this_hash = Hash32::from_bytes(b.hash().0);
+            let this_height = height_of.get(&this_hash).copied().unwrap_or(0);
+            bc_blocks.push(zebra_gui::BcBlock {
+                this_hash,
+                parent_hash: Hash32::from_bytes(b.header.previous_block_hash.0),
+                this_height,
+                txs_n: b.transactions.len(),
+                is_best_chain: best_chain.contains(&this_hash),
+                is_finalized: finalized_chain.contains(&this_hash),
+                knowledge: zebra_gui::BcKnowledge::FullBlock,
+                points_at_bft_block: Hash32::from_bytes(
+                    b.header.fat_pointer_to_bft_block.points_at_block_hash().0,
+                ),
+                pointed_at_by_bft_height: pointed_at_by
+                    .get(&this_hash)
+                    .copied()
+                    .unwrap_or(u64::MAX),
+                work: work_from_difficulty(b.header.difficulty_threshold),
+                utc: b.header.time.timestamp(),
+                serialized_size: b.zcash_serialized_size(),
+                is_hardfork_activation: hardfork_activation_heights.contains(&this_height),
+            });
+        }
+
+        let hardfork_bft_heights: HashSet<u64> = bft
+            .iter()
+            .filter(|b| !b.hardforks.is_empty())
+            .map(|b| b.height as u64)
+            .collect();
+        let mut bft_blocks: Vec<zebra_gui::BftBlock> = Vec::new();
+        let mut bft_by_hash: HashMap<Hash32, wallet::bft::BftBlock> = HashMap::new();
+        for b in &bft {
+            let Some(candidate_hdr) = b.headers.first() else {
+                continue;
+            };
+            let candidate_hash = Hash32::from_bytes(BlockHash::from_header_data(candidate_hdr).0);
+            let this_hash = Hash32::from_bytes(b.blake3_hash().0);
+            bft_by_hash.insert(this_hash, b.clone());
+            bft_blocks.push(zebra_gui::BftBlock {
+                this_hash,
+                parent_hash: Hash32::from_bytes(b.previous_block_hash().0),
+                this_height: b.height as u64,
+                points_at_bc_block: candidate_hash,
+                points_at_bc_height: height_of.get(&candidate_hash).copied().unwrap_or(0),
+                proving_blocks: b
+                    .headers
+                    .iter()
+                    .skip(1)
+                    .map(|x| zebra_gui::ProvingHeader {
+                        hash: Hash32::from_bytes(BlockHash::from_header_data(x).0),
+                        parent_hash: Hash32::from_bytes(x.prev_block.0),
+                        utc: x.time as i64,
+                        work: work_from_difficulty(
+                            zebra_chain::work::difficulty::CompactDifficulty(x.bits),
+                        ),
+                    })
+                    .collect(),
+                next_block_is_hardfork: hardfork_bft_heights.contains(&(b.height as u64 + 1)),
+            });
+        }
+
+        VizScene {
+            bc_tip_height: best_tip.and_then(|h| height_of.get(&h).copied()).unwrap_or(0),
+            bc_finalized_tip_height,
+            bft_tip_height: bft.iter().map(|b| b.height as u64).max().unwrap_or(0),
+            bc_blocks,
+            bft_blocks,
+            instr_strings,
+            pow_by_hash,
+            bft_by_hash,
+        }
+    }
+
+    fn response(
+        &self,
+        request: &zebra_gui::RequestToZebra,
+        reset_blocks: bool,
+    ) -> zebra_gui::ResponseFromZebra {
+        let mut response = zebra_gui::ResponseFromZebra::_0();
+        response.view_mode = true;
+        response.reset_blocks = reset_blocks;
+        // The whole scene every cycle: these files are tens of blocks, so none of the
+        // paging the live path needs applies.
+        response.bc_blocks = self.bc_blocks.clone();
+        response.bft_blocks = self.bft_blocks.clone();
+        response.bc_tip_height = self.bc_tip_height;
+        response.bc_finalized_tip_height = self.bc_finalized_tip_height;
+        response.bft_tip_height = self.bft_tip_height;
+        response.start_bc_height = self
+            .bc_blocks
+            .iter()
+            .map(|b| b.this_height)
+            .min()
+            .unwrap_or(0);
+        response.instr_strings = self.instr_strings.clone();
+        response.instr_done_n = self.instr_strings.len();
+
+        if request.want_to_inspect_block != Hash32::from_u64(0) {
+            if let Some(b) = self.pow_by_hash.get(&request.want_to_inspect_block) {
+                response.what_block_it_is = request.want_to_inspect_block;
+                response.block_inspection = pow_inspection(b.as_ref());
+            } else if let Some(b) = self.bft_by_hash.get(&request.want_to_inspect_block) {
+                response.what_block_it_is = request.want_to_inspect_block;
+                response.block_inspection = bft_inspection(b);
+            }
+        }
+
+        response
+    }
 }
 
 /// Bridge between tokio & viz code
@@ -81,6 +383,12 @@ pub async fn service_viz_requests(
     let mut bft_candidate_heights: std::collections::HashMap<Hash32, u64> = std::collections::HashMap::new();
     let mut bft_unresolved_heights: std::collections::HashSet<Hash32> = std::collections::HashSet::new();
     let mut bft_resolved_at_tip: u64 = u64::MAX; // PoW tip at the last resolution round
+    // While set, the picture comes from a .zeccltf file and the node is not consulted.
+    // The two reset flags make the screen start empty on each switch between the sources,
+    // since they describe unrelated chains.
+    let mut view_scene: Option<VizScene> = None;
+    let mut view_reset = false;
+    let mut live_reset = false;
 
     loop {
         let request_queue = zebra_gui::REQUESTS_TO_ZEBRA.lock().unwrap();
@@ -93,6 +401,49 @@ pub async fn service_viz_requests(
 
         'main_loop: loop {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+            // Viewing a file answers from the file alone: the node may be on an unrelated
+            // chain, or on none, and asking it anything here would mix the two pictures.
+            if view_scene.is_some() {
+                let mut leaving = false;
+                for _ in 0..256 {
+                    let Ok(request) = request_queue.try_recv() else { break };
+                    crate::BFT_PAUSE.store(request.bft_pause, std::sync::atomic::Ordering::Relaxed);
+                    if request.view_exit {
+                        leaving = true;
+                        break;
+                    }
+                    if !request.serialize_instrs_path.is_empty() {
+                        info!("not serializing to {} while a file is being viewed: the node's chains are not what is on screen",
+                              request.serialize_instrs_path);
+                    }
+                    if !request.load_instrs_path.is_empty() {
+                        info!("not loading {} while a file is being viewed: go back to the live chain first",
+                              request.load_instrs_path);
+                    }
+                    if !request.view_instrs_path.is_empty() {
+                        match test_format::TF::read_from_file(std::path::Path::new(&request.view_instrs_path)) {
+                            Ok((bytes, tf)) => {
+                                view_scene = Some(VizScene::from_tf(&bytes, &tf.instrs));
+                                view_reset = true;
+                            }
+                            Err(err) => error!("failed to view {}: {}", request.view_instrs_path, err),
+                        }
+                    }
+                    if let Some(scene) = view_scene.as_ref() {
+                        if response_queue.try_send(scene.response(&request, view_reset)).is_ok() {
+                            view_reset = false;
+                        }
+                    }
+                }
+                if leaving {
+                    view_scene = None;
+                    live_reset = true;
+                } else {
+                    continue 'main_loop;
+                }
+            }
+
             let Ok(StateReadResponse::TipPoolValues { value_balance, .. }) = (call.read_state)(StateReadRequest::TipPoolValues).await
             else {
                 continue 'main_loop;
@@ -257,6 +608,17 @@ pub async fn service_viz_requests(
                         }
                     }
 
+                    if !request.view_instrs_path.is_empty() {
+                        match test_format::TF::read_from_file(std::path::Path::new(&request.view_instrs_path)) {
+                            Ok((bytes, tf)) => {
+                                view_scene = Some(VizScene::from_tf(&bytes, &tf.instrs));
+                                view_reset = true;
+                                continue 'main_loop;
+                            }
+                            Err(err) => error!("failed to view {}: {}", request.view_instrs_path, err),
+                        }
+                    }
+
                     if !request.serialize_instrs_path.is_empty() {
                         let handle = tfl_handle.clone();
                         let ser_call = call.clone();
@@ -383,6 +745,8 @@ pub async fn service_viz_requests(
 
                     let mut internal = tfl_handle.internal.lock().await;
                     let mut response = zebra_gui::ResponseFromZebra::_0();
+                    response.reset_blocks = live_reset;
+                    live_reset = false;
                     response.bc_attested = bc_attested.clone();
                     response.bft_recency = internal.recency_status.clone(); // TODO: do we want a better way of communicating singleton data
                     {
@@ -428,55 +792,6 @@ pub async fn service_viz_requests(
                     // window onto the tip block itself.
                     bc_ack_height = bc_ack_height.max(request.bc_ack_height).min(bc_tip_height);
 
-                    let pow_inspection = |block: &Block| {
-                        use zebra_chain::{transaction::Transaction, transparent};
-                        BlockInspection::Pow(PowBlockInspection {
-                            hash: Hash32::from_bytes(block.hash().0),
-                            height: block.coinbase_height().map(|h| h.0 as u64),
-                            parent_hash: Hash32::from_bytes(block.header.previous_block_hash.0),
-                            time: block.header.time.timestamp(),
-                            fat_pointer: block.header.fat_pointer_to_bft_block.to_string(),
-                            transactions: block.transactions.iter().map(|tx| TxInspection {
-                                hash: format!("{}", tx.hash()),
-                                is_coinbase: matches!(tx.inputs().first(), Some(transparent::Input::Coinbase { .. })),
-                                staking_action: match tx.as_ref() {
-                                    Transaction::VCrosslink { staking_action: Some(sa), .. } => Some(format!("{sa}")),
-                                    _ => None,
-                                },
-                            }).collect(),
-                            serialized_hex: {
-                                let mut bytes = Vec::new();
-                                let _ = block.zcash_serialize(&mut bytes);
-                                bytes.iter().map(|b| format!("{b:02x}")).collect()
-                            },
-                        })
-                    };
-
-                    let bft_inspection = |b: &wallet::bft::BftBlock| {
-                        BlockInspection::Bft(BftBlockInspection {
-                            hash: Hash32::from_bytes(b.blake3_hash().0),
-                            version: b.version,
-                            height: b.height,
-                            previous_hash: Hash32::from_bytes(b.previous_block_hash().0),
-                            finalization_candidate_height: 0,
-                            do_not_include_until_bc_height: b.do_not_include_until_bc_height,
-                            hardforks: b.hardforks.iter().map(|hf| zebra_gui::HardforkInspection {
-                                pow_activation_height: hf.pow_activation_height,
-                                bft_certificate_height: hf.bft_certificate_height,
-                                terminated_finalizers: hf.terminated_finalizers.iter().map(|id| Hash32::from_bytes(id.0)).collect(),
-                            }).collect(),
-                            pow_headers: b
-                                .headers
-                                .iter()
-                                .enumerate()
-                                .map(|(i, hdr)| BftPowHeaderInspection {
-                                    height: i as u32,
-                                    hash: Hash32::from_bytes(BlockHash::from_header_data(hdr).0),
-                                })
-                                .collect(),
-                        })
-                    };
-
                     let push_bc_block = |response: &mut zebra_gui::ResponseFromZebra,
                                          height: &ZebBlockHeight,
                                          hash: &ZebBlockHash,
@@ -487,13 +802,19 @@ pub async fn service_viz_requests(
                             response.what_block_it_is = this_hash;
                             response.block_inspection = pow_inspection(bc);
                         }
+                        // Whether the picture calls a block finalized is settled here rather
+                        // than by the drawing code, which cannot express the case that matters:
+                        // a finalized block that is not on the best chain. This node never holds
+                        // that state, but a viewed file can.
+                        let is_finalized =
+                            is_best_chain && height.0 as u64 <= response.bc_finalized_tip_height;
                         response.bc_blocks.push(zebra_gui::BcBlock {
                             this_hash,
                             parent_hash: Hash32::from_bytes(bc.header.previous_block_hash.0),
                             this_height: height.0 as u64,
                             txs_n: bc.transactions.len(),
                             is_best_chain,
-                            is_finalized: false,
+                            is_finalized,
                             knowledge: zebra_gui::BcKnowledge::FullBlock,
                             points_at_bft_block: Hash32::from_bytes(bc.header.fat_pointer_to_bft_block.points_at_block_hash().0),
                             pointed_at_by_bft_height: bft_pointing_heights.get(&this_hash).copied().unwrap_or(u64::MAX),
@@ -659,3 +980,131 @@ pub async fn service_viz_requests(
     }
 }
 
+#[cfg(test)]
+mod scene_tests {
+    use super::*;
+
+    /// The scenes are written by `crosslink_write_finality_diagram_scenes` in zebrad's
+    /// `tests/crosslink.rs` and committed beside the other test-format data.
+    fn scene(name: &str) -> VizScene {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../crosslink-test-data")
+            .join(name);
+        let (bytes, tf) = test_format::TF::read_from_file(&path)
+            .unwrap_or_else(|err| panic!("reading {}: {}", path.display(), err));
+        VizScene::from_tf(&bytes, &tf.instrs)
+    }
+
+    fn at_height(scene: &VizScene, height: u64) -> Vec<&zebra_gui::BcBlock> {
+        scene.bc_blocks.iter().filter(|b| b.this_height == height).collect()
+    }
+
+    fn best_heights(scene: &VizScene) -> Vec<u64> {
+        let mut heights: Vec<u64> = scene
+            .bc_blocks
+            .iter()
+            .filter(|b| b.is_best_chain)
+            .map(|b| b.this_height)
+            .collect();
+        heights.sort_unstable();
+        heights
+    }
+
+    fn finalized_heights(scene: &VizScene) -> Vec<u64> {
+        let mut heights: Vec<u64> = scene
+            .bc_blocks
+            .iter()
+            .filter(|b| b.is_finalized)
+            .map(|b| b.this_height)
+            .collect();
+        heights.sort_unstable();
+        heights
+    }
+
+    #[test]
+    fn diagram_scene_1_puts_the_marker_on_p5() {
+        let scene = scene("finality_diagram_1_candidate.zeccltf");
+
+        assert_eq!(scene.bc_blocks.len(), 10);
+        assert_eq!(scene.bc_tip_height, 10);
+        assert_eq!(best_heights(&scene), (1..=10).collect::<Vec<_>>());
+
+        assert_eq!(scene.bft_blocks.len(), 3);
+        assert_eq!(scene.bft_tip_height, 2);
+
+        // The diagram's fin.
+        assert_eq!(scene.bc_finalized_tip_height, 5);
+        assert_eq!(finalized_heights(&scene), (1..=5).collect::<Vec<_>>());
+
+        // Each BFT block's finalization candidate is the deepest header of its window:
+        // P3, P4, P5 for bft0, bft1, bft2.
+        let mut by_height = scene.bft_blocks.clone();
+        by_height.sort_by_key(|b| b.this_height);
+        assert_eq!(
+            by_height.iter().map(|b| b.points_at_bc_height).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+
+        // P6 cites bft0, P7 cites bft1, P8..P10 cite bft2: a context_bft that never
+        // regresses, which is the Extension rule this node enforces.
+        for (height, bft_index) in [(6u64, 0usize), (7, 1), (8, 2), (9, 2), (10, 2)] {
+            let block = at_height(&scene, height);
+            assert_eq!(block.len(), 1, "one block at height {height}");
+            assert_eq!(
+                block[0].points_at_bft_block, by_height[bft_index].this_hash,
+                "height {height} should cite bft{bft_index}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagram_scene_2_reorganizes_above_the_marker() {
+        let scene = scene("finality_diagram_2_benign_reorg.zeccltf");
+
+        // Ten blocks on the original branch plus four on the competing one.
+        assert_eq!(scene.bc_blocks.len(), 14);
+        assert_eq!(scene.bc_tip_height, 11);
+
+        // The competing branch is longer, so it is the best chain from height 8 up, and
+        // the three blocks it displaced are still drawn beside it.
+        assert_eq!(best_heights(&scene), (1..=11).collect::<Vec<_>>());
+        for height in 8..=10 {
+            assert_eq!(at_height(&scene, height).len(), 2, "two blocks at height {height}");
+        }
+
+        // The whole new best chain still contains fin, and fin has not moved: no BFT
+        // block decided, so this is the diagram's benign case rather than a conflict.
+        assert_eq!(scene.bc_finalized_tip_height, 5);
+        assert_eq!(finalized_heights(&scene), (1..=5).collect::<Vec<_>>());
+        assert!(at_height(&scene, 5)[0].is_best_chain);
+    }
+
+    #[test]
+    fn diagram_scene_3_forks_below_the_marker() {
+        let scene = scene("finality_diagram_3_conflicting_fork.zeccltf");
+
+        // Seven blocks on the branch the BFT chain finalized, five on the heavier one.
+        assert_eq!(scene.bc_blocks.len(), 12);
+        assert_eq!(scene.bc_tip_height, 8);
+        assert_eq!(best_heights(&scene), (1..=8).collect::<Vec<_>>());
+
+        assert_eq!(scene.bc_finalized_tip_height, 5);
+        assert_eq!(finalized_heights(&scene), (1..=5).collect::<Vec<_>>());
+
+        // The whole point of the scene: the finalized block is not on the best chain, and
+        // neither is anything above the fork at height 3.
+        let finalized_block = scene
+            .bc_blocks
+            .iter()
+            .find(|b| b.this_height == 5 && b.is_finalized)
+            .expect("a finalized block at height 5");
+        assert!(!finalized_block.is_best_chain);
+        for height in 4..=7 {
+            assert!(
+                at_height(&scene, height).iter().any(|b| !b.is_best_chain),
+                "the abandoned branch is still drawn at height {height}"
+            );
+        }
+        assert!(at_height(&scene, 3)[0].is_best_chain, "the branches meet at P3");
+    }
+}

@@ -4436,6 +4436,24 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                     }
                                 }
 
+                                // Viewing draws the file's blocks directly, without the node
+                                // accepting them, so states this node rejects by policy -- a best
+                                // chain forking below the finalized block, most of all -- can still
+                                // be looked at.
+                                if let _ = elem().decl(Decl { direction: LeftToRight, child_gap: ui.scale(8.0), width: grow!(), height: fit!(), ..Decl }) {
+                                    if tf_button(ui, "View (no consensus)") {
+                                        viz.view_instrs_path_pending = path.clone();
+                                    }
+                                    if viz.view_mode && tf_button(ui, "Back to live chain") {
+                                        viz.view_exit_pending = true;
+                                    }
+                                }
+
+                                if viz.view_mode {
+                                    ui.text("Viewing a file: these blocks are drawn from it, not accepted by this node.",
+                                            TextDecl { h: ui.scale(13.0), colour: (244u8, 196u8, 94u8, 255u8), align: AlignX::Left, ..TextDecl });
+                                }
+
                                 if viz.instr_strings.len() > 0 {
                                     ui.text(frame_strf!(data, "{}/{} done, {} failed",
                                         viz.instr_done_n.min(viz.instr_strings.len()), viz.instr_strings.len(), viz.instr_failed.len()), hdr_text_decl);
