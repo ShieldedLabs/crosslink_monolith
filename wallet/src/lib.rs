@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::{identity, Infallible};
 use std::future::Future;
 use std::mem;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio_rustls::rustls;
 use tonic::client::GrpcService;
@@ -205,8 +205,8 @@ pub struct LESlice<'a>(pub &'a [u8]);
 impl std::fmt::Display for LESlice<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let n = usize::min(self.0.len(), f.precision().unwrap_or(self.0.len()));
-        for i in 0..n {
-            write!(f, "{:02x}", self.0[31-i])?;
+        for byte in self.0.iter().rev().take(n) {
+            write!(f, "{:02x}", byte)?;
         }
         Ok(())
     }
@@ -286,6 +286,11 @@ impl std::fmt::Debug for OrchardNote {
 
 impl OrchardNote {
     fn monotonically_update(&mut self, mut new_note: OrchardNote) {
+        // A mempool sighting can arrive after the block scan (the mempool fetch isn't
+        // sequenced with chain reading); a real height is never demoted to a sentinel.
+        if !new_note.recv_h.is_in_block() {
+            new_note.recv_h = self.recv_h;
+        }
         if new_note.position < unknown_tree_position() {
             if (self.position < unknown_tree_position() &&
                 self.position != new_note.position)
@@ -570,9 +575,9 @@ impl WalletTxPart {
 
     pub fn checked_add(&self, rhs: &WalletTxPart) -> Option<WalletTxPart> {
         Some(WalletTxPart {
-            spent_note_count: (self.spent_note_count + rhs.spent_note_count),
-            sent_note_count:  (self.sent_note_count  + rhs.sent_note_count),
-            recv_note_count:  (self.recv_note_count  + rhs.recv_note_count),
+            spent_note_count: self.spent_note_count.checked_add(rhs.spent_note_count)?,
+            sent_note_count:  self.sent_note_count.checked_add(rhs.sent_note_count)?,
+            recv_note_count:  self.recv_note_count.checked_add(rhs.recv_note_count)?,
             spent_zats:       (self.spent_zats       + rhs.spent_zats)?,
             sent_zats:        (self.sent_zats        + rhs.sent_zats)?,
             recv_zats:        (self.recv_zats        + rhs.recv_zats)?,
@@ -607,11 +612,12 @@ impl WalletTxPart {
     }
 
 
+    // NOTE: the count is only bumped once the add succeeds, so a `None` leaves the part untouched
     pub fn spent(&mut self, zats: Zatoshis, loud: bool) -> Option<()> {
-        self.spent_note_count += 1;
         match self.spent_zats + zats {
             Some(v) => {
                 self.spent_zats = v;
+                self.spent_note_count += 1;
                 Some(())
             }
             None => {
@@ -624,10 +630,10 @@ impl WalletTxPart {
     }
 
     pub fn sent(&mut self, zats: Zatoshis, loud: bool) -> Option<()> {
-        self.sent_note_count += 1;
         match self.sent_zats + zats {
             Some(v) => {
                 self.sent_zats = v;
+                self.sent_note_count += 1;
                 Some(())
             }
             None => {
@@ -640,10 +646,10 @@ impl WalletTxPart {
     }
 
     pub fn recv(&mut self, zats: Zatoshis, loud: bool) -> Option<()> {
-        self.recv_note_count += 1;
         match self.recv_zats + zats {
             Some(v) => {
                 self.recv_zats = v;
+                self.recv_note_count += 1;
                 Some(())
             }
             None => {
@@ -655,10 +661,10 @@ impl WalletTxPart {
         }
     }
     pub fn maybe_recv(&mut self, is_me: bool, zats: Zatoshis, loud: bool) -> Option<()> {
-        self.recv_note_count += is_me as usize; // allow branchless
         match self.recv_zats + Zatoshis::from_u64(zats.into_u64() * is_me as u64).expect("prev val or 0") {
             Some(v) => {
                 self.recv_zats = v;
+                self.recv_note_count += is_me as usize; // allow branchless
                 Some(())
             }
             None => {
@@ -1266,8 +1272,12 @@ fn update_with_tx(wallet: &mut ManualWallet, mut new_tx: WalletTx, insert_i: &mu
                     new_tx.parts[WalletTxPart::SHIELDED].recv_zats = old_tx.parts[WalletTxPart::SHIELDED].recv_zats;
                 }
                 if (new_tx.part_flags & TxParts::SHIELDED_SENT) == 0 {
-                    new_tx.parts[WalletTxPart::SHIELDED].spent_note_count = old_tx.parts[WalletTxPart::SHIELDED].spent_note_count;
-                    new_tx.parts[WalletTxPart::SHIELDED].spent_zats       = old_tx.parts[WalletTxPart::SHIELDED].spent_zats;
+                    // The compact-block scan only declares SHIELDED_RECV, but it does detect our
+                    // spends (nullifier match); don't let the old record clobber those.
+                    if new_tx.parts[WalletTxPart::SHIELDED].spent_note_count == 0 {
+                        new_tx.parts[WalletTxPart::SHIELDED].spent_note_count = old_tx.parts[WalletTxPart::SHIELDED].spent_note_count;
+                        new_tx.parts[WalletTxPart::SHIELDED].spent_zats       = old_tx.parts[WalletTxPart::SHIELDED].spent_zats;
+                    }
                     new_tx.parts[WalletTxPart::SHIELDED].sent_note_count  = old_tx.parts[WalletTxPart::SHIELDED].sent_note_count;
                     new_tx.parts[WalletTxPart::SHIELDED].sent_zats        = old_tx.parts[WalletTxPart::SHIELDED].sent_zats;
                 }
@@ -1296,7 +1306,23 @@ fn update_with_tx(wallet: &mut ManualWallet, mut new_tx: WalletTx, insert_i: &mu
             }
             wallet.txs.remove(tx_i);
         } else {
+            // The map and the vector disagree; leaving the orphan in place would duplicate
+            // the tx (and the orphan could never be found again).
             println!("ERROR: {txid:?} not found at associated height {tx_h:?}");
+            let mut orphan_i = None;
+            for (i, tx) in wallet.txs.iter().enumerate() {
+                if tx.txid == txid {
+                    orphan_i = Some(i);
+                    break;
+                }
+            }
+            if let Some(tx_i) = orphan_i {
+                println!("ERROR: {txid:?} was actually at {:?}; removing before re-insert", wallet.txs[tx_i].h);
+                if tx_i < *insert_i {
+                    *insert_i -= 1;
+                }
+                wallet.txs.remove(tx_i);
+            }
         }
         *tx_h = new_tx.h;
     } else {
@@ -1407,7 +1433,8 @@ pub struct ManualWallet {
     pub name: &'static str,
     pub accounts: Vec<ManualAccount>,
     pub strms: Vec<ManualStream>,
-    pub chain_tip_h: BlockHeight,
+    pub chain_tip_h: BlockHeight, // network tip as reported by the light server
+    pub sync_h: BlockHeight,      // last block scanned into this wallet; lags chain_tip_h while catching up
     /// The node's and the wallet's consensus branch IDs at the node's tip, while they disagree.
     pub branch_mismatch: Option<(u32, u32)>,
     // TODO: change type
@@ -1437,19 +1464,19 @@ pub struct ManualWallet {
 impl ManualWallet {
     pub fn chain_height(&self)          -> BlockHeight { self.chain_tip_h }
     pub fn fully_detected_height(&self) -> BlockHeight {
-        let mut h = BlockHeight(0);
+        let mut h = BlockHeight::INVALID;
         for account in &self.accounts {
             h = h.min(account.fully_detected_h);
         }
-        h
+        if h == BlockHeight::INVALID { BlockHeight(0) } else { h }
     }
 
     pub fn fully_decoded_height(&self) -> BlockHeight {
-        let mut h = BlockHeight(0);
+        let mut h = BlockHeight::INVALID;
         for account in &self.accounts {
             h = h.min(account.fully_decoded_h);
         }
-        h
+        if h == BlockHeight::INVALID { BlockHeight(0) } else { h }
     }
 
     // TODO: confirmations_policy should be overridden by finalized height
@@ -1477,23 +1504,42 @@ impl ManualWallet {
 
         //-- EXPENSIVE NETWORK SEND
         // TODO: don't block, maybe return a future?
+        // A failure is pinned at the wallet's own synced height: the network tip can be far
+        // above anything the wallet has scanned, which would float the entry above every
+        // real tx. The same height goes in the status, which is what reported_height() shows.
+        let fail_h = self.sync_h;
         let mut raw_tx = RawTransaction{ data: Vec::new(), height: 0 };
         if let Err(err) = tx.write(&mut raw_tx.data) {
             println!("couldn't serialize transaction for network send: {err:?}");
             let err_buf = ErrBuf::from_str(&format!("couldn't serialize: {err:?}"));
-            wallet_tx.status = TxStatus::HardFail(wallet_tx.h, err_buf); // i.e. built but not sent
-            wallet_tx.h = self.chain_tip_h; // TODO: this should maybe be "sync'd height"
+            wallet_tx.status = TxStatus::HardFail(fail_h, err_buf); // i.e. built but not sent
+            wallet_tx.h = fail_h;
         } else {
             let tx_size = raw_tx.data.len();
             let res = client.send_transaction(raw_tx).await;
             if DUMP_TX_SEND { println!("******* res for {:?} ({} B): {:?}", tx.txid(), tx_size, res); }
-            // TODO: distinguish sends that weren't network issues
-            if res.is_ok() {
-                wallet_tx.h = BlockHeight::SENT;
-            } else {
-                wallet_tx.status = TxStatus::SoftFail(wallet_tx.h); // i.e. built but not sent
-                wallet_tx.h = self.chain_tip_h; // TODO: this should maybe be "sync'd height"
-            };
+            // Transport/gRPC failures come back as Err; a node *rejection* comes back as Ok
+            // with a non-zero error_code (stock lightwalletd/zaino). The bundled zebrad server
+            // maps rejections to a gRPC status instead and puts the txid in error_message on
+            // success, so only error_code can be tested here.
+            match res {
+                Ok(resp) => {
+                    let resp = resp.into_inner();
+                    if resp.error_code == 0 {
+                        wallet_tx.h = BlockHeight::SENT;
+                    } else {
+                        println!("node rejected transaction {:?} ({}): {}", tx.txid(), resp.error_code, resp.error_message);
+                        let err_buf = ErrBuf::from_str(&format!("rejected ({}): {}", resp.error_code, resp.error_message));
+                        wallet_tx.status = TxStatus::HardFail(fail_h, err_buf);
+                        wallet_tx.h = fail_h;
+                    }
+                }
+                Err(status) => {
+                    println!("failed to send transaction {:?}: {status}", tx.txid());
+                    wallet_tx.status = TxStatus::SoftFail(fail_h); // i.e. built but not sent
+                    wallet_tx.h = fail_h;
+                }
+            }
         }
 
         wallet_tx.is_on_bc()
@@ -1556,7 +1602,9 @@ impl ManualWallet {
 
         //-- VERY EXPENSIVE TX CREATION (PARTICULARLY IF SHIELDED OUTPUT)
         use rand_chacha::ChaCha20Rng;
-        let prover = LocalTxProver::bundled();
+        // bundled() re-parses the Sapling proving parameters; once per process is plenty
+        static PROVER: OnceLock<LocalTxProver> = OnceLock::new();
+        let prover = PROVER.get_or_init(LocalTxProver::bundled);
         let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
 
         match txb.build(
@@ -1565,13 +1613,15 @@ impl ManualWallet {
             &o_keys,
             staking_signing_key,
             rng,
-            &prover,
-            &prover,
+            prover,
+            prover,
             &zip317::FeeRule::standard(),
         ) {
             Ok(tx_res) => {
+                let expiry_h = BlockHeight::from(tx_res.transaction().expiry_height());
                 tx.tx = WalletTx {
                     txid: tx_res.transaction().txid(),
+                    expiry_h: if expiry_h.0 == 0 { None } else { Some(expiry_h) },
                     h: BlockHeight::BUILT,
                     status: TxStatus::OnBc,
                     ..tx.tx
@@ -1639,7 +1689,9 @@ impl ManualWallet {
                     // - not too close to tip (reduced probability of loss through reorg)
                     // - spendable note heights (must be higher than all needed)
                     //   - more notes needed if fees change -> change in anchor
-                    orchard_anchor_h = self.chain_tip_h.sat_sub(1);
+                    // Checkpoints only exist for blocks the wallet has scanned, so the anchor
+                    // has to trail the *scanned* height, not the network tip.
+                    orchard_anchor_h = self.chain_tip_h.min(self.sync_h).sat_sub(1);
                     orchard_anchor = match shardtree.root_at_checkpoint_id(&orchard_anchor_h).expect("Infallible MemoryShardStore") {
                         Some(root) => orchard::Anchor::from(root),
                         None => {
@@ -2190,7 +2242,8 @@ impl ManualWallet {
         let account = &self.accounts[0];
         let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
         let (_t_addr, _p2sh, ua) = addrs_from_account(account, 0).unwrap(); // @Hack
-        if let (Some(ovk), Some(&dst)) = (keys.orchard_ovk, ua.orchard()) {
+        // the payout arrives as change, which needs an ovk and our own Ironwood address
+        if let (Some(_ovk), Some(&_dst)) = (keys.orchard_ovk, ua.orchard()) {
             let amount_zats = match client.get_bond_info(zcash_client_backend::proto::service::BondInfoRequest { bond_key: bond_key.to_vec(), }).await {
                 Ok(response) => {
                     let info = response.into_inner();
@@ -2203,9 +2256,9 @@ impl ManualWallet {
             };
             self.seen_bond_values.insert(bond_key, amount_zats);
 
-            let memo = MemoBytes::from_bytes("Claimed bond".as_bytes()).unwrap();
-            let zats = to_zats_or_dump_err("claim bond", amount_zats)?;
-            let out = &[TxOutput::Ironwood{ ovk: Some(ovk), dst, zats, memo }];
+            // No explicit output: the withdrawal is the sole spend, so the builder's change
+            // path pays the bond (less fee) back to our own Ironwood address. An explicit
+            // output of the full amount would fail as unaffordable once the fee is added.
             let opts = &TxOptions{
                 src_pools: &[],
                 staking_action: Some(StakingAction::WithdrawDelegationBond {
@@ -2429,6 +2482,41 @@ fn txo_spent_h_position(notes: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint)
     }
     None
 }
+/// RECONCILE A KNOWN NOTE WITH A FRESH SIGHTING, MOVING IT IF ITS HEIGHT CHANGED
+// A note first seen in the mempool sits at `recv_h == MEMPOOL`. When the block holding it is
+// scanned the record has to physically move: `recv_h` is the key the `*_h_position` lookups
+// binary-search on, so an in-place height change would strand it (and the next sighting would
+// insert a duplicate). Heights only ever move from a sentinel to a block, never back.
+// Returns whether the record moved.
+fn orchard_recv_h_update(notes: &mut Vec<OrchardNote>, i: usize, new_note: OrchardNote) -> bool {
+    let moved = new_note.recv_h.is_in_block() && !notes[i].recv_h.is_in_block();
+    if moved {
+        let mut note = notes.remove(i);
+        note.recv_h = new_note.recv_h;
+        note.monotonically_update(new_note);
+        orchard_recv_h_insert(notes, note);
+    } else {
+        notes[i].monotonically_update(new_note);
+    }
+    moved
+}
+fn txo_recv_h_update(notes: &mut Vec<Txo>, i: usize, new_txo: &Txo) -> bool {
+    let moved = new_txo.recv_h.is_in_block() && !notes[i].recv_h.is_in_block();
+    let i = if moved {
+        let mut txo = notes.remove(i);
+        txo.recv_h = new_txo.recv_h;
+        txo_recv_h_insert(notes, txo);
+        txo_recv_h_position(notes, new_txo.recv_h, &new_txo.id).expect("just inserted")
+    } else {
+        i
+    };
+    let expected = Txo { recv_h: notes[i].recv_h, ..new_txo.clone() };
+    if notes[i] != expected {
+        println!("ERROR: UTXO mismatch: {:?} vs {:?}", notes[i], new_txo);
+    }
+    moved
+}
+
 fn tx_h_position(txs: &[WalletTx], block_h: BlockHeight, txid: &TxId) -> Option<usize> {
     let mut i = txs.partition_point(|tx| tx.h < block_h);
     while i < txs.len() && txs[i].h == block_h {
@@ -2531,9 +2619,9 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
     for (note_i, note) in account.unspent_orchard_notes.iter().enumerate() {
         if note.nf == *spent_nf {
             // this action is a spend by us with this note/nullifier: move it to spent
+            // (fallible work first: a `?` between the remove and the insert would drop the note)
+            s.spent(to_zats_or_dump_err("read orchard action spend", note.note.value().inner())?, true)?;
             let unspent_note = account.unspent_orchard_notes.remove(note_i);
-
-            s.spent(to_zats_or_dump_err("read orchard action spend", unspent_note.note.value().inner())?, true)?;
             let spent_note = OrchardNote { spent_h: block_h, ..unspent_note };
             orchard_spent_h_insert(&mut account.spent_orchard_notes, spent_note.clone());
             // println!("{} found new spent note at {block_h:?}, tree pos={:02}: spent_nf:{:?}", wallet.name, u64::from(position), *spent_nf);
@@ -2555,11 +2643,24 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
         }
     }
     if s.spent_note_count == 0 {
-        for note in &account.spent_orchard_notes {
+        let mut spent_i = None;
+        for (i, note) in account.spent_orchard_notes.iter().enumerate() {
             if note.nf == *spent_nf {
-                s.spent(to_zats_or_dump_err("read orchard action spend", note.note.value().inner())?, true)?;
-                // println!("{} found old spent note at {block_h:?}, tree pos={:02}", wallet.name, u64::from(position));
+                spent_i = Some(i);
                 break;
+            }
+        }
+        if let Some(i) = spent_i {
+            s.spent(to_zats_or_dump_err("read orchard action spend", account.spent_orchard_notes[i].note.value().inner())?, true)?;
+            // println!("{} found old spent note at {block_h:?}, tree pos={:02}", wallet.name, u64::from(position));
+            // A spend first seen in the mempool sits at `spent_h == MEMPOOL`; this is where the
+            // block scan finds it, so this is where it moves to its mined height (spent_h is the
+            // sort key, see orchard_recv_h_update). Left at MEMPOOL, the next reorg pass would
+            // truncate it and un-spend the note.
+            if block_h.is_in_block() && !account.spent_orchard_notes[i].spent_h.is_in_block() {
+                let mut note = account.spent_orchard_notes.remove(i);
+                note.spent_h = block_h;
+                orchard_spent_h_insert(&mut account.spent_orchard_notes, note);
             }
         }
     }
@@ -2605,7 +2706,20 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
 
         // TODO: can we just check if we've seen the tx && tx.is_on_bc()
         let have_seen = if let Some(i) = orchard_recv_h_position(&account.recv_orchard_notes, txid_h, &orchard_note.nf) {
-            account.recv_orchard_notes[i].monotonically_update(orchard_note);
+            if orchard_recv_h_update(&mut account.recv_orchard_notes, i, orchard_note) {
+                #[cfg(debug_assertions)]
+                {
+                    let mut g_log = NOTE_LOG.lock().unwrap();
+                    let (tx_log, seq) = g_log.get_or_new(wallet.name, txid, "receive");
+                    tx_log.push(DevNoteAction{
+                        seq,
+                        kind: DevNoteActionKind::Recv,
+                        note: DevNote::OrchardNote(orchard_note),
+                        action_h: block_h,
+                        tip_h: wallet.chain_tip_h,
+                    });
+                }
+            }
             true
         } else {
             #[cfg(debug_assertions)]
@@ -2626,7 +2740,7 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
         };
 
         if let Some(i) = orchard_recv_h_position(&account.unspent_orchard_notes, txid_h, &orchard_note.nf) {
-            account.unspent_orchard_notes[i].monotonically_update(orchard_note);
+            orchard_recv_h_update(&mut account.unspent_orchard_notes, i, orchard_note);
         } else if !have_seen {
             orchard_recv_h_insert(&mut account.unspent_orchard_notes, orchard_note);
         }
@@ -2677,9 +2791,10 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
             for input in &t_bundle.vin {
                 if let Some(&prevout_txid_h) = wallet.tx_h_map.get(input.prevout.txid()) {
                     if let Some(utxo_i) = txo_recv_h_position(&account.utxos, prevout_txid_h, &input.prevout) {
+                        // fallible work first: a `?` between the remove and the insert would drop the txo
+                        t.spent(account.utxos[utxo_i].value, true)?;
                         let utxo = account.utxos.remove(utxo_i);
                         let stxo = Txo { spent_h: block_h, ..utxo };
-                        t.spent(stxo.value, true)?;
 
                         #[cfg(debug_assertions)]
                         {
@@ -2738,10 +2853,14 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
                         block_h
                     };
                     if let Some(utxo_i) = txo_recv_h_position(&account.utxos, txid_h, &utxo.id) {
-                        if account.utxos[utxo_i] != utxo {
-                            println!("ERROR: UTXO mismatch: {:?} vs {:?}", account.utxos[utxo_i], &utxo);
+                        txo_recv_h_update(&mut account.utxos, utxo_i, &utxo);
+                        if let Some(txo_i) = txo_recv_h_position(&account.recv_txos, txid_h, &utxo.id) {
+                            txo_recv_h_update(&mut account.recv_txos, txo_i, &utxo);
                         }
-                    } else if txo_recv_h_position(&account.recv_txos, txid_h, &utxo.id).is_none() {
+                    } else if let Some(txo_i) = txo_recv_h_position(&account.recv_txos, txid_h, &utxo.id) {
+                        // already spent; only the receive record is left to reconcile
+                        txo_recv_h_update(&mut account.recv_txos, txo_i, &utxo);
+                    } else {
                         #[cfg(debug_assertions)]
                         {
                             let mut g_log = NOTE_LOG.lock().unwrap();
@@ -3062,6 +3181,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             accounts: vec![account.clone()],
             strms: Vec::new(),
             chain_tip_h: BlockHeight(0),
+            sync_h: BlockHeight(0),
             branch_mismatch: None,
             txs: Vec::new(),
             tx_h_map: HashMap::new(),
@@ -3337,6 +3457,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         if let Some(global_seed) = *GLOBAL_SEED.lock().unwrap() {
             break global_seed;
         }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     };
 
     let network = &TEST_NETWORK;
@@ -3728,8 +3849,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             voting_power: member.voting_power,
                             txids: member.txids.clone()
                         })
-                    .collect::<Vec<WalletRosterMember>>()
-                        .clone();
+                    .collect::<Vec<WalletRosterMember>>();
                     if DUMP_ROSTER { println!("*********** WALLET ROSTER: {wallet_roster:?}"); }
                     wallet_state.lock().unwrap().roster = wallet_roster;
                 }
@@ -3968,7 +4088,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // TRANSPARENT TRANSACTIONS
             // TODO: this should no longer be tied to updating when compact blocks do now that we have independent streams
             let mut new_t_txs = Vec::<(BlockHeight, Transaction, /*wallet_i*/usize, /*strm_i*/usize)>::new();
-            let wallets = [&mut user_wallet, &mut miner_wallet];
+            let wallets = [&mut miner_wallet, &mut user_wallet]; // wallet_i order: miner, user (everywhere)
             for wallet_i in 0..2 {
                 'strms_t_sync: for strm_i in 0..wallets[wallet_i].strms.len() {
                     // ********************************************************************************
@@ -4106,6 +4226,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
         let wallets_sync_h = BlockHeight((pow_cache.next_tip_h-1).try_into().unwrap());
         let network_tip_h = user_wallet.chain_tip_h;
+        for wallet in [&mut miner_wallet, &mut user_wallet] {
+            wallet.sync_h = wallets_sync_h;
+        }
 
         // let mut orchard_frontier = prev_tip_chain_state.final_orchard_tree().clone();
         // let mut orchard_tree = incrementalmerkletree::frontier::CommitmentTree::from_frontier(&orchard_frontier);
@@ -4240,18 +4363,24 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 for tx in &mut wallet.txs[invalidate_from_i..] {
                     if tx.h > BlockHeight::MEMPOOL {
                         // mid-construction items aren't auto-invalidated
-                        // maybe sent should be?
+                        // (sent ones are handled by the expiry sweep after the block scan)
                         break;
                     }
                     if !tx.is_on_bc() {
-                        continue;
+                        continue; // already failed: keep its fail height and reason
                     }
                     // N.B. these may get revalidated later if the same txs are found in the new blocks
-                    tx.status = TxStatus::SoftFail(tx.h);
-                    tx.h = wallet.chain_tip_h;
-                    wallet.tx_h_map.remove(&tx.txid);
+                    // The fail height is the last block still believed in, not the network tip:
+                    // the tip can be far above the scan front and the entry would float above
+                    // every real tx (and be re-invalidated, and climb, every batch).
+                    let fail_h = if tx.h.is_in_block() { tx.h } else { last_block_h };
+                    tx.status = TxStatus::SoftFail(fail_h);
+                    tx.h = last_block_h;
                     wallet.tx_h_map.insert(tx.txid, tx.h);
                 }
+                // skipped entries keep heights >= block_h while the rest dropped to
+                // last_block_h; restore the h order the position lookups depend on
+                wallet.txs[invalidate_from_i..].sort_by_key(|tx| tx.h);
             }
         }
 
@@ -4279,7 +4408,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // } else {
             //     req_rng.0.try_into.expect("fits in u32")
             // };
-            let wallets = [&mut user_wallet, &mut miner_wallet];
+            let wallets = [&mut miner_wallet, &mut user_wallet]; // wallet_i order: miner, user (everywhere)
             let keys = [
                 PreparedKeys::from_ufvk_all(&wallets[0].accounts[0].ufvk),
                 PreparedKeys::from_ufvk_all(&wallets[1].accounts[0].ufvk),
@@ -4302,7 +4431,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         {
             // TODO: maybe wait until we're ~block-synced before doing this
             // NOTE: assumes we can keep up... maybe dropping with some feedback about that is better?
-            let wallets = [&mut user_wallet, &mut miner_wallet];
+            let wallets = [&mut miner_wallet, &mut user_wallet];
             let keys = [
                 PreparedKeys::from_ufvk_all(&wallets[0].accounts[0].ufvk),
                 PreparedKeys::from_ufvk_all(&wallets[1].accounts[0].ufvk),
@@ -4431,10 +4560,44 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     if DUMP_SYNC { println!("reading downloaded full tx for {txid:?}"); }
                     let keys = PreparedKeys::from_ufvk_all(&wallets[wallet_i].accounts[0].ufvk);
 
-                    read_full_tx(wallets[wallet_i], 0, &keys, existing_tx.h, &tx, &mut 0, existing_tx.status);
+                    // read at the height the node reports, not the stale one we requested at:
+                    // a mempool-requested tx that has since been mined must land at its block
+                    read_full_tx(wallets[wallet_i], 0, &keys, found_h, &tx, &mut 0, existing_tx.status);
                 }
             }
             if DUMP_SYNC { println!("after  reading, there are {} in flight tx downloads", in_flight_tx_requests.len()); }
+        }
+
+        //-- EXPIRE UNMINED TXS
+        // The mempool stream delivers a tx once and nothing re-delivers a dropped one, so a tx
+        // that hasn't reached a block by its expiry height is dead: no later block can hold it.
+        // This runs after the block scan so the scan front is current.
+        let wallets_sync_h = BlockHeight(u32::try_from(pow_cache.next_tip_h-1).unwrap());
+        for wallet in [&mut miner_wallet, &mut user_wallet] {
+            wallet.sync_h = wallets_sync_h;
+            for account in &mut wallet.accounts {
+                account.fully_detected_h = wallets_sync_h;
+            }
+
+            let mut expired = Vec::new();
+            for tx in &wallet.txs {
+                let Some(expiry_h) = tx.expiry_h else { continue; };
+                let unmined = !tx.h.is_in_block() || !tx.is_on_bc();
+                let already_hard = matches!(tx.status, TxStatus::HardFail(..));
+                if unmined && !already_hard && expiry_h < wallets_sync_h {
+                    expired.push((tx.txid, expiry_h));
+                }
+            }
+            for (txid, expiry_h) in expired {
+                let Some(tx_i) = tx_position(wallet, &txid) else { continue; };
+                println!("{} wallet: tx {txid} expired unmined at {expiry_h}", wallet.name);
+                let mut tx = wallet.txs[tx_i];
+                tx.status = TxStatus::HardFail(expiry_h, ErrBuf::from_str("expired unmined"));
+                tx.h = expiry_h;
+                let mut insert_i = 0;
+                update_insert_i(&wallet.txs, &mut insert_i, tx.h);
+                update_with_tx(wallet, tx, &mut insert_i);
+            }
         }
 
         //-- SEND DATA TO UI
@@ -4597,8 +4760,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 *STAKING_POSITIONS.lock().unwrap() = (active, withdrawable);
             }
 
-            fn push_if_proposed_tx(arr: &mut[WalletTx], n: &mut usize, proposed: &ProposedTx, min_stage: BlockHeight) -> bool {
-                if proposed.is_in_progress() && proposed.tx.h >= min_stage && proposed.tx.h != BlockHeight::INVALID {
+            // is_in_progress() covers the whole SENT..=PROPOSED range (the stage constants
+            // *descend* with progress, so a `>= PROPOSED` bound would admit only PROPOSED)
+            fn push_if_proposed_tx(arr: &mut[WalletTx], n: &mut usize, proposed: &ProposedTx) -> bool {
+                if proposed.is_in_progress() {
                     // TODO: ordering by sequence number?
                     arr[*n] = proposed.tx;
                     *n += 1;
@@ -4611,10 +4776,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let mut user_local_txs_n = 0;
             let mut miner_local_txs = [WalletTx::EMPTY; 3];
             let mut miner_local_txs_n = 0;
-            let waiting_for_send = push_if_proposed_tx(&mut user_local_txs, &mut user_local_txs_n, &proposed_send, BlockHeight::PROPOSED);
-            let waiting_for_stake_to_finalizer = push_if_proposed_tx(&mut user_local_txs, &mut user_local_txs_n, &proposed_stake, BlockHeight::PROPOSED);
-            let waiting_for_faucet = push_if_proposed_tx(&mut miner_local_txs, &mut miner_local_txs_n, &proposed_faucet, BlockHeight::PROPOSED);
-            let waiting_for_shield = push_if_proposed_tx(&mut miner_local_txs, &mut miner_local_txs_n, &proposed_miner_shield, BlockHeight::PROPOSED);
+            let waiting_for_send = push_if_proposed_tx(&mut user_local_txs, &mut user_local_txs_n, &proposed_send);
+            let waiting_for_stake_to_finalizer = push_if_proposed_tx(&mut user_local_txs, &mut user_local_txs_n, &proposed_stake);
+            let waiting_for_faucet = push_if_proposed_tx(&mut miner_local_txs, &mut miner_local_txs_n, &proposed_faucet);
+            let waiting_for_shield = push_if_proposed_tx(&mut miner_local_txs, &mut miner_local_txs_n, &proposed_miner_shield);
 
             // CHEATING USER-VIEW OF FAUCET BUILD
             if proposed_faucet.is_user_faucet {
@@ -4624,7 +4789,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     tx_res: None,
                     is_user_faucet: false,
                 };
-                push_if_proposed_tx(&mut user_local_txs, &mut user_local_txs_n, &user_view_of_faucet_tx, BlockHeight::PROPOSED);
+                push_if_proposed_tx(&mut user_local_txs, &mut user_local_txs_n, &user_view_of_faucet_tx);
             }
 
             let new_wallet_state_push_time = Instant::now();
@@ -4915,13 +5080,19 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             println!("unexpectedly no prep ready for build");
                         };
 
-                        if ! ok { // give it a final failed height
-                            tx.tx.status = TxStatus::HardFail(tx.tx.h, ErrBuf::from_str("failed to build"));
-                            tx.tx.h = wallet.chain_tip_h;
+                        if ! ok { // give it a final failed height (see send_built_tx for why sync_h)
+                            let fail_h = wallet.sync_h;
+                            tx.tx.status = TxStatus::HardFail(fail_h, ErrBuf::from_str("failed to build"));
+                            tx.tx.h = fail_h;
+                        } else {
+                            // A failed build has no txid (only build_tx_from_prep assigns one);
+                            // recording it would file every failed build under the all-zero id and
+                            // merge their parts into one phantom entry. Same guard as the faucet
+                            // user-copy below.
+                            let mut insert_i = 0;
+                            update_insert_i(&wallet.txs, &mut insert_i, tx.tx.h);
+                            update_with_tx(wallet, tx.tx, &mut insert_i);
                         }
-                        let mut insert_i = 0;
-                        update_insert_i(&wallet.txs, &mut insert_i, tx.tx.h);
-                        update_with_tx(wallet, tx.tx, &mut insert_i);
                         let result = tx.tx;
 
                         if loud {
@@ -4964,8 +5135,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             }
 
+            let is_user_faucet = proposed_faucet.is_user_faucet; // continue_proposed_tx resets the slot on completion
             let faucet_tx = continue_proposed_tx(&mut miner_wallet, network, &mut proposed_faucet, &mut client, "faucet send",  DUMP_TX_SEND).await;
-            if proposed_faucet.is_user_faucet && faucet_tx.txid != TxId::from_bytes([0;32]) {
+            if is_user_faucet && faucet_tx.txid != TxId::from_bytes([0;32]) {
                 let user_faucet_tx = user_view_of_faucet_tx(&faucet_tx);
                 let mut insert_i = 0;
                 update_insert_i(&user_wallet.txs, &mut insert_i, user_faucet_tx.h);
