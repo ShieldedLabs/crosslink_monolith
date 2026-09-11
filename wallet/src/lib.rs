@@ -762,7 +762,11 @@ pub struct WalletTx {
     pub account_id: usize,
     pub txid: zcash_protocol::TxId,
     pub expiry_h: Option<BlockHeight>,
-    pub h: BlockHeight,  // this is a logical height that is focused on ordering
+    // Where the record sits on the single stage/height axis (see BlockHeight): a mined height,
+    // or a lifecycle stage for anything not yet in a block. Sort key. For a failed tx it is the
+    // real height at which the failure was established; the stage it failed *from* lives in
+    // `status`, so "failed to build" and "failed in the mempool" stay expressible.
+    pub h: BlockHeight,
 
     // TODO: track whether full Transaction has been read
     pub is_coinbase: bool,
@@ -1504,15 +1508,17 @@ impl ManualWallet {
 
         //-- EXPENSIVE NETWORK SEND
         // TODO: don't block, maybe return a future?
-        // A failure is pinned at the wallet's own synced height: the network tip can be far
-        // above anything the wallet has scanned, which would float the entry above every
-        // real tx. The same height goes in the status, which is what reported_height() shows.
+        // On failure the status keeps the stage it failed from (BUILT here: the GUI reads that
+        // as "failed to send") and the record itself is pinned at the wallet's own synced
+        // height. Not the network tip: that can be far above anything scanned, which floated
+        // the entry above every real tx.
+        let fail_stage = wallet_tx.h;
         let fail_h = self.sync_h;
         let mut raw_tx = RawTransaction{ data: Vec::new(), height: 0 };
         if let Err(err) = tx.write(&mut raw_tx.data) {
             println!("couldn't serialize transaction for network send: {err:?}");
             let err_buf = ErrBuf::from_str(&format!("couldn't serialize: {err:?}"));
-            wallet_tx.status = TxStatus::HardFail(fail_h, err_buf); // i.e. built but not sent
+            wallet_tx.status = TxStatus::HardFail(fail_stage, err_buf);
             wallet_tx.h = fail_h;
         } else {
             let tx_size = raw_tx.data.len();
@@ -1530,13 +1536,13 @@ impl ManualWallet {
                     } else {
                         println!("node rejected transaction {:?} ({}): {}", tx.txid(), resp.error_code, resp.error_message);
                         let err_buf = ErrBuf::from_str(&format!("rejected ({}): {}", resp.error_code, resp.error_message));
-                        wallet_tx.status = TxStatus::HardFail(fail_h, err_buf);
+                        wallet_tx.status = TxStatus::HardFail(fail_stage, err_buf);
                         wallet_tx.h = fail_h;
                     }
                 }
                 Err(status) => {
                     println!("failed to send transaction {:?}: {status}", tx.txid());
-                    wallet_tx.status = TxStatus::SoftFail(fail_h); // i.e. built but not sent
+                    wallet_tx.status = TxStatus::SoftFail(fail_stage);
                     wallet_tx.h = fail_h;
                 }
             }
@@ -4370,11 +4376,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         continue; // already failed: keep its fail height and reason
                     }
                     // N.B. these may get revalidated later if the same txs are found in the new blocks
-                    // The fail height is the last block still believed in, not the network tip:
-                    // the tip can be far above the scan front and the entry would float above
-                    // every real tx (and be re-invalidated, and climb, every batch).
-                    let fail_h = if tx.h.is_in_block() { tx.h } else { last_block_h };
-                    tx.status = TxStatus::SoftFail(fail_h);
+                    // The status keeps where it fell from (its block, or MEMPOOL); the record
+                    // is pinned at the last block still believed in, not the network tip: the
+                    // tip can be far above the scan front and the entry would float above every
+                    // real tx (and be re-invalidated, and climb, every batch).
+                    tx.status = TxStatus::SoftFail(tx.h);
                     tx.h = last_block_h;
                     wallet.tx_h_map.insert(tx.txid, tx.h);
                 }
@@ -4592,7 +4598,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 let Some(tx_i) = tx_position(wallet, &txid) else { continue; };
                 println!("{} wallet: tx {txid} expired unmined at {expiry_h}", wallet.name);
                 let mut tx = wallet.txs[tx_i];
-                tx.status = TxStatus::HardFail(expiry_h, ErrBuf::from_str("expired unmined"));
+                // keep the stage it died from (SENT/MEMPOOL, or an earlier soft-fail's stage)
+                let fail_stage = tx.status.to_any_fail().unwrap_or(tx.h);
+                tx.status = TxStatus::HardFail(fail_stage, ErrBuf::from_str("expired unmined"));
                 tx.h = expiry_h;
                 let mut insert_i = 0;
                 update_insert_i(&wallet.txs, &mut insert_i, tx.h);
@@ -5080,10 +5088,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             println!("unexpectedly no prep ready for build");
                         };
 
-                        if ! ok { // give it a final failed height (see send_built_tx for why sync_h)
-                            let fail_h = wallet.sync_h;
-                            tx.tx.status = TxStatus::HardFail(fail_h, ErrBuf::from_str("failed to build"));
-                            tx.tx.h = fail_h;
+                        if ! ok { // status keeps the PROPOSED stage ("failed to build"); see send_built_tx for why sync_h
+                            tx.tx.status = TxStatus::HardFail(tx.tx.h, ErrBuf::from_str("failed to build"));
+                            tx.tx.h = wallet.sync_h;
                         } else {
                             // A failed build has no txid (only build_tx_from_prep assigns one);
                             // recording it would file every failed build under the all-zero id and
