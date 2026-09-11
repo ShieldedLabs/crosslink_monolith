@@ -24,7 +24,7 @@ fn funding_stream_address_index(
         return None;
     }
 
-    if network.magic().0 == [b'C',b'l',b'T',b'0'] {
+    if network.magic().0 == [b'C',b'N',b'i',b'0'] {
         return Some(0);
     }
 

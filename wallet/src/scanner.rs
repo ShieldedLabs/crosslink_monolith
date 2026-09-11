@@ -46,7 +46,7 @@ pub fn scan_tx(info: &mut ScanInfo, utxos: &mut HashSet<(PubKeyID, u32)>, tx_byt
                 // println!("Found a match in a coinbase transaction at height {height}! Value: {value:?}");
                 new_info = true;
                 info.coinbases_c += 1;
-                info.coinbases_value += 500_000_000; // hardcoded for @testnet ClT0
+                info.coinbases_value += 500_000_000; // hardcoded for @Crosslink @Testnet
                 debug_assert!(info.coinbase_max_height < height, "expected linear iteration");
                 info.coinbase_max_height = height;
             }

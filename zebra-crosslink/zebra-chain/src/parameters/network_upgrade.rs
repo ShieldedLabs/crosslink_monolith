@@ -136,7 +136,7 @@ pub(super) const MAINNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] 
 /// reached on this network -- and `Transaction::V6` / `Transaction::VCrosslink` carry
 /// NU6.3-era branch IDs. Until this is bumped to `Nu6_3`, the Ironwood-based Crosslink
 /// transaction cannot be used on the Crosslink testnet. Bumping it forks any running
-/// testnet (including ClT0), so it is left as-is pending that decision.
+/// Crosslink testnet, so the time to do it is when a new one starts from genesis.
 #[allow(unused)]
 pub(super) const TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] = &[
     (block::Height(0), Genesis),

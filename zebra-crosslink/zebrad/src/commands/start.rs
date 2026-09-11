@@ -272,10 +272,10 @@ impl StartCmd {
 
         let is_regtest = config.network.network.is_regtest();
 
-        let is_clt0 = 'is_clt0: { // Crosslink_Testnet_0
+        let is_crosslink_testnet = 'is_crosslink_testnet: {
             if let Network::Testnet(params) = &config.network.network {
-                if params.network_magic().0 == [b'C',b'l',b'T',b'0'] {
-                    break 'is_clt0 true;
+                if params.network_magic().0 == [b'C',b'N',b'i',b'0'] {
+                    break 'is_crosslink_testnet true;
                 }
             }
             false
@@ -352,7 +352,7 @@ impl StartCmd {
                 },
                 ..Arc::unwrap_or_clone(config)
             })
-        } else if is_clt0 {
+        } else if is_crosslink_testnet {
             // debug_enable_at_height: Some(0)
             Arc::new(ZebradConfig {
                 // mempool: mempool::Config {
@@ -616,7 +616,7 @@ impl StartCmd {
             // for a block only it can write.
             let genesis_block_for_new_network: Arc<zebra_chain::block::Block> = if is_regtest {
                 regtest_genesis_block()
-            } else if is_clt0 {
+            } else if is_crosslink_testnet {
                 use zebra_chain::serialization::ZcashDeserialize;
                 let genesis_bytes = include_bytes!("../../../ClT0-genesis.pow");
                 Arc::new(zebra_chain::block::Block::zcash_deserialize(&genesis_bytes[..]).expect("hardcoded genesis must be valid"))
@@ -831,7 +831,7 @@ impl StartCmd {
         );
 
         info!("spawning syncer task");
-        let syncer_task_handle = if is_regtest || is_clt0 {
+        let syncer_task_handle = if is_regtest || is_crosslink_testnet {
             // Genesis is committed by new_network at startup: it owns the block writer, so no
             // one else can. See the genesis handling in `new_network::sync`.
             tokio::spawn(std::future::pending().in_current_span())

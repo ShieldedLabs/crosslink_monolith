@@ -240,7 +240,7 @@ impl ZebradConfig {
         // to running with no config file.
         config.state
             .cache_dir
-            .push("crosslink_nightly_20260909");
+            .push("crosslink_nightly_20260911");
 
         // Merge user-led hardforks with the ones shipped in the executable, validate
         // them, and store the canonical (sorted, deduplicated) list back. Building
@@ -310,8 +310,8 @@ impl ZebradConfig {
                 },
 
                 network: testnet::Parameters::build()
-                    // .with_network_name("Crosslink_Testnet_0")
-                    .with_network_magic(Magic([67, 108, 84, 48]))
+                    // .with_network_name("Crosslink_Nightly_0")
+                    .with_network_magic(Magic([b'C',b'N',b'i',b'0']))
                     .expect("Crosslink testnet magic is not a reserved value")
                     .with_slow_start_interval(Height(0))
                     .with_genesis_hash("05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38")
