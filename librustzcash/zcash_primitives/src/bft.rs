@@ -740,7 +740,7 @@ impl FinalizerAddress {
 /// key, larger first). Tenderlink votes with exactly this set, and PoS issuance credits
 /// commission only to finalizers inside it, so a bond pointed at a key outside the roster
 /// never opens a reward bank.
-pub const ACTIVE_ROSTER_MAX_N: usize = 100;
+pub const ACTIVE_ROSTER_MAX_N: usize = 3; // @Nightly test
 
 /// Domain prefix of the message a finalizer signs to release reward-bank value into a
 /// bond (`StakingAction::ConvertFinalizerRewardToDelegationBond`).
