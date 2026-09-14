@@ -48,6 +48,54 @@ pub const BLOCK_TEMPLATE_WAIT_TIME: Duration = Duration::from_secs(20);
 /// A rate-limit for block template refreshes.
 pub const BLOCK_TEMPLATE_REFRESH_LIMIT: Duration = Duration::from_secs(2);
 
+/// Returns `true` when `new_header` should replace the template being solved.
+///
+/// Replacing the template cancels every solver working on it (see `cancel_fn` in
+/// [`run_mining_solver`]), throwing away the partial Equihash work they have done. On a chain
+/// producing blocks every few seconds that is a real cost, so old work is kept whenever it is
+/// still useful.
+///
+/// Adapted from Zakura's `should_replace_mining_template`
+/// (PR #748), with one addition crosslink needs:
+///
+/// # Correctness
+///
+/// `submit_old` alone is **not** sufficient here. It is derived from the long poll ID, which
+/// covers the tip height, the tip hash and the max time (see
+/// `zebra_rpc::methods::types::long_poll::LongPollId::submit_old`) — and nothing else. But a
+/// crosslink header also commits to a BFT fat pointer, which `getblocktemplate` fetches from the
+/// TFL service *after* the long poll loop has already decided `submit_old`. The BFT chain tip
+/// advances independently of the PoW tip, so `submit_old == Some(true)` can accompany a header
+/// whose fat pointer has moved.
+///
+/// Keeping old work in that case would carry on solving — and then submit — a block pointing at a
+/// superseded BFT block. So a changed fat pointer always replaces the template, whatever
+/// `submit_old` says.
+fn should_replace_mining_template(
+    current_header: Option<&block::Header>,
+    new_header: &block::Header,
+    submit_old: Option<bool>,
+) -> bool {
+    // Nothing is being solved, so there is no work to preserve.
+    let Some(current_header) = current_header else {
+        return true;
+    };
+
+    // Guard against `get_block_template()` returning an identical header.
+    if current_header == new_header {
+        return false;
+    }
+
+    // A superseded BFT fat pointer invalidates the work regardless of `submit_old`.
+    if current_header.fat_pointer_to_bft_block != new_header.fat_pointer_to_bft_block {
+        return true;
+    }
+
+    // Otherwise keep the solver's progress when the server says shares built on the old
+    // template can still be submitted — which it does for mempool-only changes.
+    submit_old != Some(true)
+}
+
 /// How long we wait after mining a block, before expecting a new template.
 ///
 /// This should be slightly longer than `BLOCK_TEMPLATE_REFRESH_LIMIT` to allow for template
@@ -420,9 +468,12 @@ where
             rpc.network(),
         )?;
 
-        // If the template has actually changed, send an updated template.
+        // Replace the template only when the old work is no longer useful, so that a
+        // mempool-only update does not cancel every solver mid-Equihash.
+        let submit_old = template.submit_old();
         template_sender.send_if_modified(|old_block| {
-            if old_block.as_ref().map(|b| b.header.clone()) == Some(block.header.clone()) {
+            let current_header = old_block.as_ref().map(|b| b.header.as_ref());
+            if !should_replace_mining_template(current_header, &block.header, submit_old) {
                 return false;
             }
             *old_block = Some(Arc::new(block));
@@ -719,4 +770,104 @@ where
     Ok(solved_blocks
         .try_into()
         .expect("a 1:1 mapping of AtLeastOne produces at least one block"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use zebra_chain::{
+        block::{merkle, FatPointerToBftBlock, Hash},
+        work::difficulty::CompactDifficulty,
+    };
+
+    /// Returns a header that differs from others only where a test changes it.
+    fn header() -> block::Header {
+        block::Header {
+            version: 5,
+            previous_block_hash: Hash([0; 32]),
+            merkle_root: merkle::Root([0; 32]),
+            commitment_bytes: [0; 32].into(),
+            time: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
+            difficulty_threshold: CompactDifficulty::default(),
+            nonce: [0; 32].into(),
+            solution: Solution::for_proposal(),
+            fat_pointer_to_bft_block: FatPointerToBftBlock::null(),
+        }
+    }
+
+    /// With nothing being solved there is no work to preserve.
+    #[test]
+    fn the_first_template_is_always_taken() {
+        assert!(should_replace_mining_template(None, &header(), Some(true)));
+    }
+
+    /// `get_block_template()` can return a header identical to the one being solved.
+    #[test]
+    fn an_identical_header_is_not_a_replacement() {
+        assert!(!should_replace_mining_template(
+            Some(&header()),
+            &header(),
+            None
+        ));
+    }
+
+    /// A mempool-only change keeps the solver's progress.
+    ///
+    /// This is the case the port exists for: before it, any header difference — including a
+    /// one-second timestamp bump — cancelled every solver mid-Equihash.
+    #[test]
+    fn mempool_only_changes_keep_the_current_template() {
+        let current = header();
+        let mut new = header();
+        new.merkle_root = merkle::Root([1; 32]);
+
+        assert!(
+            !should_replace_mining_template(Some(&current), &new, Some(true)),
+            "submit_old = true means shares on the old template are still valid"
+        );
+    }
+
+    /// A new tip invalidates old work.
+    #[test]
+    fn a_new_tip_replaces_the_current_template() {
+        let current = header();
+        let mut new = header();
+        new.previous_block_hash = Hash([9; 32]);
+
+        assert!(should_replace_mining_template(
+            Some(&current),
+            &new,
+            Some(false)
+        ));
+        assert!(
+            should_replace_mining_template(Some(&current), &new, None),
+            "an absent submit_old must not be read as 'keep the old work'"
+        );
+    }
+
+    /// A superseded BFT fat pointer replaces the template even when `submit_old` says otherwise.
+    ///
+    /// `submit_old` is derived from the long poll ID, which covers the tip and the max time but
+    /// not the fat pointer, and the fat pointer is fetched after that decision is made. Keeping
+    /// old work here would solve and submit a block pointing at a superseded BFT block.
+    #[test]
+    fn a_changed_fat_pointer_replaces_the_current_template() {
+        let current = header();
+        let mut new = header();
+
+        let mut moved = FatPointerToBftBlock::null();
+        // Any difference will do; this is the vote the pointer carries.
+        moved.vote_for_block_without_finalizer_public_key[0] ^= 0xff;
+        new.fat_pointer_to_bft_block = moved;
+
+        assert_ne!(
+            current.fat_pointer_to_bft_block, new.fat_pointer_to_bft_block,
+            "the test must actually change the fat pointer"
+        );
+        assert!(
+            should_replace_mining_template(Some(&current), &new, Some(true)),
+            "a moved BFT fat pointer must replace the template despite submit_old = true"
+        );
+    }
 }
