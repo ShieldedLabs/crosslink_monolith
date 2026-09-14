@@ -1703,11 +1703,9 @@ async fn tfl_block_finality_from_height_hash(
     let block_hdr = (call.state)(StateRequest::BlockHeader(hash.into()));
     let (final_height, final_hash) = match tfl_final_block_height_hash(&internal_handle).await {
         Some(v) => v,
-        None => {
-            return Err(TFLServiceError::Misc(
-                "There is no final block.".to_string(),
-            ));
-        }
+        // Before the first Crosslink decision nothing is final, so neither is this block. This is
+        // an answer, not an error: reporting no final block is left to FinalBlockHeightHash.
+        None => return Ok(Some(TFLBlockFinality::NotYetFinalized)),
     };
 
     if height > final_height {
@@ -1895,10 +1893,12 @@ async fn tfl_service_incoming_request(
                 let (final_height, _final_hash) =
                     match tfl_final_block_height_hash(&internal_handle).await {
                         Some(v) => v,
+                        // Nothing is final yet, so neither is this transaction; see
+                        // tfl_block_finality_from_height_hash.
                         None => {
-                            return Err(TFLServiceError::Misc(
-                                "There is no final block.".to_string(),
-                            ));
+                            return Ok(TFLServiceResponse::TxFinalityStatus(Some(
+                                TFLBlockFinality::NotYetFinalized,
+                            )));
                         }
                     };
 
