@@ -84,6 +84,12 @@ pub use finalized_state::{OutputLocation, TransactionIndex, TransactionLocation}
 
 use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified};
 
+/// How often the cached database size estimate served to `getblockchaininfo` is re-measured.
+///
+/// The database grows by at most a few blocks between refreshes, so a stale estimate is
+/// within the error of the estimate itself.
+const DB_SIZE_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
 /// A read-write service for Zebra's cached blockchain state.
 ///
 /// This service modifies and provides access to:
@@ -388,6 +394,40 @@ impl StateService {
 
         tracing::info!("cached state consensus branch is valid: no legacy chain found");
         timer.finish(module_path!(), line!(), "legacy chain check");
+
+        // Keep the database size estimate that `getblockchaininfo` reads reasonably
+        // fresh. Measuring it queries a RocksDB property per column family, so it runs
+        // on a blocking thread and well away from the RPC path.
+        //
+        // `StateService::new` is also called from tests that have no tokio runtime, so
+        // only spawn when there is one.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let db = read_service.db.clone();
+
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(DB_SIZE_CACHE_REFRESH_INTERVAL);
+
+                loop {
+                    interval.tick().await;
+
+                    let db = db.clone();
+                    let refreshed = tokio::task::spawn_blocking(move || {
+                        db.refresh_cached_size();
+                        db.cached_size()
+                    })
+                    .await;
+
+                    match refreshed {
+                        Ok(size) => debug!(
+                            size_on_disk = size,
+                            "refreshed the cached database size estimate"
+                        ),
+                        // The runtime is shutting down.
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
 
         (state, read_service, latest_chain_tip, chain_tip_change, block_writer)
     }
@@ -878,20 +918,16 @@ impl Service<ReadRequest> for ReadStateService {
         match req {
             // Used by the `getblockchaininfo` RPC.
             ReadRequest::UsageInfo => {
-                let db = self.db.clone();
+                // Answered from the periodically-refreshed estimate (see
+                // `DB_SIZE_CACHE_REFRESH_INTERVAL`) rather than by querying a RocksDB
+                // property for every column family on each call. Monitoring tooling polls
+                // `getblockchaininfo` continuously, and the size it reports is an estimate
+                // either way.
+                let db_size = self.db.cached_size();
 
-                tokio::task::spawn_blocking(move || {
-                    span.in_scope(move || {
-                        // The work is done in the future.
+                timer.finish(module_path!(), line!(), "ReadRequest::UsageInfo");
 
-                        let db_size = db.size();
-
-                        timer.finish(module_path!(), line!(), "ReadRequest::UsageInfo");
-
-                        Ok(ReadResponse::UsageInfo(db_size))
-                    })
-                })
-                .wait_for_panics()
+                async move { Ok(ReadResponse::UsageInfo(db_size)) }.boxed()
             }
 
             // Used by the StateService.

@@ -367,8 +367,21 @@ impl ZebraDb {
     }
 
     /// Returns the estimated total disk space usage of the database.
+    ///
+    /// This walks every column family. Prefer [`ZebraDb::cached_size`] on a
+    /// latency-sensitive path.
     pub fn size(&self) -> u64 {
         self.db.size()
+    }
+
+    /// Returns the most recently cached estimate of the database's disk space usage.
+    pub fn cached_size(&self) -> u64 {
+        self.db.cached_size()
+    }
+
+    /// Re-measures the database's disk space usage and updates the cached estimate.
+    pub fn refresh_cached_size(&self) {
+        self.db.refresh_cached_size()
     }
 }
 

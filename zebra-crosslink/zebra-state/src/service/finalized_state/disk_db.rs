@@ -16,7 +16,10 @@ use std::{
     fs,
     ops::RangeBounds,
     path::Path,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use itertools::Itertools;
@@ -104,6 +107,18 @@ pub struct DiskDb {
     /// In [`MultiThreaded`](rocksdb::MultiThreaded) mode,
     /// only [`Drop`] requires exclusive access.
     db: Arc<DB>,
+
+    /// The most recent complete estimate of the database's total size on disk, in bytes.
+    ///
+    /// Measuring the size queries a RocksDB property for every column family, which is
+    /// too slow to do on each `getblockchaininfo` call. This cache is refreshed when the
+    /// database is opened, periodically by the state service, and opportunistically by
+    /// [`DiskDb::print_db_metrics`], which measures every column family anyway.
+    ///
+    /// Only complete measurements are stored, so a transient RocksDB property failure
+    /// leaves the previous estimate in place rather than reporting a size that is short
+    /// by one or more column families.
+    cached_size: Arc<AtomicU64>,
 }
 
 /// Wrapper struct to ensure low-level database writes go through the correct API.
@@ -551,6 +566,8 @@ impl DiskDb {
         let mut total_size_on_disk = 0;
         let mut total_live_size_on_disk = 0;
         let mut total_size_in_mem = 0;
+        let mut measured_column_family = false;
+        let mut complete_disk_measurement = true;
         let db: &Arc<DB> = &self.db;
         let db_options = DiskDb::options();
         let column_families = DiskDb::construct_column_families(db_options, db.path(), []);
@@ -566,10 +583,17 @@ impl DiskDb {
             let live_data_size = db
                 .property_int_value_cf(cf_handle, "rocksdb.estimate-live-data-size")
                 .unwrap_or(Some(0));
-            let total_sst_files_size = db
-                .property_int_value_cf(cf_handle, "rocksdb.total-sst-files-size")
-                .unwrap_or(Some(0));
-            let cf_disk_size = total_sst_files_size.unwrap_or(0);
+            measured_column_family = true;
+            let cf_disk_size =
+                match db.property_int_value_cf(cf_handle, "rocksdb.total-sst-files-size") {
+                    Ok(Some(size)) => size,
+                    // A missing property makes the total an undercount, so this pass must
+                    // not overwrite the cached size with it.
+                    _ => {
+                        complete_disk_measurement = false;
+                        0
+                    }
+                };
             total_size_on_disk += cf_disk_size;
             total_live_size_on_disk += live_data_size.unwrap_or(0);
             let mem_table_size = db
@@ -585,6 +609,12 @@ impl DiskDb {
                 human_bytes::human_bytes(mem_table_size.unwrap_or(0) as f64)
             )
             .unwrap();
+        }
+
+        // This pass has already measured every column family, so hand the result to the
+        // size cache rather than making `getblockchaininfo` repeat the work.
+        if measured_column_family && complete_disk_measurement {
+            self.cached_size.store(total_size_on_disk, Ordering::Relaxed);
         }
 
         debug!("{}", column_families_log_string);
@@ -603,24 +633,58 @@ impl DiskDb {
     }
 
     /// Returns the estimated total disk space usage of the database.
+    ///
+    /// This walks every column family. Callers on a latency-sensitive path should use
+    /// [`DiskDb::cached_size`] instead.
     pub fn size(&self) -> u64 {
+        self.measure_size().0
+    }
+
+    /// Returns the most recently cached estimate of the database's disk space usage.
+    ///
+    /// This is a relaxed atomic load. The estimate is refreshed when the database is
+    /// opened, periodically by the state service, and whenever
+    /// [`DiskDb::print_db_metrics`] runs.
+    pub fn cached_size(&self) -> u64 {
+        self.cached_size.load(Ordering::Relaxed)
+    }
+
+    /// Re-measures the database's disk space usage and updates the cached estimate.
+    ///
+    /// An incomplete measurement is discarded, leaving the previous estimate in place.
+    pub fn refresh_cached_size(&self) {
+        let (size, complete) = self.measure_size();
+
+        if complete {
+            self.cached_size.store(size, Ordering::Relaxed);
+        }
+    }
+
+    /// Measures the estimated disk space usage of the database.
+    ///
+    /// Returns the total, and whether every column family reported a size. A partial
+    /// measurement is an undercount, so it must not be cached.
+    fn measure_size(&self) -> (u64, bool) {
         let db: &Arc<DB> = &self.db;
         let db_options = DiskDb::options();
         let mut total_size_on_disk = 0;
+        let mut measured_column_family = false;
+        let mut complete = true;
+
         for cf_descriptor in DiskDb::construct_column_families(db_options, db.path(), []) {
             let cf_name = &cf_descriptor.name();
             let cf_handle = db
                 .cf_handle(cf_name)
                 .expect("Column family handle must exist");
+            measured_column_family = true;
 
-            total_size_on_disk += db
-                .property_int_value_cf(cf_handle, "rocksdb.total-sst-files-size")
-                .ok()
-                .flatten()
-                .unwrap_or(0);
+            match db.property_int_value_cf(cf_handle, "rocksdb.total-sst-files-size") {
+                Ok(Some(size)) => total_size_on_disk += size,
+                _ => complete = false,
+            }
         }
 
-        total_size_on_disk
+        (total_size_on_disk, measured_column_family && complete)
     }
 
     /// When called with a secondary DB instance, tries to catch up with the primary DB instance
@@ -932,9 +996,11 @@ impl DiskDb {
                     network: network.clone(),
                     ephemeral: config.ephemeral,
                     db: Arc::new(db),
+                    cached_size: Arc::new(AtomicU64::new(0)),
                 };
 
                 db.assert_default_cf_is_empty();
+                db.refresh_cached_size();
 
                 db
             }
