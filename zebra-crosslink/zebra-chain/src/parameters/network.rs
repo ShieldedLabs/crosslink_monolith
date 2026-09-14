@@ -30,6 +30,14 @@ const MAINNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT: Height = Height(3_36
 // lands 3_500 blocks later.
 const TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT: Height = Height(4_048_500);
 
+/// Whether this build targets the Crosslink testnet.
+///
+/// The Crosslink consensus exceptions key on this rather than on the network magic. Each new
+/// testnet picks a fresh magic, and a config file written by an earlier build still names the
+/// previous one, which turned the exceptions off.
+#[allow(non_upper_case_globals)]
+pub const is_crosslink_testnet: bool = true;
+
 /// An enum describing the kind of network, whether it's the production mainnet or a testnet.
 // Note: The order of these variants is important for correct bincode (de)serialization
 //       of history trees in the db format.

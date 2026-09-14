@@ -20,7 +20,7 @@ use crate::{
             funding_stream_address_period, FundingStreamReceiver, FundingStreamRecipient,
             FundingStreams,
         },
-        Network, NetworkKind, NetworkUpgrade,
+        is_crosslink_testnet, Network, NetworkKind, NetworkUpgrade,
     },
     transparent,
     work::difficulty::{ExpandedDifficulty, U256},
@@ -310,7 +310,7 @@ fn num_funding_stream_addresses_required_for_height_range(
 /// Checks that the provided [`FundingStreams`] has sufficient recipient addresses for the
 /// funding stream address period of the provided [`Network`].
 fn check_funding_stream_address_period(funding_streams: &FundingStreams, network: &Network) {
-    let expected_min_num_addresses = if network.magic().0 == [b'C',b'N',b'i',b'0'] {
+    let expected_min_num_addresses = if is_crosslink_testnet {
         1
     } else {
         num_funding_stream_addresses_required_for_height_range(

@@ -4,7 +4,7 @@
 
 use zebra_chain::{
     block::Height,
-    parameters::{subsidy::*, Network},
+    parameters::{is_crosslink_testnet, subsidy::*, Network},
     transparent::{self},
 };
 
@@ -22,6 +22,12 @@ fn funding_stream_address_index(
 ) -> Option<usize> {
     if receiver == FundingStreamReceiver::Deferred {
         return None;
+    }
+
+    // The Crosslink testnet funds one recipient from a single address that never rotates, so
+    // the address period below would index past the end of the list.
+    if is_crosslink_testnet {
+        return Some(0);
     }
 
     let funding_streams = network.funding_streams(height)?;

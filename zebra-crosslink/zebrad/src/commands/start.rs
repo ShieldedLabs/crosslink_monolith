@@ -88,7 +88,7 @@ use tower::{builder::ServiceBuilder, util::BoxService, ServiceExt};
 use tracing_futures::Instrument;
 
 use zebra_chain::block::genesis::regtest_genesis_block;
-use zebra_chain::parameters::{Network, HardForkSchedule};
+use zebra_chain::parameters::{is_crosslink_testnet, HardForkSchedule};
 use zebra_consensus::router::BackgroundTaskHandles;
 use zebra_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
 
@@ -271,15 +271,6 @@ impl StartCmd {
         *zebra_crosslink::wallet::GUI_ENABLE_MINE.lock().unwrap() = config.mining.internal_miner;
 
         let is_regtest = config.network.network.is_regtest();
-
-        let is_crosslink_testnet = 'is_crosslink_testnet: {
-            if let Network::Testnet(params) = &config.network.network {
-                if params.network_magic().0 == [b'C',b'N',b'i',b'0'] {
-                    break 'is_crosslink_testnet true;
-                }
-            }
-            false
-        };
 
 
         // workshop-specific key seed
