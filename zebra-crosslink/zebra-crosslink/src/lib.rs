@@ -363,7 +363,11 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
     // PERMANENT, from the block's own height: BFT does not exist at or below the bootstrap
     // activation height, so a pointer there can never resolve to a legitimate block (see
     // `BOOTSTRAP_ACTIVATION_HEIGHT`). Decided before taking the lock: nothing to resolve.
-    if !child_is_null && pow_block_height.0 <= BOOTSTRAP_ACTIVATION_HEIGHT {
+    //
+    // Not in TEST_MODE: the test-format harness feeds BFT blocks in directly instead of
+    // bootstrapping them, so BFT does exist below h2 there and this premise is false.
+    let bft_supplied_by_harness = *TEST_MODE.lock().unwrap();
+    if !child_is_null && pow_block_height.0 <= BOOTSTRAP_ACTIVATION_HEIGHT && !bft_supplied_by_harness {
         return Some(false);
     }
 
