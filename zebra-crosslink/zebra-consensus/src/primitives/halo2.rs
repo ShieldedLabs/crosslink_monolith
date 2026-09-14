@@ -13,7 +13,7 @@ use once_cell::sync::Lazy;
 use orchard::{bundle::BatchValidator, circuit::VerifyingKey};
 use rand::thread_rng;
 use zcash_protocol::value::ZatBalance;
-use zebra_chain::transaction::SigHash;
+use zebra_chain::transaction::{SigHash, UnminedTxId};
 
 use crate::BoxError;
 use thiserror::Error;
@@ -22,7 +22,10 @@ use tower::{util::ServiceFn, Service};
 use tower_batch_control::{Batch, BatchControl, RequestWeight};
 use tower_fallback::Fallback;
 
-use super::spawn_fifo;
+use super::{
+    cache::{CacheKey, Cached, CachedItem, ShieldedPool, CACHE_CAPACITY},
+    spawn_fifo,
+};
 
 /// Adjusted batch size for halo2 batches.
 ///
@@ -59,6 +62,9 @@ lazy_static::lazy_static! {
 pub struct Item {
     bundle: orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>,
     sighash: SigHash,
+    /// The key this item's successful verification is remembered under, if the caller
+    /// supplied the transaction's identity. `None` items are always verified.
+    cache_key: Option<CacheKey>,
 }
 
 impl RequestWeight for Item {
@@ -67,13 +73,42 @@ impl RequestWeight for Item {
     }
 }
 
+impl CachedItem for Item {
+    fn cache_key(&self) -> Option<CacheKey> {
+        self.cache_key
+    }
+}
+
 impl Item {
     /// Creates a new [`Item`] from a bundle and sighash.
+    ///
+    /// Items made this way are verified normally but are not cached, because they carry no
+    /// transaction identity. Use [`Item::new_cacheable`] where one is available.
     pub fn new(
         bundle: orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>,
         sighash: SigHash,
     ) -> Self {
-        Self { bundle, sighash }
+        Self {
+            bundle,
+            sighash,
+            cache_key: None,
+        }
+    }
+
+    /// Creates an [`Item`] whose successful verification can be remembered.
+    ///
+    /// `tx_id` must identify the transaction `bundle` was parsed from; see [`CacheKey`] for why
+    /// that, the sighash and the pool determine the verification.
+    pub fn new_cacheable(
+        bundle: orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>,
+        sighash: SigHash,
+        tx_id: UnminedTxId,
+    ) -> Self {
+        Self {
+            bundle,
+            sighash,
+            cache_key: Some(CacheKey::new(tx_id, sighash.0, ShieldedPool::Orchard)),
+        }
     }
 
     /// Perform non-batched verification of this [`Item`].
@@ -92,7 +127,7 @@ trait QueueBatchVerify {
 }
 
 impl QueueBatchVerify for BatchValidator {
-    fn queue(&mut self, Item { bundle, sighash }: Item) {
+    fn queue(&mut self, Item { bundle, sighash, .. }: Item) {
         self.add_bundle(&bundle, sighash.0);
     }
 }
@@ -130,12 +165,29 @@ impl From<halo2::plonk::Error> for Halo2Error {
 /// Note that making a `Service` call requires mutable access to the service, so
 /// you should call `.clone()` on the global handle to create a local, mutable
 /// handle.
+///
+/// The stack is wrapped in a [`Cached`] so that a proof gossiped into the mempool is not verified
+/// a second time when the block that mines it arrives.
 pub static VERIFIER: Lazy<
-    Fallback<
-        Batch<Verifier, Item>,
-        ServiceFn<fn(Item) -> BoxFuture<'static, Result<(), BoxError>>>,
+    Cached<
+        Fallback<
+            Batch<Verifier, Item>,
+            ServiceFn<fn(Item) -> BoxFuture<'static, Result<(), BoxError>>>,
+        >,
     >,
 > = Lazy::new(|| {
+    Cached::new(
+        batch_fallback_verifier(),
+        CACHE_CAPACITY,
+        "halo2",
+    )
+});
+
+/// Builds the uncached batching-and-fallback stack.
+fn batch_fallback_verifier() -> Fallback<
+    Batch<Verifier, Item>,
+    ServiceFn<fn(Item) -> BoxFuture<'static, Result<(), BoxError>>>,
+> {
     Fallback::new(
         Batch::new(
             Verifier::new(&VERIFYING_KEY),
@@ -157,7 +209,7 @@ pub static VERIFIER: Lazy<
                 as fn(_) -> _,
         ),
     )
-});
+}
 
 /// Halo2 proof verifier implementation
 ///

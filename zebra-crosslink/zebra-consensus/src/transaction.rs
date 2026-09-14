@@ -1022,7 +1022,11 @@ where
             cached_ffi_transaction,
         )?
         .and(Self::verify_sprout_shielded_data(joinsplit_data, &sighash)?)
-        .and(Self::verify_sapling_bundle(sapling_bundle, &sighash)))
+        .and(Self::verify_sapling_bundle(
+            sapling_bundle,
+            &sighash,
+            tx.unmined_id(),
+        )))
     }
 
     /// Verifies if a V4 `transaction` is supported by `network_upgrade`.
@@ -1111,8 +1115,16 @@ where
             script_verifier,
             cached_ffi_transaction,
         )?
-        .and(Self::verify_sapling_bundle(sapling_bundle, &sighash))
-        .and(Self::verify_orchard_bundle(orchard_bundle, &sighash)))
+        .and(Self::verify_sapling_bundle(
+            sapling_bundle,
+            &sighash,
+            transaction.unmined_id(),
+        ))
+        .and(Self::verify_orchard_bundle(
+            orchard_bundle,
+            &sighash,
+            transaction.unmined_id(),
+        )))
     }
 
     /// Verifies if a V5 `transaction` is supported by `network_upgrade`.
@@ -1270,6 +1282,7 @@ where
     fn verify_sapling_bundle(
         bundle: Option<sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,
+        tx_id: UnminedTxId,
     ) -> AsyncChecks {
         let mut async_checks = AsyncChecks::new();
 
@@ -1324,7 +1337,9 @@ where
             async_checks.push(
                 primitives::sapling::VERIFIER
                     .clone()
-                    .oneshot(primitives::sapling::Item::new(bundle, *sighash)),
+                    .oneshot(primitives::sapling::Item::new_cacheable(
+                        bundle, *sighash, tx_id,
+                    )),
             );
         }
 
@@ -1335,6 +1350,7 @@ where
     fn verify_orchard_bundle(
         bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,
+        tx_id: UnminedTxId,
     ) -> AsyncChecks {
         let mut async_checks = AsyncChecks::new();
 
@@ -1353,7 +1369,9 @@ where
             async_checks.push(
                 primitives::halo2::VERIFIER
                     .clone()
-                    .oneshot(primitives::halo2::Item::new(bundle, *sighash)),
+                    .oneshot(primitives::halo2::Item::new_cacheable(
+                        bundle, *sighash, tx_id,
+                    )),
             );
         }
 
