@@ -296,7 +296,10 @@ fn crosslink_push_example_pow_chain_each_block_twice() {
 
     for i in 0..REGTEST_BLOCK_BYTES.len() {
         tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
-        tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], SHOULD_FAIL);
+        // Re-submitting a committed block is idempotent, not an error: ingest answers
+        // IngestOutcome::Known, so the load SUCCEEDS. What must not happen is the chain
+        // growing, which the length expectation below already asserts.
+        tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
         tf.push_instr_expect_pow_chain_length(2 + i - (i >= 3) as usize, 0);
     }
     tf.push_instr_expect_pow_chain_length(1 - 1 + REGTEST_BLOCK_BYTES.len(), 0);
@@ -315,8 +318,10 @@ fn crosslink_push_example_pow_chain_again_should_not_change_the_pow_chain_length
     }
     tf.push_instr_expect_pow_chain_length(1 - 1 + REGTEST_BLOCK_BYTES.len(), 0);
 
+    // Replaying the entire chain a second time: every block is already known, so each load
+    // succeeds idempotently and the length must stay put. See the note above.
     for i in 0..REGTEST_BLOCK_BYTES.len() {
-        tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], SHOULD_FAIL);
+        tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
         tf.push_instr_expect_pow_chain_length(1 - 1 + REGTEST_BLOCK_BYTES.len(), 0);
     }
 
