@@ -317,10 +317,7 @@ impl Default for Config {
             network_identity_seed_string: None,
             network_local_port: 0,
             network_initial_peers: Vec::new(),
-            network_checkpoint: Some((
-                280520,
-                "005f8ea35cded28a6e1529595f6d941dd67e11b9e0d92ce2705cd416cb020926".parse().expect("valid checkpoint hash"),
-            )),
+            network_checkpoint: None,
             hardfork_schedule: Default::default(),
         }
     }
