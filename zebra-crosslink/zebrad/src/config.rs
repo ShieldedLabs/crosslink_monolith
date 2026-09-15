@@ -240,7 +240,7 @@ impl ZebradConfig {
         // to running with no config file.
         config.state
             .cache_dir
-            .push("crosslink_nightly_20260911");
+            .push("crosslink_nightly_20260915");
 
         // Merge user-led hardforks with the ones shipped in the executable, validate
         // them, and store the canonical (sorted, deduplicated) list back. Building
@@ -291,10 +291,8 @@ impl ZebradConfig {
 
             state: zebra_state::config::Config {
                 network_initial_peers: vec![
-                    "[::ffff:70.34.201.146]:12001:1fgEw5Nx:_BA-d-zgMDO3lj5R-FgL3VwJQofnPVZarZSUzx9ZMhs".to_owned(), // @terminator
-                    "[::ffff:70.34.209.22]:12001:1fgEw5Nx:2huJ7vzzieTrT_dFMaQwhS0fSGZFatCeBXNFCXTfJCs".to_owned(),  // @terminator
-                    "[::ffff:70.34.195.191]:12001:1fgEw5Nx:iezUrR8zwiqzt1__9Ex0OiqQ1O0gbipHuuKwCHwQggo".to_owned(), // @terminator
-                    "[::ffff:70.34.209.18]:12001:1fgEw5Nx:9nM4V10MYltC-ShN4OaEQlvDiFHEJtsOYmOroLBanQM".to_owned(),  // @terminator
+                    "[::ffff:45.32.186.234]:12001:1fgEw5Nx:dUhGUdCw0vhbhDOKINxDDkk93RHBRRuJuW2EY0zJHyU".to_owned(), // @chainsaw @Nightly
+                    "[::ffff:64.177.122.73]:12001:1fgEw5Nx:_DrOHtqUAEtbYadBv2Dt5OzNqbtT07tDZ9iyddSqFgw".to_owned(), // @chainsaw @Nightly
                 ],
                 ..Default::default()
             },
@@ -302,10 +300,8 @@ impl ZebradConfig {
             network: zebra_network::config::Config {
                 initial_testnet_peers: {
                     let mut peers = indexmap::IndexSet::new();
-                    peers.insert("70.34.201.146:8233".to_owned()); // @terminator
-                    peers.insert("70.34.209.22:8233".to_owned());  // @terminator
-                    peers.insert("70.34.195.191:8233".to_owned()); // @terminator
-                    peers.insert("70.34.209.18:8233".to_owned());  // @terminator
+                    peers.insert("45.32.186.234:8233".to_owned()); // @chainsaw @Nightly
+                    peers.insert("64.177.122.73:8233".to_owned()); // @chainsaw @Nightly
                     peers
                 },
 
