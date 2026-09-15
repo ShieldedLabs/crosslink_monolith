@@ -1756,6 +1756,7 @@ async fn total_issuance_from_key(
     last_height: ZebBlockHeight,
 ) -> Result<Vec<ScanInfo>, String> {
     use std::sync::atomic::Ordering::Relaxed;
+    use futures::StreamExt;
     use wallet::scanner::{PROF, timed};
 
     let call = internal_handle.call.clone();
@@ -1777,24 +1778,36 @@ async fn total_issuance_from_key(
             return Err("could not create orchard ovks".to_owned());
         };
 
-        let Some((t_addr, _p2sh, _ua)) = wallet::addrs_from_ufvk(ufvk, 0) else{
+        let Some((t_addr, t_addr_p2sh, _ua)) = wallet::addrs_from_ufvk(ufvk, 0) else{
             return Err("Could not get an address".to_owned());
         };
 
-        scan_ctxs.push(wallet::scanner::ScanCtx { ufvk: ufvk.clone(), t_addr, orchard_external_ovk, orchard_internal_ovk });
+        scan_ctxs.push(wallet::scanner::ScanCtx { ufvk: ufvk.clone(), t_addr, t_addr_p2sh, orchard_external_ovk, orchard_internal_ovk });
     }
 
-    for height in first_height.0..=last_height.0 {
+    // Blocks are requested PREFETCH ahead through the concurrent ReadStateService, so the rocksdb
+    // reads and zebra deserialization of the next blocks overlap with scanning this one. The
+    // fetch bucket then measures the stall waiting for a block, not the read itself.
+    const PREFETCH: usize = 16;
+    let read_state = call.read_state.clone();
+    let mut blocks = std::pin::pin!(futures::stream::iter(first_height.0..=last_height.0)
+        .map(move |height| {
+            let read_state = read_state.clone();
+            async move { (height, (read_state)(StateReadRequest::Block(ZebBlockHeight(height).into())).await) }
+        })
+        .buffered(PREFETCH));
+
+    loop {
+        let t_fetch = std::time::Instant::now();
+        let Some((height, res)) = blocks.next().await else { break };
+        PROF.fetch_ns.fetch_add(t_fetch.elapsed().as_nanos() as u64, Relaxed);
+        PROF.blocks.fetch_add(1, Relaxed);
         if height % 1000 == 0 {
             println!("scanning height {height}");
         }
-        let t_fetch = std::time::Instant::now();
-        let res = (call.state)(StateRequest::Block(ZebBlockHeight(height).into())).await;
-        PROF.fetch_ns.fetch_add(t_fetch.elapsed().as_nanos() as u64, Relaxed);
-        PROF.blocks.fetch_add(1, Relaxed);
         let block = match res {
-            Ok(StateResponse::Block(Some(block))) => block,
-            Ok(StateResponse::Block(None)) => return Err(format!("failed to get block at height {height}")),
+            Ok(StateReadResponse::Block(Some(block))) => block,
+            Ok(StateReadResponse::Block(None)) => return Err(format!("failed to get block at height {height}")),
             _ => return Err(format!("unexpectedly failed to get block at height {height}: {res:?}")),
         };
 

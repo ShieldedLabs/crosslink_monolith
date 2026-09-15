@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 pub struct ScanCtx {
     pub ufvk: zcash_keys::keys::UnifiedFullViewingKey,
     pub t_addr: TransparentAddress,
+    pub t_addr_p2sh: TransparentAddress,
     pub orchard_external_ovk: orchard::keys::OutgoingViewingKey,
     pub orchard_internal_ovk: orchard::keys::OutgoingViewingKey,
 }
@@ -141,7 +142,9 @@ pub fn scan_tx(info: &mut ScanInfo, utxos: &mut HashSet<(PubKeyID, u32)>, tx_byt
             for (out_i, txout) in t_bundle.vout.iter().enumerate() {
                 PROF.vouts.fetch_add(1, Relaxed);
                 if let Some(t_addr) = txout.recipient_address() {
-                    if t_addr_belongs_to_ufvk_index(&ctx.ufvk, 0, t_addr) {
+                    // Both addresses are derived once in ScanCtx; deriving them per output
+                    // (t_addr_belongs_to_ufvk_index) was three quarters of the scan.
+                    if t_addr == ctx.t_addr || t_addr == ctx.t_addr_p2sh {
                         let outpoint = (PubKeyID(*txid_lrz.as_ref()), out_i.try_into().unwrap());
                         if ! utxos.insert(outpoint) {
                             dup = Some(outpoint);
