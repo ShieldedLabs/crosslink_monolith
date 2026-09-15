@@ -129,18 +129,18 @@ pub(super) const MAINNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] 
 /// we can switch to fake activation heights for some tests.
 ///
 /// Crosslink overrides the public testnet schedule: the Crosslink testnet activates
-/// straight into a single upgrade at height 1 rather than replaying Zcash's history.
-/// Upstream's schedule (which now runs through NU6.3) is deliberately not used here.
+/// straight into the newest upgrade at height 1 rather than replaying Zcash's history.
+/// Every earlier upgrade resolves to the same height through
+/// [`NetworkUpgrade::activation_height`].
 ///
-/// @todo(crosslink): this activates NU6 only, so a NU6.3 consensus branch ID is never
-/// reached on this network -- and `Transaction::V6` / `Transaction::VCrosslink` carry
-/// NU6.3-era branch IDs. Until this is bumped to `Nu6_3`, the Ironwood-based Crosslink
-/// transaction cannot be used on the Crosslink testnet. Bumping it forks any running
-/// Crosslink testnet, so the time to do it is when a new one starts from genesis.
+/// The upgrade must be NU6.3 or later, because `Transaction::VCrosslink` only exists
+/// from NU6.3 onward. The wallet's hardcoded `TestNetwork` parameters in
+/// `zcash_protocol::consensus` must name the same upgrade, or every wallet transaction
+/// carries a branch ID the node rejects.
 #[allow(unused)]
 pub(super) const TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] = &[
     (block::Height(0), Genesis),
-    (block::Height(1), Nu6),
+    (block::Height(1), Nu6_3),
 ];
 
 /// The Consensus Branch Id, used to bind transactions and blocks to a

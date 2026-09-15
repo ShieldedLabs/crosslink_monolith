@@ -320,6 +320,10 @@ impl ZebradConfig {
                             addresses: Some(vec!["t27tjLaUJZ53JKqWPkgd1XCTNWF636eLQRg".to_string()]),
                         }]),
                     }])
+                    // NU6.1 activates at height 1 along with everything else, and its activation
+                    // block would otherwise have to pay the public testnet's lockbox disbursements
+                    // out of a lockbox that is still empty.
+                    .with_lockbox_disbursements(Vec::new())
                 .to_network()
                 .expect("Crosslink testnet parameters are valid"),
 

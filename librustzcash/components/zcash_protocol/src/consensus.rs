@@ -540,18 +540,15 @@ impl Parameters for TestNetwork {
             NetworkUpgrade::Canopy => Some(BlockHeight(1)),
             NetworkUpgrade::Nu5 => Some(BlockHeight(1)),
             NetworkUpgrade::Nu6 => Some(BlockHeight(1)),
-            NetworkUpgrade::Nu6_1 => Some(BlockHeight(3_536_500)),
-            NetworkUpgrade::Nu6_2 => Some(BlockHeight(4_052_000)),
-            // Crosslink testnets activate NU6.3 immediately (height 2, just above the NU6 block
-            // at height 1), because the Ironwood-shaped `VCrosslink` transaction only exists from
-            // NU6.3 onward. The wallet builds transactions against these hardcoded parameters
-            // rather than the node's configured activation heights, so leaving this at the mainnet
-            // height made every wallet transaction carry the NU6 branch id and be rejected with
-            // "transaction uses an incorrect consensus branch id".
+            // Crosslink testnets activate every upgrade through NU6.3 at height 1, matching the
+            // node's `TESTNET_ACTIVATION_HEIGHTS` in zebra-chain. The wallet builds transactions
+            // against these hardcoded parameters rather than the node's, so the two must agree, or
+            // every wallet transaction carries a branch ID the node rejects.
             //
-            // @todo(crosslink): derive these from the node's configured network parameters instead
-            // of hardcoding them here; this mirrors the existing NU6-at-height-1 hack above.
-            NetworkUpgrade::Nu6_3 => Some(BlockHeight(2)),
+            // @todo(crosslink): derive these from the node's network parameters instead.
+            NetworkUpgrade::Nu6_1 => Some(BlockHeight(1)),
+            NetworkUpgrade::Nu6_2 => Some(BlockHeight(1)),
+            NetworkUpgrade::Nu6_3 => Some(BlockHeight(1)),
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => None,
         }
