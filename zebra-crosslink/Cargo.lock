@@ -7297,6 +7297,7 @@ dependencies = [
  "tracing",
  "windows-sys 0.61.2",
  "zcash_primitives",
+ "zebra-debug-time",
 ]
 
 [[package]]

@@ -90,7 +90,7 @@ use snow::resolvers::CryptoResolver;
 use tokio::time::Instant;
 use zcash_primitives::bft::{ HashKey, HashKeys, FatPointerToBftBlock, TMSig, PubKeyID, FatPointerSignature, BftBlockAndFatPointerToIt, BftBlock };
 
-const TICK_DURATION:         std::time::Duration = std::time::Duration::from_millis(500);
+const TICK_DURATION:         std::time::Duration = std::time::Duration::from_millis(250);
 const PEER_GOSSIP_DURATION:  std::time::Duration = std::time::Duration::from_millis(1500);
 const PEER_CONNECT_DURATION: std::time::Duration = std::time::Duration::from_millis(5000);
 
@@ -428,10 +428,18 @@ impl Timeout {
         let timeout = match step {
             // Note(Sam): These timeout should be tuned to match the maximum network load block time. An additional
             // virtue of a short block time that I had not considered is that it hides round stalls better.
-            TMStep::Propose   => Duration::from_millis(5000) + round * Duration::from_millis(1000),
-            TMStep::Prevote   => Duration::from_millis(5000) + round * Duration::from_millis(1000),
-            TMStep::Precommit => Duration::from_millis(5000) + round * Duration::from_millis(1000),
+            // A BFT block is one small packet (sigma headers + sigs), so propose only needs to
+            // cover one proposal RTT plus validation; prevote/precommit cover one vote-gossip
+            // RTT. The +500 ms/round ramp remains the safety valve for slow rounds.
+            TMStep::Propose   => Duration::from_millis(2000) + round * Duration::from_millis(500),
+            TMStep::Prevote   => Duration::from_millis(500)  + round * Duration::from_millis(500),
+            TMStep::Precommit => Duration::from_millis(500)  + round * Duration::from_millis(500),
         };
+        // The step timeouts above are tuned against the *chain-time* block interval, so on a
+        // time-dilated test network they are apparent durations: divide by the dilation
+        // multiplier so BFT rounds pace against the dilated chain the same way they would
+        // pace against a real one. Identity when dilation is off.
+        let timeout = zebra_debug_time::real_duration(timeout);
 
         Timeout{ time: now + timeout, height, round, step }
     }

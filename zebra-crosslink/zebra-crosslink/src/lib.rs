@@ -538,8 +538,16 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
                 .map_or(Blake3Hash([0u8; 32]), |b| b.blake3_hash()),
         )
     };
+    // `finality_candidate_height` is the ANCHOR the header window is walked from, but
+    // `FindBlockHeaders { known_blocks: [anchor] }` returns headers starting AFTER the
+    // anchor, so a decided block finalizes `headers.first()` == anchor + 1. Guard on the
+    // height that would actually be finalized, not the anchor: comparing the anchor here
+    // required the tip to advance 2 blocks between proposals, which produced a BFT block
+    // every other PoW block. With this guard each new PoW block is proposable at once,
+    // finalizing as high up as the sigma-header window allows (tip - sigma + 1).
+    let proposed_final_height = ZebBlockHeight(finality_candidate_height.0 + 1);
     let is_improved_final =
-        latest_final_block.is_none() || finality_candidate_height > latest_final_block.unwrap().0;
+        latest_final_block.is_none() || proposed_final_height > latest_final_block.unwrap().0;
 
     if !is_improved_final {
         info!(
