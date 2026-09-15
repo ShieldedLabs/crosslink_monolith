@@ -62,7 +62,6 @@ pub static TEST_INSTR_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None)
 pub static TEST_INSTR_BYTES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 pub static TEST_INSTRS: Mutex<Vec<test_format::TFInstr>> = Mutex::new(Vec::new());
 pub static TEST_SHUTDOWN_FN: Mutex<fn()> = Mutex::new(|| ());
-pub static TEST_PARAMS: Mutex<Option<ZcashCrosslinkParameters>> = Mutex::new(None);
 pub static TEST_NAME: Mutex<&'static str> = Mutex::new("‰‰TEST_NAME_NOT_SET‰‰");
 
 /// Runtime-configurable failure handling, ported from reece_smith_merchant. A wrapped
@@ -360,15 +359,13 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
     let parent_is_null = parent_fat_pointer == FatPointerToBftBlock::null();
     let child_is_null = child_fat_pointer == FatPointerToBftBlock::null();
 
-    // PERMANENT, from the block's own height: BFT does not exist at or below the bootstrap
-    // activation height, so a pointer there can never resolve to a legitimate block (see
-    // `BOOTSTRAP_ACTIVATION_HEIGHT`). Decided before taking the lock: nothing to resolve.
-    //
-    // Not in TEST_MODE: the test-format harness feeds BFT blocks in directly instead of
-    // bootstrapping them, so BFT does exist below h2 there and this premise is false.
-    let bft_supplied_by_harness = *TEST_MODE.lock().unwrap();
-    if !child_is_null && pow_block_height.0 <= BOOTSTRAP_ACTIVATION_HEIGHT && !bft_supplied_by_harness {
-        return Some(false);
+    // PERMANENT, from the block's own height: where BFT is bootstrapped from the chain it does not
+    // exist at or below the activation height, so a pointer there can never resolve to a
+    // legitimate block (see `BftBootstrap`). Decided before taking the lock: nothing to resolve.
+    if let Some(activation_height) = internal_handle.params.bootstrap.activation_height() {
+        if !child_is_null && pow_block_height.0 <= activation_height {
+            return Some(false);
+        }
     }
 
     let internal = internal_handle.internal.blocking_lock();
@@ -546,7 +543,7 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
     }
 
     let call = tfl_handle.call.clone();
-    let params = &PROTOTYPE_PARAMETERS;
+    let params = &tfl_handle.params;
     let (tip_height, tip_hash) =
         if let Ok(StateResponse::Tip(val)) = (call.state)(StateRequest::Tip).await {
             if val.is_none() {
@@ -1171,7 +1168,7 @@ fn namespace_for_bft_height(hardforks: &[crate::config::HardForkConfig], bft_hei
 async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [u8; 32], path_to_pos_store_file: PathBuf) -> Result<(), String> {
     let call = internal_handle.call.clone();
     let config = internal_handle.config.clone();
-    let params = &PROTOTYPE_PARAMETERS;
+    let params = internal_handle.params;
 
     #[cfg(feature = "viz_gui")]
     {
@@ -1382,9 +1379,11 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             // Crosslink bootstrap: the first accepted PoW block at the activation height (h2)
             // finalizes h1 through a deterministic genesis decision, and BFT starts at height 1
             // with h1's roster. Done before taking the internal lock -- the finalize calls back
-            // into the fat-pointer gate, which blocks on that same lock.
-            if let (Some(_), Some((tip_height, _))) = (launch.as_ref(), new_bc_tip) {
-                if tip_height.0 >= BOOTSTRAP_ACTIVATION_HEIGHT {
+            // into the fat-pointer gate, which blocks on that same lock. A network whose BFT is
+            // supplied has no activation height and never bootstraps.
+            let activation_height = internal_handle.params.bootstrap.activation_height();
+            if let (Some(_), Some((tip_height, _)), Some(activation_height)) = (launch.as_ref(), new_bc_tip, activation_height) {
+                if tip_height.0 >= activation_height {
                     if let Some((roster, ingest)) = bootstrap_bft(&internal_handle).await {
                         spawn_tenderlink(&internal_handle, launch.take().unwrap(), roster, ingest).await;
                     }
@@ -1440,8 +1439,8 @@ async fn spawn_tenderlink(
     let config = internal_handle.config.clone();
     if roster.is_empty() {
         error!(
-            "BFT height {} has an empty roster: no stake was bonded by the bootstrap roster height ({}). BFT will not run on this chain.",
-            ingest_data_for_tenderlink.len(), BOOTSTRAP_ROSTER_HEIGHT,
+            "BFT height {} has an empty roster: no stake was bonded by the bootstrap roster height ({:?}). BFT will not run on this chain.",
+            ingest_data_for_tenderlink.len(), internal_handle.params.bootstrap,
         );
         return;
     }
@@ -1640,11 +1639,14 @@ fn decided_round_data(
 /// None until the chain has the headers (the caller only asks once the tip is at or past the
 /// activation height, where h1 is finalized-by-depth, so the headers are the same on every node).
 async fn build_bootstrap_genesis(tfl_handle: &TFLServiceHandle) -> Option<(BftBlock, FatPointerToBftBlock)> {
-    let params = &PROTOTYPE_PARAMETERS;
+    let params = &tfl_handle.params;
     let call = &tfl_handle.call;
+    let BftBootstrap::FromChain { roster_height, .. } = params.bootstrap else {
+        return None;
+    };
 
     let mut headers: Vec<BcBlockHeader> = Vec::with_capacity(params.bc_confirmation_depth_sigma as usize);
-    for h in BOOTSTRAP_ROSTER_HEIGHT..BOOTSTRAP_ROSTER_HEIGHT + params.bc_confirmation_depth_sigma as u32 {
+    for h in roster_height..roster_height + params.bc_confirmation_depth_sigma as u32 {
         match (call.state)(StateRequest::BlockHeader(ZebBlockHeight(h).into())).await {
             Ok(StateResponse::BlockHeader { header, .. }) => headers.push(bc_hdr_to_lrz(&header)),
             _ => return None,
@@ -1679,10 +1681,13 @@ async fn build_bootstrap_genesis(tfl_handle: &TFLServiceHandle) -> Option<(BftBl
 /// stakes as the roster for height 1) and produce what tenderlink needs to start at height 1.
 /// Must not be called with the internal lock held.
 async fn bootstrap_bft(tfl_handle: &TFLServiceHandle) -> Option<(Vec<SortedRosterMember>, Vec<tenderlink::RoundData>)> {
+    let BftBootstrap::FromChain { roster_height, activation_height } = tfl_handle.params.bootstrap else {
+        return None;
+    };
     let (genesis, fat_pointer) = build_bootstrap_genesis(tfl_handle).await?;
     info!(
         "crosslink bootstrap: PoW reached height {}; deciding BFT genesis {} which finalizes height {}",
-        BOOTSTRAP_ACTIVATION_HEIGHT, genesis.blake3_hash(), BOOTSTRAP_ROSTER_HEIGHT,
+        activation_height, genesis.blake3_hash(), roster_height,
     );
     let roster = handle_new_decided_bft_block(tfl_handle, &genesis, &fat_pointer, Vec::new()).await;
     let terminated = terminated_finalizers_at(&tfl_handle.config.hardforks, 0, 0);

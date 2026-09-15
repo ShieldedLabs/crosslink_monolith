@@ -589,6 +589,7 @@ impl StartCmd {
                     Box::pin(async move { mempool.clone().ready().await?.call(req).await })
                 }),
                 config.crosslink.clone(),
+                config.network.network.crosslink_parameters(),
                 actual_closure2,
             )
         };

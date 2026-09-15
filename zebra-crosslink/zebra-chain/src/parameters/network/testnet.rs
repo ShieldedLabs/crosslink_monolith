@@ -27,6 +27,7 @@ use crate::{
 };
 
 use super::magic::Magic;
+use zcash_primitives::bft::{ZcashCrosslinkParameters, PROTOTYPE_PARAMETERS};
 
 /// Reserved network names that should not be allowed for configured Testnets.
 pub const RESERVED_NETWORK_NAMES: [&str; 6] = [
@@ -497,6 +498,8 @@ pub struct ParametersBuilder {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+    /// Crosslink consensus parameters for this network
+    crosslink: ZcashCrosslinkParameters,
 }
 
 impl Default for ParametersBuilder {
@@ -533,6 +536,7 @@ impl Default for ParametersBuilder {
             temporary_orchard_disabling_soft_fork_height: Some(
                 super::TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT,
             ),
+            crosslink: PROTOTYPE_PARAMETERS,
         }
     }
 }
@@ -848,6 +852,18 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets the Crosslink consensus parameters to be used in the [`Parameters`] being built.
+    pub fn with_crosslink_parameters(
+        mut self,
+        crosslink: ZcashCrosslinkParameters,
+    ) -> Result<Self, ParametersBuilderError> {
+        if !crosslink.bootstrap_is_valid() {
+            return Err(ParametersBuilderError::InvalidCrosslinkBootstrap);
+        }
+        self.crosslink = crosslink;
+        Ok(self)
+    }
+
     /// Converts the builder to a [`Parameters`] struct
     fn finish(self) -> Parameters {
         let Self {
@@ -866,6 +882,7 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
+            crosslink,
         } = self;
         Parameters {
             network_name,
@@ -883,6 +900,7 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
+            crosslink,
         }
     }
 
@@ -930,6 +948,7 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
+            crosslink,
         } = Self::default();
 
         self.activation_heights == activation_heights
@@ -944,6 +963,7 @@ impl ParametersBuilder {
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
             && self.post_blossom_halving_interval == post_blossom_halving_interval
             && self.lockbox_disbursements == lockbox_disbursements
+            && self.crosslink == crosslink
     }
 }
 
@@ -963,6 +983,8 @@ pub struct RegtestParameters {
     /// Whether to allow coinbase spends to have transparent outputs (inverse of
     /// zcashd's `-regtestshieldcoinbase`).
     pub should_allow_unshielded_coinbase_spends: Option<bool>,
+    /// Crosslink consensus parameters; [`PROTOTYPE_PARAMETERS`] if unset.
+    pub crosslink: Option<ZcashCrosslinkParameters>,
 }
 
 impl From<ConfiguredActivationHeights> for RegtestParameters {
@@ -1008,6 +1030,8 @@ pub struct Parameters {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+    /// Crosslink consensus parameters for this network
+    crosslink: ZcashCrosslinkParameters,
 }
 
 impl Default for Parameters {
@@ -1037,6 +1061,7 @@ impl Parameters {
             checkpoints,
             extend_funding_stream_addresses_as_required,
             should_allow_unshielded_coinbase_spends,
+            crosslink,
         }: RegtestParameters,
     ) -> Result<Self, ParametersBuilderError> {
         let mut parameters = Self::build()
@@ -1057,7 +1082,8 @@ impl Parameters {
             .with_halving_interval(PRE_BLOSSOM_REGTEST_HALVING_INTERVAL)?
             .with_funding_streams(funding_streams.unwrap_or_default())
             .with_lockbox_disbursements(lockbox_disbursements.unwrap_or_default())
-            .with_checkpoints(checkpoints.unwrap_or_default())?;
+            .with_checkpoints(checkpoints.unwrap_or_default())?
+            .with_crosslink_parameters(crosslink.unwrap_or(PROTOTYPE_PARAMETERS))?;
 
         if Some(true) == extend_funding_stream_addresses_as_required {
             parameters = parameters.extend_funding_streams();
@@ -1100,6 +1126,8 @@ impl Parameters {
             lockbox_disbursements: _,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
+            // Configurable on Regtest: the test-format harness supplies BFT instead of bootstrapping it
+            crosslink: _,
         } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
 
         self.network_name == network_name
@@ -1155,6 +1183,11 @@ impl Parameters {
     /// Returns true if proof-of-work validation should be disabled for this network
     pub fn disable_pow(&self) -> bool {
         self.disable_pow
+    }
+
+    /// Returns the Crosslink consensus parameters for this network
+    pub fn crosslink_parameters(&self) -> ZcashCrosslinkParameters {
+        self.crosslink
     }
 
     /// Returns true if this network should allow transactions with transparent outputs
@@ -1223,6 +1256,18 @@ impl Network {
             params.disable_pow()
         } else {
             false
+        }
+    }
+
+    /// Returns the Crosslink consensus parameters for this network.
+    ///
+    /// Crosslink is not activated on Mainnet. It gets the prototype parameters only so that it
+    /// behaves as it did before these were per-network; choosing real Mainnet values is open.
+    pub fn crosslink_parameters(&self) -> ZcashCrosslinkParameters {
+        if let Self::Testnet(params) = self {
+            params.crosslink_parameters()
+        } else {
+            PROTOTYPE_PARAMETERS
         }
     }
 

@@ -125,6 +125,7 @@ pub fn spawn_new_tfl_service(
     read_state_service_call: ReadStateServiceProcedure,
     mempool_service_call: MempoolServiceProcedure,
     config: crate::config::Config,
+    params: ZcashCrosslinkParameters,
     closure_from_state_to_here_mutex: Arc<std::sync::Mutex<Option<zebra_state::ClosureToCallIntoCrosslinkFromState>>>,
 ) -> (TFLServiceHandle, JoinHandle<Result<(), String>>) {
     let internal = Arc::new(Mutex::new(TFLServiceInternal {
@@ -186,6 +187,7 @@ pub fn spawn_new_tfl_service(
             force_feed_pos,
         },
         config,
+        params,
     };
 
     *handle_mtx.lock().unwrap() = Some(handle1.clone());
@@ -210,4 +212,7 @@ pub struct TFLServiceHandle {
     pub(crate) call: TFLServiceCalls,
     /// The file-generated config data
     pub config: crate::config::Config,
+    /// The network's Crosslink consensus parameters. Immutable, and kept outside `internal` so the
+    /// fat-pointer gate can decide on them before taking that lock.
+    pub(crate) params: ZcashCrosslinkParameters,
 }

@@ -51,10 +51,23 @@ pub fn set_test_name(name: &'static str) {
 pub fn test_start() {
     // init globals
     {
+        // Consensus parameters are fixed when the network is built, so they are read from the test
+        // file here, before the node boots.
+        let crosslink = {
+            let path = zebra_crosslink::TEST_INSTR_PATH.lock().unwrap().clone();
+            let bytes = match path {
+                Some(path) => std::fs::read(path).unwrap_or_default(),
+                None => zebra_crosslink::TEST_INSTR_BYTES.lock().unwrap().clone(),
+            };
+            crosslink_parameters_for_test(&bytes)
+        };
         *CROSSLINK_TEST_CONFIG_OVERRIDE.lock().unwrap() = {
             let mut base = ZebradConfig::default();
             base.network.network = Network::new_regtest(
-                zebra_chain::parameters::testnet::RegtestParameters::default(),
+                zebra_chain::parameters::testnet::RegtestParameters {
+                    crosslink: Some(crosslink),
+                    ..Default::default()
+                },
             );
             base.state.ephemeral = true;
 
@@ -247,7 +260,7 @@ fn regen_test_data() {
 #[test]
 fn crosslink_expect_pos_height_on_boot() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     tf.push_instr_expect_pos_chain_length(0, 0);
 
@@ -257,7 +270,7 @@ fn crosslink_expect_pos_height_on_boot() {
 #[test]
 fn crosslink_expect_pow_height_on_boot() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     tf.push_instr_expect_pow_chain_length(1, 0);
 
@@ -267,7 +280,7 @@ fn crosslink_expect_pow_height_on_boot() {
 #[test]
 fn crosslink_expect_first_pow_to_not_be_a_no_op() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[0], 0);
     tf.push_instr_expect_pow_chain_length(2, 0);
@@ -278,7 +291,7 @@ fn crosslink_expect_first_pow_to_not_be_a_no_op() {
 #[test]
 fn crosslink_push_example_pow_chain_only() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     for i in 0..REGTEST_BLOCK_BYTES.len() {
         tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
@@ -292,7 +305,7 @@ fn crosslink_push_example_pow_chain_only() {
 #[test]
 fn crosslink_push_example_pow_chain_each_block_twice() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     for i in 0..REGTEST_BLOCK_BYTES.len() {
         tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
@@ -310,7 +323,7 @@ fn crosslink_push_example_pow_chain_each_block_twice() {
 #[test]
 fn crosslink_push_example_pow_chain_again_should_not_change_the_pow_chain_length() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     for i in 0..REGTEST_BLOCK_BYTES.len() {
         tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
@@ -331,7 +344,7 @@ fn crosslink_push_example_pow_chain_again_should_not_change_the_pow_chain_length
 #[test]
 fn crosslink_expect_pos_not_pushed_if_pow_blocks_not_present() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     tf.push_instr_load_pos_bytes(REGTEST_POS_BLOCK_BYTES[0], SHOULD_FAIL);
     tf.push_instr_expect_pos_chain_length(0, 0);
@@ -342,7 +355,7 @@ fn crosslink_expect_pos_not_pushed_if_pow_blocks_not_present() {
 #[test]
 fn crosslink_expect_pos_height_after_push() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let nw = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&nw, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
@@ -372,7 +385,7 @@ fn crosslink_expect_pos_height_after_push() {
 #[test]
 fn crosslink_expect_pos_out_of_order() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
 
     let nw = Network::new_regtest(Default::default());
@@ -406,7 +419,7 @@ fn crosslink_expect_pos_out_of_order() {
 #[test]
 fn crosslink_expect_pos_push_same_block_twice_only_accepted_once() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let nw = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&nw, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
@@ -434,7 +447,7 @@ fn crosslink_expect_pos_push_same_block_twice_only_accepted_once() {
 #[test]
 fn crosslink_reject_pos_with_signature_on_different_data() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     for i in 0..REGTEST_BLOCK_BYTES.len() {
         tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
@@ -462,7 +475,7 @@ fn crosslink_reject_pos_with_signature_on_different_data() {
 #[test]
 fn crosslink_test_basic_finality() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = Network::new_regtest(Default::default());
@@ -540,7 +553,7 @@ fn crosslink_test_basic_finality() {
 #[test]
 fn reject_pos_block_with_lt_sigma_headers() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     for i in 0..4 {
         tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
@@ -562,10 +575,60 @@ fn reject_pos_block_with_lt_sigma_headers() {
     tf.push_instr_expect_pos_chain_length(0, 0);
 }
 
+/// With BFT bootstrapped from the chain, a PoW block at or below the activation height may not point
+/// at a BFT block. Every other scenario supplies BFT directly (`HARNESS_PARAMETERS`) and so never
+/// meets this rule; this one runs the prototype's bootstrap so the rule itself stays tested.
+#[test]
+fn crosslink_reject_fat_pointer_below_bootstrap_activation() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut pow = vec![gen.tip.clone()];
+    tf.push_instr_load_pow(&gen.tip, 0);
+    for _ in 2..5 {
+        pow.push(gen.next_block(&miner_addr));
+        tf.push_instr_load_pow(&gen.tip, 0);
+    }
+
+    let bft = next_pos(pos_h, fat_ptr, &pow[1..4], &[]);
+    tf.push_instr_load_pos(&bft, 0);
+
+    let fat_pointer_to_bft_block = FatPointerToBftBlock {
+        vote_for_block_without_finalizer_public_key: bft.0.fat_ptr.vote_for_block_without_finalizer_public_key,
+        signatures: bft
+            .0
+            .fat_ptr
+            .signatures
+            .iter()
+            .map(|sig| FatPointerSignature { pub_key: sig.pub_key, vote_signature: sig.vote_signature })
+            .collect(),
+    };
+
+    // Height 5 points at that BFT block, far below the prototype's activation height.
+    pow.push(gen.next_block(&miner_addr));
+    gen.tip = Arc::new(Block {
+        header: Arc::new(BlockHeader {
+            version: 5,
+            fat_pointer_to_bft_block,
+            ..*gen.tip.header
+        }),
+        ..gen.tip.as_ref().clone()
+    });
+    tf.push_instr_load_pow(&gen.tip, SHOULD_FAIL);
+    tf.push_instr_expect_pow_chain_length(5, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 #[test]
 fn crosslink_test_pow_to_pos_link() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = Network::new_regtest(Default::default());
@@ -628,7 +691,7 @@ fn crosslink_test_pow_to_pos_link() {
 #[test]
 fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized_pow_chain() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = Network::new_regtest(Default::default());
@@ -683,7 +746,7 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
 #[test]
 fn crosslink_pow_switch_to_finalized_chain_fork_even_though_longer_chain_exists() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = Network::new_regtest(Default::default());
@@ -957,7 +1020,7 @@ impl BlockGen {
 #[test]
 fn crosslink_gen_pow_fork() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
@@ -1043,7 +1106,7 @@ fn staking_tx_create_bond(
 #[test]
 fn crosslink_pow_block_with_staking_tx() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
@@ -1135,7 +1198,7 @@ fn next_pos(
 #[test]
 fn crosslink_gen_pow_and_no_signature_no_roster_pos() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
@@ -1167,7 +1230,7 @@ fn crosslink_gen_pow_and_no_signature_no_roster_pos() {
 #[test]
 fn crosslink_force_roster() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     tf.push_instr_expect_roster_includes([0xab; 32], 42, SHOULD_FAIL);
 
@@ -1184,7 +1247,7 @@ fn crosslink_force_roster() {
 #[test]
 fn crosslink_add_newcomer_to_roster_via_pow() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     // let (_, prv_key, pub_key) = rng_private_public_key_from_address(&[0]);
 
@@ -1303,7 +1366,7 @@ fn diagram_fork_miner() -> Address {
 /// The diagram's `ba_mu = prune_sigma(P10) = P7` is not drawn by the GUI: nothing in this
 /// tree computes it (FINALITY.md 6.4).
 fn diagram_scene_1() -> (TF, Vec<Arc<Block>>) {
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
@@ -1364,7 +1427,7 @@ fn diagram_scene_1() -> (TF, Vec<Arc<Block>>) {
 /// replaces P8-P10 with three Q blocks of higher work; regtest difficulty is constant, so
 /// here the branch wins by being one block longer instead, Q8..Q11.
 fn diagram_scene_2() -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
@@ -1439,7 +1502,7 @@ fn diagram_scene_2() -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
 /// the node, because the behaviour under test would be the refusal rather than the
 /// picture.
 fn diagram_scene_3(fork_flags: u32) -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();

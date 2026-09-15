@@ -127,7 +127,12 @@ impl TFInstr {
                     BlockHash::from_header_data(block.headers.last().unwrap())
                 )
             }
-            Some(TestInstr::SetParams(_)) => str += &format!("{} {}", instr.val[0], instr.val[1]),
+            Some(TestInstr::SetParams(params)) => {
+                str += &format!(
+                    "{} {} {:?}",
+                    params.bc_confirmation_depth_sigma, params.finalization_gap_bound, params.bootstrap
+                )
+            }
             Some(TestInstr::ExpectPoWChainLength(h)) => str += &h.to_string(),
             Some(TestInstr::ExpectPoSChainLength(h)) => str += &h.to_string(),
             Some(TestInstr::ExpectPoWBlockFinality(hash, f)) => {
@@ -201,21 +206,18 @@ impl TF {
             data: Vec::new(),
         };
 
-        // ALT: push as data & determine available info by size if we add more
-        const_assert!(size_of::<ZcashCrosslinkParameters>() == 16);
-        // enforce only 2 param members
+        // Enforce that every parameter is written: adding a member fails to compile here.
         let ZcashCrosslinkParameters {
             bc_confirmation_depth_sigma,
             finalization_gap_bound,
+            bootstrap,
         } = *params;
-        let val = [bc_confirmation_depth_sigma, finalization_gap_bound];
-
-        // NOTE:
-        // This empty data slice results in a 0-length data at the current data offset... We could
-        // also set it to 0-offset to clearly indicate there is no data intended to be used.
-        // (Because the offset is from the beginning of the file, nothing will refer to valid
-        // data at offset 0, which is the magic of the header)
-        // TODO (once handled): tf.push_instr_ex(TFInstr::SET_PARAMS, 0, &[], val);
+        tf.push_instr_ex(
+            TFInstr::SET_PARAMS,
+            0,
+            &bootstrap_to_bytes(bootstrap),
+            [bc_confirmation_depth_sigma, finalization_gap_bound],
+        );
 
         tf
     }
@@ -453,6 +455,62 @@ fn test_check(flags: u32, condition: bool, message: &str) {
 
 use crate::*;
 
+/// Parameters for scenarios that feed BFT blocks in directly, which is every scenario that is not
+/// testing the bootstrap itself. A file with no `SET_PARAMS` is read as these: every scenario was
+/// written that way before the bootstrap became a parameter.
+pub const HARNESS_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParameters {
+    bootstrap: BftBootstrap::Supplied,
+    ..PROTOTYPE_PARAMETERS
+};
+
+// `SET_PARAMS` carries sigma and L in `val`, and the bootstrap in its data.
+const TF_BOOTSTRAP_SUPPLIED: u8 = 0;
+const TF_BOOTSTRAP_FROM_CHAIN: u8 = 1;
+
+fn bootstrap_to_bytes(bootstrap: BftBootstrap) -> Vec<u8> {
+    match bootstrap {
+        BftBootstrap::Supplied => vec![TF_BOOTSTRAP_SUPPLIED],
+        BftBootstrap::FromChain { roster_height, activation_height } => {
+            let mut bytes = vec![TF_BOOTSTRAP_FROM_CHAIN];
+            bytes.extend_from_slice(&roster_height.to_le_bytes());
+            bytes.extend_from_slice(&activation_height.to_le_bytes());
+            bytes
+        }
+    }
+}
+
+fn bootstrap_from_bytes(bytes: &[u8]) -> Option<BftBootstrap> {
+    match bytes {
+        [TF_BOOTSTRAP_SUPPLIED] => Some(BftBootstrap::Supplied),
+        [TF_BOOTSTRAP_FROM_CHAIN, r0, r1, r2, r3, a0, a1, a2, a3] => Some(BftBootstrap::FromChain {
+            roster_height: u32::from_le_bytes([*r0, *r1, *r2, *r3]),
+            activation_height: u32::from_le_bytes([*a0, *a1, *a2, *a3]),
+        }),
+        _ => None,
+    }
+}
+
+/// The Crosslink parameters a test file's node must run with: its leading `SET_PARAMS`, or
+/// [`HARNESS_PARAMETERS`] if it has none. They are consensus parameters, so the harness builds the
+/// network with them before the node boots instead of applying them when the instruction runs.
+pub fn crosslink_parameters_for_test(bytes: &[u8]) -> ZcashCrosslinkParameters {
+    let Ok(tf) = TF::read_from_bytes(bytes) else {
+        return HARNESS_PARAMETERS;
+    };
+    let Some(first) = tf.instrs.first() else {
+        return HARNESS_PARAMETERS;
+    };
+    if first.kind != TFInstr::SET_PARAMS {
+        return HARNESS_PARAMETERS;
+    }
+    // A malformed SET_PARAMS falls back here, then fails loudly when the instruction is read.
+    if let Some(TestInstr::SetParams(params)) = tf_read_instr(bytes, first) {
+        params
+    } else {
+        HARNESS_PARAMETERS
+    }
+}
+
 pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> {
     const_assert!(TFInstr::COUNT == 8);
     match instr.kind {
@@ -473,6 +531,7 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
         TFInstr::SET_PARAMS => Some(TestInstr::SetParams(ZcashCrosslinkParameters {
             bc_confirmation_depth_sigma: instr.val[0],
             finalization_gap_bound: instr.val[1],
+            bootstrap: bootstrap_from_bytes(instr.data_slice(bytes))?,
         })),
 
         TFInstr::EXPECT_POW_CHAIN_LENGTH => {
@@ -559,9 +618,15 @@ pub(crate) async fn handle_instr(
             test_check(flags, force_feed_ok, &msg);
         }
 
-        TestInstr::SetParams(_) => {
+        TestInstr::SetParams(params) => {
             debug_assert!(instr_i == 0, "should only be set at the beginning");
-            todo!("Params");
+            // Consensus parameters are fixed when the network is built, before the node boots (see
+            // `crosslink_parameters_for_test`), so all that remains is confirming the node agrees.
+            test_check(
+                flags,
+                params == internal_handle.params,
+                &format!("SET_PARAMS: file declares {:?}, node runs {:?}", params, internal_handle.params),
+            );
         }
 
         TestInstr::ExpectPoWChainLength(h) => {

@@ -358,7 +358,7 @@ impl VizScene {
 /// Bridge between tokio & viz code
 pub async fn service_viz_requests(
     tfl_handle: crate::TFLServiceHandle,
-    params: &'static crate::ZcashCrosslinkParameters,
+    params: crate::ZcashCrosslinkParameters,
 ) {
     let call = tfl_handle.clone().call;
 
@@ -659,7 +659,7 @@ pub async fn service_viz_requests(
                             };
                             let bft_hashes: Vec<_> = bft_blocks.iter().map(|b| b.blake3_hash()).collect();
 
-                            let mut tf = test_format::TF::new(params);
+                            let mut tf = test_format::TF::new(&params);
                             let mut next_bft = 0usize;
                             // Each BFT block goes just before the first PoW block that commits to it,
                             // preserving the chronology a replay needs.

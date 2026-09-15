@@ -385,36 +385,61 @@ impl std::fmt::Display for InvalidBftBlock {
 }
 impl std::error::Error for InvalidBftBlock {}
 
-/// Crosslink bootstrap heights.
+/// How BFT comes into existence on a network.
 ///
-/// BFT does not run from genesis. Three PoW heights define how it comes up, so that no node needs
-/// an operator-supplied starting roster:
+/// On a real network BFT does not run from genesis. Three PoW heights define how it comes up, so
+/// that no node needs an operator-supplied starting roster:
 ///
 /// - `h0`: staking actions become legal. In this prototype that is genesis (the new transaction
-///   format is on from the start), so there is no constant for it.
-/// - `h1` [`BOOTSTRAP_ROSTER_HEIGHT`]: the block whose aggregated stakes become the roster that
-///   votes on BFT height 0. Chosen halfway between the first and second staking day, i.e. after
-///   the first staking window has closed, so every bond from day one counts.
-/// - `h2` [`BOOTSTRAP_ACTIVATION_HEIGHT`]: when a node accepts any PoW block at this height it
-///   walks back that chain to its `h1` ancestor, finalizes it, and starts BFT with `h1`'s roster.
+///   format is on from the start), so it is not a parameter.
+/// - `h1` (`roster_height`): the block whose aggregated stakes become the roster that votes on BFT
+///   height 0.
+/// - `h2` (`activation_height`): when a node accepts any PoW block at this height it walks back
+///   that chain to its `h1` ancestor, finalizes it, and starts BFT with `h1`'s roster.
 ///
 /// Every PoW block at or below `h2` must carry a nil fat pointer; only blocks above `h2` may point
-/// at a BFT block. `h2 - h1` exceeds the reorg limit, so by the time any `h2` block is accepted the
-/// `h1` ancestor is the same on every chain and its stakes are already in the finalized state.
-pub const BOOTSTRAP_ROSTER_HEIGHT: u32 = crate::transaction::STAKING_PERIOD / 2;
-/// See [`BOOTSTRAP_ROSTER_HEIGHT`].
-pub const BOOTSTRAP_ACTIVATION_HEIGHT: u32 = BOOTSTRAP_ROSTER_HEIGHT + 200;
-const _: () = assert!(
-    BOOTSTRAP_ACTIVATION_HEIGHT - BOOTSTRAP_ROSTER_HEIGHT > zcash_protocol::consensus::MAX_BLOCK_REORG_HEIGHT,
-    "the bootstrap roster block must be below the reorg limit when any activation-height block is accepted"
-);
+/// at a BFT block. `h2 - h1` must exceed the reorg limit, so by the time any `h2` block is accepted
+/// the `h1` ancestor is the same on every chain and its stakes are already in the finalized state;
+/// [`ZcashCrosslinkParameters::bootstrap_is_valid`] checks this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BftBootstrap {
+    /// BFT is created from the chain, as described above.
+    FromChain {
+        /// `h1`
+        roster_height: u32,
+        /// `h2`
+        activation_height: u32,
+    },
+    /// BFT blocks are supplied from outside from genesis, so there is no bootstrap and a fat
+    /// pointer is legal at any height. Only the test-format harness does this.
+    Supplied,
+}
+
+impl BftBootstrap {
+    /// `h1`, or `None` when BFT is supplied rather than bootstrapped.
+    pub const fn roster_height(&self) -> Option<u32> {
+        match *self {
+            BftBootstrap::FromChain { roster_height, .. } => Some(roster_height),
+            BftBootstrap::Supplied => None,
+        }
+    }
+
+    /// `h2`, or `None` when BFT is supplied rather than bootstrapped.
+    pub const fn activation_height(&self) -> Option<u32> {
+        match *self {
+            BftBootstrap::FromChain { activation_height, .. } => Some(activation_height),
+            BftBootstrap::Supplied => None,
+        }
+    }
+}
 
 /// Zcash Crosslink protocol parameters
 ///
-/// This is provided as a trait so that downstream users can define or plug in their own alternative parameters.
+/// These are consensus parameters: every node on a network must agree on them, so they belong to
+/// the network's definition rather than to any one node's configuration.
 ///
 /// Ref: [Zcash Trailing Finality Layer §3.3.3 Parameters](https://electric-coin-company.github.io/tfl-book/design/crosslink/construction.html#parameters)
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZcashCrosslinkParameters {
     /// The best-chain confirmation depth, `σ`
     ///
@@ -427,15 +452,44 @@ pub struct ZcashCrosslinkParameters {
     ///
     /// > In practice, L should be at least 2σ.
     pub finalization_gap_bound: u64,
+
+    /// How BFT comes into existence on this network.
+    pub bootstrap: BftBootstrap,
+}
+
+impl ZcashCrosslinkParameters {
+    /// Whether a chain-built bootstrap puts `h1` beyond reorg reach before any `h2` block can be
+    /// accepted. Always true for [`BftBootstrap::Supplied`].
+    pub const fn bootstrap_is_valid(&self) -> bool {
+        match self.bootstrap {
+            BftBootstrap::FromChain { roster_height, activation_height } => {
+                activation_height > roster_height
+                    && activation_height - roster_height
+                        > zcash_protocol::consensus::MAX_BLOCK_REORG_HEIGHT
+            }
+            BftBootstrap::Supplied => true,
+        }
+    }
 }
 
 /// Crosslink parameters chosed for prototyping / testing
+///
+/// `h1` is halfway between the first and second staking day, i.e. after the first staking window
+/// has closed, so every bond from day one counts.
 ///
 /// <div class="warning">No verification has been done on the security or performance of these parameters.</div>
 pub const PROTOTYPE_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParameters {
     bc_confirmation_depth_sigma: 3,
     finalization_gap_bound: 7,
+    bootstrap: BftBootstrap::FromChain {
+        roster_height: crate::transaction::STAKING_PERIOD / 2,
+        activation_height: crate::transaction::STAKING_PERIOD / 2 + 200,
+    },
 };
+const _: () = assert!(
+    PROTOTYPE_PARAMETERS.bootstrap_is_valid(),
+    "the bootstrap roster block must be below the reorg limit when any activation-height block is accepted"
+);
 
 /// A BLAKE3 hash.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Copy, Hash, Serialize, Deserialize)]
