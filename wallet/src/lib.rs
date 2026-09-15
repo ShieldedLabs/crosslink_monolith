@@ -4243,6 +4243,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         // maybe sent should be?
                         break;
                     }
+                    if !tx.is_on_bc() {
+                        continue;
+                    }
                     // N.B. these may get revalidated later if the same txs are found in the new blocks
                     tx.status = TxStatus::SoftFail(tx.h);
                     tx.h = wallet.chain_tip_h;
