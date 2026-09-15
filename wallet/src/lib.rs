@@ -1408,6 +1408,8 @@ pub struct ManualWallet {
     pub accounts: Vec<ManualAccount>,
     pub strms: Vec<ManualStream>,
     pub chain_tip_h: BlockHeight,
+    /// The node's and the wallet's consensus branch IDs at the node's tip, while they disagree.
+    pub branch_mismatch: Option<(u32, u32)>,
     // TODO: change type
     // TODO: to avoid nested variably-sized data, we could split these into actions that are
     // txid-linked, then reconstruct on request
@@ -1594,6 +1596,11 @@ impl ManualWallet {
         src_usk: &UnifiedSpendingKey, opts: &TxOptions<'_>
     ) -> Option<()>
     {
+        if let Some((node_branch, wallet_branch)) = self.branch_mismatch {
+            println!("tx build refused: the node is on consensus branch {node_branch:08x}, but the wallet's network parameters give {wallet_branch:08x}");
+            return None;
+        }
+
         let block_h = self.chain_tip_h.0 + 1;
 
         let account_id = 0;
@@ -3055,6 +3062,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             accounts: vec![account.clone()],
             strms: Vec::new(),
             chain_tip_h: BlockHeight(0),
+            branch_mismatch: None,
             txs: Vec::new(),
             tx_h_map: HashMap::new(),
             seen_bond_values: HashMap::new(),
@@ -3733,16 +3741,31 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // NOTE: I think this is only needed for telling the user how sync'd we are?
             match lightd_res {
                 Ok(info) => {
-                    let h = info.into_inner().block_height;
+                    let info = info.into_inner();
+                    let h = info.block_height;
                     let Ok(network_tip_h) = <u32>::try_from(h) else {
                         println!("lightd network tip height not representable in 32 bits: {h}");
                         continue 'outer_sync; // TODO: don't continue if it's not actually critical
                     };
 
+                    // The wallet builds transactions against its own hardcoded network parameters, and the
+                    // node rejects every transaction whose branch ID differs from its own.
+                    let branch_mismatch = u32::from_str_radix(&info.consensus_branch_id, 16).ok().and_then(|node_branch| {
+                        let wallet_branch = u32::from(BranchId::for_height(network, LRZBlockHeight::from_u32(network_tip_h)));
+                        (node_branch != wallet_branch).then_some((node_branch, wallet_branch))
+                    });
+                    if branch_mismatch != user_wallet.branch_mismatch {
+                        match branch_mismatch {
+                            Some((node_branch, wallet_branch)) => println!("CONSENSUS BRANCH MISMATCH at height {network_tip_h}: node {node_branch:08x}, wallet {wallet_branch:08x}; refusing to build transactions"),
+                            None => println!("consensus branch IDs of node and wallet agree again at height {network_tip_h}"),
+                        }
+                    }
+
                     // AFAICT there's no downside to updating these as frequently as possible, even if the
                     // rest of sync is lagging behind
                     for wallet in [&mut miner_wallet, &mut user_wallet] {
                         wallet.chain_tip_h = BlockHeight(network_tip_h);
+                        wallet.branch_mismatch = branch_mismatch;
                     }
                 },
                 Err(err) => {
