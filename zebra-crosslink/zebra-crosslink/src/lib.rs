@@ -1750,7 +1750,12 @@ async fn total_issuance_from_key(
     first_height: ZebBlockHeight,
     last_height: ZebBlockHeight,
 ) -> Result<Vec<ScanInfo>, String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use wallet::scanner::{PROF, timed};
+
     let call = internal_handle.call.clone();
+    let t_wall = std::time::Instant::now();
+    PROF.reset();
 
     let mut delegation_bonds = HashMap::new();
     let mut finalizer_rewards: HashMap<[u8; 32], u64> = HashMap::new();
@@ -1775,9 +1780,13 @@ async fn total_issuance_from_key(
     }
 
     for height in first_height.0..=last_height.0 {
-        // let tz = wallet::Timer::scope_("scan height", true);
-        println!("scanning height {height}");
+        if height % 1000 == 0 {
+            println!("scanning height {height}");
+        }
+        let t_fetch = std::time::Instant::now();
         let res = (call.state)(StateRequest::Block(ZebBlockHeight(height).into())).await;
+        PROF.fetch_ns.fetch_add(t_fetch.elapsed().as_nanos() as u64, Relaxed);
+        PROF.blocks.fetch_add(1, Relaxed);
         let block = match res {
             Ok(StateResponse::Block(Some(block))) => block,
             Ok(StateResponse::Block(None)) => return Err(format!("failed to get block at height {height}")),
@@ -1791,7 +1800,8 @@ async fn total_issuance_from_key(
 
 
         for (tx_i, tx) in block.transactions.iter().enumerate() {
-            let coinbase_tx_bytes = match tx.zcash_serialize_to_vec() {
+            PROF.txs.fetch_add(1, Relaxed);
+            let coinbase_tx_bytes = match timed(&PROF.serialize_ns, || tx.zcash_serialize_to_vec()) {
                 Ok(tx) => tx,
                 Err(err) => return Err(format!("failed to serialize coinbase tx at height {height}: {err:?}")),
             };
@@ -1800,10 +1810,11 @@ async fn total_issuance_from_key(
             let txid = tx.unmined_id().mined_id();
 
             if let Some(staking_action) = tx.staking_action() {
+                PROF.staking.fetch_add(1, Relaxed);
                 let mut bond_retargets = vec![HashMap::new()];
                 // Note(Sam): It seems weird that the bonds never get deleted. I don't know what I was
                 // thinking when I did that. But it makes this code easy.
-                zebra_state::update_chain_tip_with_delegation_bond(
+                let _ = timed(&PROF.replay_ns, || zebra_state::update_chain_tip_with_delegation_bond(
                     &mut zebra_chain::value_balance::ValueBalance::zero(),
                     &mut delegation_bonds,
                     &mut bond_retargets,
@@ -1814,10 +1825,10 @@ async fn total_issuance_from_key(
                         height: ZebBlockHeight(height),
                         index: zebra_state::TransactionIndex::from_index(tx_i.try_into().unwrap()),
                     }
-                );
+                ));
             }
 
-            zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds, &mut finalizer_rewards);
+            timed(&PROF.replay_ns, || zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds, &mut finalizer_rewards));
 
             for (ufvk_i, scan_ctx) in scan_ctxs.iter().enumerate() {
                 let utxos = &mut utxos_per_ufvk[ufvk_i];
@@ -1851,6 +1862,7 @@ async fn total_issuance_from_key(
         println!("final scan info: {scan_info:?}");
     }
 
+    PROF.report(t_wall.elapsed());
     Ok(scan_infos)
 }
 
