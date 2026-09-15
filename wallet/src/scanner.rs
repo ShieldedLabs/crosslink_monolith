@@ -16,6 +16,7 @@ pub struct ScanCtx {
 pub struct ScanProf {
     pub fetch_ns: AtomicU64,
     pub serialize_ns: AtomicU64,
+    pub txid_ns: AtomicU64,
     pub replay_ns: AtomicU64,
     pub parse_ns: AtomicU64,
     pub transparent_ns: AtomicU64,
@@ -31,6 +32,7 @@ pub struct ScanProf {
 pub static PROF: ScanProf = ScanProf {
     fetch_ns: AtomicU64::new(0),
     serialize_ns: AtomicU64::new(0),
+    txid_ns: AtomicU64::new(0),
     replay_ns: AtomicU64::new(0),
     parse_ns: AtomicU64::new(0),
     transparent_ns: AtomicU64::new(0),
@@ -53,7 +55,7 @@ pub fn timed<T>(slot: &AtomicU64, f: impl FnOnce() -> T) -> T {
 
 impl ScanProf {
     pub fn reset(&self) {
-        for a in [&self.fetch_ns, &self.serialize_ns, &self.replay_ns, &self.parse_ns,
+        for a in [&self.fetch_ns, &self.serialize_ns, &self.txid_ns, &self.replay_ns, &self.parse_ns,
                   &self.transparent_ns, &self.orchard_ns, &self.blocks, &self.txs,
                   &self.staking, &self.vouts, &self.trial_decrypts] {
             a.store(0, Relaxed);
@@ -66,6 +68,7 @@ impl ScanProf {
         let wall_ns = wall.as_nanos() as u64;
         let mut sum = 0u64;
         for (name, slot) in [("fetch", &self.fetch_ns), ("serialize", &self.serialize_ns),
+                             ("zebra_txid", &self.txid_ns),
                              ("replay", &self.replay_ns), ("parse", &self.parse_ns),
                              ("transparent", &self.transparent_ns), ("orchard", &self.orchard_ns)] {
             let ns = g(slot);

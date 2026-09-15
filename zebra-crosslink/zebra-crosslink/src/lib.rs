@@ -1807,7 +1807,7 @@ async fn total_issuance_from_key(
             };
 
 
-            let txid = tx.unmined_id().mined_id();
+            let txid = timed(&PROF.txid_ns, || tx.unmined_id().mined_id());
 
             if let Some(staking_action) = tx.staking_action() {
                 PROF.staking.fetch_add(1, Relaxed);
