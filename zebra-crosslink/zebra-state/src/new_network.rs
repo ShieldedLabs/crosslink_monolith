@@ -1136,9 +1136,11 @@ pub struct VerifyFns {
 
     /// Body: binds the transactions to the header (merkle), then the subsidy rules.
     /// Must run before anything trusts the height, including the crosslink gate.
+    /// Takes the height `check_header` ran at, and rejects a block whose coinbase disagrees.
     pub check_body: fn(
         &Block,
         &zebra_chain::parameters::Network,
+        Height,
     ) -> Result<CheapBlockChecks, BlockVerifyError>,
 
     pub check_cheap: fn(
@@ -2840,7 +2842,7 @@ pub fn sync(
                     Ok(cheap.clone())
                 } else {
                     let res = (verify_fns.check_header)(&block_arc.header, &network, block::Height(height), zebra_debug_time::now(), check_pow)
-                        .and_then(|()| (verify_fns.check_body)(&block_arc, &network));
+                        .and_then(|()| (verify_fns.check_body)(&block_arc, &network, block::Height(height)));
                     if let Ok(cheap) = &res {
                         cheap_checks_memo.insert(hash, cheap.clone());
                     }

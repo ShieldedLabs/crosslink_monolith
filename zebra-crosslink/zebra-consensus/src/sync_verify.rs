@@ -81,8 +81,8 @@ impl From<VerifyBlockError> for BlockVerifyError {
 /// `alleged_height` is the height claimed by whoever supplied the block. It is NOT trusted
 /// here: difficulty depends on height, so one is needed, but the value is only bound to the
 /// header once [`block_check_body`] validates the merkle root and re-derives the height from
-/// the coinbase transaction. A caller that runs this early MUST also run `block_check_body`
-/// before acting on anything height-dependent.
+/// the coinbase transaction. A caller that runs this early MUST pass the same height to
+/// `block_check_body`, which rejects the block if the claim was wrong.
 ///
 /// `check_pow` is `false` for block proposals and for networks with PoW disabled — matching
 /// the `request.is_proposal() || network.disable_pow()` branch in `SemanticBlockVerifier`.
@@ -128,9 +128,12 @@ pub fn block_check_header(
 /// the transactions (and therefore `coinbase_height()`) are not committed to by the PoW'd
 /// header and an attacker can vary them freely. Anything that consumes the height, including
 /// the crosslink fat-pointer gate, must run after this.
+///
+/// `header_height` is the height [`block_check_header`] ran its height-dependent rules at.
 pub fn block_check_body(
     block: &Block,
     network: &Network,
+    header_height: Height,
 ) -> Result<CheapBlockChecks, BlockVerifyError> {
     let hash = block.hash();
 
@@ -145,6 +148,16 @@ pub fn block_check_body(
 
     check::merkle_root_validity(network, block, &transaction_hashes)
         .map_err(VerifyBlockError::from)?;
+
+    // Only now is the height bound to the PoW'd header. If it differs, the header's difficulty
+    // rules ran against the wrong height. With a height taken from the block itself this cannot
+    // happen, so it is a caller bug rather than peer misbehaviour.
+    if height != header_height {
+        return Err(BlockVerifyError {
+            msg: format!("header was checked at height {header_height:?}, but the block is at {height:?}"),
+            misbehavior_score: 0,
+        });
+    }
 
     let coinbase_tx = check::coinbase_is_first(block).map_err(VerifyBlockError::from)?;
 
@@ -185,7 +198,7 @@ pub fn block_check_cheap(
         .map_err(VerifyBlockError::from)?;
 
     block_check_header(&block.header, network, alleged_height, now, check_pow)?;
-    block_check_body(block, network)
+    block_check_body(block, network, alleged_height)
 }
 
 /// The expensive per-block verification: transparent scripts, sigops, fees, and the shielded
