@@ -1488,6 +1488,13 @@ pub const STAKING_PERIOD: u32 = 150;
 /// Staking actions are only valid when `block_height % STAKING_PERIOD < STAKING_DAY_WINDOW`.
 pub const STAKING_DAY_WINDOW: u32 = 70;
 
+/// The number of blocks a bond must wait after its last action before it can be unbonded (counted
+/// from its creation) or withdrawn (counted from its unbonding).
+/// @Todo: We probably don't really need this or want this. We can just check:
+///        (last_action_height / STAKING_PERIOD) > (current_height / STAKING_PERIOD)
+///        which is probably more robust.
+pub const STAKING_ACTION_DELAY: u32 = STAKING_DAY_WINDOW + 5;
+
 // It takes 2 staking periods to withdraw funds-at-stake into shielded, so currently
 // there is not much point to slashing bonds older than that; any smart attacker will
 // likely have already withdrawn their stake. That's why the staking period exists: to

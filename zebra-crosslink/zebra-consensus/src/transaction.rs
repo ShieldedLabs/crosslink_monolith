@@ -24,7 +24,7 @@ use tower::{
 use tracing::Instrument;
 
 use zcash_protocol::value::ZatBalance;
-use zcash_primitives::transaction::{STAKING_PERIOD, STAKING_DAY_WINDOW};
+use zcash_primitives::transaction::{STAKING_ACTION_DELAY, STAKING_PERIOD, STAKING_DAY_WINDOW};
 
 use zebra_chain::{
     amount::{Amount, NonNegative},
@@ -420,17 +420,11 @@ where
     ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     ZS::Future: Send + 'static,
 {
-    /// Minimum number of blocks that must pass between staking actions on the same bond.
-    /// @Todo: We probably don't really need this or want this. We can just check:
-    ///        (last_action_height / STAKING_PERIOD) > (current_height / STAKING_PERIOD)
-    ///        which is probably more robust.
-    pub const STAKING_ACTION_DELAY: u32 = STAKING_DAY_WINDOW + 5;
-
     /// Checks that staking actions in a transaction respect the required delay since the
     /// last action on the same bond.
     ///
     /// For BeginDelegationUnbonding and WithdrawDelegationBond actions, verifies that at least
-    /// `STAKING_ACTION_DELAY_BLOCKS` blocks have passed since the bond was created or last modified.
+    /// `STAKING_ACTION_DELAY` blocks have passed since the bond was created or last modified.
     ///
     /// Returns `Ok(())` if the transaction has no staking action or the delay is satisfied.
     async fn check_staking_action_delay(
@@ -476,12 +470,12 @@ where
         let current_height = height.0;
 
         // Check if enough blocks have passed since the last action
-        if current_height < last_action_height + Self::STAKING_ACTION_DELAY {
+        if current_height < last_action_height + STAKING_ACTION_DELAY {
             return Err(TransactionError::StakingActionDelayNotMet {
                 bond_key,
                 last_action_height,
                 current_height,
-                required_delay: Self::STAKING_ACTION_DELAY,
+                required_delay: STAKING_ACTION_DELAY,
             });
         }
 
