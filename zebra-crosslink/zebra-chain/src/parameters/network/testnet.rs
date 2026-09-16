@@ -528,10 +528,7 @@ impl Default for ParametersBuilder {
             pre_blossom_halving_interval: PRE_BLOSSOM_HALVING_INTERVAL,
             post_blossom_halving_interval: POST_BLOSSOM_HALVING_INTERVAL,
             should_allow_unshielded_coinbase_spends: false,
-            lockbox_disbursements: testnet::NU6_1_LOCKBOX_DISBURSEMENTS
-                .iter()
-                .map(|(addr, amount)| (addr.to_string(), *amount))
-                .collect(),
+            lockbox_disbursements: Vec::new(), // @Crosslink @Testnet @Nightly
             checkpoints: TESTNET_CHECKPOINT_LIST.clone(),
             temporary_orchard_disabling_soft_fork_height: Some(
                 super::TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT,
