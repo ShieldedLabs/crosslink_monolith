@@ -59,7 +59,7 @@ pub use request::{
 pub use request::Spend;
 
 pub use response::{
-    AnyTx, GetBlockTemplateChainInfo, KnownBlock, KnownBlockLocation, MinedTx,
+    AnyTx, BondInfoResponse, GetBlockTemplateChainInfo, KnownBlock, KnownBlockLocation, MinedTx,
     NonFinalizedBlocksListener, ReadResponse, Response, SidechainFork,
 };
 pub use service::write::WriteBlockWorkerTask;

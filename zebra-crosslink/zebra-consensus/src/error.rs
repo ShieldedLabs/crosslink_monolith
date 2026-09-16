@@ -305,6 +305,9 @@ pub enum TransactionError {
     #[error("staking action on non-existent bond: {bond_key:?}")]
     StakingActionBondNotFound { bond_key: [u8; 32] },
 
+    #[error("staking action does not apply to bond {bond_key:?}: {reason}")]
+    StakingActionBondStateInvalid { bond_key: [u8; 32], reason: String },
+
     #[error(
         "staking action target finalizer address is not a valid capability: the embedded \
          signature does not verify for pub key {pub_key:?}"

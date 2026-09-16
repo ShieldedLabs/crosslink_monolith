@@ -4784,6 +4784,43 @@ mod staking_signature {
         assert!(matches!(err, TransactionError::StakingActionSignatureInvalid { .. }));
     }
 
+    /// The mempool admits a staking action only if the bond at the tip allows it, which is what
+    /// keeps a second unbonding of the same bond out of the mempool and out of block templates.
+    #[test]
+    fn mempool_staking_action_bond_state_rules() {
+        use zcash_primitives::transaction::{StakingActionKind::*, STAKING_ACTION_DELAY};
+        use zebra_chain::{amount::Amount, block::Height};
+        use zebra_state::BondInfoResponse;
+
+        use crate::transaction::check_staking_action_bond_state;
+
+        const KEY: [u8; 32] = [1; 32];
+        const LAST_ACTION: u32 = 1000;
+        let bond = |status| {
+            Some(BondInfoResponse { amount: Amount::try_from(500u64).unwrap(), status, last_action_height: LAST_ACTION })
+        };
+        let ready = Height(LAST_ACTION + STAKING_ACTION_DELAY);
+        let early = Height(LAST_ACTION + STAKING_ACTION_DELAY - 1);
+        let check = |kind, amount, bond_info, height| check_staking_action_bond_state(kind, KEY, amount, bond_info, height);
+
+        assert!(check(CreateNewDelegationBond, 500, None, ready).is_ok());
+        assert!(check(CreateNewDelegationBond, 500, bond(0), ready).is_err());
+
+        assert!(check(BeginDelegationUnbonding, 0, None, ready).is_err());
+        assert!(check(BeginDelegationUnbonding, 0, bond(0), ready).is_ok());
+        assert!(check(BeginDelegationUnbonding, 0, bond(0), early).is_err());
+        assert!(check(BeginDelegationUnbonding, 0, bond(1), ready).is_err());
+
+        assert!(check(WithdrawDelegationBond, 500, bond(1), ready).is_ok());
+        assert!(check(WithdrawDelegationBond, 500, bond(1), early).is_err());
+        assert!(check(WithdrawDelegationBond, 499, bond(1), ready).is_err());
+        assert!(check(WithdrawDelegationBond, 500, bond(0), ready).is_err());
+        assert!(check(WithdrawDelegationBond, 500, bond(2), ready).is_err());
+
+        assert!(check(RetargetDelegationBond, 0, bond(0), early).is_ok());
+        assert!(check(RetargetDelegationBond, 0, bond(3), ready).is_err());
+    }
+
     /// ZIP 215 accepts small-order keys, and under one the all-zero signature verifies over
     /// any message, so a bond with such a key could be spent by anyone. Both halves are
     /// asserted: the premise, so the check cannot silently stop firing, and the rejection.

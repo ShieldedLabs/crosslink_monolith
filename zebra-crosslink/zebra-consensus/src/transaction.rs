@@ -312,15 +312,11 @@ where
             //        checks back to after the cache check.
 
             // Check staking day window (staking actions only allowed during specific block ranges)
-            Self::check_staking_day_window(&tx, req.height)?;
+            check_staking_day_window(&tx, req.height)?;
 
             // The target finalizer address must be a valid capability (its embedded
-            // signature verifies); rejecting here keeps doomed actions out of the
-            // mempool, and the state contextual check enforces the same rule on blocks.
-            Self::check_staking_target_capability(&tx)?;
-
-            // Check staking action delay (applies to both mempool and block transactions)
-            Self::check_staking_action_delay(&tx, req.height, state.clone()).await?;
+            // signature verifies); the state contextual check enforces the same rule on blocks.
+            check_staking_target_capability(&tx)?;
 
             // NOTE: Crosslink short-circuited here on a transaction already verified in the
             // mempool. Upstream split the verifier into BlockTxVerifier and MempoolTxVerifier,
@@ -420,154 +416,6 @@ where
     ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     ZS::Future: Send + 'static,
 {
-    /// Checks that staking actions in a transaction respect the required delay since the
-    /// last action on the same bond.
-    ///
-    /// For BeginDelegationUnbonding and WithdrawDelegationBond actions, verifies that at least
-    /// `STAKING_ACTION_DELAY` blocks have passed since the bond was created or last modified.
-    ///
-    /// Returns `Ok(())` if the transaction has no staking action or the delay is satisfied.
-    async fn check_staking_action_delay(
-        tx: &Transaction,
-        height: block::Height,
-        state: Timeout<ZS>,
-    ) -> Result<(), TransactionError> {
-        use zcash_primitives::transaction::StakingActionKind;
-
-        let staking_action = match tx.staking_action() {
-            Some(action) => action,
-            None => return Ok(()),
-        };
-
-        // Only check delay for actions that modify existing bonds
-        match staking_action.kind() {
-            StakingActionKind::BeginDelegationUnbonding
-            | StakingActionKind::WithdrawDelegationBond => {}
-            _ => return Ok(()),
-        }
-
-        let bond_key = staking_action.bond_key();
-
-        // Query the state for bond info
-        let query = state.oneshot(zs::Request::BondInfo(bond_key));
-
-        let response = query
-            .await
-            .map_err(|e| TransactionError::ValidateMempoolLockTimeError(
-                format!("failed to query bond info: {}", e)
-            ))?;
-
-        let zs::Response::BondInfo(bond_info) = response else {
-            unreachable!("BondInfo request always responds with BondInfo")
-        };
-
-        let Some(info) = bond_info else {
-            // Bond doesn't exist - this will be caught by other validation
-            return Err(TransactionError::StakingActionBondNotFound { bond_key });
-        };
-
-        let last_action_height = info.last_action_height;
-        let current_height = height.0;
-
-        // Check if enough blocks have passed since the last action
-        if current_height < last_action_height + STAKING_ACTION_DELAY {
-            return Err(TransactionError::StakingActionDelayNotMet {
-                bond_key,
-                last_action_height,
-                current_height,
-                required_delay: STAKING_ACTION_DELAY,
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Checks that a staking action's target finalizer address, when it carries one,
-    /// is a valid capability: the address embeds the finalizer key's signature over
-    /// the standard message. Stateless, so it runs for mempool and block paths alike.
-    fn check_staking_target_capability(tx: &Transaction) -> Result<(), TransactionError> {
-        if let Some(staking_action) = tx.staking_action() {
-            // Retarget's claimed current target must be a valid capability too;
-            // whether it matches the bond's actual target is a contextual check
-            // in zebra-state (validate_delegation_bonds).
-            for addr in [staking_action.target_finalizer_address(), staking_action.from_finalizer_address()] {
-                if let Some(addr) = addr {
-                    if !addr.verify() {
-                        return Err(TransactionError::StakingActionInvalidFinalizerAddress {
-                            pub_key: addr.pub_key.0,
-                        });
-                    }
-                }
-            }
-
-            // A reward conversion is the finalizer releasing its own bank value, so the
-            // finalizer must have authorized exactly this (bond key, amount) pair. The
-            // message is standalone (no sighash), see `bft::finalizer_reward_conversion_msg`.
-            // Whether the bank actually holds `amount_zats` is a contextual check in
-            // zebra-state.
-            if let zcash_primitives::transaction::StakingAction::ConvertFinalizerRewardToDelegationBond {
-                unique_pubkey, this_finalizer, amount_zats, finalizer_signature, ..
-            } = staking_action {
-                let ok = zcash_primitives::bft::verify_finalizer_reward_conversion(
-                    zcash_primitives::bft::PubKeyID(*this_finalizer), unique_pubkey, *amount_zats, finalizer_signature);
-                if !ok {
-                    return Err(TransactionError::StakingActionFinalizerAuthorizationInvalid {
-                        finalizer: *this_finalizer,
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Checks that staking actions are only performed within the allowed staking window.
-    ///
-    /// Staking actions are only valid when `block_height % STAKING_PERIOD < STAKING_DAY_WINDOW`.
-    /// For example, with PERIOD=100 and WINDOW=10, staking is allowed on blocks 0-9, 100-109, 200-209, etc.
-    ///
-    /// RetargetDelegationBond is exempt from this rule and can be submitted at any time.
-    ///
-    /// Returns `Ok(())` if the transaction has no staking action or is within the staking window.
-    fn check_staking_day_window(
-        tx: &Transaction,
-        height: block::Height,
-    ) -> Result<(), TransactionError> {
-        use zcash_primitives::transaction::StakingActionKind;
-
-        let staking_action = match tx.staking_action() {
-            Some(action) => action,
-            None => return Ok(()),
-        };
-
-        // Retarget and finalizer reward conversion are exempt from staking day
-        // restrictions: neither moves value into or out of the staking pools from
-        // outside (conversion only re-labels value already at stake).
-        if matches!(staking_action.kind(), StakingActionKind::RetargetDelegationBond | StakingActionKind::ConvertFinalizerRewardToDelegationBond) {
-            return Ok(());
-        }
-
-        let block_height = height.0;
-
-        let excepted_heights = [ 1120, 2320, 2620, 2621, 3224 ];
-        if excepted_heights.contains(&block_height) {
-            // TODO: @Prod @Season2 remove this temporary cruft
-            return Ok(());
-        }
-
-
-        let position_in_period = block_height % STAKING_PERIOD;
-
-        if position_in_period >= STAKING_DAY_WINDOW {
-            return Err(TransactionError::StakingActionOutsideWindow {
-                block_height,
-                period: STAKING_PERIOD,
-                window: STAKING_DAY_WINDOW,
-            });
-        }
-
-        Ok(())
-    }
-
     /// Looks up UTXOs spent by `tx` from the best chain state, also checking
     /// `known_utxos` for UTXOs from earlier transactions in the same block.
     ///
@@ -688,7 +536,12 @@ where
             // These are pure consensus rules over the transaction structure and must always hold.
             check_transaction_invariants(tx.as_ref(), height, &network)?;
 
+            check_staking_day_window(&tx, height)?;
+            check_staking_target_capability(&tx)?;
+
             tracing::trace!(?tx_id, "passed quick checks");
+
+            Self::check_mempool_staking_action_bond_state(&tx, height, state.clone()).await?;
 
             // Mempool transactions are checked against the next median-time-past from state.
             Self::verify_mempool_lock_time(tx.as_ref(), height, state.clone()).await?;
@@ -809,6 +662,35 @@ where
         + 'static,
     Mempool::Future: Send + 'static,
 {
+    /// Checks a staking action against its bond at the best chain tip, so the mempool only holds
+    /// actions the next block could include. Blocks get the same rules from contextual validation
+    /// in the state, against the chain they extend.
+    async fn check_mempool_staking_action_bond_state(
+        tx: &Transaction,
+        height: block::Height,
+        state: Timeout<ZS>,
+    ) -> Result<(), TransactionError> {
+        use zcash_primitives::transaction::StakingActionKind;
+
+        let Some(staking_action) = tx.staking_action() else {
+            return Ok(());
+        };
+        if staking_action.kind() == StakingActionKind::Null {
+            return Ok(());
+        }
+        let bond_key = staking_action.bond_key();
+
+        let zs::Response::BondInfo(bond_info) = state
+            .oneshot(zs::Request::BondInfo(bond_key))
+            .await
+            .map_err(TransactionError::from)?
+        else {
+            unreachable!("BondInfo request always responds with BondInfo")
+        };
+
+        check_staking_action_bond_state(staking_action.kind(), bond_key, staking_action.amount_zats(), bond_info, height)
+    }
+
     /// Validates mempool lock-time consensus rules.
     ///
     /// Queries state only for time-based lock times.
@@ -955,6 +837,158 @@ where
 
         Ok((spent_utxos, spent_outputs, spent_mempool_outpoints))
     }
+}
+
+/// Checks that a staking action of `kind` applies to the bond described by `bond_info` at
+/// `height`: the key is fresh for a new bond, and otherwise the bond has the status the action
+/// needs, the withdrawal amount matches, and the staking action delay has passed.
+fn check_staking_action_bond_state(
+    kind: zcash_primitives::transaction::StakingActionKind,
+    bond_key: [u8; 32],
+    amount_zats: u64,
+    bond_info: Option<zs::BondInfoResponse>,
+    height: block::Height,
+) -> Result<(), TransactionError> {
+    use zcash_primitives::transaction::StakingActionKind;
+
+    // Status codes are those of `zs::BondInfoResponse`.
+    const ACTIVE: u8 = 0;
+    const UNBONDING: u8 = 1;
+    let invalid = |reason: &str| Err(TransactionError::StakingActionBondStateInvalid { bond_key, reason: reason.to_string() });
+
+    match (kind, bond_info) {
+        (StakingActionKind::Null, _) => Ok(()),
+        (StakingActionKind::CreateNewDelegationBond | StakingActionKind::ConvertFinalizerRewardToDelegationBond, None) => Ok(()),
+        (StakingActionKind::CreateNewDelegationBond | StakingActionKind::ConvertFinalizerRewardToDelegationBond, Some(_)) => {
+            invalid("the bond key already exists")
+        }
+        (_, None) => Err(TransactionError::StakingActionBondNotFound { bond_key }),
+        (StakingActionKind::BeginDelegationUnbonding, Some(info)) => {
+            if info.status != ACTIVE {
+                return invalid("the bond is not active");
+            }
+            check_staking_action_delay(bond_key, height, info.last_action_height)
+        }
+        (StakingActionKind::WithdrawDelegationBond, Some(info)) => {
+            if info.status != UNBONDING {
+                return invalid("the bond is not unbonding");
+            }
+            if u64::from(info.amount) != amount_zats {
+                return invalid("the withdrawal amount does not match the bond");
+            }
+            check_staking_action_delay(bond_key, height, info.last_action_height)
+        }
+        (StakingActionKind::RetargetDelegationBond, Some(info)) => {
+            if info.status != ACTIVE {
+                return invalid("the bond is not active");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Rejects an action on a bond at `height` when the bond's previous action, at
+/// `last_action_height`, is less than `STAKING_ACTION_DELAY` blocks earlier.
+fn check_staking_action_delay(
+    bond_key: [u8; 32],
+    height: block::Height,
+    last_action_height: u32,
+) -> Result<(), TransactionError> {
+    if height.0 < last_action_height.saturating_add(STAKING_ACTION_DELAY) {
+        return Err(TransactionError::StakingActionDelayNotMet {
+            bond_key,
+            last_action_height,
+            current_height: height.0,
+            required_delay: STAKING_ACTION_DELAY,
+        });
+    }
+    Ok(())
+}
+
+/// Checks that a staking action's target finalizer address, when it carries one,
+/// is a valid capability: the address embeds the finalizer key's signature over
+/// the standard message. Stateless, so it runs for mempool and block paths alike.
+fn check_staking_target_capability(tx: &Transaction) -> Result<(), TransactionError> {
+    if let Some(staking_action) = tx.staking_action() {
+        // Retarget's claimed current target must be a valid capability too;
+        // whether it matches the bond's actual target is a contextual check
+        // in zebra-state (validate_delegation_bonds).
+        for addr in [staking_action.target_finalizer_address(), staking_action.from_finalizer_address()] {
+            if let Some(addr) = addr {
+                if !addr.verify() {
+                    return Err(TransactionError::StakingActionInvalidFinalizerAddress {
+                        pub_key: addr.pub_key.0,
+                    });
+                }
+            }
+        }
+
+        // A reward conversion is the finalizer releasing its own bank value, so the
+        // finalizer must have authorized exactly this (bond key, amount) pair. The
+        // message is standalone (no sighash), see `bft::finalizer_reward_conversion_msg`.
+        // Whether the bank actually holds `amount_zats` is a contextual check in
+        // zebra-state.
+        if let zcash_primitives::transaction::StakingAction::ConvertFinalizerRewardToDelegationBond {
+            unique_pubkey, this_finalizer, amount_zats, finalizer_signature, ..
+        } = staking_action {
+            let ok = zcash_primitives::bft::verify_finalizer_reward_conversion(
+                zcash_primitives::bft::PubKeyID(*this_finalizer), unique_pubkey, *amount_zats, finalizer_signature);
+            if !ok {
+                return Err(TransactionError::StakingActionFinalizerAuthorizationInvalid {
+                    finalizer: *this_finalizer,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks that staking actions are only performed within the allowed staking window.
+///
+/// Staking actions are only valid when `block_height % STAKING_PERIOD < STAKING_DAY_WINDOW`.
+/// For example, with PERIOD=100 and WINDOW=10, staking is allowed on blocks 0-9, 100-109, 200-209, etc.
+///
+/// RetargetDelegationBond is exempt from this rule and can be submitted at any time.
+///
+/// Returns `Ok(())` if the transaction has no staking action or is within the staking window.
+fn check_staking_day_window(
+    tx: &Transaction,
+    height: block::Height,
+) -> Result<(), TransactionError> {
+    use zcash_primitives::transaction::StakingActionKind;
+
+    let staking_action = match tx.staking_action() {
+        Some(action) => action,
+        None => return Ok(()),
+    };
+
+    // Retarget and finalizer reward conversion are exempt from staking day
+    // restrictions: neither moves value into or out of the staking pools from
+    // outside (conversion only re-labels value already at stake).
+    if matches!(staking_action.kind(), StakingActionKind::RetargetDelegationBond | StakingActionKind::ConvertFinalizerRewardToDelegationBond) {
+        return Ok(());
+    }
+
+    let block_height = height.0;
+
+    let excepted_heights = [ 1120, 2320, 2620, 2621, 3224 ];
+    if excepted_heights.contains(&block_height) {
+        // TODO: @Prod @Season2 remove this temporary cruft
+        return Ok(());
+    }
+
+
+    let position_in_period = block_height % STAKING_PERIOD;
+
+    if position_in_period >= STAKING_DAY_WINDOW {
+        return Err(TransactionError::StakingActionOutsideWindow {
+            block_height,
+            period: STAKING_PERIOD,
+            window: STAKING_DAY_WINDOW,
+        });
+    }
+
+    Ok(())
 }
 
 /// Performs basic structural validation and Orchard-related network upgrade rules.
