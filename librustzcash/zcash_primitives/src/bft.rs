@@ -1073,6 +1073,14 @@ impl FatPointerToBftBlock {
         reader.read_exact(&mut vote_for_block_without_finalizer_public_key)?;
 
         let len = reader.read_u16::<LittleEndian>()?;
+        // One signature per active roster member at most. Checked before allocating: len comes off
+        // the wire, and unchecked it would reserve up to 65535 * 96 bytes (~6 MiB).
+        if usize::from(len) > ACTIVE_ROSTER_MAX_N {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "fat pointer signature count exceeds the active roster maximum",
+            ));
+        }
         let mut signatures: Vec<FatPointerSignature> = Vec::with_capacity(len.into());
         for _ in 0..len {
             let mut signature_bytes = [0u8; 32 + 64];
