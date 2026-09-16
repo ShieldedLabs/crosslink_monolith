@@ -86,6 +86,11 @@ pub enum SameEffectsTipRejectionError {
         another transaction in the mempool"
     )]
     MissingOutput,
+
+    #[error(
+        "transaction rejected because another transaction in the mempool already acts on its bond"
+    )]
+    BondActionConflict,
 }
 
 /// Transactions rejected based only on their effects (spends, outputs, transaction header).
@@ -621,6 +626,18 @@ impl Storage {
             mined: removed_mined,
             invalidated: removed_duplicate_spend,
         }
+    }
+
+    /// Removes the transactions with staking actions, and the transactions that depend on them.
+    ///
+    /// Returns the removed transactions, so they can be verified again: whether a staking action
+    /// is valid depends on the state of its bond at the tip, which any new block can change.
+    pub fn remove_staking_transactions(&mut self) -> Vec<UnminedTx> {
+        self.verified
+            .take_all_that(|tx| tx.transaction.transaction.staking_action().is_some())
+            .into_iter()
+            .map(|tx| tx.transaction)
+            .collect()
     }
 
     /// Clears the whole mempool storage.

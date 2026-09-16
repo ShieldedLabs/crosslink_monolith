@@ -784,6 +784,16 @@ impl Service<Request> for Mempool {
 
                 mined_mempool_ids.extend(mined);
                 invalidated_ids.extend(invalidated);
+
+                for tx in storage.remove_staking_transactions() {
+                    let tx_id = tx.id;
+                    if tx_downloads
+                        .download_if_needed_and_verify(tx.into(), None, None)
+                        .is_err()
+                    {
+                        invalidated_ids.insert(tx_id);
+                    }
+                }
             }
 
             // Remove expired transactions from the mempool.

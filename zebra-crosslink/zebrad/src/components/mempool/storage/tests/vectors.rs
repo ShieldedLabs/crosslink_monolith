@@ -305,6 +305,81 @@ fn mempool_expired_basic_for_network(network: Network) -> Result<()> {
     Ok(())
 }
 
+/// A VCrosslink transaction carrying `staking_action`, with a fake fee and no sigops. Transactions
+/// differing only in `lock_height` have different IDs.
+fn staking_transaction(
+    staking_action: zcash_primitives::transaction::StakingAction,
+    lock_height: u32,
+) -> VerifiedUnminedTx {
+    use zebra_chain::{parameters::NetworkUpgrade, transaction::LockTime};
+
+    let tx = Transaction::VCrosslink {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::Height(Height(lock_height)),
+        expiry_height: Height(0),
+        inputs: vec![],
+        outputs: vec![],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+        staking_action: Some(staking_action),
+    };
+
+    VerifiedUnminedTx::new(
+        tx.into(),
+        Amount::try_from(1_000_000).expect("valid amount"),
+        0,
+        0,
+        std::sync::Arc::new(vec![]),
+    )
+    .expect("verification should pass")
+}
+
+fn unbonding(bond_key: [u8; 32]) -> zcash_primitives::transaction::StakingAction {
+    zcash_primitives::transaction::StakingAction::BeginDelegationUnbonding {
+        unique_pubkey: bond_key,
+        signature: [0; 64],
+    }
+}
+
+/// The mempool holds at most one staking action per bond, and frees the bond when that action
+/// leaves.
+#[test]
+fn mempool_holds_one_staking_action_per_bond() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let mut storage: Storage = Storage::new(&config::Config {
+        tx_cost_limit: 160_000_000,
+        eviction_memory_time: EVICTION_MEMORY_TIME,
+        ..Default::default()
+    });
+
+    let first = staking_transaction(unbonding([1; 32]), 0);
+    let second = staking_transaction(unbonding([1; 32]), 1);
+    let other_bond = staking_transaction(unbonding([2; 32]), 0);
+    assert_ne!(first.transaction.id, second.transaction.id);
+
+    storage.insert(first.clone(), Vec::new(), None)?;
+    assert_eq!(
+        storage.insert(second.clone(), Vec::new(), None),
+        Err(MempoolError::StorageEffectsTip(
+            SameEffectsTipRejectionError::BondActionConflict
+        ))
+    );
+    storage.insert(other_bond, Vec::new(), None)?;
+    assert_eq!(storage.transaction_count(), 2);
+
+    let removed = storage.remove_staking_transactions();
+    assert_eq!(removed.len(), 2);
+    assert_eq!(storage.transaction_count(), 0);
+
+    storage.clear_tip_rejections();
+    storage.insert(second, Vec::new(), None)?;
+    assert_eq!(storage.transaction_count(), 1);
+
+    Ok(())
+}
+
 /// Check that the transaction dependencies are updated when transactions with spent mempool outputs
 /// are inserted into storage, and that the `Storage.remove()` method also removes any transactions
 /// that directly or indirectly spend outputs of a removed transaction.

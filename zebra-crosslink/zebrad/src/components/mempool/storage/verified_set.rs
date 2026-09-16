@@ -34,6 +34,7 @@ use zebra_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
 /// - the Sapling nullifiers revealed by transactions in the mempool
 /// - the Orchard nullifiers revealed by transactions in the mempool
 /// - the Ironwood nullifiers revealed by transactions in the mempool
+/// - the bonds acted on by staking actions in the mempool
 #[derive(Default)]
 pub struct VerifiedSet {
     /// The set of verified transactions in the mempool.
@@ -69,6 +70,11 @@ pub struct VerifiedSet {
 
     /// The set of revealed Ironwood nullifiers.
     ironwood_nullifiers: HashSet<ironwood::Nullifier>,
+
+    /// The keys of the bonds acted on by staking actions. The mempool holds at most one staking
+    /// action per bond, so a block template never carries two actions that the bond's state
+    /// can't both allow.
+    bond_keys: HashSet<[u8; 32]>,
 }
 
 impl Drop for VerifiedSet {
@@ -137,6 +143,7 @@ impl VerifiedSet {
         self.sapling_nullifiers.clear();
         self.orchard_nullifiers.clear();
         self.ironwood_nullifiers.clear();
+        self.bond_keys.clear();
         self.created_outputs.clear();
         self.transactions_serialized_size = 0;
         self.total_cost = 0;
@@ -146,7 +153,7 @@ impl VerifiedSet {
     /// Insert a `transaction` into the set.
     ///
     /// Returns an error if the `transaction` has spend conflicts with any other transaction
-    /// already in the set.
+    /// already in the set, or acts on a bond another transaction in the set already acts on.
     ///
     /// Two transactions have a spend conflict if they spend the same UTXO or if they reveal the
     /// same nullifier.
@@ -159,6 +166,15 @@ impl VerifiedSet {
     ) -> Result<(), SameEffectsTipRejectionError> {
         if self.has_spend_conflicts(&transaction.transaction) {
             return Err(SameEffectsTipRejectionError::SpendConflict);
+        }
+
+        let bond_key = transaction
+            .transaction
+            .transaction
+            .staking_action()
+            .map(|staking_action| staking_action.bond_key());
+        if bond_key.is_some_and(|bond_key| self.bond_keys.contains(&bond_key)) {
+            return Err(SameEffectsTipRejectionError::BondActionConflict);
         }
 
         // This likely only needs to check that the transaction hash of the outpoint is still in the mempool,
@@ -186,6 +202,7 @@ impl VerifiedSet {
         self.sapling_nullifiers.extend(tx.sapling_nullifiers());
         self.orchard_nullifiers.extend(tx.orchard_nullifiers());
         self.ironwood_nullifiers.extend(tx.ironwood_nullifiers());
+        self.bond_keys.extend(bond_key);
 
         self.transactions_serialized_size += transaction.transaction.size;
         self.total_cost += transaction.cost();
@@ -258,13 +275,27 @@ impl VerifiedSet {
         &mut self,
         predicate: impl Fn(&VerifiedUnminedTx) -> bool,
     ) -> HashSet<UnminedTxId> {
+        self.take_all_that(predicate)
+            .into_iter()
+            .map(|tx| tx.transaction.id)
+            .collect()
+    }
+
+    /// Removes all transactions in the set that match the `predicate`, and the transactions that
+    /// depend on them.
+    ///
+    /// Returns the removed transactions.
+    pub fn take_all_that(
+        &mut self,
+        predicate: impl Fn(&VerifiedUnminedTx) -> bool,
+    ) -> Vec<VerifiedUnminedTx> {
         let keys_to_remove: Vec<_> = self
             .transactions
             .iter()
             .filter_map(|(&tx_id, tx)| predicate(tx).then_some(tx_id))
             .collect();
 
-        let mut removed_transactions = HashSet::new();
+        let mut removed_transactions = Vec::new();
 
         for key_to_remove in keys_to_remove {
             if !self.transactions.contains_key(&key_to_remove) {
@@ -272,11 +303,7 @@ impl VerifiedSet {
                 continue;
             }
 
-            removed_transactions.extend(
-                self.remove(&key_to_remove)
-                    .into_iter()
-                    .map(|tx| tx.transaction.id),
-            );
+            removed_transactions.extend(self.remove(&key_to_remove));
         }
 
         removed_transactions
@@ -355,6 +382,10 @@ impl VerifiedSet {
         Self::remove_from_set(&mut self.sapling_nullifiers, sapling_nullifiers);
         Self::remove_from_set(&mut self.orchard_nullifiers, orchard_nullifiers);
         Self::remove_from_set(&mut self.ironwood_nullifiers, ironwood_nullifiers);
+
+        if let Some(staking_action) = tx.staking_action() {
+            self.bond_keys.remove(&staking_action.bond_key());
+        }
     }
 
     /// Returns `true` if the two sets have common items.
