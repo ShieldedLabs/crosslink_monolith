@@ -321,7 +321,8 @@ where
                     .map_err(Into::into)
                     .map_err(VerifyBlockError::Transaction)?;
 
-                sigops += response.sigops;
+                // Saturating: a sum that would overflow already exceeds MAX_BLOCK_SIGOPS.
+                sigops = u32::saturating_add(sigops, response.sigops);
 
                 // Coinbase transactions consume the miner fee,
                 // so they don't add any value to the block's total miner fee.
