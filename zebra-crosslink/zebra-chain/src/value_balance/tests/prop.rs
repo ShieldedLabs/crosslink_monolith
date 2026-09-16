@@ -159,7 +159,7 @@ proptest! {
     }
 
     #[test]
-    fn value_balance_deserialization(bytes in any::<[u8; 64]>()) {
+    fn value_balance_deserialization(bytes in any::<[u8; 72]>()) {
         let _init_guard = zebra_test::init();
 
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
@@ -168,7 +168,7 @@ proptest! {
     }
 
     /// Earlier versions of [`ValueBalance`] had 32 bytes (no `deferred`) and then 40 bytes (no
-    /// `ironwood`), compared to the current 48 bytes. It's possible to correctly instantiate the
+    /// `ironwood`), compared to the current 72 bytes. It's possible to correctly instantiate the
     /// current version from either legacy format, with the missing trailing pools defaulting to
     /// zero, so we test that Zebra can still deserialize both legacy formats.
     #[test]
@@ -180,14 +180,14 @@ proptest! {
 
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes_32) {
             let deserialized = deserialized.to_bytes();
-            let mut extended_bytes = [0u8; 64];
+            let mut extended_bytes = [0u8; 72];
             extended_bytes[..32].copy_from_slice(&bytes_32);
             prop_assert_eq!(extended_bytes, deserialized);
         }
 
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes_40) {
             let deserialized = deserialized.to_bytes();
-            let mut extended_bytes = [0u8; 64];
+            let mut extended_bytes = [0u8; 72];
             extended_bytes[..40].copy_from_slice(&bytes_40);
             prop_assert_eq!(extended_bytes, deserialized);
         }
@@ -198,7 +198,7 @@ proptest! {
 
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
             let deserialized = deserialized.to_bytes();
-            let mut extended_bytes = [0u8; 64];
+            let mut extended_bytes = [0u8; 72];
             extended_bytes[..40].copy_from_slice(&bytes);
             prop_assert_eq!(extended_bytes, deserialized);
         }
