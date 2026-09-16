@@ -11,15 +11,22 @@
 //! the full 100ms latency timer and then verifies a batch of two or three — paying all of
 //! the latency for almost none of the batching.
 //!
-//! These functions do the same checks, in the same order, on the same data, with the batch
-//! boundary set to *one block* instead of "whatever arrived in 100ms". Nothing here is a
-//! new consensus rule:
+//! These functions verify with the batch boundary set to *one block* instead of "whatever
+//! arrived in 100ms":
 //!
-//! - [`block_check_cheap`] calls straight into [`crate::block::check`], in the same order
-//!   as `SemanticBlockVerifier::call`.
-//! - [`block_verify_shielded_batched`] feeds the same `sapling_crypto` / `orchard` batch
-//!   validators that the `Batch` services feed, just queued directly and flushed once,
-//!   with no timer, no channel, and no executor.
+//! - [`block_check_header`] and [`block_check_body`] call straight into [`crate::block::check`],
+//!   in `SemanticBlockVerifier::call`'s order, except that the header time check runs before
+//!   the merkle check: the header is checked before the body exists.
+//! - [`block_verify_expensive`] verifies transparent scripts, sigops and miner fees itself, and
+//!   feeds Sapling and Orchard bundles to the same `sapling_crypto` / `orchard` batch
+//!   validators that the `Batch` services feed, flushed once per block with no timer, no
+//!   channel, and no executor.
+//!
+//! @Todo: this is not equivalent to `SemanticBlockVerifier`, which also sends every
+//! transaction through [`crate::transaction::BlockTxVerifier`]. Nothing here does, so blocks
+//! verified by these functions skip that verifier's per-transaction rules (among them the
+//! consensus branch ID, expiry height, lock time, spend conflicts and the staking rules), the
+//! Ironwood bundle's proofs and signatures, and Sprout JoinSplit proofs.
 //!
 //! Within-block batching keeps nearly all of the algorithmic win (a batch verification is
 //! a single multi-scalar multiplication rather than N independent ones, so per-item cost
@@ -201,8 +208,8 @@ pub fn block_check_cheap(
     block_check_body(block, network, alleged_height)
 }
 
-/// The expensive per-block verification: transparent scripts, sigops, fees, and the shielded
-/// proofs and signatures batched once per proof system.
+/// The expensive per-block verification: transparent scripts, sigops, fees, and the Sapling and
+/// Orchard proofs and signatures batched once per proof system.
 ///
 /// Walks the block a single time. Per transaction it runs the synchronous work directly —
 /// script verification, sigop counting, fee accounting — and *collects* the shielded bundles
