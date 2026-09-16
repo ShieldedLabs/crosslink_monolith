@@ -93,14 +93,25 @@ pub(crate) type SpendingTransactionId = transaction::Hash;
 pub(crate) type SpendingTransactionId = ();
 
 /// The status of a delegation bond in the non-finalized chain.
+///
+/// The bond's `created_at` always stays at its creation; the later actions are dated here.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BondStatusInChain {
     /// Bond is active and receiving rewards.
     Active,
     /// Bond has begun unbonding (first transaction completed).
-    Unbonding,
+    Unbonding {
+        /// The transaction location where unbonding began.
+        unbonded_at: disk_format::TransactionLocation,
+    },
     /// Bond has been withdrawn (second transaction completed).
-    Withdrawn,
+    Withdrawn {
+        /// The transaction location where withdrawal occurred.
+        withdrawn_at: disk_format::TransactionLocation,
+        /// Where unbonding began, so a reverted withdrawal can restore it. `None` only for
+        /// bonds loaded already withdrawn from finalized state, which are never reverted.
+        unbonded_at: Option<disk_format::TransactionLocation>,
+    },
     /// Bond was burned by a social slashing fork
     Burned,
 }
@@ -335,8 +346,8 @@ impl Chain {
             .map(|(key, bond, status)| {
                 let chain_status = match status {
                     disk_format::BondStatus::Active => BondStatusInChain::Active,
-                    disk_format::BondStatus::Unbonding { .. } => BondStatusInChain::Unbonding,
-                    disk_format::BondStatus::Withdrawn { .. } => BondStatusInChain::Withdrawn,
+                    disk_format::BondStatus::Unbonding { unbonded_at } => BondStatusInChain::Unbonding { unbonded_at },
+                    disk_format::BondStatus::Withdrawn { withdrawn_at } => BondStatusInChain::Withdrawn { withdrawn_at, unbonded_at: None },
                     disk_format::BondStatus::Burned => BondStatusInChain::Burned,
                 };
                 (key, (bond, chain_status))
@@ -1931,7 +1942,7 @@ impl Chain {
                 let (bond, status) = self.delegation_bonds.get_mut(&bond_key).expect(
                     "bond must be present if unbonding was added to chain"
                 );
-                assert_eq!(*status, BondStatusInChain::Unbonding,
+                assert!(matches!(*status, BondStatusInChain::Unbonding { .. }),
                     "bond should be unbonding if unbonding was added to chain");
                 *status = BondStatusInChain::Active;
                 let bond_amount = bond.amount;
@@ -1949,12 +1960,13 @@ impl Chain {
             }
             StakingActionKind::WithdrawDelegationBond => {
                 // Change status back from Withdrawn to Unbonding
-                let (bond, status) = self.delegation_bonds.get_mut(&bond_key).expect(
+                let (_bond, status) = self.delegation_bonds.get_mut(&bond_key).expect(
                     "bond must be present if withdrawal was added to chain"
                 );
-                assert_eq!(*status, BondStatusInChain::Withdrawn,
-                    "bond should be withdrawn if withdrawal was added to chain");
-                *status = BondStatusInChain::Unbonding;
+                let BondStatusInChain::Withdrawn { unbonded_at: Some(unbonded_at), .. } = *status else {
+                    panic!("bond should be withdrawn, with a known unbonding location, if withdrawal was added to chain");
+                };
+                *status = BondStatusInChain::Unbonding { unbonded_at };
             }
             StakingActionKind::ConvertFinalizerRewardToDelegationBond => {
                 // Remove the bond and refund the bank; pools revert through the
@@ -3091,5 +3103,47 @@ impl Chain {
         self.inner
             .orchard_subtrees
             .insert(subtree.index, subtree.into_data());
+    }
+}
+
+#[cfg(test)]
+mod bond_status_tests {
+    use zcash_primitives::transaction::StakingAction;
+
+    use super::*;
+
+    #[test]
+    fn reverting_bond_actions_restores_their_locations() {
+        let key = [1; 32];
+        let loc = |height| disk_format::TransactionLocation::from_usize(Height(height), 1);
+        let bond = disk_format::DelegationBond::new(Amount::try_from(1000u64).unwrap(), [7; 32], loc(100));
+        let mut pools = ValueBalance::<NonNegative>::zero();
+        pools.set_staking_bonded_amount(bond.amount);
+        let mut chain = Chain::new(
+            &Network::Mainnet,
+            Height(100),
+            NoteCommitmentTrees::default(),
+            Default::default(),
+            pools,
+            [(key, bond, disk_format::BondStatus::Active)],
+            std::iter::empty(),
+        );
+
+        let unbond = StakingAction::BeginDelegationUnbonding { unique_pubkey: key, signature: [0; 64] };
+        let withdraw = StakingAction::WithdrawDelegationBond { amount_zats: 1000, unique_pubkey: key, signature: [0; 64] };
+        let hash = transaction::Hash([0; 32]);
+
+        chain.update_chain_tip_with_delegation_bond(&unbond, &hash, loc(200)).unwrap();
+        chain.update_chain_tip_with_delegation_bond(&withdraw, &hash, loc(300)).unwrap();
+        assert_eq!(
+            chain.delegation_bonds[&key],
+            (bond, BondStatusInChain::Withdrawn { withdrawn_at: loc(300), unbonded_at: Some(loc(200)) })
+        );
+
+        chain.revert_delegation_bond(&withdraw, RevertPosition::Tip);
+        assert_eq!(chain.delegation_bonds[&key], (bond, BondStatusInChain::Unbonding { unbonded_at: loc(200) }));
+
+        chain.revert_delegation_bond(&unbond, RevertPosition::Tip);
+        assert_eq!(chain.delegation_bonds[&key], (bond, BondStatusInChain::Active));
     }
 }

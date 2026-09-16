@@ -22,16 +22,8 @@ pub fn delegation_bond(
             // Convert BondStatusInChain to BondStatus
             let finalized_status = match status {
                 BondStatusInChain::Active => BondStatus::Active,
-                BondStatusInChain::Unbonding => {
-                    BondStatus::Unbonding {
-                        unbonded_at: bond.created_at, // Using created_at as placeholder
-                    }
-                }
-                BondStatusInChain::Withdrawn => {
-                    BondStatus::Withdrawn {
-                        withdrawn_at: bond.created_at, // Using created_at as placeholder
-                    }
-                }
+                BondStatusInChain::Unbonding { unbonded_at } => BondStatus::Unbonding { unbonded_at: *unbonded_at },
+                BondStatusInChain::Withdrawn { withdrawn_at, .. } => BondStatus::Withdrawn { withdrawn_at: *withdrawn_at },
                 BondStatusInChain::Burned => BondStatus::Burned,
             };
             return Some((*bond, finalized_status));
@@ -78,7 +70,7 @@ pub fn is_bond_unbonding(
         use crate::service::non_finalized_state::BondStatusInChain;
 
         if let Some((_, status)) = chain.delegation_bonds.get(bond_key) {
-            return *status == BondStatusInChain::Unbonding;
+            return matches!(status, BondStatusInChain::Unbonding { .. });
         }
     }
 
@@ -102,7 +94,7 @@ pub fn is_bond_withdrawn(
         use crate::service::non_finalized_state::BondStatusInChain;
 
         if let Some((_, status)) = chain.delegation_bonds.get(bond_key) {
-            return *status == BondStatusInChain::Withdrawn;
+            return matches!(status, BondStatusInChain::Withdrawn { .. });
         }
     }
 

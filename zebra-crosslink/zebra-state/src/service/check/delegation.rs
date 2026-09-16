@@ -267,13 +267,13 @@ fn validate_bond_for_unbonding(
             BondStatusInChain::Active => {
                 return Ok(());
             }
-            BondStatusInChain::Unbonding => {
+            BondStatusInChain::Unbonding { .. } => {
                 return Err(ValidateContextError::InvalidDelegationBond(format!(
                     "delegation bond is already unbonding: {:?}",
                     bond_key
                 )));
             }
-            BondStatusInChain::Withdrawn => {
+            BondStatusInChain::Withdrawn { .. } => {
                 return Err(ValidateContextError::InvalidDelegationBond(format!(
                     "delegation bond is already withdrawn: {:?}",
                     bond_key
@@ -318,7 +318,7 @@ fn validate_bond_for_withdrawal(
         use crate::service::non_finalized_state::BondStatusInChain;
 
         match status {
-            BondStatusInChain::Unbonding => {
+            BondStatusInChain::Unbonding { .. } => {
                 // Validate that withdrawal amount matches bond amount
                 let bond_amount: u64 = bond.amount.into();
                 if withdrawal_amount != bond_amount {
@@ -335,7 +335,7 @@ fn validate_bond_for_withdrawal(
                     bond_key
                 )));
             }
-            BondStatusInChain::Withdrawn => {
+            BondStatusInChain::Withdrawn { .. } => {
                 return Err(ValidateContextError::InvalidDelegationBond(format!(
                     "delegation bond is already withdrawn: {:?}",
                     bond_key
@@ -375,13 +375,13 @@ fn validate_bond_for_retarget(
 
         match status {
             BondStatusInChain::Active => return Ok(()),
-            BondStatusInChain::Unbonding => {
+            BondStatusInChain::Unbonding { .. } => {
                 return Err(ValidateContextError::InvalidDelegationBond(format!(
                     "cannot retarget unbonding delegation bond: {:?}",
                     bond_key
                 )));
             }
-            BondStatusInChain::Withdrawn => {
+            BondStatusInChain::Withdrawn { .. } => {
                 return Err(ValidateContextError::InvalidDelegationBond(format!(
                     "cannot retarget withdrawn delegation bond: {:?}",
                     bond_key

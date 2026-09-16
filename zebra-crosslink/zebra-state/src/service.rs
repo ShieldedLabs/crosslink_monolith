@@ -1472,11 +1472,15 @@ impl Service<ReadRequest> for ReadStateService {
                         amount: bond.amount,
                         status: match status {
                             BondStatusInChain::Active => 0,
-                            BondStatusInChain::Unbonding => 1,
-                            BondStatusInChain::Withdrawn => 2,
+                            BondStatusInChain::Unbonding { .. } => 1,
+                            BondStatusInChain::Withdrawn { .. } => 2,
                             BondStatusInChain::Burned => 3,
                         },
-                        last_action_height: bond.created_at.height.0,
+                        last_action_height: match status {
+                            BondStatusInChain::Active | BondStatusInChain::Burned => bond.created_at.height.0,
+                            BondStatusInChain::Unbonding { unbonded_at } => unbonded_at.height.0,
+                            BondStatusInChain::Withdrawn { withdrawn_at, .. } => withdrawn_at.height.0,
+                        },
                     }
                 });
 
@@ -1755,18 +1759,10 @@ pub fn update_chain_tip_with_delegation_bond(
             );
         }
         StakingActionKind::BeginDelegationUnbonding => {
-            // Get the bond from delegation_bonds
-            let (bond, _status) = delegation_bonds.get(&bond_key)
-                .copied()
+            let (bond, status) = delegation_bonds.get_mut(&bond_key)
                 .expect("bond must exist in chain (should have been validated)");
-
-            // Update status to Unbonding and set created_at to current transaction location
-            let updated_bond = finalized_state::disk_format::DelegationBond::new(
-                bond.amount,
-                bond.target_finalizer,
-                transaction_location,
-            );
-            delegation_bonds.insert(bond_key, (updated_bond, non_finalized_state::BondStatusInChain::Unbonding));
+            *status = non_finalized_state::BondStatusInChain::Unbonding { unbonded_at: transaction_location };
+            let bond = *bond;
 
             // Decrease staking_bonded pool by bond amount
             let current_bonded = chain_value_pools.staking_bonded_amount();
@@ -1785,18 +1781,15 @@ pub fn update_chain_tip_with_delegation_bond(
             chain_value_pools.set_staking_unbonded_amount(new_unbonded);
         }
         StakingActionKind::WithdrawDelegationBond => {
-            // Get the bond from delegation_bonds
-            let (bond, _status) = delegation_bonds.get(&bond_key)
-                .copied()
+            let (_bond, status) = delegation_bonds.get_mut(&bond_key)
                 .expect("bond must exist in chain (should have been validated)");
-
-            // Update status to Withdrawn and set created_at to current transaction location
-            let updated_bond = finalized_state::disk_format::DelegationBond::new(
-                bond.amount,
-                bond.target_finalizer,
-                transaction_location,
-            );
-            delegation_bonds.insert(bond_key, (updated_bond, non_finalized_state::BondStatusInChain::Withdrawn));
+            let non_finalized_state::BondStatusInChain::Unbonding { unbonded_at } = *status else {
+                panic!("withdrawn bond should have been validated to be unbonding");
+            };
+            *status = non_finalized_state::BondStatusInChain::Withdrawn {
+                withdrawn_at: transaction_location,
+                unbonded_at: Some(unbonded_at),
+            };
         }
         StakingActionKind::RetargetDelegationBond => {
             // Get the old target first (immutable borrow)
