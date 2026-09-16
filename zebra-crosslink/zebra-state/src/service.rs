@@ -193,11 +193,31 @@ pub(crate) struct StateService {
     hardfork_schedule: Arc<HardForkSchedule>,
 }
 
+/// Resolves a PoW block hash to its height, across every chain this state holds — finalized
+/// or not, best chain or side chain. The crosslink fat-pointer gate is handed one of these
+/// because the sigma-confirmation rule it enforces is a statement about two PoW heights: the
+/// height of the block being admitted, and the height of the PoW block that the certificate
+/// that block carries finalizes. The certificate names that block by hash only, so the gate
+/// has to ask the chain. `None` means "not known here (yet)", which the gate treats as a
+/// defer rather than a rejection.
+pub type CrosslinkBlockHeightLookup<'a> = &'a dyn Fn(block::Hash) -> Option<block::Height>;
+
 /// Return type for the crosslink fat-pointer gate closure.
-/// - `None`       — defer: re-queue the block and retry on a later flush (BFT block not yet loaded).
+/// - `None`       — defer: re-queue the block and retry on a later flush (BFT block not yet loaded,
+///   or the PoW block its certificate finalizes is not known here yet).
 /// - `Some(true)` — accept: the block's fat pointer is valid.
-/// - `Some(false)`— reject: the block is permanently invalid (e.g. `do_not_include_until_bc_height` violated).
-pub type ClosureToCallIntoCrosslinkFromState = Arc<dyn Fn(FatPointerToBftBlock, FatPointerToBftBlock, block::Height) -> Option<bool> + Send + Sync>;
+/// - `Some(false)`— reject: the block is permanently invalid (e.g. `do_not_include_until_bc_height`
+///   violated, or the certificate is carried fewer than sigma + 1 blocks above what it finalizes).
+pub type ClosureToCallIntoCrosslinkFromState = Arc<
+    dyn for<'a> Fn(
+            FatPointerToBftBlock,
+            FatPointerToBftBlock,
+            block::Height,
+            CrosslinkBlockHeightLookup<'a>,
+        ) -> Option<bool>
+        + Send
+        + Sync,
+>;
 
 /// A read-only service for accessing Zebra's cached blockchain state.
 ///
@@ -1676,7 +1696,7 @@ pub async fn init_test(
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, _, _, _, _block_writer) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, Arc::new(|_,_,_| Some(true))).await;
+        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, Arc::new(|_,_,_,_| Some(true))).await;
 
     Buffer::new(BoxService::new(state_service), 1)
 }
@@ -1697,7 +1717,7 @@ pub async fn init_test_services(
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, read_state_service, latest_chain_tip, chain_tip_change, _block_writer) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true))).await;
+        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, std::sync::Arc::new(|_,_,_,_| Some(true))).await;
 
     let state_service = Buffer::new(BoxService::new(state_service), 1);
 

@@ -419,7 +419,7 @@ proptest! {
         // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
         // Commits go straight through the writer now; StateService no longer queues them.
         let (state_service, _, _, _, mut block_writer) = Runtime::new().unwrap().block_on(async {
-            StateService::new(Config::ephemeral(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true))).await
+            StateService::new(Config::ephemeral(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_,_| Some(true))).await
         });
 
         prop_assert_eq!(state_service.read_service.db.finalized_value_pool(), ValueBalance::zero());
@@ -518,7 +518,7 @@ proptest! {
         // Ported to keep the crate's test target building, not revived.
         let (_state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change, mut block_writer) =
             Runtime::new().unwrap().block_on(async {
-                StateService::new(Config::ephemeral(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true))).await
+                StateService::new(Config::ephemeral(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_,_| Some(true))).await
             });
 
         prop_assert_eq!(latest_chain_tip.best_tip_height(), None);

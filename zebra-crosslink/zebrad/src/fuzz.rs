@@ -114,7 +114,7 @@ impl Ingest {
             // Trivial always-pass fat-pointer gate, matching init_test. The gate only governs
             // PoW<->PoS linkage, which the block-bytes fuzzer is not exercising.
             let gate: zebra_state::ClosureToCallIntoCrosslinkFromState =
-                Arc::new(|_, _, _| Some(true));
+                Arc::new(|_, _, _, _| Some(true));
 
             // spawn_init is the public constructor (the zebra_state::service module is private).
             // It returns the block_writer that sync() must own -- which the init_test/

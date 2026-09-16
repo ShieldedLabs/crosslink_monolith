@@ -42,7 +42,7 @@ async fn db_init_outside_future_executor() -> Result<()> {
                 &config.network.network,
                 Height::MAX,
                 0,
-                std::sync::Arc::new(|_,_,_| Some(true)),
+                std::sync::Arc::new(|_,_,_,_| Some(true)),
             ).await
         })
     };

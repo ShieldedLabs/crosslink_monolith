@@ -2870,9 +2870,14 @@ pub fn sync(
                             format!("{{hash:{} ovd:{} sigs:{}}}", hex::encode(&v[0..32]), hex::encode(&v[32..]), fp.signatures.len())
                         };
 
+                        // The gate needs the height of whatever PoW block the carried
+                        // certificate finalizes, and only the state can answer that; see
+                        // `CrosslinkBlockHeightLookup`. Every chain is searched, because the
+                        // block being admitted may be extending a side chain.
+                        let height_of = |hash: block::Hash| read_state.known_block(hash).map(|known| known.height);
                         let (gate, defer_msg) = if let Some(parent_fp) = parent_fat_pointer {
                             let msg = format!("child fp {} / parent fp {} not resolvable yet", fp_brief(&child_fat_pointer), fp_brief(&parent_fp));
-                            ((crosslink_gate)(parent_fp, child_fat_pointer, block::Height(height)), msg)
+                            ((crosslink_gate)(parent_fp, child_fat_pointer, block::Height(height), &height_of), msg)
                         } else {
                             // known_block() saw the parent but any_chain_block_header() did not;
                             // the two views disagreeing is itself worth seeing in the log.

@@ -337,7 +337,13 @@ pub(crate) struct TFLServiceInternal {
     path_to_pos_store_file: PathBuf,
 }
 
-fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLServiceHandle, parent_fat_pointer: FatPointerToBftBlock, child_fat_pointer: FatPointerToBftBlock, pow_block_height: ZebBlockHeight) -> Option<bool> {
+fn call_from_state_to_crosslink_to_ask_about_fat_pointers(
+    internal_handle: &TFLServiceHandle,
+    parent_fat_pointer: FatPointerToBftBlock,
+    child_fat_pointer: FatPointerToBftBlock,
+    pow_block_height: ZebBlockHeight,
+    height_of: zebra_state::CrosslinkBlockHeightLookup<'_>,
+) -> Option<bool> {
     // Return value:
     //   None        => DEFER  — re-queue and re-evaluate on a later flush. REVERSIBLE. This is
     //                           the answer whenever we lack the information to be *certain* a
@@ -399,6 +405,18 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
         }
     }
 
+    // The PoW block this block's certificate finalizes -- the snapshot, i.e. the parent of the
+    // BFT block's deepest carried header. Read out under the lock; the height lookup below runs
+    // without it. Placeholder entries from out-of-order BFT ingest carry no headers and are
+    // never valid pointer targets, but guard rather than panic.
+    let snapshot_hash = match child_index {
+        Some(h) if !internal.bft_blocks[h].headers.is_empty() => {
+            Some(ZebBlockHash(internal.bft_blocks[h].snapshot_block_hash().0))
+        }
+        Some(_) => return None, // placeholder -> defer (reversible)
+        None => None,
+    };
+
     // Resolve the parent pointer. Unresolved non-null parent -> defer.
     let parent_index = if parent_is_null {
         None
@@ -420,7 +438,39 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
     // (Unresolved pointers already returned None above, so reaching here means both are known.)
     let child_rank = child_index.map(|h| h + 1).unwrap_or(0);
     let parent_rank = parent_index.map(|h| h + 1).unwrap_or(0);
-    Some(child_rank >= parent_rank)
+    if child_rank < parent_rank {
+        return Some(false);
+    }
+
+    // The sigma-confirmation rule, and the reason this gate is handed a height lookup at all.
+    //
+    // A certificate finalizing PoW height F may only be carried by a PoW block at F + sigma + 1
+    // or above, so that sigma blocks of the carrying block's OWN ancestry sit between the
+    // snapshot and the certificate. That is what makes the confirmation depth real rather than
+    // advisory: the sigma headers inside a BFT block are evidence nobody checks to be on this
+    // chain, so without this rule a block at F + 1 could carry a certificate whose
+    // "confirmations" are headers from another branch entirely, and the chain would call F final
+    // with one block of work above it. Here the height difference is measured against the
+    // carrying block's own height, and F is an ancestor of it, so the intervening work is
+    // necessarily this chain's.
+    //
+    // The lock is dropped first: `height_of` reads the state, and nothing is needed from the BFT
+    // chain past the snapshot hash.
+    drop(internal);
+    if let Some(snapshot_hash) = snapshot_hash {
+        // PERMANENT once resolved, from immutable data: which PoW block a BFT block finalizes is
+        // fixed by its bytes, that block's height is fixed by its own coinbase, and so is the
+        // height of the block carrying the pointer. An unresolved snapshot is not a failure --
+        // this node has simply not seen that PoW block yet -- so it defers, exactly as an
+        // unresolved BFT pointer does.
+        let snapshot_height = height_of(snapshot_hash.into())?;
+        let sigma = internal_handle.params.bc_confirmation_depth_sigma;
+        if (pow_block_height.0 as u64) < snapshot_height.0 as u64 + sigma + 1 {
+            return Some(false);
+        }
+    }
+
+    Some(true)
 }
 
 // TODO: Result?
@@ -581,14 +631,17 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
                 .map_or(Blake3Hash([0u8; 32]), |b| b.blake3_hash()),
         )
     };
-    // `finality_candidate_height` is the ANCHOR the header window is walked from, but
-    // `FindBlockHeaders { known_blocks: [anchor] }` returns headers starting AFTER the
-    // anchor, so a decided block finalizes `headers.first()` == anchor + 1. Guard on the
-    // height that would actually be finalized, not the anchor: comparing the anchor here
-    // required the tip to advance 2 blocks between proposals, which produced a BFT block
-    // every other PoW block. With this guard each new PoW block is proposable at once,
-    // finalizing as high up as the sigma-header window allows (tip - sigma + 1).
-    let proposed_final_height = ZebBlockHeight(finality_candidate_height.0 + 1);
+    // `finality_candidate_height` (tip - sigma) is the `snapshot`: the block this proposal
+    // finalizes. It is also the anchor the header window is walked from, and
+    // `FindBlockHeaders { known_blocks: [anchor] }` returns headers starting AFTER the anchor --
+    // so the sigma carried headers are exactly the sigma confirmations built on top of the
+    // snapshot, and the snapshot itself is not carried. That is what the specification means by
+    // sigma confirmations; carrying the snapshot as `headers[0]` (as this did before) left it
+    // with only sigma - 1.
+    //
+    // Guarding on the snapshot height keeps one BFT block per PoW block: the tip advancing by
+    // one advances the snapshot by one, so each new PoW block is proposable at once.
+    let proposed_final_height = finality_candidate_height;
     let is_improved_final =
         latest_final_block.is_none() || proposed_final_height > latest_final_block.unwrap().0;
 
@@ -707,7 +760,9 @@ async fn handle_new_decided_bft_block(
     }
 
     let call = tfl_handle.call.clone();
-    let new_final_hash = ZebBlockHash(BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0);
+    // The `snapshot`: the parent of the deepest carried header, i.e. the block the sigma carried
+    // confirmations sit on top of. See `BftBlock::snapshot_block_hash`.
+    let new_final_hash = ZebBlockHash(new_block.snapshot_block_hash().0);
     let new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
     // `height` is now the 0-based canonical height, i.e. the chain index directly.
     let insert_i = new_block.height as usize;
@@ -997,7 +1052,9 @@ async fn validate_bft_block(
     let already_finalized_hash = internal.latest_final_block.map(|(_, hash)| hash);
     drop(internal);
 
-    let new_final_hash = ZebBlockHash(BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0);
+    // The `snapshot` this proposal finalizes: the parent of the deepest carried header, so the
+    // sigma headers it carries are sigma confirmations on top of it.
+    let new_final_hash = ZebBlockHash(new_block.snapshot_block_hash().0);
     let new_final_pow_height =
         if let Some(new_final_height) = block_height_from_hash(&call, new_final_hash).await {
             new_final_height.0
@@ -1019,6 +1076,7 @@ async fn validate_bft_block(
             let _ = already_finalized_hash;
             return (tenderlink::TMStatus::Indeterminate, tenderlink::TMStatusReason::NeedsBlock { hash: new_final_hash.0 });
         };
+    let _ = new_final_pow_height;
     return (tenderlink::TMStatus::Pass, tenderlink::TMStatusReason::None);
 }
 
@@ -1295,14 +1353,14 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 let this_bft_height = ingest_data_for_tenderlink.len() as u64;
                 let this_terminated = terminated_finalizers_at(&config.hardforks, this_bft_height, prev_finalized_bc_height);
                 let roster = tenderlink_roster_from_internal(&unsorted_roster, &this_terminated);
-                // Advance the watermark to this block's candidate height for the next iteration.
-                // If the candidate can't be resolved (PoW DB behind the pos file, e.g. wiped and
+                // Advance the watermark to this block's snapshot height for the next iteration.
+                // If the snapshot can't be resolved (PoW DB behind the pos file, e.g. wiped and
                 // re-syncing), keep the last known height: monotone, and correct whenever the DB
                 // is intact -- unlike the old `unwrap_or(0)`, which activated the entire blacklist
                 // across the whole replay, nondeterministically by DB-availability race.
-                if let Some(candidate) = block.headers.first() {
-                    let candidate_hash = ZebBlockHash(BlockHash::from_header_data(candidate).0);
-                    if let Some(h) = block_height_from_hash(&call, candidate_hash).await {
+                if !block.headers.is_empty() {
+                    let snapshot_hash = ZebBlockHash(block.snapshot_block_hash().0);
+                    if let Some(h) = block_height_from_hash(&call, snapshot_hash).await {
                         prev_finalized_bc_height = h.0 as u64;
                     }
                 }
@@ -1318,7 +1376,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         let mut new_final_height = ZebBlockHeight(0);
 
         if let Some(new_block) = i_bft_blocks.last() {
-            new_final_hash.0 = BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0;
+            new_final_hash.0 = new_block.snapshot_block_hash().0;
             new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
         }
 
@@ -1630,8 +1688,8 @@ fn decided_round_data(
 /// The deterministic BFT genesis block: the decision that finalizes the bootstrap roster height
 /// (h1), which every node constructs identically from its own PoW chain instead of receiving.
 ///
-/// It is shaped exactly as a proposer would shape it -- v2, headers from h1 for the confirmation
-/// depth, any hardforks scheduled at BFT height 0 -- so `validate_bft_block` accepts it unchanged.
+/// It is shaped exactly as a proposer would shape it -- v2, the sigma confirmation headers above
+/// h1, any hardforks scheduled at BFT height 0 -- so `validate_bft_block` accepts it unchanged.
 /// Its fat pointer names the block at height 0, round 0, and carries no signatures: the validator
 /// set for genesis is nil and the decision is valid by construction. BFT height 1 is the first
 /// real decision, and its previous-block pointer is this one.
@@ -1645,8 +1703,10 @@ async fn build_bootstrap_genesis(tfl_handle: &TFLServiceHandle) -> Option<(BftBl
         return None;
     };
 
+    // h1 is the snapshot, so the carried headers are the sigma blocks ABOVE it: h1+1 ..= h1+sigma.
+    // A proposal's headers are the confirmations, not the block being finalized (see BftBlock).
     let mut headers: Vec<BcBlockHeader> = Vec::with_capacity(params.bc_confirmation_depth_sigma as usize);
-    for h in roster_height..roster_height + params.bc_confirmation_depth_sigma as u32 {
+    for h in roster_height + 1..=roster_height + params.bc_confirmation_depth_sigma as u32 {
         match (call.state)(StateRequest::BlockHeader(ZebBlockHeight(h).into())).await {
             Ok(StateResponse::BlockHeader { header, .. }) => headers.push(bc_hdr_to_lrz(&header)),
             _ => return None,
@@ -1991,13 +2051,42 @@ async fn tfl_service_incoming_request(
         })),
 
         TFLServiceRequest::FatPointerToBFTChainTip(proposed_pow_height) => {
+            // Walk back from the tip to the highest BFT block this PoW height may carry: one
+            // whose do_not_include_until_bc_height allows it, AND whose snapshot is deep enough
+            // to satisfy the sigma-confirmation rule the fat-pointer gate enforces (see
+            // `call_from_state_to_crosslink_to_ask_about_fat_pointers`).
+            //
+            // The second condition belongs here as much as in the gate: the gate rejects a
+            // violation PERMANENTLY, so handing the miner a too-new certificate produces a block
+            // that can never be committed and is re-mined forever. Being one PoW block behind the
+            // proposer is enough to reach that state -- this node can hold a decided BFT block
+            // whose snapshot sits sigma below a tip it has not seen yet.
+            //
+            // Each candidate's snapshot height comes from the chain, the same way the gate gets
+            // it. The walk normally stops at the first candidate, so this is one lookup.
+            let sigma = internal_handle.params.bc_confirmation_depth_sigma;
+            let n = internal_handle.internal.lock().await.bft_blocks.len();
+            let mut suitable_height = None;
+            for i in (0..n).rev() {
+                let (do_not_include, snapshot_hash) = {
+                    let internal = internal_handle.internal.lock().await;
+                    let b = &internal.bft_blocks[i];
+                    if b.headers.is_empty() {
+                        continue; // placeholder from out-of-order ingest
+                    }
+                    (b.do_not_include_until_bc_height, ZebBlockHash(b.snapshot_block_hash().0))
+                };
+                if do_not_include > proposed_pow_height {
+                    continue;
+                }
+                if let Some(h) = block_height_from_hash(&call, snapshot_hash).await {
+                    if h.0 as u64 + sigma + 1 <= proposed_pow_height {
+                        suitable_height = Some(i + 1); // 1-based (see fat_pointer_to_block_at_height)
+                        break;
+                    }
+                }
+            }
             let internal = internal_handle.internal.lock().await;
-            // Walk back from the tip to find the highest BFT block whose
-            // do_not_include_until_bc_height <= proposed_pow_height.
-            let n = internal.bft_blocks.len();
-            let suitable_height = (0..n).rev()
-                .find(|&i| internal.bft_blocks[i].do_not_include_until_bc_height <= proposed_pow_height)
-                .map(|i| i + 1); // 1-based (see fat_pointer_to_block_at_height)
             let fat_ptr = if let Some(h) = suitable_height {
                 fat_pointer_to_block_at_height(&internal.bft_blocks, &internal.fat_pointer_to_tip, h as u64)
                     .unwrap_or_else(|| FatPointerToBftBlock::null())

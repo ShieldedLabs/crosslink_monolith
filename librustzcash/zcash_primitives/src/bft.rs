@@ -118,7 +118,7 @@ impl HardForkConfig {
 ///
 /// A [BftBlock] may be constructed from a node's local view in order to create a new BFT proposal, or they may be constructed from unknown sources across a network protocol.
 ///
-/// To construct a [BftBlock] for a new BFT proposal, build a [Vec] of exactly [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma) consecutive [BcBlockHeader] values in ascending height order, so that element zero is the deepest, then pass this to [BftBlock::try_from]. The specification requires these to be the tail of a bc-valid chain. The Zebra prototype does not always satisfy that: it clamps how far the finalization candidate may advance in a single step, and under that clamp it carries a mid-chain window instead of a tail.
+/// To construct a [BftBlock] for a new BFT proposal, build a [Vec] of exactly [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma) consecutive [BcBlockHeader] values in ascending height order, so that element zero is the deepest, then pass this to [BftBlock::try_from]. These headers are the σ *confirmations*: the block being finalized (the `snapshot`) is the parent of element zero and is NOT carried, so σ headers mean σ confirmations atop it. The specification requires these to be the tail of a bc-valid chain. The Zebra prototype does not always satisfy that: it clamps how far the snapshot may advance in a single step, and under that clamp it carries a mid-chain window instead of a tail.
 ///
 /// To construct from an untrusted source, call the same [BftBlock::try_from].
 ///
@@ -176,6 +176,10 @@ pub struct BftBlock {
     /// Hash of the previous BFT Block.
     pub previous_block_fat_ptr: FatPointerToBftBlock,
     /// The PoW Headers
+    ///
+    /// Exactly σ headers, deepest first: the σ confirmations built *on top of* the snapshot
+    /// (see [snapshot_block_hash](BftBlock::snapshot_block_hash)). The snapshot itself is not
+    /// among them — it is `headers[0]`'s parent.
     // @Zooko: PoPoW?
     pub headers: Vec<BcBlockHeader>,
     /// The user-led hardfork rules activated by this block, in canonical schedule
@@ -299,17 +303,17 @@ impl BftBlock {
     }
 
 
-    /// Refer to the [BcBlockHeader] that is the finalization candidate for this block
+    /// The `snapshot`: the PoW block this BFT block finalizes.
     ///
-    /// This returns the deepest carried header, which is one block above the snapshot the
-    /// specification defines: `snapshot` is that header's *parent*. No caller in this tree
-    /// takes the parent, so the finalized point is currently one block shallower than the
-    /// specification intends. See the off-by-one discussion in FINALITY.md.
+    /// The carried headers are the σ confirmations built *on top of* the snapshot, deepest
+    /// first, so the snapshot is `headers[0]`'s parent — exactly as the specification defines
+    /// it. Only the hash is carried: a consumer that needs the height asks the chain, which is
+    /// the only thing that can answer it truthfully.
     ///
     /// Panics if the block carries no headers, which the placeholder entries used during
     /// out-of-order BFT ingest do.
-    pub fn finalization_candidate(&self) -> &BcBlockHeader {
-        &self.headers.first().expect("Vec should never be empty")
+    pub fn snapshot_block_hash(&self) -> crate::block::BlockHash {
+        self.headers.first().expect("Vec should never be empty").prev_block
     }
 
     /// Attempt to construct a [BftBlock] from headers while performing immediate validations; see [BftBlock] type docs
