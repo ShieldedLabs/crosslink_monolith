@@ -118,7 +118,7 @@ impl HardForkConfig {
 ///
 /// A [BftBlock] may be constructed from a node's local view in order to create a new BFT proposal, or they may be constructed from unknown sources across a network protocol.
 ///
-/// To construct a [BftBlock] for a new BFT proposal, build a [Vec] of exactly [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma) consecutive [BcBlockHeader] values in ascending height order, so that element zero is the deepest, then pass this to [BftBlock::try_from]. These headers are the σ *confirmations*: the block being finalized (the `snapshot`) is the parent of element zero and is NOT carried, so σ headers mean σ confirmations atop it. The specification requires these to be the tail of a bc-valid chain. The Zebra prototype does not always satisfy that: it clamps how far the snapshot may advance in a single step, and under that clamp it carries a mid-chain window instead of a tail.
+/// To construct a [BftBlock] for a new BFT proposal, build a [Vec] of exactly `bc_confirmation_depth_sigma − 1` consecutive [BcBlockHeader] values in ascending height order, so that element zero is the deepest, then pass this to [BftBlock::try_from]. σ counts the window starting AT the block being finalized (the `snapshot`): the snapshot is element zero's parent and is NOT carried — it is named by hash instead — so with σ = 5 the certificate carries 4 headers, the confirmations atop the snapshot. The specification requires these to be the tail of a bc-valid chain. The Zebra prototype does not always satisfy that: it clamps how far the snapshot may advance in a single step, and under that clamp it carries a mid-chain window instead of a tail.
 ///
 /// To construct from an untrusted source, call the same [BftBlock::try_from].
 ///
@@ -126,7 +126,7 @@ impl HardForkConfig {
 ///
 /// The [BftBlock::try_from] method is the only way to construct [BftBlock] values and performs the following validation internally:
 ///
-/// 1. The number of headers matches the expected protocol confirmation depth, [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma).
+/// 1. The number of headers matches the expected protocol confirmation depth, `bc_confirmation_depth_sigma − 1` (σ counts the snapshot itself, which is named by hash and not carried); see [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma).
 /// 2. The [version](BcBlockHeader::version) field is a known expected value.
 /// 3. The headers are in the correct order given the [previous_block_hash](BcBlockHeader::previous_block_hash) fields.
 /// 4. The PoW solutions validate.
@@ -159,6 +159,9 @@ impl HardForkConfig {
 ///
 /// > Each bft‑proposal has, in addition to origbft‑proposal fields, a headers_bc field containing a sequence of exactly σ bc‑headers (zero‑indexed, deepest first).
 ///
+/// (Clarified reading, per the design discussion: σ counts the finalized block itself, so the
+/// carried sequence has σ − 1 headers — the window above the snapshot.)
+///
 /// That order is a property of the honest producer, not of this type. Nothing establishes it for a block from an unknown source: [BftBlock::try_from] checks only the header count, and the deserialization path does not call it.
 ///
 /// The [TryFrom] impl performs internal validations and is intended to be the only way to construct a [BftBlock], whether locally generated or from an unknown source. This is the safest design, though potentially less efficient.
@@ -177,9 +180,9 @@ pub struct BftBlock {
     pub previous_block_fat_ptr: FatPointerToBftBlock,
     /// The PoW Headers
     ///
-    /// Exactly σ headers, deepest first: the σ confirmations built *on top of* the snapshot
-    /// (see [snapshot_block_hash](BftBlock::snapshot_block_hash)). The snapshot itself is not
-    /// among them — it is `headers[0]`'s parent.
+    /// Exactly σ − 1 headers, deepest first: the confirmations built *on top of* the snapshot
+    /// (see [snapshot_block_hash](BftBlock::snapshot_block_hash)). σ counts the snapshot itself,
+    /// which is not among them — it is `headers[0]`'s parent, named by hash.
     // @Zooko: PoPoW?
     pub headers: Vec<BcBlockHeader>,
     /// The user-led hardfork rules activated by this block, in canonical schedule
@@ -305,7 +308,7 @@ impl BftBlock {
 
     /// The `snapshot`: the PoW block this BFT block finalizes.
     ///
-    /// The carried headers are the σ confirmations built *on top of* the snapshot, deepest
+    /// The carried headers are the σ − 1 confirmations built *on top of* the snapshot, deepest
     /// first, so the snapshot is `headers[0]`'s parent — exactly as the specification defines
     /// it. Only the hash is carried: a consumer that needs the height asks the chain, which is
     /// the only thing that can answer it truthfully.
@@ -323,7 +326,9 @@ impl BftBlock {
         previous_block_fat_ptr: FatPointerToBftBlock,
         headers: Vec<BcBlockHeader>,
     ) -> Result<Self, InvalidBftBlock> {
-        let expected = params.bc_confirmation_depth_sigma;
+        // σ counts the snapshot itself (the parent of the deepest header, named by hash
+        // rather than carried), so the block carries σ − 1 headers.
+        let expected = params.bc_confirmation_depth_sigma - 1;
         let actual = headers.len() as u64;
         if actual != expected {
             return Err(InvalidBftBlock::IncorrectConfirmationDepth { expected, actual });
@@ -372,7 +377,7 @@ pub enum InvalidBftBlock {
     //     "invalid confirmation depth: Crosslink requires {expected} while {actual} were present"
     // )]
     IncorrectConfirmationDepth {
-        /// The expected number of headers, as per [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma)
+        /// The expected number of headers, `bc_confirmation_depth_sigma − 1` (σ counts the snapshot, which is not carried); see [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma)
         expected: u64,
         /// The number of headers present
         actual: u64,
@@ -447,7 +452,8 @@ impl BftBootstrap {
 pub struct ZcashCrosslinkParameters {
     /// The best-chain confirmation depth, `σ`
     ///
-    /// At least this many PoW blocks must be atop the PoW block used to obtain a finalized view.
+    /// σ counts the finalized block itself: a certificate finalizing PoW height `F` carries
+    /// `σ − 1` headers (`F+1 ..= F+σ−1`) and is proposed once the tip reaches `F+σ−1`.
     pub bc_confirmation_depth_sigma: u64,
 
     /// The depth of unfinalized PoW blocks past which "Stalled Mode" activates, `L`

@@ -1174,7 +1174,7 @@ fn create_pos_and_ptr_to_finalize_pow(
 ) -> BftBlockAndFatPointerToItWrap {
     assert_eq!(
         pow_blocks.len(),
-        HARNESS_PARAMETERS.bc_confirmation_depth_sigma as usize
+        HARNESS_PARAMETERS.bc_confirmation_depth_sigma as usize - 1
     );
 
     let mut hdrs = Vec::with_capacity(pow_blocks.len());
@@ -1185,9 +1185,10 @@ fn create_pos_and_ptr_to_finalize_pow(
     }
 
     // The `snapshot` -- the block this BFT block finalizes -- is the PARENT of the deepest
-    // carried header: the carried headers are the sigma confirmations built on top of it, and
-    // the snapshot itself is not carried. The PoW-side fat-pointer gate resolves its height
-    // from the chain to enforce `pow_height >= snapshot + sigma + 1`.
+    // carried header: sigma counts the snapshot itself, so the sigma - 1 carried headers are
+    // the confirmations built on top of it, and the snapshot is not carried. The PoW-side
+    // fat-pointer gate resolves its height
+    // from the chain to enforce `pow_height >= snapshot + sigma`.
     let block = BftBlock::try_from(
         &HARNESS_PARAMETERS,
         bft_height,
@@ -1241,7 +1242,7 @@ fn crosslink_gen_pow_and_no_signature_no_roster_pos() {
 
     let fat_ptr = &mut FatPointerToBftBlock::null();
     let pos_h = &mut 0;
-    let bft = next_pos(pos_h, fat_ptr, &pow_common[0..3], &[]);
+    let bft = next_pos(pos_h, fat_ptr, &pow_common[0..2], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
     for _ in 4..7 {
@@ -1289,7 +1290,7 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
     // pub_key here, so EXPECT_ROSTER_INCLUDES(pub_key) below matches.
     let target = zcash_primitives::bft::FinalizerAddress::create(&prv_key);
 
-    // NOTE: the bond must be in the height-1 block: the BFT block over headers 2..=4
+    // NOTE: the bond must be in the height-1 block: the BFT block over headers 2..=3
     // finalizes their parent, height 1, and the roster snapshot taken at finalization only
     // sees bonds already in the finalized state. Amount 0 as the bond can't be funded (see
     // staking_tx_create_bond).
@@ -1309,10 +1310,10 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
         tf.push_instr_load_pow(block, 0);
     }
 
-    // The window is [2,3,4] so its snapshot -- the parent of its deepest header, which is what
+    // The window is [2,3] so its snapshot -- the parent of its deepest header, which is what
     // a BFT block finalizes -- is height 1, the block carrying the bond.
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
-    let bft = next_pos(pos_h, fat_ptr, &pow_common[1..4], &[]);
+    let bft = next_pos(pos_h, fat_ptr, &pow_common[1..3], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
     // NOTE: membership only: the bond is created with 0 stake, but finalizer rewards
@@ -1378,18 +1379,19 @@ fn diagram_fork_miner() -> Address {
 /// ```text
 ///   PoW           BFT             file order
 ///   P1..P6        -               P1..P6
-///   -             bft0 [P4,P5,P6] bft0
+///   -             bft0 [P4,P5]    bft0
 ///   P7 -> bft0    -               P7
-///   -             bft1 [P5,P6,P7] bft1
+///   -             bft1 [P5,P6]    bft1
 ///   P8 -> bft1    -               P8
-///   -             bft2 [P6,P7,P8] bft2
+///   -             bft2 [P6,P7]    bft2
 ///   P9..P10 -> bft2               P9, P10
 /// ```
 ///
 /// Each BFT block finalizes the PARENT of its deepest header -- the carried headers are the
-/// sigma confirmations above it -- so bft2 over [P6,P7,P8] is what puts the marker on P5. A
-/// certificate may only be carried by a PoW block at `snapshot + sigma + 1` or above, which is
-/// why each one is cited one block later than its window ends.
+/// sigma - 1 confirmations above it -- so bft2 over [P6,P7] is what puts the marker on P5. A
+/// certificate may only be carried by a PoW block at `snapshot + sigma` or above (sigma counts
+/// the snapshot, so bft0's earliest legal carrier is P6); the interleave cites each one in the
+/// first block built after it, which is later than that minimum.
 ///
 /// A BFT block can only carry headers of PoW blocks that already exist, and a PoW block
 /// can only point at a BFT block that already exists, so the two chains have to be
@@ -1417,23 +1419,23 @@ fn diagram_scene_1() -> (TF, Vec<Arc<Block>>) {
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
 
-    // bft0 over [P4,P5,P6]; P7 then cites it.
-    let bft0 = next_pos(pos_h, fat_ptr, &pow[3..6], &[]);
+    // bft0 over [P4,P5]; P7 then cites it.
+    let bft0 = next_pos(pos_h, fat_ptr, &pow[3..5], &[]);
     tf.push_instr_load_pos(&bft0, 0);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft0.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
-    // bft1 over [P5,P6,P7]; P8 then cites it.
-    let bft1 = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
+    // bft1 over [P5,P6]; P8 then cites it.
+    let bft1 = next_pos(pos_h, fat_ptr, &pow[4..6], &[]);
     tf.push_instr_load_pos(&bft1, 0);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft1.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
-    // bft2 over [P6,P7,P8]. Its snapshot is P5 -- the parent of its deepest header -- so the
+    // bft2 over [P6,P7]. Its snapshot is P5 -- the parent of its deepest header -- so the
     // finalized marker lands there.
-    let bft2 = next_pos(pos_h, fat_ptr, &pow[5..8], &[]);
+    let bft2 = next_pos(pos_h, fat_ptr, &pow[5..7], &[]);
     tf.push_instr_load_pos(&bft2, 0);
     for _ in 9..=10 {
         gen.next_block(&miner_addr);
@@ -1476,13 +1478,13 @@ fn diagram_scene_2() -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
 
-    let bft0 = next_pos(pos_h, fat_ptr, &pow[3..6], &[]);
+    let bft0 = next_pos(pos_h, fat_ptr, &pow[3..5], &[]);
     tf.push_instr_load_pos(&bft0, 0);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft0.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
-    let bft1 = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
+    let bft1 = next_pos(pos_h, fat_ptr, &pow[4..6], &[]);
     tf.push_instr_load_pos(&bft1, 0);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft1.0.fat_ptr));
@@ -1492,7 +1494,7 @@ fn diagram_scene_2() -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
     // branches descend from the same block.
     let mut fork_gen = gen.clone();
 
-    let bft2 = next_pos(pos_h, fat_ptr, &pow[5..8], &[]);
+    let bft2 = next_pos(pos_h, fat_ptr, &pow[5..7], &[]);
     tf.push_instr_load_pos(&bft2, 0);
     for _ in 9..=10 {
         gen.next_block(&miner_addr);
@@ -1556,25 +1558,25 @@ fn diagram_scene_3(fork_flags: u32) -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
 
-    let bft0 = next_pos(pos_h, fat_ptr, &pow[3..6], &[]);
+    let bft0 = next_pos(pos_h, fat_ptr, &pow[3..5], &[]);
     tf.push_instr_load_pos(&bft0, 0);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft0.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
-    let bft1 = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
+    let bft1 = next_pos(pos_h, fat_ptr, &pow[4..6], &[]);
     tf.push_instr_load_pos(&bft1, 0);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft1.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
     // Snapshot P5, so that is the finalized marker. Everything after this conflicts with it.
-    let bft2 = next_pos(pos_h, fat_ptr, &pow[5..8], &[]);
+    let bft2 = next_pos(pos_h, fat_ptr, &pow[5..7], &[]);
     tf.push_instr_load_pos(&bft2, 0);
 
     // C4..C6 carry no BFT pointer: bft0's snapshot is P3, and the sigma-confirmation rule in
-    // the fat-pointer gate lets nothing below P3 + sigma + 1 = 7 carry that certificate. Their
-    // parent P3 carries no pointer either, so a nil one is legal here. C7..C9 then cite bft0,
+    // the fat-pointer gate lets nothing below P3 + sigma = 6 carry that certificate. C6 could,
+    // but its parent P3 carries no pointer, so staying nil is legal too. C7..C9 then cite bft0,
     // whose headers sit on the branch this one conflicts with -- the point of the scene.
     let mut fork: Vec<Arc<Block>> = Vec::new();
     for height in 4..=9 {
@@ -1663,8 +1665,8 @@ fn crosslink_finality_diagram_2_benign_reorg() {
 // - reject pos block with < 2/3rds roster stake
 // - reject pos block with signatures from the previous, but not current roster
 // > require correctly-signed incorrect data:
-//   - reject pos block with > sigma headers
-//   - reject pos block with < sigma headers
+//   - reject pos block with > sigma - 1 headers
+//   - reject pos block with < sigma - 1 headers
 //   - reject pos block where headers don't form subchain (hdrs[i].hash() != hdrs[i+1].previous_block_hash)
 //   - repeat all signature tests but for the *next* pos block's fat pointer back
 // - reject pos block that does have the correct fat pointer *hash* to prev block

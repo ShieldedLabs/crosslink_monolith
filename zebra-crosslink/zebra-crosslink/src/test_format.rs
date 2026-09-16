@@ -462,7 +462,7 @@ pub const HARNESS_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParameter
     bootstrap: BftBootstrap::Supplied,
     // Sigma and L are pinned here rather than inherited from `PROTOTYPE_PARAMETERS`. The
     // scenes in the test suite are hand-built at specific heights: a BFT block carries exactly
-    // sigma headers, and the PoW block that cites it has to sit at least sigma + 1 above the
+    // sigma - 1 headers, and the PoW block that cites it has to sit at least sigma above the
     // block that certificate finalizes. Inheriting sigma would silently invalidate every one of
     // those scenes the moment the network parameter moved, which is not what changing a network
     // parameter should mean. The rules under test do not depend on sigma's value; the live

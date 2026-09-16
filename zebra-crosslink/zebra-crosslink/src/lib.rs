@@ -444,9 +444,10 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(
 
     // The sigma-confirmation rule, and the reason this gate is handed a height lookup at all.
     //
-    // A certificate finalizing PoW height F may only be carried by a PoW block at F + sigma + 1
-    // or above, so that sigma blocks of the carrying block's OWN ancestry sit between the
-    // snapshot and the certificate. That is what makes the confirmation depth real rather than
+    // A certificate finalizing PoW height F may only be carried by a PoW block at F + sigma
+    // or above. Sigma counts the finalized block itself, so the whole sigma window -- F plus
+    // the sigma - 1 carried headers above it -- must sit inside the carrying block's OWN
+    // ancestry. That is what makes the confirmation depth real rather than
     // advisory: the sigma headers inside a BFT block are evidence nobody checks to be on this
     // chain, so without this rule a block at F + 1 could carry a certificate whose
     // "confirmations" are headers from another branch entirely, and the chain would call F final
@@ -465,7 +466,7 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(
         // unresolved BFT pointer does.
         let snapshot_height = height_of(snapshot_hash.into())?;
         let sigma = internal_handle.params.bc_confirmation_depth_sigma;
-        if (pow_block_height.0 as u64) < snapshot_height.0 as u64 + sigma + 1 {
+        if (pow_block_height.0 as u64) < snapshot_height.0 as u64 + sigma {
             return Some(false);
         }
     }
@@ -608,7 +609,7 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
     use zebra_chain::block::HeightDiff as BlockHeightDiff;
 
     let finality_candidate_height = tip_height.sub(BlockHeightDiff::from(
-        params.bc_confirmation_depth_sigma as i64,
+        params.bc_confirmation_depth_sigma as i64 - 1,
     ));
 
     let finality_candidate_height = if let Some(h) = finality_candidate_height {
@@ -631,13 +632,13 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
                 .map_or(Blake3Hash([0u8; 32]), |b| b.blake3_hash()),
         )
     };
-    // `finality_candidate_height` (tip - sigma) is the `snapshot`: the block this proposal
-    // finalizes. It is also the anchor the header window is walked from, and
-    // `FindBlockHeaders { known_blocks: [anchor] }` returns headers starting AFTER the anchor --
-    // so the sigma carried headers are exactly the sigma confirmations built on top of the
-    // snapshot, and the snapshot itself is not carried. That is what the specification means by
-    // sigma confirmations; carrying the snapshot as `headers[0]` (as this did before) left it
-    // with only sigma - 1.
+    // `finality_candidate_height` (tip - (sigma - 1)) is the `snapshot`: the block this proposal
+    // finalizes. Sigma counts the window starting AT the snapshot -- the block being finalized is
+    // included in sigma -- so with sigma = 5 the certificate carries 4 headers, F+1 ..= tip, the
+    // confirmations above the snapshot, and the deepest carried header is the tip itself. The
+    // snapshot is not carried: it is named by `BftBlock::snapshot_block_hash()`
+    // (`parent(headers[0])`), and `FindBlockHeaders { known_blocks: [anchor] }` returns the
+    // headers starting AFTER the anchor, which is exactly the window above the snapshot.
     //
     // Guarding on the snapshot height keeps one BFT block per PoW block: the tip advancing by
     // one advances the snapshot by one, so each new PoW block is proposable at once.
@@ -681,7 +682,9 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
         // Error or unexpected response type:
         panic!("TODO: improve error handling.");
     };
-    headers.truncate(params.bc_confirmation_depth_sigma as usize);
+    // sigma - 1 headers: sigma counts the snapshot itself, which is named by hash rather than
+    // carried (see the comment above and BftBlock).
+    headers.truncate(params.bc_confirmation_depth_sigma as usize - 1);
 
     let internal = tfl_handle.internal.lock().await;
 
@@ -760,8 +763,9 @@ async fn handle_new_decided_bft_block(
     }
 
     let call = tfl_handle.call.clone();
-    // The `snapshot`: the parent of the deepest carried header, i.e. the block the sigma carried
-    // confirmations sit on top of. See `BftBlock::snapshot_block_hash`.
+    // The `snapshot`: the parent of the deepest carried header, i.e. the block being finalized.
+    // Sigma counts it, so the sigma - 1 carried headers sit on top of it.
+    // See `BftBlock::snapshot_block_hash`.
     let new_final_hash = ZebBlockHash(new_block.snapshot_block_hash().0);
     let new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
     // `height` is now the 0-based canonical height, i.e. the chain index directly.
@@ -1052,8 +1056,8 @@ async fn validate_bft_block(
     let already_finalized_hash = internal.latest_final_block.map(|(_, hash)| hash);
     drop(internal);
 
-    // The `snapshot` this proposal finalizes: the parent of the deepest carried header, so the
-    // sigma headers it carries are sigma confirmations on top of it.
+    // The `snapshot` this proposal finalizes: the parent of the deepest carried header. Sigma
+    // counts the snapshot, so the sigma - 1 headers it carries are the confirmations atop it.
     let new_final_hash = ZebBlockHash(new_block.snapshot_block_hash().0);
     let new_final_pow_height =
         if let Some(new_final_height) = block_height_from_hash(&call, new_final_hash).await {
@@ -1703,10 +1707,10 @@ async fn build_bootstrap_genesis(tfl_handle: &TFLServiceHandle) -> Option<(BftBl
         return None;
     };
 
-    // h1 is the snapshot, so the carried headers are the sigma blocks ABOVE it: h1+1 ..= h1+sigma.
-    // A proposal's headers are the confirmations, not the block being finalized (see BftBlock).
-    let mut headers: Vec<BcBlockHeader> = Vec::with_capacity(params.bc_confirmation_depth_sigma as usize);
-    for h in roster_height + 1..=roster_height + params.bc_confirmation_depth_sigma as u32 {
+    // h1 is the snapshot, and sigma counts it, so the carried headers are the sigma - 1 blocks
+    // ABOVE it: h1+1 ..= h1+sigma-1 (see BftBlock).
+    let mut headers: Vec<BcBlockHeader> = Vec::with_capacity(params.bc_confirmation_depth_sigma as usize - 1);
+    for h in roster_height + 1..=roster_height + params.bc_confirmation_depth_sigma as u32 - 1 {
         match (call.state)(StateRequest::BlockHeader(ZebBlockHeight(h).into())).await {
             Ok(StateResponse::BlockHeader { header, .. }) => headers.push(bc_hdr_to_lrz(&header)),
             _ => return None,
@@ -2080,7 +2084,7 @@ async fn tfl_service_incoming_request(
                     continue;
                 }
                 if let Some(h) = block_height_from_hash(&call, snapshot_hash).await {
-                    if h.0 as u64 + sigma + 1 <= proposed_pow_height {
+                    if h.0 as u64 + sigma <= proposed_pow_height {
                         suitable_height = Some(i + 1); // 1-based (see fat_pointer_to_block_at_height)
                         break;
                     }
