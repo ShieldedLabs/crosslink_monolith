@@ -1583,6 +1583,17 @@ pub fn sync(
                         });
                         continue;
                     }
+                    // The commit loop expects every queued block to have a coinbase height, and a
+                    // block that parses with no transactions has none. The packet path refuses
+                    // those before queueing; this is the same refusal for submissions. Mirrors
+                    // zebra_consensus::BlockError::MissingHeight and its misbehavior score.
+                    if block.coinbase_height().is_none() {
+                        let _ = reply.send(IngestOutcome::Failed {
+                            reason: format!("invalid block {hash:?}: missing block height"),
+                            misbehavior_score: 100,
+                        });
+                        continue;
+                    }
 
                     blocks_to_commit.push((hash, block));
                     submission_replies.insert(hash, reply);

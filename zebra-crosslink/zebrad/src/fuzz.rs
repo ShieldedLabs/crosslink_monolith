@@ -222,10 +222,9 @@ impl Ingest {
 mod tests {
     use super::*;
 
-    // NOTE: these tests each boot an Ingest, and boot() has a process-wide single-boot guard, so
-    // AT MOST ONE may run per process. That is fine normally -- the reproducer below is #[ignore]d,
-    // so a plain `cargo test` runs only the smoke test, and `--ignored` runs only the reproducer.
-    // Do NOT run them together with `--include-ignored`: the second boot() panics by design.
+    // NOTE: boot() has a process-wide single-boot guard, so each test here boots its own Ingest and
+    // relies on running in its own process, as nextest does. Plain `cargo test` runs tests as threads
+    // of one process and panics on the second boot, so run these with nextest or one at a time.
 
     // Green smoke test / P5 regression replay (stable toolchain, no nightly, no libfuzzer): the
     // harness boots the REAL ingest (genesis committed through the real path), rejects garbage
@@ -269,35 +268,26 @@ mod tests {
         assert!(replayed > 0, "corpus must contain at least one *.bin seed at {corpus_dir}");
     }
 
-    // Deterministic reproducer for the open finding (2026-09-10): a block that deserializes but has
-    // an empty transaction vector returns coinbase_height() == None, and the submit doorway does no
-    // height check before the commit queue's .expect() at new_network.rs:2806/2822. With a known
-    // (genesis) parent it reaches that expect and kills the sync loop; a correct node must REJECT
-    // it with a verdict. #[ignore]d because it is RED until the submit path grows the same
-    // coinbase-height guard the packet path already has at new_network.rs:2726 -- run it with
-    // `--ignored` to check the finding, and delete the attribute once the guard lands.
+    // Regression (found by this harness 2026-09-10): a block that parses with an empty transaction
+    // vector has no coinbase height. Queued, it reached the commit loop's height expect and killed
+    // the sync loop. It must be rejected with a verdict, and the loop must still answer afterwards.
     #[test]
-    #[ignore = "open finding: coinbase_height().expect on the submit path, new_network.rs:2822"]
-    fn empty_tx_block_must_not_crash_sync_loop() {
+    fn empty_tx_block_must_be_rejected() {
         let ingest = Ingest::boot();
+        let seed = include_bytes!("../../crosslink-test-data/test_pow_block_0.bin");
 
-        let mut empty_tx_block =
-            Block::zcash_deserialize(&include_bytes!("../../crosslink-test-data/test_pow_block_0.bin")[..])
-                .expect("seed block parses");
+        let mut empty_tx_block = Block::zcash_deserialize(&seed[..]).expect("seed block parses");
         empty_tx_block.transactions = vec![];
         assert!(empty_tx_block.coinbase_height().is_none(), "empty-tx block must have no coinbase height");
         let empty_tx_bytes = empty_tx_block.zcash_serialize_to_vec().expect("reserialize");
-
-        // Observe the RETURN value, never a propagated worker-thread panic: a sync-loop panic does
-        // not reach this thread, so relying on it propagating would let the reproducer pass green on
-        // a broken node. A healthy node returns a verdict (Outcome, a Failed rejection); a crash
-        // surfaces as TransportDead and a stall as TimedOut -- both mean the loop did not survive.
         match ingest.submit_bytes(&empty_tx_bytes) {
-            IngestResult::Outcome(_) => {}
-            other => panic!(
-                "empty-tx block did not get a clean verdict -- the sync loop did not survive it \
-                 (coinbase_height().expect at new_network.rs:2822): {other:?}"
-            ),
+            IngestResult::Outcome(IngestOutcome::Failed { .. }) => {}
+            other => panic!("an empty-tx block must be rejected with a verdict, got {other:?}"),
+        }
+
+        // A dead loop only shows up as TransportDead on a later submission.
+        if let IngestResult::TransportDead(reason) = ingest.submit_bytes(&seed[..]) {
+            panic!("the sync loop died after rejecting the empty-tx block: {reason}");
         }
     }
 }
