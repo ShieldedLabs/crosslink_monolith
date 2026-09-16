@@ -254,7 +254,7 @@ fn regen_test_data() {
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     for (i, &link) in REGTEST_POW_IDX_FINALIZED_BY_POS_BLOCK.iter().enumerate() {
-        let bft = next_pos(pos_h, fat_ptr, &pow[link..link + 3], &[]);
+        let bft = next_pos(pos_h, fat_ptr, &pow[link..link + 2], &[]);
         let bytes = bft.zcash_serialize_to_vec().unwrap();
         std::fs::write(dir.join(format!("test_pos_block_{}.bin", POS_FILE_IDX[i])), bytes).unwrap();
     }
@@ -381,7 +381,7 @@ fn crosslink_expect_pos_height_after_push() {
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     for i in 1..5 {
-        let bft = next_pos(pos_h, fat_ptr, &pow_common[i..i+3], &[]);
+        let bft = next_pos(pos_h, fat_ptr, &pow_common[i..i+2], &[]);
         tf.push_instr_load_pos(&bft, 0);
         tf.push_instr_expect_pos_chain_length((*pos_h).try_into().unwrap(), 0);
     }
@@ -412,9 +412,9 @@ fn crosslink_expect_pos_out_of_order() {
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let pos = [
-        next_pos(pos_h, fat_ptr, &pow_common[0..=2], &[]),
-        next_pos(pos_h, fat_ptr, &pow_common[1..=3], &[]),
-        next_pos(pos_h, fat_ptr, &pow_common[2..=4], &[]),
+        next_pos(pos_h, fat_ptr, &pow_common[0..=1], &[]),
+        next_pos(pos_h, fat_ptr, &pow_common[1..=2], &[]),
+        next_pos(pos_h, fat_ptr, &pow_common[2..=3], &[]),
     ];
 
     tf.push_instr_load_pos(&pos[0], 0);
@@ -444,7 +444,7 @@ fn crosslink_expect_pos_push_same_block_twice_only_accepted_once() {
     tf.push_instr_expect_pow_chain_length(4, 0);
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
-    let pos = next_pos(pos_h, fat_ptr, &pow_common[0..=2], &[]);
+    let pos = next_pos(pos_h, fat_ptr, &pow_common[0..=1], &[]);
 
     tf.push_instr_load_pos(&pos, 0);
     tf.push_instr_load_pos(&pos, SHOULD_FAIL);
@@ -534,7 +534,7 @@ fn crosslink_test_basic_finality() {
 
     const LINKS: &[usize] = &[1, 4, 6, 10, 13, 16];//, 18];
     for i in 0..LINKS.len() {
-        let bft = next_pos(pos_h, fat_ptr, &pow[LINKS[i]..LINKS[i]+3], &[]);
+        let bft = next_pos(pos_h, fat_ptr, &pow[LINKS[i]..LINKS[i]+2], &[]);
         tf.push_instr_load_pos(&bft, 0);
 
         for i2 in 0..n {
@@ -607,7 +607,7 @@ fn crosslink_reject_fat_pointer_below_bootstrap_activation() {
         tf.push_instr_load_pow(&gen.tip, 0);
     }
 
-    let bft = next_pos(pos_h, fat_ptr, &pow[1..4], &[]);
+    let bft = next_pos(pos_h, fat_ptr, &pow[1..3], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
     let fat_pointer_to_bft_block = FatPointerToBftBlock {
@@ -657,7 +657,7 @@ fn crosslink_test_pow_to_pos_link() {
 
     // TODO: push
 
-    let bft = next_pos(pos_h, fat_ptr, &pow[1..4], &[]);
+    let bft = next_pos(pos_h, fat_ptr, &pow[1..3], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
     let fat_pointer_to_bft_block = FatPointerToBftBlock {
@@ -723,7 +723,7 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
 
     // Finalize heights 1, 3, 5.
     for i in 0..3 {
-        let bft = next_pos(pos_h, fat_ptr, &pow[2*i+1..2*i+4], &[]);
+        let bft = next_pos(pos_h, fat_ptr, &pow[2*i+1..2*i+3], &[]);
         tf.push_instr_load_pos(&bft, 0);
     }
 
@@ -735,7 +735,7 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
     }
 
     // Finalize height 7.
-    let bft = next_pos(pos_h, fat_ptr, &pow[7..10], &[]);
+    let bft = next_pos(pos_h, fat_ptr, &pow[7..9], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
     for _ in 11..14 {
@@ -744,7 +744,7 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
     }
 
     // Finalize height 10, above the fork point, so the whole fork below conflicts with it.
-    let bft = next_pos(pos_h, fat_ptr, &pow[10..13], &[]);
+    let bft = next_pos(pos_h, fat_ptr, &pow[10..12], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
     // A second, distinct, valid transparent P2PKH miner (a different coinbase => different
@@ -781,7 +781,7 @@ fn crosslink_pow_switch_to_finalized_chain_fork_even_though_longer_chain_exists(
     }
 
     for i in 0..3 {
-        let bft = next_pos(pos_h, fat_ptr, &pow[i..i+3], &[]);
+        let bft = next_pos(pos_h, fat_ptr, &pow[i..i+2], &[]);
         tf.push_instr_load_pos(&bft, 0);
     }
 
@@ -814,7 +814,7 @@ fn crosslink_pow_switch_to_finalized_chain_fork_even_though_longer_chain_exists(
     tf.push_instr_expect_pow_chain_length(19, 0);
 
     // finalize the small sidechain: snapshot is its first block, at height 10
-    let bft = next_pos(pos_h, fat_ptr, &pow[10..13], &[]);
+    let bft = next_pos(pos_h, fat_ptr, &pow[10..12], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
     tf.push_instr_expect_pow_chain_length(14, 0);
