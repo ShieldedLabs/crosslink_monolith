@@ -502,6 +502,26 @@ const _: () = assert!(
     "the bootstrap roster block must be below the reorg limit when any activation-height block is accepted"
 );
 
+/// How far finality may lag behind the chain and still earn PoS issuance, measured in PoW
+/// blocks beyond the tightest possible gap.
+///
+/// PoS issuance is not paid per block. It is paid by a PoW block `P` that both *advances* the
+/// certificate (its `context_bft` names a different BFT block than its parent's does) and does
+/// so *promptly*: with `F` the height of the PoW block that certificate finalizes,
+///
+/// ```text
+/// payout(P)  iff  cert(P) != cert(parent(P))  and  height(P) - F <= σ + FINALITY_LIVENESS_ALLOWANCE
+/// ```
+///
+/// The fat-pointer gate already refuses any `P` below `F + σ`, so `height(P) - F` is at least
+/// `σ` — equivalently, at least `σ - 1` blocks sit strictly between `F` and `P`. This allowance
+/// is the slack above that floor: at `2`, a certificate carried with `σ + 1` blocks between it
+/// and what it finalizes still pays, and one more block than that does not.
+///
+/// So issuance tracks finality liveness: a stalled or lagging BFT layer mints nothing, and
+/// minting resumes only once certificates are both fresh and arriving.
+pub const FINALITY_LIVENESS_ALLOWANCE: u64 = 2;
+
 /// A BLAKE3 hash.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Copy, Hash, Serialize, Deserialize)]
 pub struct Blake3Hash(pub [u8; 32]);

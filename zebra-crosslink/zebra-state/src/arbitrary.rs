@@ -101,6 +101,7 @@ impl ContextuallyVerifiedBlock {
             height,
             new_outputs,
             transaction_hashes,
+            pos_payout,
         } = block.into();
 
         Self {
@@ -114,6 +115,7 @@ impl ContextuallyVerifiedBlock {
             spent_outputs: new_outputs,
             transaction_hashes,
             chain_value_pool_change: ValueBalance::zero(),
+            pos_payout,
         }
     }
 }

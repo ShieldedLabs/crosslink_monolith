@@ -2113,7 +2113,7 @@ async fn setup_with_mempool_config(
     // UTXO verification doesn't matter here.
     let state_config = StateConfig::ephemeral();
     let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change, mut block_writer) =
-        zebra_state::init(state_config, network, Height::MAX, 0, std::sync::Arc::new(|_,_,_,_| Some(true))).await;
+        zebra_state::init(state_config, network, Height::MAX, 0, std::sync::Arc::new(|_,_,_,_| Some(zebra_state::CrosslinkVerdict::Accept { pos_payout: true }))).await;
     let mut state_service = ServiceBuilder::new().buffer(10).service(state);
 
     let tx_verifier = MockService::build().for_unit_tests();

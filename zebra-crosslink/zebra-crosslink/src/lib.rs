@@ -343,17 +343,18 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(
     child_fat_pointer: FatPointerToBftBlock,
     pow_block_height: ZebBlockHeight,
     height_of: zebra_state::CrosslinkBlockHeightLookup<'_>,
-) -> Option<bool> {
+) -> Option<zebra_state::CrosslinkVerdict> {
     // Return value:
     //   None        => DEFER  — re-queue and re-evaluate on a later flush. REVERSIBLE. This is
     //                           the answer whenever we lack the information to be *certain* a
     //                           block is invalid — i.e. an unresolved BFT pointer (its block has
     //                           not entered this node yet) that may resolve later.
-    //   Some(false) => REJECT — PERMANENT and IRREVERSIBLE: the block is dropped and every
+    //   Some(Reject) => REJECT — PERMANENT and IRREVERSIBLE: the block is dropped and every
     //                           descendant queued behind it is orphaned. We may ONLY return this
     //                           on facts that are immutable and view-independent, so that the
     //                           decision can never turn out to have been a transient mistake.
-    //   Some(true)  => ACCEPT.
+    //   Some(Accept { pos_payout }) => ACCEPT. `pos_payout` additionally decides whether this
+    //                           block mints PoS issuance; see the tail of this function.
     //
     // This runs synchronously inside the state service. `blocking_lock` panics if called on a
     // tokio runtime thread *unless* it is inside `tokio::task::block_in_place`, so EVERY caller
@@ -370,7 +371,7 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(
     // legitimate block (see `BftBootstrap`). Decided before taking the lock: nothing to resolve.
     if let Some(activation_height) = internal_handle.params.bootstrap.activation_height() {
         if !child_is_null && pow_block_height.0 <= activation_height {
-            return Some(false);
+            return Some(zebra_state::CrosslinkVerdict::Reject);
         }
     }
 
@@ -380,7 +381,7 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(
     // block: the child reverts to no BFT pointer while its parent had one. A null pointer can
     // never be "as new or newer" than a real one, so this is a certain regression.
     if child_is_null && !parent_is_null {
-        return Some(false);
+        return Some(zebra_state::CrosslinkVerdict::Reject);
     }
 
     // Resolve the child pointer against the in-memory BFT chain. A non-null pointer we cannot
@@ -401,7 +402,7 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(
     if let Some(h) = child_index {
         let do_not_include = internal.bft_blocks[h].do_not_include_until_bc_height;
         if (pow_block_height.0 as u64) < do_not_include {
-            return Some(false);
+            return Some(zebra_state::CrosslinkVerdict::Reject);
         }
     }
 
@@ -439,7 +440,7 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(
     let child_rank = child_index.map(|h| h + 1).unwrap_or(0);
     let parent_rank = parent_index.map(|h| h + 1).unwrap_or(0);
     if child_rank < parent_rank {
-        return Some(false);
+        return Some(zebra_state::CrosslinkVerdict::Reject);
     }
 
     // The sigma-confirmation rule, and the reason this gate is handed a height lookup at all.
@@ -458,6 +459,7 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(
     // The lock is dropped first: `height_of` reads the state, and nothing is needed from the BFT
     // chain past the snapshot hash.
     drop(internal);
+    let mut pos_payout = false;
     if let Some(snapshot_hash) = snapshot_hash {
         // PERMANENT once resolved, from immutable data: which PoW block a BFT block finalizes is
         // fixed by its bytes, that block's height is fixed by its own coinbase, and so is the
@@ -466,12 +468,101 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(
         // unresolved BFT pointer does.
         let snapshot_height = height_of(snapshot_hash.into())?;
         let sigma = internal_handle.params.bc_confirmation_depth_sigma;
-        if (pow_block_height.0 as u64) < snapshot_height.0 as u64 + sigma {
-            return Some(false);
+        let gap = (pow_block_height.0 as u64).saturating_sub(snapshot_height.0 as u64);
+        if gap < sigma {
+            return Some(zebra_state::CrosslinkVerdict::Reject);
+        }
+
+        // PoS issuance rides on this gate because this is the one place that knows both facts it
+        // needs. A block pays only when it ADVANCES finality (its certificate is a different BFT
+        // block than its parent's -- compared by the cert's identity, the BFT block hash, since
+        // two honest nodes can carry different signature sets for the same decision) and does so
+        // PROMPTLY (`gap <= sigma + FINALITY_LIVENESS_ALLOWANCE`; the check above already put
+        // `gap >= sigma`, so the payable window is exactly those few heights).
+        //
+        // Both facts are objective functions of committed chain data, so every node reaches the
+        // same answer for the same block. See `FINALITY_LIVENESS_ALLOWANCE`.
+        let cert_advanced =
+            child_fat_pointer.points_at_block_hash() != parent_fat_pointer.points_at_block_hash();
+        pos_payout = cert_advanced
+            && gap <= sigma + zcash_primitives::bft::FINALITY_LIVENESS_ALLOWANCE;
+
+        // One line per block recording the decision and the facts behind it. `debug!` would be
+        // the natural level, but the release binary is built with `release_max_level_info`, so
+        // anything below `info` is compiled out and would never be seen on a real node.
+        if cert_advanced && !pos_payout {
+            // The notable case: finality DID advance here, but so slowly that the block earns
+            // nothing. It is otherwise indistinguishable from a block that simply carried the
+            // same certificate as its parent, so it is spelled out.
+            info!(
+                "no PoS issuance at height {}: the certificate finalizes height {} \
+                 (gap {}), beyond sigma {} + FINALITY_LIVENESS_ALLOWANCE {}",
+                pow_block_height.0,
+                snapshot_height.0,
+                gap,
+                sigma,
+                zcash_primitives::bft::FINALITY_LIVENESS_ALLOWANCE,
+            );
+        } else {
+            info!(
+                "PoS payout decision at height {}: payout={} cert_advanced={} gap={} snapshot={} sigma={}",
+                pow_block_height.0, pos_payout, cert_advanced, gap, snapshot_height.0, sigma,
+            );
         }
     }
 
-    Some(true)
+    Some(zebra_state::CrosslinkVerdict::Accept { pos_payout })
+}
+
+/// Recomputes, for a block already on the chain, the PoS-issuance decision the fat-pointer gate
+/// made when that block was committed.
+///
+/// The live rule lives in `call_from_state_to_crosslink_to_ask_about_fat_pointers` and rides on
+/// the gate because that is where both facts are known; replay paths (here, the wallet issuance
+/// projection) have to reconstruct it from committed data. Both halves are objective: the
+/// certificate identity comes from the two block headers, and what that certificate finalizes
+/// comes from the decided BFT block, which is immutable once decided.
+///
+/// Returns an error rather than `false` when the certificate cannot be resolved: silently
+/// skipping a payout would understate issuance without saying so.
+async fn block_pays_pos_issuance(
+    internal_handle: &TFLServiceHandle,
+    block_height: ZebBlockHeight,
+    fat_pointer: &FatPointerToBftBlock,
+    parent_fat_pointer: &FatPointerToBftBlock,
+) -> Result<bool, String> {
+    // No advance, no payout. Also covers every pre-activation block, where both pointers are null.
+    if fat_pointer.points_at_block_hash() == parent_fat_pointer.points_at_block_hash() {
+        return Ok(false);
+    }
+
+    let snapshot_hash = {
+        let internal = internal_handle.internal.lock().await;
+        match internal.bft_block_hash_to_height.get(&fat_pointer.points_at_block_hash()) {
+            Some(&h) if !internal.bft_blocks[h as usize].headers.is_empty() => {
+                ZebBlockHash(internal.bft_blocks[h as usize].snapshot_block_hash().0)
+            }
+            _ => {
+                return Err(format!(
+                    "block at height {} carries a certificate this node cannot resolve ({:?});                      its issuance cannot be replayed",
+                    block_height.0,
+                    fat_pointer.points_at_block_hash(),
+                ))
+            }
+        }
+    };
+
+    let Some(snapshot_height) = block_height_from_hash(&internal_handle.call, snapshot_hash).await
+    else {
+        return Err(format!(
+            "the block finalized by the certificate in block {} is not in this database",
+            block_height.0,
+        ));
+    };
+
+    let sigma = internal_handle.params.bc_confirmation_depth_sigma;
+    let gap = (block_height.0 as u64).saturating_sub(snapshot_height.0 as u64);
+    Ok(gap <= sigma + zcash_primitives::bft::FINALITY_LIVENESS_ALLOWANCE)
 }
 
 // TODO: Result?
@@ -1829,6 +1920,9 @@ async fn total_issuance_from_key(
 
     let mut delegation_bonds = HashMap::new();
     let mut finalizer_rewards: HashMap<[u8; 32], u64> = HashMap::new();
+    // The certificate carried by the previously scanned block, to tell whether the next one
+    // advances it. `None` until the first block of the range, whose parent is outside it.
+    let mut prev_fat_pointer: Option<FatPointerToBftBlock> = None;
     let mut utxos_per_ufvk = vec![HashSet::<(PubKeyID, u32)>::new(); ufvks.len()]; // NOTE: hashsets here are grow-only
     let mut t_spend_per_ufvk = vec![false; ufvks.len()];
 
@@ -1945,8 +2039,6 @@ async fn total_issuance_from_key(
                 ));
             }
 
-            timed(&PROF.replay_ns, || zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds, &mut finalizer_rewards));
-
             if let Some((tx_lrz, txid_lrz)) = &parsed {
                 for (ufvk_i, scan_ctx) in scan_ctxs.iter().enumerate() {
                     let scan_info = &mut scan_infos[ufvk_i];
@@ -1956,6 +2048,28 @@ async fn total_issuance_from_key(
                 }
             }
         }
+
+        // PoS issuance is applied once per block, after that block's staking actions, exactly as
+        // the live commit path does -- and only for blocks that pay under the variable payout
+        // rule. `block_pays_pos_issuance` is the replay of the gate's decision.
+        let fat_pointer = block.header.fat_pointer_to_bft_block.clone();
+        let parent_fat_pointer = match &prev_fat_pointer {
+            Some(fat_pointer) => fat_pointer.clone(),
+            None if height == 0 => FatPointerToBftBlock::null(),
+            None => {
+                // First block of the range: its parent was not scanned, so read its header.
+                match (call.read_state)(StateReadRequest::Block(ZebBlockHeight(height - 1).into())).await {
+                    Ok(StateReadResponse::Block(Some(parent))) => parent.header.fat_pointer_to_bft_block.clone(),
+                    _ => return Err(format!("failed to get block at height {} to read its certificate", height - 1)),
+                }
+            }
+        };
+        if height != 0
+            && block_pays_pos_issuance(&internal_handle, ZebBlockHeight(height), &fat_pointer, &parent_fat_pointer).await?
+        {
+            timed(&PROF.replay_ns, || zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds, &mut finalizer_rewards));
+        }
+        prev_fat_pointer = Some(fat_pointer);
     }
 
     for scan_info in &mut scan_infos {

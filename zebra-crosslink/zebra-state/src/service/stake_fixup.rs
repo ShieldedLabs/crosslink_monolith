@@ -154,6 +154,9 @@ pub fn fixup_aggregated_stakes(
     );
     let mut bonds: HashMap<BondKey, (DelegationBond, BondStatusInChain)> = HashMap::new();
     let mut finalizer_rewards: HashMap<[u8; 32], u64> = HashMap::new();
+    // The previous block's certificate, to decide whether the next block advances it. Genesis
+    // carries none, which is exactly the null pointer every pre-activation block also carries.
+    let mut prev_fat_pointer = zebra_chain::block::FatPointerToBftBlock::null();
     let mut fills: Vec<(Height, block::Hash, AggregatedStakes)> = Vec::new();
     let mut mismatches: u32 = 0;
 
@@ -192,7 +195,20 @@ pub fn fixup_aggregated_stakes(
                 }
             }
 
-            update_bonds_with_pos_issuance(POS_BLOCK_REWARD_ZATS, &mut bonds, &mut finalizer_rewards);
+            // Variable payout: a block mints only if it ADVANCES the certificate. That half of the
+            // rule is visible here, in the block headers. The other half -- that the certificate
+            // is fresh, `gap <= sigma + FINALITY_LIVENESS_ALLOWANCE` -- is NOT: the finalized
+            // height lives inside the BFT block, which this repair tool cannot see (it has the
+            // PoW database and nothing else). So an advancing block is assumed to have paid,
+            // which is right whenever BFT kept up. If it did not, the replay disagrees with the
+            // stored rows and the mismatch check below refuses to write anything: wrong rows are
+            // never produced, the repair just declines. See FINALITY.md.
+            let cert_advanced = block.header.fat_pointer_to_bft_block.points_at_block_hash()
+                != prev_fat_pointer.points_at_block_hash();
+            prev_fat_pointer = block.header.fat_pointer_to_bft_block.clone();
+            if cert_advanced {
+                update_bonds_with_pos_issuance(POS_BLOCK_REWARD_ZATS, &mut bonds, &mut finalizer_rewards);
+            }
 
             // The live path burns after the activation block's own staking
             // actions and rewards (`NonFinalizedState::commit_new_chain`), so
