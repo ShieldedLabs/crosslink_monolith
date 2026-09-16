@@ -483,8 +483,9 @@ impl ZcashCrosslinkParameters {
 ///
 /// <div class="warning">No verification has been done on the security or performance of these parameters.</div>
 pub const PROTOTYPE_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParameters {
-    bc_confirmation_depth_sigma: 3,
-    finalization_gap_bound: 7,
+    bc_confirmation_depth_sigma: 5,
+    // The specification asks for L >= 2 sigma; keep it there as sigma moves.
+    finalization_gap_bound: 10,
     bootstrap: BftBootstrap::FromChain {
         roster_height: crate::transaction::STAKING_PERIOD / 2,
         activation_height: crate::transaction::STAKING_PERIOD / 2 + 200,
