@@ -1457,29 +1457,23 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::BondInfo(bond_key) => {
-                let bond_info = state
-                    .non_finalized_state_receiver
-                    .with_watch_data(|non_finalized_state| {
-                        non_finalized_state
-                            .best_chain()
-                            .map(|chain| chain.delegation_bonds.get(&bond_key).cloned())
-                    })
-                    .flatten();
+                let best_chain = state.latest_best_chain();
+                let bond_info = read::delegation::delegation_bond(&state.db, best_chain.as_deref(), &bond_key);
 
                 let response = bond_info.map(|(bond, status)| {
-                    use crate::service::non_finalized_state::BondStatusInChain;
+                    use crate::service::finalized_state::disk_format::BondStatus;
                     BondInfoResponse {
                         amount: bond.amount,
                         status: match status {
-                            BondStatusInChain::Active => 0,
-                            BondStatusInChain::Unbonding { .. } => 1,
-                            BondStatusInChain::Withdrawn { .. } => 2,
-                            BondStatusInChain::Burned => 3,
+                            BondStatus::Active => 0,
+                            BondStatus::Unbonding { .. } => 1,
+                            BondStatus::Withdrawn { .. } => 2,
+                            BondStatus::Burned => 3,
                         },
                         last_action_height: match status {
-                            BondStatusInChain::Active | BondStatusInChain::Burned => bond.created_at.height.0,
-                            BondStatusInChain::Unbonding { unbonded_at } => unbonded_at.height.0,
-                            BondStatusInChain::Withdrawn { withdrawn_at, .. } => withdrawn_at.height.0,
+                            BondStatus::Active | BondStatus::Burned => bond.created_at.height.0,
+                            BondStatus::Unbonding { unbonded_at } => unbonded_at.height.0,
+                            BondStatus::Withdrawn { withdrawn_at } => withdrawn_at.height.0,
                         },
                     }
                 });
