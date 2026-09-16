@@ -39,6 +39,7 @@ fn construct_empty() {
         Default::default(),
         ValueBalance::zero(),
         std::iter::empty(),
+        std::iter::empty(),
     );
 }
 
@@ -54,6 +55,7 @@ fn construct_single() -> Result<()> {
         NoteCommitmentTrees::default(),
         Default::default(),
         ValueBalance::fake_populated_pool(),
+        std::iter::empty(),
         std::iter::empty(),
     );
 
@@ -88,6 +90,7 @@ fn construct_many() -> Result<()> {
         Default::default(),
         ValueBalance::fake_populated_pool(),
         std::iter::empty(),
+        std::iter::empty(),
     );
 
     for block in blocks {
@@ -114,6 +117,7 @@ fn ord_matches_work() -> Result<()> {
         Default::default(),
         ValueBalance::fake_populated_pool(),
         std::iter::empty(),
+        std::iter::empty(),
     );
     lesser_chain = lesser_chain.push(less_block.prepare().test_with_zero_spent_utxos())?;
 
@@ -123,6 +127,7 @@ fn ord_matches_work() -> Result<()> {
         NoteCommitmentTrees::default(),
         Default::default(),
         ValueBalance::zero(),
+        std::iter::empty(),
         std::iter::empty(),
     );
     bigger_chain = bigger_chain.push(more_block.prepare().test_with_zero_spent_utxos())?;
@@ -719,6 +724,7 @@ fn fork_drops_subtrees_above_fork_point() -> Result<()> {
         Default::default(),
         ValueBalance::fake_populated_pool(),
         Vec::new(),
+        std::iter::empty(),
     );
     chain = chain.push(block1.clone().prepare().test_with_zero_spent_utxos())?;
     chain = chain.push(block2.clone().prepare().test_with_zero_spent_utxos())?;

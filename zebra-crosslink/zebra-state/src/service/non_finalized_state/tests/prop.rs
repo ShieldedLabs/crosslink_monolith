@@ -43,7 +43,7 @@ fn push_genesis_chain() -> Result<()> {
     |((chain, count, network, empty_tree) in PreparedChain::default())| {
         prop_assert!(empty_tree.is_none());
 
-        let mut only_chain = Chain::new(&network, Height(0), Default::default(), empty_tree, ValueBalance::zero(), Vec::new());
+        let mut only_chain = Chain::new(&network, Height(0), Default::default(), empty_tree, ValueBalance::zero(), Vec::new(), Vec::new());
         // contains the block value pool changes and chain value pool balances for each height
         let mut chain_values = BTreeMap::new();
 
@@ -96,7 +96,7 @@ fn push_history_tree_chain() -> Result<()> {
         let count = std::cmp::min(count, chain.len() - 1);
         let chain = &chain[1..];
 
-        let mut only_chain = Chain::new(&network, Height(0), Default::default(), finalized_tree, ValueBalance::zero(), Vec::new());
+        let mut only_chain = Chain::new(&network, Height(0), Default::default(), finalized_tree, ValueBalance::zero(), Vec::new(), Vec::new());
 
         for block in chain
             .iter()
@@ -145,6 +145,7 @@ fn forked_equals_pushed_genesis() -> Result<()> {
             empty_tree.clone(),
             ValueBalance::zero(),
             Vec::new(),
+            Vec::new(),
         );
         for block in chain.iter().take(fork_at_count).skip(1).cloned() {
             let block = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
@@ -164,7 +165,8 @@ fn forked_equals_pushed_genesis() -> Result<()> {
             NoteCommitmentTrees::default(),
             empty_tree,
             ValueBalance::zero(),
-            Vec::new()
+            Vec::new(),
+            Vec::new(),
         );
 
         for block in chain.iter().cloned() {
@@ -246,8 +248,8 @@ fn forked_equals_pushed_history_tree() -> Result<()> {
         // use `fork_at_count` as the fork tip
         let fork_tip_hash = chain[fork_at_count - 1].hash;
 
-        let mut full_chain = Chain::new(&network, Height(0), Default::default(), finalized_tree.clone(), ValueBalance::zero(), Vec::new());
-        let mut partial_chain = Chain::new(&network, Height(0), Default::default(), finalized_tree, ValueBalance::zero(), Vec::new());
+        let mut full_chain = Chain::new(&network, Height(0), Default::default(), finalized_tree.clone(), ValueBalance::zero(), Vec::new(), Vec::new());
+        let mut partial_chain = Chain::new(&network, Height(0), Default::default(), finalized_tree, ValueBalance::zero(), Vec::new(), Vec::new());
 
         for block in chain
             .iter()
@@ -314,7 +316,7 @@ fn finalized_equals_pushed_genesis() -> Result<()> {
 
         let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
 
-        let mut full_chain = Chain::new(&network, Height(0), Default::default(), empty_tree, fake_value_pool, Vec::new());
+        let mut full_chain = Chain::new(&network, Height(0), Default::default(), empty_tree, fake_value_pool, Vec::new(), Vec::new());
         for block in chain
             .clone()
             .take(finalized_count) {
@@ -333,6 +335,7 @@ fn finalized_equals_pushed_genesis() -> Result<()> {
             },
             full_chain.history_block_commitment_tree(),
             full_chain.chain_value_pools,
+            Vec::new(),
             Vec::new(),
         );
         for block in chain
@@ -396,7 +399,7 @@ fn finalized_equals_pushed_history_tree() -> Result<()> {
 
         let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
 
-        let mut full_chain = Chain::new(&network, Height(0), Default::default(), finalized_tree, fake_value_pool, Vec::new());
+        let mut full_chain = Chain::new(&network, Height(0), Default::default(), finalized_tree, fake_value_pool, Vec::new(), Vec::new());
         for block in chain
             .iter()
             .take(finalized_count)
@@ -416,6 +419,7 @@ fn finalized_equals_pushed_history_tree() -> Result<()> {
             },
             full_chain.history_block_commitment_tree(),
             full_chain.chain_value_pools,
+            Vec::new(),
             Vec::new(),
         );
 
@@ -597,8 +601,8 @@ fn different_blocks_different_chains() -> Result<()> {
             Default::default()
         };
 
-        let chain1 = Chain::new(&Network::Mainnet, Height(0), Default::default(), finalized_tree1, ValueBalance::fake_populated_pool(), Vec::new());
-        let chain2 = Chain::new(&Network::Mainnet, Height(0), Default::default(), finalized_tree2, ValueBalance::fake_populated_pool(), Vec::new());
+        let chain1 = Chain::new(&Network::Mainnet, Height(0), Default::default(), finalized_tree1, ValueBalance::fake_populated_pool(), Vec::new(), Vec::new());
+        let chain2 = Chain::new(&Network::Mainnet, Height(0), Default::default(), finalized_tree2, ValueBalance::fake_populated_pool(), Vec::new(), Vec::new());
 
         let block1 = vec1[1].clone().prepare().test_with_zero_spent_utxos();
         let block2 = vec2[1].clone().prepare().test_with_zero_spent_utxos();
