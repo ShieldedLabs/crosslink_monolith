@@ -53,7 +53,8 @@ impl From<Item> for batch::Item {
 }
 
 impl Item {
-    fn verify_single(self) -> VerifyResult {
+    /// Verifies this signature on its own, on the calling thread.
+    pub(crate) fn verify_single(self) -> VerifyResult {
         self.0.verify_single()
     }
 }

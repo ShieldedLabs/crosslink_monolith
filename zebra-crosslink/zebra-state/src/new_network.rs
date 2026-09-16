@@ -1121,8 +1121,7 @@ pub struct BlockVerifyError {
 /// The synchronous verification entry points, injected from zebrad.
 ///
 /// Plain `fn` pointers, not closures: these functions capture nothing, so there is no
-/// allocation and no dynamic dispatch. @Todo: none of these run the per-transaction verifier;
-/// see the `zebra_consensus::sync_verify` module docs for what that leaves unchecked.
+/// allocation and no dynamic dispatch.
 #[derive(Clone, Copy)]
 pub struct VerifyFns {
     /// Header-only: PoW, difficulty, header time. Runs before the body is trusted.

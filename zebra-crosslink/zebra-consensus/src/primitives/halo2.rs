@@ -361,6 +361,34 @@ pub fn orchard_verifying_key_for(network_upgrade: NetworkUpgrade) -> &'static It
     }
 }
 
+/// The Orchard Action circuit an Orchard-pool or Ironwood-pool bundle commits to, which picks the
+/// key it verifies under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrchardCircuit {
+    /// A v5 Orchard bundle, whose circuit is that of the network upgrade of its block.
+    V5(NetworkUpgrade),
+    /// A v6 Orchard or Ironwood bundle, which always uses the NU6.3 circuit.
+    V6,
+}
+
+impl OrchardCircuit {
+    /// The batch verifier service for this circuit.
+    pub fn verifier(self) -> &'static VerifierService {
+        match self {
+            OrchardCircuit::V5(network_upgrade) => orchard_v5_verifier_for(network_upgrade),
+            OrchardCircuit::V6 => orchard_v6_verifier(),
+        }
+    }
+
+    /// The verifying key for this circuit, the one behind [`OrchardCircuit::verifier`].
+    pub fn verifying_key(self) -> &'static ItemVerifyingKey {
+        match self {
+            OrchardCircuit::V5(network_upgrade) => orchard_verifying_key_for(network_upgrade),
+            OrchardCircuit::V6 => &VERIFYING_KEY_NU6_3_ONWARD,
+        }
+    }
+}
+
 /// Returns the global Halo2 verifier for **v6** Orchard-pool and Ironwood-pool bundles.
 ///
 /// v6 Orchard and Ironwood bundles only exist from NU6.3 onward, so they always use the NU6.3

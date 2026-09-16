@@ -17,16 +17,10 @@
 //! - [`block_check_header`] and [`block_check_body`] call straight into [`crate::block::check`],
 //!   in `SemanticBlockVerifier::call`'s order, except that the header time check runs before
 //!   the merkle check: the header is checked before the body exists.
-//! - [`block_verify_expensive`] verifies transparent scripts, sigops and miner fees itself, and
-//!   feeds Sapling and Orchard bundles to the same `sapling_crypto` / `orchard` batch
-//!   validators that the `Batch` services feed, flushed once per block with no timer, no
-//!   channel, and no executor.
-//!
-//! @Todo: this is not equivalent to `SemanticBlockVerifier`, which also sends every
-//! transaction through [`crate::transaction::BlockTxVerifier`]. Nothing here does, so blocks
-//! verified by these functions skip that verifier's per-transaction rules (among them the
-//! consensus branch ID, expiry height, lock time, spend conflicts and the staking rules), the
-//! Ironwood bundle's proofs and signatures, and Sprout JoinSplit proofs.
+//! - [`block_verify_expensive`] runs, for each transaction, the same functions
+//!   [`crate::transaction::BlockTxVerifier`] runs, and feeds the Sapling, Orchard and Ironwood
+//!   bundles to the same `sapling_crypto` / `orchard` batch validators that the `Batch` services
+//!   feed, flushed once per block with no timer, no channel, and no executor.
 //!
 //! Within-block batching keeps nearly all of the algorithmic win (a batch verification is
 //! a single multi-scalar multiplication rather than N independent ones, so per-item cost
@@ -51,17 +45,14 @@ use zebra_chain::{
     amount::{Amount, NonNegative},
     block::{self, Block, Height},
     parameters::{Network, NetworkUpgrade},
-    transaction::{self, HashType, Transaction},
     transparent,
-    work::equihash,
 };
-use zebra_script::{CachedFfiTransaction, Sigops};
+use zebra_script::CachedFfiTransaction;
 
 use crate::{
     block::{check, VerifyBlockError, MAX_BLOCK_SIGOPS},
-    error::BlockError,
-    primitives::halo2::orchard_verifying_key_for,
-    primitives::sapling::SAPLING,
+    error::{BlockError, TransactionError},
+    primitives::{halo2, sapling::SAPLING},
     transaction as tx,
 };
 
@@ -208,13 +199,14 @@ pub fn block_check_cheap(
     block_check_body(block, network, alleged_height)
 }
 
-/// The expensive per-block verification: transparent scripts, sigops, fees, and the Sapling and
-/// Orchard proofs and signatures batched once per proof system.
+/// The expensive per-block verification: each transaction's version, network upgrade and staking
+/// rules, transparent scripts, sigops and fees, and its proofs and signatures, with the Sapling and
+/// the Orchard-circuit proofs batched once per verifying key.
 ///
-/// Walks the block a single time. Per transaction it runs the synchronous work directly —
-/// script verification, sigop counting, fee accounting — and *collects* the shielded bundles
-/// without verifying them. Only after the walk are the Sapling and Orchard batches flushed,
-/// once each, for the whole block.
+/// Walks the block a single time. Per transaction it runs the checks
+/// [`tx::BlockTxVerifier`] runs, through the same functions, and verifies scripts and Sprout
+/// JoinSplits directly; it *collects* the Sapling, Orchard and Ironwood bundles without verifying
+/// them. Only after the walk are the batches flushed, once each, for the whole block.
 ///
 /// That is the same work Zebra's `Batch` services do, with the accumulation boundary moved
 /// from "64 items or 100ms, across all concurrent callers" to "this block". A caller
@@ -244,6 +236,8 @@ pub fn block_verify_expensive(
     cheap: &CheapBlockChecks,
     lookup_utxo: &dyn Fn(&transparent::OutPoint) -> Option<transparent::Utxo>,
 ) -> Result<HashMap<transparent::OutPoint, transparent::OrderedUtxo>, BlockVerifyError> {
+    let transaction_error = |err: TransactionError| BlockVerifyError::from(VerifyBlockError::Transaction(err));
+
     let nu = NetworkUpgrade::current(network, cheap.height);
 
     // Outputs created by earlier transactions in this same block. Spends of these can never be
@@ -251,12 +245,14 @@ pub fn block_verify_expensive(
     let known_utxos = transparent::new_ordered_outputs(block, &cheap.transaction_hashes);
 
     let mut sapling_bundles = Vec::new();
-    let mut orchard_bundles = Vec::new();
+    let mut orchard_batches: Vec<(&'static halo2::ItemVerifyingKey, orchard::bundle::BatchValidator)> = Vec::new();
 
     let mut block_sigops: u32 = 0;
     let mut block_miner_fees = Amount::<NonNegative>::zero();
 
     for tx in block.transactions.iter() {
+        tx::check_block_transaction(tx, cheap.height, block.header.time, network).map_err(transaction_error)?;
+
         // Resolve the outputs this transaction spends. Coinbase inputs have a null prevout and
         // spend nothing, so they contribute no entries.
         let mut spent_utxos = HashMap::new();
@@ -282,57 +278,51 @@ pub fn block_verify_expensive(
 
         // The sighash for v5+ binds the spent outputs (ZIP-244), so this has to be built even
         // for a shielded-only transaction.
-        let cached = CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu)
-            .map_err(|_| BlockVerifyError {
-                msg: format!("transaction is not supported by network upgrade {nu:?}"),
-                misbehavior_score: 100,
-            })?;
+        let cached = Arc::new(
+            CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu)
+                .map_err(|_| transaction_error(TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu)))?,
+        );
 
-        // Transparent scripts. `script::Verifier`'s tower wrapper does nothing but call this;
-        // the work was always synchronous.
-        if !tx.is_coinbase() {
-            for input_index in 0..tx.inputs().len() {
-                cached.is_valid(input_index).map_err(|err| BlockVerifyError {
-                    msg: format!("script verification failed for input {input_index}: {err}"),
-                    misbehavior_score: 100,
-                })?;
-            }
-        }
+        let (miner_fee, sigops) =
+            tx::block_transaction_fee_and_sigops(tx, &spent_utxos, &cached).map_err(transaction_error)?;
 
-        block_sigops = block_sigops
-            .checked_add(tx.sigops().map_err(|err| BlockVerifyError {
-                msg: format!("could not count sigops: {err}"),
-                misbehavior_score: 100,
-            })?)
-            .ok_or_else(|| BlockVerifyError {
-                msg: "sigop count overflowed".to_string(),
-                misbehavior_score: 100,
-            })?;
+        // Saturating: a sum that would overflow already exceeds MAX_BLOCK_SIGOPS.
+        block_sigops = block_sigops.saturating_add(sigops);
 
         // Coinbase transactions consume the miner fee, so they add nothing to the block total.
-        if !tx.is_coinbase() {
-            let value_balance = tx.value_balance(&spent_utxos).map_err(|_| BlockVerifyError {
-                msg: "incorrect fee: could not compute the transaction value balance".to_string(),
-                misbehavior_score: 100,
-            })?;
-            let miner_fee = value_balance.remaining_transaction_value().map_err(|_| BlockVerifyError {
-                msg: "incorrect fee: negative remaining transaction value".to_string(),
-                misbehavior_score: 100,
-            })?;
-            block_miner_fees = (block_miner_fees + miner_fee).map_err(|err| BlockVerifyError {
-                msg: format!("summing miner fees overflowed: {err}"),
-                misbehavior_score: 100,
+        if let Some(miner_fee) = miner_fee {
+            block_miner_fees = (block_miner_fees + miner_fee).map_err(|source| {
+                VerifyBlockError::from(BlockError::SummingMinerFees {
+                    height: cheap.height,
+                    hash: cheap.hash,
+                    source,
+                })
             })?;
         }
 
-        let sighasher = cached.sighasher();
-        let sighash = sighasher.sighash(HashType::ALL, None);
+        let items = tx::transaction_crypto_items(tx, nu, cached).map_err(transaction_error)?;
 
-        if let Some(bundle) = sighasher.sapling_bundle() {
-            sapling_bundles.push((bundle, sighash));
+        items.verify_unbatched().map_err(transaction_error)?;
+
+        if let Some(bundle) = items.sapling_bundle {
+            sapling_bundles.push((bundle, items.sighash));
         }
-        if let Some(bundle) = sighasher.orchard_bundle() {
-            orchard_bundles.push((bundle, sighash));
+
+        for (bundle, circuit) in items.orchard_bundles {
+            let key = circuit.verifying_key();
+            let batch = match orchard_batches.iter().position(|(batch_key, _)| std::ptr::eq(*batch_key, key)) {
+                Some(index) => &mut orchard_batches[index].1,
+                None => {
+                    orchard_batches.push((key, orchard::bundle::BatchValidator::new(key)));
+                    &mut orchard_batches.last_mut().expect("just pushed").1
+                }
+            };
+
+            // `add_bundle` rejects a bundle whose cross-address restriction is not supported by
+            // this circuit's verifying key. Ignoring that would accept an invalid bundle.
+            batch
+                .add_bundle(&bundle, items.sighash.0)
+                .map_err(|_| transaction_error(TransactionError::Halo2VerificationFailed))?;
         }
     }
 
@@ -356,43 +346,26 @@ pub fn block_verify_expensive(
     )
     .map_err(VerifyBlockError::from)?;
 
-    // One flush per proof system for the whole block. No timer, no channel, no executor.
+    // One flush per verifying key for the whole block. No timer, no channel, no executor.
     if !sapling_bundles.is_empty() {
         let mut validator = sapling_crypto::BatchValidator::new();
 
         for (bundle, sighash) in sapling_bundles {
             // check_bundle does the structural/queueing half and can reject immediately.
             if !validator.check_bundle(bundle, sighash.into()) {
-                return Err(BlockVerifyError { msg: "invalid Sapling bundle in block".to_string(), misbehavior_score: 100 });
+                return Err(transaction_error(TransactionError::SaplingVerificationFailed));
             }
         }
 
         let (spend_vk, output_vk) = SAPLING.verifying_keys();
         if !validator.validate(&spend_vk, &output_vk, thread_rng()) {
-            return Err(BlockVerifyError { msg: "invalid Sapling bundle in block".to_string(), misbehavior_score: 100 });
+            return Err(transaction_error(TransactionError::SaplingVerificationFailed));
         }
     }
 
-    if !orchard_bundles.is_empty() {
-        // orchard 0.15 moved the verifying key from `validate()` into `new()`, so the era's key is
-        // fixed when the batch is created. Resolve it from this block's upgrade rather than
-        // assuming NU6.3: a Crosslink testnet at NU6 carries Orchard proofs built under the
-        // pre-NU6.2 circuit, which do not verify under the NU6.3 key.
-        let mut validator = orchard::bundle::BatchValidator::new(orchard_verifying_key_for(nu));
-
-        for (bundle, sighash) in orchard_bundles {
-            // `add_bundle` rejects a bundle whose cross-address restriction is not supported by
-            // this era's verifying key. Ignoring that would accept an invalid bundle.
-            if validator.add_bundle(&bundle, sighash.0).is_err() {
-                return Err(BlockVerifyError {
-                    msg: "Orchard bundle is invalid for this consensus era".to_string(),
-                    misbehavior_score: 100,
-                });
-            }
-        }
-
+    for (_key, validator) in orchard_batches {
         if !validator.validate(thread_rng()) {
-            return Err(BlockVerifyError { msg: "invalid Orchard bundle in block".to_string(), misbehavior_score: 100 });
+            return Err(transaction_error(TransactionError::Halo2VerificationFailed));
         }
     }
 

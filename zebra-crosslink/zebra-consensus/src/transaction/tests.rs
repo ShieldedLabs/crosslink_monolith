@@ -2810,6 +2810,57 @@ async fn v4_with_joinsplit_is_rejected_for_modification(
     assert_eq!(result, expected_error);
 }
 
+/// The synchronous block path verifies Sprout JoinSplits itself, and must accept and reject them
+/// as [`BlockTxVerifier`] does.
+#[test]
+fn v4_sprout_joinsplits_verify_on_the_calling_thread() {
+    let _init_guard = zebra_test::init();
+    let network = Network::Mainnet;
+
+    let verify = |height: block::Height, transaction: Arc<Transaction>| {
+        let nu = NetworkUpgrade::current(&network, height);
+        let cached = zebra_script::CachedFfiTransaction::new(transaction.clone(), Arc::new(Vec::new()), nu)
+            .expect("the network upgrade supports the transaction");
+        super::transaction_crypto_items(&transaction, nu, Arc::new(cached))?.verify_unbatched()
+    };
+
+    let (height, transaction) = test_transactions(&network)
+        .rev()
+        .filter(|(_, tx)| {
+            !tx.is_coinbase() && tx.inputs().is_empty() && !tx.has_sapling_shielded_data()
+        })
+        .find(|(_, tx)| tx.sprout_groth16_joinsplits().next().is_some())
+        .expect("There should be a tx with Groth16 JoinSplits.");
+
+    assert_eq!(verify(height, transaction.clone()), Ok(()));
+
+    for (modification, expected_error) in [
+        (
+            JoinSplitModification::CorruptSignature,
+            TransactionError::Ed25519(ed25519::Error::InvalidSignature),
+        ),
+        (
+            JoinSplitModification::CorruptProof,
+            TransactionError::Groth16("proof verification failed".to_string()),
+        ),
+        (
+            JoinSplitModification::ZeroProof,
+            TransactionError::MalformedGroth16("invalid G1".to_string()),
+        ),
+    ] {
+        let mut modified = Transaction::clone(&transaction);
+        match &mut modified {
+            Transaction::V4 {
+                joinsplit_data: Some(joinsplit_data),
+                ..
+            } => modify_joinsplit_data(joinsplit_data, modification),
+            _ => unreachable!("Transaction should have some JoinSplit shielded data."),
+        }
+
+        assert_eq!(verify(height, Arc::new(modified)), Err(expected_error));
+    }
+}
+
 /// Test if a V4 transaction with Sapling spends is accepted by the verifier.
 #[test]
 fn v4_with_sapling_spends() {

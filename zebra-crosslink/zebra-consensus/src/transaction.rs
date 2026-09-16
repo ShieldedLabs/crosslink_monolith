@@ -30,7 +30,6 @@ use zebra_chain::{
     amount::{Amount, NonNegative},
     block,
     parameters::{Network, NetworkUpgrade},
-    primitives::Groth16Proof,
     serialization::DateTime32,
     transaction::{
         self, HashType, SigHash, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx,
@@ -306,18 +305,6 @@ where
         async move {
             tracing::trace!(?tx_id, ?req, "got tx verify request");
 
-            // @Todo: In @Prod we don't want to do these checks before the cached verification result.
-            //        But because staking day rules don't currently walk the mempool and evict expired staking actions,
-            //        staking day violates the invariants of the mempool. Once we walk the mempool, we can move these
-            //        checks back to after the cache check.
-
-            // Check staking day window (staking actions only allowed during specific block ranges)
-            check_staking_day_window(&tx, req.height)?;
-
-            // The target finalizer address must be a valid capability (its embedded
-            // signature verifies); the state contextual check enforces the same rule on blocks.
-            check_staking_target_capability(&tx)?;
-
             // NOTE: Crosslink short-circuited here on a transaction already verified in the
             // mempool. Upstream split the verifier into BlockTxVerifier and MempoolTxVerifier,
             // and the block path no longer holds a mempool handle, so the cache lookup is gone.
@@ -325,29 +312,9 @@ where
             // block-verification throughput.
 
             // Do quick checks first
-            check_structure_and_network_rules(tx.as_ref(), height, &network)?;
-
-            if tx.is_coinbase() {
-                check::coinbase_tx_no_prevout_joinsplit_spend(&tx)?;
-            } else if !tx.is_valid_non_coinbase() {
-                return Err(TransactionError::NonCoinbaseHasCoinbaseInput);
-            }
-
-            // Validate `nExpiryHeight` consensus rules
-            if tx.is_coinbase() {
-                check::coinbase_expiry_height(&height, &tx, &network)?;
-            } else {
-                check::non_coinbase_expiry_height(&height, &tx)?;
-            }
-
-            // Transaction invariants that apply regardless of request type or transaction version.
-            // These are pure consensus rules over the transaction structure and must always hold.
-            check_transaction_invariants(tx.as_ref(), height, &network)?;
+            check_block_transaction(tx.as_ref(), height, time, &network)?;
 
             tracing::trace!(?tx_id, "passed quick checks");
-
-            // Block transactions are checked against the block's own time directly.
-            check::lock_time_has_passed(&tx, height, time)?;
 
             // "The consensus rules applied to valueBalance, vShieldedOutput, and bindingSig
             // in non-coinbase transactions MUST also be applied to coinbase transactions."
@@ -369,13 +336,8 @@ where
 
             tracing::trace!(?tx_id, "got state UTXOs");
 
-            // Select version-specific async verification pipeline
-            let async_checks = dispatch_version_verification(
-                tx.as_ref(),
-                nu,
-                script_verifier,
-                cached_ffi_transaction.clone()
-            )?;
+            let async_checks = transaction_crypto_items(tx.as_ref(), nu, cached_ffi_transaction.clone())?
+                .into_async_checks(script_verifier);
 
             tracing::trace!(?tx_id, "awaiting async checks...");
 
@@ -383,23 +345,13 @@ where
 
             tracing::trace!(?tx_id, "finished async checks");
 
-            let miner_fee = if tx.is_coinbase() {
-                None
-            } else {
-                Some(miner_fee(tx.as_ref(), &spent_utxos)?)
-            };
-            let sigops = tx.sigops().map_err(zebra_script::Error::from)?;
+            let (miner_fee, sigops) =
+                block_transaction_fee_and_sigops(tx.as_ref(), &spent_utxos, &cached_ffi_transaction)?;
 
             Ok(BlockResponse {
                 tx_id,
                 miner_fee,
-                // In block validation, the consensus sigop total must include P2SH
-                // redeem-script sigops, matching zcashd's `ConnectBlock` which sums
-                // `GetLegacySigOpCount` and `GetP2SHSigOpCount` per transaction before
-                // comparing against `MAX_BLOCK_SIGOPS`. Coinbase inputs contribute zero P2SH
-                // sigops. See
-                // <https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-jv4h-j224-23cc>.
-                sigops: sigops.saturating_add(cached_ffi_transaction.p2sh_sigops()),
+                sigops,
             })
         }
             .inspect(move |result| {
@@ -581,13 +533,8 @@ where
 
             tracing::trace!(?tx_id, "got state UTXOs");
 
-            // Select version-specific async verification pipeline
-            let mut async_checks = dispatch_version_verification(
-                tx.as_ref(),
-                nu,
-                script_verifier,
-                cached_ffi_transaction.clone()
-            )?;
+            let mut async_checks = transaction_crypto_items(tx.as_ref(), nu, cached_ffi_transaction.clone())?
+                .into_async_checks(script_verifier);
 
             let check_anchors_and_revealed_nullifiers_query = state
                 .clone()
@@ -991,6 +938,46 @@ fn check_staking_day_window(
     Ok(())
 }
 
+/// Checks the rules a block applies to each of its transactions that need neither the chain state
+/// nor the outputs the transaction spends. `height` and `time` are those of the block.
+pub fn check_block_transaction(
+    tx: &Transaction,
+    height: block::Height,
+    time: DateTime<Utc>,
+    network: &Network,
+) -> Result<(), TransactionError> {
+    // Staking actions are only allowed during specific block ranges.
+    check_staking_day_window(tx, height)?;
+
+    // The target finalizer address must be a valid capability (its embedded
+    // signature verifies); the state contextual check enforces the same rule on blocks.
+    check_staking_target_capability(tx)?;
+
+    check_structure_and_network_rules(tx, height, network)?;
+
+    if tx.is_coinbase() {
+        check::coinbase_tx_no_prevout_joinsplit_spend(tx)?;
+    } else if !tx.is_valid_non_coinbase() {
+        return Err(TransactionError::NonCoinbaseHasCoinbaseInput);
+    }
+
+    // Validate `nExpiryHeight` consensus rules
+    if tx.is_coinbase() {
+        check::coinbase_expiry_height(&height, tx, network)?;
+    } else {
+        check::non_coinbase_expiry_height(&height, tx)?;
+    }
+
+    // Transaction invariants that apply regardless of request type or transaction version.
+    // These are pure consensus rules over the transaction structure and must always hold.
+    check_transaction_invariants(tx, height, network)?;
+
+    // Block transactions are checked against the block's own time directly.
+    check::lock_time_has_passed(tx, height, time)?;
+
+    Ok(())
+}
+
 /// Performs basic structural validation and Orchard-related network upgrade rules.
 fn check_structure_and_network_rules(
     tx: &Transaction,
@@ -1117,376 +1104,69 @@ fn check_maturity_height(
     )
 }
 
-/// Dispatches version-specific async verification checks for `tx`.
-///
-/// `nu` is the network upgrade active at the transaction's verification height,
-/// pre-computed by the caller using [`NetworkUpgrade::current`].
+/// The transparent scripts, proofs and signatures of a transaction, gathered once the outputs it
+/// spends are known. [`BlockTxVerifier`] and [`MempoolTxVerifier`] queue them on the shared batch
+/// verifier services; [`crate::sync_verify`] batches them per block on the calling thread.
+pub struct TransactionCryptoItems {
+    /// The transaction and the outputs it spends, which the scripts are verified against.
+    pub cached_ffi_transaction: Arc<CachedFfiTransaction>,
+    /// The number of inputs whose scripts need verifying: all of them, except for a coinbase
+    /// transaction, which spends no outputs.
+    pub script_input_count: usize,
+    /// The sighash that the shielded bundles and the Sprout JoinSplit signature sign.
+    pub sighash: SigHash,
+    /// The Sapling bundle.
+    pub sapling_bundle: Option<sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>>,
+    /// The Orchard-pool and Ironwood-pool bundles, each with the circuit it commits to.
+    pub orchard_bundles: Vec<(
+        ::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>,
+        primitives::halo2::OrchardCircuit,
+    )>,
+    /// The Groth16 proof of each Sprout JoinSplit.
+    pub sprout_proofs: Vec<primitives::groth16::Item>,
+    /// The signature over all of the Sprout JoinSplits.
+    pub sprout_signature: Option<primitives::ed25519::Item>,
+}
+
+/// Checks that the version of `tx` is valid at network upgrade `nu`, checks its staking action
+/// signature, and gathers the scripts, proofs and signatures it still needs verified.
 ///
 /// Returns [`TransactionError::WrongVersion`] for V1-V3 transactions, which
 /// are not supported by any network upgrade Zebra verifies.
-fn dispatch_version_verification(
+pub fn transaction_crypto_items(
     tx: &Transaction,
     nu: NetworkUpgrade,
-    script_verifier: script::Verifier,
     cached_ffi_transaction: Arc<CachedFfiTransaction>,
-) -> Result<AsyncChecks, TransactionError> {
-    match tx {
+) -> Result<TransactionCryptoItems, TransactionError> {
+    use primitives::halo2::OrchardCircuit;
+
+    let (joinsplit_data, orchard_circuit) = match tx {
         Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
             tracing::debug!(?tx, "got transaction with wrong version");
-            Err(TransactionError::WrongVersion)
+            return Err(TransactionError::WrongVersion);
         }
-        Transaction::V4 { joinsplit_data, .. } => verify_v4_transaction(
-            tx,
-            nu,
-            script_verifier,
-            cached_ffi_transaction,
-            joinsplit_data,
-        ),
+        Transaction::V4 { joinsplit_data, .. } => {
+            verify_v4_transaction_network_upgrade(tx, nu)?;
+            (joinsplit_data.as_ref(), OrchardCircuit::V5(nu))
+        }
         Transaction::V5 { .. } => {
-            verify_v5_transaction(tx, nu, script_verifier, cached_ffi_transaction)
+            verify_v5_transaction_network_upgrade(tx, nu)?;
+            (None, OrchardCircuit::V5(nu))
+        }
+        Transaction::V6 { .. } => {
+            verify_v6_transaction_network_upgrade(tx, nu)?;
+            (None, OrchardCircuit::V6)
         }
         // Crosslink carries the v6 body, so it takes the v6 verification path.
-        Transaction::V6 { .. } => {
-            verify_v6_transaction(tx, nu, script_verifier, cached_ffi_transaction)
-        }
         Transaction::VCrosslink { .. } => {
             check::staking_action_signature(tx, cached_ffi_transaction.sighasher())?;
-            verify_v6_transaction(tx, nu, script_verifier, cached_ffi_transaction)
+            verify_v6_transaction_network_upgrade(tx, nu)?;
+            (None, OrchardCircuit::V6)
         }
-    }
-}
+    };
 
-/// Verify a V4 transaction.
-///
-/// Returns a set of asynchronous checks that must all succeed for the transaction to be
-/// considered valid. These checks include:
-///
-/// - transparent transfers
-/// - sprout shielded data
-/// - sapling shielded data
-///
-/// The parameters of this method are:
-///
-/// - the `tx` transaction to verify
-/// - the `nu` network upgrade active at the transaction's verification height
-/// - the `script_verifier` to use for verifying the transparent transfers
-/// - the prepared `cached_ffi_transaction` used by the script verifier
-/// - the Sprout `joinsplit_data` shielded data in the transaction
-#[allow(clippy::unwrap_in_result)]
-fn verify_v4_transaction(
-    tx: &Transaction,
-    nu: NetworkUpgrade,
-    script_verifier: script::Verifier,
-    cached_ffi_transaction: Arc<CachedFfiTransaction>,
-    joinsplit_data: &Option<transaction::JoinSplitData<Groth16Proof>>,
-) -> Result<AsyncChecks, TransactionError> {
-    verify_v4_transaction_network_upgrade(tx, nu)?;
-
-    let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
-
-    let sighash = cached_ffi_transaction
-        .sighasher()
-        .sighash(HashType::ALL, None);
-
-    Ok(
-        verify_transparent_inputs_and_outputs(tx, script_verifier, cached_ffi_transaction)?
-            .and(verify_sprout_shielded_data(joinsplit_data, &sighash)?)
-            .and(verify_sapling_bundle(sapling_bundle, &sighash)),
-    )
-}
-
-/// Verifies if a V4 `transaction` is supported by `network_upgrade`.
-fn verify_v4_transaction_network_upgrade(
-    transaction: &Transaction,
-    network_upgrade: NetworkUpgrade,
-) -> Result<(), TransactionError> {
-    match network_upgrade {
-        // Supports V4 transactions
-        //
-        // # Consensus
-        //
-        // > [Sapling to Canopy inclusive, pre-NU5] The transaction version number MUST be 4,
-        // > and the version group ID MUST be 0x892F2085.
-        //
-        // > [NU5 onward] The transaction version number MUST be 4 or 5.
-        // > If the transaction version number is 4 then the version group ID MUST be 0x892F2085.
-        // > If the transaction version number is 5 then the version group ID MUST be 0x26A7270A.
-        //
-        // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
-        //
-        // Note: Here we verify the transaction version number of the above two rules, the group
-        // id is checked in zebra-chain crate, in the transaction serialize.
-        NetworkUpgrade::Sapling
-        | NetworkUpgrade::Blossom
-        | NetworkUpgrade::Heartwood
-        | NetworkUpgrade::Canopy
-        | NetworkUpgrade::Nu5
-        | NetworkUpgrade::Nu6
-        | NetworkUpgrade::Nu6_1
-        | NetworkUpgrade::Nu6_2
-        | NetworkUpgrade::Nu6_3 => Ok(()),
-
-        #[cfg(zcash_unstable = "zfuture")]
-        NetworkUpgrade::ZFuture => Ok(()),
-
-        // Does not support V4 transactions
-        NetworkUpgrade::Genesis
-        | NetworkUpgrade::BeforeOverwinter
-        | NetworkUpgrade::Overwinter
-        | NetworkUpgrade::Nu7 => Err(TransactionError::UnsupportedByNetworkUpgrade(
-            transaction.version(),
-            network_upgrade,
-        )),
-    }
-}
-
-/// Verify a V5 transaction.
-///
-/// Returns a set of asynchronous checks that must all succeed for the transaction to be
-/// considered valid. These checks include:
-///
-/// - transaction support by the selected network upgrade, as checked by
-///   [`verify_v5_transaction_network_upgrade`]
-/// - transparent transfers
-/// - sapling shielded data (TODO)
-/// - orchard shielded data (TODO)
-///
-/// The parameters of this method are:
-///
-/// - the `tx` transaction to verify
-/// - the `nu` network upgrade active at the transaction's verification height
-/// - the `script_verifier` to use for verifying the transparent transfers
-/// - the prepared `cached_ffi_transaction` used by the script verifier
-#[allow(clippy::unwrap_in_result)]
-fn verify_v5_transaction(
-    tx: &Transaction,
-    nu: NetworkUpgrade,
-    script_verifier: script::Verifier,
-    cached_ffi_transaction: Arc<CachedFfiTransaction>,
-) -> Result<AsyncChecks, TransactionError> {
-    verify_v5_transaction_network_upgrade(tx, nu)?;
-
-    let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
-    let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
-
-    let sighash = cached_ffi_transaction
-        .sighasher()
-        .sighash(HashType::ALL, None);
-
-    Ok(
-        verify_transparent_inputs_and_outputs(tx, script_verifier, cached_ffi_transaction)?
-            .and(verify_sapling_bundle(sapling_bundle, &sighash))
-            .and(verify_orchard_bundle(orchard_bundle, &sighash, nu)),
-    )
-}
-
-/// Verifies if a V5 `transaction` is supported by `network_upgrade`.
-fn verify_v5_transaction_network_upgrade(
-    transaction: &Transaction,
-    network_upgrade: NetworkUpgrade,
-) -> Result<(), TransactionError> {
-    match network_upgrade {
-        // Supports V5 transactions
-        //
-        // # Consensus
-        //
-        // > [NU5 onward] The transaction version number MUST be 4 or 5.
-        // > If the transaction version number is 4 then the version group ID MUST be 0x892F2085.
-        // > If the transaction version number is 5 then the version group ID MUST be 0x26A7270A.
-        //
-        // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
-        //
-        // Note: Here we verify the transaction version number of the above rule, the group
-        // id is checked in zebra-chain crate, in the transaction serialize.
-        NetworkUpgrade::Nu5
-        | NetworkUpgrade::Nu6
-        | NetworkUpgrade::Nu6_1
-        | NetworkUpgrade::Nu6_2
-        | NetworkUpgrade::Nu6_3
-        | NetworkUpgrade::Nu7 => Ok(()),
-
-        #[cfg(zcash_unstable = "zfuture")]
-        NetworkUpgrade::ZFuture => Ok(()),
-
-        // Does not support V5 transactions
-        NetworkUpgrade::Genesis
-        | NetworkUpgrade::BeforeOverwinter
-        | NetworkUpgrade::Overwinter
-        | NetworkUpgrade::Sapling
-        | NetworkUpgrade::Blossom
-        | NetworkUpgrade::Heartwood
-        | NetworkUpgrade::Canopy => Err(TransactionError::UnsupportedByNetworkUpgrade(
-            transaction.version(),
-            network_upgrade,
-        )),
-    }
-}
-
-/// Verifies a V6 (NU6.3 / Ironwood) transaction's shielded data.
-///
-/// Differs from [`verify_v5_transaction`] in the Orchard verifier: a v6 Orchard bundle
-/// commits to the NU6.3 cross-address circuit, so it (and the Ironwood bundle) verify under the
-/// NU6.3 key, not the v5 fixed key.
-fn verify_v6_transaction(
-    tx: &Transaction,
-    nu: NetworkUpgrade,
-    script_verifier: script::Verifier,
-    cached_ffi_transaction: Arc<CachedFfiTransaction>,
-) -> Result<AsyncChecks, TransactionError> {
-    verify_v6_transaction_network_upgrade(tx, nu)?;
-
-    let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
-    let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
-    let ironwood_bundle = cached_ffi_transaction.sighasher().ironwood_bundle();
-
-    let sighash = cached_ffi_transaction
-        .sighasher()
-        .sighash(HashType::ALL, None);
-
-    // The Ironwood bundle reuses the Orchard Action proof system and the NU6.3 circuit key, so
-    // it is verified the same way as the v6 Orchard bundle (against the NU6.3 key).
-    Ok(
-        verify_transparent_inputs_and_outputs(tx, script_verifier, cached_ffi_transaction)?
-            .and(verify_sapling_bundle(sapling_bundle, &sighash))
-            .and(verify_orchard_v6_bundle(orchard_bundle, &sighash))
-            .and(verify_orchard_v6_bundle(ironwood_bundle, &sighash)),
-    )
-}
-
-/// Verifies that a V6 `transaction` is supported by `network_upgrade`.
-///
-/// V6 transactions are only valid from NU6.3 onward.
-fn verify_v6_transaction_network_upgrade(
-    transaction: &Transaction,
-    network_upgrade: NetworkUpgrade,
-) -> Result<(), TransactionError> {
-    match network_upgrade {
-        NetworkUpgrade::Nu6_3 | NetworkUpgrade::Nu7 => Ok(()),
-
-        #[cfg(zcash_unstable = "zfuture")]
-        NetworkUpgrade::ZFuture => Ok(()),
-
-        // V6 transactions are not valid before NU6.3.
-        NetworkUpgrade::Genesis
-        | NetworkUpgrade::BeforeOverwinter
-        | NetworkUpgrade::Overwinter
-        | NetworkUpgrade::Sapling
-        | NetworkUpgrade::Blossom
-        | NetworkUpgrade::Heartwood
-        | NetworkUpgrade::Canopy
-        | NetworkUpgrade::Nu5
-        | NetworkUpgrade::Nu6
-        | NetworkUpgrade::Nu6_1
-        | NetworkUpgrade::Nu6_2 => Err(TransactionError::UnsupportedByNetworkUpgrade(
-            transaction.version(),
-            network_upgrade,
-        )),
-    }
-}
-
-/// Verifies if a transaction's transparent inputs are valid using the provided
-/// `script_verifier` and `cached_ffi_transaction`.
-///
-/// Returns the asynchronous script verification checks for transparent inputs in `tx`.
-fn verify_transparent_inputs_and_outputs(
-    tx: &Transaction,
-    script_verifier: script::Verifier,
-    cached_ffi_transaction: Arc<CachedFfiTransaction>,
-) -> Result<AsyncChecks, TransactionError> {
-    if tx.is_coinbase() {
-        // The script verifier only verifies PrevOut inputs and their corresponding UTXOs.
-        // Coinbase transactions don't have any PrevOut inputs.
-        Ok(AsyncChecks::new())
-    } else {
-        // feed all of the inputs to the script verifier
-        let inputs = tx.inputs();
-
-        let script_checks = (0..inputs.len())
-            .map(move |input_index| {
-                let request = script::Request {
-                    cached_ffi_transaction: cached_ffi_transaction.clone(),
-                    input_index,
-                };
-
-                script_verifier.oneshot(request)
-            })
-            .collect();
-
-        Ok(script_checks)
-    }
-}
-
-/// Verifies a transaction's Sprout shielded join split data.
-fn verify_sprout_shielded_data(
-    joinsplit_data: &Option<transaction::JoinSplitData<Groth16Proof>>,
-    shielded_sighash: &SigHash,
-) -> Result<AsyncChecks, TransactionError> {
-    let mut checks = AsyncChecks::new();
-
-    if let Some(joinsplit_data) = joinsplit_data {
-        for joinsplit in joinsplit_data.joinsplits() {
-            // # Consensus
-            //
-            // > The proof π_ZKJoinSplit MUST be valid given a
-            // > primary input formed from the relevant other fields and h_{Sig}
-            //
-            // https://zips.z.cash/protocol/protocol.pdf#joinsplitdesc
-            //
-            // Queue the verification of the Groth16 spend proof
-            // for each JoinSplit description while adding the
-            // resulting future to our collection of async
-            // checks that (at a minimum) must pass for the
-            // transaction to verify.
-            checks.push(primitives::groth16::JOINSPLIT_VERIFIER.oneshot(
-                primitives::groth16::Item::from_joinsplit(joinsplit, &joinsplit_data.pub_key)?,
-            ));
-        }
-
-        // # Consensus
-        //
-        // > If effectiveVersion ≥ 2 and nJoinSplit > 0, then:
-        // > - joinSplitPubKey MUST be a valid encoding of an Ed25519 validating key
-        // > - joinSplitSig MUST represent a valid signature under
-        //     joinSplitPubKey of dataToBeSigned, as defined in § 4.11
-        //
-        // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
-        //
-        // The `if` part is indirectly enforced, since the `joinsplit_data`
-        // is only parsed if those conditions apply in
-        // [`Transaction::zcash_deserialize`].
-        //
-        // The valid encoding is defined in
-        //
-        // > A valid Ed25519 validating key is defined as a sequence of 32
-        // > bytes encoding a point on the Ed25519 curve
-        //
-        // https://zips.z.cash/protocol/protocol.pdf#concreteed25519
-        //
-        // which is enforced during signature verification, in both batched
-        // and single verification, when decompressing the encoded point.
-        //
-        // Queue the validation of the JoinSplit signature while
-        // adding the resulting future to our collection of
-        // async checks that (at a minimum) must pass for the
-        // transaction to verify.
-        //
-        // https://zips.z.cash/protocol/protocol.pdf#sproutnonmalleability
-        // https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
-        let ed25519_verifier = primitives::ed25519::VERIFIER.clone();
-        let ed25519_item = (joinsplit_data.pub_key, joinsplit_data.sig, shielded_sighash).into();
-
-        checks.push(ed25519_verifier.oneshot(ed25519_item));
-    }
-
-    Ok(checks)
-}
-
-/// Verifies a transaction's Sapling shielded data.
-fn verify_sapling_bundle(
-    bundle: Option<sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>>,
-    sighash: &SigHash,
-) -> AsyncChecks {
-    let mut async_checks = AsyncChecks::new();
+    let sighasher = cached_ffi_transaction.sighasher();
+    let sighash = sighasher.sighash(HashType::ALL, None);
 
     // The Sapling batch verifier checks the following consensus rules:
     //
@@ -1535,83 +1215,284 @@ fn verify_sapling_bundle(
     // > signature changes to prohibit non-canonical encodings.
     //
     // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
-    if let Some(bundle) = bundle {
-        async_checks.push(
-            primitives::sapling::VERIFIER
-                .clone()
-                .oneshot(primitives::sapling::Item::new(bundle, *sighash)),
-        );
+    let sapling_bundle = sighasher.sapling_bundle();
+
+    // # Consensus
+    //
+    // > The proof 𝜋 MUST be valid given a primary input (cv, rt^{Orchard}, nf, rk, cm_x,
+    // > enableSpends, enableOutputs)
+    //
+    // <https://zips.z.cash/protocol/protocol.pdf#actiondesc>
+    //
+    // Unlike Sapling, Orchard shielded transactions have a single aggregated Halo2 proof per
+    // transaction, even with multiple Actions, so it is verified once instead of once per Action
+    // description. The Ironwood bundle reuses the Orchard Action proof system and the NU6.3
+    // circuit.
+    let orchard_bundles = sighasher
+        .orchard_bundle()
+        .map(|bundle| (bundle, orchard_circuit))
+        .into_iter()
+        .chain(sighasher.ironwood_bundle().map(|bundle| (bundle, OrchardCircuit::V6)))
+        .collect();
+
+    let mut sprout_proofs = Vec::new();
+    let mut sprout_signature = None;
+    if let Some(joinsplit_data) = joinsplit_data {
+        for joinsplit in joinsplit_data.joinsplits() {
+            // # Consensus
+            //
+            // > The proof π_ZKJoinSplit MUST be valid given a
+            // > primary input formed from the relevant other fields and h_{Sig}
+            //
+            // https://zips.z.cash/protocol/protocol.pdf#joinsplitdesc
+            sprout_proofs.push(primitives::groth16::Item::from_joinsplit(
+                joinsplit,
+                &joinsplit_data.pub_key,
+            )?);
+        }
+
+        // # Consensus
+        //
+        // > If effectiveVersion ≥ 2 and nJoinSplit > 0, then:
+        // > - joinSplitPubKey MUST be a valid encoding of an Ed25519 validating key
+        // > - joinSplitSig MUST represent a valid signature under
+        //     joinSplitPubKey of dataToBeSigned, as defined in § 4.11
+        //
+        // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
+        //
+        // The `if` part is indirectly enforced, since the `joinsplit_data`
+        // is only parsed if those conditions apply in
+        // [`Transaction::zcash_deserialize`].
+        //
+        // The valid encoding is defined in
+        //
+        // > A valid Ed25519 validating key is defined as a sequence of 32
+        // > bytes encoding a point on the Ed25519 curve
+        //
+        // https://zips.z.cash/protocol/protocol.pdf#concreteed25519
+        //
+        // which is enforced during signature verification, in both batched
+        // and single verification, when decompressing the encoded point.
+        //
+        // https://zips.z.cash/protocol/protocol.pdf#sproutnonmalleability
+        // https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
+        sprout_signature = Some((joinsplit_data.pub_key, joinsplit_data.sig, &sighash).into());
     }
 
-    async_checks
-}
-
-/// Verifies a **v5** transaction's Orchard bundle.
-///
-/// A v5 Orchard bundle commits to the Orchard Action circuit of the block's era, so the
-/// verifying key is selected by `network_upgrade` via
-/// [`primitives::halo2::orchard_v5_verifier_for`]: the historical insecure key before NU6.2, the
-/// fixed key from NU6.2 until NU6.3, and the NU6.3 key from NU6.3 onward. The Orchard-pool
-/// cross-address restriction applies to every Orchard Action from NU6.3 onward regardless of
-/// transaction version (ZIP 229), so a v5 bundle at NU6.3 uses the NU6.3 circuit — the same key
-/// as v6 Orchard and Ironwood bundles — not the fixed one.
-fn verify_orchard_bundle(
-    bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
-    sighash: &SigHash,
-    network_upgrade: NetworkUpgrade,
-) -> AsyncChecks {
-    queue_orchard_bundle(
-        || primitives::halo2::orchard_v5_verifier_for(network_upgrade),
-        bundle,
+    Ok(TransactionCryptoItems {
+        script_input_count: if tx.is_coinbase() { 0 } else { tx.inputs().len() },
+        cached_ffi_transaction,
         sighash,
-    )
+        sapling_bundle,
+        orchard_bundles,
+        sprout_proofs,
+        sprout_signature,
+    })
 }
 
-/// Verifies a **v6** transaction's Orchard bundle.
-///
-/// A v6 Orchard bundle commits to the NU6.3 cross-address circuit, so it always verifies under
-/// the NU6.3 key ([`primitives::halo2::orchard_v6_verifier`]), independent of the block's
-/// network upgrade (v6 transactions only exist from NU6.3 onward). The Ironwood bundle reuses
-/// the same verifier.
-fn verify_orchard_v6_bundle(
-    bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
-    sighash: &SigHash,
-) -> AsyncChecks {
-    queue_orchard_bundle(primitives::halo2::orchard_v6_verifier, bundle, sighash)
-}
+impl TransactionCryptoItems {
+    /// Queues every item on the shared batch verifier services.
+    fn into_async_checks(self, script_verifier: script::Verifier) -> AsyncChecks {
+        let mut checks = AsyncChecks::new();
 
-/// Queues an Orchard-shaped bundle's single aggregated Halo2 proof against a verifier.
-///
-/// # Consensus
-///
-/// > The proof 𝜋 MUST be valid given a primary input (cv, rt^{Orchard}, nf, rk, cm_x,
-/// > enableSpends, enableOutputs)
-///
-/// <https://zips.z.cash/protocol/protocol.pdf#actiondesc>
-///
-/// Unlike Sapling, Orchard shielded transactions have a single aggregated Halo2 proof per
-/// transaction, even with multiple Actions, so it is queued for verification only once instead
-/// of once per Action description. The choice of verifying key is the caller's; see
-/// [`verify_orchard_bundle`] and [`verify_orchard_v6_bundle`].
-///
-/// `select_verifier` is only invoked when a bundle is present, so a bundle-less transaction
-/// never forces the (lazily initialized) verifier services.
-fn queue_orchard_bundle(
-    select_verifier: impl FnOnce() -> &'static primitives::halo2::VerifierService,
-    bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
-    sighash: &SigHash,
-) -> AsyncChecks {
-    let mut async_checks = AsyncChecks::new();
+        for input_index in 0..self.script_input_count {
+            checks.push(script_verifier.oneshot(script::Request {
+                cached_ffi_transaction: self.cached_ffi_transaction.clone(),
+                input_index,
+            }));
+        }
 
-    if let Some(bundle) = bundle {
-        async_checks.push(
-            select_verifier()
-                .clone()
-                .oneshot(primitives::halo2::Item::new(bundle, *sighash)),
-        );
+        for proof in self.sprout_proofs {
+            checks.push(primitives::groth16::JOINSPLIT_VERIFIER.oneshot(proof));
+        }
+        if let Some(signature) = self.sprout_signature {
+            checks.push(primitives::ed25519::VERIFIER.clone().oneshot(signature));
+        }
+
+        if let Some(bundle) = self.sapling_bundle {
+            checks.push(
+                primitives::sapling::VERIFIER
+                    .clone()
+                    .oneshot(primitives::sapling::Item::new(bundle, self.sighash)),
+            );
+        }
+
+        for (bundle, circuit) in self.orchard_bundles {
+            checks.push(
+                circuit
+                    .verifier()
+                    .clone()
+                    .oneshot(primitives::halo2::Item::new(bundle, self.sighash)),
+            );
+        }
+
+        checks
     }
 
-    async_checks
+    /// Verifies, on the calling thread, the items that are not batched per block: the transparent
+    /// scripts, the Sprout JoinSplit proofs and the Sprout signature.
+    pub fn verify_unbatched(&self) -> Result<(), TransactionError> {
+        for input_index in 0..self.script_input_count {
+            self.cached_ffi_transaction.is_valid(input_index)?;
+        }
+
+        for proof in &self.sprout_proofs {
+            proof
+                .clone()
+                .verify_single(primitives::groth16::SPROUT.prepared_verifying_key())
+                .map_err(|err| TransactionError::Groth16(err.to_string()))?;
+        }
+        if let Some(signature) = &self.sprout_signature {
+            signature.clone().verify_single()?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Returns what a block counts for its transaction `tx`: the miner fee, which is `None` for a
+/// coinbase transaction, and the transparent signature operations.
+pub fn block_transaction_fee_and_sigops(
+    tx: &Transaction,
+    spent_utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
+    cached_ffi_transaction: &CachedFfiTransaction,
+) -> Result<(Option<Amount<NonNegative>>, u32), TransactionError> {
+    let miner_fee = if tx.is_coinbase() {
+        None
+    } else {
+        Some(miner_fee(tx, spent_utxos)?)
+    };
+
+    // In block validation, the consensus sigop total must include P2SH
+    // redeem-script sigops, matching zcashd's `ConnectBlock` which sums
+    // `GetLegacySigOpCount` and `GetP2SHSigOpCount` per transaction before
+    // comparing against `MAX_BLOCK_SIGOPS`. Coinbase inputs contribute zero P2SH
+    // sigops. See
+    // <https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-jv4h-j224-23cc>.
+    let sigops = tx
+        .sigops()
+        .map_err(zebra_script::Error::from)?
+        .saturating_add(cached_ffi_transaction.p2sh_sigops());
+
+    Ok((miner_fee, sigops))
+}
+
+/// Verifies if a V4 `transaction` is supported by `network_upgrade`.
+fn verify_v4_transaction_network_upgrade(
+    transaction: &Transaction,
+    network_upgrade: NetworkUpgrade,
+) -> Result<(), TransactionError> {
+    match network_upgrade {
+        // Supports V4 transactions
+        //
+        // # Consensus
+        //
+        // > [Sapling to Canopy inclusive, pre-NU5] The transaction version number MUST be 4,
+        // > and the version group ID MUST be 0x892F2085.
+        //
+        // > [NU5 onward] The transaction version number MUST be 4 or 5.
+        // > If the transaction version number is 4 then the version group ID MUST be 0x892F2085.
+        // > If the transaction version number is 5 then the version group ID MUST be 0x26A7270A.
+        //
+        // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
+        //
+        // Note: Here we verify the transaction version number of the above two rules, the group
+        // id is checked in zebra-chain crate, in the transaction serialize.
+        NetworkUpgrade::Sapling
+        | NetworkUpgrade::Blossom
+        | NetworkUpgrade::Heartwood
+        | NetworkUpgrade::Canopy
+        | NetworkUpgrade::Nu5
+        | NetworkUpgrade::Nu6
+        | NetworkUpgrade::Nu6_1
+        | NetworkUpgrade::Nu6_2
+        | NetworkUpgrade::Nu6_3 => Ok(()),
+
+        #[cfg(zcash_unstable = "zfuture")]
+        NetworkUpgrade::ZFuture => Ok(()),
+
+        // Does not support V4 transactions
+        NetworkUpgrade::Genesis
+        | NetworkUpgrade::BeforeOverwinter
+        | NetworkUpgrade::Overwinter
+        | NetworkUpgrade::Nu7 => Err(TransactionError::UnsupportedByNetworkUpgrade(
+            transaction.version(),
+            network_upgrade,
+        )),
+    }
+}
+
+/// Verifies if a V5 `transaction` is supported by `network_upgrade`.
+fn verify_v5_transaction_network_upgrade(
+    transaction: &Transaction,
+    network_upgrade: NetworkUpgrade,
+) -> Result<(), TransactionError> {
+    match network_upgrade {
+        // Supports V5 transactions
+        //
+        // # Consensus
+        //
+        // > [NU5 onward] The transaction version number MUST be 4 or 5.
+        // > If the transaction version number is 4 then the version group ID MUST be 0x892F2085.
+        // > If the transaction version number is 5 then the version group ID MUST be 0x26A7270A.
+        //
+        // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
+        //
+        // Note: Here we verify the transaction version number of the above rule, the group
+        // id is checked in zebra-chain crate, in the transaction serialize.
+        NetworkUpgrade::Nu5
+        | NetworkUpgrade::Nu6
+        | NetworkUpgrade::Nu6_1
+        | NetworkUpgrade::Nu6_2
+        | NetworkUpgrade::Nu6_3
+        | NetworkUpgrade::Nu7 => Ok(()),
+
+        #[cfg(zcash_unstable = "zfuture")]
+        NetworkUpgrade::ZFuture => Ok(()),
+
+        // Does not support V5 transactions
+        NetworkUpgrade::Genesis
+        | NetworkUpgrade::BeforeOverwinter
+        | NetworkUpgrade::Overwinter
+        | NetworkUpgrade::Sapling
+        | NetworkUpgrade::Blossom
+        | NetworkUpgrade::Heartwood
+        | NetworkUpgrade::Canopy => Err(TransactionError::UnsupportedByNetworkUpgrade(
+            transaction.version(),
+            network_upgrade,
+        )),
+    }
+}
+
+/// Verifies that a V6 `transaction` is supported by `network_upgrade`.
+///
+/// V6 transactions are only valid from NU6.3 onward.
+fn verify_v6_transaction_network_upgrade(
+    transaction: &Transaction,
+    network_upgrade: NetworkUpgrade,
+) -> Result<(), TransactionError> {
+    match network_upgrade {
+        NetworkUpgrade::Nu6_3 | NetworkUpgrade::Nu7 => Ok(()),
+
+        #[cfg(zcash_unstable = "zfuture")]
+        NetworkUpgrade::ZFuture => Ok(()),
+
+        // V6 transactions are not valid before NU6.3.
+        NetworkUpgrade::Genesis
+        | NetworkUpgrade::BeforeOverwinter
+        | NetworkUpgrade::Overwinter
+        | NetworkUpgrade::Sapling
+        | NetworkUpgrade::Blossom
+        | NetworkUpgrade::Heartwood
+        | NetworkUpgrade::Canopy
+        | NetworkUpgrade::Nu5
+        | NetworkUpgrade::Nu6
+        | NetworkUpgrade::Nu6_1
+        | NetworkUpgrade::Nu6_2 => Err(TransactionError::UnsupportedByNetworkUpgrade(
+            transaction.version(),
+            network_upgrade,
+        )),
+    }
 }
 
 /// Calculates the miner fee from the transaction's value balance.
