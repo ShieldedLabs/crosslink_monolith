@@ -281,10 +281,8 @@ impl ZebradConfig {
         Self {
             crosslink: zebra_crosslink::config::Config {
                 bft_peers: vec![
-                    "70.34.201.146:12301".to_owned(), // @terminator
-                    "70.34.209.22:12301".to_owned(),  // @terminator
-                    "70.34.195.191:12301".to_owned(), // @terminator
-                    "70.34.209.18:12301".to_owned(),  // @terminator
+                    "45.32.186.234:12301".to_owned(), // @chainsaw @Nightly
+                    "64.177.122.73:12301".to_owned(), // @chainsaw @Nightly
                 ],
                 ..Default::default()
             },
