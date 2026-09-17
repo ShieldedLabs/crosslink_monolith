@@ -17,6 +17,7 @@
       --lf: #ffb3bd;
       --candidate: #f4c45e;
       --fin: #bd91ff;
+      --bft-snapshot: #ff9f5a;
       --accent: #58d6c3;
       --hazard: #ff554f;
       --old: #718399;
@@ -75,6 +76,7 @@
     .lf { background: var(--lf); }
     .candidate { background: var(--candidate); }
     .fin { background: var(--fin); }
+    .bft-snapshot { background: var(--bft-snapshot); }
 
     .svg-wrap { overflow-x: auto; }
     svg { display: block; width: 100%; min-width: 780px; height: auto; }
@@ -96,7 +98,7 @@
     svg .node-text { font-size: 12px; font-weight: 700; text-anchor: middle; dominant-baseline: middle; }
     svg .callout { fill: var(--callout-bg); stroke: var(--line); stroke-width: 1.5; }
 
-    .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    .cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
     .card { padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: rgba(7, 17, 29, .55); }
     .card p { margin-bottom: 0; color: var(--muted); }
     .card .tag { display: inline-block; margin-bottom: 12px; padding: 3px 9px; border-radius: 99px; color: #07111d; font-size: .76rem; font-weight: 800; }
@@ -106,6 +108,8 @@
     .bc-card .tag { background: var(--pow); }
     .candidate-card .tag { background: var(--candidate); }
     .fin-card .tag { background: var(--fin); }
+    .card.bft-snapshot-card { border-top: 4px solid var(--bft-snapshot); }
+    .bft-snapshot-card .tag { background: var(--bft-snapshot); }
 
     .scenarios { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
     .scenario { padding: 16px; border: 1px solid var(--line); border-radius: 14px; background: rgba(7, 17, 29, .45); }
@@ -221,6 +225,11 @@
     forks below <code>fin</code> is a different, exceptional event.
   </p>
   <p class="lede">
+    A fourth point, <code>bft_final_snapshot</code>, is the PoW block the newest BFT decision
+    finalized. It is objective, but it need not lie on <code>bc_best</code>; <code>fin</code>
+    reaches it only through the node's own best chain.
+  </p>
+  <p class="lede">
     Zebra Crosslink omits Stalled Mode, and with it the Book's bounded availability. Nothing lies
     between <code>bc_best</code> and <code>fin</code>, and nothing bounds
     how far the best chain runs ahead of <code>fin</code>.
@@ -234,6 +243,7 @@
     <span><i class="swatch lf"></i><code>LF(H)</code> on PoS</span>
     <span><i class="swatch candidate"></i><code>candidate(H)</code></span>
     <span><i class="swatch fin"></i><code>fin</code></span>
+    <span><i class="swatch bft-snapshot"></i><code>bft_final_snapshot</code></span>
   </div>
 
   <div class="warning-note">
@@ -394,7 +404,12 @@
       <article class="card fin-card">
         <span class="tag">MEMORY</span>
         <h3><code>fin</code></h3>
-        <p>“What is the furthest compatible <code>candidate(bc_best_tip)</code> this node has accepted across best-chain updates?” It depends on local update history, never moves backward, and is the view to which CL2's assured-finality guarantee applies.</p>
+        <p>“What is the furthest compatible <code>candidate(bc_best_tip)</code> this node has accepted across best-chain updates?” It depends on local update history, never moves backward, and is the view to which CL2's assured-finality guarantee applies. Under sticky fork choice, <code>candidate(bc_best_tip) ⪯ fin ⪯ bc_best_tip</code>.</p>
+      </article>
+      <article class="card bft-snapshot-card">
+        <span class="tag">BFT DECISION</span>
+        <h3><code>bft_final_snapshot</code></h3>
+        <p>“Which PoW block has <code>Π_bft</code> most recently finalized?” It is <code>snapshot(B)</code> for the newest decided BFT block <code>B</code> in view, and every node that has seen <code>B</code> agrees on it. It can lie on a chain that is not <code>bc_best</code>, for any length of time; under Linearity <code>fin ⪯ bft_final_snapshot</code>. The validator set for the next BFT height is read from the bonds there, so the node syncs that chain even while it follows another.</p>
       </article>
     </div>
     <div class="protocol-note">
@@ -835,8 +850,9 @@
     <div class="takeaway">
       <p><code>bc_best</code> is raw fork choice; <code>candidate(H)</code> is objective evidence;
       and <code>fin</code> is node-local monotone memory. An application either stops with <code>fin</code> during a finalization stall, or follows
-      <code>bc_best</code> with no bound on how far it runs past <code>fin</code>. Sticky fork
-      choice is a candidate rule that selects <code>bc_best</code> only among chains containing
+      <code>bc_best</code> with no bound on how far it runs past <code>fin</code>. <code>bft_final_snapshot</code> is what BFT has decided, which
+      <code>fin</code> follows only along the node's own best chain. Sticky fork
+      choice, the rule Zebra Crosslink implements, selects <code>bc_best</code> only among chains containing
       <code>fin</code>, ordered by work and then tip hash.</p>
     </div>
   </section>
