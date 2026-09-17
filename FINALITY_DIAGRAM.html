@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Crosslink 2 in Zebra: four quantities and three derived markers</title>
+  <title>Crosslink 2 in Zebra: three quantities and two derived markers</title>
   <style>
     :root {
       color-scheme: dark;
@@ -17,7 +17,7 @@
       --lf: #ffb3bd;
       --candidate: #f4c45e;
       --fin: #bd91ff;
-      --ba: #58d6c3;
+      --accent: #58d6c3;
       --hazard: #ff554f;
       --old: #718399;
       --pow-node-bg: #102c46;
@@ -55,7 +55,7 @@
     code { font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace; }
 
     .lede { max-width: 900px; color: var(--muted); font-size: 1.1rem; }
-    .eyebrow { margin-bottom: 10px; color: var(--ba); font-size: .78rem; font-weight: 750; letter-spacing: .13em; text-transform: uppercase; }
+    .eyebrow { margin-bottom: 10px; color: var(--accent); font-size: .78rem; font-weight: 750; letter-spacing: .13em; text-transform: uppercase; }
     .panel {
       margin-top: 28px;
       padding: clamp(18px, 3vw, 30px);
@@ -75,7 +75,6 @@
     .lf { background: var(--lf); }
     .candidate { background: var(--candidate); }
     .fin { background: var(--fin); }
-    .ba { background: var(--ba); }
 
     .svg-wrap { overflow-x: auto; }
     svg { display: block; width: 100%; min-width: 780px; height: auto; }
@@ -101,12 +100,12 @@
     .card { padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: rgba(7, 17, 29, .55); }
     .card p { margin-bottom: 0; color: var(--muted); }
     .card .tag { display: inline-block; margin-bottom: 12px; padding: 3px 9px; border-radius: 99px; color: #07111d; font-size: .76rem; font-weight: 800; }
+    .card.bc-card { border-top: 4px solid var(--pow); }
     .card.candidate-card { border-top: 4px solid var(--candidate); }
     .card.fin-card { border-top: 4px solid var(--fin); }
-    .card.ba-card { border-top: 4px solid var(--ba); }
+    .bc-card .tag { background: var(--pow); }
     .candidate-card .tag { background: var(--candidate); }
     .fin-card .tag { background: var(--fin); }
-    .ba-card .tag { background: var(--ba); }
 
     .scenarios { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
     .scenario { padding: 16px; border: 1px solid var(--line); border-radius: 14px; background: rgba(7, 17, 29, .45); }
@@ -117,7 +116,7 @@
     .rules { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 18px; }
     .rule { padding: 16px 18px; border-left: 4px solid var(--line); border-radius: 8px; background: rgba(7, 17, 29, .55); }
     .rule p { margin: 0; color: var(--muted); }
-    .rule.advance { border-color: var(--ba); }
+    .rule.advance { border-color: var(--accent); }
     .rule.hold { border-color: var(--candidate); }
     .rule.hazard { border-color: var(--hazard); }
     .rule.fast { border-color: var(--pow); }
@@ -202,16 +201,21 @@
 <main>
   <header id="scope">
   <p class="eyebrow">Zebra PoW/PoS instantiation of generic Crosslink 2</p>
-  <h1>Four protocol quantities, three derived chain markers</h1>
+  <h1>Three protocol quantities, two derived chain markers</h1>
   <p class="lede">
     Generic Crosslink 2 combines a best-chain protocol with a BFT protocol. Here blue PoW and
     red PoS/BFT show Zebra's instantiation. The blue chain itself is <code>bc_best</code>; the
-    visualization then marks the other three quantities on that chain. Crosslinks let a block
+    visualization then marks the other two quantities on that chain. Crosslinks let a block
     determine objective <code>candidate(H)</code>. On each best-chain update, local history turns
-    <code>candidate(bc_best_tip)</code> into <code>fin</code>; then <code>ba_mu</code> combines
-    <code>fin</code> with a pruned best-chain prefix. A derived candidate can move backward
-    without the PoW best chain crossing <code>fin</code>. A best chain that actually forks below
-    <code>fin</code> is a different, exceptional event.
+    <code>candidate(bc_best_tip)</code> into <code>fin</code>. A derived candidate can move
+    backward without the PoW best chain crossing <code>fin</code>. A best chain that actually
+    forks below <code>fin</code> is a different, exceptional event.
+  </p>
+  <p class="lede">
+    Zebra Crosslink omits Stalled Mode, so the Book's bounded-available view <code>ba_mu</code>,
+    its depth <code>mu</code>, the gap bound <code>L</code>, and the Finality Depth rule do not
+    exist here. Nothing lies between <code>bc_best</code> and <code>fin</code>, and nothing bounds
+    how far the best chain runs ahead of <code>fin</code>.
   </p>
   <p class="lede">See the <a href="./FINALITY.md">full semantic and implementation analysis</a>.</p>
   </header>
@@ -222,17 +226,17 @@
     <span><i class="swatch lf"></i><code>LF(H)</code> on PoS</span>
     <span><i class="swatch candidate"></i><code>candidate(H)</code></span>
     <span><i class="swatch fin"></i><code>fin</code></span>
-    <span><i class="swatch ba"></i><code>ba_mu</code></span>
   </div>
 
   <div class="warning-note">
     <p><strong>Do not conflate two tests.</strong> The condition
-    <code>fin ⪯ prune_mu(bc_best_tip)</code> can fail merely because pruning lands behind
+    <code>fin ⪯ candidate(bc_best_tip)</code> can fail merely because the candidate lands behind
     <code>fin</code>. That does not mean the full best chain has rolled back a finalized block.
     A full-best-chain conflict means that <code>fin</code> and <code>bc_best_tip</code> are on different forks,
     with neither an ancestor of the other. That means this execution does not satisfy PoW
     Prefix Consistency at the chosen <code>sigma</code>, and it can strand miners on an
-    unfinalizable branch.</p>
+    unfinalizable branch. The candidate test alone does not detect it: the candidate of a
+    conflicting tip can still be an ancestor of <code>fin</code>.</p>
   </div>
 
   <section class="panel" id="candidate-calculation">
@@ -307,15 +311,15 @@
   </section>
 
   <section class="panel" id="chain-positions">
-    <h2>2. The three values all name PoW-chain points</h2>
+    <h2>2. All three values name PoW-chain points</h2>
     <p class="subhead">
-      The PoS chain helps compute the candidate, but <code>candidate</code>, <code>fin</code>, and
-      <code>ba_mu</code> are all tips of PoW-chain prefixes.
+      The PoS chain helps compute the candidate, but <code>bc_best_tip</code>,
+      <code>candidate</code>, and <code>fin</code> are all tips of PoW-chain prefixes.
     </p>
     <div class="svg-wrap">
       <svg viewBox="0 0 1100 610" role="img" aria-labelledby="positions-title positions-desc">
-        <title id="positions-title">Candidate, fin, and bounded available markers on the PoW chain</title>
-        <desc id="positions-desc">P10 is the PoW best tip. Crosslinks through the PoS chain produce candidate P5. Local fin advances from P4 to P5. With mu three, bounded available is P7.</desc>
+        <title id="positions-title">Best tip, candidate, and fin markers on the PoW chain</title>
+        <desc id="positions-desc">P10 is the PoW best tip. Crosslinks through the PoS chain produce candidate P5. Local fin advances from P4 to P5. No marker lies between P5 and P10.</desc>
         <defs>
           <marker id="pow-arrow-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#58a6ff"/></marker>
           <marker id="pos-arrow-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#ff6b7d"/></marker>
@@ -329,7 +333,7 @@
         <g transform="translate(230 75)"><circle class="pow-node" r="24"/><text class="node-text">P10</text></g>
         <g transform="translate(230 130)"><circle class="pow-node" r="18"/><text class="node-text">P9</text></g>
         <g transform="translate(230 185)"><circle class="pow-node" r="18"/><text class="node-text">P8</text></g>
-        <g transform="translate(230 240)"><circle class="pow-node" r="22"/><circle r="28" fill="none" stroke="var(--ba)" stroke-width="4"/><text class="node-text">P7</text></g>
+        <g transform="translate(230 240)"><circle class="pow-node" r="18"/><text class="node-text">P7</text></g>
         <g transform="translate(230 295)"><circle class="pow-node" r="18"/><text class="node-text">P6</text></g>
         <g transform="translate(230 350)"><circle class="pow-node" r="22"/><circle r="28" fill="none" stroke="var(--candidate)" stroke-width="4"/><circle r="34" fill="none" stroke="var(--fin)" stroke-width="3"/><text class="node-text">P5</text></g>
         <g transform="translate(230 405)"><circle class="pow-node" r="18"/><text class="node-text">P4</text></g>
@@ -347,32 +351,33 @@
         <path class="pointer-pos" d="M536 318 C440 294 350 293 250 295" marker-end="url(#pos-arrow-2)"/>
         <text class="micro" x="395" y="284" text-anchor="middle">headers_bc = [P6, P7, P8]</text>
 
-        <rect class="callout" x="700" y="70" width="330" height="78" rx="12" style="stroke:var(--pow)"/>
+        <rect class="callout" x="700" y="70" width="330" height="105" rx="12" style="stroke:var(--pow)"/>
         <text class="label" x="720" y="98" style="fill:var(--pow)">bc_best_tip = P10</text>
         <text class="small" x="720" y="122">fork-choice result; not finality</text>
+        <text class="micro" x="720" y="145">P6–P10 are unfinalized; no protocol bound on this gap</text>
 
-        <rect class="callout" x="700" y="180" width="330" height="88" rx="12" style="stroke:var(--ba)"/>
-        <text class="label" x="720" y="208" style="fill:var(--ba)">bounded_available_tip = P7</text>
-        <text class="small" x="720" y="232">prune_mu(P10) = P7; contains fin, so use fast path</text>
-        <text class="micro" x="720" y="250">derived client view</text>
+        <rect class="callout" x="700" y="238" width="330" height="105" rx="12" style="stroke:var(--candidate)"/>
+        <text class="label" x="720" y="266" style="fill:var(--candidate)">finalization_candidate(P10) = P5</text>
+        <text class="small" x="720" y="291">objective result of the two-chain walk</text>
+        <text class="micro" x="720" y="314">pure; can move backward while the best chain still contains fin</text>
 
-        <rect class="callout" x="700" y="300" width="330" height="105" rx="12" style="stroke:var(--candidate)"/>
-        <text class="label" x="720" y="328" style="fill:var(--candidate)">finalization_candidate(P10) = P5</text>
-        <text class="small" x="720" y="353">objective result of the two-chain walk</text>
-        <text class="micro" x="720" y="376">pure function; may move backward while the full best chain still contains fin</text>
+        <rect class="callout" x="700" y="406" width="330" height="105" rx="12" style="stroke:var(--fin)"/>
+        <text class="label" x="720" y="434" style="fill:var(--fin)">local_finalized_tip: P4 → P5</text>
+        <text class="small" x="720" y="459">on a bc_best update, its candidate is ahead</text>
+        <text class="micro" x="720" y="482">stateful; never rolls back locally</text>
 
-        <rect class="callout" x="700" y="438" width="330" height="105" rx="12" style="stroke:var(--fin)"/>
-        <text class="label" x="720" y="466" style="fill:var(--fin)">local_finalized_tip: P4 → P5</text>
-        <text class="small" x="720" y="491">on a bc_best update, its candidate is ahead</text>
-        <text class="micro" x="720" y="514">stateful; never rolls back locally</text>
-
-        <path d="M676 219 H263" fill="none" stroke="var(--ba)" stroke-width="2" stroke-dasharray="5 5"/>
-        <path d="M676 348 H265" fill="none" stroke="var(--candidate)" stroke-width="2" stroke-dasharray="5 5"/>
-        <path d="M676 487 C560 487 410 380 265 354" fill="none" stroke="var(--fin)" stroke-width="2" stroke-dasharray="5 5"/>
+        <path d="M676 140 C540 140 330 130 250 92" fill="none" stroke="var(--pow)" stroke-width="2" stroke-dasharray="5 5"/>
+        <path d="M676 290 C560 290 400 344 265 348" fill="none" stroke="var(--candidate)" stroke-width="2" stroke-dasharray="5 5"/>
+        <path d="M676 458 C560 458 410 380 265 354" fill="none" stroke="var(--fin)" stroke-width="2" stroke-dasharray="5 5"/>
       </svg>
     </div>
 
     <div class="cards">
+      <article class="card bc-card">
+        <span class="tag">FORK CHOICE</span>
+        <h3><code>bc_best</code></h3>
+        <p>“Which bc-valid chain has the highest score in this node's view?” It is available but not final. An application that keeps working through a finalization stall reads this chain, or a confirmation-depth prefix of it, and accepts an unbounded distance to <code>fin</code>.</p>
+      </article>
       <article class="card candidate-card">
         <span class="tag">CALCULATION</span>
         <h3><code>candidate(H)</code></h3>
@@ -383,14 +388,9 @@
         <h3><code>fin</code></h3>
         <p>“What is the furthest compatible <code>candidate(bc_best_tip)</code> this node has accepted across best-chain updates?” It depends on local update history, never moves backward, and is the view to which CL2's assured-finality guarantee applies.</p>
       </article>
-      <article class="card ba-card">
-        <span class="tag">CLIENT VIEW</span>
-        <h3><code>ba_mu</code></h3>
-        <p>“What bounded-available view should this application use during a finalization stall?” Normally it is <code>mu</code> blocks behind the best tip. If that <em>pruned prefix</em> does not extend <code>fin</code>, the result is exactly <code>fin</code>.</p>
-      </article>
     </div>
     <div class="protocol-note">
-      <p><strong>Recommended client exposure gate:</strong> the Book recommends baking in a BFT checkpoint and withholding <code>fin</code> and <code>ba_mu</code> until that checkpoint precedes <code>LF(bc_best_tip)</code>, its snapshot precedes <code>fin</code>, and <code>fin</code>'s timestamp is sufficiently recent. This is sync-safety guidance, not a block-validity rule; Zebra does not implement it.</p>
+      <p><strong>Recommended client exposure condition:</strong> the Book recommends baking in a BFT checkpoint and withholding <code>fin</code> until that checkpoint precedes <code>LF(bc_best_tip)</code>, its snapshot precedes <code>fin</code>, and <code>fin</code>'s timestamp is sufficiently recent. This is sync-safety guidance, not a block-validity rule; Zebra does not implement it.</p>
     </div>
   </section>
 
@@ -403,8 +403,8 @@
     </p>
     <div class="scenarios">
       <article class="scenario">
-        <h3>Before: normal fast path</h3>
-        <p><code>candidate = P5</code>, so <code>fin</code> advances to P5. With <code>mu = 3</code>, the confirmed prefix P7 contains fin, so <code>ba_mu = P7</code>.</p>
+        <h3>Before: fin advances</h3>
+        <p><code>bc_best_tip = P10</code> carries context S6, whose last final block S4 yields <code>candidate = P5</code>, so <code>fin</code> advances to P5.</p>
         <svg viewBox="0 0 510 650" role="img" aria-label="Before reorg, parallel PoW and PoS chains">
           <defs>
             <marker id="pow-before" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#58a6ff"/></marker>
@@ -418,7 +418,7 @@
           <g transform="translate(145 70)"><circle class="pow-node" r="21"/><text class="node-text">P10</text></g>
           <g transform="translate(145 125)"><circle class="pow-node" r="16"/><text class="node-text">P9</text></g>
           <g transform="translate(145 180)"><circle class="pow-node" r="16"/><text class="node-text">P8</text></g>
-          <g transform="translate(145 235)"><circle class="pow-node" r="20"/><circle r="25" fill="none" stroke="var(--ba)" stroke-width="4"/><text class="node-text">P7</text></g>
+          <g transform="translate(145 235)"><circle class="pow-node" r="16"/><text class="node-text">P7</text></g>
           <g transform="translate(145 290)"><circle class="pow-node" r="16"/><text class="node-text">P6</text></g>
           <g transform="translate(145 345)"><circle class="pow-node" r="20"/><circle r="25" fill="none" stroke="var(--candidate)" stroke-width="4"/><circle r="30" fill="none" stroke="var(--fin)" stroke-width="3"/><text class="node-text">P5</text></g>
           <g transform="translate(145 400)"><circle class="pow-node" r="16"/><text class="node-text">P4</text></g>
@@ -437,18 +437,17 @@
           <path class="pointer-pos" d="M353 312 C290 285 230 282 163 289" marker-end="url(#pos-before)"/>
           <text class="micro" x="260" y="276" text-anchor="middle">headers_bc = [P6, P7, P8]</text>
 
-          <text class="label" x="25" y="238" style="fill:var(--ba)">ba_mu</text>
           <text class="label" x="25" y="338" style="fill:var(--candidate)">candidate</text>
           <text class="label" x="25" y="360" style="fill:var(--fin)">fin</text>
 
           <rect x="35" y="605" width="440" height="32" rx="8" fill="rgba(88,214,195,.08)" stroke="rgba(88,214,195,.5)"/>
-          <text class="formula" x="255" y="626" text-anchor="middle">candidate=P5 · fin=P5 · ba_mu=P7</text>
+          <text class="formula" x="255" y="626" text-anchor="middle">bc_best=P10 · candidate=P5 · fin=P5</text>
         </svg>
       </article>
 
       <article class="scenario">
         <h3>After: candidate is older, not conflicting</h3>
-        <p>The higher-work Q branch replaces only P8–P10, so <code>bc_best_tip = Q10</code> still contains <code>fin = P5</code>. Its older BFT context yields candidate P4. Hold fin at P5; with <code>mu = 3</code>, <code>prune_mu(Q10) = P7</code> still extends fin, so <code>ba_mu = P7</code>.</p>
+        <p>The higher-work Q branch replaces only P8–P10, so <code>bc_best_tip = Q10</code> still contains <code>fin = P5</code>. Its older BFT context yields candidate P4. Hold fin at P5.</p>
         <svg viewBox="0 0 510 650" role="img" aria-label="After a shallow reorg, the candidate moves behind fin while the full PoW best chain still contains fin">
           <defs>
             <marker id="pow-after" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#58a6ff"/></marker>
@@ -464,7 +463,7 @@
           <g transform="translate(155 70)"><circle class="pow-node" r="21"/><text class="node-text">Q10</text></g>
           <g transform="translate(155 125)"><circle class="pow-node" r="16"/><text class="node-text">Q9</text></g>
           <g transform="translate(155 180)"><circle class="pow-node" r="16"/><text class="node-text">Q8</text></g>
-          <g transform="translate(155 235)"><circle class="pow-node" r="20"/><circle r="25" fill="none" stroke="var(--ba)" stroke-width="4"/><text class="node-text">P7</text></g>
+          <g transform="translate(155 235)"><circle class="pow-node" r="16"/><text class="node-text">P7</text></g>
           <g transform="translate(155 290)"><circle class="pow-node" r="16"/><text class="node-text">P6</text></g>
           <g transform="translate(155 345)"><circle class="pow-node" r="20"/><circle r="26" fill="none" stroke="var(--fin)" stroke-width="4"/><text class="node-text">P5</text></g>
           <g transform="translate(155 400)"><circle class="pow-node" r="20"/><circle r="26" fill="none" stroke="var(--candidate)" stroke-width="4"/><text class="node-text">P4</text></g>
@@ -491,13 +490,11 @@
           <text class="micro" x="300" y="382" text-anchor="middle">S3.headers_bc = [P5, P6, P7]</text>
           <text class="micro" x="310" y="444" text-anchor="middle">snapshot(S3) = parent(P5) = P4</text>
 
-          <text class="label" x="20" y="239" style="fill:var(--ba)">ba_mu</text>
           <text class="label" x="20" y="349" style="fill:var(--fin)">fin</text>
           <text class="label" x="15" y="404" style="fill:var(--candidate)">candidate</text>
-          <text class="micro" x="32" y="258" style="fill:var(--ba)">prune_mu(Q10) = P7</text>
 
           <rect x="35" y="605" width="440" height="32" rx="8" fill="rgba(189,145,255,.08)" stroke="rgba(189,145,255,.5)"/>
-          <text class="formula" x="255" y="626" text-anchor="middle">candidate=P4 · fin=P5 · ba_mu=P7 · fin ⪯ Q10</text>
+          <text class="formula" x="255" y="626" text-anchor="middle">bc_best=Q10 · candidate=P4 · fin=P5 · fin ⪯ Q10</text>
         </svg>
       </article>
     </div>
@@ -520,8 +517,8 @@
         <p>Hold <code>fin</code> and record a finalization safety hazard.</p>
       </div>
       <div class="rule fast">
-        <h3>The pruned prefix contains fin</h3>
-        <p>Expose <code>prune_mu(bc_best)</code> as <code>ba_mu</code>. This test is not the same as asking whether the full best chain contains fin.</p>
+        <h3><code>bc_best_tip</code> itself conflicts with fin</h3>
+        <p>Hold <code>fin</code>. The candidate test may only report "ancestor", so detect this separately; see §4.</p>
       </div>
     </div>
   </section>
@@ -565,11 +562,11 @@
 
         <path class="old-branch" d="M210 390 C245 375 275 360 290 345 S305 310 310 290 S315 255 320 235 S325 200 330 180"/>
         <g transform="translate(290 345)"><circle r="15" fill="var(--old-node-bg)" stroke="var(--old)" stroke-width="2" stroke-dasharray="5 4"/><text class="node-text">P4</text></g>
-        <g transform="translate(310 290)"><circle r="21" fill="var(--fin-node-bg)" stroke="var(--fin)" stroke-width="4"/><circle r="27" fill="none" stroke="var(--ba)" stroke-width="3"/><text class="node-text">P5</text></g>
+        <g transform="translate(310 290)"><circle r="21" fill="var(--fin-node-bg)" stroke="var(--fin)" stroke-width="4"/><text class="node-text">P5</text></g>
         <g transform="translate(320 235)"><circle r="15" fill="var(--old-node-bg)" stroke="var(--old)" stroke-width="2" stroke-dasharray="5 4"/><text class="node-text">P6</text></g>
         <g transform="translate(330 180)"><circle r="15" fill="var(--old-node-bg)" stroke="var(--old)" stroke-width="2" stroke-dasharray="5 4"/><text class="node-text">P7</text></g>
         <text class="label" x="344" y="285" style="fill:var(--fin)">fin = P5</text>
-        <text class="micro" x="344" y="303" style="fill:var(--ba)">ba_mu falls back here</text>
+        <text class="micro" x="344" y="303" style="fill:var(--fin)">finalized client view</text>
 
         <g transform="translate(590 140)"><circle class="pos-node" r="20"/><text class="node-text">S5</text></g>
         <g transform="translate(590 250)"><circle class="pos-node" r="22"/><text class="node-text">S4</text></g>
@@ -608,11 +605,11 @@
 
         <rect class="callout" x="725" y="405" width="340" height="76" rx="11" style="stroke:var(--fin)"/>
         <text class="label" x="745" y="432" style="fill:var(--fin)">4. candidate(C8) = P3; fin stays P5</text>
-        <text class="small" x="745" y="453">ba_mu falls back to the finalized client view.</text>
-        <text class="micro" x="745" y="469">No C block can advance this finalization point.</text>
+        <text class="small" x="745" y="453">No C block can advance this finalization point.</text>
+        <text class="micro" x="745" y="469">No Stalled Mode: C blocks still carry ordinary spends.</text>
 
         <rect x="35" y="560" width="1030" height="58" rx="10" fill="rgba(244,196,94,.08)" stroke="rgba(244,196,94,.55)"/>
-        <text class="label" x="550" y="585" text-anchor="middle" style="fill:var(--candidate)">Result: miners extend an unfinalizable raw best chain; finality progress stalls.</text>
+        <text class="label" x="550" y="585" text-anchor="middle" style="fill:var(--candidate)">Result: miners extend an unfinalizable best chain with ordinary spends; the finality gap grows without bound.</text>
         <text class="small" x="550" y="605" text-anchor="middle">Raw fork choice may return to P; intervention is needed only if C stays dominant and finality must resume elsewhere.</text>
       </svg>
     </div>
@@ -628,7 +625,7 @@
     <div class="comparison">
       <article>
         <h3>Abstract CL2 response</h3>
-        <p>Subject to the stated BFT assumptions, keep raw <code>bc_best = C8</code>; keep <code>fin = ba_mu = P5</code>; prevent valid BFT snapshots from crossing forks; and restrict later blocks through Stalled Mode once the finality gap exceeds <code>L</code>.</p>
+        <p>Subject to the stated BFT assumptions, keep raw <code>bc_best = C8</code>; keep <code>fin = P5</code>; and prevent valid BFT snapshots from crossing forks. With Stalled Mode omitted, nothing restricts later C blocks: spends accumulate past <code>fin</code> for as long as C dominates, and would be rolled back if the best chain returns to P.</p>
       </article>
       <article>
         <h3>Current Zebra prototype response</h3>
@@ -637,7 +634,7 @@
     </div>
 
     <div class="protocol-note">
-      <p><strong>Prototype warning:</strong> the Shielded Labs adaptation says it omits CL2's Stalled Mode. Therefore removing Zebra's finalized-prefix behavior in order to imitate raw CL2 fork choice would leave no implemented bound on ordinary activity along an unfinalizable branch.</p>
+      <p><strong>Design consequence:</strong> Zebra Crosslink omits Stalled Mode by design, so no consensus rule bounds ordinary activity along an unfinalizable branch. Removing Zebra's finalized-prefix behavior in order to imitate raw CL2 fork choice would remove the only local constraint on activating such a branch; keeping it costs the enforcing node's liveness while that branch dominates.</p>
     </div>
   </section>
 
@@ -676,8 +673,9 @@
     <h2>6. The shortest useful summary</h2>
     <div class="takeaway">
       <p><code>bc_best</code> is raw fork choice; <code>candidate(H)</code> is objective evidence;
-      <code>fin</code> is node-local monotone memory; and <code>ba_mu</code> is the bounded-available
-      view used to define behavior during a finalization stall.</p>
+      and <code>fin</code> is node-local monotone memory. There is no bounded-available view: an
+      application either stops with <code>fin</code> during a finalization stall, or follows
+      <code>bc_best</code> with no bound on how far it runs past <code>fin</code>.</p>
     </div>
   </section>
 
@@ -688,9 +686,10 @@
       <li>The Book <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L13-L16">does not assume synchrony or reliable delivery globally</a>. Its <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L317-L328">communication and partition discussion</a> and <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L361-L373">PoW intuition and concrete-<code>sigma</code> caveat</a> explain that honest block-production advantage, sufficiently reliable communication, absence of a long partition, and a sufficiently large <code>sigma</code> are intuition or protocol-specific conditions—not a separate formal CL2 assumption list.</li>
       <li><a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L245-L260">Original TFL Book: highest-score best-chain definition</a> and its <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L709-L717">normative warning against additional BFT-derived fork-choice constraints</a>.</li>
       <li><a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/questions.md#L11-L26">Original TFL Book: analysis of stale BFT context and a finalized-snapshot fork-choice rule</a>, followed by its <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/questions.md#L44-L52">“Probably not” conclusion</a>.</li>
-      <li><a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L423-L562">Original TFL Book: definitions of <code>candidate</code>, <code>fin</code>, and <code>ba_mu</code>, plus sync guidance</a>.</li>
+      <li><a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L423-L562">Original TFL Book: definitions of <code>candidate</code> and <code>fin</code>, plus sync guidance</a>. The same range defines <code>ba_mu</code>, which this design omits.</li>
+      <li><a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/security-analysis.md#L7-L13">Original TFL Book: liveness note</a> that the Finality Depth rule can be omitted independently of the rest of Crosslink 2, at the cost of weaker incentives to advance finalization.</li>
       <li><a href="https://github.com/ShieldedLabs/zebra-crosslink/blob/6d02a1b80f896d08f923e39b2505f0565efb5787/book/src/design/cl2-construction.md#L1-L14">Shielded Labs adaptation warning</a>: the copy may be incomplete, confusing, or inconsistent and records Zebra-specific divergences. Definitions above are cited separately from the original pinned source.</li>
-      <li><a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/the-arguments-for-bounded-availability-and-finality-overrides.md">Pinned TFL Book discussion of bounded availability and finality overrides</a>: explains the two-log model and why finality stalls sacrifice availability.</li>
+      <li><a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/the-arguments-for-bounded-availability-and-finality-overrides.md">Pinned TFL Book discussion of bounded availability and finality overrides</a>: the case for bounding the finality gap with Stalled Mode, which Zebra Crosslink does not adopt.</li>
     </ul>
   </section>
 </main>

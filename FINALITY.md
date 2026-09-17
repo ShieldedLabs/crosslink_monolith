@@ -1,6 +1,6 @@
 # Crosslink finality semantics and Zebra policy boundaries
 
-This document separates the four protocol quantities used by the Crosslink 2 construction
+This document separates the three Crosslink 2 protocol quantities that Zebra's design retains
 from Zebra's irreversible state-commit boundary, legacy reorg-depth fallback, and
 consumer-specific meanings of "final". It records the implementation as of this revision of
 the repository and identifies decisions that must be made before consensus behavior changes.
@@ -30,12 +30,18 @@ Final Snapshot rule based on proof and latency results
 This document treats the formula as the current construction, not as a settled protocol
 decision beyond that source revision.
 
-The prototype sets `σ = 3` and `L = 7` in
-`librustzcash/zcash_primitives/src/bft.rs` (`PROTOTYPE_PARAMETERS`). The inequality `7 ≥ 2 × 3`
-meets the Book's stated minimum heuristic for `L`, but does not establish that `L` is
-"significantly greater" than `σ`, or that either value is secure or performant. The source
-code explicitly warns that these parameters have not been verified. `L` is not enforced by
-the prototype.
+Zebra Crosslink does not implement Stalled Mode, and bounded availability is not a concept in
+this codebase. The Book builds bounded availability from three parts: the finalization gap
+bound `L`, the Finality Depth rule with its stalled-block exception, and the bounded-available
+client view `ba_μ` with its confirmation depth `μ`. All three are omitted. §3.3 derives why
+omitting Stalled Mode removes the other two as well, and what the remaining definitions then
+guarantee.
+
+The prototype sets `σ = 3` in `librustzcash/zcash_primitives/src/bft.rs`
+(`PROTOTYPE_PARAMETERS`). The source code explicitly warns that this value has not been
+verified as secure or performant. The same struct also carries `finalization_gap_bound: 7`, the
+Book's `L`. It has no protocol meaning in this design: only test formatting reads it, and its
+doc comment still describes Stalled Mode activation.
 
 ### Notation
 
@@ -50,17 +56,19 @@ The two chains have their own parent links. They also contain two cross-chain re
 
 ## 2. Terminology and layers
 
-The construction has one fork-choice input, one objective intermediate quantity, and two
-client views:
+The construction as adopted has one fork-choice input, one objective intermediate quantity, and
+one client view:
 
 | quantity | definition | kind |
 |---|---|---|
 | `bc_best` / `χ` | highest-score bc-valid chain in the node's view | raw fork-choice view |
 | `candidate(H)` | `lca(snapshot(LF(H)), prune_σ(H))` | objective function of a block and its ancestry |
 | `fin` | monotone local state updated from `candidate(bc_best)` | locally finalized client view |
-| `ba_μ` | `prune_μ(bc_best)` when it extends `fin`, otherwise `fin` | locally bounded-available client view |
 
-Those four quantities do not exhaust the meanings carried by "final" in this tree. Zebra also
+The Book's fourth quantity, the bounded-available chain `ba_μ`, is not part of this design
+(§3.3). No CL2 quantity lies between `bc_best` and `fin`.
+
+Those three quantities do not exhaust the meanings carried by "final" in this tree. Zebra also
 has:
 
 - a **canonical-finalized policy point**, proposed here as `canonical_finalized_tip`, that
@@ -126,31 +134,70 @@ current tip.
 Assured Finality requires honest nodes' `fin` values at arbitrary times to be
 prefix-compatible. It does not require those values to be equal at the same wall-clock time.
 
-### 3.3 `ba_μ`: bounded availability during a finalization stall
+### 3.3 No bounded availability
 
-The [bounded-available chain](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L520-L527)
-is:
+The Book's bounded availability is one mechanism in three parts:
 
-```text
-ba_μ := prune_μ(bc_best)  if fin ⪯ prune_μ(bc_best)
-     := fin               otherwise
-```
+- the [Finality Depth rule](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L691-L699)
+  admits a bc-block `H` with `height(H) − height(snapshot(LF(H))) > L` only if `H` is a stalled
+  block;
+- [Stalled Mode](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L401-L415)
+  defines stalled blocks (proposed for Zcash as coinbase-only), so that `Π_bc` keeps producing
+  blocks while no user transaction lands more than `L` blocks past the snapshot; and
+- the [bounded-available chain](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L520-L554)
+  `ba_μ := prune_μ(bc_best) if fin ⪯ prune_μ(bc_best), else fin` is the client view whose
+  distance ahead of `fin` that bound limits.
 
-Here `0 < μ ≤ σ`, with recommended default `μ = σ`; choosing a smaller value is
-[at the node's own risk](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L393-L399)
-and affects only `ba_μ`, not `fin`. The defining invariant is `fin ⪯ ba_μ`.
+Omitting Stalled Mode forces the other two parts out:
 
-For `μ = σ`, the Book says the main application choice between `fin` and `ba_μ` is
-[behavior during a finalization stall, not average latency](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L401-L415):
-use `fin` to stop immediately, or use `ba_μ` to continue within the bounded window before
-Stalled Mode constrains activity.
+1. **The Finality Depth rule is dropped, not kept without its exception.** With no stalled
+   blocks the rule reduces to `height(H) − height(snapshot(LF(H))) ≤ L`. During a BFT stall no
+   context can lower that depth, so `Π_bc` halts `L` blocks past the snapshot. That is still
+   bounded availability, in its strictest form. The Book also rejects it as a design: it calls
+   stopping the chain
+   [a naive approach with serious security problems under PoW](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/the-arguments-for-bounded-availability-and-finality-overrides.md#L19-L24),
+   and its liveness analysis says any loss of `Π_bc` liveness
+   [would be a bug because it allows tail-thrashing attacks](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/security-analysis.md#L7-L13).
+   `L` and `is_stalled_block` therefore have no remaining role.
+2. **`ba_μ` and `μ` are dropped.** `ba_μ` differs from a plain confirmation depth only in its
+   fallback to `fin`, and that fallback exists to keep `fin ⪯ ba_μ`. Without a bound there is
+   nothing for that view to bound.
 
-The fallback can occur in two ways:
+The same liveness analysis states that the Finality Depth rule
+[is technically independent of the rest of Crosslink 2](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/security-analysis.md#L9-L11):
+without it, the protocol keeps its advantages over Snap-and-Chat, but the incentive to pull the
+finalization point forward is weaker. The concrete consequences for the remaining definitions
+are:
 
-- `prune_μ(bc_best)` is behind `fin` on the same chain; or
-- `prune_μ(bc_best)` and `fin` are on different forks.
+- **`candidate(bc_best)` can lag without any validity cost.** The Extension rule permits
+  `LF(H) = LF(parent(H))`, and the Valid Context and Last Final Snapshot rules are always
+  satisfiable by reusing the parent's `context_bft`. With no depth bound, a chain that never
+  updates its context stays valid at any height. Progress of `fin` while `Π_bft` is live
+  therefore depends on bc-block producers following the honest context-selection procedure
+  (§3.4), which is not a validity rule. A producer with enough hash rate to dominate `bc_best`
+  can withhold finality progress; under bounded availability it would have been confined to
+  stalled blocks after `L`.
+- **The finality gap is unbounded.** During a finalization stall, `bc_best` keeps accepting
+  ordinary spending transactions at any distance past `fin`. The rollback exposure of those
+  transactions grows with the gap. This is the outcome the Book's bounded-availability argument
+  was written to avoid; omitting Stalled Mode accepts it.
+- **No client view is both available and guaranteed to extend `fin`.** An application that
+  does not want to stop with finality reads `bc_best` or a confirmation prefix
+  `prune_k(bc_best)`. Those are `Π_bc` views, not CL2 quantities, and their security is
+  `Π_bc`'s own Prefix Consistency. The Book's "Prefix Consistency of `ba`" theorem has no
+  subject. A prefix `prune_k(bc_best)` can be an ancestor of `fin` even when every assumption
+  holds; the Book gives difficulty adjustment after a reorg as the reason, which is why `ba_μ`
+  had its fallback. It can conflict with `fin` only if Prefix Consistency at `σ` has failed:
+  `fin ⪯ prune_σ(χ^r)` for some earlier `r`, so Prefix Consistency at `σ` gives `fin ⪯ bc_best`,
+  and every prefix of `bc_best` is then comparable with `fin`.
+- **The application choice changes.** The Book framed it as `fin` (stop immediately) versus
+  `ba_μ` (continue for at most `L` blocks). Here it is `fin` versus a `bc_best` view that never
+  stops and has no bound on how much can be rolled back to `fin`.
 
-Neither condition alone proves that the full `bc_best` conflicts with `fin`.
+In the current Zebra prototype, the finalized-prefix policy of §4.2 locally forces
+`canonical_finalized_tip ⪯ canonical_tip`. That restores, as a chain-activation policy, a
+prefix relation that `ba_μ` provided by definition. It is not a substitute for bounded
+availability: it does not limit the finality gap, and it costs local liveness (§9.1).
 
 ### 3.4 Validity rules and honest production
 
@@ -161,8 +208,11 @@ are:
 - **Valid context:** `H.context_bft` is bft-block-valid.
 - **Extension:** `LF(parent(H)) ⪯bft LF(H)`.
 - **Last Final Snapshot:** `snapshot(LF(H)) ⪯bc H`.
-- **Finality depth:** `height(H) − height(snapshot(LF(H))) ≤ L`, unless `H` is a valid stalled
-  block.
+
+The Book's fourth rule, **Finality Depth**, is omitted with Stalled Mode (§3.3). The Last Final
+Snapshot rule stays: besides making the finality depth a meaningful height difference, it is
+what the Book's safety sketch uses to show that each candidate final snapshot is `σ`-confirmed
+in its observer's best chain.
 
 The separately stated
 [bft-proposal and bft-block validity rules](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L568-L574)
@@ -171,17 +221,13 @@ add:
 - **Linearity:** `snapshot(parent(B)) ⪯bc snapshot(B)`.
 - **Tail Confirmation:** `B.headers_bc` form the `σ`-block tail of a bc-valid chain.
 
-The rationale for the finality-depth rule states that “The finality depth must be objectively
-defined” and therefore measures `H` against `snapshot(LF(H))`, an objective function of `H`,
-rather than against node-local `fin`
-([lines 695–698](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L695-L698)).
-
-Beyond satisfying validity and stalled-block rules, the explicit BFT-context selection
-procedure chooses `H.context_bft`: among eligible bft-valid tips it chooses a longest chain,
-then breaks ties by final-snapshot score and hash
+Beyond satisfying validity rules, the explicit BFT-context selection procedure chooses
+`H.context_bft`: among eligible bft-valid tips it chooses a longest chain, then breaks ties by
+final-snapshot score and hash
 ([lines 705–716](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L705-L716)).
-BFT-derived data therefore affects more than this selection procedure: it also affects block
-validity, finality depth, and whether an honest producer must emit a stalled block.
+BFT-derived data therefore affects block validity as well as this selection procedure. With no
+Finality Depth rule, the procedure is the only thing that makes a producer advance its
+context (§3.3).
 
 ### 3.5 Prefix Consistency and client exposure
 
@@ -199,7 +245,9 @@ longer applies to that execution.
 The Book [recommends baking in a BFT checkpoint and gating client
 exposure](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L557-L562)
 until the checkpoint precedes `LF(bc_best)`, its snapshot precedes `fin`, and `fin` is recent.
-This is an unimplemented sync-safety recommendation, not a block-validity or consensus rule.
+This is an unimplemented sync-safety recommendation, not a block-validity or consensus rule. The
+Book applies it to `fin` and `ba_μ`; here it covers `fin` only, and says nothing about exposing
+`bc_best`.
 
 ## 4. Raw fork choice and finalized-prefix policy
 
@@ -411,8 +459,9 @@ Any future consensus change must keep all three paths identical.
 ### 6.2 Missing validity rules
 
 - The Last Final Snapshot rule is not implemented for bc-block admission.
-- The Finality Depth rule and Stalled Mode are not implemented. `L` is serialized only by test
-  formatting; the 512-block log threshold is diagnostic, not consensus.
+- The Finality Depth rule and Stalled Mode are not implemented, by design (§3.3). They are
+  omissions from the Book, not missing work. `finalization_gap_bound` is read only by test
+  formatting, and the 512-block log threshold is diagnostic, not consensus.
 - BFT validation does not implement Linearity or Tail Confirmation. It checks that the first
   carried header's block is locally present, but does not establish that all `σ` headers form a
   valid chain with valid PoW.
@@ -440,11 +489,19 @@ The documentation and implementation must separately name:
 - the Zebra policy floor `canonical_finalized_tip`; and
 - the successfully persisted `state_commit_tip`.
 
-### 6.4 Bounded availability and Stalled Mode
+### 6.4 Unbounded finality gap
 
-`ba_μ` does not exist in the tree. The fallback branch, bounded behavior during a finalization
-stall, and the consensus restrictions of Stalled Mode are therefore absent. The diagnostic
-warning at a hardcoded gap does not substitute for them.
+Nothing in consensus bounds the finality gap or restricts which transactions a block far past
+the snapshot may carry. This follows from omitting Stalled Mode (§3.3) and is not a divergence
+from this design. It has two practical consequences:
+
+- The diagnostic warning at a hardcoded gap is the only signal of a long finalization stall.
+  Any response to one, such as alerts, wallet warnings, or operator action, is outside
+  consensus.
+- A best chain that has forked below `fin` (§3.5) can carry ordinary spending transactions for
+  as long as it dominates. Under raw CL2 fork choice nothing limits that activity. In the
+  current prototype, only the finalized-prefix policy of §4.2 keeps an enforcing node from
+  activating such a branch.
 
 ### 6.5 Client exposure and API semantics
 
@@ -472,18 +529,19 @@ The protocol names should encode their definitions:
 | `bc_best` | `bc_best_tip` | `BcBestTip` |
 | `candidate(H)` | `finalization_candidate` | `FinalizationCandidate` |
 | `fin` | `local_finalized_tip` | `LocalFinalizedTip` |
-| `ba_μ` | `bounded_available_tip` | `BoundedAvailableTip` |
 
 Policy and persistence need separate names such as `canonical_finalized_tip` and
 `state_commit_tip`. The legacy reorg-depth value should keep a name that says it is a
-reorg-depth marker, not Crosslink finality.
+reorg-depth marker, not Crosslink finality. No identifier should say "bounded available": this
+tree has no such quantity.
 
-No blanket "presentation uses `ba_μ`" rule is correct. Each consumer needs a contract:
+Without `ba_μ` there is no protocol view between the best tip and the finalized tip, so nothing
+is a default for "confirmed" presentation. Each consumer needs a contract:
 
 | consumer or endpoint | value | contract or unresolved work |
 |---|---|---|
 | raw best-tip display | `bc_best_tip` | current fork-choice result |
-| confirmed/bounded-available display | `bounded_available_tip` | bounded behavior during finalization stalls |
+| confirmed display | `bc_best_tip` at a stated confirmation depth | `Π_bc` confirmation only; can be an ancestor of `local_finalized_tip`, or conflict with it after a Prefix Consistency failure (§3.3); never present it as bounded or final |
 | final display | `local_finalized_tip` | node-local monotone CL2 view |
 | `get_tfl_final_block_hash` and `get_tfl_final_block_height_and_hash` | `local_finalized_tip` | partly implemented: they now return no value when the marker is absent, but when present it is still the legacy-fed slot, and the checkpoint/recency exposure condition of §6.5 does not exist |
 | block/transaction status | unresolved API contract | define distinct `Confirmed` and `Finalized` states before routing either |
@@ -537,9 +595,8 @@ quantity the code does not implement and would need a second rename once real `f
 Whether to name it for its present role, or defer until the update trigger lands, is an open
 decision and should not be bundled with the mechanical steps above.
 
-Computing `candidate`, changing the update trigger, enforcing validity rules, implementing
-Stalled Mode, and changing chain eligibility or rewards are later behavior changes, not part of
-a semantic rename.
+Computing `candidate`, changing the update trigger, enforcing validity rules, and changing
+chain eligibility or rewards are later behavior changes, not part of a semantic rename.
 
 ## 9. Open consensus decisions
 
@@ -550,6 +607,14 @@ chain-activation policy. Raw CL2 permits `fin` to remain off `bc_best`, while th
 client view stays fixed. The current physical state model requires
 `canonical_finalized_tip ⪯ canonical_tip` locally. Removing or retaining that requirement has
 liveness, recovery, storage, and migration consequences.
+
+Omitting Stalled Mode changes the weight of this choice. The Book pairs raw fork choice with
+Stalled Mode, which confines a dominant unfinalizable branch to stalled blocks after `L`. Without
+it, raw fork choice lets that branch carry ordinary spends without limit, all of them past `fin`
+and unfinalizable under Linearity. Removing Zebra's finalized-prefix policy would therefore
+leave no local constraint on activity along such a branch. Retaining it keeps the constraint at
+the cost of the enforcing node's liveness whenever the dominant chain excludes its finalized
+point.
 
 ### 9.2 Objective reward trigger and reward economics
 
@@ -568,7 +633,9 @@ This is not literally the event "local `fin` advanced." It is a block-local even
 permit `fin` to advance if `H` were observed as best and its candidate were ahead of that
 node's current `fin`. `snapshot(LF(H))` is another objective candidate source. The selected
 function must be monotone under the enforced validity rules; today the missing Linearity and
-Last Final Snapshot checks leave that premise unenforced.
+Last Final Snapshot checks leave that premise unenforced. Without a Finality Depth rule, a
+bc-block producer can also keep a stale `context_bft` at no validity cost (§3.3), so an
+objective advance trigger lets whoever dominates `bc_best` delay payouts while `Π_bft` is live.
 
 Payout amount is a separate decision:
 
@@ -598,9 +665,11 @@ which ledger state is read to materialize that set.
 
 ### 9.4 Remaining protocol choices
 
-- Decide whether and how to implement the Last Final Snapshot, Finality Depth, Linearity, and
-  Tail Confirmation rules. These are consensus changes in the current prototype.
-- Decide how Stalled Mode behaves for Zebra transactions and block production.
+- Decide whether and how to implement the Last Final Snapshot, Linearity, and Tail
+  Confirmation rules. These are consensus changes in the current prototype. Finality Depth is
+  not among them (§3.3).
+- Remove `finalization_gap_bound` from `ZcashCrosslinkParameters` and the test format, or
+  re-document it as unused; its doc comment still describes Stalled Mode.
 - Decide whether the one-block snapshot shift requires PoS-store migration or replay rules. It
   does require replay rules at minimum. The PoS store record is not a serialized `BftBlock`
   alone: each record appends the block, the fat pointer, `finalizers_at_current_height`, and the
@@ -615,13 +684,18 @@ which ledger state is read to materialize that set.
   a hardfork activation boundary. Nodes running the two derivations would also disagree about
   which bc-block is finalized. The RocksDB side is unaffected: aggregated stakes are keyed by
   block hash and written in the block's own batch, so both derivations' rows already exist.
-- Choose `μ` and whether it is node-configurable; default `μ = σ` follows the Book's
-  recommendation.
 - Specify checkpoint/recency exposure gating independently of block validity.
 
 ## 10. Source appendix
 
-- [Original TFL Book: `candidate`, `fin`, `ba_μ`, and syncing](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L423-L562)
+- [Original TFL Book: `candidate`, `fin`, and syncing](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L423-L562);
+  the same range defines the omitted `ba_μ`
+- [Original TFL Book: parameters `σ`, `L`, `μ`, and Stalled Mode](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L386-L415),
+  of which only `σ` is used here
+- [Original TFL Book: liveness argument](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/security-analysis.md#L5-L58),
+  including the note that the Finality Depth rule can be omitted
+- [Original TFL Book: the arguments for bounded availability](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/the-arguments-for-bounded-availability-and-finality-overrides.md),
+  the case for the design this tree does not adopt
 - [Original TFL Book: BFT validity rules](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L568-L574)
 - [Original TFL Book: bc validity and honest production](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L680-L717)
 - [Original TFL Book: fork-choice question](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/questions.md#L11-L52)
