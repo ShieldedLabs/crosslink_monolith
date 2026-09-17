@@ -93,6 +93,27 @@ as its own block hash, and the database's finalized tip, which is the higher of 
 block Zebra commits at reorg depth. The finalized tip equals `fin` while finality lags the
 best tip by less than about `MAX_BLOCK_REORG_HEIGHT` blocks.
 
+A fourth quantity is objective rather than node-local:
+
+| quantity | definition | kind |
+|---|---|---|
+| `bft_final_snapshot` | `snapshot(B)` for the newest decided bft-block `B` in the node's view | the bc-block `Π_bft` has most recently finalized |
+
+A BFT decision finalizes `bft_final_snapshot` in the sense of `Π_bft`, and "Crosslink finalized"
+in conversation usually means this point. A node's `fin` reaches it only through the node's own
+best chain, by the update rule of §3.2. Under sticky fork choice, and after each update:
+
+```text
+candidate(bc_best) ⪯ fin ⪯ bc_best
+fin ⪯ bft_final_snapshot                       (under Linearity and Π_bft Final Agreement)
+```
+
+`fin` equals `candidate(bc_best)` except after a reorganization that moved the candidate back.
+`bft_final_snapshot` need not be on `bc_best`, and can stay off it for any length of time: it is
+on a chain the node switches to only when that chain has more work (§4.3). The first line holds
+exactly under fork-choice rules that keep `fin ⪯ bc_best`; under raw work-based fork choice both
+of its relations can fail.
+
 ## 3. Crosslink 2 model
 
 ### 3.1 `snapshot`, `LF`, and `candidate`
@@ -156,6 +177,22 @@ both of its arguments. At genesis both sides are `O_bc`, since pruning `O_bc` yi
 Book combines the lemma with `Π_bc` Prefix Agreement at depth `σ` to argue Assured Finality; that
 use is why `candidate` clamps to `prune_σ(H)` rather than using `snapshot(LF(H))` alone
 ([line 513](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L513)).
+
+**When the `prune_σ` clamp binds.** When the `σ` headers of `LF(H)` are all ancestors of `H`,
+the last of them is at or below `parent(H)`, so `snapshot(LF(H))` is at least `σ + 1` blocks
+below `H` and the clamp does not bind. It binds when the headers lie on another chain that extends past `H`'s own chain: for
+example a short side chain whose blocks sit just above `snapshot(B)` and cite a bft-block `B`
+whose `σ` headers continue on a different, longer chain. Last Final Snapshot admits such a block,
+since `snapshot(B)` is its ancestor. Without the clamp, a node whose best chain is that side
+chain would finalize `snapshot(B)` while its own chain buried that block only one or two deep.
+
+That matters only when `Π_bft` is subverted. A subverted `Π_bft` can decide a bft-block whose
+headers come from any chain with valid PoW, including one the adversary mined privately, and so
+can name as its snapshot a block that an honest node has seen only shallowly on a branch about to
+be abandoned. With the clamp, a node finalizes a block only once its own best chain has buried it
+`σ` deep, so under `Π_bc` Prefix Consistency every honest best chain keeps that block and honest
+`fin` values stay compatible without any assumption about `Π_bft`. Without it, a subverted
+`Π_bft` alone could give honest nodes conflicting `fin` values.
 
 Assured Finality requires honest nodes' `fin` values at arbitrary times to be
 prefix-compatible. It does not require those values to be equal at the same wall-clock time.
@@ -279,6 +316,14 @@ proposers repeat `B.headers_bc`. Last Final Snapshot admits a block `H` on that 
 a chain containing `snapshot(B)` becomes their best chain again. Under honest proposal at every
 bc-block, `snapshot(B)` sits about `σ` blocks below the proposer's tip, so a reorganization
 slightly deeper than `σ` reaches this case.
+
+**Finality lag under honest production.** A proposer at tip `T` carries headers `T − σ + 1`
+through `T`, so the decided block's snapshot is `T − σ`. The first bc-block that can cite that
+decision is `T + 1`, and only if its template was built after the decision arrived; then
+`candidate(T + 1) = T − σ`. In steady state `fin` therefore trails the best tip by at least
+`σ + 1` blocks. Every bc-block built from a template that predates the latest decision cites an
+older bft-block and adds one more block of lag, and a decision that takes longer than a bc-block
+interval adds more.
 
 The Book's informal safety argument uses Linearity and Last Final Snapshot as follows:
 
@@ -582,10 +627,25 @@ The rule is implemented through the finalized database rather than as a separate
 - `fin` is stored in the finalized database as its own block hash, so the floor survives a
   restart. The database's finalized tip is the higher of `fin` and the reorg-depth commit (next
   bullet), so finality readers take `fin`, never the finalized tip.
+- A BFT decision does not change the finalized state. It advances `bft_final_snapshot` (§2),
+  which can lie on a chain that is not `bc_best`. Only a later `bc_best` change moves `fin`, and
+  only by the rule above.
+- The node syncs the chain leading to `bft_final_snapshot` whether or not it is `bc_best`. It
+  stores those bc-blocks and the BFT decisions on disk outside the finalized state, tracks bond
+  state along that chain, and computes the validator set there (§7), so that it can validate
+  later bft-blocks while following another best chain. Under Linearity that chain contains
+  `fin`, so it remains eligible, and the node switches to it once it has more work. BFT
+  processing therefore belongs to `NonFinalizedState`, and the Proof-of-Stake logic to
+  `zebra-state`, where bc-block validity, bft-block validity, and roster computation run in one
+  synchronous domain with no asynchronous calls between them.
 - Zebra also commits the root of the best chain to the finalized database once the chain is
   longer than `MAX_BLOCK_REORG_HEIGHT` (99, from `zcash_protocol::consensus`, applied in
   `zebra-state/src/service/write.rs`). Chains forking below that point are no longer in view.
   On a Zebra node the effective floor is the higher of `fin` and that depth-committed block.
+  If `bc_best` runs more than that depth past the point where the chain to `bft_final_snapshot`
+  forks from it, the depth commit writes a block that conflicts with `bft_final_snapshot`. The
+  node can then never switch to the finalized chain, and under Linearity and Last Final
+  Snapshot its own branch never finalizes again (§9.2).
 
 Sticky fork choice and Linearity constrain different points. Sticky fork choice keeps `fin` on
 `bc_best`; Linearity keeps each final snapshot on or after the previous one. `fin` lies at or
@@ -642,6 +702,11 @@ state.
 `zebra_state::Request::CrosslinkFinalizeBlock`. The request is retried indefinitely after an
 error. During that interval, RPC and GUI readers and notification subscribers can observe a
 marker whose database state has not been finalized.
+
+A decision and its database commit are coupled. Tenderlink awaits the decide callback before it
+starts the next round, and the callback returns only after `CrosslinkFinalizeBlock` succeeds,
+so BFT progress waits on the finalized-state write. Sticky fork choice (§4.3) separates them: a
+decision advances `bft_final_snapshot`, and the finalized state follows `fin`.
 
 The state behavior depends on whether the hash is known:
 
@@ -735,7 +800,10 @@ Any future consensus change must keep all three paths identical.
   *following* the intersection, ascending, and the implementation iterates an ascending range
   from `intersection + 1`, so `headers[0]` is the block one above the candidate height and
   `parent(headers[0])` is the candidate height itself. Storing `hash(headers[0])` therefore
-  finalizes one block shallower than intended.
+  finalizes one block shallower than intended. The header window itself is already right: `σ`
+  headers suffice, because `headers[0]` carries the snapshot's hash in its parent field, and a
+  validator must hold the snapshot block to validate the certificate anyway. The fix changes
+  only the derivation, not the number of headers.
   The in-memory header order is consequently deepest-first, matching the specification, so the
   `BftBlock` doc comment in `librustzcash/zcash_primitives/src/bft.rs` claiming the order is
   reversed from the specification was not merely stale but inverted. Nothing enforces that
@@ -781,8 +849,13 @@ Any future consensus change must keep all three paths identical.
   fails, the path makes no proposal, where honest proposal repeats the parent's `headers_bc`.
 - Bc-block production does not follow the honest context-selection procedure (§3.4): the block
   template's `FatPointerToBFTChainTip` request cites the newest decided bft-block whose
-  `do_not_include_until_bc_height` admits the proposed height, whatever that block's snapshot. Under Last Final Snapshot a template whose parent chain does not contain that
-  snapshot produces an invalid block.
+  `do_not_include_until_bc_height` admits the proposed height, whatever that block's snapshot.
+  Under Last Final Snapshot a template whose parent chain does not contain that snapshot
+  produces an invalid block.
+- Block templates lag BFT decisions. Time-accelerated and realtime tests show miners producing
+  two consecutive bc-blocks with the same fat pointer, each of which adds a block of finality
+  lag (§3.4). Any rule keyed to finalization at exactly `σ + 1` below the tip misses those
+  blocks.
 - The Extension rule is implemented by
   `call_from_state_to_crosslink_to_ask_about_fat_pointers`, including its defer/reject
   distinction.
@@ -842,6 +915,7 @@ The protocol names should encode their definitions:
 | `bc_best` | `bc_best_tip` | `BcBestTip` |
 | `candidate(H)` | `finalization_candidate` | `FinalizationCandidate` |
 | `fin` | `local_finalized_tip` | `LocalFinalizedTip` |
+| `bft_final_snapshot` | `bft_final_snapshot` | `BftFinalSnapshot` |
 
 The database's finalized tip needs a name distinct from `fin` (§6.3). The legacy reorg-depth value should keep a name that says it is a
 reorg-depth marker, not Crosslink finality.
@@ -881,9 +955,17 @@ The two quantities are separate:
   height of the same block.
 
 `snapshot(B_{H−1})` generally lies above `fin`, because `candidate(H) ⪯ snapshot(LF(H))` and
-`fin` advances only once a bc-block citing the bft-block is best. Its bonds are therefore
-usually read from a non-finalized chain. An honest validator has downloaded that chain while
+`fin` advances only once a bc-block citing the bft-block is best. It need not lie on `bc_best`
+at all, and can stay off it for any length of time (§2, §4.3). Its bonds are therefore read from
+the chain leading to `bft_final_snapshot`, which the node syncs, stores, and tracks bond state
+along independently of its best chain. An honest validator has downloaded that chain while
 validating `B_{H−1}` (§3.4).
+
+Validation on that chain is interdependent but well-founded. Validating bft-block `B_H` needs
+the validator set from the bonds at `snapshot(B_{H−1})` and the bc-blocks under `B_H.headers_bc`;
+validating those bc-blocks needs the bft-blocks their fat pointers cite, all of which were
+decided before them. Processing decisions in BFT height order, each after the bc-blocks up to its
+headers, satisfies every dependency.
 
 ## 8. Minimal code slice after the decisions
 
@@ -920,7 +1002,14 @@ The behavior changes that follow the mechanical steps are:
 - derive `snapshot(B)` as `parent(B.headers_bc[0])` at every site listed in §8.1;
 - enforce Last Final Snapshot, Linearity, and Tail Confirmation, and follow honest proposal and
   honest context selection (§3.4, §6.2);
-- read the validator set for BFT height `H` from the bonds at `snapshot(B_{H−1})` (§7); and
+- read the validator set for BFT height `H` from the bonds at `snapshot(B_{H−1})` (§7);
+- stop a BFT decision from waiting on a finalized-state write, so that a decision advances only
+  `bft_final_snapshot` (§5.2);
+- sync, store on disk, and track bond state along the chain to `bft_final_snapshot` while it is
+  not `bc_best`, with BFT certificate processing and roster computation in `NonFinalizedState`
+  (§4.3);
+- move the Proof-of-Stake logic into `zebra-state`, so that bc-block validity, bft-block
+  validity, and roster computation share one synchronous domain; and
 - report a refused switch on stdout (§4.3).
 
 ### 8.1 Implementation pitfalls
@@ -967,7 +1056,16 @@ These hold for any change to how the marker is derived, stored, or consumed.
   reads `headers[0]` as the deepest header relies on the producer, not on validation.
 - **The BFT service lock must be released before any state request.** zebra-state can call back
   into the Crosslink service during `CrosslinkFinalizeBlock`. An update trigger on `bc_best`
-  changes adds a state-to-Crosslink call path with the same reentrancy constraint.
+  changes adds a state-to-Crosslink call path with the same reentrancy constraint. The constraint
+  lasts as long as Proof-of-Stake logic sits across an asynchronous boundary from `zebra-state`.
+- **`NonFinalizedState` holds less than the finalized chain needs.** It lives in memory, and it
+  drops chains that do not contain the finalized tip, including those forking below a
+  reorg-depth commit. The chain to `bft_final_snapshot` must survive both a restart and a best
+  chain that has pulled ahead of it, so its blocks, its BFT decisions, and the bond state its
+  rosters are read from need storage of their own.
+- **A switch onto the finalized chain replaces bond state.** Bonds tracked along that chain while
+  it was a side chain must agree with what the chain produces once it becomes `bc_best`; one
+  implementation of the bond update serves both (§5.4).
 - **Aborts kill the node.** The build uses `panic=abort`. The decide path unwraps
   `block_height_from_hash` on the decided header, so a decided block whose header is unknown to
   state terminates the process, as does every `assert!` on that path.
@@ -1053,6 +1151,14 @@ decision document once a concrete policy is proposed.
   a hardfork activation boundary. Nodes running the two derivations would also disagree about
   which bc-block is finalized. The RocksDB side is unaffected: aggregated stakes are keyed by
   block hash and written in the block's own batch, so both derivations' rows already exist.
+- Specify what a node does once its best chain runs more than `MAX_BLOCK_REORG_HEIGHT` past the
+  fork from the chain to `bft_final_snapshot` (§4.3). The depth commit then conflicts with
+  `bft_final_snapshot`, so the node can never switch back. Options include keeping the finalized
+  chain synced regardless, which keeps the node able to validate bft-blocks but not to finalize;
+  ceasing to follow it, which also ends its bft-block validation until it resyncs; and holding
+  the depth commit below any block that conflicts with `bft_final_snapshot`, which makes fork
+  choice follow the newest final snapshot at that depth, close to the rule the Book declines in
+  §4.1.
 - Specify the checkpoint and recency condition for exposing `fin` to clients (§3.5),
   independently of block validity.
 - Define the block and transaction status contract, with distinct confirmed and finalized
