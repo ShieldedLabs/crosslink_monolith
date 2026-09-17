@@ -72,6 +72,7 @@ mod pending_utxos;
 mod queued_blocks;
 pub(crate) mod read;
 pub mod stake_fixup;
+pub mod staking_replay;
 pub mod write;
 
 #[cfg(any(test, feature = "proptest-impl"))]

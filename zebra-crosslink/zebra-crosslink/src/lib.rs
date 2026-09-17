@@ -1659,7 +1659,8 @@ async fn total_issuance_from_key(
     let t_wall = std::time::Instant::now();
     PROF.reset();
 
-    let mut delegation_bonds = HashMap::new();
+    let hardfork_schedule = zebra_chain::parameters::HardForkSchedule::from_canonical(internal_handle.config.hardforks.clone());
+    let mut staking = zebra_state::StakingReplay::new(&hardfork_schedule);
     let mut utxos_per_ufvk = vec![HashSet::<(PubKeyID, u32)>::new(); ufvks.len()]; // NOTE: hashsets here are grow-only
     let mut t_spend_per_ufvk = vec![false; ufvks.len()];
 
@@ -1759,20 +1760,16 @@ async fn total_issuance_from_key(
 
             if let (Some(staking_action), Some((_, txid_lrz))) = (staking_action, &parsed) {
                 debug_assert_eq!(*txid_lrz, tx.hash().0, "txids from zebra/librustzcash disagree");
-                let mut bond_retargets = vec![HashMap::new()];
                 // Note(Sam): It seems weird that the bonds never get deleted. I don't know what I was
                 // thinking when I did that. But it makes this code easy.
-                let _ = timed(&PROF.replay_ns, || zebra_state::update_chain_tip_with_delegation_bond(
-                    &mut zebra_chain::value_balance::ValueBalance::zero(),
-                    &mut delegation_bonds,
-                    &mut bond_retargets,
-                    staking_action,
-                    &zebra_chain::transaction::Hash(*txid_lrz),
-                    zebra_state::TransactionLocation {
-                        height: ZebBlockHeight(height),
-                        index: zebra_state::TransactionIndex::from_index(tx_i.try_into().unwrap()),
-                    }
-                ));
+                let location = zebra_state::TransactionLocation {
+                    height: ZebBlockHeight(height),
+                    index: zebra_state::TransactionIndex::from_index(tx_i.try_into().unwrap()),
+                };
+                let replayed = timed(&PROF.replay_ns, || staking.apply_staking_action(staking_action, &zebra_chain::transaction::Hash(*txid_lrz), location));
+                if let Err(err) = replayed {
+                    return Err(format!("failed to replay the staking action of tx {tx_i} at height {height}: {err}"));
+                }
             }
 
             if let Some((tx_lrz, txid_lrz)) = &parsed {
@@ -1785,17 +1782,18 @@ async fn total_issuance_from_key(
             }
         }
 
-        // Once per block, after all of its staking actions, as the live commit path does. Paying
-        // it inside the tx loop paid a block with n txs n times.
-        if height != 0 && delegation_bonds.values().any(|(_, status)| *status == zebra_state::BondStatusInChain::Active) {
-            timed(&PROF.replay_ns, || zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds));
+        if height != 0 {
+            timed(&PROF.replay_ns, || staking.apply_block_reward());
+            if let Some(slash) = timed(&PROF.replay_ns, || staking.apply_slash_burns(ZebBlockHeight(height))) {
+                println!("applied hardfork slash burns at height {height}: {} bond(s) burned for {} terminated finalizer(s)", slash.burned.len(), slash.finalizers.len());
+            }
         }
     }
 
     for scan_info in &mut scan_infos {
         let mut bonds_value = 0;
         for bond in &scan_info.bonds {
-            match delegation_bonds.get(&bond.pk.0) {
+            match staking.delegation_bonds.get(&bond.pk.0) {
                 Some(bond_info) => {
                     let initial_val: u64 = bond.initial_val;
                     let final_val = u64::from(bond_info.0.amount);

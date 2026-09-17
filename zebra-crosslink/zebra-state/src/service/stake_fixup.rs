@@ -8,29 +8,19 @@
 //! live commit path uses, and refuses to write unless the replay reproduces
 //! every row already on disk. Run it via `zebrad --fixup-db-stake`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use zebra_chain::{
-    amount::{Amount, NonNegative, MAX_MONEY},
     block::{self, Height},
     parameters::Network,
-    value_balance::ValueBalance,
 };
 
 use crate::{
-    constants::{state_database_format_version_in_code, POS_BLOCK_REWARD_ZATS, STATE_DATABASE_KIND},
+    constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     service::{
-        burn_delegation_bonds,
-        finalized_state::{
-            disk_format::{AggregatedStakes, BondKey, DelegationBond, TransactionLocation},
-            slashing::{
-                apply_staking_action_to_open_runs, OpenSlashRuns, SlashRunChange,
-                SLASH_ANALYSIS_WINDOW,
-            },
-            ZebraDb, STATE_COLUMN_FAMILIES_IN_CODE,
-        },
+        finalized_state::{disk_format::AggregatedStakes, ZebraDb, STATE_COLUMN_FAMILIES_IN_CODE},
         non_finalized_state::BondStatusInChain,
-        update_bonds_with_pos_issuance, update_chain_tip_with_delegation_bond,
+        staking_replay::StakingReplay,
     },
     BoxError, Config, HashOrHeight,
 };
@@ -118,13 +108,7 @@ pub fn fixup_aggregated_stakes(
         );
     }
 
-    // At a rule's activation height A, the live commit path burns every bond
-    // that delegated to a terminated finalizer anywhere in [A - W, A), computed
-    // from the slash index plus a replay of its unindexed tail
-    // (`Chain::slash_window_burns`). This replay starts at genesis, so it sees
-    // every delegation run directly and needs no index: closed runs are burned
-    // as they close, still-open runs are swept at activation.
-    let mut slash_rules: Vec<SlashRule> = config
+    let activations: Vec<String> = config
         .hardfork_schedule
         .rules()
         .iter()
@@ -132,23 +116,9 @@ pub fn fixup_aggregated_stakes(
             !rule.terminated_finalizers.is_empty()
                 && rule.pow_activation_height <= u64::from(tip_height.0)
         })
-        .map(|rule| {
-            let activation =
-                u32::try_from(rule.pow_activation_height).expect("at most the tip height");
-            SlashRule {
-                activation,
-                window_start: activation.saturating_sub(SLASH_ANALYSIS_WINDOW),
-                finalizers: rule.terminated_finalizers.iter().map(|f| f.0).collect(),
-                open_runs: OpenSlashRuns::new(),
-                burned: BTreeSet::new(),
-            }
-        })
+        .map(|rule| rule.pow_activation_height.to_string())
         .collect();
-    if !slash_rules.is_empty() {
-        let activations: Vec<String> = slash_rules
-            .iter()
-            .map(|rule| rule.activation.to_string())
-            .collect();
+    if !activations.is_empty() {
         println!(
             "replaying hardfork slash burns activating at height(s) {}",
             activations.join(", "),
@@ -159,7 +129,7 @@ pub fn fixup_aggregated_stakes(
         "replaying staking history from genesis to height {}",
         tip_height.0,
     );
-    let mut bonds: HashMap<BondKey, (DelegationBond, BondStatusInChain)> = HashMap::new();
+    let mut replay = StakingReplay::new(&config.hardfork_schedule);
     let mut fills: Vec<(Height, block::Hash, AggregatedStakes)> = Vec::new();
     let mut mismatches: u32 = 0;
 
@@ -174,84 +144,18 @@ pub fn fixup_aggregated_stakes(
                 .block(HashOrHeight::Height(height))
                 .ok_or_else(|| format!("no block at height {h}, below the finalized tip"))?;
 
-            // Scratch pools: `update_chain_tip_with_delegation_bond` debits
-            // unbonded amounts from the bonded pool, and the real pool values
-            // are irrelevant here, so seed enough balance that it cannot fail.
-            let mut pools: ValueBalance<NonNegative> = ValueBalance::zero();
-            pools.set_staking_bonded_amount(
-                Amount::try_from(MAX_MONEY).expect("constant is in range"),
-            );
-            let mut retargets = vec![HashMap::new()];
-
-            for (transaction_index, transaction) in block.transactions.iter().enumerate() {
-                if let Some(staking_action) = transaction.staking_action() {
-                    update_chain_tip_with_delegation_bond(
-                        &mut pools,
-                        &mut bonds,
-                        &mut retargets,
-                        staking_action,
-                        &transaction.hash(),
-                        TransactionLocation::from_usize(height, transaction_index),
-                    )?;
-
-                    // A rule's burn set is computed from the blocks strictly
-                    // below its activation, so this block feeds only the rules
-                    // still ahead of it.
-                    for rule in slash_rules
-                        .iter_mut()
-                        .filter(|rule| rule.activation > h)
-                    {
-                        for change in apply_staking_action_to_open_runs(
-                            &mut rule.open_runs,
-                            &rule.finalizers,
-                            height,
-                            staking_action.kind,
-                            staking_action.arg32_0,
-                            staking_action.arg32_2,
-                        ) {
-                            if let SlashRunChange::Close(key, end) = change {
-                                if end.0 > rule.window_start {
-                                    rule.burned.insert(key.bond);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if bonds
-                .values()
-                .any(|(_, status)| *status == BondStatusInChain::Active)
-            {
-                update_bonds_with_pos_issuance(POS_BLOCK_REWARD_ZATS, &mut bonds);
-            }
-
-            // The live path burns after the activation block's own staking
-            // actions and rewards (`NonFinalizedState::commit_new_chain`), so
-            // the burned bonds still collect this block's reward and this
-            // block's snapshot already excludes them.
-            for rule in slash_rules
-                .iter_mut()
-                .filter(|rule| rule.activation == h)
-            {
-                let mut burn_set = std::mem::take(&mut rule.burned);
-                for (bond, (_, start)) in rule.open_runs.iter() {
-                    if start.0 < h {
-                        burn_set.insert(*bond);
-                    }
-                }
-                burn_delegation_bonds(&mut bonds, &burn_set);
+            if let Some(slash) = replay.apply_block(height, &block)? {
                 println!(
                     "applied hardfork slash burns at height {h}: {} bond(s) burned for {} \
                      terminated finalizer(s)",
-                    burn_set.len(),
-                    rule.finalizers.len(),
+                    slash.burned.len(),
+                    slash.finalizers.len(),
                 );
             }
         }
 
         let mut stakes_by_finalizer: HashMap<[u8; 32], u64> = HashMap::new();
-        for (bond, status) in bonds.values() {
+        for (bond, status) in replay.delegation_bonds.values() {
             if *status == BondStatusInChain::Active {
                 let amount: u64 = bond.amount.into();
                 *stakes_by_finalizer.entry(bond.target_finalizer).or_insert(0) += amount;
@@ -326,16 +230,6 @@ pub fn fixup_aggregated_stakes(
         fills.len(),
     );
     Ok(())
-}
-
-/// One hardfork slash rule active within the replay range, with the delegation
-/// runs on its terminated finalizers tracked from genesis.
-struct SlashRule {
-    activation: u32,
-    window_start: u32,
-    finalizers: BTreeSet<[u8; 32]>,
-    open_runs: OpenSlashRuns,
-    burned: BTreeSet<BondKey>,
 }
 
 fn format_stakes(stakes: &[([u8; 32], u64)]) -> String {
