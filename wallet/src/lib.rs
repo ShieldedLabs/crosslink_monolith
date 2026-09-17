@@ -166,6 +166,28 @@ impl BlockHeight {
             *self
         }
     }
+    /// Confirmations of something at this height when the chain tip is `tip`, counted inclusively
+    /// as zcashd and librustzcash do: the tip block itself has 1. 0 if it is not in a block at or
+    /// below `tip`.
+    pub fn confirmations(&self, tip: BlockHeight) -> u32 {
+        if self.is_in_block() && tip.is_in_block() && self.0 <= tip.0 {
+            tip.0 - self.0 + 1
+        } else {
+            0
+        }
+    }
+}
+
+/// Confirmations (see [`BlockHeight::confirmations`]) a note needs before the wallet spends it or
+/// reports it as spendable, and a transaction needs before the GUI shows it as confirmed.
+pub const SPENDABLE_CONFIRMATIONS: u32 = 3;
+
+impl ManualWallet {
+    /// The tip that confirmations are counted against. The wallet can only witness notes in blocks
+    /// it has scanned, so this trails the network tip while it catches up.
+    pub fn confirmations_tip(&self) -> BlockHeight {
+        self.chain_tip_h.min(self.sync_h)
+    }
 }
 impl From<LRZBlockHeight> for BlockHeight {
     fn from(h: LRZBlockHeight) -> BlockHeight {
@@ -1695,9 +1717,10 @@ impl ManualWallet {
                     // - not too close to tip (reduced probability of loss through reorg)
                     // - spendable note heights (must be higher than all needed)
                     //   - more notes needed if fees change -> change in anchor
-                    // Checkpoints only exist for blocks the wallet has scanned, so the anchor
-                    // has to trail the *scanned* height, not the network tip.
-                    orchard_anchor_h = self.chain_tip_h.min(self.sync_h).sat_sub(1);
+                    // The newest block whose notes are spendable, so every spendable note has a
+                    // witness here. Balances use the same rule, so what they report as spendable
+                    // is exactly what this can spend.
+                    orchard_anchor_h = self.confirmations_tip().sat_sub(SPENDABLE_CONFIRMATIONS - 1);
                     orchard_anchor = match shardtree.root_at_checkpoint_id(&orchard_anchor_h).expect("Infallible MemoryShardStore") {
                         Some(root) => orchard::Anchor::from(root),
                         None => {
@@ -1944,7 +1967,7 @@ impl ManualWallet {
                         shuffled_notes.shuffle(&mut OsRng);
 
                         for &note in &shuffled_notes {
-                            if note.recv_h > orchard_anchor_h { continue; }
+                            if note.recv_h.confirmations(self.confirmations_tip()) < SPENDABLE_CONFIRMATIONS { continue; }
 
                             let witness = match tree.witness_at_checkpoint_id(note.position, &orchard_anchor_h) {
                                 // NOTE: presumably can fail from too-recent note
@@ -4627,7 +4650,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
             for note in &miner_wallet.accounts[0].unspent_orchard_notes {
                 let val = note.note.value().inner();
-                if note.recv_h < miner_wallet.chain_tip_h.sat_sub(5) {
+                if note.recv_h.confirmations(miner_wallet.confirmations_tip()) >= SPENDABLE_CONFIRMATIONS {
                     miner_shielded_spendable_funds += val;
                 } else {
                     miner_shielded_pending_funds += val;
@@ -4672,7 +4695,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 let val = note.note.value().inner();
                 if committed_nfs.contains(&note.nf) {
                     user_shielded_committed_funds += val;
-                } else if note.recv_h < user_wallet.chain_tip_h.sat_sub(5) {
+                } else if note.recv_h.confirmations(user_wallet.confirmations_tip()) >= SPENDABLE_CONFIRMATIONS {
                     user_shielded_spendable_funds += val;
                 } else {
                     user_shielded_pending_funds += val;
@@ -5246,3 +5269,22 @@ impl ServerCertVerifier for DerVerifier {
     }
 }
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirmations_count_the_tip_block() {
+        let tip = BlockHeight(100);
+        assert_eq!(BlockHeight(100).confirmations(tip), 1);
+        assert_eq!(BlockHeight(98).confirmations(tip), SPENDABLE_CONFIRMATIONS);
+        assert_eq!(BlockHeight(101).confirmations(tip), 0);
+        assert_eq!(BlockHeight::MEMPOOL.confirmations(tip), 0);
+        assert_eq!(BlockHeight(0).confirmations(BlockHeight::INVALID), 0);
+        // The anchor is the newest block whose notes are spendable.
+        let anchor = tip.sat_sub(SPENDABLE_CONFIRMATIONS - 1);
+        assert_eq!(anchor.confirmations(tip), SPENDABLE_CONFIRMATIONS);
+        assert_eq!(BlockHeight(anchor.0 + 1).confirmations(tip), SPENDABLE_CONFIRMATIONS - 1);
+    }
+}

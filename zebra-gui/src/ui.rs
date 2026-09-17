@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::cell::RefCell;
 //use clay::*; // @Temporary
 use FontKind::Normal;
-use wallet::{ BlockHeight, TxParts, TxStatus, WalletState, WalletTxKind, WalletTxPart, WalletRosterMember, FinalizerFilters, FinalizerRecencyStatus, str_from_ctaz };
+use wallet::{ BlockHeight, SPENDABLE_CONFIRMATIONS, TxParts, TxStatus, WalletState, WalletTxKind, WalletTxPart, WalletRosterMember, FinalizerFilters, FinalizerRecencyStatus, str_from_ctaz };
 
 use super::*;
 
@@ -3021,13 +3021,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         }) {
                             let mut error_text_buf = String::new();
                             let (text_colour, mut icon_colour, status_icon, tooltip) = {
-                                let CONFIRMATIONS_THRESHOLD = 3;
-
-                                let confirmations_n = if viz.bc_tip_height >= tx_h.0 as u64 {
-                                    viz.bc_tip_height - tx_h.0 as u64
-                                } else {
-                                    0
-                                };
+                                let confirmations_n = tx_h.confirmations(BlockHeight(viz.bc_tip_height as u32));
 
                                 pub const RED:  (u8, u8, u8, u8) = (255, 64, 67, 0xff);      /* @todo colors */
                                 pub const BLUE: (u8, u8, u8, u8) = (0x33, 0x88, 0xde, 0xff); /* @todo colors */
@@ -3035,10 +3029,10 @@ pub fn ui_left_pane(ui: &mut Context,
                                     TxStatus::OnBc => {
                                         if tx_h.0 as u64 <= viz.bc_finalized_tip_height { // finalized
                                             (WHITE, BLUE,  DOUBLE_ICON_OK_CIRCLED_1, "This transaction is in a finalized block.")
-                                        } else if tx_h.0 as u64 + CONFIRMATIONS_THRESHOLD <= viz.bc_tip_height { // confirmed
-                                            (WHITE, WHITE, DOUBLE_ICON_OK_CIRCLED2_1, &format!("Confirmations: {}/3", confirmations_n).to_string() as &str)
+                                        } else if confirmations_n >= SPENDABLE_CONFIRMATIONS { // confirmed
+                                            (WHITE, WHITE, DOUBLE_ICON_OK_CIRCLED2_1, &format!("Confirmations: {}/{}", confirmations_n, SPENDABLE_CONFIRMATIONS).to_string() as &str)
                                         } else if tx_is_in_block {
-                                            (WHITE, WHITE, ICON_OK_CIRCLED2_1, &format!("Confirmations: {}/3", confirmations_n).to_string() as &str)
+                                            (WHITE, WHITE, ICON_OK_CIRCLED2_1, &format!("Confirmations: {}/{}", confirmations_n, SPENDABLE_CONFIRMATIONS).to_string() as &str)
                                         } else if tx_h == BlockHeight::MEMPOOL {
                                             (WHITE, WHITE, ICON_EYE_1, "This transaction is in the mempool waiting to be mined.")
                                         } else if tx_h == BlockHeight::SENT {

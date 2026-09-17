@@ -1178,18 +1178,17 @@ pub struct ScanBond {
 
 /// What `wallet_basic_send` can draw on right now, and where to send it.
 ///
-/// `spendable_zats` is a floor, not an exact predicate. It counts notes at least six blocks
-/// behind the tip, while the transaction builder anchors at `tip - 1` and so may also spend
-/// notes reported here as pending. A send of `spendable_zats` (less the fee) therefore has the
-/// funds it needs, but a larger one can still succeed.
+/// A note is spendable once it has `SPENDABLE_CONFIRMATIONS` (3) confirmations, counted inclusively
+/// (a note in the tip block has 1) against the lower of the chain tip and the wallet's scanned
+/// height. The transaction builder uses the same rule, so a send of `spendable_zats` (less the fee)
+/// has the funds it needs and a larger one does not.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WalletSpendableFunds {
     /// The wallet's own unified address, the destination other wallets pay to.
     pub address: std::string::String,
     /// Shielded value that can be spent now.
     pub spendable_zats: u64,
-    /// Shielded value received too recently to count toward `spendable_zats`. The builder may
-    /// still draw on it, since it anchors at `tip - 1`.
+    /// Shielded value with too few confirmations to spend yet.
     pub pending_zats: u64,
     /// Shielded value whose notes are already consumed by a send of ours that has been built
     /// or broadcast but not yet seen in a block. Counted here rather than in `spendable_zats`
