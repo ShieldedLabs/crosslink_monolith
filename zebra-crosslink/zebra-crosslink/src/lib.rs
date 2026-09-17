@@ -1651,10 +1651,17 @@ async fn total_issuance_from_key(
     first_height: ZebBlockHeight,
     last_height: ZebBlockHeight,
 ) -> Result<Vec<ScanInfo>, String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use futures::StreamExt;
+    use wallet::scanner::{PROF, timed};
+
     let call = internal_handle.call.clone();
+    let t_wall = std::time::Instant::now();
+    PROF.reset();
 
     let mut delegation_bonds = HashMap::new();
     let mut utxos_per_ufvk = vec![HashSet::<(PubKeyID, u32)>::new(); ufvks.len()]; // NOTE: hashsets here are grow-only
+    let mut t_spend_per_ufvk = vec![false; ufvks.len()];
 
     let mut scan_infos = Vec::<ScanInfo>::with_capacity(ufvks.len());
     let mut scan_ctxs = Vec::<wallet::scanner::ScanCtx>::with_capacity(ufvks.len());
@@ -1667,20 +1674,36 @@ async fn total_issuance_from_key(
             return Err("could not create orchard ovks".to_owned());
         };
 
-        let Some((t_addr, _p2sh, _ua)) = wallet::addrs_from_ufvk(ufvk, 0) else{
+        let Some((t_addr, t_addr_p2sh, _ua)) = wallet::addrs_from_ufvk(ufvk, 0) else{
             return Err("Could not get an address".to_owned());
         };
 
-        scan_ctxs.push(wallet::scanner::ScanCtx { ufvk: ufvk.clone(), t_addr, orchard_external_ovk, orchard_internal_ovk });
+        scan_ctxs.push(wallet::scanner::ScanCtx::new(ufvk.clone(), t_addr, t_addr_p2sh, orchard_external_ovk, orchard_internal_ovk));
     }
 
-    for height in first_height.0..=last_height.0 {
-        // let tz = wallet::Timer::scope_("scan height", true);
-        println!("scanning height {height}");
-        let res = (call.state)(StateRequest::Block(ZebBlockHeight(height).into())).await;
+    // Blocks are requested PREFETCH ahead through the concurrent ReadStateService, so the rocksdb
+    // reads and zebra deserialization of the next blocks overlap with scanning this one. The
+    // fetch bucket then measures the stall waiting for a block, not the read itself.
+    const PREFETCH: usize = 16;
+    let read_state = call.read_state.clone();
+    let mut blocks = std::pin::pin!(futures::stream::iter(first_height.0..=last_height.0)
+        .map(move |height| {
+            let read_state = read_state.clone();
+            async move { (height, (read_state)(StateReadRequest::Block(ZebBlockHeight(height).into())).await) }
+        })
+        .buffered(PREFETCH));
+
+    loop {
+        let t_fetch = std::time::Instant::now();
+        let Some((height, res)) = blocks.next().await else { break };
+        PROF.fetch_ns.fetch_add(t_fetch.elapsed().as_nanos() as u64, Relaxed);
+        PROF.blocks.fetch_add(1, Relaxed);
+        if height % 1000 == 0 {
+            println!("scanning height {height}");
+        }
         let block = match res {
-            Ok(StateResponse::Block(Some(block))) => block,
-            Ok(StateResponse::Block(None)) => return Err(format!("failed to get block at height {height}")),
+            Ok(StateReadResponse::Block(Some(block))) => block,
+            Ok(StateReadResponse::Block(None)) => return Err(format!("failed to get block at height {height}")),
             _ => return Err(format!("unexpectedly failed to get block at height {height}: {res:?}")),
         };
 
@@ -1688,45 +1711,80 @@ async fn total_issuance_from_key(
             return Err(format!("block at height {height} had 0 transactions"));
         }
 
-
-
         for (tx_i, tx) in block.transactions.iter().enumerate() {
-            let coinbase_tx_bytes = match tx.zcash_serialize_to_vec() {
-                Ok(tx) => tx,
-                Err(err) => return Err(format!("failed to serialize coinbase tx at height {height}: {err:?}")),
+            PROF.txs.fetch_add(1, Relaxed);
+            let is_coinbase = tx.is_coinbase();
+            if tx_i == 0 && ! is_coinbase {
+                return Err(format!("no coinbase found at height {height}"));
+            }
+
+            // The transparent pass reads zebra's already-decoded inputs and outputs. The txid is
+            // hashed only when an output is ours, at most once per tx across the ufvks.
+            let mut txid_memo: Option<[u8; 32]> = None;
+            let mut txid = || *txid_memo.get_or_insert_with(|| timed(&PROF.txid_ns, || tx.hash().0));
+            for (ufvk_i, scan_ctx) in scan_ctxs.iter().enumerate() {
+                let inputs = tx.inputs().iter().filter_map(|input| match input {
+                    zebra_chain::transparent::Input::PrevOut { outpoint, .. } => Some((outpoint.hash.0, outpoint.index)),
+                    _ => None,
+                });
+                let outputs = tx.outputs().iter().map(|output| output.lock_script.as_raw_bytes());
+                let scan_info = &mut scan_infos[ufvk_i];
+                let utxos = &mut utxos_per_ufvk[ufvk_i];
+                match timed(&PROF.transparent_ns, || wallet::scanner::scan_tx_transparent(scan_info, utxos, scan_ctx, height, is_coinbase, inputs, outputs, &mut txid)) {
+                    Ok((new_info, contains_my_t_spend)) => {
+                        t_spend_per_ufvk[ufvk_i] = contains_my_t_spend;
+                        if new_info {
+                            println!("scan info at {height}: {scan_info:?}");
+                        }
+                    }
+                    Err(err) => return Err(format!("failed to scan tx {tx_i} at height {height}: {err}")),
+                }
+            }
+
+            // Only staking txs need the librustzcash view (bond terms, Orchard trial decryption).
+            let staking_action = tx.staking_action();
+            let parsed = if staking_action.is_some() {
+                PROF.staking.fetch_add(1, Relaxed);
+                let tx_bytes = match timed(&PROF.serialize_ns, || tx.zcash_serialize_to_vec()) {
+                    Ok(bytes) => bytes,
+                    Err(err) => return Err(format!("failed to serialize tx {tx_i} at height {height}: {err:?}")),
+                };
+                match timed(&PROF.parse_ns, || wallet::scanner::parse_tx(&tx_bytes, height)) {
+                    Ok(parsed) => Some(parsed),
+                    Err(err) => return Err(format!("failed to parse tx {tx_i} at height {height}: {err}")),
+                }
+            } else {
+                None
             };
 
-
-            let txid = tx.unmined_id().mined_id();
-
-            if let Some(staking_action) = tx.staking_action() {
+            if let (Some(staking_action), Some((_, txid_lrz))) = (staking_action, &parsed) {
+                debug_assert_eq!(*txid_lrz, tx.hash().0, "txids from zebra/librustzcash disagree");
                 let mut bond_retargets = vec![HashMap::new()];
                 // Note(Sam): It seems weird that the bonds never get deleted. I don't know what I was
                 // thinking when I did that. But it makes this code easy.
-                zebra_state::update_chain_tip_with_delegation_bond(
+                let _ = timed(&PROF.replay_ns, || zebra_state::update_chain_tip_with_delegation_bond(
                     &mut zebra_chain::value_balance::ValueBalance::zero(),
                     &mut delegation_bonds,
                     &mut bond_retargets,
-                    &staking_action,
-                    &txid.0.into(),
+                    staking_action,
+                    &zebra_chain::transaction::Hash(*txid_lrz),
                     zebra_state::TransactionLocation {
                         height: ZebBlockHeight(height),
                         index: zebra_state::TransactionIndex::from_index(tx_i.try_into().unwrap()),
                     }
-                );
+                ));
             }
 
             if delegation_bonds.values().any(|(_, status)| *status == zebra_state::BondStatusInChain::Active) {
-                zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds);
+                timed(&PROF.replay_ns, || zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds));
             }
 
-            for (ufvk_i, scan_ctx) in scan_ctxs.iter().enumerate() {
-                let utxos = &mut utxos_per_ufvk[ufvk_i];
-                let scan_info = &mut scan_infos[ufvk_i];
-                match wallet::scanner::scan_tx(scan_info, utxos, &coinbase_tx_bytes, tx_i, height, scan_ctx, txid.0) {
-                    Ok(false) => {},
-                    Ok(true) => println!("scan info at {height}: {scan_info:?}"),
-                    Err(err) => return Err(format!("failed to scan {txid:?} at height {height}: {err}")),
+            if let Some((tx_lrz, txid_lrz)) = &parsed {
+                for (ufvk_i, scan_ctx) in scan_ctxs.iter().enumerate() {
+                    let scan_info = &mut scan_infos[ufvk_i];
+                    if wallet::scanner::scan_tx_staking(scan_info, tx_lrz, *txid_lrz, t_spend_per_ufvk[ufvk_i], height, scan_ctx) {
+                        println!("scan info at {height}: {scan_info:?}");
+                    }
                 }
             }
         }
@@ -1752,6 +1810,7 @@ async fn total_issuance_from_key(
         println!("final scan info: {scan_info:?}");
     }
 
+    PROF.report(t_wall.elapsed());
     Ok(scan_infos)
 }
 
