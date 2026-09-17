@@ -130,6 +130,21 @@ hazard record, which carries `bc_best` and the `fin` history back to the last up
 an ancestor of `N`. `fin` is therefore a node-local time series, not a pure function of the
 current tip.
 
+The Book's
+[Local fin-depth lemma](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L490-L495)
+bounds where that series can be:
+
+```text
+for node i honest at time t, there is a time r ≤ t with fin_i^t ⪯ prune_σ(bc_best_i^r)
+```
+
+Take `r` as the last time `fin` changed, or genesis if it never has. At `r > 0`, `fin` was set
+to `candidate(bc_best^r)`, and `candidate(H) ⪯ prune_σ(H)` because an lca is an ancestor of
+both of its arguments. At genesis both sides are `O_bc`, since pruning `O_bc` yields `O_bc`. The
+Book combines the lemma with `Π_bc` Prefix Agreement at depth `σ` to argue Assured Finality; that
+use is why `candidate` clamps to `prune_σ(H)` rather than using `snapshot(LF(H))` alone
+([line 513](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L513)).
+
 Assured Finality requires honest nodes' `fin` values at arbitrary times to be
 prefix-compatible. It does not require those values to be equal at the same wall-clock time.
 
@@ -422,7 +437,7 @@ condition, and hold wherever protocol `fin` is computed, which this tree does no
   written. Its observable counterpart is a refused switch, meaning a chain in view with more
   work than `current` that excludes `fin`.
 - The rule selects a different chain from raw work-based fork choice only when a chain with
-  more work than `current` excludes `fin`. By the Local fin-depth lemma, `fin` was part of
+  more work than `current` excludes `fin`. By the Local fin-depth lemma (§3.2), `fin` was part of
   `prune_σ` of this node's best chain at some earlier time. The raw choice in that situation
   would displace a prefix that was `σ`-confirmed in the node's own earlier best chain. Where no such chain is in view, the two
   rules select the same chain.
@@ -522,7 +537,7 @@ preferred over brittle working tree line numbers.
 
 `zebra-crosslink/zebra-crosslink/src/lib.rs` defines
 `TFLServiceInternal::latest_final_block: Option<(ZebBlockHeight, ZebBlockHash)>`. It is assigned
-by:
+only by `set_final_block`, which also sends the new value on `final_change_tx`. Its callers are:
 
 - `handle_new_decided_bft_block`, after inserting the BFT block;
 - `tfl_service_main_loop`, when restoring the last entry from the PoS store; and
@@ -547,10 +562,10 @@ state.
 
 ### 5.2 Irreversible commitment and ordering
 
-`handle_new_decided_bft_block` assigns `latest_final_block` before it sends
+`handle_new_decided_bft_block` assigns and publishes `latest_final_block` before it sends
 `zebra_state::Request::CrosslinkFinalizeBlock`. The request is retried indefinitely after an
-error. During that interval, RPC and GUI readers can observe a marker whose database state has
-not been finalized.
+error. During that interval, RPC and GUI readers and notification subscribers can observe a
+marker whose database state has not been finalized.
 
 The state behavior depends on whether the hash is known:
 
@@ -558,8 +573,15 @@ The state behavior depends on whether the hash is known:
   `NonFinalizedState::crosslink_finalize` retains the chain containing a known side-chain hash,
   so finalizing that hash can make the side chain canonical before blocks are committed by
   `WriteBlockWorkerTask::handle_crosslink_finalize`.
-- an unknown hash produces an error; the Crosslink caller then keeps retrying and can remain in
-  that loop indefinitely.
+- a hash the state does not know never reaches the request. `handle_new_decided_bft_block`
+  first asserts that `validate_bft_block` passes, and validation returns `Indeterminate`
+  (`NeedsBlock`) when `KnownBlock` cannot resolve `headers[0]`, so the assertion panics and,
+  under `panic = abort`, the node exits. The retry loop runs only for a hash known at that
+  point; if the chain holding it is then dropped from the non-finalized state before the request
+  succeeds, the loop can retry indefinitely.
+- the PoS-store restore path unwraps the same `KnownBlock` lookup for the last stored BFT block,
+  so a finalized database that is behind the PoS store, for example one wiped and re-syncing,
+  panics at startup. The replay-watermark loop just above it tolerates that case.
 
 Consequently, the stored marker is neither a reliable `fin` implementation nor a reliable
 `state_commit_tip`. A physical commit marker must advance only after the state request
@@ -595,10 +617,11 @@ same value by another route rather than by reading the slot:
 
 By actual reads, the widest consumer of the slot is the visualizer, not consensus.
 
-`TFLServiceInternal::final_change_tx` is created and
-`TFLServiceRequest::FinalBlockRx` returns subscribers. The RPC notification methods wait on
-those receivers, but no `final_change_tx.send(...)` site exists in this tree. This
-surface is incomplete: a waiter can remain blocked even when the marker changes.
+`TFLServiceRequest::FinalBlockRx` returns subscribers to `TFLServiceInternal::final_change_tx`,
+and the RPC notification methods in `zebra-crosslink/zebra-rpc/src/methods.rs` wait on them.
+Every `set_final_block` call sends on that channel, so a notification carries the same
+overloaded value at the same moments: on the decide path before `CrosslinkFinalizeBlock`
+succeeds, on PoS-store restore, and through the testing setter.
 
 ### 5.4 Current staking rewards
 
@@ -655,13 +678,14 @@ Any future consensus change must keep all three paths identical.
 - **Four sites derive the marker from `headers.first()`**, not three: the decide path, the BFT
   validation path, the PoS-store restore path, and — separately — the historical replay
   watermark `prev_finalized_bc_height` computed during restore. `BftBlock::finalization_candidate()`
-  is a fifth accessor with the same convention. The replay watermark is the one that makes a
-  change of derivation costly; see §9.4.
-- **Mixed conventions in the improvement test.** `is_improved_final` compares the candidate
-  height, a snapshot height, against the stored marker, which is a snapshot height plus one. A
-  new proposal is therefore admitted only when the snapshot advances by two or more blocks. The
-  test runs before the `+40` clamp is applied, so the clamp does not affect this conclusion.
-  The mismatch is a direct consequence of the off-by-one and disappears with it.
+  is a fifth accessor with the same convention, and `viz2.rs` repeats the derivation for the GUI
+  and for `VizScene`. The replay watermark is the one that makes a change of derivation costly;
+  see §9.4.
+- **The improvement test encodes the same convention.** `is_improved_final` compares
+  `proposed_final_height`, the anchor plus one, against the stored marker, so every new PoW
+  block is proposable at once. That `+ 1` is the `headers[0]` convention and changes with it.
+  The test runs before the `+40` clamp. The clamp can only lower the anchor to `marker + 40`,
+  so it never turns an admitted proposal into a non-improving one.
 - **Missing monotonicity and hazard record.** All marker writes are unconditional. There is no
   `fin ⪯ candidate` guard and no distinction between a benign candidate regression and a
   conflicting-candidate safety incident.
@@ -725,10 +749,11 @@ still the legacy-fed slot, not `fin`.
 
 ### 6.6 Ordering and notification
 
-- The visible marker advances before irreversible state commitment succeeds.
-- A known side-chain hash can change the canonical branch; an unknown hash can retry forever.
+- The visible marker advances, and `FinalBlockRx` subscribers are notified, before irreversible
+  state commitment succeeds.
+- A known side-chain hash can change the canonical branch. A hash unknown to state panics the
+  decide path; a hash whose chain is dropped after validation can retry forever (§5.2).
 - `current_bc_final` is unused duplicate state.
-- `FinalBlockRx` has subscribers but no publisher send site.
 
 ## 7. Proposed names and consumer decision matrix
 
@@ -784,8 +809,9 @@ writers already implement CL2:
    `tfl_final_block_height_hash_pre_locked` then have no callers and were deleted with it.
 2. Add a distinct successful-commit marker if callers need to report database finalization;
    update it only after `CrosslinkFinalizeBlock` succeeds.
-3. Either publish `FinalBlockRx` changes at the documented transition point or remove the dead
-   notification API in separate code work.
+3. **Done in part.** `set_final_block` publishes every marker write on `FinalBlockRx`. The send
+   sits at the marker write, before state commitment and without the public-finality contract
+   of §7; it moves to the documented transition point once that point is chosen.
 4. Rename the main-loop `current_bc_tip` local to `bc_best_tip`.
 5. Rename `latest_final_block` and document what feeds it.
 
