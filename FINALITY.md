@@ -639,13 +639,17 @@ The rule is implemented through the finalized database rather than as a separate
   `zebra-state`, where bc-block validity, bft-block validity, and roster computation run in one
   synchronous domain with no asynchronous calls between them.
 - Zebra also commits the root of the best chain to the finalized database once the chain is
-  longer than `MAX_BLOCK_REORG_HEIGHT` (99, from `zcash_protocol::consensus`, applied in
-  `zebra-state/src/service/write.rs`). Chains forking below that point are no longer in view.
+  longer than `MAX_BLOCK_REORG_HEIGHT` (from `zcash_protocol::consensus`, applied in
+  `zebra-state/src/service/write.rs`). The value in this tree is 99. Upstream Zebra raised it to
+  999, and that change was lost when this tree was rebased onto new Zebra, so 999 is the intended
+  value; the depths of 99 written elsewhere in this document follow the tree. Chains forking below that point are no longer in view.
   On a Zebra node the effective floor is the higher of `fin` and that depth-committed block.
   If `bc_best` runs more than that depth past the point where the chain to `bft_final_snapshot`
   forks from it, the depth commit writes a block that conflicts with `bft_final_snapshot`. The
   node can then never switch to the finalized chain, and under Linearity and Last Final
-  Snapshot its own branch never finalizes again (§9.2).
+  Snapshot its own branch never finalizes again. The node stops following the chain to
+  `bft_final_snapshot` at that point, which also ends its bft-block validation until it
+  resyncs. Implementations annotate that code path with a comment saying so.
 
 Sticky fork choice and Linearity constrain different points. Sticky fork choice keeps `fin` on
 `bc_best`; Linearity keeps each final snapshot on or after the previous one. `fin` lies at or
@@ -823,8 +827,8 @@ Any future consensus change must keep all three paths identical.
   validation path, the PoS-store restore path, and — separately — the historical replay
   watermark `prev_finalized_bc_height` computed during restore. `BftBlock::finalization_candidate()`
   is a fifth accessor with the same convention, and `viz2.rs` repeats the derivation for the GUI
-  and for `VizScene`. The replay watermark is the one that makes a change of derivation costly;
-  see §9.2.
+  and for `VizScene`. The replay watermark recomputes the old derivation from stored records, which is
+  one reason stores written under it are deleted rather than loaded (§8.1).
 - **The improvement test encodes the same convention.** `is_improved_final` compares
   `proposed_final_height`, the anchor plus one, against the stored marker, so every new PoW
   block is proposable at once. That `+ 1` is the `headers[0]` convention and changes with it.
@@ -929,7 +933,8 @@ default for "confirmed" presentation. Each consumer needs a contract:
 | confirmed display | `bc_best_tip` at a stated confirmation depth | `Π_bc` confirmation only; can be an ancestor of `local_finalized_tip`, or conflict with it after a Prefix Consistency failure (§3.3); never present it as final |
 | final display | `local_finalized_tip` | node-local monotone CL2 view |
 | `get_tfl_final_block_hash` and `get_tfl_final_block_height_and_hash` | `local_finalized_tip` | partly implemented: they now return no value when the marker is absent, but when present it is still the legacy-fed slot, and the checkpoint/recency exposure condition of §6.5 does not exist |
-| block/transaction status | unresolved API contract | define distinct `Confirmed` and `Finalized` states before routing either |
+| block status | `local_finalized_tip` and `bc_best_tip` | `Finalized` if the block is an ancestor of or equal to `local_finalized_tip`; `InBestChain { confirmations }` if it is on `bc_best` above that; `NotInBestChain` otherwise, including unknown blocks |
+| transaction status | status of the block containing it | the block status of its mined block under the same three states; a mempool transaction has no block status |
 | finality-change notifications | `local_finalized_tip` transitions | publish only after the chosen public-finality contract is met |
 | visualization paging | operational paging cursor | do not overload a finality value merely to bound a window |
 | canonical state activation | `fin` | sticky fork choice floor (§4.3) |
@@ -1010,7 +1015,10 @@ The behavior changes that follow the mechanical steps are:
   (§4.3);
 - move the Proof-of-Stake logic into `zebra-state`, so that bc-block validity, bft-block
   validity, and roster computation share one synchronous domain; and
-- report a refused switch on stdout (§4.3).
+- report a refused switch on stdout (§4.3);
+- remove `finalization_gap_bound` (§8.1); and
+- mark with an `@Todo` where the client exposure condition of §3.5 applies, without
+  implementing it.
 
 ### 8.1 Implementation pitfalls
 
@@ -1033,8 +1041,12 @@ These hold for any change to how the marker is derived, stored, or consumed.
   activation height, so under `parent(headers_bc[0])` its snapshot, and the roster for BFT
   height 1, is one block below that height.
 - **A derivation change is a network-wide consensus change.** Nodes running two derivations
-  disagree on the finalized block and on the roster. Existing PoS-store records carry roster
-  bytes computed under the old derivation and are read back verbatim (§9.2).
+  disagree on the finalized block and on the roster. PoS stores and databases written under
+  the old derivation are deleted, not migrated. A PoS-store record
+  holds the `BftBlock`, the fat pointer, `finalizers_at_current_height`, and the proposal
+  signatures; restore reads the roster bytes back verbatim and recomputes the replay watermark
+  `prev_finalized_bc_height` from `headers.first()`, so an old store loaded by new code yields
+  rosters that disagree with the stored votes, which travel by roster index.
 - **`fin` moves only forward.** `candidate(bc_best)` falls below `fin` after a benign reorg
   (§3.2), and `WriteBlockWorkerTask::handle_crosslink_finalize` returns success for a hash the
   database already holds, so a caller that stores whatever it committed can move `fin`
@@ -1078,16 +1090,22 @@ These hold for any change to how the marker is derived, stored, or consumed.
 - **The `+40` candidate clamp breaks honest proposal (§6.2).** Without it, one bft-block's
   snapshot can advance by any number of bc-blocks, so the commit, the roster lookup, and
   `terminated_finalizers_at` each handle steps of any size.
+- **Block status never reports `bft_final_snapshot` as finalized.** A block at or below
+  `bft_final_snapshot` but above `local_finalized_tip` is `InBestChain` or `NotInBestChain`,
+  because `fin` is the view Assured Finality covers (§2).
 - **`σ` comes from `ZcashCrosslinkParameters`.** The GUI's `apply_viz_op` hardcodes it as
   `TMP_SIGMA`, which matches only while `PROTOTYPE_PARAMETERS` is unchanged.
-- **Removing `finalization_gap_bound` changes the test format.** `test_format.rs` serializes it
-  as the second parameter value, so existing `.zeccltf` files in `crosslink-test-data` need
-  regenerating or a compatible reader.
+- **Removing `finalization_gap_bound` changes the test format.** The field is the Book's `L` in
+  `ZcashCrosslinkParameters`, and `test_format.rs` serializes it as the second parameter value.
+  It is removed, and the `.zeccltf` files in `crosslink-test-data` are regenerated where a test
+  generates them and deleted otherwise.
 - **Crosslink node tests run without `viz_gui`.** Every node test in `zebrad/tests/crosslink.rs`
   panics in winit when that feature is enabled, and `phargo.bat` enables it, so those tests run
   under plain cargo without the feature.
 
 ## 9. Open decisions
+
+Payout design belongs to separate work, recorded here for context.
 
 ### 9.1 Objective reward trigger and reward economics
 
@@ -1132,37 +1150,6 @@ The choice of objective trigger does not depend on resolving the amount formula.
 the amount decision must not obscure the already-settled requirement that a consensus trigger
 be replayable from the chain alone. Detailed reward economics should live in a separate
 decision document once a concrete policy is proposed.
-
-### 9.2 Remaining protocol choices
-
-- Remove `finalization_gap_bound` from `ZcashCrosslinkParameters` and the test format, or
-  re-document it as unused; its doc comment still describes Stalled Mode.
-- Choose between PoS-store migration and replay rules for the one-block snapshot shift; replay
-  rules are the minimum. The PoS store record is not a serialized `BftBlock`
-  alone: each record appends the block, the fat pointer, `finalizers_at_current_height`, and the
-  proposal signatures. The roster is marker-derived — it is the aggregated stakes that
-  `CrosslinkFinalizeBlock(hash(headers[0]))` returned — and restore reads it back verbatim
-  rather than recomputing it, so existing files carry old-derivation roster bytes that corrected
-  code will not correct. Meanwhile the replay watermark `prev_finalized_bc_height` *is*
-  recomputed from `headers.first()` during restore and feeds `terminated_finalizers_at`, whose
-  third argument is the marker height at every call site. Votes travel by roster index, so a
-  divergent roster re-indexes stored votes through seats that never voted; the code comment at
-  that site records this having already jailed and unjailed finalizers one certificate early at
-  a hardfork activation boundary. Nodes running the two derivations would also disagree about
-  which bc-block is finalized. The RocksDB side is unaffected: aggregated stakes are keyed by
-  block hash and written in the block's own batch, so both derivations' rows already exist.
-- Specify what a node does once its best chain runs more than `MAX_BLOCK_REORG_HEIGHT` past the
-  fork from the chain to `bft_final_snapshot` (§4.3). The depth commit then conflicts with
-  `bft_final_snapshot`, so the node can never switch back. Options include keeping the finalized
-  chain synced regardless, which keeps the node able to validate bft-blocks but not to finalize;
-  ceasing to follow it, which also ends its bft-block validation until it resyncs; and holding
-  the depth commit below any block that conflicts with `bft_final_snapshot`, which makes fork
-  choice follow the newest final snapshot at that depth, close to the rule the Book declines in
-  §4.1.
-- Specify the checkpoint and recency condition for exposing `fin` to clients (§3.5),
-  independently of block validity.
-- Define the block and transaction status contract, with distinct confirmed and finalized
-  states (§6.5, §7).
 
 ## 10. Source appendix
 
