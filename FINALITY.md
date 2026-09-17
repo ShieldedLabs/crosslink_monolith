@@ -3,7 +3,9 @@
 This document separates the three Crosslink 2 protocol quantities that Zebra's design retains
 from Zebra's irreversible state-commit boundary, legacy reorg-depth fallback, and
 consumer-specific meanings of "final". It records the implementation as of this revision of
-the repository and identifies decisions that must be made before consensus behavior changes.
+the repository, describes the behavior the implementation is being changed to (sticky fork
+choice, persisted `fin`, and every CL2 validity rule), and identifies the decisions that remain
+open.
 
 A companion visual explanation is in
 [`FINALITY_DIAGRAM.html`](./FINALITY_DIAGRAM.html).
@@ -72,7 +74,7 @@ has:
 
 - a **canonical-finalized policy point**, proposed here as `canonical_finalized_tip`, that
   makes only chains containing that point eligible for local activation;
-- a **physical database-commit boundary**, proposed as `state_commit_tip`, which advances only
+- a **physical database-commit boundary**, the finalized database's tip, which advances only
   after the finalized-state write has succeeded; and
 - a **legacy reorg-depth marker**, roughly `tip − MAX_BLOCK_REORG_HEIGHT`, formerly substituted
   by the finality RPCs when no Crosslink marker existed. That substitution has been removed and
@@ -85,6 +87,12 @@ Zebra implementation, irreversible state commitment instead enforces
 `canonical_finalized_tip ⪯ canonical_tip` locally. That is an additional chain-activation and
 state policy.
 
+Under sticky fork choice (§4.3) the policy floor is `fin` itself, so `canonical_finalized_tip`
+and `fin` are one quantity. Two stored values remain: `fin`, persisted in the finalized database
+as its own block hash, and the database's finalized tip, which is the higher of `fin` and the
+block Zebra commits at reorg depth. The finalized tip equals `fin` while finality lags the
+best tip by less than about `MAX_BLOCK_REORG_HEIGHT` blocks.
+
 ## 3. Crosslink 2 model
 
 ### 3.1 `snapshot`, `LF`, and `candidate`
@@ -96,10 +104,14 @@ LF(H)        := bft-last-final(H.context_bft)
 candidate(H) := lca(snapshot(LF(H)), prune_σ(H))
 ```
 
-The walk is `bc → bft → bft → bc`, followed by the last-common-ancestor clamp. In this
-prototype every entry stored in `TFLServiceInternal::bft_blocks` is already decided, so
-`bft-last-final` is currently the identity for stored entries. That storage shortcut is not a
-protocol identity.
+The walk is `bc → bft → bft → bc`, followed by the last-common-ancestor clamp.
+
+`bft-last-final(B)` is the last final ancestor of `B`, `B` included. In Zebra, `Π_bft` decides
+each bft-block individually, and a decided block is final. A bc-block's `context_bft` is a fat
+pointer, and a node resolves it only against `TFLServiceInternal::bft_blocks`, whose entries are
+all decided; a pointer that does not resolve defers the bc-block (§6.2, Extension). Every
+context a node accepts is therefore final, and `bft-last-final` is the identity on them, so
+`LF(H)` is the bft-block that `H.context_bft` points at.
 
 The clamp puts `candidate(H)` on `H`'s own chain and no later than `prune_σ(H)`. The Book says,
 “This ensures that the candidate is at least σ‑confirmed”
@@ -209,9 +221,10 @@ are:
   stops and has no bound on how much can be rolled back to `fin`.
 
 In the current Zebra prototype, the finalized-prefix policy of §4.2 locally forces
-`canonical_finalized_tip ⪯ canonical_tip`. That restores, as a chain-activation policy, a
-prefix relation that `ba_μ` provided by definition. It does not limit the finality gap, and it
-costs local liveness (§9.1).
+`canonical_finalized_tip ⪯ canonical_tip`, and sticky fork choice (§4.3) keeps `fin ⪯ bc_best`.
+Either restores, as a chain-selection policy, a prefix relation that `ba_μ` provided by
+definition. Neither limits the finality gap, and both cost local liveness whenever the dominant
+chain excludes the floor (§4.3).
 
 ### 3.4 Validity rules and honest production
 
@@ -231,6 +244,41 @@ add:
 
 - **Linearity:** `snapshot(parent(B)) ⪯bc snapshot(B)`.
 - **Tail Confirmation:** `B.headers_bc` form the `σ`-block tail of a bc-valid chain.
+
+Zebra Crosslink implements all five rules above (§6.2 lists where the current tree does not
+yet).
+
+Tail Confirmation is objective: `σ` consecutive headers ending at a bc-valid block are the tail
+of the chain that ends at that block, whatever the validator's own best chain. The Book
+separately defines what an honest proposer puts in that field.
+
+**Honest proposal.** An
+[honest proposer](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L625-L633)
+of a bft-proposal `P`:
+
+- sets `P.headers_bc` to the `σ`-block tail of its own `bc_best`, if that satisfies Linearity
+  against `P`'s parent;
+- otherwise sets `P.headers_bc` to its parent's `headers_bc`, repeating the parent's snapshot;
+  and
+- makes no proposals until its `bc_best` is at least `σ + 1` blocks long.
+
+A proposal is therefore always possible once the chain is long enough. The Linearity rationale
+[depends on that](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L610-L614):
+liveness of the underlying BFT protocol can require honest proposers to propose at a minimum
+rate. Honest proposal is a behavior, not a validity rule: a validator cannot tell whether the
+carried tail was the proposer's best chain. An
+[honest validator](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L639-L643)
+first downloads the bc-blocks for `P.headers_bc` and checks their bc-block validity.
+
+**Linearity and bc reorganizations.** Let `B` be the newest final bft-block. Linearity requires
+every later final snapshot to extend `snapshot(B)`. When a node's `bc_best` reorganizes onto a
+branch that forks below `snapshot(B)`, the tail of that branch fails Linearity, so honest
+proposers repeat `B.headers_bc`. Last Final Snapshot admits a block `H` on that branch only if
+`snapshot(LF(H))` lies on the branch, so `H` cannot cite `B` or any later final bft-block, and
+`candidate(H)` stays at or below the fork point. Finality for nodes on that branch resumes when
+a chain containing `snapshot(B)` becomes their best chain again. Under honest proposal at every
+bc-block, `snapshot(B)` sits about `σ` blocks below the proposer's tip, so a reorganization
+slightly deeper than `σ` reaches this case.
 
 The Book's informal safety argument uses Linearity and Last Final Snapshot as follows:
 
@@ -281,8 +329,8 @@ It is not a Crosslink checkpoint rule and is not enforced by `fin`. If a later b
 displaces an earlier `σ`-confirmed prefix, an argument that assumes Prefix Consistency no
 longer applies to that execution.
 
-The Book [recommends baking in a BFT checkpoint and gating client
-exposure](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L557-L562)
+The Book [recommends baking in a BFT checkpoint and withholding `fin` from
+clients](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L557-L562)
 until the checkpoint precedes `LF(bc_best)`, its snapshot precedes `fin`, and `fin` is recent.
 This is an unimplemented sync-safety recommendation, not a block-validity or consensus rule. The
 Book applies it to `fin` and `ba_μ`; here it covers `fin` only, and says nothing about exposing
@@ -351,13 +399,20 @@ enforcing node has no eligible progressing chain, local liveness must yield.
 
 Current Zebra's `CrosslinkFinalizeBlock` behavior is stronger still: it commits database state
 on the named branch and discards incompatible non-finalized branches. This makes the policy
-physical. It may be a deliberate Zebra choice, but it is not mandated by the CL2 construction
-and must be specified and analyzed separately.
+physical. The CL2 construction does not mandate it. §4.3 specifies the rule it becomes when the
+floor is `fin`.
+
+Omitting Stalled Mode changes what the policy constrains. The Book pairs raw fork choice with
+Stalled Mode, which confines a dominant unfinalizable branch to stalled blocks after `L`. Without
+it, raw fork choice lets that branch carry ordinary spends without limit, all of them past `fin`
+and unfinalizable under Linearity. A finalized-prefix policy keeps an enforcing node off such a
+branch, at the cost of that node's liveness whenever the dominant chain excludes its finalized
+point.
 
 ### 4.3 Sticky fork choice
 
-Sticky fork choice is a rule for selecting `bc_best` that never lets a node's best chain exclude
-its own `fin`. It is temporal: the result depends on the node's current best chain and its
+Sticky fork choice is the fork-choice rule Zebra Crosslink implements. It selects `bc_best` so
+that a node's best chain never excludes its own `fin`. It is temporal: the result depends on the node's current best chain and its
 current `fin`, which is node-local memory (§3.2), not only on the set of chains in view.
 
 A node holds `current`, its best chain, and `fin`. When a bc-valid chain `new` is in view, the
@@ -370,7 +425,7 @@ and ( work(new) > work(current)
 ```
 
 After every change of best chain, `fin` is updated from `candidate(bc_best)` by the rule in
-§3.2. The tiebreak is Zebra's existing one: `Chain::cmp` in
+§3.2. Equal-work chains are ordered by tip hash, which is Zebra's existing tiebreak: `Chain::cmp` in
 `zebra-state/src/service/non_finalized_state/chain.rs` orders equal-work chains by tip hash
 bytes, and `NonFinalizedState::best_chain` takes the greatest. That doc comment records that the
 Zcash protocol specification instead prefers the block received first.
@@ -513,7 +568,32 @@ current prototype, which enforces neither Linearity nor Last Final Snapshot (§6
   - *Without Linearity:* conflicting `fin` values need no Final Agreement failure; the
     partition case above is an example.
 
-#### Zebra specifics
+#### Implementation in Zebra
+
+The rule is implemented through the finalized database rather than as a separate chain filter:
+
+- On every change of `bc_best`, the node computes `N := candidate(bc_best)`. If `fin ⪯ N` and
+  `N ≠ fin`, it commits `N` through `CrosslinkFinalizeBlock` and then stores `N` as `fin`. A
+  candidate at or below `fin` changes nothing.
+- The commit discards every non-finalized chain that does not contain `N`, and Zebra rejects
+  blocks that fork below its finalized tip. Chains that exclude `fin` therefore never enter the
+  node's view, which is the switch condition above. That rejection is the refused switch; the
+  node reports it on stdout, and a persisted hazard record is future work.
+- `fin` is stored in the finalized database as its own block hash, so the floor survives a
+  restart. The database's finalized tip is the higher of `fin` and the reorg-depth commit (next
+  bullet), so finality readers take `fin`, never the finalized tip.
+- Zebra also commits the root of the best chain to the finalized database once the chain is
+  longer than `MAX_BLOCK_REORG_HEIGHT` (99, from `zcash_protocol::consensus`, applied in
+  `zebra-state/src/service/write.rs`). Chains forking below that point are no longer in view.
+  On a Zebra node the effective floor is the higher of `fin` and that depth-committed block.
+
+Sticky fork choice and Linearity constrain different points. Sticky fork choice keeps `fin` on
+`bc_best`; Linearity keeps each final snapshot on or after the previous one. `fin` lies at or
+below the newest final snapshot, so a reorganization that forks between the two is admitted by
+sticky fork choice and then leaves finality on the new branch waiting (§3.4, Linearity and bc
+reorganizations).
+
+Current tree:
 
 - The rule needs protocol `fin`, which this tree does not compute (§6.1). The current collapse
   onto a BFT-decided branch (§4.2, §6.3) is a related rule with a different floor: the stored
@@ -523,10 +603,6 @@ current prototype, which enforces neither Linearity nor Last Final Snapshot (§6
   (§5.2).
 - The prototype enforces neither Linearity nor Last Final Snapshot (§6.2), so the
   *Without Linearity* outcomes above are the ones that apply to it.
-- Zebra also commits the root of the best chain to the finalized database once the chain is
-  longer than `MAX_BLOCK_REORG_HEIGHT` (99, from `zcash_protocol::consensus`, applied in
-  `zebra-state/src/service/write.rs`). Chains forking below that point are no longer in view.
-  On a Zebra node the effective floor is the higher of `fin` and that depth-committed block.
 
 ## 5. Zebra implementation inventory
 
@@ -584,8 +660,8 @@ The state behavior depends on whether the hash is known:
   panics at startup. The replay-watermark loop just above it tolerates that case.
 
 Consequently, the stored marker is neither a reliable `fin` implementation nor a reliable
-`state_commit_tip`. A physical commit marker must advance only after the state request
-succeeds, while publication of protocol `fin` must follow the CL2 update rule.
+record of the finalized database's tip. Persisted `fin` advances only after the state request
+succeeds, and only by the CL2 update rule.
 
 ### 5.3 Consumers
 
@@ -680,7 +756,7 @@ Any future consensus change must keep all three paths identical.
   watermark `prev_finalized_bc_height` computed during restore. `BftBlock::finalization_candidate()`
   is a fifth accessor with the same convention, and `viz2.rs` repeats the derivation for the GUI
   and for `VizScene`. The replay watermark is the one that makes a change of derivation costly;
-  see §9.4.
+  see §9.2.
 - **The improvement test encodes the same convention.** `is_improved_final` compares
   `proposed_final_height`, the anchor plus one, against the stored marker, so every new PoW
   block is proposable at once. That `+ 1` is the `headers[0]` convention and changes with it.
@@ -699,12 +775,14 @@ Any future consensus change must keep all three paths identical.
 - BFT validation does not implement Linearity or Tail Confirmation. It checks that the first
   carried header's block is locally present, but does not establish that all `σ` headers form a
   valid chain with valid PoW.
-- Tail Confirmation is additionally violated by construction whenever the `+40` candidate clamp
-  in §6.1 binds. The rule requires `B.headers_bc` to be the `σ`-block tail of a bc-valid chain,
-  but under the clamp the proposal carries a mid-chain window starting at `marker + 41`, which
-  is not a tail of anything. Implementing the rule as specified would reject the prototype's own
-  proposals during catch-up, so the clamp and the rule must be reconciled before either is
-  treated as settled.
+- The proposal path departs from honest proposal (§3.4) in two ways. When the `+40` candidate
+  clamp in §6.1 binds, `headers_bc` is a window ending at `marker + 40 + σ`, not the tail of the
+  proposer's `bc_best`; the window still satisfies Tail Confirmation. When `is_improved_final`
+  fails, the path makes no proposal, where honest proposal repeats the parent's `headers_bc`.
+- Bc-block production does not follow the honest context-selection procedure (§3.4): the block
+  template's `FatPointerToBFTChainTip` request cites the newest decided bft-block whose
+  `do_not_include_until_bc_height` admits the proposed height, whatever that block's snapshot. Under Last Final Snapshot a template whose parent chain does not contain that
+  snapshot produces an invalid block.
 - The Extension rule is implemented by
   `call_from_state_to_crosslink_to_ask_about_fat_pointers`, including its defer/reject
   distinction.
@@ -719,9 +797,9 @@ prototype behavior.
 
 The documentation and implementation must separately name:
 
-- protocol `local_finalized_tip` (`fin`);
-- the Zebra policy floor `canonical_finalized_tip`; and
-- the successfully persisted `state_commit_tip`.
+- protocol `local_finalized_tip` (`fin`), which under sticky fork choice is also the Zebra
+  policy floor `canonical_finalized_tip` (§2, §4.3); and
+- the database's finalized tip, the higher of `fin` and the reorg-depth commit.
 
 ### 6.4 Unbounded finality gap
 
@@ -765,8 +843,7 @@ The protocol names should encode their definitions:
 | `candidate(H)` | `finalization_candidate` | `FinalizationCandidate` |
 | `fin` | `local_finalized_tip` | `LocalFinalizedTip` |
 
-Policy and persistence need separate names such as `canonical_finalized_tip` and
-`state_commit_tip`. The legacy reorg-depth value should keep a name that says it is a
+The database's finalized tip needs a name distinct from `fin` (§6.3). The legacy reorg-depth value should keep a name that says it is a
 reorg-depth marker, not Crosslink finality.
 
 No protocol view lies between the best tip and the finalized tip, so no CL2 quantity is a
@@ -781,9 +858,10 @@ default for "confirmed" presentation. Each consumer needs a contract:
 | block/transaction status | unresolved API contract | define distinct `Confirmed` and `Finalized` states before routing either |
 | finality-change notifications | `local_finalized_tip` transitions | publish only after the chosen public-finality contract is met |
 | visualization paging | operational paging cursor | do not overload a finality value merely to bound a window |
-| canonical state activation | `canonical_finalized_tip` policy | separate Zebra decision; not an ordinary consumer of protocol `fin` |
-| physical database status | `state_commit_tip` | advance after successful state commit |
-| staking rewards | objective per-block source | never use node-local `fin`; see §9.2 |
+| canonical state activation | `fin` | sticky fork choice floor (§4.3) |
+| physical database status | database finalized tip | higher of `fin` and the reorg-depth commit; never reported as Crosslink finality |
+| staking rewards | objective per-block source | never use node-local `fin`; see §9.1 |
+| validator roster and hardfork membership | bonds at `snapshot(B_{H−1})` | objective; see below |
 
 ### Consensus-sensitive roster and hardfork inputs
 
@@ -792,12 +870,20 @@ consensus-sensitive. They must not read node-local `fin` unless there is a proof
 validator derives the same value at the same BFT height. Prefix compatibility between honest
 `fin` values is insufficient.
 
-This remains an open design question. Candidate objective sources include `snapshot(B)` for an
-agreed BFT block, `snapshot(LF(H))`, or `candidate(H)`, but each choice needs a precise rule and
-proof. The design must state separately:
+The two quantities are separate:
 
-- which quantity selects canonical ledger state; and
-- which objective quantity selects the validator set for a given BFT height.
+- **Canonical ledger state** is selected by sticky fork choice with floor `fin` (§4.3).
+- **The validator set for BFT height `H`** (roster, voting power, and hardfork-driven
+  membership) is read from the bonds at `snapshot(B_{H−1})`, where `B_{H−1}` is the decided
+  bft-block at height `H − 1`. `Π_bft` agreement fixes `B_{H−1}`, its snapshot is a function of
+  its `headers_bc`, and the bonds at a bc-block are a function of that block's ancestry, so every
+  validator that has those blocks derives the same set. `terminated_finalizers_at` takes the
+  height of the same block.
+
+`snapshot(B_{H−1})` generally lies above `fin`, because `candidate(H) ⪯ snapshot(LF(H))` and
+`fin` advances only once a bc-block citing the bft-block is best. Its bonds are therefore
+usually read from a non-finalized chain. An honest validator has downloaded that chain while
+validating `B_{H−1}` (§3.4).
 
 ## 8. Minimal code slice after the decisions
 
@@ -807,8 +893,8 @@ writers already implement CL2:
 1. **Done.** Make the final-block accessor return only the stored Crosslink value; do not
    substitute the legacy reorg-depth marker. `tfl_reorg_final_block_height_hash` and
    `tfl_final_block_height_hash_pre_locked` then have no callers and were deleted with it.
-2. Add a distinct successful-commit marker if callers need to report database finalization;
-   update it only after `CrosslinkFinalizeBlock` succeeds.
+2. Store `fin` in the finalized database as its own block hash, updated only after
+   `CrosslinkFinalizeBlock` for that hash succeeds (§4.3).
 3. **Done in part.** `set_final_block` publishes every marker write on `FinalBlockRx`. The send
    sits at the marker write, before state commitment and without the public-finality contract
    of §7; it moves to the documented transition point once that point is chosen.
@@ -820,18 +906,22 @@ queries return `None` rather than labelling a Zebra reorg-depth point as Crossli
 regression test covering the absent and explicitly present cases has **not** been written; there
 is no test harness for these RPC methods.
 
-Step 5 is listed last because the obvious rename is not obviously correct, and the choice should
-be made from the read inventory in §5.3 rather than from the name `CrosslinkFinalizeBlock`. The
-slot is written from the same local that the state request is sent, so it is a *record of* what
-was force-finalized rather than an input to it; its actual readers are the BFT proposal path,
-the main-loop diagnostic, and the visualizer. It has no `candidate` computation, no monotonicity
-guard, and no `bc_best` update trigger, so naming it `local_finalized_tip` would assert a CL2
-quantity the code does not implement and would need a second rename once real `fin` exists.
-Whether to name it for its present role, or defer until the update trigger lands, is an open
-decision and should not be bundled with the mechanical steps above.
+Step 5 depends on step 2 and on the update trigger of §4.3. The slot is written from the same
+local that the state request is sent, so it is a *record of* what was force-finalized rather
+than an input to it; its actual readers are the BFT proposal path, the main-loop diagnostic, and
+the visualizer. It has no `candidate` computation, no monotonicity guard, and no `bc_best`
+update trigger, so naming it `local_finalized_tip` before those exist would assert a CL2
+quantity the code does not implement. Once they exist, its readers take the persisted `fin`.
 
-Computing `candidate`, changing the update trigger, enforcing validity rules, and changing
-chain eligibility or rewards are later behavior changes, not part of a semantic rename.
+The behavior changes that follow the mechanical steps are:
+
+- compute `candidate(bc_best)` and advance `fin` on every `bc_best` change, which implements
+  sticky fork choice (§4.3);
+- derive `snapshot(B)` as `parent(B.headers_bc[0])` at every site listed in §8.1;
+- enforce Last Final Snapshot, Linearity, and Tail Confirmation, and follow honest proposal and
+  honest context selection (§3.4, §6.2);
+- read the validator set for BFT height `H` from the bonds at `snapshot(B_{H−1})` (§7); and
+- report a refused switch on stdout (§4.3).
 
 ### 8.1 Implementation pitfalls
 
@@ -847,12 +937,28 @@ These hold for any change to how the marker is derived, stored, or consumed.
 - **The roster is consensus data reached through the marker.** `finalizers_at_current_height`
   is the aggregated stake set that `CrosslinkFinalizeBlock` returns for the marker hash, and
   `terminated_finalizers_at` takes the marker height. That is objective today only because
-  `Π_bft` agreement fixes the hash. Feeding node-local `fin` into either path lets validators
-  derive different rosters at the same BFT height (§7, §9.3).
+  `Π_bft` agreement fixes the hash. Once the commit target is `candidate(bc_best)`, the stakes
+  that call returns are node-local, so the validator set reads the bonds at
+  `snapshot(B_{H−1})` through its own lookup, which also covers non-finalized chains (§7).
+- **The BFT genesis snapshot moves.** Bootstrap genesis carries headers starting at the
+  activation height, so under `parent(headers_bc[0])` its snapshot, and the roster for BFT
+  height 1, is one block below that height.
 - **A derivation change is a network-wide consensus change.** Nodes running two derivations
-  disagree on the finalized block and on the roster, so it needs an activation height in the
-  hardfork schedule. Existing PoS-store records carry roster bytes computed under the old
-  derivation and are read back verbatim (§9.4).
+  disagree on the finalized block and on the roster. Existing PoS-store records carry roster
+  bytes computed under the old derivation and are read back verbatim (§9.2).
+- **`fin` moves only forward.** `candidate(bc_best)` falls below `fin` after a benign reorg
+  (§3.2), and `WriteBlockWorkerTask::handle_crosslink_finalize` returns success for a hash the
+  database already holds, so a caller that stores whatever it committed can move `fin`
+  backwards. The `fin ⪯ N` check belongs at the caller.
+- **`fin` is written no earlier than its commit.** A persisted `fin` above the finalized tip can
+  name a block that was only in non-finalized state, which does not survive a restart. Writing
+  `fin` in the commit's batch, or after it, keeps `fin` at or below the finalized tip.
+- **The database finalized tip is not `fin`.** Past `MAX_BLOCK_REORG_HEIGHT` of lag it is the
+  reorg-depth commit. RPC, GUI, and notification readers take the persisted `fin`.
+- **Last Final Snapshot constrains block templates.** A template must cite a bft-block whose
+  snapshot lies on the template's parent chain, or the mined block is invalid (§6.2).
+- **Tail Confirmation needs the whole tail.** Validation checks all `σ` carried headers and the
+  bc-validity of their blocks, which a validator may first have to download (§3.4).
 - **Reward logic has three copies.** `Chain::push` with `update_bonds_with_pos_issuance`,
   `fixup_aggregated_stakes` in `stake_fixup.rs`, and the wallet projection in `lib.rs` must
   change together (§5.4).
@@ -866,14 +972,14 @@ These hold for any change to how the marker is derived, stored, or consumed.
   `block_height_from_hash` on the decided header, so a decided block whose header is unknown to
   state terminates the process, as does every `assert!` on that path.
 - **`fin` is a time series, not a function of the tip (§3.2).** Recomputing it from
-  `candidate(bc_best)` after a restart reproduces only the current candidate. Sticky fork choice
-  (§4.3) uses `fin` as its floor, so that floor survives a restart only if `fin` is persisted.
+  `candidate(bc_best)` after a restart reproduces only the current candidate, which is why `fin`
+  is persisted.
 - **Zebra's depth commit is a second floor.** Blocks deeper than `MAX_BLOCK_REORG_HEIGHT` on the
-  best chain are written to the finalized database regardless of `fin` (§4.3, Zebra specifics).
-  Any fork-choice rule above `fin` operates only within that window.
-- **The `+40` candidate clamp has no recorded purpose.** It was introduced without explanation,
-  and it conflicts with Tail Confirmation (§6.2). Its role, such as bounding the size of one
-  finalization step, has to be established before either the clamp or the rule is changed.
+  best chain are written to the finalized database regardless of `fin` (§4.3, Implementation in
+  Zebra). Any fork-choice rule above `fin` operates only within that window.
+- **The `+40` candidate clamp breaks honest proposal (§6.2).** Without it, one bft-block's
+  snapshot can advance by any number of bc-blocks, so the commit, the roster lookup, and
+  `terminated_finalizers_at` each handle steps of any size.
 - **`σ` comes from `ZcashCrosslinkParameters`.** The GUI's `apply_viz_op` hardcodes it as
   `TMP_SIGMA`, which matches only while `PROTOTYPE_PARAMETERS` is unchanged.
 - **Removing `finalization_gap_bound` changes the test format.** `test_format.rs` serializes it
@@ -883,28 +989,9 @@ These hold for any change to how the marker is derived, stored, or consumed.
   panics in winit when that feature is enabled, and `phargo.bat` enables it, so those tests run
   under plain cargo without the feature.
 
-## 9. Open consensus decisions
+## 9. Open decisions
 
-### 9.1 Canonical state and fork choice
-
-Choose explicitly between raw CL2 fork choice and Zebra's additional finalized-prefix
-chain-activation policy. Raw CL2 permits `fin` to remain off `bc_best`, while the finalized
-client view stays fixed. The current physical state model requires
-`canonical_finalized_tip ⪯ canonical_tip` locally. Removing or retaining that requirement has
-liveness, recovery, storage, and migration consequences.
-
-Omitting Stalled Mode changes the weight of this choice. The Book pairs raw fork choice with
-Stalled Mode, which confines a dominant unfinalizable branch to stalled blocks after `L`. Without
-it, raw fork choice lets that branch carry ordinary spends without limit, all of them past `fin`
-and unfinalizable under Linearity. Removing Zebra's finalized-prefix policy would therefore
-leave no local constraint on activity along such a branch. Retaining it keeps the constraint at
-the cost of the enforcing node's liveness whenever the dominant chain excludes its finalized
-point.
-
-§4.3 describes one concrete form of the retaining option, sticky fork choice, which uses
-protocol `fin` as the floor and Zebra's existing work-then-hash order above it.
-
-### 9.2 Objective reward trigger and reward economics
+### 9.1 Objective reward trigger and reward economics
 
 Consensus issuance cannot depend on node-local `fin`. Honest nodes can reach the same chain
 through different best-chain and reorg histories, so they need not observe the same sequence
@@ -948,21 +1035,12 @@ the amount decision must not obscure the already-settled requirement that a cons
 be replayable from the chain alone. Detailed reward economics should live in a separate
 decision document once a concrete policy is proposed.
 
-### 9.3 Validator-set derivation
+### 9.2 Remaining protocol choices
 
-Specify the objective input for the roster, voting power, and hardfork membership at each BFT
-height, and prove that validators at that height derive the same set. Also specify separately
-which ledger state is read to materialize that set.
-
-### 9.4 Remaining protocol choices
-
-- Decide whether and how to implement the Last Final Snapshot, Linearity, and Tail
-  Confirmation rules. These are consensus changes in the current prototype. Under sticky fork
-  choice, §4.3 lists the outcomes that depend on Linearity.
 - Remove `finalization_gap_bound` from `ZcashCrosslinkParameters` and the test format, or
   re-document it as unused; its doc comment still describes Stalled Mode.
-- Decide whether the one-block snapshot shift requires PoS-store migration or replay rules. It
-  does require replay rules at minimum. The PoS store record is not a serialized `BftBlock`
+- Choose between PoS-store migration and replay rules for the one-block snapshot shift; replay
+  rules are the minimum. The PoS store record is not a serialized `BftBlock`
   alone: each record appends the block, the fat pointer, `finalizers_at_current_height`, and the
   proposal signatures. The roster is marker-derived — it is the aggregated stakes that
   `CrosslinkFinalizeBlock(hash(headers[0]))` returned — and restore reads it back verbatim
@@ -975,7 +1053,10 @@ which ledger state is read to materialize that set.
   a hardfork activation boundary. Nodes running the two derivations would also disagree about
   which bc-block is finalized. The RocksDB side is unaffected: aggregated stakes are keyed by
   block hash and written in the block's own batch, so both derivations' rows already exist.
-- Specify checkpoint/recency exposure gating independently of block validity.
+- Specify the checkpoint and recency condition for exposing `fin` to clients (§3.5),
+  independently of block validity.
+- Define the block and transaction status contract, with distinct confirmed and finalized
+  states (§6.5, §7).
 
 ## 10. Source appendix
 
