@@ -40,7 +40,13 @@ START=$(date +%s)
 for n in 0 1; do
   sed "s|@ROOT@|$ROOT_TOML|g; s|@START@|$START|g" "$HERE/node$n.toml.in" > "$OUT/node$n.toml"
   if [ $WIN = 1 ]; then
-    PID[$n]=$(powershell -NoProfile -Command "(Start-Process -FilePath '$(cygpath -w "$ZEBRAD")' -ArgumentList '-c','$(cygpath -w "$OUT/node$n.toml")','start' -WorkingDirectory '$(cygpath -w "$ROOT")' -RedirectStandardOutput '$(cygpath -w "$OUT/node$n.log")' -RedirectStandardError '$(cygpath -w "$OUT/node$n.err")' -PassThru).Id")
+    # The pid goes through a file rather than a `$(...)` capture: the node inherits PowerShell's
+    # standard output, so when that is the capture's pipe the node holds it open for the whole
+    # run and the capture never returns -- node 1 would never start. Sending both of PowerShell's
+    # streams to the void leaves the node nothing worth inheriting.
+    powershell -NoProfile -Command "(Start-Process -FilePath '$(cygpath -w "$ZEBRAD")' -ArgumentList '-c','$(cygpath -w "$OUT/node$n.toml")','start' -WorkingDirectory '$(cygpath -w "$ROOT")' -RedirectStandardOutput '$(cygpath -w "$OUT/node$n.log")' -RedirectStandardError '$(cygpath -w "$OUT/node$n.err")' -PassThru).Id | Set-Content -Encoding ascii '$(cygpath -w "$OUT/node$n.pid")'" >/dev/null 2>&1 </dev/null
+    PID[$n]=$(tr -dc '0-9' < "$OUT/node$n.pid")
+    [ -n "${PID[$n]}" ] || { echo "node$n did not start; see $OUT/node$n.err"; exit 2; }
   else
     (cd "$ROOT" && "$ZEBRAD" -c "$OUT/node$n.toml" start > "$OUT/node$n.log" 2> "$OUT/node$n.err") & PID[$n]=$!
   fi
