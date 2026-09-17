@@ -1775,10 +1775,6 @@ async fn total_issuance_from_key(
                 ));
             }
 
-            if delegation_bonds.values().any(|(_, status)| *status == zebra_state::BondStatusInChain::Active) {
-                timed(&PROF.replay_ns, || zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds));
-            }
-
             if let Some((tx_lrz, txid_lrz)) = &parsed {
                 for (ufvk_i, scan_ctx) in scan_ctxs.iter().enumerate() {
                     let scan_info = &mut scan_infos[ufvk_i];
@@ -1787,6 +1783,12 @@ async fn total_issuance_from_key(
                     }
                 }
             }
+        }
+
+        // Once per block, after all of its staking actions, as the live commit path does. Paying
+        // it inside the tx loop paid a block with n txs n times.
+        if height != 0 && delegation_bonds.values().any(|(_, status)| *status == zebra_state::BondStatusInChain::Active) {
+            timed(&PROF.replay_ns, || zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds));
         }
     }
 
