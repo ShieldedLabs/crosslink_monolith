@@ -24,7 +24,10 @@ if "%config%"=="Release" (
     set "build_folder=debug"
 )
 
-if "%project%"=="zebra-crosslink" (
+rem The node tests in zebrad/tests/crosslink.rs run headless: viz_gui puts winit on the
+rem main thread, which the test harness has no way to yield. Setting PH_NO_VIZ_GUI leaves the
+rem feature out of an otherwise identical build; any non-empty value counts.
+if "%project%"=="zebra-crosslink" if not defined PH_NO_VIZ_GUI (
     set "flags=%flags% -Fviz_gui"
 )
 

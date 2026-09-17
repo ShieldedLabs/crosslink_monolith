@@ -8,6 +8,9 @@ right and this file is corrected.
 Stages 1–4 are ready. Stages 5 and 6 wait on the questions in
 [Needs design pass](#needs-design-pass).
 
+Stages run one at a time, in order, each committed before the next starts. Stages 1 and 2 edit
+the same test files, and stages 3 and 4 depend on stage 1.
+
 ## Rules for every stage
 
 - Read the FINALITY.md sections a stage cites before changing code. FINALITY.md labels each
@@ -22,8 +25,16 @@ Stages 1–4 are ready. Stages 5 and 6 wait on the questions in
 - A stage that changes code FINALITY.md describes as current tree updates those FINALITY.md
   statements in the same commit (FINALITY.md §§5, 6, 8).
 - `VIZ_GUI_FINALITY_RULES.md` is untracked on purpose and is never committed.
-- Crosslink node tests in `zebrad/tests/crosslink.rs` panic under `viz_gui`, so they run under
-  plain cargo without that feature (FINALITY.md §8.1).
+- Tests run through `phest.bat zebra-crosslink`, with a test-name filter as the fourth
+  argument: `phest.bat zebra-crosslink Debug Win64 <filter>`. Never call `cargo` directly.
+  `phargo.bat` enables `viz_gui` for `zebra-crosslink`, which puts winit on the main thread.
+  The node tests in `zebrad/tests/crosslink.rs` run headless, on the crate's
+  `cfg(not(feature = "viz_gui"))` path (FINALITY.md §8.1), so they run with
+  `PH_NO_VIZ_GUI=1` set, which leaves the feature out of an otherwise identical build:
+  `$env:PH_NO_VIZ_GUI=1; .\phest.bat zebra-crosslink Debug Win64 -p zebrad --test crosslink -- --nocapture`.
+  `phargo.bat` forwards `%4` through `%9`, so an argument list longer than that one needs
+  the wrapper widened first.
+  A winit panic means the feature was left on; it is not worked around in the test code.
 - The build uses `panic = abort`: a new `assert!`, `unwrap`, or `expect` on a consensus path
   terminates the node when it fails.
 
@@ -68,7 +79,8 @@ Implements FINALITY.md §1 (`finalization_gap_bound`), §5.1 (`current_bc_final`
   in `librustzcash/zcash_primitives/src/bft.rs`, and from the parameter serialization in
   `test_format.rs`. The test format loses its second parameter value.
 - Regenerate each `.zeccltf` file in `zebra-crosslink/crosslink-test-data` that a test
-  generates. Ask the user before deleting a file that a test loads but does not generate.
+  generates. Keep each file that a test loads but does not generate, and rewrite its parameter
+  instruction without the removed value so that it still loads.
 - Delete `TFLServiceInternal::current_bc_final` and its initialization and assignment.
 - Rename the main-loop local `current_bc_tip` to `bc_best_tip`.
 - Delete the `ba_mu` paragraph from `diagram_scene_1`'s doc comment in
@@ -95,9 +107,12 @@ header's previous-block hash is the hash of the one before it, and the block at 
 is bc-valid. This is objective and does not consult the validator's best chain (FINALITY.md
 §3.4). A block that is not yet known returns `Indeterminate`.
 
-**Honest proposal.** The proposal carries the `σ`-block tail of the proposer's `bc_best`:
+**Honest proposal.** The proposal carries the `σ`-block tail of the proposer's `bc_best`,
+except where the `+40` clamp binds:
 
-- Delete the `+40` candidate clamp (the `min(…, latest_final_block + 40)` line).
+- Keep the `+40` candidate clamp (the `min(…, latest_final_block + 40)` line). Comment it as
+  a Zebra Crosslink design heuristic that is not part of the Crosslink 2 specification and
+  departs from honest proposal (FINALITY.md §3.4).
 - Read the tip and the tail consistently: `StateRequest::Tip` followed by
   `FindBlockHeaders` can straddle a reorganization.
 - Make no proposal while `bc_best` has fewer than `σ + 1` blocks.

@@ -333,6 +333,12 @@ carried tail was the proposer's best chain. An
 [honest validator](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L639-L643)
 first downloads the bc-blocks for `P.headers_bc` and checks their bc-block validity.
 
+**Zebra Crosslink.** A proposer clamps its candidate height to at most 40 blocks above the
+previous final snapshot. When the clamp binds, `P.headers_bc` is a window of `bc_best` ending
+below its tip rather than its tail, which breaks honest proposal. The clamp is a design
+heuristic, not part of the Crosslink 2 specification. The window still satisfies Tail
+Confirmation.
+
 **Linearity and bc reorganizations.** Let `B` be the newest final bft-block. Linearity requires
 every later final snapshot to extend `snapshot(B)`. When a node's `bc_best` reorganizes onto a
 branch that forks below `snapshot(B)`, the tail of that branch fails Linearity, so honest
@@ -881,8 +887,9 @@ it departs from.
   valid chain with valid PoW.
 - The proposal path departs from honest proposal (§3.4) in two ways. When the `+40` candidate
   clamp in §6.1 binds, `headers_bc` is a window ending at `marker + 40 + σ`, not the tail of the
-  proposer's `bc_best`; the window still satisfies Tail Confirmation. When `is_improved_final`
-  fails, the path makes no proposal, where honest proposal repeats the parent's `headers_bc`.
+  proposer's `bc_best`; the window still satisfies Tail Confirmation. The clamp is a Zebra
+  Crosslink design heuristic (§3.4). When `is_improved_final` fails, the path makes no proposal,
+  where honest proposal repeats the parent's `headers_bc`.
 - Bc-block production does not follow the honest context-selection procedure (§3.4): the block
   template's `FatPointerToBFTChainTip` request cites the newest decided bft-block whose
   `do_not_include_until_bc_height` admits the proposed height, whatever that block's snapshot.
@@ -1094,9 +1101,9 @@ stored, or consumed.
 - **Zebra's depth commit is a second floor.** Blocks deeper than `MAX_BLOCK_REORG_HEIGHT` on the
   best chain are written to the finalized database regardless of `fin` (§4.3, Implementation in
   Zebra). Any fork-choice rule above `fin` operates only within that window.
-- **The `+40` candidate clamp breaks honest proposal (§6.2).** Without it, one bft-block's
-  snapshot can advance by any number of bc-blocks, so the commit, the roster lookup, and
-  `terminated_finalizers_at` each handle steps of any size.
+- **The `+40` candidate clamp breaks honest proposal (§6.2).** It stays, as a design heuristic
+  outside the specification (§3.4). With it, one bft-block's snapshot advances by at most 40 bc-blocks; the commit, the
+  roster lookup, and `terminated_finalizers_at` handle steps of any size regardless.
 - **Block status never reports `bft_final_snapshot` as finalized.** A block at or below
   `bft_final_snapshot` but above `local_finalized_tip` is `InBestChain` or `NotInBestChain`,
   because `fin` is the view Assured Finality covers (§2).
@@ -1104,11 +1111,12 @@ stored, or consumed.
   `TMP_SIGMA`, which matches only while `PROTOTYPE_PARAMETERS` is unchanged.
 - **Removing `finalization_gap_bound` changes the test format.** The field is the Book's `L` in
   `ZcashCrosslinkParameters`, and `test_format.rs` serializes it as the second parameter value.
-  It is removed, and the `.zeccltf` files in `crosslink-test-data` are regenerated where a test
-  generates them and deleted otherwise.
-- **Crosslink node tests run without `viz_gui`.** Every node test in `zebrad/tests/crosslink.rs`
-  panics in winit when that feature is enabled, and `phargo.bat` enables it, so those tests run
-  under plain cargo without the feature.
+  It is removed. The `.zeccltf` files in `crosslink-test-data` are regenerated where a test
+  generates them, and otherwise kept with that value removed from their parameter instruction.
+- **Crosslink node tests and `viz_gui`.** Tests run through `phest.bat zebra-crosslink`, and
+  `phargo.bat` enables `viz_gui` for that project, which puts winit on the main thread. The
+  node tests in `zebrad/tests/crosslink.rs` run headless, so they run with `PH_NO_VIZ_GUI` set,
+  which leaves the feature out of an otherwise identical build.
 
 ## 9. Open decisions
 
