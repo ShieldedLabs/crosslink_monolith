@@ -303,6 +303,103 @@ on the named branch and discards incompatible non-finalized branches. This makes
 physical. It may be a deliberate Zebra choice, but it is not mandated by the CL2 construction
 and must be specified and analyzed separately.
 
+### 4.3 Sticky fork choice
+
+Sticky fork choice is a rule for selecting `bc_best` that never lets a node's best chain exclude
+its own `fin`. It is temporal: the result depends on the node's current best chain and its
+current `fin`, which is node-local memory (§3.2), not only on the set of chains in view.
+
+A node holds `current`, its best chain, and `fin`. When a bc-valid chain `new` is in view, the
+node switches from `current` to `new` iff:
+
+```text
+fin ⪯ new
+and ( work(new) > work(current)
+      or ( work(new) = work(current) and tip_hash(new) > tip_hash(current) ) )
+```
+
+After every change of best chain, `fin` is updated from `candidate(bc_best)` by the rule in
+§3.2. The tiebreak is Zebra's existing one: `Chain::cmp` in
+`zebra-state/src/service/non_finalized_state/chain.rs` orders equal-work chains by tip hash
+bytes, and `NonFinalizedState::best_chain` takes the greatest. That doc comment records that the
+Zcash protocol specification instead prefers the block received first.
+
+**Relation to §4.2.** `fin` only ever advances to `candidate(bc_best)`, and
+`candidate(bc_best) ⪯ bc_best`, so the current chain always contains `fin`. A chain that contains
+`fin` now also contained every earlier `fin`, so it was eligible when it appeared and would have
+been switched to then if it were greater. The pairwise switch condition therefore selects the
+greatest chain, by work and then tip hash, among the chains that contain `fin`. That is the
+eligibility rule of §4.2 with `local_finalized_tip := fin`. The temporal behavior comes
+entirely from `fin`: the eligible set shrinks each time `fin` advances.
+
+**Properties that follow from the definition:**
+
+- `fin ⪯ bc_best` holds on the node at all times. The raw-CL2 state in which `fin` stays fixed
+  on a branch that `bc_best` no longer contains (§4.1) does not arise.
+- The conflicting-candidate case of the §3.2 update cannot occur: `candidate(bc_best)` and `fin`
+  both lie on `bc_best`, so they are comparable. Its observable counterpart is a refused switch,
+  meaning a chain in view with more work than `current` that excludes `fin`.
+- The rule selects a different chain from raw work-based fork choice only when a chain with
+  more work than `current` excludes `fin`. By the Local fin-depth lemma, `fin` was part of
+  `prune_σ` of this node's best chain at some earlier time, so the raw choice in that situation
+  would displace a prefix that was `σ`-confirmed in the node's own earlier best chain. Where no
+  such chain is in view, the two rules select the same chain.
+- `Π_bft` can move `fin` only to `candidate(bc_best)`, which lies at or below
+  `prune_σ(bc_best)`. Finality therefore pins only blocks the node had already selected by work
+  and `σ`-confirmed; it cannot move the node onto a chain it did not select. While `Π_bft` is
+  stalled or withholding, `fin` is frozen and selection above it is the raw work rule.
+- The rule uses `Π_bft`-derived information to select among bc-valid chains. The Book's
+  honest-production instruction (§4.1, item 3) excludes that, and its `Π_bc`-side safety argument
+  assumes an unmodified best-chain rule. The `Π_bft`-side argument, Final Agreement plus
+  Linearity implying Assured Finality, does not involve fork choice.
+
+**Behavior by situation, compared with raw work-based fork choice:**
+
+- *Candidate regression with `fin` still on the heavier chain* (FINALITY_DIAGRAM §3). Both rules
+  switch to the heavier chain.
+- *Heavier chain forked below `fin`* (FINALITY_DIAGRAM §4). Raw: the node follows the heavier
+  chain, `fin` stays behind on the other branch, and finality stalls under Linearity. Sticky: the
+  node stays on the branch containing `fin`, and its tip advances only as fast as hash rate on
+  that branch extends it. No amount of work on the other branch changes this; only a change to
+  `fin` from outside the protocol would.
+- *Partition while `fin` is frozen on every node.* Every chain extending the common `fin` is
+  eligible, so selection is by work on both sides. After the partition heals, nodes converge on
+  the heavier chain under either rule, provided no node's `fin` moved past the fork point.
+- *Partition in which one side advances `fin`.* Side A holds enough stake for `Π_bft` to decide
+  and advances `fin` past the fork point; side B does not. After the partition heals, A-side
+  nodes never switch to B's chain, whatever its work. B-side nodes switch to A's chain once it
+  has more work than theirs, since it contains their `fin`. B's miners cannot bring B's chain
+  under A's BFT decisions, because the Last Final Snapshot rule requires `snapshot(LF(H)) ⪯ H`
+  and those snapshots lie on A's branch. While B's branch has more work, the nodes stay split
+  along the partition. Under raw fork choice, all nodes converge on the heavier branch and
+  finality stays stalled until that branch is abandoned. How often this arises, and how many
+  nodes land on each side, depends on how stake and hash rate are distributed across the
+  partition.
+- *Order of observation.* Suppose a lighter branch carries BFT-final snapshots past the fork
+  point and a heavier branch does not. A node that processes the lighter branch first, for
+  example during sync, advances `fin` into it and then refuses the heavier branch. A node that
+  processes the heavier branch first keeps `fin` at or below the fork and does not switch to the
+  lighter branch until it has more work. Under raw fork choice both nodes end on the heavier
+  branch.
+- *Conflicting finality.* For two nodes to hold conflicting `fin` values, `Π_bft` Final
+  Agreement must fail and, because each `fin` is `σ`-confirmed in its own node's chain, their
+  best chains must also have diverged at depth `σ`. Under raw fork choice both nodes follow the
+  heavier chain and one of them records the §3.2 safety hazard. Under sticky fork choice each node
+  keeps the branch containing its own `fin`, whatever the work on the other.
+
+**Zebra specifics.**
+
+- The rule needs protocol `fin`, which this tree does not compute (§6.1). The current collapse
+  onto a BFT-decided branch (§4.2, §6.3) is a related rule with a different floor: the stored
+  marker, taken directly from a decided BFT block when it is decided rather than from
+  `candidate(bc_best)`. With that floor, the invariant above does not follow: the marker need not
+  lie on the node's best chain when it advances, and a known side-chain hash becomes canonical
+  (§5.2).
+- Zebra also commits the root of the best chain to the finalized database once the chain is
+  longer than `MAX_BLOCK_REORG_HEIGHT` (99, from `zcash_protocol::consensus`, applied in
+  `zebra-state/src/service/write.rs`). Chains forking below that point are no longer in view.
+  On a Zebra node the effective floor is the higher of `fin` and that depth-committed block.
+
 ## 5. Zebra implementation inventory
 
 This inventory refers to symbols in the tree this document ships with; symbol names are
@@ -615,6 +712,9 @@ and unfinalizable under Linearity. Removing Zebra's finalized-prefix policy woul
 leave no local constraint on activity along such a branch. Retaining it keeps the constraint at
 the cost of the enforcing node's liveness whenever the dominant chain excludes its finalized
 point.
+
+§4.3 describes one concrete form of the retaining option, sticky fork choice, which uses
+protocol `fin` as the floor and Zebra's existing work-then-hash order above it.
 
 ### 9.2 Objective reward trigger and reward economics
 

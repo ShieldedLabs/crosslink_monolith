@@ -167,6 +167,13 @@
       font-weight: 700;
     }
     .sources li + li { margin-top: 8px; }
+    .table-wrap { margin-top: 18px; overflow-x: auto; }
+    .outcomes { width: 100%; min-width: 640px; border-collapse: collapse; font-size: .95rem; }
+    .outcomes th, .outcomes td { padding: 10px 12px; border-top: 1px solid var(--line); text-align: left; vertical-align: top; }
+    .outcomes th { color: var(--ink); }
+    .outcomes td { color: var(--muted); }
+    .outcomes td:first-child { color: var(--ink); }
+    .rule.plain { border-color: var(--fin); }
 
     @media (max-width: 850px) {
       main { width: min(100% - 20px, 1180px); padding-top: 28px; }
@@ -669,18 +676,131 @@
       snapshot in the observer's view.</p>
   </section>
 
+  <section class="panel" id="sticky-fork-choice">
+    <h2>6. Sticky fork choice</h2>
+    <p class="subhead">
+      A candidate rule for selecting <code>bc_best</code> that keeps the node's own
+      <code>fin</code> on its best chain. It is temporal: the result depends on the chain the node is
+      already on and on its current <code>fin</code>, not only on the chains in view.
+    </p>
+
+    <div class="svg-wrap">
+      <svg viewBox="0 0 1100 540" role="img" aria-labelledby="sticky-title sticky-desc">
+        <title id="sticky-title">Sticky fork choice: which heavier chains a node switches to</title>
+        <desc id="sticky-desc">The node's current chain ends at P8 and fin is P5. Branch Q forks at P6, contains fin, and has more work, so the node switches to Q9. Branch C forks at P3, below fin, and has more work, so the node does not switch to C9.</desc>
+        <defs>
+          <marker id="pow-sticky" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#58a6ff"/></marker>
+        </defs>
+
+        <text class="title" x="330" y="30" text-anchor="middle" style="fill:var(--pow)">PoW block tree in one node's view</text>
+
+        <path class="rail-pow" d="M330 150 V518" marker-end="url(#pow-sticky)"/>
+        <path d="M330 250 L230 200 L200 150 L170 100" fill="none" stroke="var(--pow)" stroke-width="4" opacity=".72"/>
+        <path d="M330 400 L430 350 L460 300 L490 250 L520 200 L550 150 L580 100" fill="none" stroke="var(--old)" stroke-width="3" stroke-dasharray="7 6"/>
+
+        <g transform="translate(330 150)"><circle class="pow-node" r="18"/><text class="node-text">P8</text></g>
+        <g transform="translate(330 200)"><circle class="pow-node" r="16"/><text class="node-text">P7</text></g>
+        <g transform="translate(330 250)"><circle class="pow-node" r="16"/><text class="node-text">P6</text></g>
+        <g transform="translate(330 300)"><circle class="pow-node" r="18"/><circle r="24" fill="none" stroke="var(--fin)" stroke-width="4"/><text class="node-text">P5</text></g>
+        <g transform="translate(330 350)"><circle class="pow-node" r="16"/><text class="node-text">P4</text></g>
+        <g transform="translate(330 400)"><circle class="pow-node" r="16"/><text class="node-text">P3</text></g>
+        <g transform="translate(330 450)"><circle class="pow-node" r="16"/><text class="node-text">P2</text></g>
+        <g transform="translate(330 500)"><circle class="pow-node" r="16"/><text class="node-text">P1</text></g>
+
+        <g transform="translate(230 200)"><circle class="pow-node" r="16"/><text class="node-text">Q7</text></g>
+        <g transform="translate(200 150)"><circle class="pow-node" r="16"/><text class="node-text">Q8</text></g>
+        <g transform="translate(170 100)"><circle class="pow-node" r="18"/><text class="node-text">Q9</text></g>
+
+        <g transform="translate(430 350)"><circle r="15" fill="var(--old-node-bg)" stroke="var(--old)" stroke-width="2" stroke-dasharray="5 4"/><text class="node-text">C4</text></g>
+        <g transform="translate(460 300)"><circle r="15" fill="var(--old-node-bg)" stroke="var(--old)" stroke-width="2" stroke-dasharray="5 4"/><text class="node-text">C5</text></g>
+        <g transform="translate(490 250)"><circle r="15" fill="var(--old-node-bg)" stroke="var(--old)" stroke-width="2" stroke-dasharray="5 4"/><text class="node-text">C6</text></g>
+        <g transform="translate(520 200)"><circle r="15" fill="var(--old-node-bg)" stroke="var(--old)" stroke-width="2" stroke-dasharray="5 4"/><text class="node-text">C7</text></g>
+        <g transform="translate(550 150)"><circle r="15" fill="var(--old-node-bg)" stroke="var(--old)" stroke-width="2" stroke-dasharray="5 4"/><text class="node-text">C8</text></g>
+        <g transform="translate(580 100)"><circle r="17" fill="var(--old-node-bg)" stroke="var(--old)" stroke-width="2" stroke-dasharray="5 4"/><text class="node-text">C9</text></g>
+
+        <text class="label" x="352" y="155" style="fill:var(--pow)">current</text>
+        <text class="label" x="296" y="305" text-anchor="end" style="fill:var(--fin)">fin</text>
+        <text class="micro" x="352" y="424">C forks here, below fin</text>
+        <text class="micro" x="352" y="254">Q forks here, above fin</text>
+        <text class="label" x="170" y="68" text-anchor="middle" style="fill:var(--pow)">Q9: switch</text>
+        <text class="label" x="580" y="68" text-anchor="middle" style="fill:var(--old)">C9: no switch</text>
+
+        <rect class="callout" x="690" y="40" width="380" height="120" rx="12" style="stroke:var(--fin)"/>
+        <text class="label" x="710" y="68" style="fill:var(--fin)">Switch from current to new iff</text>
+        <text class="formula" x="710" y="95">fin ⪯ new, and</text>
+        <text class="formula" x="710" y="118">work(new) &gt; work(current), or</text>
+        <text class="formula" x="710" y="141">equal work and greater tip hash</text>
+
+        <rect class="callout" x="690" y="185" width="380" height="80" rx="12" style="stroke:var(--pow)"/>
+        <text class="label" x="710" y="213" style="fill:var(--pow)">Q9: more work, contains fin = P5</text>
+        <text class="small" x="710" y="238">Switch. Raw work-based fork choice does the same.</text>
+
+        <rect class="callout" x="690" y="290" width="380" height="96" rx="12" style="stroke:var(--old)"/>
+        <text class="label" x="710" y="318" style="fill:var(--ink)">C9: more work, forks at P3, below fin</text>
+        <text class="small" x="710" y="343">No switch, whatever C's work. Raw fork</text>
+        <text class="small" x="710" y="364">choice switches and leaves fin off bc_best.</text>
+
+        <rect class="callout" x="690" y="411" width="380" height="96" rx="12" style="stroke:var(--candidate)"/>
+        <text class="label" x="710" y="439" style="fill:var(--candidate)">fin advances only to candidate(bc_best)</text>
+        <text class="small" x="710" y="464">candidate(bc_best) ⪯ bc_best, so the node's</text>
+        <text class="small" x="710" y="485">best chain always contains its fin.</text>
+      </svg>
+    </div>
+
+    <div class="rules">
+      <div class="rule plain">
+        <h3>Same as the finalized-prefix rule, with floor <code>fin</code></h3>
+        <p>Because the current chain always contains <code>fin</code>, pairwise switching selects the chain with the most work (then greatest tip hash) among chains containing <code>fin</code>. The eligible set shrinks each time <code>fin</code> advances.</p>
+      </div>
+      <div class="rule advance">
+        <h3>Local invariant: <code>fin ⪯ bc_best</code></h3>
+        <p>A conflicting candidate cannot arise on the node's own chain. The observable counterpart is a refused switch: a heavier chain in view that excludes <code>fin</code>.</p>
+      </div>
+      <div class="rule hold">
+        <h3>Differs from raw fork choice only at a refused switch</h3>
+        <p><code>fin</code> was <code>sigma</code>-confirmed in this node's earlier best chain, so the raw rule would displace that prefix at exactly those moments. Otherwise both rules select the same chain.</p>
+      </div>
+      <div class="rule fast">
+        <h3>Finality pins only what work already selected</h3>
+        <p><code>fin</code> moves only to <code>candidate(bc_best)</code>, at or below <code>prune_sigma(bc_best)</code>. While BFT is stalled or withholding, <code>fin</code> is frozen and selection above it is by work.</p>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table class="outcomes">
+        <thead>
+          <tr><th>Situation</th><th>Raw work-based fork choice</th><th>Sticky fork choice</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Candidate regression, heavier chain still contains <code>fin</code> (§3)</td><td>Switches to the heavier chain.</td><td>Switches to the heavier chain.</td></tr>
+          <tr><td>Heavier chain forks below <code>fin</code> (§4)</td><td>Follows the heavier chain; <code>fin</code> stays on the other branch; finality stalls under Linearity.</td><td>Stays on the branch containing <code>fin</code>; its tip advances at that branch's hash rate, whatever the other branch's work.</td></tr>
+          <tr><td>Partition while <code>fin</code> is frozen on every node</td><td>Converges on the heavier chain after healing.</td><td>Converges on the heavier chain after healing, provided no node's <code>fin</code> moved past the fork point.</td></tr>
+          <tr><td>Partition in which only side A advances <code>fin</code> past the fork</td><td>All nodes converge on the heavier branch; finality stays stalled until that branch is abandoned.</td><td>A-side nodes never switch to B. B-side nodes switch to A once A has more work. While B has more work, nodes stay split along the partition; the extent depends on how stake and hash rate are distributed.</td></tr>
+          <tr><td>Lighter branch carries BFT-final snapshots past the fork; heavier branch does not</td><td>Every node ends on the heavier branch, in any order of observation.</td><td>A node that processes the lighter branch first stays on it; a node that processes the heavier branch first stays there until the lighter one has more work.</td></tr>
+          <tr><td>Conflicting <code>fin</code> values (needs a BFT Final Agreement failure and a <code>sigma</code>-deep bc divergence)</td><td>Both nodes follow the heavier chain; one records a finalization safety hazard.</td><td>Each node keeps the branch containing its own <code>fin</code>, whatever the work on the other.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="protocol-note">
+      <p><strong>Relation to the Book and to current Zebra:</strong> the rule uses BFT-derived information to choose among bc-valid chains, which the Book's honest-production instruction (§5) excludes, and the Book's best-chain-side safety argument assumes an unmodified fork choice. The BFT-side argument, Final Agreement plus Linearity implying Assured Finality, does not involve fork choice. The rule needs protocol <code>fin</code>, which Zebra does not yet compute; the prototype's current finalized-branch collapse uses the BFT-decided marker as its floor instead. Zebra also commits the root of any best chain longer than <code>MAX_BLOCK_REORG_HEIGHT</code> (99), so on a Zebra node the effective floor is the higher of <code>fin</code> and that depth-committed block.</p>
+    </div>
+  </section>
+
   <section class="panel" id="summary">
-    <h2>6. The shortest useful summary</h2>
+    <h2>7. The shortest useful summary</h2>
     <div class="takeaway">
       <p><code>bc_best</code> is raw fork choice; <code>candidate(H)</code> is objective evidence;
       and <code>fin</code> is node-local monotone memory. There is no bounded-available view: an
       application either stops with <code>fin</code> during a finalization stall, or follows
-      <code>bc_best</code> with no bound on how far it runs past <code>fin</code>.</p>
+      <code>bc_best</code> with no bound on how far it runs past <code>fin</code>. Sticky fork
+      choice is a candidate rule that selects <code>bc_best</code> only among chains containing
+      <code>fin</code>, ordered by work and then tip hash.</p>
     </div>
   </section>
 
   <section class="panel sources" id="sources">
-    <h2>7. Sources and scope</h2>
+    <h2>8. Sources and scope</h2>
     <ul>
       <li><a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L285-L290">Original TFL Book: formal Prefix Consistency definition</a>. This execution property at the chosen <code>sigma</code> is the formal PoW-side premise used here.</li>
       <li>The Book <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L13-L16">does not assume synchrony or reliable delivery globally</a>. Its <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L317-L328">communication and partition discussion</a> and <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L361-L373">PoW intuition and concrete-<code>sigma</code> caveat</a> explain that honest block-production advantage, sufficiently reliable communication, absence of a long partition, and a sufficiently large <code>sigma</code> are intuition or protocol-specific conditions—not a separate formal CL2 assumption list.</li>
