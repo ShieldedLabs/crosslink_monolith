@@ -8,7 +8,9 @@ right and this file is corrected.
 Stage 1 is done. Stages 2–4 are ready. Stages 5 and 6 wait on the questions in
 [Needs design pass](#needs-design-pass).
 
-Stages run one at a time, in order, each committed before the next starts. Stages 1 and 2 edit
+Stages run one at a time, in order. Each stage ends the same way: its node tests pass, it is
+committed, and the dilated two-node regtest (DILATED_REGTEST.md, `zebra-crosslink/dilated_regtest/run.sh`)
+passes against a build of that commit before the next stage starts. Stages 1 and 2 edit
 the same test files, and stages 3 and 4 depend on stage 1.
 
 ## Rules for every stage
@@ -39,6 +41,9 @@ the same test files, and stages 3 and 4 depend on stage 1.
   `%9` and splits `--test-threads=1` at the `=`, so a trailing `-- --nocapture
   --test-threads=1` never reaches the harness.
   A winit panic means the feature was left on; it is not worked around in the test code.
+- After a stage is committed, `zebra-crosslink/dilated_regtest/run.sh` runs against a debug
+  build of the commit and must print `PASS` (DILATED_REGTEST.md). It is the system test the
+  node tests are not: wallet, staking, BFT bootstrap and finality under 90x time dilation.
 - A stage's test condition is read against the node tests that fail for reasons outside the
   stages. None of them is fixed or worked around by a stage:
   - `staking_tx_create_bond` in `zebrad/tests/crosslink.rs` leaves the bond signature zero,

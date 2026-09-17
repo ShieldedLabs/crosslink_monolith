@@ -1,0 +1,49 @@
+# Rendered by run.sh: @ROOT@ is the zebra-crosslink directory, @START@ the launch unix time.
+[debug_time_dilation]
+start_unix_time = @START@
+multiplier = 90
+
+[consensus]
+checkpoint_sync = true
+
+[crosslink]
+public_address = "127.0.0.1:12301"
+explicit_bft_key_seed = "127.0.0.1:12301"
+bft_peers = ["127.0.0.1:12301", "127.0.0.1:12302"]
+
+[mempool]
+eviction_memory_time = "1h"
+tx_cost_limit = 80000000
+
+[mining]
+internal_miner = false
+miner_address = "tmRB9AEVsxNAQsqtJPqJUje9KCaAijpS77z"
+
+[network]
+cache_dir = true
+initial_mainnet_peers = []
+initial_testnet_peers = []
+listen_addr = "[::]:8233"
+max_connections_per_ip = 1
+network = "Regtest"
+peerset_initial_target_size = 25
+
+[rpc]
+cookie_dir = "@ROOT@/dilated_regtest/out/state0"
+enable_cookie_auth = false
+listen_addr = "127.0.0.1:8232"
+
+[state]
+cache_dir = "@ROOT@/dilated_regtest/out/state0"
+delete_old_database = true
+ephemeral = false
+network_identity_seed_string = "This is node one."
+network_local_port = 12001
+network_initial_peers = ["[::ffff:127.0.0.1]:12002:1fgEw5Nx:kadD12IIrFqeXeftIyVA3mgLY4WovpjYK7dgWlVjR0g"]
+
+[state.network_checkpoint]
+height = 0
+hash = ""
+
+[tracing]
+use_color = false

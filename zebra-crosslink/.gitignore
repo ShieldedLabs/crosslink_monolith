@@ -169,3 +169,4 @@ __pycache__/
 # RPC tests cache
 zebra-rpc/qa/cache/
 .vscode/launch.json
+dilated_regtest/out/
