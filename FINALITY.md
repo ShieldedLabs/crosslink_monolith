@@ -30,12 +30,11 @@ Final Snapshot rule based on proof and latency results
 This document treats the formula as the current construction, not as a settled protocol
 decision beyond that source revision.
 
-Zebra Crosslink does not implement Stalled Mode, and bounded availability is not a concept in
-this codebase. The Book builds bounded availability from three parts: the finalization gap
-bound `L`, the Finality Depth rule with its stalled-block exception, and the bounded-available
-client view `ba_μ` with its confirmation depth `μ`. All three are omitted. §3.3 derives why
-omitting Stalled Mode removes the other two as well, and what the remaining definitions then
-guarantee.
+Zebra Crosslink omits Stalled Mode. The Book builds bounded availability from three parts: the
+finalization gap bound `L`, the Finality Depth rule with its stalled-block exception, and the
+bounded-available client view `ba_μ` with its confirmation depth `μ`. This design has none of
+them; §3.3 derives why omitting Stalled Mode removes the other two, and what the remaining
+definitions guarantee.
 
 The prototype sets `σ = 3` in `librustzcash/zcash_primitives/src/bft.rs`
 (`PROTOTYPE_PARAMETERS`). The source code explicitly warns that this value has not been
@@ -148,18 +147,18 @@ The Book's bounded availability is one mechanism in three parts:
   `ba_μ := prune_μ(bc_best) if fin ⪯ prune_μ(bc_best), else fin` is the client view whose
   distance ahead of `fin` that bound limits.
 
-Omitting Stalled Mode forces the other two parts out:
+Without Stalled Mode, the other two parts have no role:
 
-1. **The Finality Depth rule is dropped, not kept without its exception.** With no stalled
-   blocks the rule reduces to `height(H) − height(snapshot(LF(H))) ≤ L`. During a BFT stall no
-   context can lower that depth, so `Π_bc` halts `L` blocks past the snapshot. That is still
+1. **Finality Depth.** With no stalled blocks the rule would reduce to
+   `height(H) − height(snapshot(LF(H))) ≤ L`. During a BFT stall no context can lower that
+   depth, so `Π_bc` would halt `L` blocks past the snapshot. That is still
    bounded availability, in its strictest form. The Book also rejects it as a design: it calls
    stopping the chain
    [a naive approach with serious security problems under PoW](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/the-arguments-for-bounded-availability-and-finality-overrides.md#L19-L24),
    and its liveness analysis says any loss of `Π_bc` liveness
    [would be a bug because it allows tail-thrashing attacks](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/security-analysis.md#L7-L13).
-   `L` and `is_stalled_block` therefore have no remaining role.
-2. **`ba_μ` and `μ` are dropped.** `ba_μ` differs from a plain confirmation depth only in its
+   `L` and `is_stalled_block` have no other use.
+2. **`ba_μ` and `μ`.** `ba_μ` differs from a plain confirmation depth only in its
    fallback to `fin`, and that fallback exists to keep `fin ⪯ ba_μ`. Without a bound there is
    nothing for that view to bound.
 
@@ -196,8 +195,8 @@ are:
 
 In the current Zebra prototype, the finalized-prefix policy of §4.2 locally forces
 `canonical_finalized_tip ⪯ canonical_tip`. That restores, as a chain-activation policy, a
-prefix relation that `ba_μ` provided by definition. It is not a substitute for bounded
-availability: it does not limit the finality gap, and it costs local liveness (§9.1).
+prefix relation that `ba_μ` provided by definition. It does not limit the finality gap, and it
+costs local liveness (§9.1).
 
 ### 3.4 Validity rules and honest production
 
@@ -209,10 +208,7 @@ are:
 - **Extension:** `LF(parent(H)) ⪯bft LF(H)`.
 - **Last Final Snapshot:** `snapshot(LF(H)) ⪯bc H`.
 
-The Book's fourth rule, **Finality Depth**, is omitted with Stalled Mode (§3.3). The Last Final
-Snapshot rule stays: besides making the finality depth a meaningful height difference, it is
-what the Book's safety sketch uses to show that each candidate final snapshot is `σ`-confirmed
-in its observer's best chain.
+The Book's fourth rule, **Finality Depth**, is omitted with Stalled Mode (§3.3).
 
 The separately stated
 [bft-proposal and bft-block validity rules](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L568-L574)
@@ -220,6 +216,34 @@ add:
 
 - **Linearity:** `snapshot(parent(B)) ⪯bc snapshot(B)`.
 - **Tail Confirmation:** `B.headers_bc` form the `σ`-block tail of a bc-valid chain.
+
+The Book's informal safety argument uses Linearity and Last Final Snapshot as follows:
+
+- **Linearity with `Π_bft` Final Agreement** makes the snapshots of final bft-blocks
+  bc-linear, which the Book says implies Assured Finality without any `Π_bc` safety assumption
+  ([lines 587–594](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L587-L594)).
+- **Last Final Snapshot with the `σ` carried headers** is the basis of the other half of that
+  sketch: each candidate final snapshot is a `σ`-confirmed prefix of the observer's best
+  chain, so `Π_bc` Prefix Agreement gives safety without any `Π_bft` assumption (same lines).
+- **The two together** remove the sanitization of ledgers that Snap-and-Chat and Crosslink 1
+  needed ([potential changes, lines 320–371](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/potential-changes.md#L320-L371)). That
+  section's security analysis starts from the observation that neither rule affects the
+  evolution of `Π_bc` unless its Prefix Consistency or Prefix Agreement would be violated, and
+  breaks off mid-sentence.
+
+The Book's safety section is
+[marked as not updated for Crosslink 2](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/security-analysis.md#L52-L54), and
+[a later edit](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/security-analysis.md#L281) says Linearity so far contributes to security
+only heuristically. These arguments are sketches, not proofs.
+
+Two facts used in §4.3 follow from the definitions:
+
+- `candidate(H) ⪯ snapshot(LF(H))` and `candidate(H) ⪯ prune_σ(H)` hold for every `H`,
+  because an lca is an ancestor of both of its arguments.
+- With Last Final Snapshot, `snapshot(LF(H))` and `prune_σ(H)` both lie on `H`, so
+  `candidate(H)` is the lower of the two. Without it, `snapshot(LF(H))` can lie on another
+  branch, and `candidate(H)` is then the lower of `prune_σ(H)` and the point where that
+  branch leaves `H`.
 
 Beyond satisfying validity rules, the explicit BFT-context selection procedure chooses
 `H.context_bft`: among eligible bft-valid tips it chooses a longest chain, then breaks ties by
@@ -279,11 +303,23 @@ Its exact conclusion is:
 >
 > — [Questions about Crosslink, lines 44–52](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/questions.md#L44-L52)
 
-The Questions page is partly historical: its heading predates the current Last Final Snapshot
-block-validity rule. Its discussion still distinguishes that per-block rule from the stronger,
-unadopted fork-choice constraint. A block can satisfy `snapshot(LF(H)) ⪯ H` using stale BFT
-context; the stronger rule would constrain the selected best chain by the newest final BFT
-snapshot in the observer's view.
+The Questions page is partly historical. It
+[analyzes the Last Final Snapshot rule on its own](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/questions.md#L7-L9) and defers the
+combination with Linearity to the potential-changes section, which says the Questions argument
+against that rule
+[was made for a protocol without Linearity](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/potential-changes.md#L346). The fork-choice
+change and its "Probably not" belong to the same pre-Linearity discussion, and part of that
+discussion
+[relies on the Finality Depth rule and Stalled Mode](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/questions.md#L38), which this
+design omits. The Book does not revisit the fork-choice change with Linearity in place. The
+reason it gives for its conclusion is that an analysis that treats `Π_bft` as possibly
+subverted
+[can say nothing useful about `snapshot(B)`](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/questions.md#L48-L50).
+
+The per-block rule and the fork-choice constraint remain distinct. A block can satisfy
+`snapshot(LF(H)) ⪯ H` using stale BFT context; the fork-choice constraint would constrain the
+selected best chain by the newest final BFT snapshot in the observer's view. §4.3 compares that
+constraint with sticky fork choice.
 
 ### 4.2 The additional Zebra policy
 
@@ -332,62 +368,137 @@ greatest chain, by work and then tip hash, among the chains that contain `fin`. 
 eligibility rule of §4.2 with `local_finalized_tip := fin`. The temporal behavior comes
 entirely from `fin`: the eligible set shrinks each time `fin` advances.
 
-**Properties that follow from the definition:**
+#### Relation to the Book's fork-choice discussion
+
+The nearest relative of sticky fork choice in the Book is the fork-choice change on the
+Questions page (§4.1): `bc_best` must extend `snapshot(B)` for the newest final bft-block `B`
+in the node's view. The two rules differ in their floor:
+
+- The Questions rule uses `snapshot(B)`. That point need not lie on any chain the node has
+  selected, nor be `σ`-confirmed in one.
+- Sticky fork choice uses `fin`. It advances only to `candidate(bc_best)`, a point on the node's
+  own best chain at or below `prune_σ(bc_best)`.
+
+Under `Π_bft` Final Agreement and Linearity, `fin ⪯ snapshot(B)`: `fin` is at or below the
+snapshot of some final bft-block (§3.4), and the snapshots of final bft-blocks are bc-linear.
+Every chain containing `snapshot(B)` then contains `fin`, so sticky fork choice refuses a subset
+of the chains the Questions rule refuses. Without Linearity the two floors can conflict, and
+neither set of refused chains contains the other.
+
+If the Last Final Snapshot rule holds as well, every chain that sticky fork choice refuses ends
+in a block whose last final bft-block is strictly older than the one from which `fin` was last
+advanced. Suppose `fin` was advanced from a chain with last final bft-block `F`, so
+`fin ⪯ snapshot(F)`. A chain `new` with `F ⪯bft LF(new)` has `snapshot(F) ⪯ snapshot(LF(new))`
+by Linearity, and `snapshot(LF(new)) ⪯ new` by Last Final Snapshot, so `new` contains `fin`. The
+refused chains are therefore stale-context chains, as in the adversary strategy the Questions
+page describes.
+
+The Book makes three statements that bear on a change of this kind:
+
+- The honest-production instruction excludes using `Π_bft` information beyond the consensus
+  rules to choose among bc-valid chains (§4.1, item 3). Sticky fork choice uses `fin`.
+- The liveness analysis
+  [attributes its tractability to leaving `Π_bc` fork choice unmodified](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/security-analysis.md#L15-L23),
+  in contrast with Casper FFG, whose fork choice follows the justified checkpoint. Under sticky
+  fork choice a node never switches to a chain with less work, and an advance of `fin` never
+  causes a switch, because `fin` advances only along the current chain. A node can instead
+  refuse a switch. The Book has no liveness argument for that.
+- The reason given for "Probably not" is that nothing useful can be said about `snapshot(B)`
+  once `Π_bft` may be subverted. Under sticky fork choice a subverted `Π_bft` still cannot place
+  `fin` off the node's best chain or above `prune_σ(bc_best)`. It can choose when to finalize: a
+  `σ`-confirmed prefix finalized before a Prefix Consistency failure would displace it is the
+  branch the node keeps. The Book has no safety argument for that either.
+
+#### Properties
+
+These follow from the definitions of `candidate` and `fin` (§3.1, §3.2) and the switch
+condition, and hold wherever protocol `fin` is computed, which this tree does not do yet
+(§6.1).
 
 - `fin ⪯ bc_best` holds on the node at all times. The raw-CL2 state in which `fin` stays fixed
   on a branch that `bc_best` no longer contains (§4.1) does not arise.
 - The conflicting-candidate case of the §3.2 update cannot occur: `candidate(bc_best)` and `fin`
-  both lie on `bc_best`, so they are comparable. Its observable counterpart is a refused switch,
-  meaning a chain in view with more work than `current` that excludes `fin`.
+  both lie on `bc_best`, so they are comparable. The §3.2 hazard record is therefore never
+  written. Its observable counterpart is a refused switch, meaning a chain in view with more
+  work than `current` that excludes `fin`.
 - The rule selects a different chain from raw work-based fork choice only when a chain with
   more work than `current` excludes `fin`. By the Local fin-depth lemma, `fin` was part of
-  `prune_σ` of this node's best chain at some earlier time, so the raw choice in that situation
-  would displace a prefix that was `σ`-confirmed in the node's own earlier best chain. Where no
-  such chain is in view, the two rules select the same chain.
-- `Π_bft` can move `fin` only to `candidate(bc_best)`, which lies at or below
-  `prune_σ(bc_best)`. Finality therefore pins only blocks the node had already selected by work
-  and `σ`-confirmed; it cannot move the node onto a chain it did not select. While `Π_bft` is
-  stalled or withholding, `fin` is frozen and selection above it is the raw work rule.
-- The rule uses `Π_bft`-derived information to select among bc-valid chains. The Book's
-  honest-production instruction (§4.1, item 3) excludes that, and its `Π_bc`-side safety argument
-  assumes an unmodified best-chain rule. The `Π_bft`-side argument, Final Agreement plus
-  Linearity implying Assured Finality, does not involve fork choice.
+  `prune_σ` of this node's best chain at some earlier time. The raw choice in that situation
+  would displace a prefix that was `σ`-confirmed in the node's own earlier best chain. Where no such chain is in view, the two
+  rules select the same chain.
+- `candidate(H) ⪯ prune_σ(H)` for every `H`, because an lca is an ancestor of both of its
+  arguments. `Π_bft` can therefore move `fin` only to blocks the node had already selected by
+  work and `σ`-confirmed; it cannot move the node onto a chain it did not select. While `Π_bft`
+  is stalled or withholding, `fin` is frozen and selection above it is the raw work rule.
+- The node never switches to a chain with less work than `current`.
 
-**Behavior by situation, compared with raw work-based fork choice:**
+#### Behavior by situation
+
+Each case compares sticky fork choice with raw work-based fork choice. Statements under
+*With Linearity* assume `Π_bft` Final Agreement and enforcement of the Linearity rule, as the
+abstract outcome in FINALITY_DIAGRAM §4 does. Statements under *Without Linearity* apply to the
+current prototype, which enforces neither Linearity nor Last Final Snapshot (§6.2).
 
 - *Candidate regression with `fin` still on the heavier chain* (FINALITY_DIAGRAM §3). Both rules
   switch to the heavier chain.
-- *Heavier chain forked below `fin`* (FINALITY_DIAGRAM §4). Raw: the node follows the heavier
-  chain, `fin` stays behind on the other branch, and finality stalls under Linearity. Sticky: the
-  node stays on the branch containing `fin`, and its tip advances only as fast as hash rate on
-  that branch extends it. No amount of work on the other branch changes this; only a change to
-  `fin` from outside the protocol would.
+- *Heavier chain forked below `fin`* (FINALITY_DIAGRAM §4). Under raw fork choice the node
+  follows the heavier chain and `fin` stays behind on the other branch. Under sticky fork choice
+  the node stays on the branch containing `fin`, and its tip advances only as fast as hash rate
+  on that branch extends it. No amount of work on the other branch changes this; only a change
+  to `fin` from outside the protocol would.
+  - *With Linearity:* no final snapshot can move onto the heavier branch past the branch point.
+    Under raw fork choice the node's `fin` stays frozen while that branch is its best chain.
+    Under sticky fork choice `fin` can keep advancing if `Π_bft` finalizes the branch the node
+    holds.
+  - *Without Linearity:* `Π_bft` can finalize snapshots on the heavier branch. Under raw fork
+    choice `candidate(bc_best)` then conflicts with `fin`, the node records the §3.2 hazard, and
+    `fin` stays frozen. Under sticky fork choice `candidate(bc_best)` is at or below the branch
+    point, so `fin` freezes without a hazard record; the event is visible only as the refused
+    switch.
 - *Partition while `fin` is frozen on every node.* Every chain extending the common `fin` is
   eligible, so selection is by work on both sides. After the partition heals, nodes converge on
   the heavier chain under either rule, provided no node's `fin` moved past the fork point.
 - *Partition in which one side advances `fin`.* Side A holds enough stake for `Π_bft` to decide
   and advances `fin` past the fork point; side B does not. After the partition heals, A-side
   nodes never switch to B's chain, whatever its work. B-side nodes switch to A's chain once it
-  has more work than theirs, since it contains their `fin`. B's miners cannot bring B's chain
-  under A's BFT decisions, because the Last Final Snapshot rule requires `snapshot(LF(H)) ⪯ H`
-  and those snapshots lie on A's branch. While B's branch has more work, the nodes stay split
-  along the partition. Under raw fork choice, all nodes converge on the heavier branch and
-  finality stays stalled until that branch is abandoned. How often this arises, and how many
+  has more work than theirs, since it contains their `fin`. While B's branch has more work, the
+  nodes stay split along the partition. B's blocks cannot advance B-side `fin` past the fork
+  point using A's decisions: with Last Final Snapshot they cannot carry that context, and
+  without it their candidate is clamped to the fork point. How often this arises, and how many
   nodes land on each side, depends on how stake and hash rate are distributed across the
-  partition.
-- *Order of observation.* Suppose a lighter branch carries BFT-final snapshots past the fork
-  point and a heavier branch does not. A node that processes the lighter branch first, for
-  example during sync, advances `fin` into it and then refuses the heavier branch. A node that
-  processes the heavier branch first keeps `fin` at or below the fork and does not switch to the
-  lighter branch until it has more work. Under raw fork choice both nodes end on the heavier
-  branch.
-- *Conflicting finality.* For two nodes to hold conflicting `fin` values, `Π_bft` Final
-  Agreement must fail and, because each `fin` is `σ`-confirmed in its own node's chain, their
-  best chains must also have diverged at depth `σ`. Under raw fork choice both nodes follow the
-  heavier chain and one of them records the §3.2 safety hazard. Under sticky fork choice each node
-  keeps the branch containing its own `fin`, whatever the work on the other.
+  partition. Under raw fork choice all nodes follow the heavier branch.
+  - *With Linearity:* later final snapshots stay on A's branch, so B-side `fin` never passes the
+    fork point and B-side nodes can always still switch to A. Under raw fork choice, if B is
+    heavier, finality stays stalled until B's branch is abandoned.
+  - *Without Linearity:* if `Π_bft` later finalizes a snapshot on B's branch, B-side nodes
+    advance `fin` past the fork point on B. From then on neither side switches, whatever the
+    work, and neither records a hazard, because each side's candidate from the other branch is
+    clamped below its own `fin`. Under raw fork choice every node follows the heavier branch, and
+    nodes whose `fin` lies on the other branch record the hazard once the candidate passes the
+    branch point.
+- *Order of observation.* Suppose a lighter branch carries final snapshots past the fork point
+  and a heavier branch does not. A node that processes the lighter branch first, for example
+  during sync, advances `fin` into it and then refuses the heavier branch. A node that processes
+  the heavier branch first keeps `fin` at or below the fork and does not switch to the lighter
+  branch until it has more work. Under raw fork choice both nodes end on the heavier branch.
+  - *With Linearity:* the premise persists: no later final snapshot can move onto the heavier
+    branch past the fork point.
+  - *Without Linearity:* the heavier branch can later gain final snapshots past the fork point
+    as well. A node that processed it first then advances `fin` into it, and the two nodes stay
+    on different branches whatever the work.
+- *Conflicting finality.* Each `fin` lies on `prune_σ` of its own node's earlier best chain,
+  so two conflicting `fin` values require those best chains to have diverged at depth `σ`, a
+  Prefix Consistency failure. Under raw fork choice both nodes follow the heavier chain, and the
+  node whose `fin` it excludes records the §3.2 hazard once the candidate passes the branch
+  point. Under sticky fork choice each node keeps the branch containing its own `fin`, whatever
+  the work on the other, and neither records a hazard.
+  - *With Linearity:* conflicting `fin` values also require a Final Agreement failure, because
+    every `fin` is at or below the snapshot of a final bft-block (§3.4) and those snapshots are
+    bc-linear.
+  - *Without Linearity:* conflicting `fin` values need no Final Agreement failure; the
+    partition case above is an example.
 
-**Zebra specifics.**
+#### Zebra specifics
 
 - The rule needs protocol `fin`, which this tree does not compute (§6.1). The current collapse
   onto a BFT-decided branch (§4.2, §6.3) is a related rule with a different floor: the stored
@@ -395,6 +506,8 @@ entirely from `fin`: the eligible set shrinks each time `fin` advances.
   `candidate(bc_best)`. With that floor, the invariant above does not follow: the marker need not
   lie on the node's best chain when it advances, and a known side-chain hash becomes canonical
   (§5.2).
+- The prototype enforces neither Linearity nor Last Final Snapshot (§6.2), so the
+  *Without Linearity* outcomes above are the ones that apply to it.
 - Zebra also commits the root of the best chain to the finalized database once the chain is
   longer than `MAX_BLOCK_REORG_HEIGHT` (99, from `zcash_protocol::consensus`, applied in
   `zebra-state/src/service/write.rs`). Chains forking below that point are no longer in view.
@@ -556,9 +669,9 @@ Any future consensus change must keep all three paths identical.
 ### 6.2 Missing validity rules
 
 - The Last Final Snapshot rule is not implemented for bc-block admission.
-- The Finality Depth rule and Stalled Mode are not implemented, by design (§3.3). They are
-  omissions from the Book, not missing work. `finalization_gap_bound` is read only by test
-  formatting, and the 512-block log threshold is diagnostic, not consensus.
+- The Finality Depth rule and Stalled Mode are omitted by design (§3.3).
+  `finalization_gap_bound` is read only by test formatting, and the 512-block log threshold is
+  diagnostic, not consensus.
 - BFT validation does not implement Linearity or Tail Confirmation. It checks that the first
   carried header's block is locally present, but does not establish that all `σ` headers form a
   valid chain with valid PoW.
@@ -589,8 +702,8 @@ The documentation and implementation must separately name:
 ### 6.4 Unbounded finality gap
 
 Nothing in consensus bounds the finality gap or restricts which transactions a block far past
-the snapshot may carry. This follows from omitting Stalled Mode (§3.3) and is not a divergence
-from this design. It has two practical consequences:
+the snapshot may carry. This follows from omitting Stalled Mode (§3.3). It has two practical
+consequences:
 
 - The diagnostic warning at a hardcoded gap is the only signal of a long finalization stall.
   Any response to one, such as alerts, wallet warnings, or operator action, is outside
@@ -629,16 +742,15 @@ The protocol names should encode their definitions:
 
 Policy and persistence need separate names such as `canonical_finalized_tip` and
 `state_commit_tip`. The legacy reorg-depth value should keep a name that says it is a
-reorg-depth marker, not Crosslink finality. No identifier should say "bounded available": this
-tree has no such quantity.
+reorg-depth marker, not Crosslink finality.
 
-Without `ba_μ` there is no protocol view between the best tip and the finalized tip, so nothing
-is a default for "confirmed" presentation. Each consumer needs a contract:
+No protocol view lies between the best tip and the finalized tip, so no CL2 quantity is a
+default for "confirmed" presentation. Each consumer needs a contract:
 
 | consumer or endpoint | value | contract or unresolved work |
 |---|---|---|
 | raw best-tip display | `bc_best_tip` | current fork-choice result |
-| confirmed display | `bc_best_tip` at a stated confirmation depth | `Π_bc` confirmation only; can be an ancestor of `local_finalized_tip`, or conflict with it after a Prefix Consistency failure (§3.3); never present it as bounded or final |
+| confirmed display | `bc_best_tip` at a stated confirmation depth | `Π_bc` confirmation only; can be an ancestor of `local_finalized_tip`, or conflict with it after a Prefix Consistency failure (§3.3); never present it as final |
 | final display | `local_finalized_tip` | node-local monotone CL2 view |
 | `get_tfl_final_block_hash` and `get_tfl_final_block_height_and_hash` | `local_finalized_tip` | partly implemented: they now return no value when the marker is absent, but when present it is still the legacy-fed slot, and the checkpoint/recency exposure condition of §6.5 does not exist |
 | block/transaction status | unresolved API contract | define distinct `Confirmed` and `Finalized` states before routing either |
@@ -732,8 +844,11 @@ payout boundary at H  iff  candidate(H) != candidate(parent(H))
 This is not literally the event "local `fin` advanced." It is a block-local event that would
 permit `fin` to advance if `H` were observed as best and its candidate were ahead of that
 node's current `fin`. `snapshot(LF(H))` is another objective candidate source. The selected
-function must be monotone under the enforced validity rules; today the missing Linearity and
-Last Final Snapshot checks leave that premise unenforced. Without a Finality Depth rule, a
+function must be monotone along a chain under the enforced validity rules. Extension, which is
+implemented, makes `LF(H)` monotone along a chain; Linearity then makes `snapshot(LF(H))`
+monotone, and `candidate(H)` follows because `prune_σ(H)` is monotone and an lca of two
+monotone arguments is monotone. The missing Linearity check leaves the premise unenforced
+today. Without a Finality Depth rule, a
 bc-block producer can also keep a stale `context_bft` at no validity cost (§3.3), so an
 objective advance trigger lets whoever dominates `bc_best` delay payouts while `Π_bft` is live.
 
@@ -766,8 +881,8 @@ which ledger state is read to materialize that set.
 ### 9.4 Remaining protocol choices
 
 - Decide whether and how to implement the Last Final Snapshot, Linearity, and Tail
-  Confirmation rules. These are consensus changes in the current prototype. Finality Depth is
-  not among them (§3.3).
+  Confirmation rules. These are consensus changes in the current prototype. Under sticky fork
+  choice, §4.3 lists the outcomes that depend on Linearity.
 - Remove `finalization_gap_bound` from `ZcashCrosslinkParameters` and the test format, or
   re-document it as unused; its doc comment still describes Stalled Mode.
 - Decide whether the one-block snapshot shift requires PoS-store migration or replay rules. It
@@ -799,6 +914,12 @@ which ledger state is read to materialize that set.
 - [Original TFL Book: BFT validity rules](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L568-L574)
 - [Original TFL Book: bc validity and honest production](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L680-L717)
 - [Original TFL Book: fork-choice question](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/questions.md#L11-L52)
+- [Original TFL Book: Linearity and Last Final Snapshot rules combined](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/potential-changes.md#L320-L371),
+  including the note that the Questions argument predates Linearity
+- [Original TFL Book: what the Linearity rule does](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L587-L604), the
+  informal safety sketch for both rules
+- [Original TFL Book: liveness contrast with Casper FFG](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/security-analysis.md#L15-L23) and
+  [the status of the safety argument](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/security-analysis.md#L52-L54)
 - [Shielded Labs warning about the adapted construction](https://github.com/ShieldedLabs/zebra-crosslink/blob/6d02a1b80f896d08f923e39b2505f0565efb5787/book/src/design/cl2-construction.md#L1-L14).
   Protocol definitions above are cited separately from the original pinned source.
 

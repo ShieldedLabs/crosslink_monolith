@@ -174,6 +174,8 @@
     .outcomes td { color: var(--muted); }
     .outcomes td:first-child { color: var(--ink); }
     .rule.plain { border-color: var(--fin); }
+    .block-title { margin: 30px 0 6px; font-size: 1.2rem; }
+    .outcomes { min-width: 860px; }
 
     @media (max-width: 850px) {
       main { width: min(100% - 20px, 1180px); padding-top: 28px; }
@@ -219,9 +221,8 @@
     forks below <code>fin</code> is a different, exceptional event.
   </p>
   <p class="lede">
-    Zebra Crosslink omits Stalled Mode, so the Book's bounded-available view <code>ba_mu</code>,
-    its depth <code>mu</code>, the gap bound <code>L</code>, and the Finality Depth rule do not
-    exist here. Nothing lies between <code>bc_best</code> and <code>fin</code>, and nothing bounds
+    Zebra Crosslink omits Stalled Mode, and with it the Book's bounded availability. Nothing lies
+    between <code>bc_best</code> and <code>fin</code>, and nothing bounds
     how far the best chain runs ahead of <code>fin</code>.
   </p>
   <p class="lede">See the <a href="./FINALITY.md">full semantic and implementation analysis</a>.</p>
@@ -670,10 +671,18 @@
 
     <p>— <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/questions.md#L44-L52">Questions about Crosslink, lines 44–52</a>.</p>
 
-    <p>The Questions heading predates the construction's current Last Final Snapshot validity
-      rule. Its analysis remains relevant because it distinguishes that per-block rule from the
-      stronger, unadopted requirement that the selected best chain extend the latest final BFT
-      snapshot in the observer's view.</p>
+    <p>The Questions page
+      <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/questions.md#L7-L9">analyzes the Last Final Snapshot rule on its own</a>, and the
+      potential-changes section notes that the argument against that rule
+      <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/potential-changes.md#L346">was made for a protocol without Linearity</a>. The
+      fork-choice change belongs to the same discussion, part of which
+      <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/questions.md#L38">relies on the Finality Depth rule and Stalled Mode</a> that this
+      design omits; the Book does not revisit the change with Linearity in place. It declines the
+      change because
+      <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/questions.md#L48-L50">nothing useful can be said about <code>snapshot(B)</code></a>
+      once BFT may be subverted. The per-block rule and the
+      fork-choice constraint stay distinct: a block can satisfy the Last Final Snapshot rule with
+      stale BFT context. Section 6 compares the constraint with sticky fork choice.</p>
   </section>
 
   <section class="panel" id="sticky-fork-choice">
@@ -747,6 +756,9 @@
       </svg>
     </div>
 
+    <h3 class="block-title">Properties</h3>
+    <p class="subhead">These follow from the definitions of <code>candidate</code> and <code>fin</code> and the switch condition, and hold wherever protocol <code>fin</code> is computed.</p>
+
     <div class="rules">
       <div class="rule plain">
         <h3>Same as the finalized-prefix rule, with floor <code>fin</code></h3>
@@ -754,36 +766,67 @@
       </div>
       <div class="rule advance">
         <h3>Local invariant: <code>fin ⪯ bc_best</code></h3>
-        <p>A conflicting candidate cannot arise on the node's own chain. The observable counterpart is a refused switch: a heavier chain in view that excludes <code>fin</code>.</p>
+        <p>A conflicting candidate cannot arise on the node's own chain, so the finalization safety hazard record is never written. The observable counterpart is a refused switch: a heavier chain in view that excludes <code>fin</code>.</p>
       </div>
       <div class="rule hold">
         <h3>Differs from raw fork choice only at a refused switch</h3>
-        <p><code>fin</code> was <code>sigma</code>-confirmed in this node's earlier best chain, so the raw rule would displace that prefix at exactly those moments. Otherwise both rules select the same chain.</p>
+        <p><code>fin</code> was <code>sigma</code>-confirmed in this node's earlier best chain, so the raw rule would displace that prefix at exactly those moments. The node never switches to a chain with less work, and an advance of <code>fin</code> never causes a switch.</p>
       </div>
       <div class="rule fast">
         <h3>Finality pins only what work already selected</h3>
-        <p><code>fin</code> moves only to <code>candidate(bc_best)</code>, at or below <code>prune_sigma(bc_best)</code>. While BFT is stalled or withholding, <code>fin</code> is frozen and selection above it is by work.</p>
+        <p><code>candidate(H)</code> is an lca with <code>prune_sigma(H)</code>, so <code>fin</code> moves only to blocks at or below <code>prune_sigma(bc_best)</code>. While BFT is stalled or withholding, <code>fin</code> is frozen and selection above it is by work.</p>
       </div>
     </div>
 
+    <h3 class="block-title">Relation to the Book's fork-choice discussion</h3>
+    <p class="subhead">The nearest relative of sticky fork choice in the Book is the fork-choice change it considers and declines (§5). The two differ in their floor.</p>
+
+    <div class="comparison">
+      <article>
+        <h3>The Book's fork-choice change: floor <code>snapshot(B)</code></h3>
+        <p><code>B</code> is the newest final BFT block in the node's view. Its snapshot need not lie on any chain the node has selected, nor be <code>sigma</code>-confirmed in one.</p>
+      </article>
+      <article>
+        <h3>Sticky fork choice: floor <code>fin</code></h3>
+        <p><code>fin</code> advances only to <code>candidate(bc_best)</code>, a block on the node's own best chain at or below <code>prune_sigma(bc_best)</code>.</p>
+      </article>
+    </div>
+
+    <div class="rules">
+      <div class="rule plain">
+        <h3>With Final Agreement and Linearity: a subset</h3>
+        <p><code>fin ⪯ snapshot(B)</code>, because <code>fin</code> is at or below the snapshot of some final BFT block and those snapshots are linear. Sticky fork choice then refuses a subset of the chains the Book's change refuses. Without Linearity the two floors can conflict, and neither set contains the other.</p>
+      </div>
+      <div class="rule hold">
+        <h3>With Last Final Snapshot as well: stale contexts</h3>
+        <p>A chain whose last final BFT block extends the one that last advanced <code>fin</code> contains that block's snapshot, and therefore <code>fin</code>. Every refused chain carries an older BFT context.</p>
+      </div>
+    </div>
+
+    <h3 class="block-title">Behavior by situation</h3>
     <div class="table-wrap">
       <table class="outcomes">
         <thead>
-          <tr><th>Situation</th><th>Raw work-based fork choice</th><th>Sticky fork choice</th></tr>
+          <tr><th>Situation</th><th>Raw fork choice, with Linearity</th><th>Sticky fork choice, with Linearity</th><th>Without Linearity</th></tr>
         </thead>
         <tbody>
-          <tr><td>Candidate regression, heavier chain still contains <code>fin</code> (§3)</td><td>Switches to the heavier chain.</td><td>Switches to the heavier chain.</td></tr>
-          <tr><td>Heavier chain forks below <code>fin</code> (§4)</td><td>Follows the heavier chain; <code>fin</code> stays on the other branch; finality stalls under Linearity.</td><td>Stays on the branch containing <code>fin</code>; its tip advances at that branch's hash rate, whatever the other branch's work.</td></tr>
-          <tr><td>Partition while <code>fin</code> is frozen on every node</td><td>Converges on the heavier chain after healing.</td><td>Converges on the heavier chain after healing, provided no node's <code>fin</code> moved past the fork point.</td></tr>
-          <tr><td>Partition in which only side A advances <code>fin</code> past the fork</td><td>All nodes converge on the heavier branch; finality stays stalled until that branch is abandoned.</td><td>A-side nodes never switch to B. B-side nodes switch to A once A has more work. While B has more work, nodes stay split along the partition; the extent depends on how stake and hash rate are distributed.</td></tr>
-          <tr><td>Lighter branch carries BFT-final snapshots past the fork; heavier branch does not</td><td>Every node ends on the heavier branch, in any order of observation.</td><td>A node that processes the lighter branch first stays on it; a node that processes the heavier branch first stays there until the lighter one has more work.</td></tr>
-          <tr><td>Conflicting <code>fin</code> values (needs a BFT Final Agreement failure and a <code>sigma</code>-deep bc divergence)</td><td>Both nodes follow the heavier chain; one records a finalization safety hazard.</td><td>Each node keeps the branch containing its own <code>fin</code>, whatever the work on the other.</td></tr>
+          <tr><td>Candidate regression, heavier chain still contains <code>fin</code> (§3)</td><td>Switches to the heavier chain.</td><td>Switches to the heavier chain.</td><td>Same.</td></tr>
+          <tr><td>Heavier chain forks below <code>fin</code> (§4)</td><td>Follows the heavier chain; <code>fin</code> stays on the other branch and is frozen while that branch is best.</td><td>Stays on the branch containing <code>fin</code>; its tip advances at that branch's hash rate, whatever the other branch's work, and <code>fin</code> can keep advancing there.</td><td>BFT can finalize snapshots on the heavier branch. Raw: the candidate conflicts with <code>fin</code> and the node records a hazard. Sticky: <code>fin</code> freezes with no hazard record; only the refused switch shows it.</td></tr>
+          <tr><td>Partition while <code>fin</code> is frozen on every node</td><td>Converges on the heavier chain after healing.</td><td>Converges on the heavier chain after healing, provided no node's <code>fin</code> moved past the fork point.</td><td>Same.</td></tr>
+          <tr><td>Partition in which only side A advances <code>fin</code> past the fork</td><td>All nodes follow the heavier branch; if that is B, finality stays stalled until B is abandoned.</td><td>A-side nodes never switch to B. B-side nodes switch to A once A has more work. While B has more work, nodes stay split along the partition; the extent depends on how stake and hash rate are distributed.</td><td>If BFT later finalizes a snapshot on B, B-side <code>fin</code> passes the fork: under sticky fork choice neither side ever switches and neither records a hazard. Under raw fork choice all nodes follow the heavier branch, and nodes whose <code>fin</code> is on the other one record a hazard.</td></tr>
+          <tr><td>Lighter branch carries final snapshots past the fork; heavier branch does not</td><td>Every node ends on the heavier branch, in any order of observation.</td><td>A node that processes the lighter branch first stays on it; a node that processes the heavier branch first stays there until the lighter one has more work.</td><td>The heavier branch can gain final snapshots too. Under sticky fork choice nodes then stay on whichever branch they processed first, whatever the work.</td></tr>
+          <tr><td>Conflicting <code>fin</code> values</td><td>Need a <code>sigma</code>-deep bc divergence and a BFT Final Agreement failure. Both nodes follow the heavier chain; the node whose <code>fin</code> it excludes records a hazard.</td><td>Same preconditions. Each node keeps the branch containing its own <code>fin</code>, whatever the work on the other; no hazard is recorded.</td><td>Need only the <code>sigma</code>-deep divergence; the partition row is an example.</td></tr>
         </tbody>
       </table>
     </div>
 
+    <div class="warning-note">
+      <p><strong>The last column is the one that applies to the current Zebra prototype</strong>, once it computes protocol <code>fin</code>. The other two columns assume BFT Final Agreement and enforcement of the Linearity rule, as the abstract outcome in §4 does. The prototype enforces neither Linearity nor Last Final Snapshot.</p>
+    </div>
+
     <div class="protocol-note">
-      <p><strong>Relation to the Book and to current Zebra:</strong> the rule uses BFT-derived information to choose among bc-valid chains, which the Book's honest-production instruction (§5) excludes, and the Book's best-chain-side safety argument assumes an unmodified fork choice. The BFT-side argument, Final Agreement plus Linearity implying Assured Finality, does not involve fork choice. The rule needs protocol <code>fin</code>, which Zebra does not yet compute; the prototype's current finalized-branch collapse uses the BFT-decided marker as its floor instead. Zebra also commits the root of any best chain longer than <code>MAX_BLOCK_REORG_HEIGHT</code> (99), so on a Zebra node the effective floor is the higher of <code>fin</code> and that depth-committed block.</p>
+      <p><strong>What the Book says about changes of this kind:</strong> its honest-production instruction excludes BFT-derived information when choosing among bc-valid chains (§5). Its <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/security-analysis.md#L15-L23">liveness analysis</a> attributes its tractability to leaving fork choice unmodified, in contrast with Casper FFG, whose fork choice follows the justified checkpoint. Under sticky fork choice a node never switches to a lighter chain and never switches because <code>fin</code> advanced, but it can refuse a switch; the Book has no liveness argument for that. The Book declines its own change because nothing useful can be said about <code>snapshot(B)</code> once BFT may be subverted. A subverted BFT still cannot place <code>fin</code> off the node's best chain or above <code>prune_sigma(bc_best)</code>, but by finalizing a <code>sigma</code>-confirmed prefix before a Prefix Consistency failure would displace it, it decides which branch the node keeps; the Book has no safety argument for that either.</p>
+      <p><strong>Current Zebra:</strong> the rule needs protocol <code>fin</code>, which Zebra does not yet compute; the prototype's current finalized-branch collapse uses the BFT-decided marker as its floor instead. Zebra also commits the root of any best chain longer than <code>MAX_BLOCK_REORG_HEIGHT</code> (99), so on a Zebra node the effective floor is the higher of <code>fin</code> and that depth-committed block.</p>
     </div>
   </section>
 
@@ -791,8 +834,7 @@
     <h2>7. The shortest useful summary</h2>
     <div class="takeaway">
       <p><code>bc_best</code> is raw fork choice; <code>candidate(H)</code> is objective evidence;
-      and <code>fin</code> is node-local monotone memory. There is no bounded-available view: an
-      application either stops with <code>fin</code> during a finalization stall, or follows
+      and <code>fin</code> is node-local monotone memory. An application either stops with <code>fin</code> during a finalization stall, or follows
       <code>bc_best</code> with no bound on how far it runs past <code>fin</code>. Sticky fork
       choice is a candidate rule that selects <code>bc_best</code> only among chains containing
       <code>fin</code>, ordered by work and then tip hash.</p>
@@ -807,6 +849,8 @@
       <li><a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L245-L260">Original TFL Book: highest-score best-chain definition</a> and its <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L709-L717">normative warning against additional BFT-derived fork-choice constraints</a>.</li>
       <li><a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/questions.md#L11-L26">Original TFL Book: analysis of stale BFT context and a finalized-snapshot fork-choice rule</a>, followed by its <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/questions.md#L44-L52">“Probably not” conclusion</a>.</li>
       <li><a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L423-L562">Original TFL Book: definitions of <code>candidate</code> and <code>fin</code>, plus sync guidance</a>. The same range defines <code>ba_mu</code>, which this design omits.</li>
+      <li><a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L587-L604">Original TFL Book: what the Linearity rule does</a>, including the informal safety sketch for Linearity and Last Final Snapshot, and <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/potential-changes.md#L320-L371">the two rules combined</a>, whose security analysis is unfinished.</li>
+      <li><a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/security-analysis.md#L15-L23">Original TFL Book: liveness contrast with Casper FFG</a>, resting on unmodified fork choice, and <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/security-analysis.md#L52-L54">the safety argument's status</a>: not yet updated for Crosslink 2.</li>
       <li><a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/security-analysis.md#L7-L13">Original TFL Book: liveness note</a> that the Finality Depth rule can be omitted independently of the rest of Crosslink 2, at the cost of weaker incentives to advance finalization.</li>
       <li><a href="https://github.com/ShieldedLabs/zebra-crosslink/blob/6d02a1b80f896d08f923e39b2505f0565efb5787/book/src/design/cl2-construction.md#L1-L14">Shielded Labs adaptation warning</a>: the copy may be incomplete, confusing, or inconsistent and records Zebra-specific divergences. Definitions above are cited separately from the original pinned source.</li>
       <li><a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/the-arguments-for-bounded-availability-and-finality-overrides.md">Pinned TFL Book discussion of bounded availability and finality overrides</a>: the case for bounding the finality gap with Stalled Mode, which Zebra Crosslink does not adopt.</li>
