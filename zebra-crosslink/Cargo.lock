@@ -9678,6 +9678,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "thread-priority",
+ # "tikv-jemallocator",
  "tinyvec",
  "tokio",
  "tokio-stream",
