@@ -630,7 +630,6 @@ struct DTestnetParameters {
 #[serde(deny_unknown_fields)]
 struct DCrosslinkParameters {
     bc_confirmation_depth_sigma: Option<u64>,
-    finalization_gap_bound: Option<u64>,
     bootstrap_roster_height: Option<u32>,
     bootstrap_activation_height: Option<u32>,
 }
@@ -648,9 +647,6 @@ impl DCrosslinkParameters {
             bc_confirmation_depth_sigma: self
                 .bc_confirmation_depth_sigma
                 .unwrap_or(prototype.bc_confirmation_depth_sigma),
-            finalization_gap_bound: self
-                .finalization_gap_bound
-                .unwrap_or(prototype.finalization_gap_bound),
             bootstrap: BftBootstrap::FromChain {
                 roster_height: self.bootstrap_roster_height.unwrap_or(prototype_roster_height),
                 activation_height: self
@@ -665,7 +661,6 @@ impl From<ZcashCrosslinkParameters> for DCrosslinkParameters {
     fn from(params: ZcashCrosslinkParameters) -> Self {
         Self {
             bc_confirmation_depth_sigma: Some(params.bc_confirmation_depth_sigma),
-            finalization_gap_bound: Some(params.finalization_gap_bound),
             bootstrap_roster_height: params.bootstrap.roster_height(),
             bootstrap_activation_height: params.bootstrap.activation_height(),
         }

@@ -130,8 +130,8 @@ impl TFInstr {
             }
             Some(TestInstr::SetParams(params)) => {
                 str += &format!(
-                    "{} {} {:?}",
-                    params.bc_confirmation_depth_sigma, params.finalization_gap_bound, params.bootstrap
+                    "{} {:?}",
+                    params.bc_confirmation_depth_sigma, params.bootstrap
                 )
             }
             Some(TestInstr::ExpectPoWChainLength(h)) => str += &h.to_string(),
@@ -210,14 +210,13 @@ impl TF {
         // Enforce that every parameter is written: adding a member fails to compile here.
         let ZcashCrosslinkParameters {
             bc_confirmation_depth_sigma,
-            finalization_gap_bound,
             bootstrap,
         } = *params;
         tf.push_instr_ex(
             TFInstr::SET_PARAMS,
             0,
             &bootstrap_to_bytes(bootstrap),
-            [bc_confirmation_depth_sigma, finalization_gap_bound],
+            [bc_confirmation_depth_sigma, 0],
         );
 
         tf
@@ -461,7 +460,7 @@ use crate::*;
 /// written that way before the bootstrap became a parameter.
 pub const HARNESS_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParameters {
     bootstrap: BftBootstrap::Supplied,
-    // Sigma and L are pinned here rather than inherited from `PROTOTYPE_PARAMETERS`. The
+    // Sigma is pinned here rather than inherited from `PROTOTYPE_PARAMETERS`. The
     // scenes in the test suite are hand-built at specific heights: a BFT block carries exactly
     // sigma headers, and the PoW block that cites it has to sit at least sigma + 1 above the
     // block that certificate finalizes. Inheriting sigma would silently invalidate every one of
@@ -469,10 +468,10 @@ pub const HARNESS_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParameter
     // parameter should mean. The rules under test do not depend on sigma's value; the live
     // network's value is exercised on a testnet, not here.
     bc_confirmation_depth_sigma: 3,
-    finalization_gap_bound: 7,
 };
 
-// `SET_PARAMS` carries sigma and L in `val`, and the bootstrap in its data.
+// `SET_PARAMS` carries sigma in `val[0]`, and the bootstrap in its data. `val[1]` is written as
+// zero and never read: it used to carry the Book's `L`, which Zebra Crosslink does not have.
 const TF_BOOTSTRAP_SUPPLIED: u8 = 0;
 const TF_BOOTSTRAP_FROM_CHAIN: u8 = 1;
 
@@ -539,7 +538,6 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
 
         TFInstr::SET_PARAMS => Some(TestInstr::SetParams(ZcashCrosslinkParameters {
             bc_confirmation_depth_sigma: instr.val[0],
-            finalization_gap_bound: instr.val[1],
             bootstrap: bootstrap_from_bytes(instr.data_slice(bytes))?,
         })),
 

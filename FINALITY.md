@@ -64,9 +64,9 @@ definitions guarantee.
 
 **Current tree.** The prototype sets `σ = 4` in `librustzcash/zcash_primitives/src/bft.rs`
 (`PROTOTYPE_PARAMETERS`). The source code explicitly warns that this value has not been
-verified as secure or performant. The same struct also carries `finalization_gap_bound: 10`,
-the Book's `L`. It has no meaning in Zebra Crosslink, which removes it: only test formatting
-reads it, and its doc comment still describes Stalled Mode activation.
+verified as secure or performant. The Book's `L` is not a parameter of this design:
+`finalization_gap_bound` has been removed from `ZcashCrosslinkParameters`, from the node
+configuration, and from the test format, which writes zero in its place.
 
 ### Notation
 
@@ -732,10 +732,9 @@ service request, and the `TxFinalityStatus` service request. Every consensus-, s
 GUI-side reader takes `internal.latest_final_block` directly and never saw the substituted
 value.
 
-`TFLServiceInternal::current_bc_final` is initialized in
-`zebra-crosslink/zebra-crosslink/src/service.rs` and assigned during PoS-store startup in
-`tfl_service_main_loop`. No other read or write was found. It is currently unused duplicate
-state.
+`TFLServiceInternal` no longer carries a second copy of the marker: `current_bc_final`, which
+was written during PoS-store startup and read nowhere, has been deleted. The main loop's local
+tip is named `bc_best_tip`, after the protocol quantity it holds (§7).
 
 ### 5.2 Irreversible commitment and ordering
 
@@ -916,9 +915,8 @@ it departs from.
 ### 6.2 Missing validity rules
 
 - The Last Final Snapshot rule is not implemented for bc-block admission.
-- The Finality Depth rule and Stalled Mode are omitted by design (§3.3).
-  `finalization_gap_bound` is read only by test formatting, and the 512-block log threshold is
-  diagnostic, not consensus.
+- The Finality Depth rule and Stalled Mode are omitted by design (§3.3). There is no
+  `finalization_gap_bound`, and the 512-block log threshold is diagnostic, not consensus.
 - BFT validation does not implement Linearity or Tail Confirmation. It checks that the
   snapshot (`parent(headers[0])`) is locally present, but does not establish that the `σ`
   carried headers form a valid chain with valid PoW, nor that they are on the chain of the
@@ -997,7 +995,6 @@ still the legacy-fed slot, not `fin`.
   state commitment succeeds.
 - A known side-chain hash can change the canonical branch. A hash unknown to state panics the
   decide path; a hash whose chain is dropped after validation can retry forever (§5.2).
-- `current_bc_final` is unused duplicate state.
 
 ## 7. Names and consumer contracts
 
@@ -1159,10 +1156,12 @@ stored, or consumed.
   because `fin` is the view Assured Finality covers (§2).
 - **`σ` comes from `ZcashCrosslinkParameters`.** The GUI's `apply_viz_op` hardcodes it as
   `TMP_SIGMA`, which matches only while `PROTOTYPE_PARAMETERS` is unchanged.
-- **Removing `finalization_gap_bound` changes the test format.** The field is the Book's `L` in
-  `ZcashCrosslinkParameters`, and `test_format.rs` serializes it as the second parameter value.
-  It is removed. The `.zeccltf` files in `crosslink-test-data` are regenerated where a test
-  generates them, and otherwise kept with that value removed from their parameter instruction.
+- **Removing `finalization_gap_bound` changed the test format.** The field was the Book's `L` in
+  `ZcashCrosslinkParameters`, and `test_format.rs` serialized it as `SET_PARAMS`'s second
+  parameter value. Both are gone; `SET_PARAMS` still carries two values and writes zero in the
+  second, so the instruction's width is unchanged and older files still load. The `.zeccltf`
+  files a test generates were regenerated; the ones a test only loads carry no `SET_PARAMS` at
+  all and were left alone.
 - **Crosslink node tests and `viz_gui`.** Tests run through `phest.bat zebra-crosslink`, and
   `phargo.bat` enables `viz_gui` for that project, which puts winit on the main thread. The
   node tests in `zebrad/tests/crosslink.rs` run headless, so they run with `PH_NO_VIZ_GUI` set,

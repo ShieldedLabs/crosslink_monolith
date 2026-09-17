@@ -1388,9 +1388,6 @@ fn diagram_fork_miner() -> Address {
 /// can only point at a BFT block that already exists, so the two chains have to be
 /// interleaved this way; the diagram's `P10.context_bft = S6` with `S6` covering P8..P10
 /// is not constructible at all, since the pointer is inside the hashed header.
-///
-/// The diagram's `ba_mu = prune_sigma(P10) = P7` is not drawn by the GUI: nothing in this
-/// tree computes it (FINALITY.md 6.4).
 fn diagram_scene_1() -> (TF, Vec<Arc<Block>>) {
     let mut tf = TF::new(&HARNESS_PARAMETERS);
 

@@ -143,7 +143,6 @@ pub fn spawn_new_tfl_service(
         active_bft_string: None,
         // Empty until the bootstrap roster is taken from the chain (see `bootstrap_roster`).
         finalizers_at_current_height: Vec::new(),
-        current_bc_final: None,
         path_to_pos_store_file: path_to_pos_store_file.clone(),
         recency_status: TFLRecencyStatus::default(),
     }));

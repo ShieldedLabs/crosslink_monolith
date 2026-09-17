@@ -333,7 +333,6 @@ pub(crate) struct TFLServiceInternal {
 
     recency_status: TFLRecencyStatus,
 
-    current_bc_final: Option<(ZebBlockHeight, ZebBlockHash)>,
     path_to_pos_store_file: PathBuf,
 }
 
@@ -1487,7 +1486,6 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             internal.bft_blocks = i_bft_blocks;
             internal.fat_pointer_to_tip = fat_pointer_to_tip;
             if new_final_hash != ZebBlockHash([0; 32]) {
-                internal.current_bc_final = Some((new_final_height, new_final_hash));
                 set_final_block(&mut internal, new_final_height, new_final_hash);
             }
             roster
@@ -1508,7 +1506,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
         let mut run_instant = Instant::now();
         let mut last_diagnostic_print = Instant::now();
-        let mut current_bc_tip: Option<(ZebBlockHeight, ZebBlockHash)> = None;
+        let mut bc_best_tip: Option<(ZebBlockHeight, ZebBlockHash)> = None;
 
         loop {
             // Calculate this prior to message handling so that handlers can use it:
@@ -1544,7 +1542,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             if last_diagnostic_print.elapsed() >= MAIN_LOOP_INFO_DUMP_INTERVAL {
                 last_diagnostic_print = Instant::now();
                 if let (Some((tip_height, _tip_hash)), Some((final_height, _final_hash))) =
-                    (current_bc_tip, internal.latest_final_block)
+                    (bc_best_tip, internal.latest_final_block)
                 {
                     if tip_height < final_height {
                         info!(
@@ -1560,7 +1558,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 }
             }
 
-            current_bc_tip = new_bc_tip;
+            bc_best_tip = new_bc_tip;
         }
     }
 }

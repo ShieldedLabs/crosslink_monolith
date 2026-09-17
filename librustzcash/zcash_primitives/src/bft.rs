@@ -450,13 +450,6 @@ pub struct ZcashCrosslinkParameters {
     /// proposed once the tip reaches `F+σ`. A PoW block carries it at `F+σ+1` or above.
     pub bc_confirmation_depth_sigma: u64,
 
-    /// The depth of unfinalized PoW blocks past which "Stalled Mode" activates, `L`
-    ///
-    /// Quoting from [Zcash Trailing Finality Layer §3.3.3 Stalled Mode](https://electric-coin-company.github.io/tfl-book/design/crosslink/construction.html#stalled-mode):
-    ///
-    /// > In practice, L should be at least 2σ.
-    pub finalization_gap_bound: u64,
-
     /// How BFT comes into existence on this network.
     pub bootstrap: BftBootstrap,
 }
@@ -484,8 +477,6 @@ impl ZcashCrosslinkParameters {
 /// <div class="warning">No verification has been done on the security or performance of these parameters.</div>
 pub const PROTOTYPE_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParameters {
     bc_confirmation_depth_sigma: 4,
-    // The specification asks for L >= 2 sigma; keep it there as sigma moves.
-    finalization_gap_bound: 10,
     bootstrap: BftBootstrap::FromChain {
         roster_height: crate::transaction::STAKING_PERIOD / 2,
         activation_height: crate::transaction::STAKING_PERIOD / 2 + 200,
