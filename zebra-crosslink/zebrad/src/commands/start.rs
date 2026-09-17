@@ -452,9 +452,9 @@ impl StartCmd {
                 max_checkpoint_height,
                 config.sync.checkpoint_verify_concurrency_limit
                     * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
-                Arc::new(move |fat_pointer_a, fat_pointer_b, height| {
+                Arc::new(move |fat_pointer_a, fat_pointer_b, height, height_of| {
                     if let Some(closure) = actual_closure.lock().unwrap().as_mut() {
-                        (closure)(fat_pointer_a, fat_pointer_b, height)
+                        (closure)(fat_pointer_a, fat_pointer_b, height, height_of)
                     } else {
                         tracing::error!("State -> Crosslink closure not yet initialized.");
                         None
@@ -589,6 +589,7 @@ impl StartCmd {
                     Box::pin(async move { mempool.clone().ready().await?.call(req).await })
                 }),
                 config.crosslink.clone(),
+                config.network.network.crosslink_parameters(),
                 actual_closure2,
             )
         };
@@ -632,9 +633,9 @@ impl StartCmd {
                 // The same state -> crosslink closure the state service holds, so new_network
                 // can run the fat-pointer gate itself rather than discovering it at commit time.
                 let crosslink_gate: zebra_state::ClosureToCallIntoCrosslinkFromState =
-                    Arc::new(move |fat_pointer_a, fat_pointer_b, height| {
+                    Arc::new(move |fat_pointer_a, fat_pointer_b, height, height_of| {
                         if let Some(closure) = actual_closure3.lock().unwrap().as_mut() {
-                            (closure)(fat_pointer_a, fat_pointer_b, height)
+                            (closure)(fat_pointer_a, fat_pointer_b, height, height_of)
                         } else {
                             tracing::error!("NewNet -> Crosslink closure not yet initialized.");
                             None

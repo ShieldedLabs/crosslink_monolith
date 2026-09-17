@@ -15,8 +15,8 @@ use zcash_primitives::transaction::StakingActionRequest;
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TFLBlockFinality {
     // TODO: rename?
-    /// The block height is above the finalized height, so it's not yet determined
-    /// whether or not it will be finalized.
+    /// The block height is above the finalized height, or nothing is finalized yet, so it's
+    /// not yet determined whether or not it will be finalized.
     NotYetFinalized,
 
     /// The block is finalized: it's height is below the finalized height and

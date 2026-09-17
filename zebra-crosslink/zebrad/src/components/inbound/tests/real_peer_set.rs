@@ -651,7 +651,7 @@ async fn setup(
     // UTXO verification doesn't matter for these tests.
     let state_config = StateConfig::ephemeral();
     let (state_service, _read_only_state_service, latest_chain_tip, chain_tip_change, _block_writer) =
-        zebra_state::init(state_config, &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true))).await;
+        zebra_state::init(state_config, &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_,_| Some(zebra_state::CrosslinkVerdict::Accept { pos_payout: true }))).await;
     let state_service = ServiceBuilder::new().buffer(10).service(state_service);
 
     // Network
@@ -846,7 +846,7 @@ mod submitblock_test {
         // State
         let state_config = StateConfig::ephemeral();
         let (_state_service, _read_only_state_service, latest_chain_tip, chain_tip_change, _block_writer) =
-            zebra_state::init(state_config, &Network::Mainnet, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true))).await;
+            zebra_state::init(state_config, &Network::Mainnet, Height::MAX, 0, std::sync::Arc::new(|_,_,_,_| Some(zebra_state::CrosslinkVerdict::Accept { pos_payout: true }))).await;
 
         let config_listen_addr = "127.0.0.1:0".parse().unwrap();
 

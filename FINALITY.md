@@ -30,8 +30,8 @@ Final Snapshot rule based on proof and latency results
 This document treats the formula as the current construction, not as a settled protocol
 decision beyond that source revision.
 
-The prototype sets `σ = 3` and `L = 7` in
-`librustzcash/zcash_primitives/src/bft.rs` (`PROTOTYPE_PARAMETERS`). The inequality `7 ≥ 2 × 3`
+The prototype sets `σ = 5` and `L = 10` in
+`librustzcash/zcash_primitives/src/bft.rs` (`PROTOTYPE_PARAMETERS`). The inequality `10 ≥ 2 × 5`
 meets the Book's stated minimum heuristic for `L`, but does not establish that `L` is
 "significantly greater" than `σ`, or that either value is secure or performant. The source
 code explicitly warns that these parameters have not been verified. `L` is not enforced by
@@ -46,7 +46,8 @@ to `B`; `A` and `B` conflict when neither is an ancestor of the other.
 The two chains have their own parent links. They also contain two cross-chain references:
 
 - each bc-block `H` has `H.context_bft`, which commits to a bft-block; and
-- each non-genesis bft-block has `headers_bc`, exactly `σ` bc-headers in deepest-first order.
+- each non-genesis bft-block has `headers_bc`, exactly `σ − 1` bc-headers in deepest-first order
+  (σ counts the finalized block itself, which is named by the snapshot hash and not carried; see §6.1).
 
 ## 2. Terminology and layers
 
@@ -270,8 +271,8 @@ by:
 - `tfl_service_main_loop`, when restoring the last entry from the PoS store; and
 - `tfl_set_finality_by_hash`, through the testing/service setter.
 
-The live path computes the hash of `new_block.headers[0]`: the first header itself, rather than
-`snapshot(new_block) = parent(new_block.headers[0])`.
+The live path derives the marker from `BftBlock::snapshot_block_hash()`
+(`parent(new_block.headers[0])`), as the other derivation sites below do.
 
 When this marker is absent, `tfl_final_block_height_hash` returns `None`. It previously
 substituted a Zebra reorg-depth location derived from the state block locator, so that the API
@@ -347,8 +348,10 @@ surface is incomplete: a waiter can remain blocked even when the marker changes.
 At the end of `Chain::push` in
 `zebra-crosslink/zebra-state/src/service/non_finalized_state/chain.rs`:
 
-- if no bond is active, the code pushes an empty `bond_rewards` entry and mints no staking
-  reward; and
+- a block that does not pay (see the payout rule below) pushes empty `bond_rewards` and
+  `finalizer_commissions` entries and mints nothing; the empty entries keep positional reorg
+  reversal aligned;
+- if no bond is active, the same empty entries are pushed and no staking reward is minted; and
 - otherwise it distributes the fixed `POS_BLOCK_REWARD_ZATS` for that PoW block, increases
   `staking_bonded_amount` by the same total, and records the per-bond rewards for exact reorg
   reversal.
@@ -357,10 +360,57 @@ At the end of `Chain::push` in
 total pro rata with integer division, gives the remainder to the largest active bond (then
 smallest key on a tie), and adds rewards to bond principal. Rewards therefore compound.
 
-The same per-block calculation is replayed by `fixup_aggregated_stakes` in
+#### The variable payout rule
+
+Issuance is not paid per PoW block. A block `P` pays exactly when it *advances* finality and
+does so *promptly*:
+
+```text
+payout(P)  iff  cert(P) != cert(parent(P))  and  height(P) - F <= σ + FINALITY_LIVENESS_ALLOWANCE
+```
+
+where `cert(P)` is the BFT block named by `P.context_bft` (compared by BFT block hash, not by
+the whole fat pointer: two honest nodes can carry different signature sets for the same
+decision) and `F` is the height of the PoW block that certificate finalizes — its snapshot.
+`FINALITY_LIVENESS_ALLOWANCE = 2`, in `librustzcash/zcash_primitives/src/bft.rs`.
+
+Both inputs are objective functions of committed chain data, so every node computes the same
+answer for the same block, as §9.2 requires. The fat-pointer gate already refuses any `P` below
+`F + σ`, so `height(P) - F` is at least `σ`: with σ = 5 the paying gaps are 5, 6 and 7, i.e. 4,
+5 or 6 blocks strictly between `F` and `P`, and a seventh earns nothing.
+
+The decision is made in `call_from_state_to_crosslink_to_ask_about_fat_pointers`
+(`zebra-crosslink/zebra-crosslink/src/lib.rs`), which is the one place that can resolve both
+facts, and travels with the block as `SemanticallyVerifiedBlock::pos_payout` →
+`ContextuallyVerifiedBlock::pos_payout` → `Chain::push`. Paths that never run the gate
+(checkpoint sync, tests, blocks rebuilt from raw bytes) carry `pos_payout: false` and mint
+nothing.
+
+Because the verdict cannot be recovered from the block bytes, it is **persisted in the
+non-finalized state backup** alongside the deferred pool change
+(`zebra-state/src/service/non_finalized_state/backup.rs`), and restored with the block. Without
+that, a node that restarts re-enters its non-finalized blocks through
+`SemanticallyVerifiedBlock::from(Arc<Block>)`, which defaults to `pos_payout: false`: the
+restarted node mints nothing for blocks every other node has already paid. That is not a local
+accounting slip. It changes the bonded stake, the bonded stake is the voting power, and the
+roster derived from it then differs between nodes — which in a two-node roster is enough to
+make both nodes believe they are the proposer, prevote different values forever and stall
+finality permanently. This was observed on a dilated two-node testnet: node two restarted,
+restored 4 backed-up blocks, and came back exactly `4 × POS_BLOCK_REWARD_ZATS` short, after
+which BFT never decided another block.
+
+The same per-block calculation is replayed by the wallet projection path in
+`zebra-crosslink/zebra-crosslink/src/lib.rs`, which recomputes the rule from committed data in
+`block_pays_pos_issuance`, and by `fixup_aggregated_stakes` in
 `zebra-crosslink/zebra-state/src/service/stake_fixup.rs` (reached through the `--fixup-db-stake`
-entry point) and by the wallet projection path in `zebra-crosslink/zebra-crosslink/src/lib.rs`.
-Any future consensus change must keep all three paths identical.
+entry point). Any future consensus change must keep all three paths identical.
+
+The repair tool is the one path that cannot evaluate the rule in full: it has the PoW database
+and nothing else, and `F` lives inside the BFT block. It applies the half it can see — a block
+that does not advance the certificate pays nothing — and assumes an advancing block was
+prompt. That is correct whenever BFT kept up. When it did not, the replay disagrees with the
+rows already stored and its existing cross-check refuses to write anything, so the failure mode
+is a repair that declines, never a repair that corrupts.
 
 ## 6. Divergences and hazards by category
 
@@ -371,39 +421,42 @@ Any future consensus change must keep all three paths identical.
   restored, without requiring the current best chain to cite that decision.
 - **Missing clamp.** Zebra does not compute
   `lca(snapshot(LF(H)), prune_σ(H))`; it takes a hash directly from the decided BFT block.
-- **Off-by-one snapshot.** Honest proposal construction obtains a deepest-first `σ`-header
-  tail. `headers[0]` is one block after the snapshot, but Zebra stores that header's hash rather
-  than its parent. The proposal path picks a candidate height, then issues `FindBlockHeaders`
-  with that block as the sole known hash. That request is specified to return the headers
-  *following* the intersection, ascending, and the implementation iterates an ascending range
-  from `intersection + 1`, so `headers[0]` is the block one above the candidate height and
-  `parent(headers[0])` is the candidate height itself. Storing `hash(headers[0])` therefore
-  finalizes one block shallower than intended.
-  The in-memory header order is consequently deepest-first, matching the specification, so the
-  `BftBlock` doc comment in `librustzcash/zcash_primitives/src/bft.rs` claiming the order is
-  reversed from the specification was not merely stale but inverted. Nothing enforces that
+- **Off-by-one snapshot — fixed, then recounted.** The snapshot is `parent(headers[0])`, as the
+  specification defines it. The first fix made the `σ` carried headers `σ` confirmations *above*
+  the finalized block; per the clarified design reading, that overcounted: **σ counts the
+  finalized block itself**, so a certificate carries `σ − 1` headers — with `σ = 5`, four
+  block headers inside the cert — which are the confirmations above the snapshot, and the
+  proposal path picks the snapshot at `tip − (σ − 1)` so the deepest carried header is the tip.
+  (The finalized *height* is the same one the original `hash(headers[0])` derivation produced;
+  only the certificate contents changed.) The proposal path issues `FindBlockHeaders` with the
+  snapshot block as the sole known hash; that request returns the headers *following* the
+  intersection, ascending, so the window it gets back is exactly the confirmations. Every
+  consumer reads the snapshot through `BftBlock::snapshot_block_hash()`.
+  Nothing new is carried in the block for this: the snapshot is named by hash only, and any
+  consumer that needs its height asks the chain, which is the only thing that can answer
+  truthfully. The fat-pointer gate is handed a height lookup for exactly that purpose; see §6.2.
+  The in-memory header order is deepest-first, matching the specification. Nothing enforces that
   order: `BftBlock::try_from` checks only the header count and logs that its documented
   validations are unimplemented, and the deserialization path used for network and PoS-store
   blocks does not call `try_from` at all. Deepest-first is a property of the honest producer,
   not of the type.
 - **The candidate height is clamped, and the clamp is not `prune_σ`.** The proposal path
-  computes `tip − σ` and then takes
-  `min(tip − σ, latest_final_block + 40)`. Only when that clamp does not bind is the stored
-  marker `prune_σ(tip) + 1`, i.e. `σ − 1` confirmations — two rather than three under
-  `PROTOTYPE_PARAMETERS`. Whenever `tip − σ > marker + 40`, which is the normal regime during
+  computes `tip − (σ − 1)` and then takes
+  `min(tip − (σ − 1), latest_final_block + 40)`. Only when that clamp does not bind is the stored
+  marker `tip − σ + 1`, i.e. the σ window with the finalized block counted in it — five under
+  `PROTOTYPE_PARAMETERS`. Whenever `tip − (σ − 1) > marker + 40`, which is the normal regime during
   catch-up after a restart or a BFT stall, the candidate is `marker + 40` and the block is
   finalized far deeper than `σ`. Any statement of the form "the proposal path finalizes at
-  `tip − σ`" is true only in the unclamped regime.
-- **Four sites derive the marker from `headers.first()`**, not three: the decide path, the BFT
+  `tip − σ + 1`" is true only in the unclamped regime.
+- **Four sites derive the marker from the snapshot**, not three: the decide path, the BFT
   validation path, the PoS-store restore path, and — separately — the historical replay
-  watermark `prev_finalized_bc_height` computed during restore. `BftBlock::finalization_candidate()`
-  is a fifth accessor with the same convention. The replay watermark is the one that makes a
-  change of derivation costly; see §9.4.
-- **Mixed conventions in the improvement test.** `is_improved_final` compares the candidate
-  height, a snapshot height, against the stored marker, which is a snapshot height plus one. A
-  new proposal is therefore admitted only when the snapshot advances by two or more blocks. The
-  test runs before the `+40` clamp is applied, so the clamp does not affect this conclusion.
-  The mismatch is a direct consequence of the off-by-one and disappears with it.
+  watermark `prev_finalized_bc_height` computed during restore. All four now go through
+  `BftBlock::snapshot_block_hash()` (`parent(headers[0])`), which replaced the old
+  `finalization_candidate()` accessor.
+- **Mixed conventions in the improvement test — resolved.** `is_improved_final` now compares
+  the proposed snapshot height against the stored marker, which is also a snapshot height, so a
+  proposal is admitted as soon as the snapshot advances by one block — one BFT block per PoW
+  block. The test runs before the `+40` clamp is applied.
 - **Missing monotonicity and hazard record.** All marker writes are unconditional. There is no
   `fin ⪯ candidate` guard and no distinction between a benign candidate regression and a
   conflicting-candidate safety incident.
@@ -413,9 +466,21 @@ Any future consensus change must keep all three paths identical.
 - The Last Final Snapshot rule is not implemented for bc-block admission.
 - The Finality Depth rule and Stalled Mode are not implemented. `L` is serialized only by test
   formatting; the 512-block log threshold is diagnostic, not consensus.
-- BFT validation does not implement Linearity or Tail Confirmation. It checks that the first
-  carried header's block is locally present, but does not establish that all `σ` headers form a
-  valid chain with valid PoW.
+- BFT validation does not implement Linearity or Tail Confirmation. It checks that the
+  snapshot (`parent(headers[0])`) is locally present, but does not establish that the `σ − 1`
+  carried headers form a valid chain with valid PoW, nor that they are on the chain of the block
+  that will carry the certificate.
+- **The confirmation depth is enforced on inclusion instead.** A PoW block at height `P` may
+  carry a fat pointer to a BFT block whose snapshot is at height `F` only when `P ≥ F + σ`.
+  Admitting a PoW block therefore requires a PoW → PoS → PoW lookup: resolve the pointer to its
+  BFT block, take that block's snapshot hash, and ask the state for its height. The gate is given
+  a `CrosslinkBlockHeightLookup` to do it, searching every chain the state holds, and defers
+  (rather than rejecting) while the snapshot is unknown here. The block-template path applies the
+  same test so a miner is never handed a certificate that could not be committed. Because `F` is an
+  ancestor of `P`, that inequality puts the whole `σ` window — `F` itself plus the `σ − 1` carried
+  headers above it — inside `P`'s own ancestry, which is the guarantee the unverified carried
+  headers were supposed to provide. Without it a block at `F + 1` could carry a certificate whose "confirmations" are
+  headers from another branch entirely.
 - Tail Confirmation is additionally violated by construction whenever the `+40` candidate clamp
   in §6.1 binds. The rule requires `B.headers_bc` to be the `σ`-block tail of a bc-valid chain,
   but under the clamp the proposal carries a mid-chain window starting at `marker + 41`, which
@@ -564,6 +629,13 @@ An objective per-block event can instead be derived from block data, for example
 payout boundary at H  iff  candidate(H) != candidate(parent(H))
 ```
 
+**Implemented.** The prototype now takes this trigger, with a liveness bound added to it:
+a block pays iff its certificate differs from its parent's *and* the certificate is at most
+`σ + FINALITY_LIVENESS_ALLOWANCE` blocks behind it. §5.4 states the rule and where each path
+evaluates it. The consequences listed below under "payout amount" are the ones this choice
+accepts: a flat reward per advance, so a BFT stall lowers issuance for as long as it lasts and
+never pays the missed blocks back.
+
 This is not literally the event "local `fin` advanced." It is a block-local event that would
 permit `fin` to advance if `H` were observed as best and its candidate were ahead of that
 node's current `fin`. `snapshot(LF(H))` is another objective candidate source. The selected
@@ -602,7 +674,10 @@ which ledger state is read to materialize that set.
   Tail Confirmation rules. These are consensus changes in the current prototype.
 - Decide how Stalled Mode behaves for Zebra transactions and block production.
 - Decide whether the one-block snapshot shift requires PoS-store migration or replay rules. It
-  does require replay rules at minimum. The PoS store record is not a serialized `BftBlock`
+  does require replay rules at minimum. (After the σ recount, the finalized height again matches
+  the original derivation's — only the certificate contents changed from `σ` to `σ − 1`
+  headers — but stored certificates still differ in size and the roster-replay concerns below
+  stand.) The PoS store record is not a serialized `BftBlock`
   alone: each record appends the block, the fat pointer, `finalizers_at_current_height`, and the
   proposal signatures. The roster is marker-derived — it is the aggregated stakes that
   `CrosslinkFinalizeBlock(hash(headers[0]))` returned — and restore reads it back verbatim

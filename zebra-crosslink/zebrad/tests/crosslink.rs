@@ -51,10 +51,23 @@ pub fn set_test_name(name: &'static str) {
 pub fn test_start() {
     // init globals
     {
+        // Consensus parameters are fixed when the network is built, so they are read from the test
+        // file here, before the node boots.
+        let crosslink = {
+            let path = zebra_crosslink::TEST_INSTR_PATH.lock().unwrap().clone();
+            let bytes = match path {
+                Some(path) => std::fs::read(path).unwrap_or_default(),
+                None => zebra_crosslink::TEST_INSTR_BYTES.lock().unwrap().clone(),
+            };
+            crosslink_parameters_for_test(&bytes)
+        };
         *CROSSLINK_TEST_CONFIG_OVERRIDE.lock().unwrap() = {
             let mut base = ZebradConfig::default();
             base.network.network = Network::new_regtest(
-                zebra_chain::parameters::testnet::RegtestParameters::default(),
+                zebra_chain::parameters::testnet::RegtestParameters {
+                    crosslink: Some(crosslink),
+                    ..Default::default()
+                },
             );
             base.state.ephemeral = true;
 
@@ -108,6 +121,15 @@ pub fn test_start() {
     #[cfg(not(feature = "viz_gui"))]
     ZebradApp::run(&APPLICATION, args);
 }
+
+/// The harness parameters with the prototype's from-chain bootstrap instead of `Supplied`, for
+/// the one test that exercises the bootstrap gate. Sigma stays the harness's pinned value, since
+/// the scenes are built for it (see `HARNESS_PARAMETERS`).
+const BOOTSTRAP_HARNESS_PARAMETERS: zcash_primitives::bft::ZcashCrosslinkParameters =
+    zcash_primitives::bft::ZcashCrosslinkParameters {
+        bootstrap: PROTOTYPE_PARAMETERS.bootstrap,
+        ..HARNESS_PARAMETERS
+    };
 
 /// Run a Crosslink Test from a dynamic byte array.
 pub fn test_bytes(bytes: Vec<u8>) {
@@ -178,10 +200,76 @@ const REGTEST_POS_BLOCK_BYTES: &[&[u8]] = &[
 
 const REGTEST_POW_IDX_FINALIZED_BY_POS_BLOCK: &[usize] = &[1, 4, 6, 10, 13, 16, 18];
 
+/// Filename index of each block in `REGTEST_BLOCK_BYTES` / `REGTEST_POS_BLOCK_BYTES`. The two
+/// sets interleave as one 0..29 sequence, so the numbering only makes sense together.
+const POW_FILE_IDX: [usize; REGTEST_BLOCK_BYTES_N] = [
+    0, 1, 2, 3, 4, 6, 7, 9, 10, 12, 13, 14, 15, 17, 18, 19, 21, 22, 23, 25, 26, 28, 29,
+];
+const POS_FILE_IDX: [usize; 7] = [5, 8, 11, 16, 20, 24, 27];
+
+/// Rewrite the checked-in binaries in `crosslink-test-data` from the current block format.
+///
+/// A tool rather than a test, so it is `#[ignore]`d like `read_from_file` and runs only when
+/// named. The checked-in files predate Ironwood v6: the PoS blocks no longer deserialize and
+/// the PoW blocks carry pre-rework `hashBlockCommitments`.
+///
+/// Two invariants the consumers depend on, neither obvious from the data itself:
+/// only the clone advances at i == 2, so `pow[2]` and `pow[3]` are siblings at height 3 and
+/// the chain must not grow when index 3 arrives, which is what
+/// `crosslink_push_example_pow_chain_only`'s `2 + i - (i >= 3)` asserts; and each PoS block
+/// finalizes the PoW index named by `REGTEST_POW_IDX_FINALIZED_BY_POS_BLOCK`.
+///
+///     cargo nextest run -p zebrad --test crosslink regen_test_data --run-ignored only
+#[ignore]
+#[test]
+fn regen_test_data() {
+    let dir = PathBuf::from("../crosslink-test-data");
+    assert!(dir.is_dir(), "expected {dir:?} relative to the zebrad crate dir");
+
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    // A second valid P2PKH miner: a different coinbase gives a different block hash, so the
+    // sibling at height 3 actually competes.
+    let miner_addr2 = Address::Transparent(
+        zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
+    );
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+
+    let mut pow = vec![gen.tip.clone()];
+    let mut genb = gen.clone();
+    for i in 1..REGTEST_BLOCK_BYTES_N {
+        if i == 2 {
+            pow.push(genb.next_block(&miner_addr2));
+        } else {
+            pow.push(gen.next_block(&miner_addr));
+        }
+        genb = gen.clone();
+    }
+
+    for i in 0..REGTEST_BLOCK_BYTES_N {
+        let bytes = pow[i].zcash_serialize_to_vec().unwrap();
+        std::fs::write(dir.join(format!("test_pow_block_{}.bin", POW_FILE_IDX[i])), bytes).unwrap();
+    }
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+    for (i, &link) in REGTEST_POW_IDX_FINALIZED_BY_POS_BLOCK.iter().enumerate() {
+        let bft = next_pos(pos_h, fat_ptr, &pow[link..link + 2], &[]);
+        let bytes = bft.zcash_serialize_to_vec().unwrap();
+        std::fs::write(dir.join(format!("test_pos_block_{}.bin", POS_FILE_IDX[i])), bytes).unwrap();
+    }
+
+    println!(
+        "regenerated {} pow + {} pos blocks in {dir:?}",
+        REGTEST_BLOCK_BYTES_N,
+        POS_FILE_IDX.len()
+    );
+}
+
 #[test]
 fn crosslink_expect_pos_height_on_boot() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     tf.push_instr_expect_pos_chain_length(0, 0);
 
@@ -191,7 +279,7 @@ fn crosslink_expect_pos_height_on_boot() {
 #[test]
 fn crosslink_expect_pow_height_on_boot() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     tf.push_instr_expect_pow_chain_length(1, 0);
 
@@ -201,7 +289,7 @@ fn crosslink_expect_pow_height_on_boot() {
 #[test]
 fn crosslink_expect_first_pow_to_not_be_a_no_op() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[0], 0);
     tf.push_instr_expect_pow_chain_length(2, 0);
@@ -212,7 +300,7 @@ fn crosslink_expect_first_pow_to_not_be_a_no_op() {
 #[test]
 fn crosslink_push_example_pow_chain_only() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     for i in 0..REGTEST_BLOCK_BYTES.len() {
         tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
@@ -226,11 +314,14 @@ fn crosslink_push_example_pow_chain_only() {
 #[test]
 fn crosslink_push_example_pow_chain_each_block_twice() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     for i in 0..REGTEST_BLOCK_BYTES.len() {
         tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
-        tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], SHOULD_FAIL);
+        // Re-submitting a committed block is idempotent, not an error: ingest answers
+        // IngestOutcome::Known, so the load SUCCEEDS. What must not happen is the chain
+        // growing, which the length expectation below already asserts.
+        tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
         tf.push_instr_expect_pow_chain_length(2 + i - (i >= 3) as usize, 0);
     }
     tf.push_instr_expect_pow_chain_length(1 - 1 + REGTEST_BLOCK_BYTES.len(), 0);
@@ -241,7 +332,7 @@ fn crosslink_push_example_pow_chain_each_block_twice() {
 #[test]
 fn crosslink_push_example_pow_chain_again_should_not_change_the_pow_chain_length() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     for i in 0..REGTEST_BLOCK_BYTES.len() {
         tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
@@ -249,8 +340,10 @@ fn crosslink_push_example_pow_chain_again_should_not_change_the_pow_chain_length
     }
     tf.push_instr_expect_pow_chain_length(1 - 1 + REGTEST_BLOCK_BYTES.len(), 0);
 
+    // Replaying the entire chain a second time: every block is already known, so each load
+    // succeeds idempotently and the length must stay put. See the note above.
     for i in 0..REGTEST_BLOCK_BYTES.len() {
-        tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], SHOULD_FAIL);
+        tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
         tf.push_instr_expect_pow_chain_length(1 - 1 + REGTEST_BLOCK_BYTES.len(), 0);
     }
 
@@ -260,7 +353,7 @@ fn crosslink_push_example_pow_chain_again_should_not_change_the_pow_chain_length
 #[test]
 fn crosslink_expect_pos_not_pushed_if_pow_blocks_not_present() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     tf.push_instr_load_pos_bytes(REGTEST_POS_BLOCK_BYTES[0], SHOULD_FAIL);
     tf.push_instr_expect_pos_chain_length(0, 0);
@@ -271,7 +364,7 @@ fn crosslink_expect_pos_not_pushed_if_pow_blocks_not_present() {
 #[test]
 fn crosslink_expect_pos_height_after_push() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let nw = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&nw, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
@@ -288,7 +381,7 @@ fn crosslink_expect_pos_height_after_push() {
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     for i in 1..5 {
-        let bft = next_pos(pos_h, fat_ptr, &pow_common[i..i+3], &[]);
+        let bft = next_pos(pos_h, fat_ptr, &pow_common[i..i+2], &[]);
         tf.push_instr_load_pos(&bft, 0);
         tf.push_instr_expect_pos_chain_length((*pos_h).try_into().unwrap(), 0);
     }
@@ -301,7 +394,7 @@ fn crosslink_expect_pos_height_after_push() {
 #[test]
 fn crosslink_expect_pos_out_of_order() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
 
     let nw = Network::new_regtest(Default::default());
@@ -319,9 +412,9 @@ fn crosslink_expect_pos_out_of_order() {
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let pos = [
-        next_pos(pos_h, fat_ptr, &pow_common[0..=2], &[]),
-        next_pos(pos_h, fat_ptr, &pow_common[1..=3], &[]),
-        next_pos(pos_h, fat_ptr, &pow_common[2..=4], &[]),
+        next_pos(pos_h, fat_ptr, &pow_common[0..=1], &[]),
+        next_pos(pos_h, fat_ptr, &pow_common[1..=2], &[]),
+        next_pos(pos_h, fat_ptr, &pow_common[2..=3], &[]),
     ];
 
     tf.push_instr_load_pos(&pos[0], 0);
@@ -335,7 +428,7 @@ fn crosslink_expect_pos_out_of_order() {
 #[test]
 fn crosslink_expect_pos_push_same_block_twice_only_accepted_once() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let nw = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&nw, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
@@ -351,7 +444,7 @@ fn crosslink_expect_pos_push_same_block_twice_only_accepted_once() {
     tf.push_instr_expect_pow_chain_length(4, 0);
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
-    let pos = next_pos(pos_h, fat_ptr, &pow_common[0..=2], &[]);
+    let pos = next_pos(pos_h, fat_ptr, &pow_common[0..=1], &[]);
 
     tf.push_instr_load_pos(&pos, 0);
     tf.push_instr_load_pos(&pos, SHOULD_FAIL);
@@ -363,7 +456,7 @@ fn crosslink_expect_pos_push_same_block_twice_only_accepted_once() {
 #[test]
 fn crosslink_reject_pos_with_signature_on_different_data() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     for i in 0..REGTEST_BLOCK_BYTES.len() {
         tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
@@ -391,7 +484,7 @@ fn crosslink_reject_pos_with_signature_on_different_data() {
 #[test]
 fn crosslink_test_basic_finality() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = Network::new_regtest(Default::default());
@@ -441,7 +534,7 @@ fn crosslink_test_basic_finality() {
 
     const LINKS: &[usize] = &[1, 4, 6, 10, 13, 16];//, 18];
     for i in 0..LINKS.len() {
-        let bft = next_pos(pos_h, fat_ptr, &pow[LINKS[i]..LINKS[i]+3], &[]);
+        let bft = next_pos(pos_h, fat_ptr, &pow[LINKS[i]..LINKS[i]+2], &[]);
         tf.push_instr_load_pos(&bft, 0);
 
         for i2 in 0..n {
@@ -453,7 +546,10 @@ fn crosslink_test_basic_finality() {
                     // Some(TFLBlockFinality::CantBeFinalized)
                     None
                 }
-            } else if i2 <= LINKS[i] {
+            } else if i2 < LINKS[i] {
+                // A BFT block over `pow[k..k+3]` finalizes the PARENT of its deepest header --
+                // the carried headers are the sigma confirmations above the snapshot -- so the
+                // finalized run ends one block below the window, at pow[LINKS[i] - 1].
                 Some(TFLBlockFinality::Finalized)
             } else {
                 Some(TFLBlockFinality::NotYetFinalized)
@@ -469,7 +565,7 @@ fn crosslink_test_basic_finality() {
 #[test]
 fn reject_pos_block_with_lt_sigma_headers() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     for i in 0..4 {
         tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
@@ -491,10 +587,60 @@ fn reject_pos_block_with_lt_sigma_headers() {
     tf.push_instr_expect_pos_chain_length(0, 0);
 }
 
+/// With BFT bootstrapped from the chain, a PoW block at or below the activation height may not point
+/// at a BFT block. Every other scenario supplies BFT directly (`HARNESS_PARAMETERS`) and so never
+/// meets this rule; this one runs the prototype's bootstrap so the rule itself stays tested.
+#[test]
+fn crosslink_reject_fat_pointer_below_bootstrap_activation() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BOOTSTRAP_HARNESS_PARAMETERS);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut pow = vec![gen.tip.clone()];
+    tf.push_instr_load_pow(&gen.tip, 0);
+    for _ in 2..5 {
+        pow.push(gen.next_block(&miner_addr));
+        tf.push_instr_load_pow(&gen.tip, 0);
+    }
+
+    let bft = next_pos(pos_h, fat_ptr, &pow[1..3], &[]);
+    tf.push_instr_load_pos(&bft, 0);
+
+    let fat_pointer_to_bft_block = FatPointerToBftBlock {
+        vote_for_block_without_finalizer_public_key: bft.0.fat_ptr.vote_for_block_without_finalizer_public_key,
+        signatures: bft
+            .0
+            .fat_ptr
+            .signatures
+            .iter()
+            .map(|sig| FatPointerSignature { pub_key: sig.pub_key, vote_signature: sig.vote_signature })
+            .collect(),
+    };
+
+    // Height 5 points at that BFT block, far below the prototype's activation height.
+    pow.push(gen.next_block(&miner_addr));
+    gen.tip = Arc::new(Block {
+        header: Arc::new(BlockHeader {
+            version: 5,
+            fat_pointer_to_bft_block,
+            ..*gen.tip.header
+        }),
+        ..gen.tip.as_ref().clone()
+    });
+    tf.push_instr_load_pow(&gen.tip, SHOULD_FAIL);
+    tf.push_instr_expect_pow_chain_length(5, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 #[test]
 fn crosslink_test_pow_to_pos_link() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = Network::new_regtest(Default::default());
@@ -511,7 +657,7 @@ fn crosslink_test_pow_to_pos_link() {
 
     // TODO: push
 
-    let bft = next_pos(pos_h, fat_ptr, &pow[1..4], &[]);
+    let bft = next_pos(pos_h, fat_ptr, &pow[1..3], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
     let fat_pointer_to_bft_block = FatPointerToBftBlock {
@@ -557,7 +703,7 @@ fn crosslink_test_pow_to_pos_link() {
 #[test]
 fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized_pow_chain() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = Network::new_regtest(Default::default());
@@ -567,31 +713,38 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
     let mut pow = vec![gen.tip.clone()];
     tf.push_instr_load_pow(&gen.tip, 0);
 
-    for _ in 2..9 {
+    // Heights 1..9. A BFT block over `pow[k..k+3]` finalizes the PARENT of its deepest
+    // header (the carried headers are the sigma confirmations above the snapshot), so every
+    // window here sits one block above the height it is meant to finalize.
+    for _ in 2..10 {
         pow.push(gen.next_block(&miner_addr));
         tf.push_instr_load_pow(&gen.tip, 0);
     }
 
+    // Finalize heights 1, 3, 5.
     for i in 0..3 {
-        let bft = next_pos(pos_h, fat_ptr, &pow[2*i..2*i+3], &[]);
+        let bft = next_pos(pos_h, fat_ptr, &pow[2*i+1..2*i+3], &[]);
         tf.push_instr_load_pos(&bft, 0);
     }
 
-    for _ in 9..10 {
+    let mut genb = gen.clone(); // fork, at height 9
+
+    for _ in 10..11 {
         pow.push(gen.next_block(&miner_addr));
         tf.push_instr_load_pow(&gen.tip, 0);
     }
-    let mut genb = gen.clone(); // fork
 
-    let bft = next_pos(pos_h, fat_ptr, &pow[6..9], &[]);
+    // Finalize height 7.
+    let bft = next_pos(pos_h, fat_ptr, &pow[7..9], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
-    for _ in 10..13 {
+    for _ in 11..14 {
         pow.push(gen.next_block(&miner_addr));
         tf.push_instr_load_pow(&gen.tip, 0);
     }
 
-    let bft = next_pos(pos_h, fat_ptr, &pow[9..12], &[]);
+    // Finalize height 10, above the fork point, so the whole fork below conflicts with it.
+    let bft = next_pos(pos_h, fat_ptr, &pow[10..12], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
     // A second, distinct, valid transparent P2PKH miner (a different coinbase => different
@@ -603,7 +756,7 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
     for _ in 10..18 {
         tf.push_instr_load_pow(&genb.next_block(&miner_addr2), SHOULD_FAIL);
     }
-    tf.push_instr_expect_pow_chain_length(13, 0);
+    tf.push_instr_expect_pow_chain_length(14, 0);
 
     test_bytes(tf.write_to_bytes());
 }
@@ -612,7 +765,7 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
 #[test]
 fn crosslink_pow_switch_to_finalized_chain_fork_even_though_longer_chain_exists() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = Network::new_regtest(Default::default());
@@ -628,7 +781,7 @@ fn crosslink_pow_switch_to_finalized_chain_fork_even_though_longer_chain_exists(
     }
 
     for i in 0..3 {
-        let bft = next_pos(pos_h, fat_ptr, &pow[i..i+3], &[]);
+        let bft = next_pos(pos_h, fat_ptr, &pow[i..i+2], &[]);
         tf.push_instr_load_pos(&bft, 0);
     }
 
@@ -650,24 +803,27 @@ fn crosslink_pow_switch_to_finalized_chain_fork_even_though_longer_chain_exists(
     let miner_addr2 = zcash_keys::address::Address::Transparent(
         zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
     );
-    for _ in 10..13 {
+    // Four blocks, not three: the BFT block below finalizes the PARENT of its deepest header
+    // (the carried headers are the sigma confirmations above the snapshot), so finalizing the
+    // sidechain's first block needs a window one block higher than it.
+    for _ in 10..14 {
         pow.push(genb.next_block(&miner_addr2));
         tf.push_instr_load_pow(&genb.tip, 0);
     }
     // small sidechain currently ignored
     tf.push_instr_expect_pow_chain_length(19, 0);
 
-    // finalize the small sidechain
-    let bft = next_pos(pos_h, fat_ptr, &pow[9..12], &[]);
+    // finalize the small sidechain: snapshot is its first block, at height 10
+    let bft = next_pos(pos_h, fat_ptr, &pow[10..12], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
-    tf.push_instr_expect_pow_chain_length(13, 0);
+    tf.push_instr_expect_pow_chain_length(14, 0);
 
     tf.push_instr_load_pow(&gen.next_block(&miner_addr), SHOULD_FAIL);
-    tf.push_instr_expect_pow_chain_length(13, 0);
+    tf.push_instr_expect_pow_chain_length(14, 0);
 
     tf.push_instr_load_pow(&genb.next_block(&miner_addr2), 0);
-    tf.push_instr_expect_pow_chain_length(14, 0);
+    tf.push_instr_expect_pow_chain_length(15, 0);
 
     test_bytes(tf.write_to_bytes());
 }
@@ -886,7 +1042,7 @@ impl BlockGen {
 #[test]
 fn crosslink_gen_pow_fork() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
@@ -972,7 +1128,7 @@ fn staking_tx_create_bond(
 #[test]
 fn crosslink_pow_block_with_staking_tx() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
@@ -1018,7 +1174,7 @@ fn create_pos_and_ptr_to_finalize_pow(
 ) -> BftBlockAndFatPointerToItWrap {
     assert_eq!(
         pow_blocks.len(),
-        PROTOTYPE_PARAMETERS.bc_confirmation_depth_sigma as usize
+        HARNESS_PARAMETERS.bc_confirmation_depth_sigma as usize - 1
     );
 
     let mut hdrs = Vec::with_capacity(pow_blocks.len());
@@ -1028,8 +1184,13 @@ fn create_pos_and_ptr_to_finalize_pow(
         hdrs.push(zebra_crosslink::bc_hdr_to_lrz(pow_block.header.as_ref()));
     }
 
+    // The `snapshot` -- the block this BFT block finalizes -- is the PARENT of the deepest
+    // carried header: sigma counts the snapshot itself, so the sigma - 1 carried headers are
+    // the confirmations built on top of it, and the snapshot is not carried. The PoW-side
+    // fat-pointer gate resolves its height
+    // from the chain to enforce `pow_height >= snapshot + sigma`.
     let block = BftBlock::try_from(
-        &PROTOTYPE_PARAMETERS,
+        &HARNESS_PARAMETERS,
         bft_height,
         parent_fat_ptr,
         hdrs,
@@ -1064,7 +1225,7 @@ fn next_pos(
 #[test]
 fn crosslink_gen_pow_and_no_signature_no_roster_pos() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
@@ -1081,7 +1242,7 @@ fn crosslink_gen_pow_and_no_signature_no_roster_pos() {
 
     let fat_ptr = &mut FatPointerToBftBlock::null();
     let pos_h = &mut 0;
-    let bft = next_pos(pos_h, fat_ptr, &pow_common[0..3], &[]);
+    let bft = next_pos(pos_h, fat_ptr, &pow_common[0..2], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
     for _ in 4..7 {
@@ -1096,7 +1257,7 @@ fn crosslink_gen_pow_and_no_signature_no_roster_pos() {
 #[test]
 fn crosslink_force_roster() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     tf.push_instr_expect_roster_includes([0xab; 32], 42, SHOULD_FAIL);
 
@@ -1113,7 +1274,7 @@ fn crosslink_force_roster() {
 #[test]
 fn crosslink_add_newcomer_to_roster_via_pow() {
     set_test_name(function_name!());
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     // let (_, prv_key, pub_key) = rng_private_public_key_from_address(&[0]);
 
@@ -1129,9 +1290,9 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
     // pub_key here, so EXPECT_ROSTER_INCLUDES(pub_key) below matches.
     let target = zcash_primitives::bft::FinalizerAddress::create(&prv_key);
 
-    // NOTE: the bond must be in the height-1 block: the BFT block over headers 1..=3
-    // finalizes height 1, and the roster snapshot taken at finalization only sees bonds
-    // already in the finalized state. Amount 0 as the bond can't be funded (see
+    // NOTE: the bond must be in the height-1 block: the BFT block over headers 2..=3
+    // finalizes their parent, height 1, and the roster snapshot taken at finalization only
+    // sees bonds already in the finalized state. Amount 0 as the bond can't be funded (see
     // staking_tx_create_bond).
     let staking_tx = staking_tx_create_bond([0xcd; 32], target, 0);
     let mut gen = BlockGen::init_at_genesis_plus_1_with_txs(
@@ -1142,15 +1303,17 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
     );
 
     let mut pow_common = vec![gen.tip.clone()];
-    for _ in 2..4 {
+    for _ in 2..5 {
         pow_common.push(gen.next_block(&miner_addr));
     }
-    for block in &pow_common[0..3] {
+    for block in &pow_common[0..4] {
         tf.push_instr_load_pow(block, 0);
     }
 
+    // The window is [2,3] so its snapshot -- the parent of its deepest header, which is what
+    // a BFT block finalizes -- is height 1, the block carrying the bond.
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
-    let bft = next_pos(pos_h, fat_ptr, &pow_common[0..3], &[]);
+    let bft = next_pos(pos_h, fat_ptr, &pow_common[1..3], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
     // NOTE: membership only: the bond is created with 0 stake, but finalizer rewards
@@ -1215,14 +1378,20 @@ fn diagram_fork_miner() -> Address {
 ///
 /// ```text
 ///   PoW           BFT             file order
-///   P1..P5        -               P1..P5
-///   -             bft0 [P3,P4,P5] bft0
-///   P6 -> bft0    -               P6
-///   -             bft1 [P4,P5,P6] bft1
-///   P7 -> bft1    -               P7
-///   -             bft2 [P5,P6,P7] bft2
-///   P8..P10 -> bft2               P8, P9, P10
+///   P1..P6        -               P1..P6
+///   -             bft0 [P4,P5]    bft0
+///   P7 -> bft0    -               P7
+///   -             bft1 [P5,P6]    bft1
+///   P8 -> bft1    -               P8
+///   -             bft2 [P6,P7]    bft2
+///   P9..P10 -> bft2               P9, P10
 /// ```
+///
+/// Each BFT block finalizes the PARENT of its deepest header -- the carried headers are the
+/// sigma - 1 confirmations above it -- so bft2 over [P6,P7] is what puts the marker on P5. A
+/// certificate may only be carried by a PoW block at `snapshot + sigma` or above (sigma counts
+/// the snapshot, so bft0's earliest legal carrier is P6); the interleave cites each one in the
+/// first block built after it, which is later than that minimum.
 ///
 /// A BFT block can only carry headers of PoW blocks that already exist, and a PoW block
 /// can only point at a BFT block that already exists, so the two chains have to be
@@ -1232,7 +1401,7 @@ fn diagram_fork_miner() -> Address {
 /// The diagram's `ba_mu = prune_sigma(P10) = P7` is not drawn by the GUI: nothing in this
 /// tree computes it (FINALITY.md 6.4).
 fn diagram_scene_1() -> (TF, Vec<Arc<Block>>) {
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
@@ -1241,7 +1410,7 @@ fn diagram_scene_1() -> (TF, Vec<Arc<Block>>) {
 
     // pow[i] is the block at height i + 1, so pow[4] is the diagram's P5.
     let mut pow: Vec<Arc<Block>> = vec![gen.tip.clone()];
-    for _ in 2..=5 {
+    for _ in 2..=6 {
         pow.push(gen.next_block(&miner_addr));
     }
     for block in &pow {
@@ -1250,24 +1419,25 @@ fn diagram_scene_1() -> (TF, Vec<Arc<Block>>) {
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
 
-    // bft0 over [P3,P4,P5]; P6 then cites it.
-    let bft0 = next_pos(pos_h, fat_ptr, &pow[2..5], &[]);
+    // bft0 over [P4,P5]; P7 then cites it.
+    let bft0 = next_pos(pos_h, fat_ptr, &pow[3..5], &[]);
     tf.push_instr_load_pos(&bft0, 0);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft0.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
-    // bft1 over [P4,P5,P6]; P7 then cites it.
-    let bft1 = next_pos(pos_h, fat_ptr, &pow[3..6], &[]);
+    // bft1 over [P5,P6]; P8 then cites it.
+    let bft1 = next_pos(pos_h, fat_ptr, &pow[4..6], &[]);
     tf.push_instr_load_pos(&bft1, 0);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft1.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
-    // bft2 over [P5,P6,P7]. Its deepest header is P5, so the finalized marker lands there.
-    let bft2 = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
+    // bft2 over [P6,P7]. Its snapshot is P5 -- the parent of its deepest header -- so the
+    // finalized marker lands there.
+    let bft2 = next_pos(pos_h, fat_ptr, &pow[5..7], &[]);
     tf.push_instr_load_pos(&bft2, 0);
-    for _ in 8..=10 {
+    for _ in 9..=10 {
         gen.next_block(&miner_addr);
         pow.push(point_tip_at_bft(&mut gen, &bft2.0.fat_ptr));
         tf.push_instr_load_pow(pow.last().unwrap(), 0);
@@ -1275,12 +1445,9 @@ fn diagram_scene_1() -> (TF, Vec<Arc<Block>>) {
 
     assert_eq!(pow.len(), 10);
     assert_eq!(
-        zcash_primitives::block::BlockHash::from_header_data(
-            bft2.0.block.headers.first().unwrap()
-        )
-        .0,
+        bft2.0.block.snapshot_block_hash().0,
         pow[4].hash().0,
-        "the newest BFT block's deepest header must be P5, the diagram's fin"
+        "the newest BFT block's snapshot must be P5, the diagram's fin"
     );
 
     (tf, pow)
@@ -1289,11 +1456,11 @@ fn diagram_scene_1() -> (TF, Vec<Arc<Block>>) {
 /// Scene 2: the benign case, where a reorganization exposes an older BFT context so the
 /// derived candidate moves backward while the whole new best chain still contains `fin`.
 ///
-/// Scene 1, then a branch off P7 whose blocks cite `bft1` rather than `bft2`. The diagram
-/// replaces P8-P10 with three Q blocks of higher work; regtest difficulty is constant, so
-/// here the branch wins by being one block longer instead, Q8..Q11.
+/// Scene 1, then a branch off P8 whose blocks cite `bft1` rather than `bft2`. The diagram
+/// replaces the blocks above the fork with Q blocks of higher work; regtest difficulty is
+/// constant, so here the branch wins by being one block longer instead, Q9..Q11.
 fn diagram_scene_2() -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
@@ -1302,7 +1469,7 @@ fn diagram_scene_2() -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
         BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
 
     let mut pow: Vec<Arc<Block>> = vec![gen.tip.clone()];
-    for _ in 2..=5 {
+    for _ in 2..=6 {
         pow.push(gen.next_block(&miner_addr));
     }
     for block in &pow {
@@ -1311,46 +1478,46 @@ fn diagram_scene_2() -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
 
-    let bft0 = next_pos(pos_h, fat_ptr, &pow[2..5], &[]);
+    let bft0 = next_pos(pos_h, fat_ptr, &pow[3..5], &[]);
     tf.push_instr_load_pos(&bft0, 0);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft0.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
-    let bft1 = next_pos(pos_h, fat_ptr, &pow[3..6], &[]);
+    let bft1 = next_pos(pos_h, fat_ptr, &pow[4..6], &[]);
     tf.push_instr_load_pos(&bft1, 0);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft1.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
-    // The competing branch starts from P7, which already carries its bft1 pointer, so both
+    // The competing branch starts from P8, which already carries its bft1 pointer, so both
     // branches descend from the same block.
     let mut fork_gen = gen.clone();
 
-    let bft2 = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
+    let bft2 = next_pos(pos_h, fat_ptr, &pow[5..7], &[]);
     tf.push_instr_load_pos(&bft2, 0);
-    for _ in 8..=10 {
+    for _ in 9..=10 {
         gen.next_block(&miner_addr);
         pow.push(point_tip_at_bft(&mut gen, &bft2.0.fat_ptr));
         tf.push_instr_load_pow(pow.last().unwrap(), 0);
     }
 
-    // Q8..Q11 cite bft1: an older context than P8..P10's bft2, which is what makes the
-    // derived candidate move backward. The Extension rule still holds -- their parent P7
+    // Q9..Q11 cite bft1: an older context than P9..P10's bft2, which is what makes the
+    // derived candidate move backward. The Extension rule still holds -- their parent P8
     // cites bft1 too, so the pointer never regresses along the branch.
     let mut fork: Vec<Arc<Block>> = Vec::new();
-    for _ in 8..=11 {
+    for _ in 9..=11 {
         fork_gen.next_block(&fork_addr);
         fork.push(point_tip_at_bft(&mut fork_gen, &bft1.0.fat_ptr));
         tf.push_instr_load_pow(fork.last().unwrap(), 0);
     }
 
     assert_eq!(pow.len(), 10);
-    assert_eq!(fork.len(), 4);
+    assert_eq!(fork.len(), 3);
     assert_eq!(
         fork[0].header.previous_block_hash,
-        pow[6].hash(),
-        "the branch must fork from P7"
+        pow[7].hash(),
+        "the branch must fork from P8"
     );
 
     (tf, pow, fork)
@@ -1358,8 +1525,8 @@ fn diagram_scene_2() -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
 
 /// Scene 3: the exceptional case, where the raw best chain forks below `fin`.
 ///
-/// P1..P7 with the BFT chain finalizing P5, then C4..C8 forking from P3 -- one block
-/// longer than P4..P7, so it is the heaviest chain -- and citing `bft0`, whose own headers
+/// P1..P8 with the BFT chain finalizing P5, then C4..C9 forking from P3 -- one block
+/// longer than P4..P8, so it is the heaviest chain -- and citing `bft0`, whose own headers
 /// sit on the branch it conflicts with.
 ///
 /// This node will not hold this state: `CrosslinkFinalizeBlock` collapses the
@@ -1368,7 +1535,7 @@ fn diagram_scene_2() -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
 /// the node, because the behaviour under test would be the refusal rather than the
 /// picture.
 fn diagram_scene_3(fork_flags: u32) -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
-    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
@@ -1382,7 +1549,7 @@ fn diagram_scene_3(fork_flags: u32) -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
     }
     // The conflicting branch forks from P3, below everything the BFT chain finalizes.
     let mut fork_gen = gen.clone();
-    for _ in 4..=5 {
+    for _ in 4..=6 {
         pow.push(gen.next_block(&miner_addr));
     }
     for block in &pow {
@@ -1391,31 +1558,39 @@ fn diagram_scene_3(fork_flags: u32) -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
 
-    let bft0 = next_pos(pos_h, fat_ptr, &pow[2..5], &[]);
+    let bft0 = next_pos(pos_h, fat_ptr, &pow[3..5], &[]);
     tf.push_instr_load_pos(&bft0, 0);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft0.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
-    let bft1 = next_pos(pos_h, fat_ptr, &pow[3..6], &[]);
+    let bft1 = next_pos(pos_h, fat_ptr, &pow[4..6], &[]);
     tf.push_instr_load_pos(&bft1, 0);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft1.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
-    // Finalizes P5. Everything after this conflicts with it.
-    let bft2 = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
+    // Snapshot P5, so that is the finalized marker. Everything after this conflicts with it.
+    let bft2 = next_pos(pos_h, fat_ptr, &pow[5..7], &[]);
     tf.push_instr_load_pos(&bft2, 0);
 
+    // C4..C6 carry no BFT pointer: bft0's snapshot is P3, and the sigma-confirmation rule in
+    // the fat-pointer gate lets nothing below P3 + sigma = 6 carry that certificate. C6 could,
+    // but its parent P3 carries no pointer, so staying nil is legal too. C7..C9 then cite bft0,
+    // whose headers sit on the branch this one conflicts with -- the point of the scene.
     let mut fork: Vec<Arc<Block>> = Vec::new();
-    for _ in 4..=8 {
+    for height in 4..=9 {
         fork_gen.next_block(&fork_addr);
-        fork.push(point_tip_at_bft(&mut fork_gen, &bft0.0.fat_ptr));
+        if height >= 7 {
+            fork.push(point_tip_at_bft(&mut fork_gen, &bft0.0.fat_ptr));
+        } else {
+            fork.push(fork_gen.tip.clone());
+        }
         tf.push_instr_load_pow(fork.last().unwrap(), fork_flags);
     }
 
-    assert_eq!(pow.len(), 7);
-    assert_eq!(fork.len(), 5);
+    assert_eq!(pow.len(), 8);
+    assert_eq!(fork.len(), 6);
     assert_eq!(
         fork[0].header.previous_block_hash,
         pow[2].hash(),
@@ -1439,8 +1614,8 @@ fn crosslink_write_finality_diagram_scenes() {
         pow1.iter().map(|b| b.hash()).collect::<Vec<_>>(),
         pow2.iter().map(|b| b.hash()).collect::<Vec<_>>()
     );
-    assert_eq!(pow3.len() + fork3.len(), 12);
-    assert_eq!(fork2.len(), 4);
+    assert_eq!(pow3.len() + fork3.len(), 14);
+    assert_eq!(fork2.len(), 3);
 
     for (tf, name) in [
         (tf1, "finality_diagram_1_candidate.zeccltf"),
@@ -1490,8 +1665,8 @@ fn crosslink_finality_diagram_2_benign_reorg() {
 // - reject pos block with < 2/3rds roster stake
 // - reject pos block with signatures from the previous, but not current roster
 // > require correctly-signed incorrect data:
-//   - reject pos block with > sigma headers
-//   - reject pos block with < sigma headers
+//   - reject pos block with > sigma - 1 headers
+//   - reject pos block with < sigma - 1 headers
 //   - reject pos block where headers don't form subchain (hdrs[i].hash() != hdrs[i+1].previous_block_hash)
 //   - repeat all signature tests but for the *next* pos block's fat pointer back
 // - reject pos block that does have the correct fat pointer *hash* to prev block
@@ -1499,14 +1674,14 @@ fn crosslink_finality_diagram_2_benign_reorg() {
 
 /// Scene 3 through the real admission path, which refuses it: the conflicting branch
 /// forks below the finalized block, so none of it is admitted and the best chain stays
-/// P7. The scene file itself carries no SHOULD_FAIL flags -- it is a picture for the
+/// P8. The scene file itself carries no SHOULD_FAIL flags -- it is a picture for the
 /// GUI's "View (no consensus)" path, where the branch is drawn as the diagram draws it.
 #[test]
 fn crosslink_finality_diagram_3_conflicting_fork_is_refused() {
     set_test_name(function_name!());
     let (mut tf, pow, _fork) = diagram_scene_3(SHOULD_FAIL);
 
-    tf.push_instr_expect_pow_chain_length(8, 0);
+    tf.push_instr_expect_pow_chain_length(9, 0);
     tf.push_instr_expect_pos_chain_length(3, 0);
     tf.push_instr_expect_pow_block_finality(&pow[4].hash(), Some(TFLBlockFinality::Finalized), 0);
 

@@ -193,11 +193,48 @@ pub(crate) struct StateService {
     hardfork_schedule: Arc<HardForkSchedule>,
 }
 
+/// Resolves a PoW block hash to its height, across every chain this state holds — finalized
+/// or not, best chain or side chain. The crosslink fat-pointer gate is handed one of these
+/// because the sigma-confirmation rule it enforces is a statement about two PoW heights: the
+/// height of the block being admitted, and the height of the PoW block that the certificate
+/// that block carries finalizes. The certificate names that block by hash only, so the gate
+/// has to ask the chain. `None` means "not known here (yet)", which the gate treats as a
+/// defer rather than a rejection.
+pub type CrosslinkBlockHeightLookup<'a> = &'a dyn Fn(block::Hash) -> Option<block::Height>;
+
+/// What the crosslink fat-pointer gate decided about a block.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum CrosslinkVerdict {
+    /// Permanently invalid (e.g. `do_not_include_until_bc_height` violated, or the certificate
+    /// is carried fewer than sigma blocks above what it finalizes).
+    Reject,
+    /// Admit the block.
+    Accept {
+        /// Whether this block pays PoS issuance.
+        ///
+        /// True exactly when the block advances the certificate (its `context_bft` names a
+        /// different BFT block than its parent's does) *and* that certificate is fresh: at most
+        /// `sigma + FINALITY_LIVENESS_ALLOWANCE` blocks above the PoW block it finalizes. The
+        /// gate is the one place that resolves both facts, so it decides here and the state
+        /// carries the answer through to `Chain::push`.
+        pos_payout: bool,
+    },
+}
+
 /// Return type for the crosslink fat-pointer gate closure.
-/// - `None`       — defer: re-queue the block and retry on a later flush (BFT block not yet loaded).
-/// - `Some(true)` — accept: the block's fat pointer is valid.
-/// - `Some(false)`— reject: the block is permanently invalid (e.g. `do_not_include_until_bc_height` violated).
-pub type ClosureToCallIntoCrosslinkFromState = Arc<dyn Fn(FatPointerToBftBlock, FatPointerToBftBlock, block::Height) -> Option<bool> + Send + Sync>;
+/// - `None` — defer: re-queue the block and retry on a later flush (BFT block not yet loaded,
+///   or the PoW block its certificate finalizes is not known here yet).
+/// - `Some(verdict)` — see [`CrosslinkVerdict`].
+pub type ClosureToCallIntoCrosslinkFromState = Arc<
+    dyn for<'a> Fn(
+            FatPointerToBftBlock,
+            FatPointerToBftBlock,
+            block::Height,
+            CrosslinkBlockHeightLookup<'a>,
+        ) -> Option<CrosslinkVerdict>
+        + Send
+        + Sync,
+>;
 
 /// A read-only service for accessing Zebra's cached blockchain state.
 ///
@@ -1674,7 +1711,7 @@ pub async fn init_test(
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, _, _, _, _block_writer) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, Arc::new(|_,_,_| Some(true))).await;
+        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, Arc::new(|_,_,_,_| Some(crate::CrosslinkVerdict::Accept { pos_payout: true }))).await;
 
     Buffer::new(BoxService::new(state_service), 1)
 }
@@ -1695,7 +1732,7 @@ pub async fn init_test_services(
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, read_state_service, latest_chain_tip, chain_tip_change, _block_writer) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true))).await;
+        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, std::sync::Arc::new(|_,_,_,_| Some(crate::CrosslinkVerdict::Accept { pos_payout: true }))).await;
 
     let state_service = Buffer::new(BoxService::new(state_service), 1);
 

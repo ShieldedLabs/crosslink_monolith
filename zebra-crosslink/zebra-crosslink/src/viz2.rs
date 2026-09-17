@@ -213,13 +213,12 @@ impl VizScene {
         let best_chain = ancestry(best_tip);
 
         // The finalized marker this node would publish for these blocks: the newest BFT
-        // block's `headers[0]`. That is `latest_final_block`'s own derivation, off-by-one
-        // and all (FINALITY.md 6.1). The point is to show what this tree does, not what
-        // the construction says it should do.
+        // block's `snapshot`, i.e. the parent of its `headers[0]`. That is
+        // `latest_final_block`'s own derivation, so the viz shows what this tree does.
         let bft_tip_block = bft.iter().max_by_key(|b| b.height);
         let finalized_hash = bft_tip_block
-            .and_then(|b| b.headers.first())
-            .map(|h| Hash32::from_bytes(BlockHash::from_header_data(h).0));
+            .filter(|b| !b.headers.is_empty())
+            .map(|b| Hash32::from_bytes(b.snapshot_block_hash().0));
         let finalized_chain = ancestry(finalized_hash);
         let bc_finalized_tip_height = finalized_hash
             .and_then(|h| height_of.get(&h).copied())
@@ -276,10 +275,10 @@ impl VizScene {
         let mut bft_blocks: Vec<zebra_gui::BftBlock> = Vec::new();
         let mut bft_by_hash: HashMap<Hash32, wallet::bft::BftBlock> = HashMap::new();
         for b in &bft {
-            let Some(candidate_hdr) = b.headers.first() else {
+            if b.headers.is_empty() {
                 continue;
-            };
-            let candidate_hash = Hash32::from_bytes(BlockHash::from_header_data(candidate_hdr).0);
+            }
+            let candidate_hash = Hash32::from_bytes(b.snapshot_block_hash().0);
             let this_hash = Hash32::from_bytes(b.blake3_hash().0);
             bft_by_hash.insert(this_hash, b.clone());
             bft_blocks.push(zebra_gui::BftBlock {
@@ -288,10 +287,11 @@ impl VizScene {
                 this_height: b.height as u64,
                 points_at_bc_block: candidate_hash,
                 points_at_bc_height: height_of.get(&candidate_hash).copied().unwrap_or(0),
+                // Every carried header is a confirmation now: the snapshot is the parent of
+                // headers[0] and is not itself carried, so none of them is skipped.
                 proving_blocks: b
                     .headers
                     .iter()
-                    .skip(1)
                     .map(|x| zebra_gui::ProvingHeader {
                         hash: Hash32::from_bytes(BlockHash::from_header_data(x).0),
                         parent_hash: Hash32::from_bytes(x.prev_block.0),
@@ -358,7 +358,7 @@ impl VizScene {
 /// Bridge between tokio & viz code
 pub async fn service_viz_requests(
     tfl_handle: crate::TFLServiceHandle,
-    params: &'static crate::ZcashCrosslinkParameters,
+    params: crate::ZcashCrosslinkParameters,
 ) {
     let call = tfl_handle.clone().call;
 
@@ -543,7 +543,7 @@ pub async fn service_viz_requests(
                     while bft_checked_n < scan_end {
                         let b = &internal.bft_blocks[bft_checked_n];
                         if b.headers.is_empty() { break; } // placeholder: recheck once filled
-                        let hash = Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0);
+                        let hash = Hash32::from_bytes(b.snapshot_block_hash().0);
                         bft_candidate_hashes.push(hash);
                         bft_pointing_heights.insert(hash, bft_checked_n as u64);
                         if !bft_candidate_heights.contains_key(&hash) {
@@ -659,7 +659,7 @@ pub async fn service_viz_requests(
                             };
                             let bft_hashes: Vec<_> = bft_blocks.iter().map(|b| b.blake3_hash()).collect();
 
-                            let mut tf = test_format::TF::new(params);
+                            let mut tf = test_format::TF::new(&params);
                             let mut next_bft = 0usize;
                             // Each BFT block goes just before the first PoW block that commits to it,
                             // preserving the chronology a replay needs.
@@ -910,7 +910,7 @@ pub async fn service_viz_requests(
                         // cached for the fully-checked range; blocks past a stalled
                         // placeholder (catch-up) compute on the fly until checked
                         let candidate_hash = bft_candidate_hashes.get(i).copied().unwrap_or_else(||
-                            Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0));
+                            Hash32::from_bytes(b.snapshot_block_hash().0));
                         // past a stalled placeholder the fully-checked scan hasn't seen this
                         // hash, so enqueue it here: resolution must still learn its height
                         // or the block positions at 0 forever

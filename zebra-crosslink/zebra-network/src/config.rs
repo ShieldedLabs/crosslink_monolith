@@ -14,6 +14,7 @@ use tokio::fs;
 
 use tracing::Span;
 use zebra_chain::{
+    block::{BftBootstrap, ZcashCrosslinkParameters, PROTOTYPE_PARAMETERS},
     common::atomic_write,
     parameters::{
         testnet::{
@@ -616,6 +617,59 @@ struct DTestnetParameters {
     temporary_orchard_disabling_soft_fork_height: Option<u32>,
     /// Regtest only: whether to allow coinbase spends to have transparent outputs.
     should_allow_unshielded_coinbase_spends: Option<bool>,
+    /// Crosslink consensus parameters. Unset values keep the prototype's.
+    crosslink: Option<DCrosslinkParameters>,
+}
+
+/// Crosslink consensus parameters as written in a config file.
+///
+/// Like the rest of `testnet_parameters`, every node on the network must use the same values or
+/// they will fork. A config file cannot select [`BftBootstrap::Supplied`]: a network whose BFT
+/// nobody supplies would never start it, so that mode is left to the test-format harness.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DCrosslinkParameters {
+    bc_confirmation_depth_sigma: Option<u64>,
+    finalization_gap_bound: Option<u64>,
+    bootstrap_roster_height: Option<u32>,
+    bootstrap_activation_height: Option<u32>,
+}
+
+impl DCrosslinkParameters {
+    fn to_parameters(&self) -> ZcashCrosslinkParameters {
+        let prototype = PROTOTYPE_PARAMETERS;
+        let (prototype_roster_height, prototype_activation_height) = match prototype.bootstrap {
+            BftBootstrap::FromChain { roster_height, activation_height } => {
+                (roster_height, activation_height)
+            }
+            BftBootstrap::Supplied => unreachable!("the prototype bootstraps BFT from the chain"),
+        };
+        ZcashCrosslinkParameters {
+            bc_confirmation_depth_sigma: self
+                .bc_confirmation_depth_sigma
+                .unwrap_or(prototype.bc_confirmation_depth_sigma),
+            finalization_gap_bound: self
+                .finalization_gap_bound
+                .unwrap_or(prototype.finalization_gap_bound),
+            bootstrap: BftBootstrap::FromChain {
+                roster_height: self.bootstrap_roster_height.unwrap_or(prototype_roster_height),
+                activation_height: self
+                    .bootstrap_activation_height
+                    .unwrap_or(prototype_activation_height),
+            },
+        }
+    }
+}
+
+impl From<ZcashCrosslinkParameters> for DCrosslinkParameters {
+    fn from(params: ZcashCrosslinkParameters) -> Self {
+        Self {
+            bc_confirmation_depth_sigma: Some(params.bc_confirmation_depth_sigma),
+            finalization_gap_bound: Some(params.finalization_gap_bound),
+            bootstrap_roster_height: params.bootstrap.roster_height(),
+            bootstrap_activation_height: params.bootstrap.activation_height(),
+        }
+    }
 }
 
 /// Network configuration used during deserialization.
@@ -714,6 +768,11 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             should_allow_unshielded_coinbase_spends: params
                 .is_regtest()
                 .then(|| params.should_allow_unshielded_coinbase_spends()),
+            crosslink: if params.crosslink_parameters() == PROTOTYPE_PARAMETERS {
+                None
+            } else {
+                Some(DCrosslinkParameters::from(params.crosslink_parameters()))
+            },
         }
     }
 }
@@ -790,9 +849,10 @@ impl<'de> Deserialize<'de> for Config {
             (DNetwork::ConfiguredTestnet(params), _) => {
                 build_configured_testnet::<D>(*params, &initial_testnet_peers)?
             }
-            (DNetwork::ConfiguredRegtest { params, .. }, _) => {
-                Network::new_regtest(build_regtest_params(*params))
-            }
+            (DNetwork::ConfiguredRegtest { params, .. }, _) => Network::new_configured_testnet(
+                testnet::Parameters::new_regtest(build_regtest_params(*params))
+                    .map_err(de::Error::custom)?,
+            ),
             (DNetwork::DefaultForKind(NetworkKind::Mainnet), _) => Network::Mainnet,
             (DNetwork::DefaultForKind(NetworkKind::Testnet), Some(params)) => {
                 build_configured_testnet::<D>(params, &initial_testnet_peers)?
@@ -801,7 +861,10 @@ impl<'de> Deserialize<'de> for Config {
                 Network::new_default_testnet()
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), Some(params)) => {
-                Network::new_regtest(build_regtest_params(params))
+                Network::new_configured_testnet(
+                    testnet::Parameters::new_regtest(build_regtest_params(params))
+                        .map_err(de::Error::custom)?,
+                )
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), None) => {
                 Network::new_regtest(Default::default())
@@ -904,6 +967,7 @@ where
         extend_funding_stream_addresses_as_required,
         temporary_orchard_disabling_soft_fork_height,
         should_allow_unshielded_coinbase_spends,
+        crosslink,
     } = params;
 
     // This is a Regtest-only consensus knob, so reject it rather than silently ignoring it.
@@ -992,6 +1056,12 @@ where
         params_builder = params_builder.extend_funding_streams();
     }
 
+    if let Some(crosslink) = crosslink {
+        params_builder = params_builder
+            .with_crosslink_parameters(crosslink.to_parameters())
+            .map_err(de::Error::custom)?;
+    }
+
     // Retain the default soft-fork activation height unless one is configured.
     if let Some(height) = temporary_orchard_disabling_soft_fork_height {
         params_builder = params_builder.with_temporary_orchard_disabling_soft_fork_height(
@@ -1027,6 +1097,7 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
         checkpoints,
         extend_funding_stream_addresses_as_required,
         should_allow_unshielded_coinbase_spends,
+        crosslink,
         ..
     } = params;
 
@@ -1047,5 +1118,10 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
         checkpoints: Some(checkpoints),
         extend_funding_stream_addresses_as_required,
         should_allow_unshielded_coinbase_spends,
+        crosslink: if let Some(crosslink) = crosslink {
+            Some(crosslink.to_parameters())
+        } else {
+            None
+        },
     }
 }

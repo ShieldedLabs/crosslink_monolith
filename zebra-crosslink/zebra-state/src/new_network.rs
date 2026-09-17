@@ -2871,9 +2871,14 @@ pub fn sync(
                             format!("{{hash:{} ovd:{} sigs:{}}}", hex::encode(&v[0..32]), hex::encode(&v[32..]), fp.signatures.len())
                         };
 
+                        // The gate needs the height of whatever PoW block the carried
+                        // certificate finalizes, and only the state can answer that; see
+                        // `CrosslinkBlockHeightLookup`. Every chain is searched, because the
+                        // block being admitted may be extending a side chain.
+                        let height_of = |hash: block::Hash| read_state.known_block(hash).map(|known| known.height);
                         let (gate, defer_msg) = if let Some(parent_fp) = parent_fat_pointer {
                             let msg = format!("child fp {} / parent fp {} not resolvable yet", fp_brief(&child_fat_pointer), fp_brief(&parent_fp));
-                            ((crosslink_gate)(parent_fp, child_fat_pointer, block::Height(height)), msg)
+                            ((crosslink_gate)(parent_fp, child_fat_pointer, block::Height(height), &height_of), msg)
                         } else {
                             // known_block() saw the parent but any_chain_block_header() did not;
                             // the two views disagreeing is itself worth seeing in the log.
@@ -2899,12 +2904,14 @@ pub fn sync(
                             // re-check next tick rather than dropping and re-downloading it.
                             None => Err(("crosslink", defer_msg, true)),
                             // Permanent, per the gate's own documentation. Drop it.
-                            Some(false) => Err(("crosslink", "fat pointer regressed or is too early".to_string(), false)),
-                            Some(true) => {
+                            Some(crate::CrosslinkVerdict::Reject) => Err(("crosslink", "fat pointer regressed or is too early".to_string(), false)),
+                            // `pos_payout` travels with the block to `Chain::push`: the gate is the
+                            // only place that resolves the certificate and what it finalizes.
+                            Some(crate::CrosslinkVerdict::Accept { pos_payout }) => {
                                 let lookup = |outpoint: &zebra_chain::transparent::OutPoint| read_state.any_chain_utxo(outpoint);
                                 match (verify_fns.verify_expensive)(&block_arc, &network, &cheap, &lookup) {
                                     Err(err) => Err(("expensive", err.msg, false)),
-                                    Ok(new_outputs) => Ok((cheap, new_outputs)),
+                                    Ok(new_outputs) => Ok((cheap, new_outputs, pos_payout)),
                                 }
                             }
                         }
@@ -2917,13 +2924,14 @@ pub fn sync(
             // orphan queue -> sent-hash bookkeeping) is bypassed entirely; the write task is
             // handed a block we already verified, leaving only contextual validation.
             let res = match &verdict {
-                Ok((cheap, new_outputs)) => {
+                Ok((cheap, new_outputs, pos_payout)) => {
                     let semantically_verified = crate::SemanticallyVerifiedBlock {
                         block: block_arc.clone(),
                         hash,
                         height: cheap.height,
                         new_outputs: new_outputs.clone(),
                         transaction_hashes: cheap.transaction_hashes.clone(),
+                        pos_payout: *pos_payout,
                     };
                     block_writer
                         .handle_commit(semantically_verified)

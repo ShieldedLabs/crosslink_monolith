@@ -1996,6 +1996,7 @@ impl Chain {
             spent_outputs,
             transaction_hashes,
             chain_value_pool_change,
+            pos_payout,
         ) = (
             contextually_valid.block.as_ref(),
             contextually_valid.hash,
@@ -2004,6 +2005,7 @@ impl Chain {
             &contextually_valid.spent_outputs,
             &contextually_valid.transaction_hashes,
             &contextually_valid.chain_value_pool_change,
+            contextually_valid.pos_payout,
         );
 
         // add hash to height_by_hash
@@ -2170,11 +2172,21 @@ impl Chain {
         let size = block.zcash_serialized_size();
         self.update_chain_tip_with(&(*chain_value_pool_change, height, size))?;
 
-        // Nothing at stake (no active bond, every bank empty) means no issuance this
+        // PoS issuance is paid only by a block that advances finality promptly: `pos_payout` is
+        // the crosslink fat-pointer gate's verdict on exactly that (cert changed vs the parent's,
+        // and carried no more than sigma + FINALITY_LIVENESS_ALLOWANCE above what it finalizes).
+        // A block that does not pay still pushes empty reward/commission entries, because both
+        // logs are positional twins of the block list and `pop_tip` pops one entry per block.
+        //
+        // Nothing at stake (no active bond, every bank empty) also means no issuance this
         // block; the two logs then hold empty entries. TODO: for prototyping this is whatever.
         {
             let ChainInner { delegation_bonds, finalizer_rewards, chain_value_pools, .. } = &mut self.inner;
-            let (bond_rewards, commissions) = crate::service::update_bonds_with_pos_issuance(crate::constants::POS_BLOCK_REWARD_ZATS, delegation_bonds, finalizer_rewards);
+            let (bond_rewards, commissions) = if pos_payout {
+                crate::service::update_bonds_with_pos_issuance(crate::constants::POS_BLOCK_REWARD_ZATS, delegation_bonds, finalizer_rewards)
+            } else {
+                (Vec::new(), Vec::new())
+            };
             let to_bonds: u64 = bond_rewards.iter().map(|(_, r)| r).sum();
             let commission_total: u64 = commissions.iter().map(|(_, c)| c).sum();
             chain_value_pools.set_staking_bonded_amount((chain_value_pools.staking_bonded_amount() + Amount::new(to_bonds as i64)).unwrap());
