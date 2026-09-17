@@ -833,6 +833,56 @@ decision and should not be bundled with the mechanical steps above.
 Computing `candidate`, changing the update trigger, enforcing validity rules, and changing
 chain eligibility or rewards are later behavior changes, not part of a semantic rename.
 
+### 8.1 Implementation pitfalls
+
+These hold for any change to how the marker is derived, stored, or consumed.
+
+- **The derivation is duplicated.** `hash(headers[0])` is computed independently in
+  `handle_new_decided_bft_block`, the BFT validation path, the PoS-store restore path, the
+  restore replay watermark `prev_finalized_bc_height`, `BftBlock::finalization_candidate()`,
+  `test_format.rs`, and `viz2.rs` (both the live viz response and `VizScene`). The
+  finality-diagram tests in `zebrad/tests/crosslink.rs` and `viz2::scene_tests` assert
+  marker positions derived the same way. A change to one site without the others makes the
+  node, the GUI, and the tests disagree about which block is final.
+- **The roster is consensus data reached through the marker.** `finalizers_at_current_height`
+  is the aggregated stake set that `CrosslinkFinalizeBlock` returns for the marker hash, and
+  `terminated_finalizers_at` takes the marker height. That is objective today only because
+  `Π_bft` agreement fixes the hash. Feeding node-local `fin` into either path lets validators
+  derive different rosters at the same BFT height (§7, §9.3).
+- **A derivation change is a network-wide consensus change.** Nodes running two derivations
+  disagree on the finalized block and on the roster, so it needs an activation height in the
+  hardfork schedule. Existing PoS-store records carry roster bytes computed under the old
+  derivation and are read back verbatim (§9.4).
+- **Reward logic has three copies.** `Chain::push` with `update_bonds_with_pos_issuance`,
+  `fixup_aggregated_stakes` in `stake_fixup.rs`, and the wallet projection in `lib.rs` must
+  change together (§5.4).
+- **Header order is a property of the honest producer.** `BftBlock::try_from` checks only the
+  header count, and the network and PoS-store deserialization path does not call it. Code that
+  reads `headers[0]` as the deepest header relies on the producer, not on validation.
+- **The BFT service lock must be released before any state request.** zebra-state can call back
+  into the Crosslink service during `CrosslinkFinalizeBlock`. An update trigger on `bc_best`
+  changes adds a state-to-Crosslink call path with the same reentrancy constraint.
+- **Aborts kill the node.** The build uses `panic=abort`. The decide path unwraps
+  `block_height_from_hash` on the decided header, so a decided block whose header is unknown to
+  state terminates the process, as does every `assert!` on that path.
+- **`fin` is a time series, not a function of the tip (§3.2).** Recomputing it from
+  `candidate(bc_best)` after a restart reproduces only the current candidate. Sticky fork choice
+  (§4.3) uses `fin` as its floor, so that floor survives a restart only if `fin` is persisted.
+- **Zebra's depth commit is a second floor.** Blocks deeper than `MAX_BLOCK_REORG_HEIGHT` on the
+  best chain are written to the finalized database regardless of `fin` (§4.3, Zebra specifics).
+  Any fork-choice rule above `fin` operates only within that window.
+- **The `+40` candidate clamp has no recorded purpose.** It was introduced without explanation,
+  and it conflicts with Tail Confirmation (§6.2). Its role, such as bounding the size of one
+  finalization step, has to be established before either the clamp or the rule is changed.
+- **`σ` comes from `ZcashCrosslinkParameters`.** The GUI's `apply_viz_op` hardcodes it as
+  `TMP_SIGMA`, which matches only while `PROTOTYPE_PARAMETERS` is unchanged.
+- **Removing `finalization_gap_bound` changes the test format.** `test_format.rs` serializes it
+  as the second parameter value, so existing `.zeccltf` files in `crosslink-test-data` need
+  regenerating or a compatible reader.
+- **Crosslink node tests run without `viz_gui`.** Every node test in `zebrad/tests/crosslink.rs`
+  panics in winit when that feature is enabled, and `phargo.bat` enables it, so those tests run
+  under plain cargo without the feature.
+
 ## 9. Open consensus decisions
 
 ### 9.1 Canonical state and fork choice
