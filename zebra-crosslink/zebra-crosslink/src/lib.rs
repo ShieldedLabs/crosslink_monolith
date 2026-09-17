@@ -1792,19 +1792,27 @@ async fn total_issuance_from_key(
 
     for scan_info in &mut scan_infos {
         let mut bonds_value = 0;
-        for bond in &scan_info.bonds {
-            match staking.delegation_bonds.get(&bond.pk.0) {
-                Some(bond_info) => {
-                    let initial_val: u64 = bond.initial_val;
-                    let final_val = u64::from(bond_info.0.amount);
-                    let issuance_gained = final_val - initial_val;
-                    println!("bond {:?}: initial value = {}; final value = {}; gained {}", bond, initial_val, final_val, issuance_gained);
-                    bonds_value += issuance_gained;
-                },
-                None => return Err(format!("couldn't find bond {:?}", bond)),
+        let mut kept_bonds = Vec::with_capacity(scan_info.bonds.len());
+        for bond in std::mem::take(&mut scan_info.bonds) {
+            let Some((bond_state, status)) = staking.delegation_bonds.get(&bond.pk.0) else {
+                return Err(format!("couldn't find bond {:?}", bond));
+            };
+            let initial_val: u64 = bond.initial_val;
+            let final_val = u64::from(bond_state.amount);
+            let issuance_gained = final_val - initial_val;
+            let burned = *status == zebra_state::BondStatusInChain::Burned;
+            println!("bond {:?}: initial value = {}; final value = {}; gained {}; burned {}", bond, initial_val, final_val, issuance_gained, burned);
+            if burned {
+                scan_info.burned_bonds_initial_value += initial_val;
+                scan_info.burned_bonds_value += issuance_gained;
+                scan_info.burned_bonds.push(bond);
+            } else {
+                bonds_value += issuance_gained;
+                kept_bonds.push(bond);
             }
         }
 
+        scan_info.bonds = kept_bonds;
         scan_info.bonds_value = bonds_value;
         scan_info.total_value = scan_info.coinbases_value + scan_info.bonds_value;
         println!("final scan info: {scan_info:?}");
