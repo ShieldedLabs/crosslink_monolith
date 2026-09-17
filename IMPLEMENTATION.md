@@ -5,7 +5,7 @@ code to it. Each stage names the FINALITY.md sections it implements, the code it
 the condition under which it is done. Where this file and FINALITY.md disagree, FINALITY.md is
 right and this file is corrected.
 
-Stages 1–4 are ready. Stages 5 and 6 wait on the questions in
+Stage 1 is done. Stages 2–4 are ready. Stages 5 and 6 wait on the questions in
 [Needs design pass](#needs-design-pass).
 
 Stages run one at a time, in order, each committed before the next starts. Stages 1 and 2 edit
@@ -30,11 +30,31 @@ the same test files, and stages 3 and 4 depend on stage 1.
   `phargo.bat` enables `viz_gui` for `zebra-crosslink`, which puts winit on the main thread.
   The node tests in `zebrad/tests/crosslink.rs` run headless, on the crate's
   `cfg(not(feature = "viz_gui"))` path (FINALITY.md §8.1), so they run with
-  `PH_NO_VIZ_GUI=1` set, which leaves the feature out of an otherwise identical build:
-  `$env:PH_NO_VIZ_GUI=1; .\phest.bat zebra-crosslink Debug Win64 -p zebrad --test crosslink -- --nocapture`.
-  `phargo.bat` forwards `%4` through `%9`, so an argument list longer than that one needs
-  the wrapper widened first.
+  `PH_NO_VIZ_GUI=1` set, which leaves the feature out of an otherwise identical build.
+  Each node test boots a zebrad in the test process and ends it with `process::exit`, so a
+  test run is one process per test, and the harness's capture is turned off so the
+  runner's per-instruction dump survives an abort:
+  `$env:PH_NO_VIZ_GUI=1; $env:RUST_TEST_THREADS=1; $env:RUST_TEST_NOCAPTURE=1; .\phest.bat zebra-crosslink Debug Win64 -p zebrad --test crosslink <test name>`.
+  Both settings are environment variables because `phargo.bat` forwards `%4` through
+  `%9` and splits `--test-threads=1` at the `=`, so a trailing `-- --nocapture
+  --test-threads=1` never reaches the harness.
   A winit panic means the feature was left on; it is not worked around in the test code.
+- A stage's test condition is read against the node tests that fail for reasons outside the
+  stages. None of them is fixed or worked around by a stage:
+  - `call_from_state_to_crosslink_to_ask_about_fat_pointers` rejects any PoW block at or
+    below `BOOTSTRAP_ACTIVATION_HEIGHT` that carries a fat pointer, so every test whose PoW
+    blocks cite a BFT block fails at its first citing block:
+    `crosslink_test_pow_to_pos_link` and the three `crosslink_finality_diagram_*` node tests.
+    Their finality expectations before that block hold.
+  - `staking_tx_create_bond` in `zebrad/tests/crosslink.rs` leaves the bond signature zero,
+    and the sync path verifies staking signatures, so
+    `crosslink_pow_block_with_staking_tx` and `crosslink_add_newcomer_to_roster_via_pow`
+    fail at the block carrying the bond.
+  - `REGTEST_BLOCK_BYTES` and `REGTEST_POS_BLOCK_BYTES` were mined under a different
+    difficulty and format, so every test built on them fails at its first `LOAD_POW`.
+  - `tfl_block_finality_from_height_hash` returns an error while no BFT block exists, and
+    `EXPECT_POW_BLOCK_FINALITY` treats that as a panic, so `crosslink_test_basic_finality`
+    aborts in its PoW-only prefix.
 - The build uses `panic = abort`: a new `assert!`, `unwrap`, or `expect` on a consensus path
   terminates the node when it fails.
 
@@ -63,7 +83,7 @@ snapshot.
 
 Consequences to expect, not to work around:
 
-- The BFT-height-1 roster moves one block below the activation height (FINALITY.md §8.1).
+- The BFT-height-1 roster moves one block below the bootstrap roster height (FINALITY.md §8.1).
 - `CrosslinkFinalizeBlock` is sent the snapshot hash. The decide path still commits the decided
   block; that policy changes in stage 5.
 

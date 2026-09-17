@@ -347,7 +347,7 @@ pub struct BftBlock {
     pub parent_hash: Hash32,
     pub this_height: u64,
     pub points_at_bc_block: Hash32,
-    pub points_at_bc_height: u64, // finalization candidate's BC height (0 = unknown): positions the BFT block even before its PoW block arrives
+    pub points_at_bc_height: u64, // the snapshot's BC height (0 = unknown): positions the BFT block even before its PoW block arrives
     pub proving_blocks: Vec<ProvingHeader>,
     /// The *next* BFT block (this block's successor) activates a user-led
     /// hardfork. We mark this block so the GUI can signal that a hardfork is
@@ -691,8 +691,8 @@ pub fn apply_viz_op(state: &VizState, block: Hash32, op: InteractiveVizOp) -> Ve
         InteractiveVizOp::bft_last_final => res.push(bft.unwrap().block.parent_hash),
         InteractiveVizOp::origbft_last_final => todo!(),
         InteractiveVizOp::snapshot => {
-            // TODO: what is the `ceil(1, bc')` suffix?
-            res.push(bft.unwrap().block.proving_blocks.first().map(|ph| ph.hash).unwrap_or(Hash32::from_u64(0))); // TODO: fall back to genesis hash instead of 0
+            // `snapshot(B) := parent(B.headers_bc[0])`, which is the block the BFT block points at.
+            res.push(bft.unwrap().block.points_at_bc_block);
         },
     }
 
@@ -1069,14 +1069,14 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
 
                 // BFT proving headers are real header data for blocks we may never have
                 // received the body of. Headers are deepest-first: proving_blocks[i] sits
-                // i+1 above the finalization candidate this BFT block points at.
-                let candidate_height = bc.block.this_height;
+                // i+1 above the snapshot this BFT block points at.
+                let snapshot_height = bc.block.this_height;
                 for (i, ph) in bft.proving_blocks.iter().enumerate() {
                     let header_block = BcBlock {
                         this_hash: ph.hash,
                         parent_hash: ph.parent_hash,
                         txs_n: 0,
-                        this_height: candidate_height + 1 + i as u64,
+                        this_height: snapshot_height + 1 + i as u64,
                         is_best_chain: false,
                         is_finalized: false,
                         knowledge: BcKnowledge::HeaderSeen,

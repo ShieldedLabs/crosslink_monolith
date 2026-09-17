@@ -514,11 +514,14 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
     use std::ops::Sub;
     use zebra_chain::block::HeightDiff as BlockHeightDiff;
 
-    let finality_candidate_height = tip_height.sub(BlockHeightDiff::from(
+    // The snapshot of the proposed block: `FindBlockHeaders { known_blocks: [snapshot] }` returns
+    // the headers after the snapshot, so the proposal carries the `σ` blocks above it and
+    // `parent(headers[0])` is the snapshot itself.
+    let snapshot_height = tip_height.sub(BlockHeightDiff::from(
         params.bc_confirmation_depth_sigma as i64,
     ));
 
-    let finality_candidate_height = if let Some(h) = finality_candidate_height {
+    let snapshot_height = if let Some(h) = snapshot_height {
         h
     } else {
         info!(
@@ -538,30 +541,23 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
                 .map_or(Blake3Hash([0u8; 32]), |b| b.blake3_hash()),
         )
     };
-    // `finality_candidate_height` is the ANCHOR the header window is walked from, but
-    // `FindBlockHeaders { known_blocks: [anchor] }` returns headers starting AFTER the
-    // anchor, so a decided block finalizes `headers.first()` == anchor + 1. Guard on the
-    // height that would actually be finalized, not the anchor: comparing the anchor here
-    // required the tip to advance 2 blocks between proposals, which produced a BFT block
-    // every other PoW block. With this guard each new PoW block is proposable at once,
-    // finalizing as high up as the sigma-header window allows (tip - sigma + 1).
-    let proposed_final_height = ZebBlockHeight(finality_candidate_height.0 + 1);
+    // A proposal improves when its snapshot is above the parent bft-block's snapshot.
     let is_improved_final =
-        latest_final_block.is_none() || proposed_final_height > latest_final_block.unwrap().0;
+        latest_final_block.is_none() || snapshot_height > latest_final_block.unwrap().0;
 
     if !is_improved_final {
         info!(
             "candidate block can't be final: height {}, final height: {:?}",
-            finality_candidate_height.0, latest_final_block
+            snapshot_height.0, latest_final_block
         );
         return None;
     }
 
-    let finality_candidate_height = ZebBlockHeight(finality_candidate_height.0.min(if let Some(v) = latest_final_block { v.0.0+40 } else { u32::MAX }));
+    let snapshot_height = ZebBlockHeight(snapshot_height.0.min(if let Some(v) = latest_final_block { v.0.0+40 } else { u32::MAX }));
 
-    let resp = (call.state)(StateRequest::BlockHeader(finality_candidate_height.into())).await;
+    let resp = (call.state)(StateRequest::BlockHeader(snapshot_height.into())).await;
 
-    let candidate_hash = if let Ok(StateResponse::BlockHeader { hash, .. }) = resp {
+    let snapshot_hash = if let Ok(StateResponse::BlockHeader { hash, .. }) = resp {
         hash
     } else {
         // Error or unexpected response type:
@@ -571,7 +567,7 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
 
     // NOTE: probably faster to request 2x as many blocks as we need rather than have another async call
     let resp = (call.state)(StateRequest::FindBlockHeaders {
-        known_blocks: vec![candidate_hash],
+        known_blocks: vec![snapshot_hash],
         stop: None,
     })
     .await;
@@ -664,7 +660,7 @@ async fn handle_new_decided_bft_block(
     }
 
     let call = tfl_handle.call.clone();
-    let new_final_hash = ZebBlockHash(BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0);
+    let new_final_hash = ZebBlockHash(new_block.snapshot_hash().expect("at least 1 header").0);
     let new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
     // `height` is now the 0-based canonical height, i.e. the chain index directly.
     let insert_i = new_block.height as usize;
@@ -954,7 +950,7 @@ async fn validate_bft_block(
     let already_finalized_hash = internal.latest_final_block.map(|(_, hash)| hash);
     drop(internal);
 
-    let new_final_hash = ZebBlockHash(BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0);
+    let new_final_hash = ZebBlockHash(new_block.snapshot_hash().expect("at least 1 header").0);
     let new_final_pow_height =
         if let Some(new_final_height) = block_height_from_hash(&call, new_final_hash).await {
             new_final_height.0
@@ -1252,14 +1248,13 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 let this_bft_height = ingest_data_for_tenderlink.len() as u64;
                 let this_terminated = terminated_finalizers_at(&config.hardforks, this_bft_height, prev_finalized_bc_height);
                 let roster = tenderlink_roster_from_internal(&unsorted_roster, &this_terminated);
-                // Advance the watermark to this block's candidate height for the next iteration.
-                // If the candidate can't be resolved (PoW DB behind the pos file, e.g. wiped and
+                // Advance the watermark to this block's snapshot height for the next iteration.
+                // If the snapshot can't be resolved (PoW DB behind the pos file, e.g. wiped and
                 // re-syncing), keep the last known height: monotone, and correct whenever the DB
                 // is intact -- unlike the old `unwrap_or(0)`, which activated the entire blacklist
                 // across the whole replay, nondeterministically by DB-availability race.
-                if let Some(candidate) = block.headers.first() {
-                    let candidate_hash = ZebBlockHash(BlockHash::from_header_data(candidate).0);
-                    if let Some(h) = block_height_from_hash(&call, candidate_hash).await {
+                if let Some(snapshot) = block.snapshot_hash() {
+                    if let Some(h) = block_height_from_hash(&call, ZebBlockHash(snapshot.0)).await {
                         prev_finalized_bc_height = h.0 as u64;
                     }
                 }
@@ -1275,7 +1270,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         let mut new_final_height = ZebBlockHeight(0);
 
         if let Some(new_block) = i_bft_blocks.last() {
-            new_final_hash.0 = BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0;
+            new_final_hash.0 = new_block.snapshot_hash().expect("at least 1 header").0;
             new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
         }
 
@@ -1334,8 +1329,9 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             run_instant += MAIN_LOOP_SLEEP_INTERVAL;
 
             // Crosslink bootstrap: the first accepted PoW block at the activation height (h2)
-            // finalizes h1 through a deterministic genesis decision, and BFT starts at height 1
-            // with h1's roster. Done before taking the internal lock -- the finalize calls back
+            // finalizes h1 - 1, the snapshot of a deterministic genesis decision carrying the
+            // headers from h1, and BFT starts at height 1 with the roster at h1 - 1. Done before
+            // taking the internal lock -- the finalize calls back
             // into the fat-pointer gate, which blocks on that same lock.
             if let (Some(_), Some((tip_height, _))) = (launch.as_ref(), new_bc_tip) {
                 if tip_height.0 >= BOOTSTRAP_ACTIVATION_HEIGHT {
@@ -1384,7 +1380,8 @@ struct TenderlinkLaunch {
 }
 
 /// Start tenderlink at the height after `ingest` with `roster`, and mark TFL active. Refuses an
-/// empty roster: BFT height 1's roster is fixed by the stakes at h1, so nothing would ever change.
+/// empty roster: BFT height 1's roster is fixed by the stakes at h1 - 1, so nothing would ever
+/// change.
 async fn spawn_tenderlink(
     internal_handle: &TFLServiceHandle,
     launch: TenderlinkLaunch,
@@ -1394,8 +1391,8 @@ async fn spawn_tenderlink(
     let config = internal_handle.config.clone();
     if roster.is_empty() {
         error!(
-            "BFT height {} has an empty roster: no stake was bonded by the bootstrap roster height ({}). BFT will not run on this chain.",
-            ingest_data_for_tenderlink.len(), BOOTSTRAP_ROSTER_HEIGHT,
+            "BFT height {} has an empty roster: no stake was bonded by the BFT genesis snapshot height ({}). BFT will not run on this chain.",
+            ingest_data_for_tenderlink.len(), BOOTSTRAP_ROSTER_HEIGHT - 1,
         );
         return;
     }
@@ -1582,8 +1579,9 @@ fn decided_round_data(
     round_data
 }
 
-/// The deterministic BFT genesis block: the decision that finalizes the bootstrap roster height
-/// (h1), which every node constructs identically from its own PoW chain instead of receiving.
+/// The deterministic BFT genesis block: the decision whose snapshot is the block below the
+/// bootstrap roster height (h1 - 1), which every node constructs identically from its own PoW
+/// chain instead of receiving.
 ///
 /// It is shaped exactly as a proposer would shape it -- v2, headers from h1 for the confirmation
 /// depth, any hardforks scheduled at BFT height 0 -- so `validate_bft_block` accepts it unchanged.
@@ -1629,14 +1627,14 @@ async fn build_bootstrap_genesis(tfl_handle: &TFLServiceHandle) -> Option<(BftBl
     Some((block, fat_pointer))
 }
 
-/// Run the bootstrap: decide genesis (finalizing h1 on the PoW side and taking h1's aggregated
+/// Run the bootstrap: decide genesis (finalizing h1 - 1 on the PoW side and taking its aggregated
 /// stakes as the roster for height 1) and produce what tenderlink needs to start at height 1.
 /// Must not be called with the internal lock held.
 async fn bootstrap_bft(tfl_handle: &TFLServiceHandle) -> Option<(Vec<SortedRosterMember>, Vec<tenderlink::RoundData>)> {
     let (genesis, fat_pointer) = build_bootstrap_genesis(tfl_handle).await?;
     info!(
         "crosslink bootstrap: PoW reached height {}; deciding BFT genesis {} which finalizes height {}",
-        BOOTSTRAP_ACTIVATION_HEIGHT, genesis.blake3_hash(), BOOTSTRAP_ROSTER_HEIGHT,
+        BOOTSTRAP_ACTIVATION_HEIGHT, genesis.blake3_hash(), BOOTSTRAP_ROSTER_HEIGHT - 1,
     );
     let roster = handle_new_decided_bft_block(tfl_handle, &genesis, &fat_pointer, Vec::new()).await;
     let terminated = terminated_finalizers_at(&tfl_handle.config.hardforks, 0, 0);

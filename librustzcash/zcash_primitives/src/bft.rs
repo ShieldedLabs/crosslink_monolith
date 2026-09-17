@@ -299,17 +299,15 @@ impl BftBlock {
     }
 
 
-    /// Refer to the [BcBlockHeader] that is the finalization candidate for this block
+    /// `snapshot(B)`: the bc-block this bft-block finalizes, which is the parent of the
+    /// deepest carried header (FINALITY.md §3.1). Every reader of the finalized block derives
+    /// it here, so the node, the GUI, and the tests agree on it.
     ///
-    /// This returns the deepest carried header, which is one block above the snapshot the
-    /// specification defines: `snapshot` is that header's *parent*. No caller in this tree
-    /// takes the parent, so the finalized point is currently one block shallower than the
-    /// specification intends. See the off-by-one discussion in FINALITY.md.
-    ///
-    /// Panics if the block carries no headers, which the placeholder entries used during
-    /// out-of-order BFT ingest do.
-    pub fn finalization_candidate(&self) -> &BcBlockHeader {
-        &self.headers.first().expect("Vec should never be empty")
+    /// `None` when the block carries no headers, as the placeholder entries used during
+    /// out-of-order BFT ingest do. The specification's `snapshot(B) = O_bc` for an empty
+    /// `headers_bc` is left to the caller, which knows the bc genesis hash.
+    pub fn snapshot_hash(&self) -> Option<crate::block::BlockHash> {
+        self.headers.first().map(|header| header.prev_block)
     }
 
     /// Attempt to construct a [BftBlock] from headers while performing immediate validations; see [BftBlock] type docs
@@ -392,15 +390,18 @@ impl std::error::Error for InvalidBftBlock {}
 ///
 /// - `h0`: staking actions become legal. In this prototype that is genesis (the new transaction
 ///   format is on from the start), so there is no constant for it.
-/// - `h1` [`BOOTSTRAP_ROSTER_HEIGHT`]: the block whose aggregated stakes become the roster that
-///   votes on BFT height 0. Chosen halfway between the first and second staking day, i.e. after
-///   the first staking window has closed, so every bond from day one counts.
+/// - `h1` [`BOOTSTRAP_ROSTER_HEIGHT`]: the deepest header the BFT genesis block carries. Its
+///   snapshot is the block below, `h1 - 1`, whose aggregated stakes become the roster that
+///   votes at BFT height 1. `h1` is chosen halfway between the first and second staking day,
+///   i.e. after the first staking window has closed, so every bond from day one counts.
 /// - `h2` [`BOOTSTRAP_ACTIVATION_HEIGHT`]: when a node accepts any PoW block at this height it
-///   walks back that chain to its `h1` ancestor, finalizes it, and starts BFT with `h1`'s roster.
+///   walks back that chain to `h1`, builds the genesis block from the headers there, finalizes
+///   `h1 - 1`, and starts BFT with its roster.
 ///
 /// Every PoW block at or below `h2` must carry a nil fat pointer; only blocks above `h2` may point
 /// at a BFT block. `h2 - h1` exceeds the reorg limit, so by the time any `h2` block is accepted the
-/// `h1` ancestor is the same on every chain and its stakes are already in the finalized state.
+/// `h1` ancestor and its parent are the same on every chain and their stakes are already in the
+/// finalized state.
 pub const BOOTSTRAP_ROSTER_HEIGHT: u32 = crate::transaction::STAKING_PERIOD / 2;
 /// See [`BOOTSTRAP_ROSTER_HEIGHT`].
 pub const BOOTSTRAP_ACTIVATION_HEIGHT: u32 = BOOTSTRAP_ROSTER_HEIGHT + 200;

@@ -121,8 +121,9 @@ impl TFInstr {
             }
             Some(TestInstr::LoadPoS((block, fat_ptr))) => {
                 str += &format!(
-                    "{}, hdrs: [{} .. {}]",
+                    "{}, snapshot: {}, hdrs: [{} .. {}]",
                     block.blake3_hash(),
+                    block.snapshot_hash().expect("at least 1 header"),
                     BlockHash::from_header_data(&block.headers[0]),
                     BlockHash::from_header_data(block.headers.last().unwrap())
                 )

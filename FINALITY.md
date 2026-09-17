@@ -718,8 +718,9 @@ only by `set_final_block`, which also sends the new value on `final_change_tx`. 
 - `tfl_service_main_loop`, when restoring the last entry from the PoS store; and
 - `tfl_set_finality_by_hash`, through the testing/service setter.
 
-The live path computes the hash of `new_block.headers[0]`: the first header itself, rather than
-`snapshot(new_block) = parent(new_block.headers[0])`.
+The live path takes `snapshot(new_block) = parent(new_block.headers[0])` from
+`BftBlock::snapshot_hash`, the one accessor through which every reader derives the finalized
+block (§8.1).
 
 When this marker is absent, `tfl_final_block_height_hash` returns `None`. It previously
 substituted a Zebra reorg-depth location derived from the state block locator, so that the API
@@ -755,7 +756,7 @@ The state behavior depends on whether the hash is known:
   `WriteBlockWorkerTask::handle_crosslink_finalize`.
 - a hash the state does not know never reaches the request. `handle_new_decided_bft_block`
   first asserts that `validate_bft_block` passes, and validation returns `Indeterminate`
-  (`NeedsBlock`) when `KnownBlock` cannot resolve `headers[0]`, so the assertion panics and,
+  (`NeedsBlock`) when `KnownBlock` cannot resolve the snapshot block, so the assertion panics and,
   under `panic = abort`, the node exits. The retry loop runs only for a hash known at that
   point; if the chain holding it is then dropped from the non-finalized state before the request
   succeeds, the loop can retry indefinitely.
@@ -835,43 +836,27 @@ it departs from.
   restored, without requiring the current best chain to cite that decision.
 - **Missing clamp.** Zebra does not compute
   `lca(snapshot(LF(H)), prune_σ(H))`; it takes a hash directly from the decided BFT block.
-- **Off-by-one snapshot.** Honest proposal construction obtains a deepest-first `σ`-header
-  tail. `headers[0]` is one block after the snapshot, but Zebra stores that header's hash rather
-  than its parent. The proposal path picks a candidate height, then issues `FindBlockHeaders`
-  with that block as the sole known hash. That request is specified to return the headers
-  *following* the intersection, ascending, and the implementation iterates an ascending range
-  from `intersection + 1`, so `headers[0]` is the block one above the candidate height and
-  `parent(headers[0])` is the candidate height itself. Storing `hash(headers[0])` therefore
-  finalizes one block shallower than intended. The header window itself is already right: `σ`
-  headers suffice, because `headers[0]` carries the snapshot's hash in its parent field, and a
-  validator must hold the snapshot block to validate the certificate anyway. The fix changes
-  only the derivation, not the number of headers.
-  The in-memory header order is consequently deepest-first, matching the specification, so the
-  `BftBlock` doc comment in `librustzcash/zcash_primitives/src/bft.rs` claiming the order is
-  reversed from the specification was not merely stale but inverted. Nothing enforces that
-  order: `BftBlock::try_from` checks only the header count and logs that its documented
-  validations are unimplemented, and the deserialization path used for network and PoS-store
-  blocks does not call `try_from` at all. Deepest-first is a property of the honest producer,
-  not of the type.
+- **Header order is unenforced.** Honest proposal construction issues `FindBlockHeaders` with
+  the snapshot block as the sole known hash. That request returns the headers *following* the
+  intersection, ascending, so the proposal carries the `σ` blocks above the snapshot,
+  deepest-first, and `parent(headers[0])` is the snapshot. `σ` headers suffice, because
+  `headers[0]` carries the snapshot's hash in its parent field, and a validator must hold the
+  snapshot block to validate the certificate anyway. Nothing enforces that order:
+  `BftBlock::try_from` checks only the header count and logs that its documented validations
+  are unimplemented, and the deserialization path used for network and PoS-store blocks does
+  not call `try_from` at all. Deepest-first is a property of the honest producer, not of the
+  type (§3.4, Tail Confirmation).
 - **The candidate height is clamped, and the clamp is not `prune_σ`.** The proposal path
   computes `tip − σ` and then takes
   `min(tip − σ, latest_final_block + 40)`. Only when that clamp does not bind is the stored
-  marker `prune_σ(tip) + 1`, i.e. `σ − 1` confirmations — two rather than three under
-  `PROTOTYPE_PARAMETERS`. Whenever `tip − σ > marker + 40`, which is the normal regime during
+  marker `prune_σ(tip)`, i.e. `σ` confirmations. Whenever `tip − σ > marker + 40`, which is the normal regime during
   catch-up after a restart or a BFT stall, the candidate is `marker + 40` and the block is
   finalized far deeper than `σ`. Any statement of the form "the proposal path finalizes at
   `tip − σ`" is true only in the unclamped regime.
-- **Four sites derive the marker from `headers.first()`**, not three: the decide path, the BFT
-  validation path, the PoS-store restore path, and — separately — the historical replay
-  watermark `prev_finalized_bc_height` computed during restore. `BftBlock::finalization_candidate()`
-  is a fifth accessor with the same convention, and `viz2.rs` repeats the derivation for the GUI
-  and for `VizScene`. The replay watermark recomputes the old derivation from stored records, which is
-  one reason stores written under it are deleted rather than loaded (§8.1).
-- **The improvement test encodes the same convention.** `is_improved_final` compares
-  `proposed_final_height`, the anchor plus one, against the stored marker, so every new PoW
-  block is proposable at once. That `+ 1` is the `headers[0]` convention and changes with it.
-  The test runs before the `+40` clamp. The clamp can only lower the anchor to `marker + 40`,
-  so it never turns an admitted proposal into a non-improving one.
+- **The improvement test runs before the clamp.** `is_improved_final` compares the proposal's
+  snapshot height, `tip − σ`, against the stored marker, so every new PoW block is proposable
+  at once. The clamp can only lower the snapshot to `marker + 40`, so it never turns an
+  admitted proposal into a non-improving one.
 - **Missing monotonicity and hazard record.** All marker writes are unconditional. There is no
   `fin ⪯ candidate` guard and no distinction between a benign candidate regression and a
   conflicting-candidate safety incident.
@@ -1038,28 +1023,28 @@ implement. In Zebra Crosslink its readers take the persisted `fin`.
 These are current-tree facts, and they hold for any change to how the marker is derived,
 stored, or consumed.
 
-- **The derivation is duplicated.** `hash(headers[0])` is computed independently in
-  `handle_new_decided_bft_block`, the BFT validation path, the PoS-store restore path, the
-  restore replay watermark `prev_finalized_bc_height`, `BftBlock::finalization_candidate()`,
-  `test_format.rs`, and `viz2.rs` (both the live viz response and `VizScene`). The
-  finality-diagram tests in `zebrad/tests/crosslink.rs` and `viz2::scene_tests` assert
-  marker positions derived the same way. A change to one site without the others makes the
-  node, the GUI, and the tests disagree about which block is final.
+- **The derivation has one accessor.** `BftBlock::snapshot_hash` is the only place
+  `parent(headers[0])` is computed. `handle_new_decided_bft_block`, the BFT validation path,
+  the PoS-store restore path and its replay watermark `prev_finalized_bc_height`,
+  `test_format.rs`, and `viz2.rs` (both the live viz response and `VizScene`) read it, and the
+  finality-diagram tests in `zebrad/tests/crosslink.rs` and `viz2::scene_tests` assert marker
+  positions derived from it. A second derivation makes the node, the GUI, and the tests
+  disagree about which block is final.
 - **The roster is consensus data reached through the marker.** `finalizers_at_current_height`
   is the aggregated stake set that `CrosslinkFinalizeBlock` returns for the marker hash, and
   `terminated_finalizers_at` takes the marker height. That is objective today only because
   `Π_bft` agreement fixes the hash. Once the commit target is `candidate(bc_best)`, the stakes
   that call returns are node-local, so the validator set reads the bonds at
   `snapshot(B_{H−1})` through its own lookup, which also covers non-finalized chains (§7).
-- **The BFT genesis snapshot moves.** Bootstrap genesis carries headers starting at the
-  activation height, so under `parent(headers_bc[0])` its snapshot, and the roster for BFT
-  height 1, is one block below that height.
+- **The BFT genesis snapshot is below the bootstrap roster height.** Bootstrap genesis
+  carries headers starting at `BOOTSTRAP_ROSTER_HEIGHT`, so its snapshot, and the roster for
+  BFT height 1, is the block below that height.
 - **A derivation change is a network-wide consensus change.** Nodes running two derivations
   disagree on the finalized block and on the roster. PoS stores and databases written under
   the old derivation are deleted, not migrated. A PoS-store record
   holds the `BftBlock`, the fat pointer, `finalizers_at_current_height`, and the proposal
   signatures; restore reads the roster bytes back verbatim and recomputes the replay watermark
-  `prev_finalized_bc_height` from `headers.first()`, so an old store loaded by new code yields
+  `prev_finalized_bc_height` from each stored block's snapshot, so an old store loaded by new code yields
   rosters that disagree with the stored votes, which travel by roster index.
 - **`fin` moves only forward.** `candidate(bc_best)` falls below `fin` after a benign reorg
   (§3.2), and `WriteBlockWorkerTask::handle_crosslink_finalize` returns success for a hash the
