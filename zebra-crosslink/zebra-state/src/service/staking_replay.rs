@@ -28,7 +28,7 @@ use crate::{
         burn_delegation_bonds,
         finalized_state::{
             disk_format::{BondKey, DelegationBond, TransactionLocation},
-            slashing::{apply_staking_action_to_open_runs, OpenSlashRuns, SlashRunChange, SLASH_ANALYSIS_WINDOW},
+            slashing::{OpenSlashRuns, SlashRunTracker},
         },
         non_finalized_state::BondStatusInChain,
         update_bonds_with_pos_issuance, update_chain_tip_with_delegation_bond,
@@ -36,25 +36,15 @@ use crate::{
     ValidateContextError,
 };
 
-/// One hardfork slash rule, with the delegation runs onto its terminated finalizers
-/// tracked from genesis.
-#[derive(Clone, Debug)]
-struct SlashRule {
-    activation: u32,
-    window_start: u32,
-    finalizers: BTreeSet<[u8; 32]>,
-    open_runs: OpenSlashRuns,
-    burned: BTreeSet<BondKey>,
-}
-
 /// Bonds advanced one block at a time from genesis, with the hardfork slash rules they
-/// are subject to. Replays must start at genesis: the slash rules track delegation runs
-/// from there.
+/// are subject to. Replays must start at genesis: the slash trackers follow delegation
+/// runs from there, with no slash index to resume from.
 #[derive(Clone, Debug, Default)]
 pub struct StakingReplay {
     /// Every bond ever created, with its current amount and status.
     pub delegation_bonds: HashMap<BondKey, (DelegationBond, BondStatusInChain)>,
-    slash_rules: Vec<SlashRule>,
+    /// One tracker per hardfork rule whose activation the replay has not reached yet.
+    slash_trackers: Vec<SlashRunTracker>,
 }
 
 /// A hardfork slash applied by the replay.
@@ -70,22 +60,17 @@ impl StakingReplay {
     /// An empty replay subject to the slash rules of `hardfork_schedule`, which must be the
     /// node's canonical schedule.
     pub fn new(hardfork_schedule: &HardForkSchedule) -> Self {
-        let slash_rules = hardfork_schedule
+        let slash_trackers = hardfork_schedule
             .rules()
             .iter()
             .filter(|rule| !rule.terminated_finalizers.is_empty())
             .map(|rule| {
                 let activation = u32::try_from(rule.pow_activation_height).expect("activation heights fit a block height");
-                SlashRule {
-                    activation,
-                    window_start: activation.saturating_sub(SLASH_ANALYSIS_WINDOW),
-                    finalizers: rule.terminated_finalizers.iter().map(|finalizer| finalizer.0).collect(),
-                    open_runs: OpenSlashRuns::new(),
-                    burned: BTreeSet::new(),
-                }
+                let finalizers = rule.terminated_finalizers.iter().map(|finalizer| finalizer.0).collect();
+                SlashRunTracker::new(finalizers, Height(activation), OpenSlashRuns::new())
             })
             .collect();
-        Self { delegation_bonds: HashMap::new(), slash_rules }
+        Self { delegation_bonds: HashMap::new(), slash_trackers }
     }
 
     /// Applies one block: its staking actions in transaction order, then the block reward,
@@ -135,24 +120,8 @@ impl StakingReplay {
             location,
         )?;
 
-        // A rule's burn set is computed from the blocks strictly below its activation, so
-        // this action feeds only the rules still ahead of it.
-        let height = location.height;
-        for rule in self.slash_rules.iter_mut().filter(|rule| rule.activation > height.0) {
-            for change in apply_staking_action_to_open_runs(
-                &mut rule.open_runs,
-                &rule.finalizers,
-                height,
-                staking_action.kind,
-                staking_action.arg32_0,
-                staking_action.arg32_2,
-            ) {
-                if let SlashRunChange::Close(key, end) = change {
-                    if end.0 > rule.window_start {
-                        rule.burned.insert(key.bond);
-                    }
-                }
-            }
+        for tracker in &mut self.slash_trackers {
+            tracker.apply_staking_action(location.height, staking_action.kind, staking_action.arg32_0, staking_action.arg32_2);
         }
         Ok(())
     }
@@ -166,17 +135,12 @@ impl StakingReplay {
         }
     }
 
-    /// Burns the bonds of a hardfork activating exactly at `height`: runs closed inside its
-    /// window and runs still open at activation. Call after the block's reward.
+    /// Burns the bonds of a hardfork activating exactly at `height`. Call after the block's reward.
     pub fn apply_slash_burns(&mut self, height: Height) -> Option<SlashBurns> {
-        let rule = self.slash_rules.iter_mut().find(|rule| rule.activation == height.0)?;
-        let mut burned = std::mem::take(&mut rule.burned);
-        for (bond, (_, start)) in rule.open_runs.iter() {
-            if start.0 < height.0 {
-                burned.insert(*bond);
-            }
-        }
-        let finalizers = rule.finalizers.clone();
+        let index = self.slash_trackers.iter().position(|tracker| tracker.activation() == height)?;
+        let tracker = self.slash_trackers.swap_remove(index);
+        let finalizers = tracker.slashed().clone();
+        let burned = tracker.burn_set();
         burn_delegation_bonds(&mut self.delegation_bonds, &burned);
         Some(SlashBurns { finalizers, burned })
     }

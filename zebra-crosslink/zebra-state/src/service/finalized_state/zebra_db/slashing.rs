@@ -23,8 +23,9 @@
 // [`ZebraDb::bonds_burned_by`] for any window at or below the watermark.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
-use zebra_chain::block::Height;
+use zebra_chain::block::{Block, Height};
 
 pub use zcash_primitives::transaction::SLASH_ANALYSIS_WINDOW;
 pub use zcash_primitives::transaction::StakingActionKind;
@@ -125,6 +126,71 @@ pub fn apply_staking_action_to_open_runs(
     out
 }
 
+/// Delegation runs onto one hardfork's terminated finalizers, advanced one staking action at a
+/// time, and the burn set they imply at that hardfork's activation.
+///
+/// This is the database-free half of the burn rule. [`ZebraDb::slash_window_burns`] seeds it with
+/// the slash index's open runs and feeds it only the blocks the index has not reached; a replay
+/// from genesis (`StakingReplay`) seeds it empty and feeds it every staking action.
+#[derive(Clone, Debug)]
+pub struct SlashRunTracker {
+    slashed: BTreeSet<[u8; 32]>,
+    activation: Height,
+    open_runs: OpenSlashRuns,
+    burned: BTreeSet<BondKey>,
+}
+
+impl SlashRunTracker {
+    /// A tracker for a hardfork terminating `slashed` at `activation`, resuming from `open_runs`.
+    ///
+    /// Runs on any other finalizer are dropped. An index covers the union of every rule's
+    /// terminated finalizers, and the sweep in [`SlashRunTracker::burn_set`] consumes open runs
+    /// without checking whose finalizer they point at, so another rule's runs left in would burn
+    /// their bonds at this activation.
+    pub fn new(slashed: BTreeSet<[u8; 32]>, activation: Height, mut open_runs: OpenSlashRuns) -> Self {
+        open_runs.retain(|_, (run_finalizer, _)| slashed.contains(run_finalizer));
+        Self { slashed, activation, open_runs, burned: BTreeSet::new() }
+    }
+
+    /// The finalizers this hardfork terminates.
+    pub fn slashed(&self) -> &BTreeSet<[u8; 32]> {
+        &self.slashed
+    }
+
+    /// The PoW height at which this hardfork burns.
+    pub fn activation(&self) -> Height {
+        self.activation
+    }
+
+    /// Feeds one staking action at `height`. Actions at or above the activation height are
+    /// ignored: the burn set is decided by the blocks strictly below it.
+    pub fn apply_staking_action(&mut self, height: Height, kind: StakingActionKind, bond: BondKey, target: [u8; 32]) {
+        if height.0 >= self.activation.0 {
+            return;
+        }
+        let window_start = self.activation.0.saturating_sub(SLASH_ANALYSIS_WINDOW);
+        for change in apply_staking_action_to_open_runs(&mut self.open_runs, &self.slashed, height, kind, bond, target) {
+            if let SlashRunChange::Close(key, end) = change {
+                if end.0 > window_start {
+                    self.burned.insert(key.bond);
+                }
+            }
+        }
+    }
+
+    /// The bonds to burn: runs that closed inside the window, plus sitting ducks, the runs still
+    /// open at activation.
+    pub fn burn_set(self) -> BTreeSet<BondKey> {
+        let mut burned = self.burned;
+        for (bond, (_, start)) in self.open_runs.iter() {
+            if start.0 < self.activation.0 {
+                burned.insert(*bond);
+            }
+        }
+        burned
+    }
+}
+
 impl ZebraDb {
     pub(crate) fn slashed_bond_intervals_cf(&self) -> SlashedBondIntervalsCf<'_> {
         SlashedBondIntervalsCf::new(&self.db, SLASHED_BOND_INTERVALS)
@@ -176,6 +242,50 @@ impl ZebraDb {
         for finalizer in finalizers {
             burned.extend(self.bonds_burned_by(finalizer, activation));
         }
+        burned
+    }
+
+    /// The bonds a hardfork terminating `finalizers` burns at `activation`: every bond delegated
+    /// to one of them anywhere in `[activation - W, activation)`.
+    ///
+    /// The slash index answers for the heights below its watermark. The blocks from the
+    /// watermark up to `activation` are fed to a [`SlashRunTracker`] seeded with the index's open
+    /// runs. `chain_block` supplies blocks this database doesn't have yet, from the caller's
+    /// non-finalized chain; any height it returns `None` for is read from the database.
+    pub fn slash_window_burns(
+        &self,
+        finalizers: &[[u8; 32]],
+        activation: Height,
+        chain_block: impl Fn(Height) -> Option<Arc<Block>>,
+    ) -> BTreeSet<BondKey> {
+        // The index driver advances concurrently, so the read order below matters.
+        // Watermark first (earliest → widest replay), open runs second, and the
+        // interval query LAST (see the end of this function): a run the driver
+        // closes between these reads is then missing from the open runs and its
+        // close-action replay no-ops, but the closed interval is already on disk
+        // by the time we query it. Both sources feed one set with the same overlap
+        // predicate, so double coverage is harmless; only under-coverage isn't.
+        let starting_from = self.slash_index_next_height().0;
+        let mut tracker = SlashRunTracker::new(finalizers.iter().copied().collect(), activation, self.load_open_slash_runs());
+
+        for h in starting_from..activation.0 {
+            let height = Height(h);
+            // Heights at or below the finalized tip come from the db (the index may
+            // lag finalization); heights above it are in the caller's chain, whose
+            // blocks are contiguous from the finalized tip up past A-1.
+            let block = chain_block(height)
+                .or_else(|| self.block(HashOrHeight::Height(height)))
+                .expect("every height below activation is finalized or in this chain");
+            for tx in block.transactions.iter() {
+                if let Some(action) = tx.staking_action() {
+                    tracker.apply_staking_action(height, action.kind, action.arg32_0, action.arg32_2);
+                }
+            }
+        }
+
+        let mut burned = tracker.burn_set();
+        // Finalized portion, from the index — queried last (see read-order note above).
+        burned.extend(self.bonds_burned_by_any(finalizers, activation));
         burned
     }
 
@@ -563,6 +673,70 @@ mod tests {
             ]
         );
         assert_eq!(open.get(&b), Some(&(u, Height(160))));
+    }
+
+    /// The tracker burns sitting ducks and runs that closed inside the window, and nothing that
+    /// closed at or before the window start, arrived at activation, or pointed elsewhere.
+    #[test]
+    fn tracker_burn_set() {
+        use StakingActionKind::*;
+        let t = [1u8; 32];
+        let other = [2u8; 32];
+        let b = |n: u8| [n; 32];
+        let activation = Height(1000);
+        let window_start = activation.0 - SLASH_ANALYSIS_WINDOW;
+        let mut tracker = SlashRunTracker::new(set(&[t]), activation, OpenSlashRuns::new());
+
+        tracker.apply_staking_action(Height(100), CreateNewDelegationBond, b(1), t); // sitting duck
+        tracker.apply_staking_action(Height(100), CreateNewDelegationBond, b(2), t);
+        tracker.apply_staking_action(Height(window_start + 10), BeginDelegationUnbonding, b(2), [0u8; 32]); // fled inside window
+        tracker.apply_staking_action(Height(100), CreateNewDelegationBond, b(3), t);
+        tracker.apply_staking_action(Height(window_start), RetargetDelegationBond, b(3), other); // left at the window start
+        tracker.apply_staking_action(Height(100), CreateNewDelegationBond, b(4), other); // never on t
+        tracker.apply_staking_action(activation, CreateNewDelegationBond, b(5), t); // arrives at activation
+        tracker.apply_staking_action(Height(window_start + 5), CreateNewDelegationBond, b(6), t); // joined inside window
+
+        assert_eq!(tracker.burn_set(), [b(1), b(2), b(6)].into_iter().collect());
+    }
+
+    /// Seeded runs on finalizers this hardfork does not terminate are dropped, so another rule's
+    /// runs from a shared index never burn at this activation.
+    #[test]
+    fn tracker_drops_other_rules_runs() {
+        let t = [1u8; 32];
+        let u = [3u8; 32];
+        let mut seed = OpenSlashRuns::new();
+        seed.insert([8u8; 32], (t, Height(10)));
+        seed.insert([9u8; 32], (u, Height(10)));
+
+        let tracker = SlashRunTracker::new(set(&[t]), Height(1000), seed);
+
+        assert_eq!(tracker.burn_set(), [[8u8; 32]].into_iter().collect());
+    }
+
+    /// With the index caught up to activation, the window burns come from the index alone, its
+    /// closed intervals plus its open runs, and no block is read.
+    #[test]
+    fn window_burns_from_caught_up_index() {
+        let db = new_ephemeral_db();
+        let t = [1u8; 32];
+        let other = [2u8; 32];
+        let b = |n: u8| [n; 32];
+        let activation = Height(1000);
+
+        put(&db, t, 500, b(1), MAX_ON_DISK_HEIGHT); // sitting duck
+        put(&db, t, 800, b(2), Height(900)); // joined and fled inside the window
+        put(&db, t, 400, b(3), Height(650)); // fled before the window start
+        put(&db, other, 500, b(4), MAX_ON_DISK_HEIGHT); // another rule's finalizer
+        db.slashed_bond_index_meta_cf()
+            .new_batch_for_writing()
+            .zs_insert(&(), &SlashIndexMeta { next_height: activation, slashed: vec![t, other] })
+            .write_batch()
+            .expect("write should succeed");
+
+        let burned = db.slash_window_burns(&[t], activation, |_| None);
+
+        assert_eq!(burned, [b(1), b(2)].into_iter().collect());
     }
 
     /// unbonding closes an open run
