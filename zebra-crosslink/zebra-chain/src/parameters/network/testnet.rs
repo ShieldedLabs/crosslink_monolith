@@ -412,6 +412,12 @@ impl ConfiguredActivationHeights {
         let canopy = canopy.or(heartwood);
         let nu5 = nu5.or(canopy);
         let nu6 = nu6.or(nu5);
+        // Crosslink regtest activates every upgrade through NU6.3 together, like the Crosslink
+        // testnet: the wallet builds transactions against hardcoded parameters that put NU6.3 at
+        // height 1, and `Transaction::VCrosslink` only exists from NU6.3 onward.
+        let nu6_1 = nu6_1.or(nu6);
+        let nu6_2 = nu6_2.or(nu6_1);
+        let nu6_3 = nu6_3.or(nu6_2);
 
         Self {
             before_overwinter,
