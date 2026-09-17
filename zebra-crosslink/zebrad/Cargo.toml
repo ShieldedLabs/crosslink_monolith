@@ -266,6 +266,9 @@ console-subscriber = { workspace = true, optional = true }
 
 tempfile = "3.19.1"
 
+# [target.'cfg(not(target_env = "msvc"))'.dependencies]
+# tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"] } # memory profiling
+
 [build-dependencies]
 # test feature lightwalletd-grpc-tests
 tonic-prost-build = { workspace = true, optional = true }
