@@ -1,0 +1,7 @@
+# cargo-fuzz build output and crash/coverage artifacts. The seed corpus under
+# corpus/ IS checked in (see README) so the Linux CI runner has seeds without a
+# separate step; evolved corpus entries added during a campaign are left untracked
+# for whoever runs it to commit deliberately.
+/target
+/artifacts
+/coverage

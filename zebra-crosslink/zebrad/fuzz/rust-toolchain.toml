@@ -1,0 +1,5 @@
+# cargo-fuzz needs nightly (-Z sanitizer coverage). Scoped to this package only; the workspace
+# stays on stable. Pin a concrete nightly for reproducible instrumentation across machines.
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]

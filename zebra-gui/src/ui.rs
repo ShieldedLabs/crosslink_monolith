@@ -2973,6 +2973,10 @@ pub fn ui_left_pane(ui: &mut Context,
 
                         let tx_h           = tx.reported_height();
                         let tx_is_in_block = tx_h.is_in_block();
+                        // reported_height() is the stage a failed tx fell from (drives the
+                        // tooltips below); for a chain position use the block it fell from if
+                        // it had one, otherwise where the wallet pinned it (a real height)
+                        let tx_chain_h     = if tx_is_in_block { tx_h } else { tx.h };
 
                         let id = id_index("Transaction", index as u32);
                         let (clicked, hovered) = {
@@ -2987,7 +2991,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         };
 
                         if clicked {
-                            let (cx, cy, ok) = viz.pos_at_height(tx.reported_height());
+                            let (cx, cy, ok) = viz.pos_at_height(tx_chain_h);
                             if ok {
                                 viz.camera_x = cx;
                                 viz.camera_y = cy;
@@ -2997,7 +3001,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         }
 
                         if hovered {
-                            viz.ui_hovered_height = Some(tx.reported_height());
+                            viz.ui_hovered_height = Some(tx_chain_h);
                         }
 
                         if let _ = elem().decl(Decl {

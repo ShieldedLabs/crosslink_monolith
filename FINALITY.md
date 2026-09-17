@@ -62,11 +62,11 @@ bounded-available client view `ba_μ` with its confirmation depth `μ`. This des
 them; §3.3 derives why omitting Stalled Mode removes the other two, and what the remaining
 definitions guarantee.
 
-**Current tree.** The prototype sets `σ = 3` in `librustzcash/zcash_primitives/src/bft.rs`
+**Current tree.** The prototype sets `σ = 4` in `librustzcash/zcash_primitives/src/bft.rs`
 (`PROTOTYPE_PARAMETERS`). The source code explicitly warns that this value has not been
-verified as secure or performant. The same struct also carries `finalization_gap_bound: 7`, the
-Book's `L`. It has no meaning in Zebra Crosslink, which removes it: only test formatting reads
-it, and its doc comment still describes Stalled Mode activation.
+verified as secure or performant. The same struct also carries `finalization_gap_bound: 10`,
+the Book's `L`. It has no meaning in Zebra Crosslink, which removes it: only test formatting
+reads it, and its doc comment still describes Stalled Mode activation.
 
 ### Notation
 
@@ -77,7 +77,8 @@ to `B`; `A` and `B` conflict when neither is an ancestor of the other.
 The two chains have their own parent links. They also contain two cross-chain references:
 
 - each bc-block `H` has `H.context_bft`, which commits to a bft-block; and
-- each non-genesis bft-block has `headers_bc`, exactly `σ` bc-headers in deepest-first order.
+- each non-genesis bft-block has `headers_bc`, exactly `σ` bc-headers in deepest-first order;
+  the block it finalizes is the parent of the first, named by that header's parent hash (§6.1).
 
 ## 2. Terminology and layers
 
@@ -719,8 +720,8 @@ only by `set_final_block`, which also sends the new value on `final_change_tx`. 
 - `tfl_set_finality_by_hash`, through the testing/service setter.
 
 The live path takes `snapshot(new_block) = parent(new_block.headers[0])` from
-`BftBlock::snapshot_hash`, the one accessor through which every reader derives the finalized
-block (§8.1).
+`BftBlock::snapshot_block_hash`, the one accessor through which every reader derives the
+finalized block (§8.1).
 
 When this marker is absent, `tfl_final_block_height_hash` returns `None`. It previously
 substituted a Zebra reorg-depth location derived from the state block locator, so that the API
@@ -809,8 +810,10 @@ succeeds, on PoS-store restore, and through the testing setter.
 At the end of `Chain::push` in
 `zebra-crosslink/zebra-state/src/service/non_finalized_state/chain.rs`:
 
-- if no bond is active, the code pushes an empty `bond_rewards` entry and mints no staking
-  reward; and
+- a block that does not pay (see the payout rule below) pushes empty `bond_rewards` and
+  `finalizer_commissions` entries and mints nothing; the empty entries keep positional reorg
+  reversal aligned;
+- if no bond is active, the same empty entries are pushed and no staking reward is minted; and
 - otherwise it distributes the fixed `POS_BLOCK_REWARD_ZATS` for that PoW block, increases
   `staking_bonded_amount` by the same total, and records the per-bond rewards for exact reorg
   reversal.
@@ -819,10 +822,57 @@ At the end of `Chain::push` in
 total pro rata with integer division, gives the remainder to the largest active bond (then
 smallest key on a tie), and adds rewards to bond principal. Rewards therefore compound.
 
-The same per-block calculation is replayed by `fixup_aggregated_stakes` in
+#### The variable payout rule
+
+Issuance is not paid per PoW block. A block `P` pays exactly when it *advances* finality and
+does so *promptly*:
+
+```text
+payout(P)  iff  cert(P) != cert(parent(P))  and  height(P) - F <= σ + FINALITY_LIVENESS_ALLOWANCE
+```
+
+where `cert(P)` is the BFT block named by `P.context_bft` (compared by BFT block hash, not by
+the whole fat pointer: two honest nodes can carry different signature sets for the same
+decision) and `F` is the height of the PoW block that certificate finalizes — its snapshot.
+`FINALITY_LIVENESS_ALLOWANCE = 3`, in `librustzcash/zcash_primitives/src/bft.rs`.
+
+Both inputs are objective functions of committed chain data, so every node computes the same
+answer for the same block, as §9.2 requires. The fat-pointer check (§6.2) already refuses any
+`P` below `F + σ + 1`, so `height(P) − F` is at least `σ + 1`: with σ = 4 the paying gaps are 5,
+6 and 7, i.e. 4, 5 or 6 blocks strictly between `F` and `P`, and a seventh earns nothing.
+
+The decision is made in `call_from_state_to_crosslink_to_ask_about_fat_pointers`
+(`zebra-crosslink/zebra-crosslink/src/lib.rs`), which is the one place that can resolve both
+facts, and travels with the block as `SemanticallyVerifiedBlock::pos_payout` →
+`ContextuallyVerifiedBlock::pos_payout` → `Chain::push`. Paths that never run that check
+(checkpoint sync, tests, blocks rebuilt from raw bytes) carry `pos_payout: false` and mint
+nothing.
+
+Because the verdict cannot be recovered from the block bytes, it is **persisted in the
+non-finalized state backup** alongside the deferred pool change
+(`zebra-state/src/service/non_finalized_state/backup.rs`), and restored with the block. Without
+that, a node that restarts re-enters its non-finalized blocks through
+`SemanticallyVerifiedBlock::from(Arc<Block>)`, which defaults to `pos_payout: false`: the
+restarted node mints nothing for blocks every other node has already paid. That is not a local
+accounting slip. It changes the bonded stake, the bonded stake is the voting power, and the
+roster derived from it then differs between nodes — which in a two-node roster is enough to
+make both nodes believe they are the proposer, prevote different values forever and stall
+finality permanently. This was observed on a dilated two-node testnet: node two restarted,
+restored 4 backed-up blocks, and came back exactly `4 × POS_BLOCK_REWARD_ZATS` short, after
+which BFT never decided another block.
+
+The same per-block calculation is replayed by the wallet projection path in
+`zebra-crosslink/zebra-crosslink/src/lib.rs`, which recomputes the rule from committed data in
+`block_pays_pos_issuance`, and by `fixup_aggregated_stakes` in
 `zebra-crosslink/zebra-state/src/service/stake_fixup.rs` (reached through the `--fixup-db-stake`
-entry point) and by the wallet projection path in `zebra-crosslink/zebra-crosslink/src/lib.rs`.
-Any future consensus change must keep all three paths identical.
+entry point). Any future consensus change must keep all three paths identical.
+
+The repair tool is the one path that cannot evaluate the rule in full: it has the PoW database
+and nothing else, and `F` lives inside the BFT block. It applies the half it can see — a block
+that does not advance the certificate pays nothing — and assumes an advancing block was
+prompt. That is correct whenever BFT kept up. When it did not, the replay disagrees with the
+rows already stored and its existing cross-check refuses to write anything, so the failure mode
+is a repair that declines, never a repair that corrupts.
 
 ## 6. Current tree: divergences from Zebra Crosslink
 
@@ -845,7 +895,9 @@ it departs from.
   `BftBlock::try_from` checks only the header count and logs that its documented validations
   are unimplemented, and the deserialization path used for network and PoS-store blocks does
   not call `try_from` at all. Deepest-first is a property of the honest producer, not of the
-  type (§3.4, Tail Confirmation).
+  type (§3.4, Tail Confirmation). The snapshot is named by hash only; a consumer that needs
+  its height asks the chain, and the fat-pointer check is handed a height lookup for that
+  purpose (§6.2).
 - **The candidate height is clamped, and the clamp is not `prune_σ`.** The proposal path
   computes `tip − σ` and then takes
   `min(tip − σ, latest_final_block + 40)`. Only when that clamp does not bind is the stored
@@ -867,9 +919,22 @@ it departs from.
 - The Finality Depth rule and Stalled Mode are omitted by design (§3.3).
   `finalization_gap_bound` is read only by test formatting, and the 512-block log threshold is
   diagnostic, not consensus.
-- BFT validation does not implement Linearity or Tail Confirmation. It checks that the first
-  carried header's block is locally present, but does not establish that all `σ` headers form a
-  valid chain with valid PoW.
+- BFT validation does not implement Linearity or Tail Confirmation. It checks that the
+  snapshot (`parent(headers[0])`) is locally present, but does not establish that the `σ`
+  carried headers form a valid chain with valid PoW, nor that they are on the chain of the
+  block that will carry the certificate.
+- **The confirmation depth is enforced on inclusion.** A PoW block at height `P` may carry a
+  fat pointer to a BFT block whose snapshot is at height `F` only when `P ≥ F + σ + 1`: the
+  `σ` carried headers `F+1 ..= F+σ`, then the carrier. Admitting a PoW block therefore
+  requires a PoW → PoS → PoW lookup: resolve the pointer to its BFT block, take that block's
+  snapshot hash, and ask the state for its height.
+  `call_from_state_to_crosslink_to_ask_about_fat_pointers` is given a
+  `CrosslinkBlockHeightLookup` to do it, searching every chain the state holds, and defers
+  rather than rejects while the snapshot is unknown here. The block-template path applies the
+  same test, so a miner is never handed a certificate that could not be committed. The
+  inequality bounds depth only. Whether `F` is an ancestor of `P` is the Last Final Snapshot
+  rule, which is not implemented, so a block at `F + σ + 1` can still carry a certificate
+  whose headers lie on another branch.
 - The proposal path departs from honest proposal (§3.4) in two ways. When the `+40` candidate
   clamp in §6.1 binds, `headers_bc` is a window ending at `marker + 40 + σ`, not the tail of the
   proposer's `bc_best`; the window still satisfies Tail Confirmation. The clamp is a Zebra
@@ -1023,7 +1088,7 @@ implement. In Zebra Crosslink its readers take the persisted `fin`.
 These are current-tree facts, and they hold for any change to how the marker is derived,
 stored, or consumed.
 
-- **The derivation has one accessor.** `BftBlock::snapshot_hash` is the only place
+- **The derivation has one accessor.** `BftBlock::snapshot_block_hash` is the only place
   `parent(headers[0])` is computed. `handle_new_decided_bft_block`, the BFT validation path,
   the PoS-store restore path and its replay watermark `prev_finalized_bc_height`,
   `test_format.rs`, and `viz2.rs` (both the live viz response and `VizScene`) read it, and the
@@ -1120,6 +1185,13 @@ An objective per-block event can instead be derived from block data, for example
 ```text
 payout boundary at H  iff  candidate(H) != candidate(parent(H))
 ```
+
+**Implemented.** The prototype now takes this trigger, with a liveness bound added to it:
+a block pays iff its certificate differs from its parent's *and* the certificate is at most
+`σ + FINALITY_LIVENESS_ALLOWANCE` blocks behind it. §5.4 states the rule and where each path
+evaluates it. The consequences listed below under "payout amount" are the ones this choice
+accepts: a flat reward per advance, so a BFT stall lowers issuance for as long as it lasts and
+never pays the missed blocks back.
 
 This is not literally the event "local `fin` advanced." It is a block-local event that would
 permit `fin` to advance if `H` were observed as best and its candidate were ahead of that

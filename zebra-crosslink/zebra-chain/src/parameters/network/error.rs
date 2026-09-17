@@ -88,4 +88,8 @@ pub enum ParametersBuilderError {
     )]
     #[non_exhaustive]
     InsufficientCheckpointCoverage,
+
+    #[error("the Crosslink bootstrap activation height must exceed the roster height by more than the reorg limit")]
+    #[non_exhaustive]
+    InvalidCrosslinkBootstrap,
 }

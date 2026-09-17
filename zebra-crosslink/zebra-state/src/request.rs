@@ -269,6 +269,15 @@ pub struct SemanticallyVerifiedBlock {
     /// A precomputed list of the hashes of the transactions in this block,
     /// in the same order as `block.transactions`.
     pub transaction_hashes: Arc<[transaction::Hash]>,
+
+    /// Whether this block pays PoS issuance, as decided by the crosslink fat-pointer gate.
+    ///
+    /// See [`CrosslinkVerdict::Accept`](crate::CrosslinkVerdict): true exactly when the block
+    /// advances the certificate and that certificate is fresh enough. The gate is the only place
+    /// that can resolve both facts, so the answer rides along with the block instead of being
+    /// recomputed here. Blocks built by paths that never run the gate (tests, checkpoint sync)
+    /// default to `false` and mint nothing.
+    pub pos_payout: bool,
 }
 
 /// A block ready to be committed directly to the finalized state with
@@ -329,6 +338,9 @@ pub struct ContextuallyVerifiedBlock {
 
     /// The sum of the chain value pool changes of all transactions in this block.
     pub(crate) chain_value_pool_change: ValueBalance<NegativeAllowed>,
+
+    /// Whether this block pays PoS issuance; see [`SemanticallyVerifiedBlock::pos_payout`].
+    pub(crate) pos_payout: bool,
 }
 
 /// Wraps note commitment trees and the history tree together.
@@ -550,6 +562,7 @@ impl ContextuallyVerifiedBlock {
             height,
             new_outputs,
             transaction_hashes,
+            pos_payout,
         } = semantically_verified;
 
         // This is redundant for the non-finalized state,
@@ -569,6 +582,7 @@ impl ContextuallyVerifiedBlock {
                 &utxos_from_ordered_utxos(spent_outputs),
                 deferred_pool_balance_change,
             )?,
+            pos_payout,
         })
     }
 }
@@ -604,6 +618,8 @@ impl SemanticallyVerifiedBlock {
             height,
             new_outputs,
             transaction_hashes,
+            // Not gated: built from raw bytes, so it mints nothing. See `pos_payout`.
+            pos_payout: false,
         }
     }
 }
@@ -629,6 +645,9 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
             height,
             new_outputs,
             transaction_hashes,
+            // Not gated: a block synthesized from raw bytes has no crosslink verdict, so it
+            // mints nothing. The live ingest path sets this from the gate; see `pos_payout`.
+            pos_payout: false,
         }
     }
 }
@@ -641,6 +660,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
             height: valid.height,
             new_outputs: valid.new_outputs,
             transaction_hashes: valid.transaction_hashes,
+            pos_payout: valid.pos_payout,
         }
     }
 }
@@ -653,6 +673,8 @@ impl From<FinalizedBlock> for SemanticallyVerifiedBlock {
             height: finalized.height,
             new_outputs: finalized.new_outputs,
             transaction_hashes: finalized.transaction_hashes,
+            // Rewards were already applied while this block was in the non-finalized chain.
+            pos_payout: false,
         }
     }
 }

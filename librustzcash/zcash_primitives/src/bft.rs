@@ -118,7 +118,7 @@ impl HardForkConfig {
 ///
 /// A [BftBlock] may be constructed from a node's local view in order to create a new BFT proposal, or they may be constructed from unknown sources across a network protocol.
 ///
-/// To construct a [BftBlock] for a new BFT proposal, build a [Vec] of exactly [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma) consecutive [BcBlockHeader] values in ascending height order, so that element zero is the deepest, then pass this to [BftBlock::try_from]. The specification requires these to be the tail of a bc-valid chain. The Zebra prototype does not always satisfy that: it clamps how far the finalization candidate may advance in a single step, and under that clamp it carries a mid-chain window instead of a tail.
+/// To construct a [BftBlock] for a new BFT proposal, build a [Vec] of exactly `bc_confirmation_depth_sigma` consecutive [BcBlockHeader] values in ascending height order, so that element zero is the deepest, then pass this to [BftBlock::try_from]. The carried headers are the σ confirmations above the block being finalized (the `snapshot`): the snapshot is element zero's parent and is not carried, it is named by that parent hash. The specification requires these to be the tail of a bc-valid chain. The Zebra prototype does not always satisfy that: it clamps how far the snapshot may advance in a single step, and under that clamp it carries a mid-chain window instead of a tail.
 ///
 /// To construct from an untrusted source, call the same [BftBlock::try_from].
 ///
@@ -126,7 +126,7 @@ impl HardForkConfig {
 ///
 /// The [BftBlock::try_from] method is the only way to construct [BftBlock] values and performs the following validation internally:
 ///
-/// 1. The number of headers matches the expected protocol confirmation depth, [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma).
+/// 1. The number of headers matches the expected protocol confirmation depth, `bc_confirmation_depth_sigma`; see [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma).
 /// 2. The [version](BcBlockHeader::version) field is a known expected value.
 /// 3. The headers are in the correct order given the [previous_block_hash](BcBlockHeader::previous_block_hash) fields.
 /// 4. The PoW solutions validate.
@@ -176,6 +176,10 @@ pub struct BftBlock {
     /// Hash of the previous BFT Block.
     pub previous_block_fat_ptr: FatPointerToBftBlock,
     /// The PoW Headers
+    ///
+    /// Exactly σ headers, deepest first: the confirmations built on top of the snapshot
+    /// (see [snapshot_block_hash](BftBlock::snapshot_block_hash)). The snapshot is not among
+    /// them; it is `headers[0]`'s parent, named by hash.
     // @Zooko: PoPoW?
     pub headers: Vec<BcBlockHeader>,
     /// The user-led hardfork rules activated by this block, in canonical schedule
@@ -299,15 +303,16 @@ impl BftBlock {
     }
 
 
-    /// `snapshot(B)`: the bc-block this bft-block finalizes, which is the parent of the
-    /// deepest carried header (FINALITY.md §3.1). Every reader of the finalized block derives
-    /// it here, so the node, the GUI, and the tests agree on it.
+    /// The `snapshot`: the PoW block this BFT block finalizes.
     ///
-    /// `None` when the block carries no headers, as the placeholder entries used during
-    /// out-of-order BFT ingest do. The specification's `snapshot(B) = O_bc` for an empty
-    /// `headers_bc` is left to the caller, which knows the bc genesis hash.
-    pub fn snapshot_hash(&self) -> Option<crate::block::BlockHash> {
-        self.headers.first().map(|header| header.prev_block)
+    /// The carried headers are the σ confirmations built on top of the snapshot, deepest
+    /// first, so the snapshot is `headers[0]`'s parent, as the specification defines it. Only
+    /// the hash is carried: a consumer that needs the height asks the chain.
+    ///
+    /// Panics if the block carries no headers, which the placeholder entries used during
+    /// out-of-order BFT ingest do.
+    pub fn snapshot_block_hash(&self) -> crate::block::BlockHash {
+        self.headers.first().expect("Vec should never be empty").prev_block
     }
 
     /// Attempt to construct a [BftBlock] from headers while performing immediate validations; see [BftBlock] type docs
@@ -366,7 +371,7 @@ pub enum InvalidBftBlock {
     //     "invalid confirmation depth: Crosslink requires {expected} while {actual} were present"
     // )]
     IncorrectConfirmationDepth {
-        /// The expected number of headers, as per [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma)
+        /// The expected number of headers, `bc_confirmation_depth_sigma`; see [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma)
         expected: u64,
         /// The number of headers present
         actual: u64,
@@ -383,43 +388,66 @@ impl std::fmt::Display for InvalidBftBlock {
 }
 impl std::error::Error for InvalidBftBlock {}
 
-/// Crosslink bootstrap heights.
+/// How BFT comes into existence on a network.
 ///
-/// BFT does not run from genesis. Three PoW heights define how it comes up, so that no node needs
-/// an operator-supplied starting roster:
+/// On a real network BFT does not run from genesis. Three PoW heights define how it comes up, so
+/// that no node needs an operator-supplied starting roster:
 ///
 /// - `h0`: staking actions become legal. In this prototype that is genesis (the new transaction
-///   format is on from the start), so there is no constant for it.
-/// - `h1` [`BOOTSTRAP_ROSTER_HEIGHT`]: the deepest header the BFT genesis block carries. Its
-///   snapshot is the block below, `h1 - 1`, whose aggregated stakes become the roster that
-///   votes at BFT height 1. `h1` is chosen halfway between the first and second staking day,
-///   i.e. after the first staking window has closed, so every bond from day one counts.
-/// - `h2` [`BOOTSTRAP_ACTIVATION_HEIGHT`]: when a node accepts any PoW block at this height it
-///   walks back that chain to `h1`, builds the genesis block from the headers there, finalizes
-///   `h1 - 1`, and starts BFT with its roster.
+///   format is on from the start), so it is not a parameter.
+/// - `h1` (`roster_height`): the block whose aggregated stakes become the roster that votes on BFT
+///   height 0.
+/// - `h2` (`activation_height`): when a node accepts any PoW block at this height it walks back
+///   that chain to its `h1` ancestor, finalizes it, and starts BFT with `h1`'s roster.
 ///
 /// Every PoW block at or below `h2` must carry a nil fat pointer; only blocks above `h2` may point
-/// at a BFT block. `h2 - h1` exceeds the reorg limit, so by the time any `h2` block is accepted the
-/// `h1` ancestor and its parent are the same on every chain and their stakes are already in the
-/// finalized state.
-pub const BOOTSTRAP_ROSTER_HEIGHT: u32 = crate::transaction::STAKING_PERIOD / 2;
-/// See [`BOOTSTRAP_ROSTER_HEIGHT`].
-pub const BOOTSTRAP_ACTIVATION_HEIGHT: u32 = BOOTSTRAP_ROSTER_HEIGHT + 200;
-const _: () = assert!(
-    BOOTSTRAP_ACTIVATION_HEIGHT - BOOTSTRAP_ROSTER_HEIGHT > zcash_protocol::consensus::MAX_BLOCK_REORG_HEIGHT,
-    "the bootstrap roster block must be below the reorg limit when any activation-height block is accepted"
-);
+/// at a BFT block. `h2 - h1` must exceed the reorg limit, so by the time any `h2` block is accepted
+/// the `h1` ancestor is the same on every chain and its stakes are already in the finalized state;
+/// [`ZcashCrosslinkParameters::bootstrap_is_valid`] checks this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BftBootstrap {
+    /// BFT is created from the chain, as described above.
+    FromChain {
+        /// `h1`
+        roster_height: u32,
+        /// `h2`
+        activation_height: u32,
+    },
+    /// BFT blocks are supplied from outside from genesis, so there is no bootstrap and a fat
+    /// pointer is legal at any height. Only the test-format harness does this.
+    Supplied,
+}
+
+impl BftBootstrap {
+    /// `h1`, or `None` when BFT is supplied rather than bootstrapped.
+    pub const fn roster_height(&self) -> Option<u32> {
+        match *self {
+            BftBootstrap::FromChain { roster_height, .. } => Some(roster_height),
+            BftBootstrap::Supplied => None,
+        }
+    }
+
+    /// `h2`, or `None` when BFT is supplied rather than bootstrapped.
+    pub const fn activation_height(&self) -> Option<u32> {
+        match *self {
+            BftBootstrap::FromChain { activation_height, .. } => Some(activation_height),
+            BftBootstrap::Supplied => None,
+        }
+    }
+}
 
 /// Zcash Crosslink protocol parameters
 ///
-/// This is provided as a trait so that downstream users can define or plug in their own alternative parameters.
+/// These are consensus parameters: every node on a network must agree on them, so they belong to
+/// the network's definition rather than to any one node's configuration.
 ///
 /// Ref: [Zcash Trailing Finality Layer §3.3.3 Parameters](https://electric-coin-company.github.io/tfl-book/design/crosslink/construction.html#parameters)
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZcashCrosslinkParameters {
     /// The best-chain confirmation depth, `σ`
     ///
-    /// At least this many PoW blocks must be atop the PoW block used to obtain a finalized view.
+    /// A certificate finalizing PoW height `F` carries the `σ` headers `F+1 ..= F+σ` and is
+    /// proposed once the tip reaches `F+σ`. A PoW block carries it at `F+σ+1` or above.
     pub bc_confirmation_depth_sigma: u64,
 
     /// The depth of unfinalized PoW blocks past which "Stalled Mode" activates, `L`
@@ -428,15 +456,65 @@ pub struct ZcashCrosslinkParameters {
     ///
     /// > In practice, L should be at least 2σ.
     pub finalization_gap_bound: u64,
+
+    /// How BFT comes into existence on this network.
+    pub bootstrap: BftBootstrap,
+}
+
+impl ZcashCrosslinkParameters {
+    /// Whether a chain-built bootstrap puts `h1` beyond reorg reach before any `h2` block can be
+    /// accepted. Always true for [`BftBootstrap::Supplied`].
+    pub const fn bootstrap_is_valid(&self) -> bool {
+        match self.bootstrap {
+            BftBootstrap::FromChain { roster_height, activation_height } => {
+                activation_height > roster_height
+                    && activation_height - roster_height
+                        > zcash_protocol::consensus::MAX_BLOCK_REORG_HEIGHT
+            }
+            BftBootstrap::Supplied => true,
+        }
+    }
 }
 
 /// Crosslink parameters chosed for prototyping / testing
 ///
+/// `h1` is halfway between the first and second staking day, i.e. after the first staking window
+/// has closed, so every bond from day one counts.
+///
 /// <div class="warning">No verification has been done on the security or performance of these parameters.</div>
 pub const PROTOTYPE_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParameters {
-    bc_confirmation_depth_sigma: 3,
-    finalization_gap_bound: 7,
+    bc_confirmation_depth_sigma: 4,
+    // The specification asks for L >= 2 sigma; keep it there as sigma moves.
+    finalization_gap_bound: 10,
+    bootstrap: BftBootstrap::FromChain {
+        roster_height: crate::transaction::STAKING_PERIOD / 2,
+        activation_height: crate::transaction::STAKING_PERIOD / 2 + 200,
+    },
 };
+const _: () = assert!(
+    PROTOTYPE_PARAMETERS.bootstrap_is_valid(),
+    "the bootstrap roster block must be below the reorg limit when any activation-height block is accepted"
+);
+
+/// How far finality may lag behind the chain and still earn PoS issuance, measured in PoW
+/// blocks beyond the tightest possible gap.
+///
+/// PoS issuance is not paid per block. It is paid by a PoW block `P` that both *advances* the
+/// certificate (its `context_bft` names a different BFT block than its parent's does) and does
+/// so *promptly*: with `F` the height of the PoW block that certificate finalizes,
+///
+/// ```text
+/// payout(P)  iff  cert(P) != cert(parent(P))  and  height(P) - F <= σ + FINALITY_LIVENESS_ALLOWANCE
+/// ```
+///
+/// The fat-pointer check already refuses any `P` below `F + σ + 1`, so `height(P) - F` is at
+/// least `σ + 1`: the σ carried headers plus the carrier itself. This allowance is the slack
+/// above that floor: at `3`, the gaps `σ + 1`, `σ + 2` and `σ + 3` pay, and a certificate
+/// carried any later than that does not.
+///
+/// So issuance tracks finality liveness: a stalled or lagging BFT layer mints nothing, and
+/// minting resumes only once certificates are both fresh and arriving.
+pub const FINALITY_LIVENESS_ALLOWANCE: u64 = 3;
 
 /// A BLAKE3 hash.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Copy, Hash, Serialize, Deserialize)]

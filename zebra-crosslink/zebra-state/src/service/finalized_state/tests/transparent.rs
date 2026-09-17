@@ -128,6 +128,7 @@ fn intra_block_self_spend_chain_in_finalized_state() {
         height,
         new_outputs,
         transaction_hashes,
+        pos_payout: false,
     };
     let finalized = FinalizedBlock::from_checkpoint_verified(
         CheckpointVerifiedBlock(semantically_verified),

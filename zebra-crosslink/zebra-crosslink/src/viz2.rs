@@ -213,24 +213,26 @@ impl VizScene {
         let best_chain = ancestry(best_tip);
 
         // The finalized marker this node would publish for these blocks: the newest BFT
-        // block's snapshot, which is `latest_final_block`'s own derivation. The point is to
-        // show what this tree does: the marker comes straight from the decided block, with
-        // no `candidate` computation and no LF lag (FINALITY.md 6.1).
+        // block's `snapshot`, i.e. the parent of its `headers[0]`. That is
+        // `latest_final_block`'s own derivation, so the viz shows what this tree does.
         let bft_tip_block = bft.iter().max_by_key(|b| b.height);
         let finalized_hash = bft_tip_block
-            .and_then(|b| b.snapshot_hash())
-            .map(|h| Hash32::from_bytes(h.0));
+            .filter(|b| !b.headers.is_empty())
+            .map(|b| Hash32::from_bytes(b.snapshot_block_hash().0));
         let finalized_chain = ancestry(finalized_hash);
         let bc_finalized_tip_height = finalized_hash
             .and_then(|h| height_of.get(&h).copied())
             .unwrap_or(0);
 
-        // Which BFT block names each PoW block as its snapshot; the newest wins, matching
-        // the live path.
+        // Which BFT block names each PoW block as its finalization candidate; the newest
+        // wins, matching the live path.
         let mut pointed_at_by: HashMap<Hash32, u64> = HashMap::new();
         for b in &bft {
-            if let Some(snapshot) = b.snapshot_hash() {
-                pointed_at_by.insert(Hash32::from_bytes(snapshot.0), b.height as u64);
+            if let Some(hdr) = b.headers.first() {
+                pointed_at_by.insert(
+                    Hash32::from_bytes(BlockHash::from_header_data(hdr).0),
+                    b.height as u64,
+                );
             }
         }
 
@@ -273,19 +275,20 @@ impl VizScene {
         let mut bft_blocks: Vec<zebra_gui::BftBlock> = Vec::new();
         let mut bft_by_hash: HashMap<Hash32, wallet::bft::BftBlock> = HashMap::new();
         for b in &bft {
-            let Some(snapshot) = b.snapshot_hash() else {
+            if b.headers.is_empty() {
                 continue;
-            };
-            let snapshot_hash = Hash32::from_bytes(snapshot.0);
+            }
+            let candidate_hash = Hash32::from_bytes(b.snapshot_block_hash().0);
             let this_hash = Hash32::from_bytes(b.blake3_hash().0);
             bft_by_hash.insert(this_hash, b.clone());
             bft_blocks.push(zebra_gui::BftBlock {
                 this_hash,
                 parent_hash: Hash32::from_bytes(b.previous_block_hash().0),
                 this_height: b.height as u64,
-                points_at_bc_block: snapshot_hash,
-                points_at_bc_height: height_of.get(&snapshot_hash).copied().unwrap_or(0),
-                // Every carried header: the snapshot is below them all.
+                points_at_bc_block: candidate_hash,
+                points_at_bc_height: height_of.get(&candidate_hash).copied().unwrap_or(0),
+                // Every carried header is a confirmation now: the snapshot is the parent of
+                // headers[0] and is not itself carried, so none of them is skipped.
                 proving_blocks: b
                     .headers
                     .iter()
@@ -355,29 +358,29 @@ impl VizScene {
 /// Bridge between tokio & viz code
 pub async fn service_viz_requests(
     tfl_handle: crate::TFLServiceHandle,
-    params: &'static crate::ZcashCrosslinkParameters,
+    params: crate::ZcashCrosslinkParameters,
 ) {
     let call = tfl_handle.clone().call;
 
     let mut bc_ack_height: u64 = 0;
     let mut skipped_windows_n: u64 = 0;
     let mut instr_strings: Vec<String> = Vec::new();
-    // Snapshot info per BFT block, checked exactly once per block:
-    // bft_snapshot_hashes[i] caches the snapshot hash of bft_blocks[i] for all
+    // Finalization-candidate info per BFT block, checked exactly once per block:
+    // bft_candidate_hashes[i] caches the candidate hash of bft_blocks[i] for all
     // i < bft_checked_n. The fully-checked range only advances past real blocks;
     // an empty-headers placeholder block (see handle_new_decided_bft_block) stalls
     // it until filled in, which is safe because only placeholders are ever
-    // overwritten. Snapshot heights resolve from the state into
-    // bft_snapshot_heights; hashes whose lookup failed (snapshot not yet synced)
+    // overwritten. Candidate heights resolve from the state into
+    // bft_candidate_heights; hashes whose lookup failed (candidate not yet synced)
     // wait in bft_unresolved_heights and retry a few per cycle.
     let mut bft_checked_n: usize = 0;
-    let mut bft_snapshot_hashes: Vec<Hash32> = Vec::new();
-    // Inverse of bft_snapshot_hashes: snapshot PoW hash -> the BFT height pointing
-    // at it (latest wins when several share a snapshot). Served on each PoW block as
+    let mut bft_candidate_hashes: Vec<Hash32> = Vec::new();
+    // Inverse of bft_candidate_hashes: candidate PoW hash -> the BFT height pointing
+    // at it (latest wins when several share a candidate). Served on each PoW block as
     // pointed_at_by_bft_height, so the GUI can tell that a block it already holds
     // should have a BFT block beside it, and fetch eras its page response missed.
     let mut bft_pointing_heights: std::collections::HashMap<Hash32, u64> = std::collections::HashMap::new();
-    let mut bft_snapshot_heights: std::collections::HashMap<Hash32, u64> = std::collections::HashMap::new();
+    let mut bft_candidate_heights: std::collections::HashMap<Hash32, u64> = std::collections::HashMap::new();
     let mut bft_unresolved_heights: std::collections::HashSet<Hash32> = std::collections::HashSet::new();
     let mut bft_resolved_at_tip: u64 = u64::MAX; // PoW tip at the last resolution round
     // While set, the picture comes from a .zeccltf file and the node is not consulted.
@@ -478,7 +481,7 @@ pub async fn service_viz_requests(
             };
 
             // Keep the window covering the whole non-finalized span [finalized tip..tip]:
-            // sidechain forks root above the finalized tip and BFT snapshots
+            // sidechain forks root above the finalized tip and BFT finalization candidates
             // lag the PoW tip, so anchoring both on screen needs these best-chain blocks
             // resent every cycle. Never cut that span out of the window, even when finality lags
             // the PoW tip by more than a page (that lag is exactly what this visualizer
@@ -527,8 +530,8 @@ pub async fn service_viz_requests(
                 .map(|sb| (Hash32::from_bytes(sb.this_hash.0), Hash32::from_bytes(sb.parent_hash.0), sb.this_height as u64))
                 .collect();
 
-            // Advance the fully-checked range of BFT blocks: each block's snapshot hash
-            // is computed exactly once, then never re-checked. The
+            // Advance the fully-checked range of BFT blocks: each block's finalization-
+            // candidate hash is computed exactly once, then never re-checked. The
             // internal lock is held only for the scan; state lookups await outside it.
             // Steady-state this touches nothing but newly decided blocks.
             {
@@ -539,20 +542,19 @@ pub async fn service_viz_requests(
                     let scan_end = (bft_checked_n + 4096).min(internal.bft_blocks.len());
                     while bft_checked_n < scan_end {
                         let b = &internal.bft_blocks[bft_checked_n];
-                        // placeholder: recheck once filled
-                        let Some(snapshot) = b.snapshot_hash() else { break };
-                        let hash = Hash32::from_bytes(snapshot.0);
-                        bft_snapshot_hashes.push(hash);
+                        if b.headers.is_empty() { break; } // placeholder: recheck once filled
+                        let hash = Hash32::from_bytes(b.snapshot_block_hash().0);
+                        bft_candidate_hashes.push(hash);
                         bft_pointing_heights.insert(hash, bft_checked_n as u64);
-                        if !bft_snapshot_heights.contains_key(&hash) {
+                        if !bft_candidate_heights.contains_key(&hash) {
                             bft_unresolved_heights.insert(hash);
                         }
                         bft_checked_n += 1;
                     }
                 }
-                // retry a bounded batch; the set drains as snapshots sync into the
+                // retry a bounded batch; the set drains as candidates sync into the
                 // state. Only when the chain has grown since the last round: an
-                // unresolved snapshot can only become resolvable when new blocks
+                // unresolved candidate can only become resolvable when new blocks
                 // arrive, so retrying against an unchanged chain is pure cost
                 // (PoW catch-up used to pay hundreds of doomed lookups per cycle).
                 if !bft_unresolved_heights.is_empty() && bc_tip_height != bft_resolved_at_tip {
@@ -562,7 +564,7 @@ pub async fn service_viz_requests(
                         if let Ok(StateResponse::BlockHeader { height, .. }) =
                             (call.state)(StateRequest::BlockHeader(zebra_state::HashOrHeight::Hash(ZebBlockHash(hash.as_bytes()).into()))).await
                         {
-                            bft_snapshot_heights.insert(hash, height.0 as u64);
+                            bft_candidate_heights.insert(hash, height.0 as u64);
                             bft_unresolved_heights.remove(&hash);
                         }
                     }
@@ -570,7 +572,7 @@ pub async fn service_viz_requests(
             }
 
             // Finality-frontier page: when finality lags more than the window's sanity
-            // bound below the tip (BFT catch-up), the snapshot region falls
+            // bound below the tip (BFT catch-up), the finalization-candidate region falls
             // out of the served window and the GUI can only show it as header ghosts and
             // peer claims. Serve one page of real best-chain blocks up from the finalized
             // tip so the region the BFT chain points at stays real; it chases the frontier
@@ -657,7 +659,7 @@ pub async fn service_viz_requests(
                             };
                             let bft_hashes: Vec<_> = bft_blocks.iter().map(|b| b.blake3_hash()).collect();
 
-                            let mut tf = test_format::TF::new(params);
+                            let mut tf = test_format::TF::new(&params);
                             let mut next_bft = 0usize;
                             // Each BFT block goes just before the first PoW block that commits to it,
                             // preserving the chronology a replay needs.
@@ -704,17 +706,18 @@ pub async fn service_viz_requests(
                     }
 
                     // PoS jump: the GUI wants a BFT height whose era may be nowhere near the
-                    // PoW blocks otherwise served. Serve the PoW page around its snapshot; the
-                    // jump extent below then pulls the era's BFT blocks in via this page's fat
-                    // pointers. A snapshot whose height hasn't resolved yet serves nothing and
-                    // the GUI re-asks. Anchored on the tip hash like the pages above.
+                    // PoW blocks otherwise served. Serve the PoW page around its finalization
+                    // candidate; the jump extent below then pulls the era's BFT blocks in via
+                    // this page's fat pointers. A candidate whose height hasn't resolved yet
+                    // serves nothing and the GUI re-asks. Anchored on the tip hash like the
+                    // pages above.
                     let mut pos_jump_blocks: Vec<(ZebBlockHeight, ZebBlockHash, Arc<Block>)> = Vec::new();
                     if request.bft_want_height != u64::MAX {
-                        let snapshot_height = bft_snapshot_hashes.get(request.bft_want_height as usize)
-                            .and_then(|hash| bft_snapshot_heights.get(hash))
+                        let candidate_height = bft_candidate_hashes.get(request.bft_want_height as usize)
+                            .and_then(|hash| bft_candidate_heights.get(hash))
                             .copied();
-                        if let Some(ch) = snapshot_height {
-                            // a little above the snapshot, so the blocks whose fat pointers
+                        if let Some(ch) = candidate_height {
+                            // a little above the candidate, so the blocks whose fat pointers
                             // name the target and its successors ride along
                             let hi_h = ZebBlockHeight((ch + 64).min(bc_tip_height) as u32);
                             let lo_h = ZebBlockHeight(hi_h.0.saturating_sub(BC_PAGE_SIZE as u32 - 1));
@@ -831,8 +834,8 @@ pub async fn service_viz_requests(
                         push_bc_block(&mut response, height, hash, bc, true);
                     }
                     // backfill page (older best-chain blocks the GUI's camera wants),
-                    // finality-frontier page (real blocks where the BFT snapshots point),
-                    // and PoS-jump page (blocks around a wanted BFT era's snapshot)
+                    // finality-frontier page (real blocks where the BFT candidates point),
+                    // and PoS-jump page (blocks around a wanted BFT era's candidate)
                     for (height, hash, bc) in backfill_blocks.iter().chain(frontier_blocks.iter()).chain(pos_jump_blocks.iter()) {
                         push_bc_block(&mut response, height, hash, bc, true);
                     }
@@ -903,20 +906,20 @@ pub async fn service_viz_requests(
                         let b = &internal.bft_blocks[i];
                         // Out-of-order BFT ingest pads the chain with empty-headers placeholder
                         // blocks; nothing to show until the real block arrives.
-                        let Some(snapshot) = b.snapshot_hash() else { continue };
+                        if b.headers.is_empty() { continue; }
                         // cached for the fully-checked range; blocks past a stalled
                         // placeholder (catch-up) compute on the fly until checked
-                        let snapshot_hash = bft_snapshot_hashes.get(i).copied().unwrap_or_else(||
-                            Hash32::from_bytes(snapshot.0));
+                        let candidate_hash = bft_candidate_hashes.get(i).copied().unwrap_or_else(||
+                            Hash32::from_bytes(b.snapshot_block_hash().0));
                         // past a stalled placeholder the fully-checked scan hasn't seen this
                         // hash, so enqueue it here: resolution must still learn its height
                         // or the block positions at 0 forever
-                        if !bft_snapshot_heights.contains_key(&snapshot_hash) {
-                            bft_unresolved_heights.insert(snapshot_hash);
+                        if !bft_candidate_heights.contains_key(&candidate_hash) {
+                            bft_unresolved_heights.insert(candidate_hash);
                         }
                         // extent membership already proves this block's PoW span is served;
                         // the height is for GUI positioning only (0 = not yet resolved)
-                        let snapshot_height = bft_snapshot_heights.get(&snapshot_hash).copied().unwrap_or(0);
+                        let candidate_height = bft_candidate_heights.get(&candidate_hash).copied().unwrap_or(0);
                         let this_hash = Hash32::from_bytes(b.blake3_hash().0);
                         if request.want_to_inspect_block == this_hash {
                             response.what_block_it_is = this_hash;
@@ -926,11 +929,10 @@ pub async fn service_viz_requests(
                             this_hash: this_hash,
                             parent_hash: Hash32::from_bytes(b.previous_block_hash().0),
                             this_height: i as u64,
-                            points_at_bc_block: snapshot_hash,
-                            points_at_bc_height: snapshot_height,
-                            // full header data for every carried header, so the GUI can show
-                            // proven blocks it never received; the snapshot is below them all
-                            proving_blocks: b.headers.iter().map(|x| zebra_gui::ProvingHeader {
+                            points_at_bc_block: candidate_hash,
+                            points_at_bc_height: candidate_height,
+                            // full header data, so the GUI can show proven blocks it never received
+                            proving_blocks: b.headers.iter().skip(1).map(|x| zebra_gui::ProvingHeader {
                                 hash: Hash32::from_bytes(BlockHash::from_header_data(x).0),
                                 parent_hash: Hash32::from_bytes(x.prev_block.0),
                                 utc: x.time as i64,

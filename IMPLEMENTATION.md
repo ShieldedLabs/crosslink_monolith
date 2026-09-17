@@ -41,20 +41,18 @@ the same test files, and stages 3 and 4 depend on stage 1.
   A winit panic means the feature was left on; it is not worked around in the test code.
 - A stage's test condition is read against the node tests that fail for reasons outside the
   stages. None of them is fixed or worked around by a stage:
-  - `call_from_state_to_crosslink_to_ask_about_fat_pointers` rejects any PoW block at or
-    below `BOOTSTRAP_ACTIVATION_HEIGHT` that carries a fat pointer, so every test whose PoW
-    blocks cite a BFT block fails at its first citing block:
-    `crosslink_test_pow_to_pos_link` and the three `crosslink_finality_diagram_*` node tests.
-    Their finality expectations before that block hold.
   - `staking_tx_create_bond` in `zebrad/tests/crosslink.rs` leaves the bond signature zero,
     and the sync path verifies staking signatures, so
     `crosslink_pow_block_with_staking_tx` and `crosslink_add_newcomer_to_roster_via_pow`
-    fail at the block carrying the bond.
-  - `REGTEST_BLOCK_BYTES` and `REGTEST_POS_BLOCK_BYTES` were mined under a different
-    difficulty and format, so every test built on them fails at its first `LOAD_POW`.
-  - `tfl_block_finality_from_height_hash` returns an error while no BFT block exists, and
-    `EXPECT_POW_BLOCK_FINALITY` treats that as a panic, so `crosslink_test_basic_finality`
-    aborts in its PoW-only prefix.
+    fail at the block carrying the bond. The node does not answer the harness's submission
+    of that block, so the test process stalls there and has to be killed from outside.
+- A block loaded with `SHOULD_FAIL` costs the harness's full 30-second submission deadline:
+  a rejected block never gets an answer from the ingest queue. The fork-rejection tests and
+  diagram scene 3 therefore take minutes, not seconds.
+- `REGTEST_BLOCK_BYTES` and `REGTEST_POS_BLOCK_BYTES` are written by the `#[ignore]`d
+  `regen_test_data` in `zebrad/tests/crosslink.rs`; the diagram scenes by
+  `crosslink_write_finality_diagram_scenes`. Both are regenerated, never hand-edited, whenever
+  the block format or the header count of a BFT block changes.
 - The build uses `panic = abort`: a new `assert!`, `unwrap`, or `expect` on a consensus path
   terminates the node when it fails.
 

@@ -48,7 +48,7 @@ pub use serialize::{SerializedBlock, MAX_BLOCK_BYTES};
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use arbitrary::LedgerState;
 
-pub use zcash_primitives::bft::{BftBlock, BftBlockAndFatPointerToIt, FatPointerSignature, FatPointerToBftBlock, PROTOTYPE_PARAMETERS, PubKeyID};
+pub use zcash_primitives::bft::{BftBlock, BftBlockAndFatPointerToIt, BftBootstrap, FatPointerSignature, FatPointerToBftBlock, PROTOTYPE_PARAMETERS, PubKeyID, ZcashCrosslinkParameters};
 
 /// A Zcash block, containing a header and a list of transactions.
 #[derive(Clone, Debug, Eq, PartialEq)]

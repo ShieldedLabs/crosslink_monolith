@@ -149,7 +149,7 @@ impl CopyStateCmd {
             _target_latest_chain_tip,
             _target_chain_tip_change,
             mut target_block_writer,
-        ) = new_zs::spawn_init(target_config.clone(), network, Height::MAX, 0, std::sync::Arc::new(move |_fat_pointer_a, _fat_pointer_b, _height| { Some(true) })).await?;
+        ) = new_zs::spawn_init(target_config.clone(), network, Height::MAX, 0, std::sync::Arc::new(move |_fat_pointer_a, _fat_pointer_b, _height, _height_of| { Some(zebra_state::CrosslinkVerdict::Accept { pos_payout: true }) })).await?;
 
         let elapsed = target_start_time.elapsed();
         info!(?elapsed, "finished initializing target state service");

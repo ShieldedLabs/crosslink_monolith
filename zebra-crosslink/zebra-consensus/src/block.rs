@@ -367,6 +367,9 @@ where
                 height,
                 new_outputs,
                 transaction_hashes,
+                // The crosslink fat-pointer gate, not this verifier, decides PoS issuance.
+                // This path does not consult it, so it mints nothing; see `pos_payout`.
+                pos_payout: false,
             };
 
             // Return early for proposal requests.

@@ -149,6 +149,14 @@ pub(super) async fn run_backup_task(
 struct NonFinalizedBlockBackup {
     block: Arc<Block>,
     deferred_pool_balance_change: Amount,
+    /// Whether this block paid PoS issuance; see [`SemanticallyVerifiedBlock::pos_payout`].
+    ///
+    /// Backed up for the same reason as the deferred pool change: it is not recoverable from the
+    /// block bytes. It is decided by the crosslink fat-pointer gate, which does not run on
+    /// restore, so a restored block rebuilt from its bytes alone would re-enter the chain minting
+    /// nothing while every other node had already paid it -- a stake divergence between nodes
+    /// that were agreeing a moment earlier, and, through the roster, a BFT liveness failure.
+    pos_payout: bool,
 }
 
 impl From<&ContextuallyVerifiedBlock> for NonFinalizedBlockBackup {
@@ -156,6 +164,7 @@ impl From<&ContextuallyVerifiedBlock> for NonFinalizedBlockBackup {
         Self {
             block: cv_block.block.clone(),
             deferred_pool_balance_change: cv_block.chain_value_pool_change.deferred_amount(),
+            pos_payout: cv_block.pos_payout,
         }
     }
 }
@@ -171,18 +180,27 @@ impl NonFinalizedBlockBackup {
         let deferred_pool_balance_change_bytes =
             self.deferred_pool_balance_change.as_bytes().to_vec();
 
-        [deferred_pool_balance_change_bytes, block_bytes].concat()
+        let pos_payout_bytes = vec![u8::from(self.pos_payout)];
+
+        [deferred_pool_balance_change_bytes, pos_payout_bytes, block_bytes].concat()
     }
 
     /// Constructs a new [`NonFinalizedBlockBackup`] from a vector of bytes.
     #[allow(clippy::unwrap_in_result)]
     fn from_bytes(bytes: Vec<u8>) -> Result<Self, io::Error> {
-        let (deferred_pool_balance_change_bytes, block_bytes) = bytes
+        let (deferred_pool_balance_change_bytes, rest) = bytes
             .split_at_checked(size_of::<Amount>())
             .ok_or(io::Error::new(
                 ErrorKind::InvalidInput,
                 "input is too short",
             ))?;
+
+        // A file written before `pos_payout` was added has block bytes where this byte is, so it
+        // fails to deserialize below and the block is simply re-downloaded.
+        let (pos_payout_bytes, block_bytes) = rest.split_at_checked(1).ok_or(io::Error::new(
+            ErrorKind::InvalidInput,
+            "input is too short",
+        ))?;
 
         Ok(Self {
             block: Arc::new(
@@ -196,6 +214,7 @@ impl NonFinalizedBlockBackup {
                     .expect("slice from `split_at_checked()` should fit in [u8; 8]"),
             )
             .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?,
+            pos_payout: pos_payout_bytes[0] != 0,
         })
     }
 }
@@ -237,8 +256,11 @@ fn read_non_finalized_blocks_from_backup<'a>(
                 Ok(NonFinalizedBlockBackup {
                     block,
                     deferred_pool_balance_change: _,
+                    pos_payout,
                 }) if block.coinbase_height().is_some() => {
-                    let block = SemanticallyVerifiedBlock::from(block);
+                    let mut block = SemanticallyVerifiedBlock::from(block);
+                    // The gate does not run on restore, so the verdict comes from the backup.
+                    block.pos_payout = pos_payout;
                     if block.hash != expected_block_hash {
                         tracing::warn!(
                             block_hash = ?block.hash,

@@ -62,8 +62,49 @@ pub static TEST_INSTR_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None)
 pub static TEST_INSTR_BYTES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 pub static TEST_INSTRS: Mutex<Vec<test_format::TFInstr>> = Mutex::new(Vec::new());
 pub static TEST_SHUTDOWN_FN: Mutex<fn()> = Mutex::new(|| ());
-pub static TEST_PARAMS: Mutex<Option<ZcashCrosslinkParameters>> = Mutex::new(None);
 pub static TEST_NAME: Mutex<&'static str> = Mutex::new("‰‰TEST_NAME_NOT_SET‰‰");
+
+/// Runtime-configurable failure handling, ported from reece_smith_merchant. A wrapped
+/// `Result`/`Option` panics only when `on_fail` carries `PANIC`, otherwise it is logged
+/// (`LOG`) or returned untouched. This lets one code path assert-fail for a human running a
+/// test yet hand the error back to the fuzzer grinding through malformed inputs, without
+/// duplicating the path.
+#[allow(dead_code)]
+pub mod uhh {
+    pub const LOG: u32 = 1 << 0;
+    pub const CALLSTACK: u32 = 1 << 1;
+    pub const PANIC: u32 = 1 << 2;
+}
+
+pub fn uhh<T, E: std::fmt::Debug>(result: Result<T, E>, on_fail: u32) -> Result<T, E> {
+    if let Err(e) = &result {
+        if on_fail & (uhh::LOG | uhh::PANIC) != 0 {
+            eprintln!("{:?}", e);
+        }
+        // CALLSTACK backtrace is not implemented (matches the source); never set it here.
+        if on_fail & uhh::PANIC != 0 {
+            panic!("error marked as unrecoverable");
+        }
+    }
+    result
+}
+
+pub fn uhh_option<T>(option: Option<T>, on_fail: u32) -> Option<T> {
+    if option.is_none() {
+        if on_fail & (uhh::LOG | uhh::PANIC) != 0 {
+            eprintln!("Option of '{}' was None.", std::any::type_name::<T>());
+        }
+        if on_fail & uhh::PANIC != 0 {
+            panic!("error marked as unrecoverable");
+        }
+    }
+    option
+}
+
+/// Failure mode for the test-format load path (see [`uhh`]). Normal tests keep `PANIC`, so
+/// malformed data aborts; the fuzzer clears `PANIC` so the same path recovers and keeps
+/// grinding.
+pub static TEST_ON_FAIL: Mutex<u32> = Mutex::new(uhh::PANIC);
 
 pub fn dump_test_instrs() {
     #![allow(clippy::print_stderr)]
@@ -296,17 +337,24 @@ pub(crate) struct TFLServiceInternal {
     path_to_pos_store_file: PathBuf,
 }
 
-fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLServiceHandle, parent_fat_pointer: FatPointerToBftBlock, child_fat_pointer: FatPointerToBftBlock, pow_block_height: ZebBlockHeight) -> Option<bool> {
+fn call_from_state_to_crosslink_to_ask_about_fat_pointers(
+    internal_handle: &TFLServiceHandle,
+    parent_fat_pointer: FatPointerToBftBlock,
+    child_fat_pointer: FatPointerToBftBlock,
+    pow_block_height: ZebBlockHeight,
+    height_of: zebra_state::CrosslinkBlockHeightLookup<'_>,
+) -> Option<zebra_state::CrosslinkVerdict> {
     // Return value:
     //   None        => DEFER  — re-queue and re-evaluate on a later flush. REVERSIBLE. This is
     //                           the answer whenever we lack the information to be *certain* a
     //                           block is invalid — i.e. an unresolved BFT pointer (its block has
     //                           not entered this node yet) that may resolve later.
-    //   Some(false) => REJECT — PERMANENT and IRREVERSIBLE: the block is dropped and every
+    //   Some(Reject) => REJECT — PERMANENT and IRREVERSIBLE: the block is dropped and every
     //                           descendant queued behind it is orphaned. We may ONLY return this
     //                           on facts that are immutable and view-independent, so that the
     //                           decision can never turn out to have been a transient mistake.
-    //   Some(true)  => ACCEPT.
+    //   Some(Accept { pos_payout }) => ACCEPT. `pos_payout` additionally decides whether this
+    //                           block mints PoS issuance; see the tail of this function.
     //
     // This runs synchronously inside the state service. `blocking_lock` panics if called on a
     // tokio runtime thread *unless* it is inside `tokio::task::block_in_place`, so EVERY caller
@@ -318,11 +366,13 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
     let parent_is_null = parent_fat_pointer == FatPointerToBftBlock::null();
     let child_is_null = child_fat_pointer == FatPointerToBftBlock::null();
 
-    // PERMANENT, from the block's own height: BFT does not exist at or below the bootstrap
-    // activation height, so a pointer there can never resolve to a legitimate block (see
-    // `BOOTSTRAP_ACTIVATION_HEIGHT`). Decided before taking the lock: nothing to resolve.
-    if !child_is_null && pow_block_height.0 <= BOOTSTRAP_ACTIVATION_HEIGHT {
-        return Some(false);
+    // PERMANENT, from the block's own height: where BFT is bootstrapped from the chain it does not
+    // exist at or below the activation height, so a pointer there can never resolve to a
+    // legitimate block (see `BftBootstrap`). Decided before taking the lock: nothing to resolve.
+    if let Some(activation_height) = internal_handle.params.bootstrap.activation_height() {
+        if !child_is_null && pow_block_height.0 <= activation_height {
+            return Some(zebra_state::CrosslinkVerdict::Reject);
+        }
     }
 
     let internal = internal_handle.internal.blocking_lock();
@@ -331,7 +381,7 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
     // block: the child reverts to no BFT pointer while its parent had one. A null pointer can
     // never be "as new or newer" than a real one, so this is a certain regression.
     if child_is_null && !parent_is_null {
-        return Some(false);
+        return Some(zebra_state::CrosslinkVerdict::Reject);
     }
 
     // Resolve the child pointer against the in-memory BFT chain. A non-null pointer we cannot
@@ -352,9 +402,21 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
     if let Some(h) = child_index {
         let do_not_include = internal.bft_blocks[h].do_not_include_until_bc_height;
         if (pow_block_height.0 as u64) < do_not_include {
-            return Some(false);
+            return Some(zebra_state::CrosslinkVerdict::Reject);
         }
     }
+
+    // The PoW block this block's certificate finalizes -- the snapshot, i.e. the parent of the
+    // BFT block's deepest carried header. Read out under the lock; the height lookup below runs
+    // without it. Placeholder entries from out-of-order BFT ingest carry no headers and are
+    // never valid pointer targets, but guard rather than panic.
+    let snapshot_hash = match child_index {
+        Some(h) if !internal.bft_blocks[h].headers.is_empty() => {
+            Some(ZebBlockHash(internal.bft_blocks[h].snapshot_block_hash().0))
+        }
+        Some(_) => return None, // placeholder -> defer (reversible)
+        None => None,
+    };
 
     // Resolve the parent pointer. Unresolved non-null parent -> defer.
     let parent_index = if parent_is_null {
@@ -377,7 +439,128 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
     // (Unresolved pointers already returned None above, so reaching here means both are known.)
     let child_rank = child_index.map(|h| h + 1).unwrap_or(0);
     let parent_rank = parent_index.map(|h| h + 1).unwrap_or(0);
-    Some(child_rank >= parent_rank)
+    if child_rank < parent_rank {
+        return Some(zebra_state::CrosslinkVerdict::Reject);
+    }
+
+    // The sigma-confirmation rule, and the reason this check is handed a height lookup at all.
+    //
+    // A certificate finalizing PoW height F may only be carried by a PoW block at F + sigma + 1
+    // or above: the sigma carried headers F+1 ..= F+sigma, then the carrier. The carried
+    // headers are evidence nobody checks to be on this chain, so without this rule a block at
+    // F + 1 could carry a certificate whose "confirmations" are headers from another branch
+    // entirely, and the chain would call F final with one block of work above it. The height
+    // difference is measured against the carrying block's own height. Whether F is an
+    // ancestor of the carrier is a separate question (the Last Final Snapshot rule); this
+    // check only bounds the depth.
+    //
+    // The lock is dropped first: `height_of` reads the state, and nothing is needed from the BFT
+    // chain past the snapshot hash.
+    drop(internal);
+    let mut pos_payout = false;
+    if let Some(snapshot_hash) = snapshot_hash {
+        // PERMANENT once resolved, from immutable data: which PoW block a BFT block finalizes is
+        // fixed by its bytes, that block's height is fixed by its own coinbase, and so is the
+        // height of the block carrying the pointer. An unresolved snapshot is not a failure --
+        // this node has simply not seen that PoW block yet -- so it defers, exactly as an
+        // unresolved BFT pointer does.
+        let snapshot_height = height_of(snapshot_hash.into())?;
+        let sigma = internal_handle.params.bc_confirmation_depth_sigma;
+        let gap = (pow_block_height.0 as u64).saturating_sub(snapshot_height.0 as u64);
+        if gap < sigma + 1 {
+            return Some(zebra_state::CrosslinkVerdict::Reject);
+        }
+
+        // PoS issuance rides on this gate because this is the one place that knows both facts it
+        // needs. A block pays only when it ADVANCES finality (its certificate is a different BFT
+        // block than its parent's -- compared by the cert's identity, the BFT block hash, since
+        // two honest nodes can carry different signature sets for the same decision) and does so
+        // PROMPTLY (`gap <= sigma + FINALITY_LIVENESS_ALLOWANCE`; the check above already put
+        // `gap >= sigma + 1`, so the payable window is exactly those few heights).
+        //
+        // Both facts are objective functions of committed chain data, so every node reaches the
+        // same answer for the same block. See `FINALITY_LIVENESS_ALLOWANCE`.
+        let cert_advanced =
+            child_fat_pointer.points_at_block_hash() != parent_fat_pointer.points_at_block_hash();
+        pos_payout = cert_advanced
+            && gap <= sigma + zcash_primitives::bft::FINALITY_LIVENESS_ALLOWANCE;
+
+        // One line per block recording the decision and the facts behind it. `debug!` would be
+        // the natural level, but the release binary is built with `release_max_level_info`, so
+        // anything below `info` is compiled out and would never be seen on a real node.
+        if cert_advanced && !pos_payout {
+            // The notable case: finality DID advance here, but so slowly that the block earns
+            // nothing. It is otherwise indistinguishable from a block that simply carried the
+            // same certificate as its parent, so it is spelled out.
+            info!(
+                "no PoS issuance at height {}: the certificate finalizes height {} \
+                 (gap {}), beyond sigma {} + FINALITY_LIVENESS_ALLOWANCE {}",
+                pow_block_height.0,
+                snapshot_height.0,
+                gap,
+                sigma,
+                zcash_primitives::bft::FINALITY_LIVENESS_ALLOWANCE,
+            );
+        } else {
+            info!(
+                "PoS payout decision at height {}: payout={} cert_advanced={} gap={} snapshot={} sigma={}",
+                pow_block_height.0, pos_payout, cert_advanced, gap, snapshot_height.0, sigma,
+            );
+        }
+    }
+
+    Some(zebra_state::CrosslinkVerdict::Accept { pos_payout })
+}
+
+/// Recomputes, for a block already on the chain, the PoS-issuance decision the fat-pointer gate
+/// made when that block was committed.
+///
+/// The live rule lives in `call_from_state_to_crosslink_to_ask_about_fat_pointers` and rides on
+/// the gate because that is where both facts are known; replay paths (here, the wallet issuance
+/// projection) have to reconstruct it from committed data. Both halves are objective: the
+/// certificate identity comes from the two block headers, and what that certificate finalizes
+/// comes from the decided BFT block, which is immutable once decided.
+///
+/// Returns an error rather than `false` when the certificate cannot be resolved: silently
+/// skipping a payout would understate issuance without saying so.
+async fn block_pays_pos_issuance(
+    internal_handle: &TFLServiceHandle,
+    block_height: ZebBlockHeight,
+    fat_pointer: &FatPointerToBftBlock,
+    parent_fat_pointer: &FatPointerToBftBlock,
+) -> Result<bool, String> {
+    // No advance, no payout. Also covers every pre-activation block, where both pointers are null.
+    if fat_pointer.points_at_block_hash() == parent_fat_pointer.points_at_block_hash() {
+        return Ok(false);
+    }
+
+    let snapshot_hash = {
+        let internal = internal_handle.internal.lock().await;
+        match internal.bft_block_hash_to_height.get(&fat_pointer.points_at_block_hash()) {
+            Some(&h) if !internal.bft_blocks[h as usize].headers.is_empty() => {
+                ZebBlockHash(internal.bft_blocks[h as usize].snapshot_block_hash().0)
+            }
+            _ => {
+                return Err(format!(
+                    "block at height {} carries a certificate this node cannot resolve ({:?});                      its issuance cannot be replayed",
+                    block_height.0,
+                    fat_pointer.points_at_block_hash(),
+                ))
+            }
+        }
+    };
+
+    let Some(snapshot_height) = block_height_from_hash(&internal_handle.call, snapshot_hash).await
+    else {
+        return Err(format!(
+            "the block finalized by the certificate in block {} is not in this database",
+            block_height.0,
+        ));
+    };
+
+    let sigma = internal_handle.params.bc_confirmation_depth_sigma;
+    let gap = (block_height.0 as u64).saturating_sub(snapshot_height.0 as u64);
+    Ok(gap <= sigma + zcash_primitives::bft::FINALITY_LIVENESS_ALLOWANCE)
 }
 
 // TODO: Result?
@@ -500,7 +683,7 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
     }
 
     let call = tfl_handle.call.clone();
-    let params = &PROTOTYPE_PARAMETERS;
+    let params = &tfl_handle.params;
     let (tip_height, tip_hash) =
         if let Ok(StateResponse::Tip(val)) = (call.state)(StateRequest::Tip).await {
             if val.is_none() {
@@ -514,14 +697,11 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
     use std::ops::Sub;
     use zebra_chain::block::HeightDiff as BlockHeightDiff;
 
-    // The snapshot of the proposed block: `FindBlockHeaders { known_blocks: [snapshot] }` returns
-    // the headers after the snapshot, so the proposal carries the `σ` blocks above it and
-    // `parent(headers[0])` is the snapshot itself.
-    let snapshot_height = tip_height.sub(BlockHeightDiff::from(
+    let finality_candidate_height = tip_height.sub(BlockHeightDiff::from(
         params.bc_confirmation_depth_sigma as i64,
     ));
 
-    let snapshot_height = if let Some(h) = snapshot_height {
+    let finality_candidate_height = if let Some(h) = finality_candidate_height {
         h
     } else {
         info!(
@@ -541,23 +721,32 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
                 .map_or(Blake3Hash([0u8; 32]), |b| b.blake3_hash()),
         )
     };
-    // A proposal improves when its snapshot is above the parent bft-block's snapshot.
+    // `finality_candidate_height` (tip - sigma) is the `snapshot`: the block this proposal
+    // finalizes. The certificate carries the sigma headers F+1 ..= tip, the confirmations
+    // above the snapshot, and the highest carried header is the tip itself. The snapshot is
+    // not carried: it is named by `BftBlock::snapshot_block_hash()` (`parent(headers[0])`),
+    // and `FindBlockHeaders { known_blocks: [anchor] }` returns the headers starting AFTER the
+    // anchor, which is exactly the window above the snapshot.
+    //
+    // Guarding on the snapshot height keeps one BFT block per PoW block: the tip advancing by
+    // one advances the snapshot by one, so each new PoW block is proposable at once.
+    let proposed_final_height = finality_candidate_height;
     let is_improved_final =
-        latest_final_block.is_none() || snapshot_height > latest_final_block.unwrap().0;
+        latest_final_block.is_none() || proposed_final_height > latest_final_block.unwrap().0;
 
     if !is_improved_final {
         info!(
             "candidate block can't be final: height {}, final height: {:?}",
-            snapshot_height.0, latest_final_block
+            finality_candidate_height.0, latest_final_block
         );
         return None;
     }
 
-    let snapshot_height = ZebBlockHeight(snapshot_height.0.min(if let Some(v) = latest_final_block { v.0.0+40 } else { u32::MAX }));
+    let finality_candidate_height = ZebBlockHeight(finality_candidate_height.0.min(if let Some(v) = latest_final_block { v.0.0+40 } else { u32::MAX }));
 
-    let resp = (call.state)(StateRequest::BlockHeader(snapshot_height.into())).await;
+    let resp = (call.state)(StateRequest::BlockHeader(finality_candidate_height.into())).await;
 
-    let snapshot_hash = if let Ok(StateResponse::BlockHeader { hash, .. }) = resp {
+    let candidate_hash = if let Ok(StateResponse::BlockHeader { hash, .. }) = resp {
         hash
     } else {
         // Error or unexpected response type:
@@ -567,7 +756,7 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
 
     // NOTE: probably faster to request 2x as many blocks as we need rather than have another async call
     let resp = (call.state)(StateRequest::FindBlockHeaders {
-        known_blocks: vec![snapshot_hash],
+        known_blocks: vec![candidate_hash],
         stop: None,
     })
     .await;
@@ -660,7 +849,9 @@ async fn handle_new_decided_bft_block(
     }
 
     let call = tfl_handle.call.clone();
-    let new_final_hash = ZebBlockHash(new_block.snapshot_hash().expect("at least 1 header").0);
+    // The `snapshot`: the parent of the deepest carried header, i.e. the block being finalized.
+    // See `BftBlock::snapshot_block_hash`.
+    let new_final_hash = ZebBlockHash(new_block.snapshot_block_hash().0);
     let new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
     // `height` is now the 0-based canonical height, i.e. the chain index directly.
     let insert_i = new_block.height as usize;
@@ -950,7 +1141,8 @@ async fn validate_bft_block(
     let already_finalized_hash = internal.latest_final_block.map(|(_, hash)| hash);
     drop(internal);
 
-    let new_final_hash = ZebBlockHash(new_block.snapshot_hash().expect("at least 1 header").0);
+    // The `snapshot` this proposal finalizes: the parent of the deepest carried header.
+    let new_final_hash = ZebBlockHash(new_block.snapshot_block_hash().0);
     let new_final_pow_height =
         if let Some(new_final_height) = block_height_from_hash(&call, new_final_hash).await {
             new_final_height.0
@@ -972,6 +1164,7 @@ async fn validate_bft_block(
             let _ = already_finalized_hash;
             return (tenderlink::TMStatus::Indeterminate, tenderlink::TMStatusReason::NeedsBlock { hash: new_final_hash.0 });
         };
+    let _ = new_final_pow_height;
     return (tenderlink::TMStatus::Pass, tenderlink::TMStatusReason::None);
 }
 
@@ -1121,7 +1314,7 @@ fn namespace_for_bft_height(hardforks: &[crate::config::HardForkConfig], bft_hei
 async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [u8; 32], path_to_pos_store_file: PathBuf) -> Result<(), String> {
     let call = internal_handle.call.clone();
     let config = internal_handle.config.clone();
-    let params = &PROTOTYPE_PARAMETERS;
+    let params = internal_handle.params;
 
     #[cfg(feature = "viz_gui")]
     {
@@ -1253,8 +1446,9 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 // re-syncing), keep the last known height: monotone, and correct whenever the DB
                 // is intact -- unlike the old `unwrap_or(0)`, which activated the entire blacklist
                 // across the whole replay, nondeterministically by DB-availability race.
-                if let Some(snapshot) = block.snapshot_hash() {
-                    if let Some(h) = block_height_from_hash(&call, ZebBlockHash(snapshot.0)).await {
+                if !block.headers.is_empty() {
+                    let snapshot_hash = ZebBlockHash(block.snapshot_block_hash().0);
+                    if let Some(h) = block_height_from_hash(&call, snapshot_hash).await {
                         prev_finalized_bc_height = h.0 as u64;
                     }
                 }
@@ -1270,7 +1464,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         let mut new_final_height = ZebBlockHeight(0);
 
         if let Some(new_block) = i_bft_blocks.last() {
-            new_final_hash.0 = new_block.snapshot_hash().expect("at least 1 header").0;
+            new_final_hash.0 = new_block.snapshot_block_hash().0;
             new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
         }
 
@@ -1329,12 +1523,13 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             run_instant += MAIN_LOOP_SLEEP_INTERVAL;
 
             // Crosslink bootstrap: the first accepted PoW block at the activation height (h2)
-            // finalizes h1 - 1, the snapshot of a deterministic genesis decision carrying the
-            // headers from h1, and BFT starts at height 1 with the roster at h1 - 1. Done before
-            // taking the internal lock -- the finalize calls back
-            // into the fat-pointer gate, which blocks on that same lock.
-            if let (Some(_), Some((tip_height, _))) = (launch.as_ref(), new_bc_tip) {
-                if tip_height.0 >= BOOTSTRAP_ACTIVATION_HEIGHT {
+            // finalizes h1 through a deterministic genesis decision, and BFT starts at height 1
+            // with h1's roster. Done before taking the internal lock -- the finalize calls back
+            // into the fat-pointer gate, which blocks on that same lock. A network whose BFT is
+            // supplied has no activation height and never bootstraps.
+            let activation_height = internal_handle.params.bootstrap.activation_height();
+            if let (Some(_), Some((tip_height, _)), Some(activation_height)) = (launch.as_ref(), new_bc_tip, activation_height) {
+                if tip_height.0 >= activation_height {
                     if let Some((roster, ingest)) = bootstrap_bft(&internal_handle).await {
                         spawn_tenderlink(&internal_handle, launch.take().unwrap(), roster, ingest).await;
                     }
@@ -1380,8 +1575,7 @@ struct TenderlinkLaunch {
 }
 
 /// Start tenderlink at the height after `ingest` with `roster`, and mark TFL active. Refuses an
-/// empty roster: BFT height 1's roster is fixed by the stakes at h1 - 1, so nothing would ever
-/// change.
+/// empty roster: BFT height 1's roster is fixed by the stakes at h1, so nothing would ever change.
 async fn spawn_tenderlink(
     internal_handle: &TFLServiceHandle,
     launch: TenderlinkLaunch,
@@ -1391,8 +1585,8 @@ async fn spawn_tenderlink(
     let config = internal_handle.config.clone();
     if roster.is_empty() {
         error!(
-            "BFT height {} has an empty roster: no stake was bonded by the BFT genesis snapshot height ({}). BFT will not run on this chain.",
-            ingest_data_for_tenderlink.len(), BOOTSTRAP_ROSTER_HEIGHT - 1,
+            "BFT height {} has an empty roster: no stake was bonded by the bootstrap roster height ({:?}). BFT will not run on this chain.",
+            ingest_data_for_tenderlink.len(), internal_handle.params.bootstrap,
         );
         return;
     }
@@ -1579,12 +1773,11 @@ fn decided_round_data(
     round_data
 }
 
-/// The deterministic BFT genesis block: the decision whose snapshot is the block below the
-/// bootstrap roster height (h1 - 1), which every node constructs identically from its own PoW
-/// chain instead of receiving.
+/// The deterministic BFT genesis block: the decision that finalizes the bootstrap roster height
+/// (h1), which every node constructs identically from its own PoW chain instead of receiving.
 ///
-/// It is shaped exactly as a proposer would shape it -- v2, headers from h1 for the confirmation
-/// depth, any hardforks scheduled at BFT height 0 -- so `validate_bft_block` accepts it unchanged.
+/// It is shaped exactly as a proposer would shape it -- v2, the sigma confirmation headers above
+/// h1, any hardforks scheduled at BFT height 0 -- so `validate_bft_block` accepts it unchanged.
 /// Its fat pointer names the block at height 0, round 0, and carries no signatures: the validator
 /// set for genesis is nil and the decision is valid by construction. BFT height 1 is the first
 /// real decision, and its previous-block pointer is this one.
@@ -1592,11 +1785,16 @@ fn decided_round_data(
 /// None until the chain has the headers (the caller only asks once the tip is at or past the
 /// activation height, where h1 is finalized-by-depth, so the headers are the same on every node).
 async fn build_bootstrap_genesis(tfl_handle: &TFLServiceHandle) -> Option<(BftBlock, FatPointerToBftBlock)> {
-    let params = &PROTOTYPE_PARAMETERS;
+    let params = &tfl_handle.params;
     let call = &tfl_handle.call;
+    let BftBootstrap::FromChain { roster_height, .. } = params.bootstrap else {
+        return None;
+    };
 
+    // h1 is the snapshot, so the carried headers are the sigma blocks above it: h1+1 ..= h1+sigma
+    // (see BftBlock).
     let mut headers: Vec<BcBlockHeader> = Vec::with_capacity(params.bc_confirmation_depth_sigma as usize);
-    for h in BOOTSTRAP_ROSTER_HEIGHT..BOOTSTRAP_ROSTER_HEIGHT + params.bc_confirmation_depth_sigma as u32 {
+    for h in roster_height + 1..=roster_height + params.bc_confirmation_depth_sigma as u32 {
         match (call.state)(StateRequest::BlockHeader(ZebBlockHeight(h).into())).await {
             Ok(StateResponse::BlockHeader { header, .. }) => headers.push(bc_hdr_to_lrz(&header)),
             _ => return None,
@@ -1627,14 +1825,17 @@ async fn build_bootstrap_genesis(tfl_handle: &TFLServiceHandle) -> Option<(BftBl
     Some((block, fat_pointer))
 }
 
-/// Run the bootstrap: decide genesis (finalizing h1 - 1 on the PoW side and taking its aggregated
+/// Run the bootstrap: decide genesis (finalizing h1 on the PoW side and taking h1's aggregated
 /// stakes as the roster for height 1) and produce what tenderlink needs to start at height 1.
 /// Must not be called with the internal lock held.
 async fn bootstrap_bft(tfl_handle: &TFLServiceHandle) -> Option<(Vec<SortedRosterMember>, Vec<tenderlink::RoundData>)> {
+    let BftBootstrap::FromChain { roster_height, activation_height } = tfl_handle.params.bootstrap else {
+        return None;
+    };
     let (genesis, fat_pointer) = build_bootstrap_genesis(tfl_handle).await?;
     info!(
         "crosslink bootstrap: PoW reached height {}; deciding BFT genesis {} which finalizes height {}",
-        BOOTSTRAP_ACTIVATION_HEIGHT, genesis.blake3_hash(), BOOTSTRAP_ROSTER_HEIGHT - 1,
+        activation_height, genesis.blake3_hash(), roster_height,
     );
     let roster = handle_new_decided_bft_block(tfl_handle, &genesis, &fat_pointer, Vec::new()).await;
     let terminated = terminated_finalizers_at(&tfl_handle.config.hardforks, 0, 0);
@@ -1659,11 +1860,9 @@ async fn tfl_block_finality_from_height_hash(
     let block_hdr = (call.state)(StateRequest::BlockHeader(hash.into()));
     let (final_height, final_hash) = match tfl_final_block_height_hash(&internal_handle).await {
         Some(v) => v,
-        None => {
-            return Err(TFLServiceError::Misc(
-                "There is no final block.".to_string(),
-            ));
-        }
+        // Before the first Crosslink decision nothing is final, so neither is this block. This is
+        // an answer, not an error: reporting no final block is left to FinalBlockHeightHash.
+        None => return Ok(Some(TFLBlockFinality::NotYetFinalized)),
     };
 
     if height > final_height {
@@ -1704,11 +1903,21 @@ async fn total_issuance_from_key(
     first_height: ZebBlockHeight,
     last_height: ZebBlockHeight,
 ) -> Result<Vec<ScanInfo>, String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use futures::StreamExt;
+    use wallet::scanner::{PROF, timed};
+
     let call = internal_handle.call.clone();
+    let t_wall = std::time::Instant::now();
+    PROF.reset();
 
     let mut delegation_bonds = HashMap::new();
     let mut finalizer_rewards: HashMap<[u8; 32], u64> = HashMap::new();
+    // The certificate carried by the previously scanned block, to tell whether the next one
+    // advances it. `None` until the first block of the range, whose parent is outside it.
+    let mut prev_fat_pointer: Option<FatPointerToBftBlock> = None;
     let mut utxos_per_ufvk = vec![HashSet::<(PubKeyID, u32)>::new(); ufvks.len()]; // NOTE: hashsets here are grow-only
+    let mut t_spend_per_ufvk = vec![false; ufvks.len()];
 
     let mut scan_infos = Vec::<ScanInfo>::with_capacity(ufvks.len());
     let mut scan_ctxs = Vec::<wallet::scanner::ScanCtx>::with_capacity(ufvks.len());
@@ -1721,20 +1930,36 @@ async fn total_issuance_from_key(
             return Err("could not create orchard ovks".to_owned());
         };
 
-        let Some((t_addr, _p2sh, _ua)) = wallet::addrs_from_ufvk(ufvk, 0) else{
+        let Some((t_addr, t_addr_p2sh, _ua)) = wallet::addrs_from_ufvk(ufvk, 0) else{
             return Err("Could not get an address".to_owned());
         };
 
-        scan_ctxs.push(wallet::scanner::ScanCtx { ufvk: ufvk.clone(), t_addr, orchard_external_ovk, orchard_internal_ovk });
+        scan_ctxs.push(wallet::scanner::ScanCtx::new(ufvk.clone(), t_addr, t_addr_p2sh, orchard_external_ovk, orchard_internal_ovk));
     }
 
-    for height in first_height.0..=last_height.0 {
-        // let tz = wallet::Timer::scope_("scan height", true);
-        println!("scanning height {height}");
-        let res = (call.state)(StateRequest::Block(ZebBlockHeight(height).into())).await;
+    // Blocks are requested PREFETCH ahead through the concurrent ReadStateService, so the rocksdb
+    // reads and zebra deserialization of the next blocks overlap with scanning this one. The
+    // fetch bucket then measures the stall waiting for a block, not the read itself.
+    const PREFETCH: usize = 16;
+    let read_state = call.read_state.clone();
+    let mut blocks = std::pin::pin!(futures::stream::iter(first_height.0..=last_height.0)
+        .map(move |height| {
+            let read_state = read_state.clone();
+            async move { (height, (read_state)(StateReadRequest::Block(ZebBlockHeight(height).into())).await) }
+        })
+        .buffered(PREFETCH));
+
+    loop {
+        let t_fetch = std::time::Instant::now();
+        let Some((height, res)) = blocks.next().await else { break };
+        PROF.fetch_ns.fetch_add(t_fetch.elapsed().as_nanos() as u64, Relaxed);
+        PROF.blocks.fetch_add(1, Relaxed);
+        if height % 1000 == 0 {
+            println!("scanning height {height}");
+        }
         let block = match res {
-            Ok(StateResponse::Block(Some(block))) => block,
-            Ok(StateResponse::Block(None)) => return Err(format!("failed to get block at height {height}")),
+            Ok(StateReadResponse::Block(Some(block))) => block,
+            Ok(StateReadResponse::Block(None)) => return Err(format!("failed to get block at height {height}")),
             _ => return Err(format!("unexpectedly failed to get block at height {height}: {res:?}")),
         };
 
@@ -1742,47 +1967,102 @@ async fn total_issuance_from_key(
             return Err(format!("block at height {height} had 0 transactions"));
         }
 
-
-
         for (tx_i, tx) in block.transactions.iter().enumerate() {
-            let coinbase_tx_bytes = match tx.zcash_serialize_to_vec() {
-                Ok(tx) => tx,
-                Err(err) => return Err(format!("failed to serialize coinbase tx at height {height}: {err:?}")),
+            PROF.txs.fetch_add(1, Relaxed);
+            let is_coinbase = tx.is_coinbase();
+            if tx_i == 0 && ! is_coinbase {
+                return Err(format!("no coinbase found at height {height}"));
+            }
+
+            // The transparent pass reads zebra's already-decoded inputs and outputs. The txid is
+            // hashed only when an output is ours, at most once per tx across the ufvks.
+            let mut txid_memo: Option<[u8; 32]> = None;
+            let mut txid = || *txid_memo.get_or_insert_with(|| timed(&PROF.txid_ns, || tx.hash().0));
+            for (ufvk_i, scan_ctx) in scan_ctxs.iter().enumerate() {
+                let inputs = tx.inputs().iter().filter_map(|input| match input {
+                    zebra_chain::transparent::Input::PrevOut { outpoint, .. } => Some((outpoint.hash.0, outpoint.index)),
+                    _ => None,
+                });
+                let outputs = tx.outputs().iter().map(|output| output.lock_script.as_raw_bytes());
+                let scan_info = &mut scan_infos[ufvk_i];
+                let utxos = &mut utxos_per_ufvk[ufvk_i];
+                match timed(&PROF.transparent_ns, || wallet::scanner::scan_tx_transparent(scan_info, utxos, scan_ctx, height, is_coinbase, inputs, outputs, &mut txid)) {
+                    Ok((new_info, contains_my_t_spend)) => {
+                        t_spend_per_ufvk[ufvk_i] = contains_my_t_spend;
+                        if new_info {
+                            println!("scan info at {height}: {scan_info:?}");
+                        }
+                    }
+                    Err(err) => return Err(format!("failed to scan tx {tx_i} at height {height}: {err}")),
+                }
+            }
+
+            // Only staking txs need the librustzcash view (bond terms, Orchard trial decryption).
+            let staking_action = tx.staking_action();
+            let parsed = if staking_action.is_some() {
+                PROF.staking.fetch_add(1, Relaxed);
+                let tx_bytes = match timed(&PROF.serialize_ns, || tx.zcash_serialize_to_vec()) {
+                    Ok(bytes) => bytes,
+                    Err(err) => return Err(format!("failed to serialize tx {tx_i} at height {height}: {err:?}")),
+                };
+                match timed(&PROF.parse_ns, || wallet::scanner::parse_tx(&tx_bytes, height)) {
+                    Ok(parsed) => Some(parsed),
+                    Err(err) => return Err(format!("failed to parse tx {tx_i} at height {height}: {err}")),
+                }
+            } else {
+                None
             };
 
-
-            let txid = tx.unmined_id().mined_id();
-
-            if let Some(staking_action) = tx.staking_action() {
+            if let (Some(staking_action), Some((_, txid_lrz))) = (staking_action, &parsed) {
+                debug_assert_eq!(*txid_lrz, tx.hash().0, "txids from zebra/librustzcash disagree");
                 let mut bond_retargets = vec![HashMap::new()];
                 // Note(Sam): It seems weird that the bonds never get deleted. I don't know what I was
                 // thinking when I did that. But it makes this code easy.
-                zebra_state::update_chain_tip_with_delegation_bond(
+                let _ = timed(&PROF.replay_ns, || zebra_state::update_chain_tip_with_delegation_bond(
                     &mut zebra_chain::value_balance::ValueBalance::zero(),
                     &mut delegation_bonds,
                     &mut bond_retargets,
                     &mut finalizer_rewards,
-                    &staking_action,
-                    &txid.0.into(),
+                    staking_action,
+                    &zebra_chain::transaction::Hash(*txid_lrz),
                     zebra_state::TransactionLocation {
                         height: ZebBlockHeight(height),
                         index: zebra_state::TransactionIndex::from_index(tx_i.try_into().unwrap()),
                     }
-                );
+                ));
             }
 
-            zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds, &mut finalizer_rewards);
-
-            for (ufvk_i, scan_ctx) in scan_ctxs.iter().enumerate() {
-                let utxos = &mut utxos_per_ufvk[ufvk_i];
-                let scan_info = &mut scan_infos[ufvk_i];
-                match wallet::scanner::scan_tx(scan_info, utxos, &coinbase_tx_bytes, tx_i, height, scan_ctx, txid.0) {
-                    Ok(false) => {},
-                    Ok(true) => println!("scan info at {height}: {scan_info:?}"),
-                    Err(err) => return Err(format!("failed to scan {txid:?} at height {height}: {err}")),
+            if let Some((tx_lrz, txid_lrz)) = &parsed {
+                for (ufvk_i, scan_ctx) in scan_ctxs.iter().enumerate() {
+                    let scan_info = &mut scan_infos[ufvk_i];
+                    if wallet::scanner::scan_tx_staking(scan_info, tx_lrz, *txid_lrz, t_spend_per_ufvk[ufvk_i], height, scan_ctx) {
+                        println!("scan info at {height}: {scan_info:?}");
+                    }
                 }
             }
         }
+
+        // PoS issuance is applied once per block, after that block's staking actions, exactly as
+        // the live commit path does -- and only for blocks that pay under the variable payout
+        // rule. `block_pays_pos_issuance` is the replay of the gate's decision.
+        let fat_pointer = block.header.fat_pointer_to_bft_block.clone();
+        let parent_fat_pointer = match &prev_fat_pointer {
+            Some(fat_pointer) => fat_pointer.clone(),
+            None if height == 0 => FatPointerToBftBlock::null(),
+            None => {
+                // First block of the range: its parent was not scanned, so read its header.
+                match (call.read_state)(StateReadRequest::Block(ZebBlockHeight(height - 1).into())).await {
+                    Ok(StateReadResponse::Block(Some(parent))) => parent.header.fat_pointer_to_bft_block.clone(),
+                    _ => return Err(format!("failed to get block at height {} to read its certificate", height - 1)),
+                }
+            }
+        };
+        if height != 0
+            && block_pays_pos_issuance(&internal_handle, ZebBlockHeight(height), &fat_pointer, &parent_fat_pointer).await?
+        {
+            timed(&PROF.replay_ns, || zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds, &mut finalizer_rewards));
+        }
+        prev_fat_pointer = Some(fat_pointer);
     }
 
     for scan_info in &mut scan_infos {
@@ -1805,6 +2085,7 @@ async fn total_issuance_from_key(
         println!("final scan info: {scan_info:?}");
     }
 
+    PROF.report(t_wall.elapsed());
     Ok(scan_infos)
 }
 
@@ -1851,10 +2132,12 @@ async fn tfl_service_incoming_request(
                 let (final_height, _final_hash) =
                     match tfl_final_block_height_hash(&internal_handle).await {
                         Some(v) => v,
+                        // Nothing is final yet, so neither is this transaction; see
+                        // tfl_block_finality_from_height_hash.
                         None => {
-                            return Err(TFLServiceError::Misc(
-                                "There is no final block.".to_string(),
-                            ));
+                            return Ok(TFLServiceResponse::TxFinalityStatus(Some(
+                                TFLBlockFinality::NotYetFinalized,
+                            )));
                         }
                     };
 
@@ -1879,13 +2162,42 @@ async fn tfl_service_incoming_request(
         })),
 
         TFLServiceRequest::FatPointerToBFTChainTip(proposed_pow_height) => {
+            // Walk back from the tip to the highest BFT block this PoW height may carry: one
+            // whose do_not_include_until_bc_height allows it, AND whose snapshot is deep enough
+            // to satisfy the sigma-confirmation rule the fat-pointer gate enforces (see
+            // `call_from_state_to_crosslink_to_ask_about_fat_pointers`).
+            //
+            // The second condition belongs here as much as in the gate: the gate rejects a
+            // violation PERMANENTLY, so handing the miner a too-new certificate produces a block
+            // that can never be committed and is re-mined forever. Being one PoW block behind the
+            // proposer is enough to reach that state -- this node can hold a decided BFT block
+            // whose snapshot sits sigma below a tip it has not seen yet.
+            //
+            // Each candidate's snapshot height comes from the chain, the same way the gate gets
+            // it. The walk normally stops at the first candidate, so this is one lookup.
+            let sigma = internal_handle.params.bc_confirmation_depth_sigma;
+            let n = internal_handle.internal.lock().await.bft_blocks.len();
+            let mut suitable_height = None;
+            for i in (0..n).rev() {
+                let (do_not_include, snapshot_hash) = {
+                    let internal = internal_handle.internal.lock().await;
+                    let b = &internal.bft_blocks[i];
+                    if b.headers.is_empty() {
+                        continue; // placeholder from out-of-order ingest
+                    }
+                    (b.do_not_include_until_bc_height, ZebBlockHash(b.snapshot_block_hash().0))
+                };
+                if do_not_include > proposed_pow_height {
+                    continue;
+                }
+                if let Some(h) = block_height_from_hash(&call, snapshot_hash).await {
+                    if h.0 as u64 + sigma + 1 <= proposed_pow_height {
+                        suitable_height = Some(i + 1); // 1-based (see fat_pointer_to_block_at_height)
+                        break;
+                    }
+                }
+            }
             let internal = internal_handle.internal.lock().await;
-            // Walk back from the tip to find the highest BFT block whose
-            // do_not_include_until_bc_height <= proposed_pow_height.
-            let n = internal.bft_blocks.len();
-            let suitable_height = (0..n).rev()
-                .find(|&i| internal.bft_blocks[i].do_not_include_until_bc_height <= proposed_pow_height)
-                .map(|i| i + 1); // 1-based (see fat_pointer_to_block_at_height)
             let fat_ptr = if let Some(h) = suitable_height {
                 fat_pointer_to_block_at_height(&internal.bft_blocks, &internal.fat_pointer_to_tip, h as u64)
                     .unwrap_or_else(|| FatPointerToBftBlock::null())

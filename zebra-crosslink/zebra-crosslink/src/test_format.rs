@@ -123,12 +123,17 @@ impl TFInstr {
                 str += &format!(
                     "{}, snapshot: {}, hdrs: [{} .. {}]",
                     block.blake3_hash(),
-                    block.snapshot_hash().expect("at least 1 header"),
+                    block.snapshot_block_hash(),
                     BlockHash::from_header_data(&block.headers[0]),
                     BlockHash::from_header_data(block.headers.last().unwrap())
                 )
             }
-            Some(TestInstr::SetParams(_)) => str += &format!("{} {}", instr.val[0], instr.val[1]),
+            Some(TestInstr::SetParams(params)) => {
+                str += &format!(
+                    "{} {} {:?}",
+                    params.bc_confirmation_depth_sigma, params.finalization_gap_bound, params.bootstrap
+                )
+            }
             Some(TestInstr::ExpectPoWChainLength(h)) => str += &h.to_string(),
             Some(TestInstr::ExpectPoSChainLength(h)) => str += &h.to_string(),
             Some(TestInstr::ExpectPoWBlockFinality(hash, f)) => {
@@ -202,21 +207,18 @@ impl TF {
             data: Vec::new(),
         };
 
-        // ALT: push as data & determine available info by size if we add more
-        const_assert!(size_of::<ZcashCrosslinkParameters>() == 16);
-        // enforce only 2 param members
+        // Enforce that every parameter is written: adding a member fails to compile here.
         let ZcashCrosslinkParameters {
             bc_confirmation_depth_sigma,
             finalization_gap_bound,
+            bootstrap,
         } = *params;
-        let val = [bc_confirmation_depth_sigma, finalization_gap_bound];
-
-        // NOTE:
-        // This empty data slice results in a 0-length data at the current data offset... We could
-        // also set it to 0-offset to clearly indicate there is no data intended to be used.
-        // (Because the offset is from the beginning of the file, nothing will refer to valid
-        // data at offset 0, which is the magic of the header)
-        // TODO (once handled): tf.push_instr_ex(TFInstr::SET_PARAMS, 0, &[], val);
+        tf.push_instr_ex(
+            TFInstr::SET_PARAMS,
+            0,
+            &bootstrap_to_bytes(bootstrap),
+            [bc_confirmation_depth_sigma, finalization_gap_bound],
+        );
 
         tf
     }
@@ -454,6 +456,70 @@ fn test_check(flags: u32, condition: bool, message: &str) {
 
 use crate::*;
 
+/// Parameters for scenarios that feed BFT blocks in directly, which is every scenario that is not
+/// testing the bootstrap itself. A file with no `SET_PARAMS` is read as these: every scenario was
+/// written that way before the bootstrap became a parameter.
+pub const HARNESS_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParameters {
+    bootstrap: BftBootstrap::Supplied,
+    // Sigma and L are pinned here rather than inherited from `PROTOTYPE_PARAMETERS`. The
+    // scenes in the test suite are hand-built at specific heights: a BFT block carries exactly
+    // sigma headers, and the PoW block that cites it has to sit at least sigma + 1 above the
+    // block that certificate finalizes. Inheriting sigma would silently invalidate every one of
+    // those scenes the moment the network parameter moved, which is not what changing a network
+    // parameter should mean. The rules under test do not depend on sigma's value; the live
+    // network's value is exercised on a testnet, not here.
+    bc_confirmation_depth_sigma: 3,
+    finalization_gap_bound: 7,
+};
+
+// `SET_PARAMS` carries sigma and L in `val`, and the bootstrap in its data.
+const TF_BOOTSTRAP_SUPPLIED: u8 = 0;
+const TF_BOOTSTRAP_FROM_CHAIN: u8 = 1;
+
+fn bootstrap_to_bytes(bootstrap: BftBootstrap) -> Vec<u8> {
+    match bootstrap {
+        BftBootstrap::Supplied => vec![TF_BOOTSTRAP_SUPPLIED],
+        BftBootstrap::FromChain { roster_height, activation_height } => {
+            let mut bytes = vec![TF_BOOTSTRAP_FROM_CHAIN];
+            bytes.extend_from_slice(&roster_height.to_le_bytes());
+            bytes.extend_from_slice(&activation_height.to_le_bytes());
+            bytes
+        }
+    }
+}
+
+fn bootstrap_from_bytes(bytes: &[u8]) -> Option<BftBootstrap> {
+    match bytes {
+        [TF_BOOTSTRAP_SUPPLIED] => Some(BftBootstrap::Supplied),
+        [TF_BOOTSTRAP_FROM_CHAIN, r0, r1, r2, r3, a0, a1, a2, a3] => Some(BftBootstrap::FromChain {
+            roster_height: u32::from_le_bytes([*r0, *r1, *r2, *r3]),
+            activation_height: u32::from_le_bytes([*a0, *a1, *a2, *a3]),
+        }),
+        _ => None,
+    }
+}
+
+/// The Crosslink parameters a test file's node must run with: its leading `SET_PARAMS`, or
+/// [`HARNESS_PARAMETERS`] if it has none. They are consensus parameters, so the harness builds the
+/// network with them before the node boots instead of applying them when the instruction runs.
+pub fn crosslink_parameters_for_test(bytes: &[u8]) -> ZcashCrosslinkParameters {
+    let Ok(tf) = TF::read_from_bytes(bytes) else {
+        return HARNESS_PARAMETERS;
+    };
+    let Some(first) = tf.instrs.first() else {
+        return HARNESS_PARAMETERS;
+    };
+    if first.kind != TFInstr::SET_PARAMS {
+        return HARNESS_PARAMETERS;
+    }
+    // A malformed SET_PARAMS falls back here, then fails loudly when the instruction is read.
+    if let Some(TestInstr::SetParams(params)) = tf_read_instr(bytes, first) {
+        params
+    } else {
+        HARNESS_PARAMETERS
+    }
+}
+
 pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> {
     const_assert!(TFInstr::COUNT == 8);
     match instr.kind {
@@ -474,6 +540,7 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
         TFInstr::SET_PARAMS => Some(TestInstr::SetParams(ZcashCrosslinkParameters {
             bc_confirmation_depth_sigma: instr.val[0],
             finalization_gap_bound: instr.val[1],
+            bootstrap: bootstrap_from_bytes(instr.data_slice(bytes))?,
         })),
 
         TFInstr::EXPECT_POW_CHAIN_LENGTH => {
@@ -560,9 +627,15 @@ pub(crate) async fn handle_instr(
             test_check(flags, force_feed_ok, &msg);
         }
 
-        TestInstr::SetParams(_) => {
+        TestInstr::SetParams(params) => {
             debug_assert!(instr_i == 0, "should only be set at the beginning");
-            todo!("Params");
+            // Consensus parameters are fixed when the network is built, before the node boots (see
+            // `crosslink_parameters_for_test`), so all that remains is confirming the node agrees.
+            test_check(
+                flags,
+                params == internal_handle.params,
+                &format!("SET_PARAMS: file declares {:?}, node runs {:?}", params, internal_handle.params),
+            );
         }
 
         TestInstr::ExpectPoWChainLength(h) => {
@@ -646,16 +719,18 @@ pub(crate) async fn handle_instr(
 }
 
 pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs: &[TFInstr]) {
+    // A failed deserialize is a hard error for a normal test but an expected input rejection
+    // for the fuzzer; `uhh_option` decides which via TEST_ON_FAIL (PANIC vs recover).
+    let on_fail = *TEST_ON_FAIL.lock().unwrap();
     for instr_i in 0..instrs.len() {
-        let instr_val = &instrs[instr_i];
         // info!(
         //     "Loading instruction {}: {} ({})",
         //     instr_i,
-        //     TFInstr::string_from_instr(bytes, instr_val),
-        //     instr_val.kind
+        //     TFInstr::string_from_instr(bytes, &instrs[instr_i]),
+        //     instrs[instr_i].kind
         // );
 
-        if let Some(instr) = tf_read_instr(bytes, &instrs[instr_i]) {
+        if let Some(instr) = uhh_option(tf_read_instr(bytes, &instrs[instr_i]), on_fail) {
             handle_instr(
                 &internal_handle,
                 bytes,
@@ -664,8 +739,6 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
                 instr_i,
             )
             .await;
-        } else {
-            panic!("Failed to read {}", TFInstr::str_from_kind(instr_val.kind));
         }
 
         *TEST_INSTR_C.lock().unwrap() = instr_i + 1; // accounts for end
@@ -699,9 +772,11 @@ pub(crate) async fn instr_reader(internal_handle: TFLServiceHandle) {
 
     let bytes = TEST_INSTR_BYTES.lock().unwrap().clone();
 
-    let tf = match TF::read_from_bytes(&bytes) {
+    // Normal tests PANIC on an unparseable envelope; the fuzzer recovers (TEST_ON_FAIL).
+    let on_fail = *TEST_ON_FAIL.lock().unwrap();
+    let tf = match uhh(TF::read_from_bytes(&bytes), on_fail) {
         Ok(tf) => tf,
-        Err(err) => panic!("Invalid test data: {}", err), // TODO: specifics
+        Err(_) => return, // uhh already panicked (PANIC) or logged (fuzzer)
     };
 
     *TEST_INSTRS.lock().unwrap() = tf.instrs.clone();
@@ -715,12 +790,25 @@ pub(crate) async fn instr_reader(internal_handle: TFLServiceHandle) {
         "didn't complete test {}",
         TEST_NAME.lock().unwrap()
     );
-    // make sure the test as a whole actually fails for failed instructions
-    assert!(
-        TEST_FAILED_INSTR_IDXS.lock().unwrap().is_empty(),
-        "failed test {}",
-        TEST_NAME.lock().unwrap()
-    );
+    // make sure the test as a whole actually fails for failed instructions.
+    // Include the recorded (instruction index, message) pairs in the message so a red test is
+    // self-describing: otherwise these are collected but discarded here, and diagnosing which
+    // instruction failed needs TEST_CHECK_ASSERT raised and a rebuild.
+    //
+    // The lock MUST be released before TEST_SHUTDOWN_FN below: the shutdown path
+    // (crosslink shutdown fn -> dump_test_instrs) re-locks this same std Mutex on this thread,
+    // and std Mutex is not reentrant, so holding the guard across the shutdown call deadlocks
+    // every PASSING test at exit. (A failing test unwinds on the assert and drops the guard, so
+    // only green tests hang.) Hence the explicit scope -- do not lift the binding out of it.
+    {
+        let failed_instrs = TEST_FAILED_INSTR_IDXS.lock().unwrap();
+        assert!(
+            failed_instrs.is_empty(),
+            "failed test {}: {:?}",
+            TEST_NAME.lock().unwrap(),
+            *failed_instrs
+        );
+    }
     println!("Test done, shutting down");
     // #[cfg(feature = "viz_gui")]
     // tokio::time::sleep(Duration::from_secs(120)).await;
