@@ -2,10 +2,34 @@
 
 This document separates the three Crosslink 2 protocol quantities that Zebra's design retains
 from Zebra's irreversible state-commit boundary, legacy reorg-depth fallback, and
-consumer-specific meanings of "final". It records the implementation as of this revision of
-the repository, describes the behavior the implementation is being changed to (sticky fork
-choice, persisted `fin`, and every CL2 validity rule), and identifies the decisions that remain
-open.
+consumer-specific meanings of "final".
+
+It keeps three layers apart:
+
+- **Book**: Crosslink 2 as the pinned TFL Book specifies it (§1).
+- **Zebra Crosslink**: the behavior this tree implements. It is the Book's construction without
+  Stalled Mode, with sticky fork choice, persisted `fin`, and every remaining CL2 validity rule.
+  Statements in this layer are requirements, including where the code does not meet them yet.
+- **Current tree**: the code at this revision of the repository. Statements in this layer
+  describe code that the implementation changes, and are not requirements.
+
+| section | layer |
+|---|---|
+| §1 Scope | Book, with Zebra Crosslink's parameter and Stalled Mode choices |
+| §2 Terminology | Zebra Crosslink; the Zebra-specific quantities note their current-tree form |
+| §3 Crosslink 2 model | Book, with the consequences for Zebra Crosslink |
+| §4.1 Raw fork choice | Book |
+| §4.2 Finalized-prefix policy | a general policy, and its current-tree form |
+| §4.3 Sticky fork choice | Zebra Crosslink, ending with the current tree |
+| §5 Implementation inventory | current tree |
+| §6 Divergences | current tree, measured against Zebra Crosslink |
+| §7 Names and consumer contracts | Zebra Crosslink |
+| §8 Implementation status and pitfalls | current-tree facts that constrain the implementation |
+| §9 Open decisions | outside this document's implementation work |
+
+Where a section mixes layers, a paragraph opens with its layer in bold. The ordered
+implementation work, and the questions that still need a design pass, are in
+[`IMPLEMENTATION.md`](./IMPLEMENTATION.md).
 
 A companion visual explanation is in
 [`FINALITY_DIAGRAM.html`](./FINALITY_DIAGRAM.html).
@@ -38,11 +62,11 @@ bounded-available client view `ba_μ` with its confirmation depth `μ`. This des
 them; §3.3 derives why omitting Stalled Mode removes the other two, and what the remaining
 definitions guarantee.
 
-The prototype sets `σ = 3` in `librustzcash/zcash_primitives/src/bft.rs`
+**Current tree.** The prototype sets `σ = 3` in `librustzcash/zcash_primitives/src/bft.rs`
 (`PROTOTYPE_PARAMETERS`). The source code explicitly warns that this value has not been
 verified as secure or performant. The same struct also carries `finalization_gap_bound: 7`, the
-Book's `L`. It has no protocol meaning in this design: only test formatting reads it, and its
-doc comment still describes Stalled Mode activation.
+Book's `L`. It has no meaning in Zebra Crosslink, which removes it: only test formatting reads
+it, and its doc comment still describes Stalled Mode activation.
 
 ### Notation
 
@@ -72,23 +96,24 @@ The Book's fourth quantity, the bounded-available chain `ba_μ`, is not part of 
 Those three quantities do not exhaust the meanings carried by "final" in this tree. Zebra also
 has:
 
-- a **canonical-finalized policy point**, proposed here as `canonical_finalized_tip`, that
-  makes only chains containing that point eligible for local activation;
+- a **canonical-finalized policy point**, `canonical_finalized_tip`, that makes only chains
+  containing that point eligible for local activation;
 - a **physical database-commit boundary**, the finalized database's tip, which advances only
   after the finalized-state write has succeeded; and
-- a **legacy reorg-depth marker**, roughly `tip − MAX_BLOCK_REORG_HEIGHT`, formerly substituted
-  by the finality RPCs when no Crosslink marker existed. That substitution has been removed and
-  the marker now has no consumer, but the quantity remains distinct from the three above and is
-  listed here so that it is not reintroduced under a Crosslink name.
+- a **legacy reorg-depth marker**, roughly `tip − MAX_BLOCK_REORG_HEIGHT`. It has no consumer
+  in the current tree, whose finality RPCs no longer substitute it when no Crosslink marker
+  exists. It is listed here so that it is not reintroduced under a Crosslink name.
 
 Protocol `fin` and these Zebra quantities must not share an undocumented storage slot. In raw
-CL2, `fin` can remain fixed on a branch that raw `bc_best` no longer contains. In the current
-Zebra implementation, irreversible state commitment instead enforces
-`canonical_finalized_tip ⪯ canonical_tip` locally. That is an additional chain-activation and
-state policy.
+CL2, `fin` can remain fixed on a branch that raw `bc_best` no longer contains. A
+finalized-prefix policy instead enforces `canonical_finalized_tip ⪯ canonical_tip` locally,
+which is an additional chain-activation and state policy (§4.2).
 
-Under sticky fork choice (§4.3) the policy floor is `fin` itself, so `canonical_finalized_tip`
-and `fin` are one quantity. Two stored values remain: `fin`, persisted in the finalized database
+**Current tree.** `CrosslinkFinalizeBlock` enforces that policy with a floor taken from each BFT
+decision as it is decided (§4.2, §5.2).
+
+**Zebra Crosslink.** Under sticky fork choice (§4.3) the policy floor is `fin` itself, so
+`canonical_finalized_tip` and `fin` are one quantity. Two stored values remain: `fin`, persisted in the finalized database
 as its own block hash, and the database's finalized tip, which is the higher of `fin` and the
 block Zebra commits at reorg depth. The finalized tip equals `fin` while finality lags the
 best tip by less than about `MAX_BLOCK_REORG_HEIGHT` blocks.
@@ -127,7 +152,8 @@ candidate(H) := lca(snapshot(LF(H)), prune_σ(H))
 
 The walk is `bc → bft → bft → bc`, followed by the last-common-ancestor clamp.
 
-`bft-last-final(B)` is the last final ancestor of `B`, `B` included. In Zebra, `Π_bft` decides
+`bft-last-final(B)` is the last final ancestor of `B`, `B` included. In Zebra, in the current
+tree and in Zebra Crosslink alike, `Π_bft` decides
 each bft-block individually, and a decided block is final. A bc-block's `context_bft` is a fat
 pointer, and a node resolves it only against `TFLServiceInternal::bft_blocks`, whose entries are
 all decided; a pointer that does not resolve defers the bc-block (§6.2, Extension). Every
@@ -257,9 +283,9 @@ are:
   `ba_μ` (continue for at most `L` blocks). Here it is `fin` versus a `bc_best` view that never
   stops and has no bound on how much can be rolled back to `fin`.
 
-In the current Zebra prototype, the finalized-prefix policy of §4.2 locally forces
-`canonical_finalized_tip ⪯ canonical_tip`, and sticky fork choice (§4.3) keeps `fin ⪯ bc_best`.
-Either restores, as a chain-selection policy, a prefix relation that `ba_μ` provided by
+In the current tree, the collapse onto each decided block (§4.2) locally forces
+`canonical_finalized_tip ⪯ canonical_tip`; in Zebra Crosslink, sticky fork choice (§4.3) keeps
+`fin ⪯ bc_best`. Either restores, as a chain-selection policy, a prefix relation that `ba_μ` provided by
 definition. Neither limits the finality gap, and both cost local liveness whenever the dominant
 chain excludes the floor (§4.3).
 
@@ -282,8 +308,8 @@ add:
 - **Linearity:** `snapshot(parent(B)) ⪯bc snapshot(B)`.
 - **Tail Confirmation:** `B.headers_bc` form the `σ`-block tail of a bc-valid chain.
 
-Zebra Crosslink implements all five rules above (§6.2 lists where the current tree does not
-yet).
+**Zebra Crosslink** enforces all five rules above. **Current tree:** Valid context and
+Extension only (§6.2).
 
 Tail Confirmation is objective: `σ` consecutive headers ending at a bc-valid block are the tail
 of the chain that ends at that block, whatever the validator's own best chain. The Book
@@ -317,7 +343,8 @@ a chain containing `snapshot(B)` becomes their best chain again. Under honest pr
 bc-block, `snapshot(B)` sits about `σ` blocks below the proposer's tip, so a reorganization
 slightly deeper than `σ` reaches this case.
 
-**Finality lag under honest production.** A proposer at tip `T` carries headers `T − σ + 1`
+**Finality lag under honest production.** This follows from the Book's honest proposal and
+applies to Zebra Crosslink. A proposer at tip `T` carries headers `T − σ + 1`
 through `T`, so the decided block's snapshot is `T − σ`. The first bc-block that can cite that
 decision is `T + 1`, and only if its template was built after the decision arrived; then
 `candidate(T + 1) = T − σ`. In steady state `fin` therefore trails the best tip by at least
@@ -377,9 +404,10 @@ longer applies to that execution.
 The Book [recommends baking in a BFT checkpoint and withholding `fin` from
 clients](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L557-L562)
 until the checkpoint precedes `LF(bc_best)`, its snapshot precedes `fin`, and `fin` is recent.
-This is an unimplemented sync-safety recommendation, not a block-validity or consensus rule. The
-Book applies it to `fin` and `ba_μ`; here it covers `fin` only, and says nothing about exposing
-`bc_best`.
+This is a sync-safety recommendation, not a block-validity or consensus rule. The Book applies
+it to `fin` and `ba_μ`; here it covers `fin` only, and says nothing about exposing `bc_best`.
+Zebra Crosslink marks with an `@Todo` where the condition applies and does not implement it;
+the current tree has neither.
 
 ## 4. Raw fork choice and finalized-prefix policy
 
@@ -442,10 +470,10 @@ This rule preserves the finalized prefix for each node that enforces it. It does
 prove global agreement, network progress, or Prefix Consistency for unfinalized blocks. If an
 enforcing node has no eligible progressing chain, local liveness must yield.
 
-Current Zebra's `CrosslinkFinalizeBlock` behavior is stronger still: it commits database state
+**Current tree.** `CrosslinkFinalizeBlock` is stronger still: it commits database state
 on the named branch and discards incompatible non-finalized branches. This makes the policy
-physical. The CL2 construction does not mandate it. §4.3 specifies the rule it becomes when the
-floor is `fin`.
+physical. The CL2 construction does not mandate it. In Zebra Crosslink the floor is `fin`, and
+the rule becomes sticky fork choice (§4.3).
 
 Omitting Stalled Mode changes what the policy constrains. The Book pairs raw fork choice with
 Stalled Mode, which confines a dominant unfinalizable branch to stalled blocks after `L`. Without
@@ -527,8 +555,7 @@ The Book makes three statements that bear on a change of this kind:
 #### Properties
 
 These follow from the definitions of `candidate` and `fin` (§3.1, §3.2) and the switch
-condition, and hold wherever protocol `fin` is computed, which this tree does not do yet
-(§6.1).
+condition, and hold in Zebra Crosslink. The current tree does not compute `fin` (§6.1).
 
 - `fin ⪯ bc_best` holds on the node at all times. The raw-CL2 state in which `fin` stays fixed
   on a branch that `bc_best` no longer contains (§4.1) does not arise.
@@ -551,8 +578,8 @@ condition, and hold wherever protocol `fin` is computed, which this tree does no
 
 Each case compares sticky fork choice with raw work-based fork choice. Statements under
 *With Linearity* assume `Π_bft` Final Agreement and enforcement of the Linearity rule, as the
-abstract outcome in FINALITY_DIAGRAM §4 does. Statements under *Without Linearity* apply to the
-current prototype, which enforces neither Linearity nor Last Final Snapshot (§6.2).
+abstract outcome in FINALITY_DIAGRAM §4 does; Zebra Crosslink enforces Linearity, so they
+describe it. Statements under *Without Linearity* show what the rule prevents.
 
 - *Candidate regression with `fin` still on the heavier chain* (FINALITY_DIAGRAM §3). Both rules
   switch to the heavier chain.
@@ -613,9 +640,10 @@ current prototype, which enforces neither Linearity nor Last Final Snapshot (§6
   - *Without Linearity:* conflicting `fin` values need no Final Agreement failure; the
     partition case above is an example.
 
-#### Implementation in Zebra
+#### Implementation in Zebra Crosslink
 
-The rule is implemented through the finalized database rather than as a separate chain filter:
+These are requirements; §5 describes the current tree. The rule is implemented through the
+finalized database rather than as a separate chain filter:
 
 - On every change of `bc_best`, the node computes `N := candidate(bc_best)`. If `fin ⪯ N` and
   `N ≠ fin`, it commits `N` through `CrosslinkFinalizeBlock` and then stores `N` as `fin`. A
@@ -623,7 +651,7 @@ The rule is implemented through the finalized database rather than as a separate
 - The commit discards every non-finalized chain that does not contain `N`, and Zebra rejects
   blocks that fork below its finalized tip. Chains that exclude `fin` therefore never enter the
   node's view, which is the switch condition above. That rejection is the refused switch; the
-  node reports it on stdout, and a persisted hazard record is future work.
+  node reports it on stdout, and a persisted hazard record is an `@Todo`.
 - `fin` is stored in the finalized database as its own block hash, so the floor survives a
   restart. The database's finalized tip is the higher of `fin` and the reorg-depth commit (next
   bullet), so finality readers take `fin`, never the finalized tip.
@@ -640,9 +668,10 @@ The rule is implemented through the finalized database rather than as a separate
   synchronous domain with no asynchronous calls between them.
 - Zebra also commits the root of the best chain to the finalized database once the chain is
   longer than `MAX_BLOCK_REORG_HEIGHT` (from `zcash_protocol::consensus`, applied in
-  `zebra-state/src/service/write.rs`). The value in this tree is 99. Upstream Zebra raised it to
-  999, and that change was lost when this tree was rebased onto new Zebra, so 999 is the intended
-  value; the depths of 99 written elsewhere in this document follow the tree. Chains forking below that point are no longer in view.
+  `zebra-state/src/service/write.rs`). The value in the current tree is 99. Upstream Zebra
+  raised it to 999, and that change was lost when this tree was rebased onto new Zebra, so 999
+  is the intended value; the depths of 99 written elsewhere in this document follow the tree.
+  Chains forking below that point are no longer in view.
   On a Zebra node the effective floor is the higher of `fin` and that depth-committed block.
   If `bc_best` runs more than that depth past the point where the chain to `bft_final_snapshot`
   forks from it, the depth commit writes a block that conflicts with `bft_final_snapshot`. The
@@ -657,21 +686,21 @@ below the newest final snapshot, so a reorganization that forks between the two 
 sticky fork choice and then leaves finality on the new branch waiting (§3.4, Linearity and bc
 reorganizations).
 
-Current tree:
+#### Current tree
 
-- The rule needs protocol `fin`, which this tree does not compute (§6.1). The current collapse
+- The rule needs protocol `fin`, which the current tree does not compute (§6.1). Its collapse
   onto a BFT-decided branch (§4.2, §6.3) is a related rule with a different floor: the stored
   marker, taken directly from a decided BFT block when it is decided rather than from
   `candidate(bc_best)`. With that floor, the invariant above does not follow: the marker need not
   lie on the node's best chain when it advances, and a known side-chain hash becomes canonical
   (§5.2).
-- The prototype enforces neither Linearity nor Last Final Snapshot (§6.2), so the
-  *Without Linearity* outcomes above are the ones that apply to it.
+- It enforces neither Linearity nor Last Final Snapshot (§6.2).
 
-## 5. Zebra implementation inventory
+## 5. Current tree: implementation inventory
 
-This inventory refers to symbols in the tree this document ships with; symbol names are
-preferred over brittle working tree line numbers.
+Everything in this section describes the current tree, not requirements. It refers to symbols
+in the tree this document ships with; symbol names are preferred over brittle working tree
+line numbers.
 
 ### 5.1 The overloaded marker and write paths
 
@@ -709,8 +738,8 @@ marker whose database state has not been finalized.
 
 A decision and its database commit are coupled. Tenderlink awaits the decide callback before it
 starts the next round, and the callback returns only after `CrosslinkFinalizeBlock` succeeds,
-so BFT progress waits on the finalized-state write. Sticky fork choice (§4.3) separates them: a
-decision advances `bft_final_snapshot`, and the finalized state follows `fin`.
+so BFT progress waits on the finalized-state write. In Zebra Crosslink they are separate (§4.3):
+a decision advances `bft_final_snapshot`, and the finalized state follows `fin`.
 
 The state behavior depends on whether the hash is known:
 
@@ -729,8 +758,8 @@ The state behavior depends on whether the hash is known:
   panics at startup. The replay-watermark loop just above it tolerates that case.
 
 Consequently, the stored marker is neither a reliable `fin` implementation nor a reliable
-record of the finalized database's tip. Persisted `fin` advances only after the state request
-succeeds, and only by the CL2 update rule.
+record of the finalized database's tip. In Zebra Crosslink, persisted `fin` advances only after
+the state request succeeds, and only by the CL2 update rule.
 
 ### 5.3 Consumers
 
@@ -788,7 +817,10 @@ The same per-block calculation is replayed by `fixup_aggregated_stakes` in
 entry point) and by the wallet projection path in `zebra-crosslink/zebra-crosslink/src/lib.rs`.
 Any future consensus change must keep all three paths identical.
 
-## 6. Divergences and hazards by category
+## 6. Current tree: divergences from Zebra Crosslink
+
+Each item states a current-tree fact and, where it is not evident, the Zebra Crosslink behavior
+it departs from.
 
 ### 6.1 Derivation and update trigger
 
@@ -869,10 +901,10 @@ Any future consensus change must keep all three paths identical.
 `CrosslinkFinalizeBlock` collapses non-finalized state onto a known named branch. This locally
 enforces a finalized-prefix activation policy and prevents a higher-score conflicting chain
 from becoming canonical. Raw CL2 does not impose that rule. The existing test
-`crosslink_pow_switch_to_finalized_chain_fork_even_though_longer_chain_exists` documents the
-prototype behavior.
+`crosslink_pow_switch_to_finalized_chain_fork_even_though_longer_chain_exists` documents that
+behavior.
 
-The documentation and implementation must separately name:
+Zebra Crosslink names separately:
 
 - protocol `local_finalized_tip` (`fin`), which under sticky fork choice is also the Zebra
   policy floor `canonical_finalized_tip` (§2, §4.3); and
@@ -888,9 +920,9 @@ consequences:
   Any response to one, such as alerts, wallet warnings, or operator action, is outside
   consensus.
 - A best chain that has forked below `fin` (§3.5) can carry ordinary spending transactions for
-  as long as it dominates. Under raw CL2 fork choice nothing limits that activity. In the
-  current prototype, only the finalized-prefix policy of §4.2 keeps an enforcing node from
-  activating such a branch.
+  as long as it dominates. Under raw CL2 fork choice nothing limits that activity. In Zebra
+  Crosslink, sticky fork choice keeps a node off such a branch (§4.3); in the current tree, the
+  collapse onto each decided block does (§4.2).
 
 ### 6.5 Client exposure and API semantics
 
@@ -910,9 +942,9 @@ still the legacy-fed slot, not `fin`.
   decide path; a hash whose chain is dropped after validation can retry forever (§5.2).
 - `current_bc_final` is unused duplicate state.
 
-## 7. Proposed names and consumer decision matrix
+## 7. Names and consumer contracts
 
-The protocol names should encode their definitions:
+This section is Zebra Crosslink. The protocol names encode their definitions:
 
 | protocol quantity | value identifier | optional newtype |
 |---|---|---|
@@ -921,8 +953,8 @@ The protocol names should encode their definitions:
 | `fin` | `local_finalized_tip` | `LocalFinalizedTip` |
 | `bft_final_snapshot` | `bft_final_snapshot` | `BftFinalSnapshot` |
 
-The database's finalized tip needs a name distinct from `fin` (§6.3). The legacy reorg-depth value should keep a name that says it is a
-reorg-depth marker, not Crosslink finality.
+The database's finalized tip has a name distinct from `fin` (§6.3). The legacy reorg-depth
+value keeps a name that says it is a reorg-depth marker, not Crosslink finality.
 
 No protocol view lies between the best tip and the finalized tip, so no CL2 quantity is a
 default for "confirmed" presentation. Each consumer needs a contract:
@@ -932,15 +964,18 @@ default for "confirmed" presentation. Each consumer needs a contract:
 | raw best-tip display | `bc_best_tip` | current fork-choice result |
 | confirmed display | `bc_best_tip` at a stated confirmation depth | `Π_bc` confirmation only; can be an ancestor of `local_finalized_tip`, or conflict with it after a Prefix Consistency failure (§3.3); never present it as final |
 | final display | `local_finalized_tip` | node-local monotone CL2 view |
-| `get_tfl_final_block_hash` and `get_tfl_final_block_height_and_hash` | `local_finalized_tip` | partly implemented: they now return no value when the marker is absent, but when present it is still the legacy-fed slot, and the checkpoint/recency exposure condition of §6.5 does not exist |
+| `get_tfl_final_block_hash` and `get_tfl_final_block_height_and_hash` | `local_finalized_tip` | no value before the first `fin`; the exposure condition of §3.5 is an `@Todo` |
 | block status | `local_finalized_tip` and `bc_best_tip` | `Finalized` if the block is an ancestor of or equal to `local_finalized_tip`; `InBestChain { confirmations }` if it is on `bc_best` above that; `NotInBestChain` otherwise, including unknown blocks |
 | transaction status | status of the block containing it | the block status of its mined block under the same three states; a mempool transaction has no block status |
-| finality-change notifications | `local_finalized_tip` transitions | publish only after the chosen public-finality contract is met |
+| finality-change notifications | `local_finalized_tip` transitions | sent after `fin` is persisted; the exposure condition of §3.5 is an `@Todo` |
 | visualization paging | operational paging cursor | do not overload a finality value merely to bound a window |
 | canonical state activation | `fin` | sticky fork choice floor (§4.3) |
 | physical database status | database finalized tip | higher of `fin` and the reorg-depth commit; never reported as Crosslink finality |
 | staking rewards | objective per-block source | never use node-local `fin`; see §9.1 |
 | validator roster and hardfork membership | bonds at `snapshot(B_{H−1})` | objective; see below |
+
+**Current tree.** Every row keyed on `local_finalized_tip` reads `latest_final_block` instead
+(§5.3). The finality RPCs return no value while that slot is empty.
 
 ### Consensus-sensitive roster and hardfork inputs
 
@@ -972,57 +1007,29 @@ validating those bc-blocks needs the bft-blocks their fat pointers cite, all of 
 decided before them. Processing decisions in BFT height order, each after the bc-blocks up to its
 headers, satisfies every dependency.
 
-## 8. Minimal code slice after the decisions
+## 8. Implementation status and pitfalls
 
-The first implementation patch should expose the semantic split without claiming that legacy
-writers already implement CL2:
+The ordered implementation work is in [`IMPLEMENTATION.md`](./IMPLEMENTATION.md). This section
+records the current-tree facts that work starts from.
 
-1. **Done.** Make the final-block accessor return only the stored Crosslink value; do not
-   substitute the legacy reorg-depth marker. `tfl_reorg_final_block_height_hash` and
-   `tfl_final_block_height_hash_pre_locked` then have no callers and were deleted with it.
-2. Store `fin` in the finalized database as its own block hash, updated only after
-   `CrosslinkFinalizeBlock` for that hash succeeds (§4.3).
-3. **Done in part.** `set_final_block` publishes every marker write on `FinalBlockRx`. The send
-   sits at the marker write, before state commitment and without the public-finality contract
-   of §7; it moves to the documented transition point once that point is chosen.
-4. Rename the main-loop `current_bc_tip` local to `bc_best_tip`.
-5. Rename `latest_final_block` and document what feeds it.
+**Current tree.** The final-block accessor returns only the stored Crosslink value and never
+substitutes the legacy reorg-depth marker; `tfl_reorg_final_block_height_hash` and
+`tfl_final_block_height_hash_pre_locked` no longer exist. Before Crosslink produces a value,
+finality queries return `None`. No regression test covers the absent and present cases, and
+there is no test harness for these RPC methods. `set_final_block` publishes every marker write
+on `FinalBlockRx`, before state commitment.
 
-The accessor change is observable: before Crosslink produces a local finalized value, finality
-queries return `None` rather than labelling a Zebra reorg-depth point as Crosslink finality. The
-regression test covering the absent and explicitly present cases has **not** been written; there
-is no test harness for these RPC methods.
-
-Step 5 depends on step 2 and on the update trigger of §4.3. The slot is written from the same
-local that the state request is sent, so it is a *record of* what was force-finalized rather
-than an input to it; its actual readers are the BFT proposal path, the main-loop diagnostic, and
-the visualizer. It has no `candidate` computation, no monotonicity guard, and no `bc_best`
-update trigger, so naming it `local_finalized_tip` before those exist would assert a CL2
-quantity the code does not implement. Once they exist, its readers take the persisted `fin`.
-
-The behavior changes that follow the mechanical steps are:
-
-- compute `candidate(bc_best)` and advance `fin` on every `bc_best` change, which implements
-  sticky fork choice (§4.3);
-- derive `snapshot(B)` as `parent(B.headers_bc[0])` at every site listed in §8.1;
-- enforce Last Final Snapshot, Linearity, and Tail Confirmation, and follow honest proposal and
-  honest context selection (§3.4, §6.2);
-- read the validator set for BFT height `H` from the bonds at `snapshot(B_{H−1})` (§7);
-- stop a BFT decision from waiting on a finalized-state write, so that a decision advances only
-  `bft_final_snapshot` (§5.2);
-- sync, store on disk, and track bond state along the chain to `bft_final_snapshot` while it is
-  not `bc_best`, with BFT certificate processing and roster computation in `NonFinalizedState`
-  (§4.3);
-- move the Proof-of-Stake logic into `zebra-state`, so that bc-block validity, bft-block
-  validity, and roster computation share one synchronous domain; and
-- report a refused switch on stdout (§4.3);
-- remove `finalization_gap_bound` (§8.1); and
-- mark with an `@Todo` where the client exposure condition of §3.5 applies, without
-  implementing it.
+**Current tree.** `latest_final_block` is written from the same local that the state request is
+sent, so it is a *record of* what was force-finalized rather than an input to it; its actual
+readers are the BFT proposal path, the main-loop diagnostic, and the visualizer. It has no
+`candidate` computation, no monotonicity guard, and no `bc_best` update trigger, so naming it
+`local_finalized_tip` before those exist would assert a CL2 quantity the code does not
+implement. In Zebra Crosslink its readers take the persisted `fin`.
 
 ### 8.1 Implementation pitfalls
 
-These hold for any change to how the marker is derived, stored, or consumed.
+These are current-tree facts, and they hold for any change to how the marker is derived,
+stored, or consumed.
 
 - **The derivation is duplicated.** `hash(headers[0])` is computed independently in
   `handle_new_decided_bft_block`, the BFT validation path, the PoS-store restore path, the
@@ -1105,7 +1112,8 @@ These hold for any change to how the marker is derived, stored, or consumed.
 
 ## 9. Open decisions
 
-Payout design belongs to separate work, recorded here for context.
+Payout design belongs to separate work, recorded here for context. Implementation questions
+that need a design pass are in [`IMPLEMENTATION.md`](./IMPLEMENTATION.md).
 
 ### 9.1 Objective reward trigger and reward economics
 
@@ -1123,12 +1131,11 @@ payout boundary at H  iff  candidate(H) != candidate(parent(H))
 This is not literally the event "local `fin` advanced." It is a block-local event that would
 permit `fin` to advance if `H` were observed as best and its candidate were ahead of that
 node's current `fin`. `snapshot(LF(H))` is another objective candidate source. The selected
-function must be monotone along a chain under the enforced validity rules. Extension, which is
-implemented, makes `LF(H)` monotone along a chain; Linearity then makes `snapshot(LF(H))`
-monotone, and `candidate(H)` follows because `prune_σ(H)` is monotone and an lca of two
-monotone arguments is monotone. The missing Linearity check leaves the premise unenforced
-today. Without a Finality Depth rule, a
-bc-block producer can also keep a stale `context_bft` at no validity cost (§3.3), so an
+function must be monotone along a chain under the enforced validity rules. Extension makes
+`LF(H)` monotone along a chain; Linearity then makes `snapshot(LF(H))` monotone, and
+`candidate(H)` follows because `prune_σ(H)` is monotone and an lca of two monotone arguments is
+monotone. The current tree enforces Extension but not Linearity (§6.2). Without a Finality
+Depth rule, a bc-block producer can also keep a stale `context_bft` at no validity cost (§3.3), so an
 objective advance trigger lets whoever dominates `bc_best` delay payouts while `Π_bft` is live.
 
 Payout amount is a separate decision:
@@ -1173,6 +1180,5 @@ decision document once a concrete policy is proposed.
 - [Shielded Labs warning about the adapted construction](https://github.com/ShieldedLabs/zebra-crosslink/blob/6d02a1b80f896d08f923e39b2505f0565efb5787/book/src/design/cl2-construction.md#L1-L14).
   Protocol definitions above are cited separately from the original pinned source.
 
-All implementation observations in §§5–6 describe the monolith tree this document ships
-with. Code can move without this file being updated, so re-check the cited symbols before
+Every current-tree statement describes the monolith tree this document ships with. Code can move without this file being updated, so re-check the cited symbols before
 using this document to plan changes.
