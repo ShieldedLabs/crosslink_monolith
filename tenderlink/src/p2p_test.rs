@@ -15,9 +15,6 @@ const PRINT_SENDS                    :bool=0!=                (0);
 const PRINT_PEER_LIST                :bool=0!=                (0);
 
 
-const MAX_MTU: usize = 15972;
-const MIN_MTU: usize =  1232;
-
 const PACKET_TYPE_PEER_LIST: u8 = 3;
 const PACKET_TYPE_CHAT:      u8 = 4;
 const PACKET_TYPE_COUNT:     u8 = 5;

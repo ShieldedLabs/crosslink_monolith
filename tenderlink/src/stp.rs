@@ -172,7 +172,7 @@ pub fn crypto_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
 }
 
 pub const MAGIC2_BLOCK_SIZE: usize = 1 + 32 * 8; // 257 bytes: 1 byte count + 32 × 8-byte magic2 values. Always send full block for constant-size.
-pub const MAGIC2_APP_CROSSLINK: u64 = 0x9b21ac6a28ae93c0;
+pub const MAGIC2_APP_CROSSLINK: u64 = 0x1804a931197a4b62;
 const SERVER_SUPPORTED_MAGIC2: &[u64] = &[MAGIC2_APP_CROSSLINK];
 
 pub fn build_magic2_client_block() -> [u8; MAGIC2_BLOCK_SIZE] {
@@ -220,6 +220,16 @@ pub const fn total_packet_payload_overhead_from_connect_magic1_inside_udp_payloa
         CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b => Some(6+16),
         CONNECT_MAGIC1_PLAIN_TEXT => Some(6+0),
         _ => None,
+    }
+}
+
+pub const STP_FRAGMENT_HEADER_SIZE: usize = 8;
+
+/// Largest app message STP sends in one datagram at the guaranteed TU; bigger ones are split across datagrams.
+pub const fn max_single_datagram_message_size(magic: u64) -> Option<usize> {
+    match total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(magic) {
+        Some(overhead) => Some(ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY - overhead - STP_FRAGMENT_HEADER_SIZE),
+        None => None,
     }
 }
 
@@ -486,12 +496,12 @@ impl UnreliableSendBuffer {
 fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], unreliable_send_buffer: &mut UnreliableSendBuffer) -> bool {
     let mut send = false;
     let mut cursor = 0;
-    while cursor + 8 <= payload.len() && let Some((is_fin, package_id, frag_data, frag_offset)) = unreliable_send_buffer.try_get_fragment(payload.len() - 8 - cursor) {
+    while cursor + STP_FRAGMENT_HEADER_SIZE <= payload.len() && let Some((is_fin, package_id, frag_data, frag_offset)) = unreliable_send_buffer.try_get_fragment(payload.len() - STP_FRAGMENT_HEADER_SIZE - cursor) {
         send = true;
         let header = 0 | ((is_fin as u64) << 1) | ((package_id as u64) << 2) | ((frag_data.len() as u64 & 0x3fff) << 18) | ((frag_offset as u64) << 32);
-        store_u64(&mut payload[cursor..cursor+8], header);
-        frag_data.write_to(&mut payload[cursor+8..]);
-        cursor += 8+frag_data.len();
+        store_u64(&mut payload[cursor..cursor+STP_FRAGMENT_HEADER_SIZE], header);
+        frag_data.write_to(&mut payload[cursor+STP_FRAGMENT_HEADER_SIZE..]);
+        cursor += STP_FRAGMENT_HEADER_SIZE+frag_data.len();
     }
     if send == false { return false; }
     while cursor < payload.len() {
@@ -511,7 +521,6 @@ pub struct ConnectionTrackingData {
     pub other_port: u16,
     pub other_transport_identity: Vec<u8>,
     pub connection_state: ConnectionState,
-    pub jumbo_reassembly: JumboReassembly,
     pub handshake_hash: [u8; 64],
     // pub reliable_streams: ReliableStreams,
     
@@ -596,7 +605,6 @@ pub struct ConnectionStateConnected {
     pub magic2: u64,
 
     pub send_sequence_number: u64,
-    pub jumbogram_index: u32,
     pub last_sent_data_packet: u64,
     pub last_sent_could_have_sent_data_packet: u64,
     pub last_ack_received_time: u64,
@@ -649,7 +657,6 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         magic1,
         magic2,
         send_sequence_number: 0,
-        jumbogram_index: 0,
         last_sent_data_packet: 0,
         last_sent_could_have_sent_data_packet: 0,
         last_ack_received_time: timestamp_ns,
@@ -775,17 +782,6 @@ pub fn get_connected_mut<'a>(m: &'a mut HashMap::<ConnectionKey, ConnectionTrack
     Some(connection)
 }
 
-pub fn allocate_jumbogram_id(connections_map: &mut HashMap<ConnectionKey, ConnectionTrackingData>, key: &ConnectionKey) -> Option<u32> {
-    let conn = connections_map.get_mut(key)?;
-    if let ConnectionState::Connected(state) = &mut conn.connection_state {
-        let id = state.jumbogram_index;
-        state.jumbogram_index = state.jumbogram_index.wrapping_add(1) & (MAX_JUMBOGRAM_IDS - 1);
-        Some(id)
-    } else {
-        None
-    }
-}
-
 pub fn connection_state_string(state: &ConnectionState) -> &'static str {
     match state {
         ConnectionState::SendingClientHelloPlaintext { .. } => { return "SendingClientHelloPlaintext"; },
@@ -826,7 +822,6 @@ pub fn connect_to_endpoint(
                 other_port: endpoint.port,
                 other_transport_identity: endpoint.key.clone(),
                 connection_state: ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
-                jumbo_reassembly: Default::default(),
                 handshake_hash: [0u8; 64],
                 unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
                 unreliable_reassembly: ReassemblySlot::new_ring(1024),
@@ -860,7 +855,6 @@ pub fn connect_to_endpoint(
                 other_port: endpoint.port,
                 other_transport_identity: endpoint.key.clone(),
                 connection_state: ConnectionState::SendingClientHello { magic1: my_connect_keypair.magic1, last_sent_time_ns: 0, hello_packet_payload, handshake },
-                jumbo_reassembly: Default::default(),
                 handshake_hash: [0u8; 64],
                 unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
                 unreliable_reassembly: ReassemblySlot::new_ring(1024),
@@ -964,14 +958,6 @@ impl ReassemblySlot {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct JumboReassembly {
-    slots: HashMap<u32, ReassemblySlot>,
-}
-
-pub const MAX_REASSEMBLY_SLOTS: usize = 128; // @Todo: convert max slots into max bytes instead -- which is what we really want anyway!
-pub const MAX_JUMBOGRAM_LEN: usize = 1 << 23; // 8 MB, matches the 23-bit field
-pub const MAX_JUMBOGRAM_IDS: u32   = 1 << 18; // matches 18-bit field
 
 pub const ACK_BUFFER_TIME_NS: u64 = 50_000_000;
 
@@ -1204,7 +1190,6 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                                     other_port: other_port,
                                                     other_transport_identity: client_key,
                                                     connection_state: ConnectionState::SendingServerHelloPlaintext { magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload },
-                                                    jumbo_reassembly: Default::default(),
                                                     handshake_hash: [0u8; 64],
                                                     unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
                                                     unreliable_reassembly: ReassemblySlot::new_ring(1024),
@@ -1286,7 +1271,6 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                                         other_port: other_port,
                                                         other_transport_identity: client_key,
                                                         connection_state: ConnectionState::SendingServerHello { cipher, magic1, magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload },
-                                                        jumbo_reassembly: Default::default(),
                                                         handshake_hash,
                                                         unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
                                                         unreliable_reassembly: ReassemblySlot::new_ring(1024),

@@ -19,18 +19,7 @@ use checkpoint::Checkpoint;
 // NewNet packet types // @Todo: share common messages/code with Tenderlink
 // ---------------------------------------------------------------------------
 
-// @Todo: MTU discovery // @Duplicate with Tenderlink.
-const UDP_mMTU:        usize = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
-const STP_HEADER_SIZE: usize = total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(CRYPTO_MAGIC).unwrap();
-const STP_PACKLET_HDR: usize = 2;
-const STP_JUMBO_HDR:   usize = 8;
-const PATH_MTU: usize = UDP_mMTU
-                      - STP_HEADER_SIZE
-                      - STP_PACKLET_HDR;
-const JUMBO_FRAG_SIZE: usize = UDP_mMTU
-                             - STP_HEADER_SIZE
-                             - STP_PACKLET_HDR
-                             - STP_JUMBO_HDR;
+const JUMBO_FRAG_SIZE: usize = max_single_datagram_message_size(CRYPTO_MAGIC).unwrap();
 
 const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 //const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;

@@ -64,13 +64,7 @@ const ANSI_YLW: &'static str = "\x1b[93m";
 const ANSI_BLU: &'static str = "\x1b[34m";
 const ANSI_RST: &'static str = "\x1b[0m";
 
-// @Todo: MTU discovery // @Duplicate with NewNet.
-const UDP_mMTU:        usize = 1400; // Note(Sam): This number informs cryptography. BAD! For season one we must now not change this number. Even if it means sending jumbos to compensate. :(
-const STP_HEADER_SIZE: usize = total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(CRYPTO_MAGIC).unwrap();
-const STP_PACKLET_HDR: usize = 2;
-const PATH_MTU: usize = UDP_mMTU
-                      - STP_HEADER_SIZE
-                      - STP_PACKLET_HDR;
+const PATH_MTU: usize = max_single_datagram_message_size(CRYPTO_MAGIC).unwrap();
 
 // Tweak this!
 const MAX_BANDWIDTH_BYTES_PER_SECOND: usize = 1_000_000;
@@ -1259,7 +1253,7 @@ pub use crate::stp::fmt_byte_str_rev;
 pub use crate::stp::fmt_prefixed_byte_str;
 pub use crate::stp::fmt_prefixed_byte_str_rev;
 pub use crate::stp::CONNECT_MAGIC1_PLAIN_TEXT;
-pub use crate::stp::total_packet_payload_overhead_from_connect_magic1_inside_udp_payload;
+pub use crate::stp::{total_packet_payload_overhead_from_connect_magic1_inside_udp_payload, max_single_datagram_message_size};
 pub use crate::stp::new_keypair_from_connect_magic1_with_seed;
 pub use crate::stp::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 
@@ -2927,7 +2921,7 @@ pub struct PacketProposalChunkHeader {
     valid_round:   i64, // serialized as u32 with 0xff.ff for -1
     height:        u64,
     proposal_id:   ValueId, // for the total proposal, not just this chunk
-    // data:        [u8; 1087], // 1200-113
+    // data:        [u8; PROPOSAL_CHUNK_DATA_SIZE],
     // proposer_signature: TMSig,
 }
 impl PacketProposalChunkHeader {
