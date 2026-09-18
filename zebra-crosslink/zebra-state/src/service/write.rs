@@ -211,11 +211,13 @@ impl WriteBlockWorkerTask {
 
     /// Crosslink-finalize `hash` and everything it implicitly finalizes.
     ///
-    /// Extracted verbatim from the run loop's `CrosslinkFinalized` arm.
+    /// The reply is the hash alone. The validator set at a block is read separately, through
+    /// [`ReadRequest::CrosslinkAggregatedStakes`](crate::ReadRequest::CrosslinkAggregatedStakes):
+    /// the roster is a function of a block, not of the act of committing it (FINALITY.md §7).
     pub fn handle_crosslink_finalize(
         &mut self,
         hash: block::Hash,
-    ) -> Result<(block::Hash, Vec<([u8; 32], u64)>), BoxError> {
+    ) -> Result<block::Hash, BoxError> {
         if let Some(newly_finalized_blocks) = self.non_finalized_state.crosslink_finalize(hash) {
             update_latest_chain_channels(
                 &self.non_finalized_state,
@@ -245,15 +247,10 @@ impl WriteBlockWorkerTask {
             // The finalized tip changed, so this is stale and needs invalidation, or else it will write duplicate trees.
             self.prev_finalized_note_commitment_trees = None;
 
-            let aggregated_stakes = self.finalized_state.db.aggregated_stakes(&hash)
-                .unwrap_or_default();
-
-            Ok((hash, aggregated_stakes))
+            Ok(hash)
         } else if self.finalized_state.db.contains_hash(hash) {
             warn!("Crosslink finalization: already de-facto finalized as below reorg height");
-            let stakes = self.finalized_state.db.aggregated_stakes(&hash)
-                .unwrap_or_default();
-            Ok((hash, stakes))
+            Ok(hash)
         } else {
             Err("Couldn't find finalized block".into())
         }

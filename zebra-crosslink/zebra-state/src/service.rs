@@ -896,7 +896,7 @@ impl Service<Request> for StateService {
                         std::time::Duration::from_secs(30),
                     )
                     .await
-                    .map(|(hash, stakes)| Response::CrosslinkFinalized(hash, stakes))
+                    .map(Response::CrosslinkFinalized)
                     .map_err(BoxError::from)
                 }
                 .boxed()
@@ -1118,6 +1118,12 @@ impl Service<ReadRequest> for ReadStateService {
             ReadRequest::BlockInfo(hash_or_height) => Ok(ReadResponse::BlockInfo(
                 read::block_info(state.latest_best_chain(), &state.db, hash_or_height),
             )),
+
+            // Used by crosslink to read the BFT roster at a block, separately from the commit
+            // that finalized it.
+            ReadRequest::CrosslinkAggregatedStakes(hash) => Ok(
+                ReadResponse::CrosslinkAggregatedStakes(state.db.aggregated_stakes(&hash)),
+            ),
 
             // Used by crosslink's BFT validation (Linearity) and its block-template context
             // selection, which both ask whether a snapshot lies on a particular chain.

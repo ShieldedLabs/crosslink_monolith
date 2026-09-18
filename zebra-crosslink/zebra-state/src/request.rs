@@ -1506,6 +1506,20 @@ pub enum ReadRequest {
         descendant: block::Hash,
     },
 
+    /// The aggregated stake per finalizer at a committed block, read from
+    /// `aggregated_stakes_by_hash` in the finalized database.
+    ///
+    /// The BFT roster for height `H` is the stakes at `snapshot(B_{H-1})` (FINALITY.md §7).
+    /// Reading them here rather than taking them from the reply to
+    /// [`Request::CrosslinkFinalizeBlock`] keeps the roster a function of a block rather than
+    /// of the act of committing it.
+    ///
+    /// Returns
+    /// [`ReadResponse::CrosslinkAggregatedStakes(None)`](ReadResponse::CrosslinkAggregatedStakes)
+    /// for a block the finalized state does not hold; non-finalized chains keep only their tip's
+    /// bond state, so this covers committed blocks only.
+    CrosslinkAggregatedStakes(block::Hash),
+
     /// Performs contextual validation of the given block, but does not commit it to the state.
     ///
     /// It is the caller's responsibility to perform semantic validation.
@@ -1596,6 +1610,7 @@ impl ReadRequest {
             ReadRequest::FinalizedTip => "tip",
             ReadRequest::TipPoolValues => "tip_pool_values",
             ReadRequest::BlockInfo(_) => "block_info",
+            ReadRequest::CrosslinkAggregatedStakes(_) => "crosslink_aggregated_stakes",
             ReadRequest::CrosslinkIsAncestor { .. } => "crosslink_is_ancestor",
             ReadRequest::Depth(_) => "depth",
             ReadRequest::Block(_) => "block",

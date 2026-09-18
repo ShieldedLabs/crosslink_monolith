@@ -46,7 +46,7 @@ pub enum Response {
 
     /// Response to [`Request::CrosslinkFinalizeBlock`]
     /// Contains the finalized block hash and an array of (target_finalizer, total_stake) for all active bonds
-    CrosslinkFinalized(block::Hash, Vec<([u8; 32], u64)>),
+    CrosslinkFinalized(block::Hash),
 
     /// Response to [`Request::Tip`] with the current best chain tip.
     //
@@ -420,6 +420,10 @@ pub enum ReadResponse {
     /// not known here yet, not that the ancestry was disproved.
     CrosslinkIsAncestor(Option<bool>),
 
+    /// Response to [`ReadRequest::CrosslinkAggregatedStakes`]: the aggregated stake per
+    /// finalizer at a block, or `None` for a block the finalized state does not hold.
+    CrosslinkAggregatedStakes(Option<Vec<([u8; 32], u64)>>),
+
     /// Response to [`ReadRequest::Depth`] with the depth of the specified block.
     Depth(Option<u32>),
 
@@ -709,6 +713,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::NonFinalizedBlocksListener(_)
             | ReadResponse::IsTransparentOutputSpent(_)
             | ReadResponse::CrosslinkIsAncestor(_)
+            | ReadResponse::CrosslinkAggregatedStakes(_)
             | ReadResponse::ForkPoint(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }

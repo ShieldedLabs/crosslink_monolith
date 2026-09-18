@@ -636,6 +636,26 @@ async fn is_block_known(
 /// `None` means this node has not seen one of the two blocks yet. Every caller here treats that
 /// as "ask again later": ancestry is fixed by a block's own bytes, so only a `Some(false)` is a
 /// violation.
+/// The aggregated stake per finalizer at `hash`, as the bonds stood at that committed block.
+///
+/// The BFT roster for height `H` is the stakes at `snapshot(B_{H-1})` (FINALITY.md §7). This is
+/// the node's own read of them, separate from the commit that finalized the block, so that the
+/// roster stops depending on a decision and a commit being the same event. `None` is "the
+/// finalized state does not hold that block", which is not the same as "no stake": the caller
+/// distinguishes them.
+async fn aggregated_stakes_at(
+    call: &TFLServiceCalls,
+    hash: ZebBlockHash,
+) -> Option<Vec<([u8; 32], u64)>> {
+    if let Ok(StateReadResponse::CrosslinkAggregatedStakes(stakes)) =
+        (call.read_state)(StateReadRequest::CrosslinkAggregatedStakes(hash)).await
+    {
+        stakes
+    } else {
+        None
+    }
+}
+
 async fn crosslink_is_ancestor(
     call: &TFLServiceCalls,
     ancestor: ZebBlockHash,
@@ -992,15 +1012,15 @@ async fn handle_new_decided_bft_block(
     // new_network carrying the whole decision, and the reentrancy hazard goes with it -- the
     // call graph stops being circular.
     drop(internal);
-    let got_stakes = loop {
+    loop {
         match (call.state)(zebra_state::Request::CrosslinkFinalizeBlock(new_final_hash)).await {
-            Ok(zebra_state::Response::CrosslinkFinalized(hash, aggregated_stakes)) => {
-                info!("Successfully crosslink-finalized {}, active stakes: {:?}", hash, aggregated_stakes);
+            Ok(zebra_state::Response::CrosslinkFinalized(hash)) => {
+                info!("Successfully crosslink-finalized {}", hash);
                 assert_eq!(
                     hash, new_final_hash,
                     "PoW finalized hash should now match ours"
                 );
-                break aggregated_stakes;
+                break;
             }
             Ok(_) => unreachable!("wrong response type"),
             Err(err) => {
@@ -1010,6 +1030,11 @@ async fn handle_new_decided_bft_block(
             }
         }
     };
+
+    // The roster the next height votes with is the stake at this block's snapshot, read from the
+    // chain rather than taken from the commit reply (FINALITY.md §7). `snapshot(B_H)` is
+    // `snapshot(B_{(H+1)-1})`, which is the roster the returned value is for.
+    let got_stakes = aggregated_stakes_at(&call, new_final_hash).await.unwrap_or_default();
 
     internal = tfl_handle.internal.lock().await;
 
@@ -1647,8 +1672,26 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             // schedule (no stored blacklist; see `terminated_finalizers_at`).
             let startup_bft_height = i_bft_blocks.len() as u64;
             let terminated = terminated_finalizers_at(&config.hardforks, startup_bft_height, new_final_height.0 as u64);
-            let roster = tenderlink_roster_from_internal(&unsorted_roster, &terminated);
-            internal.finalizers_at_current_height = unsorted_roster;
+            // The live roster is read from the chain at the last loaded block's snapshot, the
+            // same way the decide path reads it (FINALITY.md §7). The per-height rosters the
+            // replay above uses still come from the store: they are the rosters that actually
+            // voted, and votes travel by roster index.
+            let restored_roster = if new_final_hash != ZebBlockHash([0; 32]) {
+                aggregated_stakes_at(&call, new_final_hash)
+                    .await
+                    .map(|stakes| {
+                        stakes
+                            .into_iter()
+                            .map(|s| RosterMember { pub_key: s.0, voting_power: s.1, txids: Vec::new() })
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|members| !members.is_empty())
+                    .unwrap_or(unsorted_roster)
+            } else {
+                unsorted_roster
+            };
+            let roster = tenderlink_roster_from_internal(&restored_roster, &terminated);
+            internal.finalizers_at_current_height = restored_roster;
             internal.bft_block_hash_to_height = i_bft_blocks
                 .iter()
                 .enumerate()

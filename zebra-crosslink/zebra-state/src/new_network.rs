@@ -1199,7 +1199,7 @@ pub enum IngestOutcome {
 /// through new_network -- it moves the finalize call, not the chain sync.
 pub struct CrosslinkFinalizeRequest {
     pub hash: Hash,
-    pub reply: tokio::sync::oneshot::Sender<Result<(Hash, Vec<([u8; 32], u64)>), String>>,
+    pub reply: tokio::sync::oneshot::Sender<Result<Hash, String>>,
 }
 
 static CROSSLINK_FINALIZE_SENDER: std::sync::OnceLock<
@@ -1210,7 +1210,7 @@ static CROSSLINK_FINALIZE_SENDER: std::sync::OnceLock<
 pub async fn crosslink_finalize_via_new_network(
     hash: Hash,
     timeout: std::time::Duration,
-) -> Result<(Hash, Vec<([u8; 32], u64)>), String> {
+) -> Result<Hash, String> {
     let Some(tx) = CROSSLINK_FINALIZE_SENDER.get() else {
         return Err("new_network is not running".to_string());
     };

@@ -788,7 +788,9 @@ same value by another route rather than by reading the slot:
 - `CrosslinkFinalizeBlock` is sent the local `new_final_hash`; the field is written from that
   same local immediately before. Deleting the field would not change its behavior.
 - `finalizers_at_current_height` is a write target, populated from the aggregated stakes that
-  the `CrosslinkFinalizeBlock` call returns.
+  `ReadRequest::CrosslinkAggregatedStakes` returns for `new_final_hash`. That read is the
+  node's own and is separate from the commit, so the slot carries no information the commit
+  put there.
 - `terminated_finalizers_at` is passed a local height at three of its four call sites; only the
   `viz2.rs` site reads the field.
 - The BFT validation path's read is dead: `already_finalized_hash` is captured and then
@@ -1103,12 +1105,16 @@ stored, or consumed.
   finality-diagram tests in `zebrad/tests/crosslink.rs` and `viz2::scene_tests` assert marker
   positions derived from it. A second derivation makes the node, the GUI, and the tests
   disagree about which block is final.
-- **The roster is consensus data reached through the marker.** `finalizers_at_current_height`
-  is the aggregated stake set that `CrosslinkFinalizeBlock` returns for the marker hash, and
-  `terminated_finalizers_at` takes the marker height. That is objective today only because
-  `Π_bft` agreement fixes the hash. Once the commit target is `candidate(bc_best)`, the stakes
-  that call returns are node-local, so the validator set reads the bonds at
-  `snapshot(B_{H−1})` through its own lookup, which also covers non-finalized chains (§7).
+- **The roster is a function of a block, not of committing it.** `finalizers_at_current_height`
+  is filled from `ReadRequest::CrosslinkAggregatedStakes` at `snapshot(B_{H−1})`, on the decide
+  path and on the PoS-store restore path alike, and `terminated_finalizers_at` takes that same
+  block's height. Nothing reads stakes from the reply to `CrosslinkFinalizeBlock`, which now
+  returns the hash alone, so the roster no longer depends on a decision and a commit being one
+  event — which is what stage 5 separates. The read goes to `aggregated_stakes_by_hash` in the
+  finalized database, so it answers for committed blocks only: non-finalized chains keep just
+  their tip's bond state (`Chain::delegation_bonds`). That is sufficient while the decide path
+  commits the snapshot it just decided; reading bonds at an uncommitted block is design
+  question 2 (§7).
 - **The BFT genesis snapshot is below the bootstrap roster height.** Bootstrap genesis
   carries headers starting at `BOOTSTRAP_ROSTER_HEIGHT`, so its snapshot, and the roster for
   BFT height 1, is the block below that height.
