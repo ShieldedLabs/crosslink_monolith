@@ -416,6 +416,10 @@ pub enum ReadResponse {
     /// the block info after the specified block.
     BlockInfo(Option<BlockInfo>),
 
+    /// Response to [`ReadRequest::CrosslinkIsAncestor`]. `None` means one of the two blocks is
+    /// not known here yet, not that the ancestry was disproved.
+    CrosslinkIsAncestor(Option<bool>),
+
     /// Response to [`ReadRequest::Depth`] with the depth of the specified block.
     Depth(Option<u32>),
 
@@ -704,6 +708,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::ChainInfo(_)
             | ReadResponse::NonFinalizedBlocksListener(_)
             | ReadResponse::IsTransparentOutputSpent(_)
+            | ReadResponse::CrosslinkIsAncestor(_)
             | ReadResponse::ForkPoint(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }

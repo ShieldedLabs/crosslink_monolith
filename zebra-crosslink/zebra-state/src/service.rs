@@ -193,14 +193,30 @@ pub(crate) struct StateService {
     hardfork_schedule: Arc<HardForkSchedule>,
 }
 
-/// Resolves a PoW block hash to its height, across every chain this state holds — finalized
-/// or not, best chain or side chain. The crosslink fat-pointer gate is handed one of these
-/// because the sigma-confirmation rule it enforces is a statement about two PoW heights: the
-/// height of the block being admitted, and the height of the PoW block that the certificate
-/// that block carries finalizes. The certificate names that block by hash only, so the gate
-/// has to ask the chain. `None` means "not known here (yet)", which the gate treats as a
-/// defer rather than a rejection.
-pub type CrosslinkBlockHeightLookup<'a> = &'a dyn Fn(block::Hash) -> Option<block::Height>;
+/// What bc-block admission may ask the chain about the block it is admitting.
+///
+/// Two of the rules admission enforces need the chain rather than the block's own bytes. The
+/// sigma-confirmation rule is a statement about two PoW heights: the height of the block being
+/// admitted, and the height of the PoW block that the certificate that block carries finalizes.
+/// The Last Final Snapshot rule (FINALITY.md §3.4) additionally requires that same block to lie
+/// on the ancestry of the block being admitted. A certificate names the block by hash only, so
+/// both questions go to the chain.
+///
+/// `None` from either method means "not known here (yet)", which admission treats as a defer
+/// rather than a rejection.
+pub trait CrosslinkChainView {
+    /// The height of `hash` in any chain this state holds — finalized or not, best chain or
+    /// side chain.
+    fn height_of(&self, hash: block::Hash) -> Option<block::Height>;
+
+    /// Whether `hash` is an ancestor of the block being admitted.
+    ///
+    /// The view is built for one candidate block, so the candidate is not named here.
+    fn is_ancestor_of_candidate(&self, hash: block::Hash) -> Option<bool>;
+}
+
+/// [`CrosslinkChainView`] as admission receives it.
+pub type CrosslinkChainViewRef<'a> = &'a dyn CrosslinkChainView;
 
 /// What the crosslink fat-pointer gate decided about a block.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -230,7 +246,7 @@ pub type ClosureToCallIntoCrosslinkFromState = Arc<
             FatPointerToBftBlock,
             FatPointerToBftBlock,
             block::Height,
-            CrosslinkBlockHeightLookup<'a>,
+            CrosslinkChainViewRef<'a>,
         ) -> Option<CrosslinkVerdict>
         + Send
         + Sync,
@@ -580,6 +596,57 @@ impl ReadStateService {
     pub fn known_block(&self, hash: block::Hash) -> Option<KnownBlock> {
         read::find::non_finalized_state_contains_block_hash(&self.latest_non_finalized_state(), hash)
             .or_else(|| read::find::finalized_state_contains_block_hash(&self.db, hash))
+    }
+
+    /// Whether `ancestor` is `descendant` or one of its ancestors, across every chain this
+    /// state holds.
+    ///
+    /// `None` means the question cannot be answered here yet, because this node has never seen
+    /// one of the two blocks. Consensus rules built on this treat `None` as a defer and never
+    /// as a violation: ancestry is fixed by a block's own bytes, so a `Some` answer is
+    /// permanent, but an absent block may still arrive.
+    ///
+    /// Every non-finalized chain carries the whole of its own history above the finalized tip
+    /// and descends from that tip, so a finalized block is an ancestor of every non-finalized
+    /// one, and within a single chain the height ordering is the ancestry.
+    pub fn is_ancestor_of(&self, ancestor: block::Hash, descendant: block::Hash) -> Option<bool> {
+        self.non_finalized_state_receiver
+            .with_watch_data(|non_finalized_state| {
+                let ancestor_is_finalized = self.db.contains_hash(ancestor);
+                let ancestor_is_known = ancestor_is_finalized
+                    || non_finalized_state
+                        .chain_iter()
+                        .any(|chain| chain.height_by_hash(ancestor).is_some());
+                if !ancestor_is_known {
+                    return None;
+                }
+
+                // Where the descendant sits decides which history answers the question.
+                if let Some((descendant_height, ancestor_height)) =
+                    non_finalized_state.chain_iter().find_map(|chain| {
+                        chain
+                            .height_by_hash(descendant)
+                            .map(|height| (height, chain.height_by_hash(ancestor)))
+                    })
+                {
+                    return Some(match ancestor_height {
+                        Some(ancestor_height) => ancestor_height <= descendant_height,
+                        // Not on this branch above the finalized tip: an ancestor only if it is
+                        // in the prefix every chain shares.
+                        None => ancestor_is_finalized,
+                    });
+                }
+
+                // The descendant is finalized, or not here at all. The finalized chain is
+                // linear, so height ordering decides it.
+                let descendant_height = self.db.height(descendant)?;
+                Some(match self.db.height(ancestor) {
+                    Some(ancestor_height) => ancestor_height <= descendant_height,
+                    // Known here but not finalized, while the descendant is finalized: the
+                    // ancestor is on a branch above it.
+                    None => false,
+                })
+            })
     }
 
     /// Return the block identified by `hash_or_height`, searching all non-finalized chains
@@ -1050,6 +1117,15 @@ impl Service<ReadRequest> for ReadStateService {
             // Used by getblock
             ReadRequest::BlockInfo(hash_or_height) => Ok(ReadResponse::BlockInfo(
                 read::block_info(state.latest_best_chain(), &state.db, hash_or_height),
+            )),
+
+            // Used by crosslink's BFT validation (Linearity) and its block-template context
+            // selection, which both ask whether a snapshot lies on a particular chain.
+            ReadRequest::CrosslinkIsAncestor {
+                ancestor,
+                descendant,
+            } => Ok(ReadResponse::CrosslinkIsAncestor(
+                state.is_ancestor_of(ancestor, descendant),
             )),
 
             // Used by the StateService.

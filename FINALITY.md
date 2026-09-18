@@ -309,8 +309,7 @@ add:
 - **Linearity:** `snapshot(parent(B)) ⪯bc snapshot(B)`.
 - **Tail Confirmation:** `B.headers_bc` form the `σ`-block tail of a bc-valid chain.
 
-**Zebra Crosslink** enforces all five rules above. **Current tree:** Valid context and
-Extension only (§6.2).
+**Zebra Crosslink** enforces all five rules above, and so does the **current tree** (§6.2).
 
 Tail Confirmation is objective: `σ` consecutive headers ending at a bc-valid block are the tail
 of the chain that ends at that block, whatever the validator's own best chain. The Book
@@ -912,37 +911,49 @@ it departs from.
   `fin ⪯ candidate` guard and no distinction between a benign candidate regression and a
   conflicting-candidate safety incident.
 
-### 6.2 Missing validity rules
+### 6.2 Validity rules
 
-- The Last Final Snapshot rule is not implemented for bc-block admission.
+- The Last Final Snapshot rule is enforced on bc-block admission, beside the Extension rule in
+  `call_from_state_to_crosslink_to_ask_about_fat_pointers`, with the same defer/reject split: a
+  snapshot the state cannot yet place on a branch defers, and one it places off the block's own
+  ancestry is rejected permanently. Ancestry is read with `ReadStateService::is_ancestor_of`,
+  across every chain the state holds rather than the best chain alone.
 - The Finality Depth rule and Stalled Mode are omitted by design (§3.3). There is no
   `finalization_gap_bound`, and the 512-block log threshold is diagnostic, not consensus.
-- BFT validation does not implement Linearity or Tail Confirmation. It checks that the
-  snapshot (`parent(headers[0])`) is locally present, but does not establish that the `σ`
-  carried headers form a valid chain with valid PoW, nor that they are on the chain of the
-  block that will carry the certificate.
+- BFT validation enforces Linearity and Tail Confirmation in `validate_bft_block`. Tail
+  Confirmation is checked as the three things it is: exactly `σ` headers, each naming the one
+  below it, and the block at the topmost header known to this state — which, given the linkage,
+  carries the bc-validity of the whole tail, since a block the state holds has been validated
+  along with its ancestry. Linearity compares the parent bft-block's snapshot against this
+  block's through the same ancestry read. A block either check cannot resolve yet returns
+  `Indeterminate` with the hash it needs, as a missing snapshot already did.
 - **The confirmation depth is enforced on inclusion.** A PoW block at height `P` may carry a
   fat pointer to a BFT block whose snapshot is at height `F` only when `P ≥ F + σ + 1`: the
   `σ` carried headers `F+1 ..= F+σ`, then the carrier. Admitting a PoW block therefore
   requires a PoW → PoS → PoW lookup: resolve the pointer to its BFT block, take that block's
   snapshot hash, and ask the state for its height.
-  `call_from_state_to_crosslink_to_ask_about_fat_pointers` is given a
-  `CrosslinkBlockHeightLookup` to do it, searching every chain the state holds, and defers
-  rather than rejects while the snapshot is unknown here. The block-template path applies the
-  same test, so a miner is never handed a certificate that could not be committed. The
-  inequality bounds depth only. Whether `F` is an ancestor of `P` is the Last Final Snapshot
-  rule, which is not implemented, so a block at `F + σ + 1` can still carry a certificate
-  whose headers lie on another branch.
+  `call_from_state_to_crosslink_to_ask_about_fat_pointers` is given a `CrosslinkChainView` to
+  do it, searching every chain the state holds, and defers rather than rejects while the
+  snapshot is unknown here. The block-template path applies the same test, so a miner is never
+  handed a certificate that could not be committed. The inequality bounds depth only; whether
+  `F` is an ancestor of `P` is the Last Final Snapshot rule, which the same view answers.
 - The proposal path departs from honest proposal (§3.4) in two ways. When the `+40` candidate
   clamp in §6.1 binds, `headers_bc` is a window ending at `marker + 40 + σ`, not the tail of the
   proposer's `bc_best`; the window still satisfies Tail Confirmation. The clamp is a Zebra
-  Crosslink design heuristic (§3.4). When `is_improved_final` fails, the path makes no proposal,
-  where honest proposal repeats the parent's `headers_bc`.
-- Bc-block production does not follow the honest context-selection procedure (§3.4): the block
-  template's `FatPointerToBFTChainTip` request cites the newest decided bft-block whose
-  `do_not_include_until_bc_height` admits the proposed height, whatever that block's snapshot.
-  Under Last Final Snapshot a template whose parent chain does not contain that snapshot
-  produces an invalid block.
+  Crosslink design heuristic (§3.4). Where honest proposal repeats the parent's `headers_bc`,
+  the path makes no proposal instead: when `is_improved_final` fails, when the candidate's
+  snapshot would fail Linearity against the parent bft-block's, and when the two reads behind
+  the tail (`Tip` then `FindBlockHeaders`) straddle a reorganization and return a tail that is
+  short or does not link to the candidate. How often a node should repeat its parent's headers
+  is an open implementation question, so declining is what it does until that is settled.
+- Bc-block production follows the honest context-selection procedure (§3.4) as far as validity
+  requires: the block template's `FatPointerToBFTChainTip` request cites the newest decided
+  bft-block whose `do_not_include_until_bc_height` admits the proposed height, whose snapshot is
+  deep enough for the σ-confirmation rule, and whose snapshot lies on the chain the template
+  extends. It does not implement the Book's longest-chain-then-score-then-hash tie-break, which
+  is a selection among bft-valid tips this tree does not hold: the decided chain is linear here.
+  When no decided block qualifies, the template repeats the parent block's own `context_bft`,
+  which always does; reverting to the null pointer would break the Extension rule.
 - Block templates lag BFT decisions. Time-accelerated and realtime tests show miners producing
   two consecutive bc-blocks with the same fat pointer, each of which adds a block of finality
   lag (§3.4). Any rule keyed to finalization at exactly `σ + 1` below the tip misses those
@@ -1121,6 +1132,12 @@ stored, or consumed.
   snapshot lies on the template's parent chain, or the mined block is invalid (§6.2).
 - **Tail Confirmation needs the whole tail.** Validation checks all `σ` carried headers and the
   bc-validity of their blocks, which a validator may first have to download (§3.4).
+- **A `σ` window is a chain, and its top must be present.** Enforcing Tail Confirmation
+  invalidated two fixtures in `crosslink_test_basic_finality` that predate it: a window taken as
+  a slice of a block list that holds a fork carried two siblings rather than a chain, and the
+  last window's topmost header named a block the test never loaded, which now defers with
+  `NeedsBlock` instead of validating. Any test that builds a certificate from a slice has to
+  take its blocks from one branch and load the block at the top of the window.
 - **Reward logic has three copies.** `Chain::push` with `update_bonds_with_pos_issuance`,
   `fixup_aggregated_stakes` in `stake_fixup.rs`, and the wallet projection in `lib.rs` must
   change together (§5.4).
@@ -1162,6 +1179,17 @@ stored, or consumed.
   second, so the instruction's width is unchanged and older files still load. The `.zeccltf`
   files a test generates were regenerated; the ones a test only loads carry no `SET_PARAMS` at
   all and were left alone.
+- **Last Final Snapshot has no node test, and cannot have one here.** A violation needs a block
+  whose ancestry omits the snapshot of the bft-block it cites. The decide path finalizes every
+  snapshot as it is decided (`handle_new_decided_bft_block` → `CrosslinkFinalizeBlock`), and the
+  state then collapses onto that snapshot's branch and refuses forks below it (§6.3), so by the
+  time such a block could be offered its parent is gone and it is refused for the wrong reason.
+  The rule is still enforced, and it is what makes the σ carried headers confirmations of the
+  admitting chain; testing it needs the decoupling of decisions from commits, not a new test.
+  Linearity and Tail Confirmation are tested, in
+  `crosslink_reject_pos_block_that_regresses_the_snapshot`,
+  `crosslink_reject_pos_block_with_lt_sigma_headers` and
+  `crosslink_reject_pos_block_with_unlinked_headers`.
 - **Crosslink node tests and `viz_gui`.** Tests run through `phest.bat zebra-crosslink`, and
   `phargo.bat` enables `viz_gui` for that project, which puts winit on the main thread. The
   node tests in `zebrad/tests/crosslink.rs` run headless, so they run with `PH_NO_VIZ_GUI` set,

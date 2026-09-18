@@ -532,9 +532,25 @@ fn crosslink_test_basic_finality() {
         }
     }
 
+    // The loop above stops at `pow[n - 1]`, but the last window below reaches `pow[n]`. Tail
+    // Confirmation needs the block at the topmost header to be present, or validation defers
+    // with `NeedsBlock` (FINALITY.md §3.4), so load it here. Nothing asserts on it: the
+    // expectation loops cover `pow[0..n]`.
+    tf.push_instr_load_pow(&pow[n], 0);
+
     const LINKS: &[usize] = &[1, 4, 6, 10, 13, 16];//, 18];
     for i in 0..LINKS.len() {
-        let bft = next_pos(pos_h, fat_ptr, &pow[LINKS[i]..LINKS[i]+3], &[]);
+        // `pow[2]` and `pow[3]` are both children of `pow[1]`: the fork this test is built
+        // around. A window containing both is not a chain, so it fails Tail Confirmation
+        // (FINALITY.md §3.4). The first window is the only one that straddles the fork, and it
+        // takes the main-chain blocks either side of the orphan instead. Its snapshot is still
+        // `parent(pow[1]) = pow[0]`, so the finality this loop expects is unchanged.
+        let window: Vec<Arc<Block>> = if LINKS[i] == 1 {
+            vec![pow[1].clone(), pow[3].clone(), pow[4].clone()]
+        } else {
+            pow[LINKS[i]..LINKS[i] + 3].to_vec()
+        };
+        let bft = next_pos(pos_h, fat_ptr, &window, &[]);
         tf.push_instr_load_pos(&bft, 0);
 
         for i2 in 0..n {
@@ -561,30 +577,116 @@ fn crosslink_test_basic_finality() {
     test_bytes(tf.write_to_bytes());
 }
 
-#[ignore]
+/// A BFT block assembled straight from PoW blocks, bypassing `BftBlock::try_from` and the header
+/// count it enforces, with the fat pointer recomputed from the result so that the only thing wrong
+/// with the block is what the test made wrong. The Tail Confirmation tests need blocks
+/// `create_pos_and_ptr_to_finalize_pow` will not build.
+fn pos_from_headers(
+    bft_height: u32,
+    parent_fat_ptr: FatPointerToBftBlock,
+    pow_blocks: &[Arc<Block>],
+) -> BftBlockAndFatPointerToItWrap {
+    let block = BftBlock {
+        version: 1,
+        height: bft_height,
+        previous_block_fat_ptr: parent_fat_ptr,
+        headers: pow_blocks
+            .iter()
+            .map(|b| zebra_crosslink::bc_hdr_to_lrz(b.header.as_ref()))
+            .collect(),
+        hardforks: Vec::new(),
+        do_not_include_until_bc_height: 0,
+    };
+    BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt::from_parts(
+        block,
+        bft_height.into(),
+        1,
+        &[],
+    ))
+}
+
+/// Genesis + `n` blocks from the standard test miner, each loaded into `tf` in order.
+/// `pow[i]` is the block at height `i + 1`, so `pow[4]` is P5.
+fn pow_chain_for(tf: &mut TF, n: usize) -> (BlockGen, Address, Vec<Arc<Block>>) {
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut pow = vec![gen.tip.clone()];
+    for _ in 1..n {
+        pow.push(gen.next_block(&miner_addr));
+    }
+    for block in &pow {
+        tf.push_instr_load_pow(block, 0);
+    }
+    (gen, miner_addr, pow)
+}
+
+/// Tail Confirmation (FINALITY.md §3.4): `headers_bc` holds exactly `sigma` headers. One short is
+/// not the tail of anything, and the shortfall is the only defect: the headers that are there are
+/// consecutive and their blocks are on the chain.
 #[test]
-fn reject_pos_block_with_lt_sigma_headers() {
+fn crosslink_reject_pos_block_with_lt_sigma_headers() {
     set_test_name(function_name!());
     let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let sigma = HARNESS_PARAMETERS.bc_confirmation_depth_sigma as usize;
+    let (_gen, _miner_addr, pow) = pow_chain_for(&mut tf, 8);
 
-    for i in 0..4 {
-        tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
-    }
-
-    let mut bft_block_and_fat_ptr =
-        BftBlockAndFatPointerToItWrap::zcash_deserialize(REGTEST_POS_BLOCK_BYTES[0]).unwrap();
-    bft_block_and_fat_ptr
-        .0.block
-        .headers
-        .truncate(bft_block_and_fat_ptr.0.block.headers.len() - 1);
-    let new_bytes = bft_block_and_fat_ptr.zcash_serialize_to_vec().unwrap();
-    assert!(
-        &new_bytes != REGTEST_POS_BLOCK_BYTES[0],
-        "test invalidated if the serialization has not been changed"
-    );
-
-    tf.push_instr_load_pos_bytes(&new_bytes, 0);
+    // P5..P7 would be the sigma-block tail above P4; this stops one header short of it.
+    let short = pos_from_headers(0, FatPointerToBftBlock::null(), &pow[4..3 + sigma]);
+    assert_eq!(short.0.block.headers.len(), sigma - 1);
+    tf.push_instr_load_pos(&short, SHOULD_FAIL);
     tf.push_instr_expect_pos_chain_length(0, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// Tail Confirmation (FINALITY.md §3.4): the `sigma` headers form a chain, each naming the one
+/// below it. These are `sigma` real headers off one chain with a gap in the middle, so the count
+/// is right and every block named is on the chain -- only the linkage is broken.
+#[test]
+fn crosslink_reject_pos_block_with_unlinked_headers() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    assert_eq!(
+        HARNESS_PARAMETERS.bc_confirmation_depth_sigma, 3,
+        "the header window below is written for sigma = 3"
+    );
+    let (_gen, _miner_addr, pow) = pow_chain_for(&mut tf, 8);
+
+    // P5, P7, P8: P7 names P6 as its parent, not P5.
+    let unlinked = pos_from_headers(
+        0,
+        FatPointerToBftBlock::null(),
+        &[pow[4].clone(), pow[6].clone(), pow[7].clone()],
+    );
+    tf.push_instr_load_pos(&unlinked, SHOULD_FAIL);
+    tf.push_instr_expect_pos_chain_length(0, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// Linearity (FINALITY.md §3.4): `snapshot(parent(B)) ⪯bc snapshot(B)`. The second block carries
+/// the window one block lower than the first, so its snapshot is the first snapshot's parent --
+/// below it on the same chain rather than above it.
+#[test]
+fn crosslink_reject_pos_block_that_regresses_the_snapshot() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let (_gen, _miner_addr, pow) = pow_chain_for(&mut tf, 8);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+    // Headers P5..P7, so the snapshot is P4.
+    let bft0 = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
+    tf.push_instr_load_pos(&bft0, 0);
+
+    // Headers P4..P6, so the snapshot is P3. Everything else about the block is well formed:
+    // the parent pointer, the height and the header window are all what the chain expects.
+    let regressed = create_pos_and_ptr_to_finalize_pow(*pos_h, fat_ptr.clone(), &pow[3..6], &[]);
+    tf.push_instr_load_pos(&regressed, SHOULD_FAIL);
+    tf.push_instr_expect_pos_chain_length(1, 0);
+
+    test_bytes(tf.write_to_bytes());
 }
 
 /// With BFT bootstrapped from the chain, a PoW block at or below the activation height may not point

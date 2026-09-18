@@ -1489,6 +1489,23 @@ pub enum ReadRequest {
         height: Option<block::Height>,
     },
 
+    /// Whether `ancestor` is `descendant` or one of its ancestors, across every chain the
+    /// state holds rather than the best chain alone.
+    ///
+    /// This is the `⪰bc` of the Crosslink 2 validity rules (FINALITY.md §3.4): Linearity
+    /// compares the snapshots of two BFT blocks, and honest context selection asks whether a
+    /// decided block's snapshot lies on the chain a template extends.
+    ///
+    /// Returns [`ReadResponse::CrosslinkIsAncestor(None)`](ReadResponse::CrosslinkIsAncestor)
+    /// when this node has not seen one of the two blocks, which a consensus rule must treat as
+    /// "ask again later" rather than as a violation.
+    CrosslinkIsAncestor {
+        /// The block that must lie on the other's ancestry.
+        ancestor: block::Hash,
+        /// The block whose ancestry is read.
+        descendant: block::Hash,
+    },
+
     /// Performs contextual validation of the given block, but does not commit it to the state.
     ///
     /// It is the caller's responsibility to perform semantic validation.
@@ -1579,6 +1596,7 @@ impl ReadRequest {
             ReadRequest::FinalizedTip => "tip",
             ReadRequest::TipPoolValues => "tip_pool_values",
             ReadRequest::BlockInfo(_) => "block_info",
+            ReadRequest::CrosslinkIsAncestor { .. } => "crosslink_is_ancestor",
             ReadRequest::Depth(_) => "depth",
             ReadRequest::Block(_) => "block",
             ReadRequest::AnyChainBlock(_) => "any_chain_block",

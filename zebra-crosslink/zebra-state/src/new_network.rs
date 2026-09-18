@@ -1311,6 +1311,26 @@ fn eviction_index(blocks_to_commit: &[(Hash, std::sync::Arc<Block>)], read_state
     Some(blocks_to_commit.len() - 1)
 }
 
+/// The [`CrosslinkChainView`](crate::CrosslinkChainView) for one block being admitted.
+///
+/// Every question admission asks is about that one block, so the candidate is baked in here
+/// rather than passed to each call. The candidate is not committed yet, so its ancestry is its
+/// parent's ancestry plus the parent itself.
+struct AdmissionChainView<'a> {
+    read_state: &'a ReadState,
+    parent_hash: block::Hash,
+}
+
+impl crate::CrosslinkChainView for AdmissionChainView<'_> {
+    fn height_of(&self, hash: block::Hash) -> Option<block::Height> {
+        self.read_state.known_block(hash).map(|known| known.height)
+    }
+
+    fn is_ancestor_of_candidate(&self, hash: block::Hash) -> Option<bool> {
+        self.read_state.is_ancestor_of(hash, self.parent_hash)
+    }
+}
+
 pub fn sync(
     config: &crate::config::Config,
     read_state: ReadState,
@@ -2872,13 +2892,14 @@ pub fn sync(
                         };
 
                         // The gate needs the height of whatever PoW block the carried
-                        // certificate finalizes, and only the state can answer that; see
-                        // `CrosslinkBlockHeightLookup`. Every chain is searched, because the
-                        // block being admitted may be extending a side chain.
-                        let height_of = |hash: block::Hash| read_state.known_block(hash).map(|known| known.height);
+                        // certificate finalizes, and whether that block lies on this block's own
+                        // ancestry; only the state can answer either. See `CrosslinkChainView`.
+                        // Every chain is searched, because the block being admitted may be
+                        // extending a side chain.
+                        let chain_view = AdmissionChainView { read_state: &read_state, parent_hash };
                         let (gate, defer_msg) = if let Some(parent_fp) = parent_fat_pointer {
                             let msg = format!("child fp {} / parent fp {} not resolvable yet", fp_brief(&child_fat_pointer), fp_brief(&parent_fp));
-                            ((crosslink_gate)(parent_fp, child_fat_pointer, block::Height(height), &height_of), msg)
+                            ((crosslink_gate)(parent_fp, child_fat_pointer, block::Height(height), &chain_view), msg)
                         } else {
                             // known_block() saw the parent but any_chain_block_header() did not;
                             // the two views disagreeing is itself worth seeing in the log.

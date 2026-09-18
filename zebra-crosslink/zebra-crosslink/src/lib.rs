@@ -341,7 +341,7 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(
     parent_fat_pointer: FatPointerToBftBlock,
     child_fat_pointer: FatPointerToBftBlock,
     pow_block_height: ZebBlockHeight,
-    height_of: zebra_state::CrosslinkBlockHeightLookup<'_>,
+    chain: zebra_state::CrosslinkChainViewRef<'_>,
 ) -> Option<zebra_state::CrosslinkVerdict> {
     // Return value:
     //   None        => DEFER  — re-queue and re-evaluate on a later flush. REVERSIBLE. This is
@@ -463,11 +463,27 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(
         // height of the block carrying the pointer. An unresolved snapshot is not a failure --
         // this node has simply not seen that PoW block yet -- so it defers, exactly as an
         // unresolved BFT pointer does.
-        let snapshot_height = height_of(snapshot_hash.into())?;
+        let snapshot_height = chain.height_of(snapshot_hash.into())?;
         let sigma = internal_handle.params.bc_confirmation_depth_sigma;
         let gap = (pow_block_height.0 as u64).saturating_sub(snapshot_height.0 as u64);
         if gap < sigma + 1 {
             return Some(zebra_state::CrosslinkVerdict::Reject);
+        }
+
+        // The Last Final Snapshot rule: `snapshot(LF(H)) ⪯bc H` (FINALITY.md §3.4). The depth
+        // check above bounds only how far below the carrier the snapshot sits; this is what
+        // makes those sigma confirmations confirmations of THIS chain. Without it a block at
+        // F + sigma + 1 can carry a certificate finalizing a block on another branch, and the
+        // chain would call final a block it does not even contain.
+        //
+        // PERMANENT once answered: a block's ancestry is fixed by its own bytes, so a `false`
+        // can never become true later. An unresolvable snapshot already deferred at `height_of`
+        // above; `None` here means the chain cannot place it on a branch yet, which defers for
+        // the same reason.
+        match chain.is_ancestor_of_candidate(snapshot_hash.into()) {
+            Some(true) => {}
+            Some(false) => return Some(zebra_state::CrosslinkVerdict::Reject),
+            None => return None,
         }
 
         // PoS issuance rides on this gate because this is the one place that knows both facts it
@@ -614,7 +630,31 @@ async fn is_block_known(
     }
 }
 
-async fn _block_header_from_hash(
+/// Whether `ancestor` is `descendant` or one of its ancestors, on whichever chain holds the
+/// descendant — the `⪯bc` of the Crosslink 2 validity rules (FINALITY.md §3.4).
+///
+/// `None` means this node has not seen one of the two blocks yet. Every caller here treats that
+/// as "ask again later": ancestry is fixed by a block's own bytes, so only a `Some(false)` is a
+/// violation.
+async fn crosslink_is_ancestor(
+    call: &TFLServiceCalls,
+    ancestor: ZebBlockHash,
+    descendant: ZebBlockHash,
+) -> Option<bool> {
+    if let Ok(StateReadResponse::CrosslinkIsAncestor(answer)) =
+        (call.read_state)(StateReadRequest::CrosslinkIsAncestor {
+            ancestor,
+            descendant,
+        })
+        .await
+    {
+        answer
+    } else {
+        None
+    }
+}
+
+async fn block_header_from_hash(
     call: &TFLServiceCalls,
     hash: ZebBlockHash,
 ) -> Option<Arc<ZebBlockHeader>> {
@@ -710,7 +750,7 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
         return None;
     };
 
-    let (latest_final_block, latest_bft_block_hash) = {
+    let (latest_final_block, latest_bft_block_hash, parent_snapshot_hash) = {
         let internal = tfl_handle.internal.lock().await;
         (
             internal.latest_final_block,
@@ -718,6 +758,13 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
                 .bft_blocks
                 .last()
                 .map_or(Blake3Hash([0u8; 32]), |b| b.blake3_hash()),
+            // The parent bft-block's snapshot, for the Linearity check below. A parent carrying
+            // no headers is a placeholder from out-of-order ingest and names no snapshot.
+            internal
+                .bft_blocks
+                .last()
+                .filter(|b| !b.headers.is_empty())
+                .map(|b| ZebBlockHash(b.snapshot_block_hash().0)),
         )
     };
     // `finality_candidate_height` (tip - sigma) is the `snapshot`: the block this proposal
@@ -741,6 +788,11 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
         return None;
     }
 
+    // The +40 candidate clamp. This is a Zebra Crosslink design heuristic, not part of the
+    // Crosslink 2 specification, and where it binds the proposal departs from honest proposal
+    // (FINALITY.md §3.4): `headers_bc` is then a window of `bc_best` ending below its tip
+    // rather than its tail. The window still satisfies Tail Confirmation, which is what block
+    // validity actually requires, so the departure costs finality speed rather than validity.
     let finality_candidate_height = ZebBlockHeight(finality_candidate_height.0.min(if let Some(v) = latest_final_block { v.0.0+40 } else { u32::MAX }));
 
     let resp = (call.state)(StateRequest::BlockHeader(finality_candidate_height.into())).await;
@@ -752,6 +804,27 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
         panic!("TODO: improve error handling.");
         return None;
     };
+
+    // Linearity (FINALITY.md §3.4): a proposal whose snapshot does not extend the parent
+    // bft-block's snapshot is invalid, so there is no point proposing it. Honest proposal says
+    // to repeat the parent's `headers_bc` instead of declining; how often a node should repeat
+    // them is design question 3 in IMPLEMENTATION.md, so this keeps declining until that is
+    // settled. The common cause is a bc reorganization onto a branch that forks below the
+    // parent's snapshot, which resolves on its own once a chain containing that snapshot is
+    // best again.
+    if let Some(parent_snapshot_hash) = parent_snapshot_hash {
+        if parent_snapshot_hash != candidate_hash
+            && crosslink_is_ancestor(&call, parent_snapshot_hash, candidate_hash).await
+                != Some(true)
+        {
+            info!(
+                "not proposing: candidate snapshot {} does not extend the parent bft-block's \
+                 snapshot {}",
+                candidate_hash, parent_snapshot_hash,
+            );
+            return None;
+        }
+    }
 
     // NOTE: probably faster to request 2x as many blocks as we need rather than have another async call
     let resp = (call.state)(StateRequest::FindBlockHeaders {
@@ -770,6 +843,28 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
         panic!("TODO: improve error handling.");
     };
     headers.truncate(params.bc_confirmation_depth_sigma as usize);
+
+    // `Tip` and `FindBlockHeaders` are two reads, and a reorganization between them can leave
+    // the tail short or hanging off a different branch than the candidate. Tail Confirmation
+    // would then reject our own proposal, so check the same thing here and decline instead.
+    let sigma = params.bc_confirmation_depth_sigma as usize;
+    if headers.len() != sigma {
+        info!(
+            "not proposing: the chain returned {} headers above the candidate, not sigma = {}",
+            headers.len(),
+            sigma,
+        );
+        return None;
+    }
+    let tail_links_to_candidate =
+        headers[0].prev_block == BlockHash(candidate_hash.0)
+            && headers
+                .windows(2)
+                .all(|w| w[1].prev_block == BlockHash::from_header_data(&w[0]));
+    if !tail_links_to_candidate {
+        info!("not proposing: the headers above the candidate do not form a chain");
+        return None;
+    }
 
     let internal = tfl_handle.internal.lock().await;
 
@@ -1135,10 +1230,57 @@ async fn validate_bft_block(
         return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
     }
 
+    // The parent bft-block's snapshot, read while the lock is still held; Linearity compares it
+    // against this block's snapshot below, which needs the state. A parent carrying no headers
+    // is a placeholder from out-of-order ingest and names no snapshot.
+    let parent_snapshot_hash = parent
+        .filter(|p| !p.headers.is_empty())
+        .map(|p| ZebBlockHash(p.snapshot_block_hash().0));
+
     // Captured before dropping the lock: an already-finalized hash we can safely use to kick
     // the state's non-finalized queue below without risking a premature finalization.
     let already_finalized_hash = internal.latest_final_block.map(|(_, hash)| hash);
     drop(internal);
+
+    // Tail Confirmation (FINALITY.md §3.4): `headers_bc` is the sigma-block tail of a bc-valid
+    // chain. The rule is objective — it says nothing about this validator's own best chain —
+    // and has three parts: the count, the linkage, and the bc-validity of the blocks named.
+    let sigma = tfl_handle.params.bc_confirmation_depth_sigma as usize;
+    if new_block.headers.len() != sigma {
+        warn!(
+            "BFT block carries {} headers; Tail Confirmation requires exactly sigma = {}",
+            new_block.headers.len(),
+            sigma,
+        );
+        return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
+    }
+    for i in 1..new_block.headers.len() {
+        let expected = BlockHash::from_header_data(&new_block.headers[i - 1]);
+        if new_block.headers[i].prev_block != expected {
+            warn!(
+                "BFT block header {} does not follow header {}: its previous-block hash is {}, \
+                 not {}",
+                i,
+                i - 1,
+                new_block.headers[i].prev_block,
+                expected,
+            );
+            return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
+        }
+    }
+    // The headers are linked, so the topmost one carries the whole tail with it: a block this
+    // state holds has passed bc validation, and its ancestry is exactly these headers and then
+    // the snapshot. Checking the rest one by one would add lookups and no information.
+    if let Some(top_header) = new_block.headers.last() {
+        let top_hash = ZebBlockHash(BlockHash::from_header_data(top_header).0);
+        if block_height_from_hash(&call, top_hash).await.is_none() {
+            // Not a violation: this node has simply not seen that bc-block yet.
+            return (
+                tenderlink::TMStatus::Indeterminate,
+                tenderlink::TMStatusReason::NeedsBlock { hash: top_hash.0 },
+            );
+        }
+    }
 
     // The `snapshot` this proposal finalizes: the parent of the deepest carried header.
     let new_final_hash = ZebBlockHash(new_block.snapshot_block_hash().0);
@@ -1164,6 +1306,35 @@ async fn validate_bft_block(
             return (tenderlink::TMStatus::Indeterminate, tenderlink::TMStatusReason::NeedsBlock { hash: new_final_hash.0 });
         };
     let _ = new_final_pow_height;
+
+    // Linearity (FINALITY.md §3.4): `snapshot(parent(B)) ⪯bc snapshot(B)`. With BFT Final
+    // Agreement this is what makes the snapshots of final bft-blocks bc-linear.
+    if let Some(parent_snapshot_hash) = parent_snapshot_hash {
+        if parent_snapshot_hash != new_final_hash {
+            match crosslink_is_ancestor(&call, parent_snapshot_hash, new_final_hash).await {
+                Some(true) => {}
+                Some(false) => {
+                    warn!(
+                        "BFT block violates Linearity: its snapshot {} does not extend its \
+                         parent's snapshot {}",
+                        new_final_hash, parent_snapshot_hash,
+                    );
+                    return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
+                }
+                None => {
+                    // One of the two is not placed on a chain here yet; ask again rather than
+                    // reject, exactly as a missing snapshot does above.
+                    return (
+                        tenderlink::TMStatus::Indeterminate,
+                        tenderlink::TMStatusReason::NeedsBlock {
+                            hash: parent_snapshot_hash.0,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
     return (tenderlink::TMStatus::Pass, tenderlink::TMStatusReason::None);
 }
 
@@ -2173,7 +2344,18 @@ async fn tfl_service_incoming_request(
             //
             // Each candidate's snapshot height comes from the chain, the same way the gate gets
             // it. The walk normally stops at the first candidate, so this is one lookup.
+            //
+            // Honest context selection (FINALITY.md §3.4) adds the third condition: the cited
+            // block's snapshot has to lie on the chain the template extends, or Last Final
+            // Snapshot rejects the block built from it. The template extends this node's best
+            // tip, so that tip's ancestry is the chain in question.
             let sigma = internal_handle.params.bc_confirmation_depth_sigma;
+            let parent_hash =
+                if let Ok(StateResponse::Tip(Some((_, hash)))) = (call.state)(StateRequest::Tip).await {
+                    Some(hash)
+                } else {
+                    None
+                };
             let n = internal_handle.internal.lock().await.bft_blocks.len();
             let mut suitable_height = None;
             for i in (0..n).rev() {
@@ -2190,15 +2372,39 @@ async fn tfl_service_incoming_request(
                 }
                 if let Some(h) = block_height_from_hash(&call, snapshot_hash).await {
                     if h.0 as u64 + sigma + 1 <= proposed_pow_height {
+                        let on_the_template_chain = match parent_hash {
+                            Some(parent_hash) => {
+                                crosslink_is_ancestor(&call, snapshot_hash, parent_hash).await
+                                    == Some(true)
+                            }
+                            // No tip to judge against, so there is no chain to be off: this is
+                            // the GUI's display query on an empty state.
+                            None => true,
+                        };
+                        if !on_the_template_chain {
+                            continue;
+                        }
                         suitable_height = Some(i + 1); // 1-based (see fat_pointer_to_block_at_height)
                         break;
                     }
                 }
             }
+            // The parent block's own context always qualifies -- it satisfied Last Final
+            // Snapshot against the parent, and the template's chain contains the parent's --
+            // so a template always has one. Falling back to it rather than to the null pointer
+            // also keeps the Extension rule satisfied, which reverting to null would not.
+            let parent_context = match parent_hash {
+                Some(parent_hash) => block_header_from_hash(&call, parent_hash)
+                    .await
+                    .map(|hdr| hdr.fat_pointer_to_bft_block.clone()),
+                None => None,
+            };
             let internal = internal_handle.internal.lock().await;
             let fat_ptr = if let Some(h) = suitable_height {
                 fat_pointer_to_block_at_height(&internal.bft_blocks, &internal.fat_pointer_to_tip, h as u64)
                     .unwrap_or_else(|| FatPointerToBftBlock::null())
+            } else if let Some(parent_context) = parent_context {
+                parent_context
             } else {
                 FatPointerToBftBlock::null()
             };
