@@ -630,12 +630,6 @@ async fn is_block_known(
     }
 }
 
-/// Whether `ancestor` is `descendant` or one of its ancestors, on whichever chain holds the
-/// descendant — the `⪯bc` of the Crosslink 2 validity rules (FINALITY.md §3.4).
-///
-/// `None` means this node has not seen one of the two blocks yet. Every caller here treats that
-/// as "ask again later": ancestry is fixed by a block's own bytes, so only a `Some(false)` is a
-/// violation.
 /// The aggregated stake per finalizer at `hash`, as the bonds stood at that committed block.
 ///
 /// The BFT roster for height `H` is the stakes at `snapshot(B_{H-1})` (FINALITY.md §7). This is
@@ -656,6 +650,13 @@ async fn aggregated_stakes_at(
     }
 }
 
+/// Whether `ancestor` is `descendant` or one of its ancestors, on whichever chain holds the
+/// descendant — the `⪯bc` of the Crosslink 2 validity rules (FINALITY.md §3.4).
+///
+/// `None` means this node has not seen one of the two blocks yet. No caller treats it as a
+/// violation: ancestry is fixed by a block's own bytes, so only a `Some(false)` is one. Validation
+/// asks again for the missing block; the proposer and the template walk decline the candidate and
+/// come back to it on a later call.
 async fn crosslink_is_ancestor(
     call: &TFLServiceCalls,
     ancestor: ZebBlockHash,
@@ -2436,11 +2437,14 @@ async fn tfl_service_incoming_request(
             // Snapshot against the parent, and the template's chain contains the parent's --
             // so a template always has one. Falling back to it rather than to the null pointer
             // also keeps the Extension rule satisfied, which reverting to null would not.
-            let parent_context = match parent_hash {
-                Some(parent_hash) => block_header_from_hash(&call, parent_hash)
+            //
+            // Read only when the walk found nothing: every template request goes through here,
+            // and the common case has a decided block to cite and no use for the parent's.
+            let parent_context = match (suitable_height, parent_hash) {
+                (None, Some(parent_hash)) => block_header_from_hash(&call, parent_hash)
                     .await
                     .map(|hdr| hdr.fat_pointer_to_bft_block.clone()),
-                None => None,
+                _ => None,
             };
             let internal = internal_handle.internal.lock().await;
             let fat_ptr = if let Some(h) = suitable_height {

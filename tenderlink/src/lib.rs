@@ -90,20 +90,18 @@ use snow::resolvers::CryptoResolver;
 use tokio::time::Instant;
 use zcash_primitives::bft::{ HashKey, HashKeys, FatPointerToBftBlock, TMSig, PubKeyID, FatPointerSignature, BftBlockAndFatPointerToIt, BftBlock };
 
-// The send tick and the peer gossip period are apparent durations, like the step timeouts in
-// `Timeout::new`: they are read through `zebra_debug_time::real_duration` before they are waited
-// on. The tick is what actually puts proposals and votes on the wire, and the step timeouts are
-// tuned as multiples of it (Propose is eight ticks), so the two have to dilate together. A real
-// 250 ms tick against a 90x-dilated 22 ms Propose timeout expires every step several ticks before
-// its messages can be sent, which leaves the chain advancing only when a message happens to land
-// inside a step by luck. `PEER_CONNECT_DURATION` stays real: it paces reconnection against a real
-// TCP stack, not against the chain clock.
+// The send tick and the peer gossip period are apparent durations: they are read through
+// `zebra_debug_time::real_duration` before they are waited on. The tick is what actually puts
+// proposals and votes on the wire, so a step that waits on a message has to dilate with it --
+// which is why `Timeout::new` dilates Prevote and Precommit and leaves Propose real (it waits on
+// the proposer's own work, not on the wire). A real 250 ms tick against a 90x-dilated 5.6 ms
+// Prevote timeout expires every such step several ticks before its messages can be sent, which
+// leaves the chain advancing only when a message happens to land inside a step by luck.
+// `PEER_CONNECT_DURATION` stays real: it paces reconnection against a real TCP stack, not against
+// the chain clock.
 const TICK_DURATION:         std::time::Duration = std::time::Duration::from_millis(250);
 const PEER_GOSSIP_DURATION:  std::time::Duration = std::time::Duration::from_millis(1500);
 const PEER_CONNECT_DURATION: std::time::Duration = std::time::Duration::from_millis(5000);
-
-
-
 
 // NOTE: Sam and Phillip discussed forward jumps; Noise trial decryption already protects connectsions against replay attacks.
 const NONCE_FORWARD_JUMP_TOLERANCE: u64 = 512;

@@ -96,14 +96,15 @@ describe the new derivation.
 
 ## Stage 2: Remove dead parameters and state
 
-Implements FINALITY.md §1 (`finalization_gap_bound`), §5.1 (`current_bc_final`), and §8.1.
+Implements FINALITY.md §1, §5.1 (`current_bc_final`), and §8.1.
 
-- Delete `finalization_gap_bound` from `ZcashCrosslinkParameters` and `PROTOTYPE_PARAMETERS`
+- Delete the Book's `L` from `ZcashCrosslinkParameters` and `PROTOTYPE_PARAMETERS`
   in `librustzcash/zcash_primitives/src/bft.rs`, and from the parameter serialization in
-  `test_format.rs`. The test format loses its second parameter value.
+  `test_format.rs`. The second parameter value stays in the instruction and is written as zero,
+  so the instruction's width is unchanged and older files still load.
 - Regenerate each `.zeccltf` file in `zebra-crosslink/crosslink-test-data` that a test
-  generates. Keep each file that a test loads but does not generate, and rewrite its parameter
-  instruction without the removed value so that it still loads.
+  generates. Keep each file that a test loads but does not generate; those carry no parameter
+  instruction at all, so they load unchanged.
 - Delete `TFLServiceInternal::current_bc_final` and its initialization and assignment.
 - Rename the main-loop local `current_bc_tip` to `bc_best_tip`.
 - Delete the `ba_mu` paragraph from `diagram_scene_1`'s doc comment in

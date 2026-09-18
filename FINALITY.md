@@ -64,9 +64,9 @@ definitions guarantee.
 
 **Current tree.** The prototype sets `σ = 4` in `librustzcash/zcash_primitives/src/bft.rs`
 (`PROTOTYPE_PARAMETERS`). The source code explicitly warns that this value has not been
-verified as secure or performant. The Book's `L` is not a parameter of this design:
-`finalization_gap_bound` has been removed from `ZcashCrosslinkParameters`, from the node
-configuration, and from the test format, which writes zero in its place.
+verified as secure or performant. The Book's `L` is not a parameter of this design: it is absent
+from `ZcashCrosslinkParameters`, from the node configuration, and from the test format, whose
+parameter instruction writes a zero in its place.
 
 ### Notation
 
@@ -920,8 +920,8 @@ it departs from.
   snapshot the state cannot yet place on a branch defers, and one it places off the block's own
   ancestry is rejected permanently. Ancestry is read with `ReadStateService::is_ancestor_of`,
   across every chain the state holds rather than the best chain alone.
-- The Finality Depth rule and Stalled Mode are omitted by design (§3.3). There is no
-  `finalization_gap_bound`, and the 512-block log threshold is diagnostic, not consensus.
+- The Finality Depth rule and Stalled Mode are omitted by design (§3.3). The 512-block log
+  threshold is diagnostic, not consensus.
 - BFT validation enforces Linearity and Tail Confirmation in `validate_bft_block`. Tail
   Confirmation is checked as the three things it is: exactly `σ` headers, each naming the one
   below it, and the block at the topmost header known to this state — which, given the linkage,
@@ -1179,12 +1179,6 @@ stored, or consumed.
   because `fin` is the view Assured Finality covers (§2).
 - **`σ` comes from `ZcashCrosslinkParameters`.** The GUI's `apply_viz_op` hardcodes it as
   `TMP_SIGMA`, which matches only while `PROTOTYPE_PARAMETERS` is unchanged.
-- **Removing `finalization_gap_bound` changed the test format.** The field was the Book's `L` in
-  `ZcashCrosslinkParameters`, and `test_format.rs` serialized it as `SET_PARAMS`'s second
-  parameter value. Both are gone; `SET_PARAMS` still carries two values and writes zero in the
-  second, so the instruction's width is unchanged and older files still load. The `.zeccltf`
-  files a test generates were regenerated; the ones a test only loads carry no `SET_PARAMS` at
-  all and were left alone.
 - **Last Final Snapshot has no node test, and cannot have one here.** A violation needs a block
   whose ancestry omits the snapshot of the bft-block it cites. The decide path finalizes every
   snapshot as it is decided (`handle_new_decided_bft_block` → `CrosslinkFinalizeBlock`), and the
