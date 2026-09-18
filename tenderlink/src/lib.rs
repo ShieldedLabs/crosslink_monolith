@@ -90,9 +90,19 @@ use snow::resolvers::CryptoResolver;
 use tokio::time::Instant;
 use zcash_primitives::bft::{ HashKey, HashKeys, FatPointerToBftBlock, TMSig, PubKeyID, FatPointerSignature, BftBlockAndFatPointerToIt, BftBlock };
 
+// The send tick and the peer gossip period are apparent durations, like the step timeouts in
+// `Timeout::new`: they are read through `zebra_debug_time::real_duration` before they are waited
+// on. The tick is what actually puts proposals and votes on the wire, and the step timeouts are
+// tuned as multiples of it (Propose is eight ticks), so the two have to dilate together. A real
+// 250 ms tick against a 90x-dilated 22 ms Propose timeout expires every step several ticks before
+// its messages can be sent, which leaves the chain advancing only when a message happens to land
+// inside a step by luck. `PEER_CONNECT_DURATION` stays real: it paces reconnection against a real
+// TCP stack, not against the chain clock.
 const TICK_DURATION:         std::time::Duration = std::time::Duration::from_millis(250);
 const PEER_GOSSIP_DURATION:  std::time::Duration = std::time::Duration::from_millis(1500);
 const PEER_CONNECT_DURATION: std::time::Duration = std::time::Duration::from_millis(5000);
+
+
 
 
 // NOTE: Sam and Phillip discussed forward jumps; Noise trial decryption already protects connectsions against replay attacks.
@@ -435,11 +445,23 @@ impl Timeout {
             TMStep::Prevote   => Duration::from_millis(500)  + round * Duration::from_millis(500),
             TMStep::Precommit => Duration::from_millis(500)  + round * Duration::from_millis(500),
         };
-        // The step timeouts above are tuned against the *chain-time* block interval, so on a
-        // time-dilated test network they are apparent durations: divide by the dilation
-        // multiplier so BFT rounds pace against the dilated chain the same way they would
-        // pace against a real one. Identity when dilation is off.
-        let timeout = zebra_debug_time::real_duration(timeout);
+        // A step's timeout dilates exactly when the thing it waits for dilates.
+        //
+        // Prevote and Precommit wait on vote gossip, which leaves on the send tick, and the tick
+        // is dilated: they are apparent durations, divided by the multiplier so the rounds pace
+        // against the dilated chain the way they would against a real one.
+        //
+        // Propose waits on the proposer instead: reading the chain, building the block and one
+        // delivery of it. That is real work on a real state service and costs the same wall time
+        // however fast the chain clock runs, so dilating this step only makes every proposal late
+        // by construction. On a debug build under mining load it measures around 1.2 s, with a
+        // tail past 6 s, which is what the 2 s base and the 500 ms/round ramp were tuned to cover.
+        //
+        // All of this is the identity when dilation is off.
+        let timeout = match step {
+            TMStep::Propose => timeout,
+            TMStep::Prevote | TMStep::Precommit => zebra_debug_time::real_duration(timeout),
+        };
 
         Timeout{ time: now + timeout, height, round, step }
     }
@@ -1568,6 +1590,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let mut next_peer_connect = std::time::Instant::now();
     let mut decide_wait_roster_printed: (u64, u32) = (u64::MAX, 0);
 
+    let tick_duration        = zebra_debug_time::real_duration(TICK_DURATION);
+    let peer_gossip_duration = zebra_debug_time::real_duration(PEER_GOSSIP_DURATION);
+
     let mut send_buf1 = [0u8; 2048];
     let mut next_tick_time = tokio::time::Instant::now();
     loop {
@@ -2003,7 +2028,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         send_stp_msg(&mut messages_to_send, &connection_key, &send_buf1[..o], &mut net_stats);
                     }
 
-                    next_peer_gossip = std::time::Instant::now() + PEER_GOSSIP_DURATION;
+                    next_peer_gossip = std::time::Instant::now() + peer_gossip_duration;
                 }
 
                 use rand::seq::IteratorRandom;
@@ -2110,10 +2135,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
 
             let now_now = tokio::time::Instant::now();
-            if now_now - next_tick_time > TICK_DURATION {
-                next_tick_time = now_now + TICK_DURATION;
+            if now_now - next_tick_time > tick_duration {
+                next_tick_time = now_now + tick_duration;
             } else {
-                next_tick_time += TICK_DURATION;
+                next_tick_time += tick_duration;
             }
         }
 

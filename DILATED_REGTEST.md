@@ -42,13 +42,20 @@ state directories and both nodes' logs. Exit status 0 is a pass.
 
 ## Timing
 
-The dilation applies to the consensus clock, the miner's pacing and tenderlink's round
-timeouts (`zebra_debug_time::real_duration`), so BFT keeps pace with PoW: one BFT block per
-PoW block, with the fat pointer advancing every one to three blocks. Transport and the
-wallet's proving time are real. In a debug build `generate` takes about three seconds per
-block, so a run to 450 takes some twenty minutes; the internal miner mines about four times
-faster but cannot be switched on from outside the GUI, which is what keeps the test on
-`generate`.
+The dilation applies to the consensus clock and the miner's pacing, and within tenderlink to
+the send tick and to the Prevote and Precommit timeouts, all through
+`zebra_debug_time::real_duration`. A step's timeout dilates exactly when the thing it waits for
+dilates: Prevote and Precommit wait on vote gossip, which leaves on the dilated tick, while
+Propose waits on the proposer reading the chain and building a block, which is real work on a
+real state service and so keeps its undilated budget. Dilating a step past what it waits on
+makes every message late by construction, which is what a run measures: with the tick left real
+against dilated timeouts the two nodes decided 20 blocks to height 450 and finality trailed the
+tip by 124 blocks mid-run; with both corrected they decide about 80 and finality trails by
+single digits. Transport and the wallet's proving time are real. BFT then keeps pace with PoW:
+one BFT block per PoW block, with the fat pointer advancing every one to three blocks. In a
+debug build `generate` takes about three seconds per block, so a run to 450 takes some twenty
+minutes; the internal miner mines about four times faster but cannot be switched on from
+outside the GUI, which is what keeps the test on `generate`.
 
 Mining must not pause once stake is placed. While the tip sits within σ of the last final
 height every proposal is empty, both nodes prevote nil and each round's timeouts grow with the
