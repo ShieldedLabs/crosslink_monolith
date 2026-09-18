@@ -700,7 +700,7 @@ reorganizations).
   `candidate(bc_best)`. With that floor, the invariant above does not follow: the marker need not
   lie on the node's best chain when it advances, and a known side-chain hash becomes canonical
   (§5.2).
-- It enforces neither Linearity nor Last Final Snapshot (§6.2).
+- It enforces Linearity and Last Final Snapshot (§6.2).
 
 ## 5. Current tree: implementation inventory
 
@@ -886,16 +886,16 @@ it departs from.
   restored, without requiring the current best chain to cite that decision.
 - **Missing clamp.** Zebra does not compute
   `lca(snapshot(LF(H)), prune_σ(H))`; it takes a hash directly from the decided BFT block.
-- **Header order is unenforced.** Honest proposal construction issues `FindBlockHeaders` with
+- **Header order is enforced by validation, not by the type.** Honest proposal construction issues `FindBlockHeaders` with
   the snapshot block as the sole known hash. That request returns the headers *following* the
   intersection, ascending, so the proposal carries the `σ` blocks above the snapshot,
   deepest-first, and `parent(headers[0])` is the snapshot. `σ` headers suffice, because
   `headers[0]` carries the snapshot's hash in its parent field, and a validator must hold the
-  snapshot block to validate the certificate anyway. Nothing enforces that order:
-  `BftBlock::try_from` checks only the header count and logs that its documented validations
-  are unimplemented, and the deserialization path used for network and PoS-store blocks does
-  not call `try_from` at all. Deepest-first is a property of the honest producer, not of the
-  type (§3.4, Tail Confirmation). The snapshot is named by hash only; a consumer that needs
+  snapshot block to validate the certificate anyway. `validate_bft_block` enforces that order
+  as part of Tail Confirmation, rejecting a block whose headers do not each name the one below
+  as parent (§6.2). The type does not: `BftBlock::try_from` checks only the header count and
+  logs that its documented validations are unimplemented, and the deserialization path used
+  for network and PoS-store blocks does not call `try_from` at all. The snapshot is named by hash only; a consumer that needs
   its height asks the chain, and the fat-pointer check is handed a height lookup for that
   purpose (§6.2).
 - **The candidate height is clamped, and the clamp is not `prune_σ`.** The proposal path
@@ -1226,7 +1226,7 @@ node's current `fin`. `snapshot(LF(H))` is another objective candidate source. T
 function must be monotone along a chain under the enforced validity rules. Extension makes
 `LF(H)` monotone along a chain; Linearity then makes `snapshot(LF(H))` monotone, and
 `candidate(H)` follows because `prune_σ(H)` is monotone and an lca of two monotone arguments is
-monotone. The current tree enforces Extension but not Linearity (§6.2). Without a Finality
+monotone. The current tree enforces both Extension and Linearity (§6.2). Without a Finality
 Depth rule, a bc-block producer can also keep a stale `context_bft` at no validity cost (§3.3), so an
 objective advance trigger lets whoever dominates `bc_best` delay payouts while `Π_bft` is live.
 
