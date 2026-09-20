@@ -117,7 +117,10 @@ decision as it is decided (§4.2, §5.2).
 `canonical_finalized_tip` and `fin` are one quantity. Two stored values remain: `fin`, persisted in the finalized database
 as its own block hash, and the database's finalized tip, which is the higher of `fin` and the
 block Zebra commits at reorg depth. The finalized tip equals `fin` while finality lags the
-best tip by less than about `MAX_BLOCK_REORG_HEIGHT` blocks.
+best tip by less than about `MAX_BLOCK_REORG_HEIGHT` blocks. Past that lag the depth commit
+runs ahead of `fin`, and if it comes to lie on a branch that excludes `bft_final_snapshot`, the
+node opens a second chain state of the same shape for the BFT branch (§4.3, §7.1). `fin` is one
+quantity across both: every branch the node records contains it.
 
 A fourth quantity is objective rather than node-local:
 
@@ -156,10 +159,12 @@ The walk is `bc → bft → bft → bc`, followed by the last-common-ancestor cl
 `bft-last-final(B)` is the last final ancestor of `B`, `B` included. In Zebra, in the current
 tree and in Zebra Crosslink alike, `Π_bft` decides
 each bft-block individually, and a decided block is final. A bc-block's `context_bft` is a fat
-pointer, and a node resolves it only against `TFLServiceInternal::bft_blocks`, whose entries are
-all decided; a pointer that does not resolve defers the bc-block (§6.2, Extension). Every
-context a node accepts is therefore final, and `bft-last-final` is the identity on them, so
-`LF(H)` is the bft-block that `H.context_bft` points at.
+pointer, and a node resolves it only against the node's own store of decided bft-blocks; a
+pointer that does not resolve defers the bc-block (§6.2, Extension). Every context a node accepts
+is therefore final, and `bft-last-final` is the identity on them, so `LF(H)` is the bft-block
+that `H.context_bft` points at. Zebra Crosslink keeps that store in `zebra-state` beside the
+chain it is resolved against (§7.1); in the current tree it is
+`TFLServiceInternal::bft_blocks` (§5.5).
 
 The clamp puts `candidate(H)` on `H`'s own chain and no later than `prune_σ(H)`. The Book says,
 “This ensures that the candidate is at least σ‑confirmed”
@@ -617,7 +622,10 @@ describe it. Statements under *Without Linearity* show what the rule prevents.
   partition. Under raw fork choice all nodes follow the heavier branch.
   - *With Linearity:* later final snapshots stay on A's branch, so B-side `fin` never passes the
     fork point and B-side nodes can always still switch to A. Under raw fork choice, if B is
-    heavier, finality stays stalled until B's branch is abandoned.
+    heavier, finality stays stalled until B's branch is abandoned. A partition lasting more than
+    `MAX_BLOCK_REORG_HEIGHT` blocks puts the fork point below the B-side depth commit, which is
+    the case the second finalized state of the implementation below exists to serve: the B-side
+    node records both branches and switches without an operator.
   - *Without Linearity:* if `Π_bft` later finalizes a snapshot on B's branch, B-side nodes
     advance `fin` past the fork point on B. From then on neither side switches, whatever the
     work, and neither records a hazard, because each side's candidate from the other branch is
@@ -652,8 +660,10 @@ These are requirements; §5 describes the current tree. The rule is implemented 
 finalized database rather than as a separate chain filter:
 
 - On every change of `bc_best`, the node computes `N := candidate(bc_best)`. If `fin ⪯ N` and
-  `N ≠ fin`, it commits `N` through `CrosslinkFinalizeBlock` and then stores `N` as `fin`. A
-  candidate at or below `fin` changes nothing.
+  `N ≠ fin`, it finalizes up to `N` and stores `N` as `fin`. A candidate at or below `fin`
+  changes nothing. The candidate computation and both writes belong to the code that changed the
+  best chain, so they are one synchronous sequence rather than a request that can fail partway
+  (§7.1).
 - The commit discards every non-finalized chain that does not contain `N`, and Zebra rejects
   blocks that fork below its finalized tip. Chains that exclude `fin` therefore never enter the
   node's view, which is the switch condition above. That rejection is the refused switch; the
@@ -664,27 +674,58 @@ finalized database rather than as a separate chain filter:
 - A BFT decision does not change the finalized state. It advances `bft_final_snapshot` (§2),
   which can lie on a chain that is not `bc_best`. Only a later `bc_best` change moves `fin`, and
   only by the rule above.
-- The node syncs the chain leading to `bft_final_snapshot` whether or not it is `bc_best`. It
-  stores those bc-blocks and the BFT decisions on disk outside the finalized state, tracks bond
-  state along that chain, and computes the validator set there (§7), so that it can validate
-  later bft-blocks while following another best chain. Under Linearity that chain contains
-  `fin`, so it remains eligible, and the node switches to it once it has more work. BFT
-  processing therefore belongs to `NonFinalizedState`, and the Proof-of-Stake logic to
-  `zebra-state`, where bc-block validity, bft-block validity, and roster computation run in one
-  synchronous domain with no asynchronous calls between them.
+- The node syncs the chain leading to `bft_final_snapshot` whether or not it is `bc_best`, and
+  it never needs a resync to do so. While that chain forks above the depth-committed block it is
+  a chain of the non-finalized state, exempt from the pruning that drops the lowest-work chains
+  past `MAX_NON_FINALIZED_CHAIN_FORKS`, and it survives a restart through the non-finalized
+  backup. Every chain carries its aggregated stakes per block, beside the per-block
+  `bond_rewards` and `finalizer_commissions` it already unwinds, so the validator set at any held
+  block is a lookup, on either side of a finalized tip (§7.3). Under Linearity that chain contains
+  `fin`, so it remains eligible, and the node switches to it once it has more work. Bc-block
+  validity, bft-block validity and roster computation are therefore one synchronous domain in
+  `zebra-state` (§7.1).
 - Zebra also commits the root of the best chain to the finalized database once the chain is
   longer than `MAX_BLOCK_REORG_HEIGHT` (from `zcash_protocol::consensus`, applied in
   `zebra-state/src/service/write.rs`). The value in the current tree is 99. Upstream Zebra
   raised it to 999, and that change was lost when this tree was rebased onto new Zebra, so 999
   is the intended value; the depths of 99 written elsewhere in this document follow the tree.
-  Chains forking below that point are no longer in view.
+  Chains forking below that point are no longer in view of that database.
   On a Zebra node the effective floor is the higher of `fin` and that depth-committed block.
-  If `bc_best` runs more than that depth past the point where the chain to `bft_final_snapshot`
-  forks from it, the depth commit writes a block that conflicts with `bft_final_snapshot`. The
-  node can then never switch to the finalized chain, and under Linearity and Last Final
-  Snapshot its own branch never finalizes again. The node stops following the chain to
-  `bft_final_snapshot` at that point, which also ends its bft-block validation until it
-  resyncs. Implementations annotate that code path with a comment saying so.
+
+  The depth commit is never held back indefinitely. A node whose BFT has stalled, for any length
+  of time or forever, keeps committing its PoW best chain and remains a working PoW node with a
+  frozen `fin`. If `bc_best` then runs more than that depth past the point where the chain to
+  `bft_final_snapshot` forks from it, the depth commit writes a block that conflicts with
+  `bft_final_snapshot`, and one finalized database cannot be rewound to take the other branch.
+  The node must nevertheless keep syncing and recording both branches for as long as both grow,
+  validating bft-blocks and computing rosters along the BFT branch, and switch its served best
+  chain to that branch when the rule above says to. That is a second finalized state:
+
+  - The PoW state **P** is today's Zebra: raw work fork choice and the depth commit. Its
+    finalized state keeps, at a height at or below `fin`, a snapshot of itself from which an
+    independent, writable copy can be opened while P keeps writing. The snapshot is retaken as
+    `fin` advances, and during a stall it stays valid, only staler. Every chain containing `fin`
+    forks at or above it.
+  - When a bc-block arrives that forks below P's finalized tip but above `fin`, the node opens
+    the Crosslink state **C** from that snapshot, replays P's own stored blocks from the
+    snapshot height to the fork point into it, and from there feeds C the conflicting chain from
+    peers. C's fork-choice floor is `bft_final_snapshot` and C never depth-commits. Both states
+    keep syncing and committing; the served best chain is chosen across both by the switch rule
+    above. C is dropped once `fin` passes the fork, and P's branch is recorded for as long as
+    blocks arrive on it.
+  - How the snapshot is taken belongs to the storage engine, and it sets the cost of a conflict
+    rather than whether the node survives one: a hard-linked checkpoint or a filesystem reflink
+    clone is milliseconds, a persistent savepoint plus a file clone needs P's writer paused for
+    the copy, and a logical copy into a fresh database costs a full database of time and disk.
+    The last is the portable floor and is acceptable, because what it pays for is a network
+    partition deeper than `MAX_BLOCK_REORG_HEIGHT`.
+
+  Until the second state exists, the node holds P's depth commit at the fork point while a
+  conflict is live, up to `CONFLICT_HOLD_DEPTH` blocks past the fork, then commits and reports on
+  stdout that it can no longer follow `bft_final_snapshot`; that path carries an `@Todo` naming
+  the second state. The hold is an interim and never the design, because under a permanent
+  conflict it is the same wall `CONFLICT_HOLD_DEPTH` blocks later. A node never requires a resync
+  to resume bft-block validation.
 
 Sticky fork choice and Linearity constrain different points. Sticky fork choice keeps `fin` on
 `bc_best`; Linearity keeps each final snapshot on or after the previous one. `fin` lies at or
@@ -837,7 +878,7 @@ decision) and `F` is the height of the PoW block that certificate finalizes — 
 `FINALITY_LIVENESS_ALLOWANCE = 3`, in `librustzcash/zcash_primitives/src/bft.rs`.
 
 Both inputs are objective functions of committed chain data, so every node computes the same
-answer for the same block, as §9.2 requires. The fat-pointer check (§6.2) already refuses any
+answer for the same block, as §9.1 requires. The fat-pointer check (§6.2) already refuses any
 `P` below `F + σ + 1`, so `height(P) − F` is at least `σ + 1`: with σ = 4 the paying gaps are 5,
 6 and 7, i.e. 4, 5 or 6 blocks strictly between `F` and `P`, and a seventh earns nothing.
 
@@ -873,6 +914,49 @@ that does not advance the certificate pays nothing — and assumes an advancing 
 prompt. That is correct whenever BFT kept up. When it did not, the replay disagrees with the
 rows already stored and its existing cross-check refuses to write anything, so the failure mode
 is a repair that declines, never a repair that corrupts.
+
+### 5.5 The Crosslink service crate
+
+`zebra-crosslink/zebra-crosslink` is about 4,900 lines in four files: `lib.rs`, holding the
+service and its internal state; `service.rs`, which constructs both; `viz2.rs`, the GUI feed;
+and `test_format.rs`, the `.zeccltf` test driver. It exposes a tower `Service` over
+`TFLServiceRequest` whose handlers take a tokio `Mutex` on `TFLServiceInternal`.
+
+Nothing on a consensus path calls that service. Its callers outside the crate are
+`zebra-crosslink/zebra-rpc/src/methods.rs` — the finality methods, the roster, the recency
+status, the block template's `FatPointerToBFTChainTip`, and the staking, wallet and faucet
+commands — and two sites in `zebra-crosslink/zebrad/src/lightwalletd.rs`, which ask for `Roster`
+and `Faucet`.
+
+One call goes the other way. `spawn_new_tfl_service` installs a closure that `zebra-state` holds
+as `ClosureToCallIntoCrosslinkFromState`; `new_network` invokes it as `crosslink_gate` for each
+bc-block it is about to commit, and `call_from_state_to_crosslink_to_ask_about_fat_pointers`
+answers with the Extension, Last Final Snapshot and σ-confirmation verdicts and with the
+`pos_payout` flag (§5.4, §6.2). That is the only path from `zebra-state` into the crate, and the
+reason the service lock must be released before a state request (§8.1).
+
+Most of what `TFLServiceInternal` holds is chain-derived. `bft_blocks` and
+`bft_block_hash_to_height` are the decided bft-chain; `fat_pointer_to_tip` is its tip's fat
+pointer; `latest_final_block` is the overloaded marker of §5.1; `finalizers_at_current_height`
+is the roster read at the snapshot of the previous decided bft-block. The rest is not:
+`my_public_key`, the peer and BFT connection strings, the message and error counters, and
+`recency_status`, which the `bft_access_closure` fills from `tenderlink`'s round state for
+`get_tfl_recency_status` and the GUI.
+
+A second copy of the decided bft-chain lives in the PoS store file.
+`handle_new_decided_bft_block` appends a record holding the `BftBlock`, its fat pointer,
+`finalizers_at_current_height` and the proposal signatures; `tfl_service_main_loop` replays the
+file at startup to rebuild `bft_blocks`, the roster and `tenderlink`'s `ingest_startup_data`,
+and recomputes the watermark `prev_finalized_bc_height` from each record's snapshot. The restore
+path unwraps a state lookup for the last stored block, so a finalized database behind the file
+ends the process (§5.2).
+
+`force_feed_pos` in `TFLServiceCalls` injects a decided bft-block without `Π_bft`. Its only
+caller is `test_format.rs`.
+
+`tfl_block_finality_from_height_hash` answers block status with two state requests and the final
+marker between them, so its reads can straddle a reorganization. It also builds a `BlockHeader`
+request that it never awaits.
 
 ## 6. Current tree: divergences from Zebra Crosslink
 
@@ -976,7 +1060,8 @@ Zebra Crosslink names separately:
 
 - protocol `local_finalized_tip` (`fin`), which under sticky fork choice is also the Zebra
   policy floor `canonical_finalized_tip` (§2, §4.3); and
-- the database's finalized tip, the higher of `fin` and the reorg-depth commit.
+- the finalized tip of the PoW state's database, the higher of `fin` and the reorg-depth commit;
+  a second state opened for a conflicting BFT branch (§4.3) has its own.
 
 ### 6.4 Unbounded finality gap
 
@@ -1009,6 +1094,24 @@ still the legacy-fed slot, not `fin`.
 - A known side-chain hash can change the canonical branch. A hash unknown to state panics the
   decide path; a hash whose chain is dropped after validation can retry forever (§5.2).
 
+### 6.7 Placement
+
+Zebra Crosslink keeps finality state in `zebra-state` (§7.1). The current tree keeps it in a
+separate crate behind an asynchronous service, and these divergences follow from that:
+
+- Admitting a bc-block crosses the crate boundary. `new_network` calls into the Crosslink
+  service for every block it is about to commit, and the answer depends on state that service
+  holds behind a lock, which is what makes the lock ordering of §8.1 a correctness condition.
+- A decision and its commit are one event (§5.2). The decide path sends `CrosslinkFinalizeBlock`
+  and retries it without limit, and `tenderlink` does not start the next round until the decide
+  closure returns.
+- The proposal path issues `Tip` and then `FindBlockHeaders`, which can straddle a
+  reorganization (§6.2). In the writer that holds the chain they are one read.
+- The decided bft-chain is stored twice, in memory and in the PoS store file, and is restored
+  from the file with its roster bytes rather than recomputed (§5.5, §8.1).
+- The roster read answers from the finalized database alone, so it is correct only while the
+  decide path commits the snapshot it has just decided (§8.1).
+
 ## 7. Names and consumer contracts
 
 This section is Zebra Crosslink. The protocol names encode their definitions:
@@ -1022,6 +1125,77 @@ This section is Zebra Crosslink. The protocol names encode their definitions:
 
 The database's finalized tip has a name distinct from `fin` (§6.3). The legacy reorg-depth
 value keeps a name that says it is a reorg-depth marker, not Crosslink finality.
+
+### 7.1 Where finality state lives
+
+Finality state is chain state. The quantities of §2 are computed from blocks the node holds —
+`fin` from its own history of them (§3.2) — and every consumer of one needs the bc-chain as it
+stood at the same instant. Zebra Crosslink keeps all of it in `zebra-state`, beside the finalized
+database and the non-finalized state, reachable without an asynchronous call:
+
+- `fin` is a column of the finalized database, written in or after the batch that commits the
+  block it names (§8.1).
+- The decided bft-chain — its blocks, their fat pointers, and the proposal signatures that
+  accompany them — is stored the way bc-blocks are stored, in the same database.
+- `LF(H)`, `snapshot(LF(H))`, `candidate(H)`, `bft_final_snapshot` and the σ-confirmation test
+  are computed from those two by the code that also holds the chains they are compared against.
+- The validator set is derived from bonds on the chain the decided bft-block names, by the same
+  function that computes the finalized aggregate (§7.3).
+
+`Π_bft` is not chain state. The `tenderlink` crate owns the vote rounds, the message transport,
+and the rule that a height decides before the next one starts; none of that is a function of the
+chain, and it stays where it is. It reaches its host through the arguments of
+`tenderlink::entry_point`, which are the whole interface:
+
+| argument | what the host answers with |
+|---|---|
+| `propose_closure` | a bft-proposal built from the host's `bc_best`, or nothing (§3.4) |
+| `validate_closure` | a verdict on a proposed bft-block, or `Indeterminate` with the block it still needs |
+| `push_block_closure` | acceptance of a decision, answered with the roster and vote namespace for the next height |
+| `peer_cmd_closure` | the peer addresses of the current roster |
+| `bft_access_closure` | a copy of round state for display; it decides nothing |
+
+Three of the five need the bc-chain: a proposal is the σ-block tail of `bc_best`, validation is
+Tail Confirmation and Linearity against the chains the node holds, and the roster is the bonds
+at a bc-block. The host side therefore belongs in `zebra-state`, which already depends on
+`tenderlink` and already runs its transport (`tenderlink::stp`, `tenderlink::native_sockets`)
+for bc-block propagation. Nothing sits between the two: a crate that relays between `tenderlink`
+and `zebra-state` can only reintroduce the boundary that makes these quantities race.
+
+The closures stay asynchronous, because `tenderlink` awaits them. What moves is the side of the
+boundary the reads happen on: a closure sends one message to the block writer and awaits one
+reply, and every chain read behind that reply is local and synchronous. There is no path back
+out, so there is no lock ordering to respect (§6.7).
+
+Finality state is chain state, and there can be two chain states at once. When the depth commit
+and `bft_final_snapshot` come to lie on different branches, the BFT branch is a second finalized
+database plus non-finalized state of the same shape as the first, opened from a snapshot of the
+first at or below `fin` (§4.3). `zebra-state` routes blocks and reads between the two and chooses
+the served best chain across both. How that snapshot is taken belongs to the storage engine, not
+to the protocol.
+
+**By fate.** What the current tree holds in the Crosslink service crate (§5.5) is four kinds of
+thing, and only the first is irreducible:
+
+| current tree | fate |
+|---|---|
+| `tenderlink` and its `entry_point` interface | unchanged; `zebra-state` constructs the five closures |
+| `bft_blocks`, `bft_block_hash_to_height`, `fat_pointer_to_tip`, `finalizers_at_current_height` | move to `zebra-state` as chain state |
+| `latest_final_block` | becomes `fin` in `zebra-state`, with one writer and the §3.2 update rule (§6.1) |
+| `propose_new_bft_block`, `validate_bft_block`, `handle_new_decided_bft_block`, `call_from_state_to_crosslink_to_ask_about_fat_pointers` | move to `zebra-state`, where each reads one consistent view |
+| the PoS store file | dies; its records become database rows, and its roster is recomputed rather than restored |
+| `TFLServiceInternal`, `tfl_service_main_loop`, `TFLServiceHandle`, the tower service over `TFLServiceRequest`, and the reentrancy constraint it imposes | die; every finality arm is answered by the state service or by a channel it publishes |
+| the wallet, faucet and staking arms | survive as calls rather than as a service: they relay to the `wallet` crate and read no finality quantity |
+| `viz2.rs` | survives as a view over the state service and a published diagnostic snapshot, holding no state of its own; where it lives is a packaging question |
+| `test_format.rs` and `force_feed_pos` | survive as test support beside the tests they drive; injection becomes a message to the block writer |
+
+Once the moves above are done, what remains holds no finality state and sits on no consensus
+path, so where it lives is a packaging question and not a finality one. The GUI feed is the
+largest such piece, and it is a view in the sense of the §7.2 table: it reads the state service
+and the published round-state snapshot, answers the renderer's requests from them, and is free to
+lag or to be absent without any consequence for consensus.
+
+### 7.2 Consumer contracts
 
 No protocol view lies between the best tip and the finalized tip, so no CL2 quantity is a
 default for "confirmed" presentation. Each consumer needs a contract:
@@ -1037,14 +1211,24 @@ default for "confirmed" presentation. Each consumer needs a contract:
 | finality-change notifications | `local_finalized_tip` transitions | sent after `fin` is persisted; the exposure condition of §3.5 is an `@Todo` |
 | visualization paging | operational paging cursor | do not overload a finality value merely to bound a window |
 | canonical state activation | `fin` | sticky fork choice floor (§4.3) |
-| physical database status | database finalized tip | higher of `fin` and the reorg-depth commit; never reported as Crosslink finality |
+| physical database status | database finalized tip | higher of `fin` and the reorg-depth commit, in the PoW state; a second state for a conflicting BFT branch has its own; never reported as Crosslink finality |
 | staking rewards | objective per-block source | never use node-local `fin`; see §9.1 |
 | validator roster and hardfork membership | bonds at `snapshot(B_{H−1})` | objective; see below |
+| block-template BFT context | newest qualifying decided bft-block | the σ-confirmation and Last Final Snapshot tests are the ones bc-block admission runs, so a template never carries a certificate its own chain would refuse (§6.2) |
+| BFT round diagnostics | `tenderlink` round state | display only; a published snapshot, never an input to consensus |
+| visualization feed | `bc_best_tip`, `local_finalized_tip`, the decided bft-chain, round diagnostics | a view: it holds no state and decides nothing |
+| wallet, faucet and staking commands | none of the above | not finality; they relay to the `wallet` crate |
+
+Every row is served by `zebra-state`: a read request against the finalized database and the
+non-finalized state, or a watch channel published beside the existing chain-tip channels. No row
+is served by a component that keeps its own copy of the value (§7.1). Block and transaction
+status read `fin` and the best chain together, so they cannot report two different moments.
 
 **Current tree.** Every row keyed on `local_finalized_tip` reads `latest_final_block` instead
-(§5.3). The finality RPCs return no value while that slot is empty.
+(§5.3), and reaches it through `TFLServiceRequest` (§5.5). The finality RPCs return no value
+while that slot is empty.
 
-### Consensus-sensitive roster and hardfork inputs
+### 7.3 Consensus-sensitive roster and hardfork inputs
 
 The validator roster, voting power, and hardfork-driven membership changes are
 consensus-sensitive. They must not read node-local `fin` unless there is a proof that every
@@ -1064,9 +1248,11 @@ The two quantities are separate:
 `snapshot(B_{H−1})` generally lies above `fin`, because `candidate(H) ⪯ snapshot(LF(H))` and
 `fin` advances only once a bc-block citing the bft-block is best. It need not lie on `bc_best`
 at all, and can stay off it for any length of time (§2, §4.3). Its bonds are therefore read from
-the chain leading to `bft_final_snapshot`, which the node syncs, stores, and tracks bond state
-along independently of its best chain. An honest validator has downloaded that chain while
-validating `B_{H−1}` (§3.4).
+the chain leading to `bft_final_snapshot`, which the node syncs and stores independently of its
+best chain: as a non-finalized chain carrying its aggregated stakes per block, or, once it forks
+below the depth commit, as the second state of §4.3. The aggregate at a block is the same function
+whichever side of a finalized tip the block is on, so a block committed later yields the
+identical row. An honest validator has downloaded that chain while validating `B_{H−1}` (§3.4).
 
 Validation on that chain is interdependent but well-founded. Validating bft-block `B_H` needs
 the validator set from the bonds at `snapshot(B_{H−1})` and the bc-blocks under `B_H.headers_bc`;
@@ -1083,7 +1269,8 @@ records the current-tree facts that work starts from.
 substitutes the legacy reorg-depth marker; `tfl_reorg_final_block_height_hash` and
 `tfl_final_block_height_hash_pre_locked` no longer exist. Before Crosslink produces a value,
 finality queries return `None`. No regression test covers the absent and present cases, and
-there is no test harness for these RPC methods. `set_final_block` publishes every marker write
+there is no test harness for these RPC methods; the cases are covered at the `ReadStateService`
+request level instead, and a JSON-RPC harness remains separate work. `set_final_block` publishes every marker write
 on `FinalBlockRx`, before state commitment.
 
 **Current tree.** `latest_final_block` is written from the same local that the state request is
@@ -1110,11 +1297,15 @@ stored, or consumed.
   path and on the PoS-store restore path alike, and `terminated_finalizers_at` takes that same
   block's height. Nothing reads stakes from the reply to `CrosslinkFinalizeBlock`, which now
   returns the hash alone, so the roster no longer depends on a decision and a commit being one
-  event — which is what stage 5 separates. The read goes to `aggregated_stakes_by_hash` in the
+  event. The read goes to `aggregated_stakes_by_hash` in the
   finalized database, so it answers for committed blocks only: non-finalized chains keep just
   their tip's bond state (`Chain::delegation_bonds`). That is sufficient while the decide path
-  commits the snapshot it just decided; reading bonds at an uncommitted block is design
-  question 2 (§7).
+  commits the snapshot it just decided. Once it does not (§4.3), the aggregate is carried per
+  block in `Chain`, beside `bond_rewards` and `finalizer_commissions` and popped with them, and
+  it is the same vector `prepare_aggregated_stakes_batch` writes on commit, so the roster read is
+  a lookup on either side of a finalized tip. Forking the chain that holds the block and reading
+  its unwound bond state is the slower equivalent and yields the same aggregate. A block on no
+  chain the node holds is the case the second state of §4.3 removes.
 - **The BFT genesis snapshot is below the bootstrap roster height.** Bootstrap genesis
   carries headers starting at `BOOTSTRAP_ROSTER_HEIGHT`, so its snapshot, and the roster for
   BFT height 1, is the block below that height.
@@ -1150,27 +1341,54 @@ stored, or consumed.
 - **Header order is a property of the honest producer.** `BftBlock::try_from` checks only the
   header count, and the network and PoS-store deserialization path does not call it. Code that
   reads `headers[0]` as the deepest header relies on the producer, not on validation.
-- **The BFT service lock must be released before any state request.** zebra-state can call back
-  into the Crosslink service during `CrosslinkFinalizeBlock`. An update trigger on `bc_best`
-  changes adds a state-to-Crosslink call path with the same reentrancy constraint. The constraint
-  lasts as long as Proof-of-Stake logic sits across an asynchronous boundary from `zebra-state`.
-- **`NonFinalizedState` holds less than the finalized chain needs.** It lives in memory, and it
-  drops chains that do not contain the finalized tip, including those forking below a
-  reorg-depth commit. The chain to `bft_final_snapshot` must survive both a restart and a best
-  chain that has pulled ahead of it, so its blocks, its BFT decisions, and the bond state its
-  rosters are read from need storage of their own.
+- **The BFT service lock must be released before any state request.** zebra-state calls into the
+  Crosslink service to admit a bc-block, so a task that holds the service lock while it awaits a
+  state request can deadlock against that call. The constraint is a property of the split rather
+  than of the protocol: it lasts exactly as long as there is a call path from `zebra-state` into
+  another crate's lock, and it ends when the admission check resolves fat pointers locally
+  (§7.1). It is removed rather than carried across the move.
+- **`NonFinalizedState` holds less than the finalized chain needs.** It lives in memory, it drops
+  the lowest-work chain past `MAX_NON_FINALIZED_CHAIN_FORKS` (10), and it drops chains that do
+  not contain the finalized tip, including those forking below a reorg-depth commit. The chain to
+  `bft_final_snapshot` must survive all three. Its BFT decisions are database rows beside the
+  bc-chain (§7.1); the chain holding `bft_final_snapshot` is exempt from the lowest-work pruning
+  and is restored by the non-finalized backup; and a fork below the depth commit is the second
+  state of §4.3, never a reason to stop following the chain.
+- **A conflict below the depth commit is a second database, not a resync.** The Wall of Death
+  (`410d99ed`) was this failure with no conflict in it: a decision's snapshot lay on the
+  committed chain, deep, and the roster could not be read there, so a node that had mined past it
+  could never resume BFT. Storing aggregated stakes per committed block fixed that, and the
+  resyncs it had forced on feature-testnet operators are what the fix existed to end. The
+  conflict case is the same failure one branch over, and the same answer applies: the node
+  recovers from what it already holds, without an operator.
+- **Switching to the BFT branch can be a reorganization deeper than `MAX_BLOCK_REORG_HEIGHT`.**
+  The wallet's `REWIND_DISTANCE` and `CHECKPOINTS_N` derive from that constant, so a client of a
+  node that can switch to a second state needs checkpoints back to `fin`.
 - **A switch onto the finalized chain replaces bond state.** Bonds tracked along that chain while
   it was a side chain must agree with what the chain produces once it becomes `bc_best`; one
   implementation of the bond update serves both (§5.4).
+- **The decided bft-chain is stored twice.** It is held in memory and appended to the PoS store
+  file, whose records carry the roster as well as the block, the fat pointer and the proposal
+  signatures. Restore reads those roster bytes back rather than recomputing them from bonds,
+  which is the second derivation the first bullet of this list warns against, and it unwraps a
+  state lookup that a database behind the file makes fail (§5.5). One store, with the roster
+  recomputed, removes all three.
+- **`MAX_BLOCK_REORG_HEIGHT` is asserted against the bootstrap gap.**
+  `ZcashCrosslinkParameters::bootstrap_is_valid` requires
+  `activation_height − roster_height > MAX_BLOCK_REORG_HEIGHT`, and a `const _: () = assert!` on
+  `PROTOTYPE_PARAMETERS` checks it while compiling. The prototype gap is 200 blocks, so raising
+  the constant past that stops the workspace building until the bootstrap heights move with it.
 - **Aborts kill the node.** The build uses `panic=abort`. The decide path unwraps
   `block_height_from_hash` on the decided header, so a decided block whose header is unknown to
   state terminates the process, as does every `assert!` on that path.
 - **`fin` is a time series, not a function of the tip (§3.2).** Recomputing it from
   `candidate(bc_best)` after a restart reproduces only the current candidate, which is why `fin`
   is persisted.
-- **Zebra's depth commit is a second floor.** Blocks deeper than `MAX_BLOCK_REORG_HEIGHT` on the
-  best chain are written to the finalized database regardless of `fin` (§4.3, Implementation in
-  Zebra). Any fork-choice rule above `fin` operates only within that window.
+- **Zebra's depth commit is a second floor, per state.** Blocks deeper than
+  `MAX_BLOCK_REORG_HEIGHT` on the best chain are written to the PoW state's finalized database
+  regardless of `fin` (§4.3, Implementation in Zebra), and a fork-choice rule above `fin`
+  operates only within that window in one database. A second state is what lets the rule reach
+  past it; holding the commit back is not, because the hold has to end.
 - **The `+40` candidate clamp breaks honest proposal (§6.2).** It stays, as a design heuristic
   outside the specification (§3.4). With it, one bft-block's snapshot advances by at most 40 bc-blocks; the commit, the
   roster lookup, and `terminated_finalizers_at` handle steps of any size regardless.
