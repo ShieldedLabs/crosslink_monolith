@@ -2,7 +2,7 @@
 //!
 //! The chain is written only by the `new_network` sync thread (see [`BftRunner`]), which also
 //! owns the block writer and the best-chain view, so every rule that reads both the bft-chain and
-//! the bc-chain -- proposal, validation, the fat-pointer gate, the block-template walk -- runs
+//! the bc-chain -- proposal, validation, fat-pointer admission, the block-template walk -- runs
 //! against one consistent view on one thread. Tenderlink's closures marshal a request to that
 //! thread and await one reply. Other readers (the RPC, the visualizer, the test harness) take the
 //! read lock on [`bft_chain`].
@@ -455,7 +455,7 @@ pub fn admit_fat_pointer(
             None => return None,
         }
 
-        // PoS issuance rides on this gate because this is the one place that knows both facts it
+        // PoS issuance rides on this check because this is the one place that knows both facts it
         // needs. A block pays only when it ADVANCES finality (its certificate is a different BFT
         // block than its parent's -- compared by the cert's identity, the BFT block hash, since
         // two honest nodes can carry different signature sets for the same decision) and does so
@@ -496,8 +496,8 @@ pub fn admit_fat_pointer(
 ///
 /// Walks back from the tip to the highest BFT block this PoW height may carry: one whose
 /// `do_not_include_until_bc_height` allows it, AND whose snapshot is deep enough to satisfy the
-/// sigma-confirmation rule the fat-pointer gate enforces. The second condition belongs here as
-/// much as in the gate: the gate rejects a violation PERMANENTLY, so handing the miner a too-new
+/// sigma-confirmation rule admission enforces. The second condition belongs here as much as in
+/// admission: admission rejects a violation PERMANENTLY, so handing the miner a too-new
 /// certificate produces a block that can never be committed and is re-mined forever. Being one
 /// PoW block behind the proposer is enough to reach that state -- this node can hold a decided
 /// BFT block whose snapshot sits sigma below a tip it has not seen yet.
@@ -576,7 +576,17 @@ pub(super) struct BftRunner {
     /// is spawned, or when this node runs no BFT at all.
     launch: Option<BftLaunch>,
     parked: Option<ParkedDecision>,
+    /// A bootstrap genesis that has been decided but whose commit has not finished yet, so
+    /// tenderlink cannot be started from it. Waiting on the reply here would freeze the sync
+    /// thread, which is the only thread that can retry the commit.
+    pending_bootstrap: Option<PendingBootstrap>,
     next_diagnostic: std::time::Instant,
+}
+
+struct PendingBootstrap {
+    genesis: BftBlock,
+    fat_pointer: FatPointerToBftBlock,
+    roster_rx: tokio::sync::oneshot::Receiver<(Vec<SortedRosterMember>, [u8; 32])>,
 }
 
 impl BftRunner {
@@ -599,6 +609,7 @@ impl BftRunner {
             pos_store_path: launch.as_ref().map(|l| l.pos_store_path.clone()).unwrap_or_default(),
             launch,
             parked: None,
+            pending_bootstrap: None,
             next_diagnostic: std::time::Instant::now(),
         };
         if runner.launch.is_some() {
@@ -615,6 +626,7 @@ impl BftRunner {
         // finalizes h1 through a deterministic genesis decision, and BFT starts at height 1 with
         // h1's roster. A network whose BFT is supplied has no activation height and never
         // bootstraps.
+        self.finish_bootstrap();
         if let (Some(_), Some(activation_height)) = (self.launch.as_ref(), self.params.bootstrap.activation_height()) {
             if read_state.best_tip().is_some_and(|(tip, _)| tip.0 >= activation_height) {
                 self.bootstrap(read_state, block_writer);
@@ -1367,6 +1379,12 @@ impl BftRunner {
         let BftBootstrap::FromChain { roster_height, activation_height } = self.params.bootstrap else {
             return;
         };
+        // Genesis is decided exactly once. `decide` asserts the block it is given validates
+        // against the chain, and a genesis already at index 0 fails that assert -- which under
+        // `panic = abort` takes the node down.
+        if BFT_CHAIN.read().unwrap().blocks.first().is_some_and(|b| !b.headers.is_empty()) {
+            return;
+        }
         let Some((genesis, fat_pointer)) = self.build_bootstrap_genesis(read_state) else {
             return;
         };
@@ -1374,14 +1392,27 @@ impl BftRunner {
             "crosslink bootstrap: PoW reached height {}; deciding BFT genesis {} which finalizes height {}",
             activation_height, genesis.blake3_hash(), roster_height,
         );
-        let (reply, rx) = tokio::sync::oneshot::channel();
+        let (reply, roster_rx) = tokio::sync::oneshot::channel();
         self.decide(genesis.clone(), fat_pointer.clone(), Vec::new(), DecisionReply::Tenderlink(reply), read_state, block_writer);
-        // Genesis finalizes a block every chain at the activation height holds, so the decision
-        // finishes at once; anything else is a bug in the bootstrap parameters.
-        let Ok((roster, _)) = rx.blocking_recv() else {
-            tracing::error!("crosslink bootstrap: genesis could not be finalized");
-            return;
+        self.pending_bootstrap = Some(PendingBootstrap { genesis, fat_pointer, roster_rx });
+        self.finish_bootstrap();
+    }
+
+    /// Start tenderlink once the bootstrap genesis decision has committed. Genesis finalizes a
+    /// block every chain at the activation height holds, so this normally succeeds on the tick
+    /// that decided it.
+    fn finish_bootstrap(&mut self) {
+        let Some(pending) = self.pending_bootstrap.as_mut() else { return; };
+        let roster = match pending.roster_rx.try_recv() {
+            Ok((roster, _)) => roster,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                tracing::error!("crosslink bootstrap: genesis could not be finalized");
+                self.pending_bootstrap = None;
+                return;
+            }
         };
+        let PendingBootstrap { genesis, fat_pointer, .. } = self.pending_bootstrap.take().unwrap();
         let hardforks = self.hardforks.rules();
         let terminated = terminated_finalizers_at(hardforks, 0, 0);
         let genesis_round = decided_round_data(
@@ -1397,13 +1428,15 @@ impl BftRunner {
 
     /// Start tenderlink at the height after `ingest` with `roster`, and mark BFT active. Refuses
     /// an empty roster: BFT height 1's roster is fixed by the stakes at h1, so nothing would ever
-    /// change.
+    /// change. Dropping the launch on that path is what stops the caller retrying: genesis is
+    /// already decided and stored, and `decide` refuses to decide it twice.
     fn spawn_tenderlink(&mut self, roster: Vec<SortedRosterMember>, ingest: Vec<RoundData>) {
         if roster.is_empty() {
             tracing::error!(
                 "BFT height {} has an empty roster: no stake was bonded by the bootstrap roster height ({:?}). BFT will not run on this chain.",
                 ingest.len(), self.params.bootstrap,
             );
+            self.launch = None;
             return;
         }
         let Some(launch) = self.launch.take() else { return; };

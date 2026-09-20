@@ -3,50 +3,22 @@
 #![allow(clippy::print_stdout)]
 #![allow(unexpected_cfgs, unused, missing_docs)]
 
-use color_eyre::install;
-
 use async_trait::async_trait;
-use strum::{EnumCount, IntoEnumIterator};
-use strum_macros::{EnumCount, EnumIter};
 
-use tenderlink::SortedRosterMember;
-use tracing_futures::WithSubscriber;
-use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind};
-use ed25519_zebra::VerificationKeyBytes;
-use zebra_chain::serialization::{
-    SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
-};
+use zebra_chain::serialization::ZcashSerialize;
+use zcash_primitives::block::BlockHash;
+use zcash_primitives::transaction::RosterMember;
 use zebra_state::crosslink::*;
 
-use multiaddr::Multiaddr;
-use rand::{CryptoRng, RngCore};
-use rand::{Rng, SeedableRng};
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
-use std::hash::{DefaultHasher, Hasher};
-use std::io::Cursor;
-use std::io::Read;
-use std::io::Write;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tempfile::TempDir;
-use tokio::sync::broadcast;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
 
-use bytes::{Bytes, BytesMut};
-
 use zcash_primitives::bft::*;
-use zcash_primitives::block::{
-    BlockHash,
-    BlockHeaderData as BcBlockHeader,
-    BlockHeader as BcBlockHeaderWrap,
-};
 use zcash_protocol::consensus::{BlockHeight, TEST_NETWORK};
-
-use chrono::DateTime;
 
 pub use wallet;
 
@@ -225,12 +197,12 @@ pub(crate) struct TFLServiceInternal {
     active_bft_string: Option<String>,
 }
 
-/// Recomputes, for a block already on the chain, the PoS-issuance decision the fat-pointer gate
-/// made when that block was committed.
+/// Recomputes, for a block already on the chain, the PoS-issuance decision that bc-block
+/// admission made when that block was committed.
 ///
-/// The live rule lives in `zebra_state::new_network::bft::admit_fat_pointer` and rides on the
-/// gate because that is where both facts are known; replay paths (here, the wallet issuance
-/// projection) have to reconstruct it from committed data. Both halves are objective: the
+/// The live rule lives in `zebra_state::new_network::bft::admit_fat_pointer`, which is where
+/// both facts are known; replay paths (here, the wallet issuance projection) have to
+/// reconstruct it from committed data. Both halves are objective: the
 /// certificate identity comes from the two block headers, and what that certificate finalizes
 /// comes from the decided BFT block, which is immutable once decided.
 ///
@@ -635,7 +607,7 @@ async fn total_issuance_from_key(
 
         // PoS issuance is applied once per block, after that block's staking actions, exactly as
         // the live commit path does -- and only for blocks that pay under the variable payout
-        // rule. `block_pays_pos_issuance` is the replay of the gate's decision.
+        // rule. `block_pays_pos_issuance` replays that decision.
         let fat_pointer = block.header.fat_pointer_to_bft_block.clone();
         let parent_fat_pointer = match &prev_fat_pointer {
             Some(fat_pointer) => fat_pointer.clone(),
