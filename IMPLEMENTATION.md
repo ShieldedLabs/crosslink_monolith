@@ -5,7 +5,7 @@ code to it. Each stage names the FINALITY.md sections it implements, the code it
 the condition under which it is done. Where this file and FINALITY.md disagree, FINALITY.md is
 right and this file is corrected.
 
-Stages 1 to 5 are done. Stages 6 to 8 move finality state out of
+Stages 1 to 6 are done. Stages 7 and 8 move the rest of the finality state out of
 `zebra-crosslink/zebra-crosslink` into `zebra-state` (FINALITY.md §7.1), each of them for a race
 or a coupling that the crate boundary creates; they leave the crate holding no finality state.
 Stage 9 then gives the node the second chain state that FINALITY.md §4.3 requires, so that a BFT
@@ -263,8 +263,10 @@ Implements FINALITY.md §7.1 and the two-stores pitfall of §8.1. Depends on sta
 - Startup reads them back and builds `tenderlink`'s `ingest_startup_data` from the database.
   `decided_round_data` keeps its shape.
 - The roster for each restored height is recomputed from the bonds at that height's snapshot,
-  never read back as stored bytes. BFT genesis is recomputed at startup from the chain at the
-  bootstrap roster height rather than stored as a row, for the same reason.
+  never read back as stored bytes. BFT genesis is stored as the row at height 0 like any other
+  decided block, and recomputed only when no row exists: it is a decided block, and rebuilding it
+  from the chain would hand a node whose PoW chain reorged below the bootstrap roster height a
+  different genesis than its peers decided.
 - A database whose bc-tip is past the bootstrap activation height but which holds no bft rows is
   refused at startup, with a message naming the state directory to delete. It is not migrated,
   not re-bootstrapped, and not run PoW-only: no node on this branch should be carrying one.

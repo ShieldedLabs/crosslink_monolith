@@ -8,10 +8,7 @@
 //! read lock on [`bft_chain`].
 
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
 use std::hash::BuildHasherDefault;
-use std::io::{Cursor, Read, Write};
-use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 
 use tenderlink::{
@@ -31,6 +28,7 @@ use zebra_chain::block::{Hash, Header, Height};
 use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize};
 
 use super::ReadState;
+use crate::service::finalized_state::bft::StoredDecision;
 use crate::service::write::WriteBlockWorkerTask;
 use crate::CrosslinkVerdict;
 
@@ -169,12 +167,11 @@ pub async fn force_feed_bft_block(
 }
 
 /// Everything BFT needs from outside the state: the node's finalizer identity, where it listens,
-/// who to connect to, and where the decided chain is persisted (empty for no persistence).
+/// and who to connect to. The decided chain is persisted in the finalized database.
 pub struct BftLaunch {
     pub signing_key: ed25519_zebra::SigningKey,
     pub public_address: String,
     pub peer_addresses: Vec<String>,
-    pub pos_store_path: PathBuf,
 }
 
 pub fn bc_hdr_to_lrz(header: &Header) -> BcBlockHeader {
@@ -571,7 +568,6 @@ pub(super) struct BftRunner {
     rt: tokio::runtime::Handle,
     params: ZcashCrosslinkParameters,
     hardforks: Arc<zebra_chain::parameters::HardForkSchedule>,
-    pos_store_path: PathBuf,
     /// Held until BFT starts (a loaded chain, or the bootstrap genesis); `None` once tenderlink
     /// is spawned, or when this node runs no BFT at all.
     launch: Option<BftLaunch>,
@@ -606,7 +602,6 @@ impl BftRunner {
             rt,
             params: read_state.network().crosslink_parameters(),
             hardforks: config.hardfork_schedule.clone(),
-            pos_store_path: launch.as_ref().map(|l| l.pos_store_path.clone()).unwrap_or_default(),
             launch,
             parked: None,
             pending_bootstrap: None,
@@ -1158,21 +1153,15 @@ impl BftRunner {
             }
         }
 
-        if !self.pos_store_path.as_os_str().is_empty() {
-            let mut append_bytes: Vec<u8> = Vec::new();
-            block.zcash_serialize(&mut append_bytes).unwrap();
-            fat_pointer.zcash_serialize(&mut append_bytes).unwrap();
-            append_bytes.extend_from_slice(&(chain.roster.len() as u64).to_le_bytes());
-            for v in &chain.roster {
-                v.write_to_vec(&mut append_bytes);
-            }
-            append_bytes.extend_from_slice(&(proposal_sigs.len() as u64).to_le_bytes());
-            for sig in &proposal_sigs {
-                append_bytes.extend_from_slice(&sig.0);
-            }
-            let mut file = OpenOptions::new().append(true).create(true).open(&self.pos_store_path).unwrap();
-            file.write_all(&append_bytes).unwrap();
-            file.flush().unwrap();
+        // The decision is stored after its snapshot commits, so a crash in between leaves the
+        // BFT chain one height short and that height is decided again on the next run.
+        if let Err(err) = block_writer.finalized_state.db.write_bft_decision(
+            block.height,
+            &block,
+            &fat_pointer,
+            &proposal_sigs,
+        ) {
+            tracing::error!("could not store BFT decision at height {}: {err}", block.height);
         }
 
         // The returned roster is for the NEXT height (tenderlink advances to it after this
@@ -1200,118 +1189,115 @@ impl BftRunner {
     /// Replay the persisted chain into the store, and start tenderlink at its next height if it
     /// holds anything. An empty store means this node has not bootstrapped yet: BFT genesis is
     /// built once the PoW chain reaches the activation height (see `tick`).
+    ///
+    /// Rosters are recomputed from the bonds at each height's snapshot, never read back as
+    /// stored bytes: a roster that disagreed with the stored votes would re-index every one of
+    /// them through seats that never voted (FINALITY.md §8.1).
     fn restore(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
         let hardforks = self.hardforks.clone();
         let hardforks = hardforks.rules();
+        let stored = block_writer.finalized_state.db.bft_chain();
+
+        // A node that has mined past the activation height has decided BFT genesis, so an empty
+        // BFT chain there is a database written before the chain was stored. It is not migrated
+        // and not re-bootstrapped: re-deriving genesis over a chain that already ran BFT would
+        // put this node on a different decided chain than its peers.
+        if stored.is_empty() {
+            if let (Some(activation_height), Some((tip, _))) =
+                (self.params.bootstrap.activation_height(), read_state.best_tip())
+            {
+                if tip.0 > activation_height && self.launch.is_some() {
+                    tracing::error!(
+                        "this database is past the BFT activation height ({}) but holds no decided \
+                         BFT chain, so it predates BFT storage in the finalized database. Delete \
+                         the state directory and resync.",
+                        activation_height,
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+
         let mut ingest: Vec<RoundData> = Vec::new();
         let mut blocks: Vec<BftBlock> = Vec::new();
         let mut fat_pointer_to_tip = FatPointerToBftBlock::null();
         // The roster that voted on the block about to be replayed. BFT genesis is decided by
         // the nil validator set (see `build_bootstrap_genesis`), so replay starts empty; each
-        // stored block carries the roster it produced for the next height.
+        // later height votes with the stakes at the previous height's snapshot.
         let mut unsorted_roster: Vec<RosterMember> = Vec::new();
+        // BC height finalized by the previous replayed block's cert; the roster voting on block
+        // N was formed at N-1's decision, so N's replayed roster must use this. Using this
+        // block's own height jailed and unjailed finalizers one cert early at a hardfork
+        // activation boundary.
+        let mut prev_finalized_bc_height: u64 = 0;
 
-        if !self.pos_store_path.as_os_str().is_empty() {
-            let mut pos_file = OpenOptions::new().read(true).write(true).create(true).open(&self.pos_store_path).unwrap();
-            let mut pos_file_bytes = Vec::new();
-            pos_file.read_to_end(&mut pos_file_bytes).unwrap();
-
-            let mut cursor = Cursor::new(pos_file_bytes);
-            let mut valid_byte_count;
-            // BC height finalized by the previous loaded block's cert; the roster voting on
-            // block N was formed at N-1's decision, so N's replayed roster must use this.
-            let mut prev_finalized_bc_height: u64 = 0;
-            'big_loop: loop {
-                valid_byte_count = cursor.position();
-                let Ok(block) = BftBlock::zcash_deserialize(&mut cursor) else { break; };
-                let Ok(fat_pointer) = FatPointerToBftBlock::zcash_deserialize(&mut cursor) else { break; };
-
-                let mut buf = [0u8; 8];
-                if cursor.read_exact(&mut buf).is_err() { break; }
-                let new_roster_count = u64::from_le_bytes(buf);
-                let mut new_roster = Vec::new();
-                for _ in 0..new_roster_count {
-                    let Ok(v) = RosterMember::read_from(&mut cursor) else { break; };
-                    new_roster.push(v);
-                }
-
-                let mut buf = [0u8; 8];
-                if cursor.read_exact(&mut buf).is_err() { break; }
-                let proposal_sigs_n = u64::from_le_bytes(buf);
-                let mut proposal_sigs = Vec::new();
-                for _ in 0..proposal_sigs_n {
-                    let mut sig = TMSig::NIL;
-                    if cursor.read_exact(&mut sig.0).is_err() { break 'big_loop; }
-                    proposal_sigs.push(sig);
-                }
-
-                if block.previous_block_fat_ptr.points_at_block_hash() != fat_pointer_to_tip.points_at_block_hash() { break; }
-
-                // Historical round replay: filter the roster exactly as the live path did at
-                // this height, so it matches the roster that actually voted on this decided
-                // block (the sigs/counts below are derived from it, and votes travel by roster
-                // index -- a divergent roster re-indexes every stored vote through seats that
-                // never voted). The live roster for block N was formed when N-1 was decided,
-                // from the BC height *that* decision finalized -- so use the previous
-                // iteration's candidate height, NOT this block's own. Using fin-by-N here
-                // jailed/unjailed finalizers one cert early at a hardfork activation boundary.
-                let this_bft_height = ingest.len() as u64;
-                let this_terminated = terminated_finalizers_at(hardforks, this_bft_height, prev_finalized_bc_height);
-                let roster = tenderlink_roster_from_internal(&unsorted_roster, &this_terminated);
-                // Advance the watermark to this block's snapshot height for the next iteration.
-                // If the snapshot can't be resolved (PoW DB behind the pos file, e.g. wiped and
-                // re-syncing), keep the last known height: monotone, and correct whenever the DB
-                // is intact.
-                if !block.headers.is_empty() {
-                    if let Some(known) = read_state.known_block(Hash(block.snapshot_block_hash().0)) {
-                        prev_finalized_bc_height = known.height.0 as u64;
-                    }
-                }
-                ingest.push(decided_round_data(hardforks, &block, &fat_pointer, roster, proposal_sigs, this_bft_height));
-                blocks.push(block);
-                fat_pointer_to_tip = fat_pointer;
-                unsorted_roster = new_roster;
+        for decision in stored {
+            let StoredDecision { block, fat_pointer, proposal_sigs } = decision;
+            if block.previous_block_fat_ptr.points_at_block_hash() != fat_pointer_to_tip.points_at_block_hash() {
+                break;
             }
-            pos_file.set_len(valid_byte_count).unwrap();
+
+            // Historical round replay: filter the roster exactly as the live path did at this
+            // height, so it matches the roster that actually voted on this decided block.
+            let this_bft_height = ingest.len() as u64;
+            let this_terminated = terminated_finalizers_at(hardforks, this_bft_height, prev_finalized_bc_height);
+            let roster = tenderlink_roster_from_internal(&unsorted_roster, &this_terminated);
+
+            // The roster the next height votes with, and the watermark that filters it, both
+            // come from this block's snapshot -- the same two reads `finish_decision` makes
+            // live. An unresolvable snapshot keeps the last known values: monotone, and correct
+            // whenever the database is intact.
+            if !block.headers.is_empty() {
+                let snapshot = Hash(block.snapshot_block_hash().0);
+                if let Some(known) = read_state.known_block(snapshot) {
+                    prev_finalized_bc_height = known.height.0 as u64;
+                }
+                let stakes = block_writer.finalized_state.db.aggregated_stakes(&snapshot).unwrap_or_default();
+                // Empty stakes are the ghost roster of `finish_decision`: the previous roster is
+                // carried forward rather than replaced, so replay reproduces what voted.
+                if !stakes.is_empty() {
+                    unsorted_roster = stakes
+                        .into_iter()
+                        .map(|s| RosterMember { pub_key: s.0, voting_power: s.1, txids: Vec::new() })
+                        .collect();
+                }
+            }
+
+            ingest.push(decided_round_data(hardforks, &block, &fat_pointer, roster, proposal_sigs, this_bft_height));
+            blocks.push(block);
+            fat_pointer_to_tip = fat_pointer;
         }
 
         let mut new_final_hash = Hash([0; 32]);
         let mut new_final_height = Height(0);
         if let Some(new_block) = blocks.last() {
             new_final_hash.0 = new_block.snapshot_block_hash().0;
-            new_final_height = read_state.known_block(new_final_hash).unwrap().height;
+            match read_state.known_block(new_final_hash) {
+                Some(known) => new_final_height = known.height,
+                None => {
+                    // The bc-chain is behind the BFT chain, which the two-stores split used to
+                    // make possible. Both now live in the same database and commit together, so
+                    // this is a damaged database rather than a configuration mistake.
+                    tracing::error!(
+                        "the decided BFT chain finalizes block {}, which this database does not \
+                         hold. Delete the state directory and resync.",
+                        new_final_hash,
+                    );
+                    std::process::exit(1);
+                }
+            }
         }
 
         // Startup roster is for the next height to decide (the loaded chain length), with the
         // terminated finalizers excluded inclusively at that height.
         let startup_bft_height = blocks.len() as u64;
         let terminated = terminated_finalizers_at(hardforks, startup_bft_height, new_final_height.0 as u64);
-        // The live roster is read from the chain at the last loaded block's snapshot, the same
-        // way the decide path reads it (FINALITY.md §7). The per-height rosters the replay above
-        // uses still come from the store: they are the rosters that actually voted, and votes
-        // travel by roster index.
-        let restored_roster = if new_final_hash != Hash([0; 32]) {
-            block_writer
-                .finalized_state
-                .db
-                .aggregated_stakes(&new_final_hash)
-                .map(|stakes| {
-                    stakes
-                        .into_iter()
-                        .map(|s| RosterMember { pub_key: s.0, voting_power: s.1, txids: Vec::new() })
-                        .collect::<Vec<_>>()
-                })
-                .filter(|members| !members.is_empty())
-                .unwrap_or(unsorted_roster)
-        } else {
-            unsorted_roster
-        };
-        let roster = tenderlink_roster_from_internal(&restored_roster, &terminated);
+        let roster = tenderlink_roster_from_internal(&unsorted_roster, &terminated);
 
         let loaded_any = !blocks.is_empty();
         {
             let mut chain = BFT_CHAIN.write().unwrap();
-            chain.roster = restored_roster;
+            chain.roster = unsorted_roster;
             chain.hash_to_height = blocks.iter().enumerate().map(|(i, b)| (b.blake3_hash(), i as u64)).collect();
             chain.blocks = blocks;
             chain.fat_pointer_to_tip = fat_pointer_to_tip;
@@ -1321,6 +1307,10 @@ impl BftRunner {
         }
 
         if loaded_any {
+            tracing::info!(
+                "crosslink restore: resuming BFT at height {}, finalizing bc height {}",
+                startup_bft_height, new_final_height.0,
+            );
             self.spawn_tenderlink(roster, ingest);
         }
     }

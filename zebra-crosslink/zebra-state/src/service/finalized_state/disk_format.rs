@@ -7,6 +7,7 @@
 
 use std::{io::Write, sync::Arc};
 
+pub mod bft;
 pub mod block;
 pub mod chain;
 pub mod delegation;

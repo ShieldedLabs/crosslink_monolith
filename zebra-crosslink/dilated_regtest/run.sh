@@ -19,7 +19,7 @@ PORT=(8232 8242); PID=(); FAIL=0
 
 rpc() { curl -s -m 300 -X POST "http://127.0.0.1:${PORT[$1]}" -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":${3:-[]}}"; }
 tip() { rpc "$1" getblockchaininfo | jq -r '.result.blocks // 0'; }
-logs() { cat "$OUT/node$1.log" "$OUT/node$1.err" 2>/dev/null | tr -d '\r'; }
+logs() { cat "$OUT"/node$1.log* "$OUT"/node$1.err* 2>/dev/null | tr -d '\r'; }
 log() { echo "$(date +%T) tip=$(tip 0) $*"; }
 fail() { echo "FAIL: $*"; FAIL=1; }
 sample() {
@@ -35,9 +35,8 @@ stop_nodes() {
 }
 trap stop_nodes EXIT
 
-mkdir -p "$OUT"; rm -rf "$OUT/state0" "$OUT/state1"; : > "$OUT/node0.log"; : > "$OUT/node1.log"
-START=$(date +%s)
-for n in 0 1; do
+start_node() {
+  n=$1
   sed "s|@ROOT@|$ROOT_TOML|g; s|@START@|$START|g" "$HERE/node$n.toml.in" > "$OUT/node$n.toml"
   if [ $WIN = 1 ]; then
     # The pid goes through a file rather than a `$(...)` capture: the node inherits PowerShell's
@@ -51,7 +50,11 @@ for n in 0 1; do
     (cd "$ROOT" && "$ZEBRAD" -c "$OUT/node$n.toml" start > "$OUT/node$n.log" 2> "$OUT/node$n.err") & PID[$n]=$!
   fi
   echo "node$n pid=${PID[$n]}"
-done
+}
+
+mkdir -p "$OUT"; rm -rf "$OUT/state0" "$OUT/state1"; rm -f "$OUT"/node?.log* "$OUT"/node?.err*
+START=$(date +%s)
+for n in 0 1; do start_node $n; done
 
 # The finalizer addresses come from each node's own startup line.
 for n in 0 1; do
@@ -78,11 +81,38 @@ rpc 0 generate '[1]' >/dev/null
 staked=$(tip 0); log "positions: $(rpc 0 wallet_staking_positions | jq -c '.result.active | map_values(length)')"
 [ "$staked" -lt "$ROSTER_HEIGHT" ] || fail "bonds landed at height $staked, at or past the roster height $ROSTER_HEIGHT"
 
-#-- mine flat out to TARGET
-n=0
-while [ "$(tip 0)" -lt "$TARGET" ]; do
-  rpc 0 generate '[1]' >/dev/null; n=$((n + 1)); [ $((n % 50)) = 0 ] && sample
-done
+#-- mine to the restart point, restart both nodes against the same state, then mine on to TARGET
+restart_nodes() {
+  for k in 0 1; do DEC_BEFORE[$k]=$(logs $k | grep -c "Successfully crosslink-finalized"); done
+  BEFORE=$(tip 0); echo "$(date +%T) restart: stopping both nodes at tip $BEFORE"
+  stop_nodes
+  for p in "${PID[@]}"; do
+    if [ $WIN = 1 ]; then
+      while [ "$(powershell -NoProfile -Command "(Get-Process -Id $p -ErrorAction SilentlyContinue | Measure-Object).Count" 2>/dev/null | tr -dc 0-9)" != 0 ]; do sleep 1; done
+    else while kill -0 "$p" 2>/dev/null; do sleep 1; done; fi
+  done
+  # The new process truncates node$n.log, so the pre-restart logs move aside; `logs` globs both,
+  # while the bare .log is what the post-restart checks read.
+  for k in 0 1; do mv "$OUT/node$k.log" "$OUT/node$k.log.1"; mv "$OUT/node$k.err" "$OUT/node$k.err.1"; done
+  PID=()
+  for k in 0 1; do start_node $k; done
+  # The tip is not expected back at $BEFORE here: a hard kill drops whatever the non-finalized
+  # state held above the crosslink-finalized height, and node 0 re-mines it in `mine_to`.
+  for k in 0 1; do until t=$(tip $k) && [ -n "$t" ] && [ "$t" -gt 0 ]; do sleep 2; done; done
+  echo "$(date +%T) restart: both nodes back at tip $(tip 0)"
+}
+
+mine_to() {
+  n=0
+  while [ "$(tip 0)" -lt "$1" ]; do
+    rpc 0 generate "[1]" >/dev/null; n=$((n + 1)); [ $((n % 50)) = 0 ] && sample
+  done
+}
+RESTART_HEIGHT=$(( (ACTIVATION_HEIGHT + TARGET) / 2 ))
+mine_to "$RESTART_HEIGHT"
+sleep 5
+restart_nodes
+mine_to "$TARGET"
 sleep 5; sample
 
 #-- verdict
@@ -90,6 +120,19 @@ T0=$(tip 0); T1=$(tip 1)
 [ "$T0" -ge "$TARGET" ] || fail "node0 tip $T0 < $TARGET"
 [ $((T0 - T1)) -le 2 ] && [ $((T1 - T0)) -le 2 ] || fail "nodes out of sync: $T0 vs $T1"
 logs 0 | grep -q "crosslink bootstrap: PoW reached height $ACTIVATION_HEIGHT" || fail "no BFT bootstrap on node0"
+# Post-restart only: the bare .log/.err pair belongs to the second process.
+for k in 0 1; do
+  P=$(cat "$OUT/node$k.log" "$OUT/node$k.err" 2>/dev/null | tr -d "\r")
+  h=$(echo "$P" | grep -o "crosslink restore: resuming BFT at height [0-9]*" | tail -1 | grep -o "[0-9]*$")
+  [ -n "$h" ] || fail "node$k did not resume BFT from its database after the restart"
+  echo "$P" | grep -q "crosslink bootstrap: PoW reached height" && fail "node$k re-bootstrapped BFT after the restart"
+  # One decision may have committed without its row being written, so the resumed height is
+  # allowed to be one short of what the pre-restart log counted.
+  [ -z "$h" ] || [ "$h" -ge $(( ${DEC_BEFORE[$k]} - 1 )) ] || fail "node$k resumed BFT at height $h, behind the ${DEC_BEFORE[$k]} blocks it had decided"
+  after=$(echo "$P" | grep -c "Successfully crosslink-finalized")
+  [ "$after" -ge 1 ] || fail "node$k decided no BFT blocks after the restart"
+done
+[ -z "$(find "$OUT" -name pos.chain 2>/dev/null)" ] || fail "a PoS store file still exists under $OUT"
 for k in 0 1; do
   L=$(logs $k)
   echo "$L" | grep -q "panicked" && fail "node$k panicked"

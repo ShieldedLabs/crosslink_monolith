@@ -300,15 +300,6 @@ impl StartCmd {
         };
         *wallet::GLOBAL_SEED.lock().unwrap() = Some(global_seed);
 
-        let path_to_pos_store_file = if config.state.ephemeral { std::path::PathBuf::new() } else {
-            let mut key_path = config.state.cache_dir.clone();
-            let _ = std::fs::create_dir_all(key_path.clone());
-
-            key_path.push("pos.chain");
-            key_path
-        };
-
-
         let config = if is_regtest {
             fn add_to_port(mut addr: std::net::SocketAddr, addend: u16) -> std::net::SocketAddr {
                 addr.set_port(addr.port() + addend);
@@ -621,7 +612,6 @@ impl StartCmd {
                 signing_key: bft_signing_key,
                 public_address,
                 peer_addresses: config.crosslink.bft_peers.clone(),
-                pos_store_path: path_to_pos_store_file,
             };
             tokio::task::spawn_blocking(move || {
                 use zebra_state::new_network::BlockCommitError;

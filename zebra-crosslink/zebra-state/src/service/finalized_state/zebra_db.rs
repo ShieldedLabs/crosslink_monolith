@@ -31,6 +31,7 @@ use crate::{
 
 use super::disk_format::upgrade::restorable_db_versions;
 
+pub mod bft;
 pub mod block;
 pub mod chain;
 pub mod delegation;

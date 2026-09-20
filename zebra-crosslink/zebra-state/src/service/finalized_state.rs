@@ -46,7 +46,7 @@ pub mod column_family;
 mod disk_db;
 pub(crate) mod disk_format;
 mod zebra_db;
-pub use zebra_db::slashing;
+pub use zebra_db::{bft, slashing};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
@@ -117,6 +117,10 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "bond_status_by_key",
     "aggregated_stakes_by_hash",
     "finalizer_reward_by_key",
+    // The decided BFT chain, by BFT height.
+    "bft_block_by_height",
+    "bft_fat_pointer_by_height",
+    "bft_proposal_sigs_by_height",
     // Legacy slash-index column families, empty and unused since Retarget actions
     // began carrying their `from` finalizer (burn sets are computed lazily at
     // activation now); still registered so existing databases open.

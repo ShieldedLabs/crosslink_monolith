@@ -756,7 +756,7 @@ line numbers.
 `set_final_block`, which also sends the new value on `final_change_tx`. Its callers are:
 
 - `BftRunner::decide`, after inserting the BFT block;
-- `BftRunner::restore`, when restoring the last entry from the PoS store; and
+- `BftRunner::restore`, when replaying the last decided block from the database; and
 - `tfl_set_finality_by_hash`, through the testing/service setter, which reaches it as
   `set_final_block_if_activated`.
 
@@ -774,7 +774,7 @@ GUI-side reader takes `BftChain::latest_final_block` directly and never saw the 
 value.
 
 The Crosslink service no longer carries a second copy of the marker: `current_bc_final`, which
-was written during PoS-store startup and read nowhere, has been deleted.
+was written during startup restore and read nowhere, has been deleted.
 
 ### 5.2 Irreversible commitment and ordering
 
@@ -800,9 +800,11 @@ The state behavior depends on whether the hash is known:
   under `panic = abort`, the node exits. The retry loop runs only for a hash known at that
   point; if the chain holding it is then dropped from the non-finalized state before the
   finalize succeeds, the decision stays parked indefinitely.
-- the PoS-store restore path unwraps the same `KnownBlock` lookup for the last stored BFT block,
-  so a finalized database that is behind the PoS store, for example one wiped and re-syncing,
-  panics at startup. The replay-watermark loop just above it tolerates that case.
+- the restore path makes the same `KnownBlock` lookup for the last decided BFT block. The
+  decided chain and the blocks it finalizes are now rows of one database, written together, so
+  a database that cannot resolve that block is damaged rather than merely behind: restore says
+  so and ends the process instead of panicking. The replay-watermark loop just above it
+  tolerates the case.
 
 Consequently, the stored marker is neither a reliable `fin` implementation nor a reliable
 record of the finalized database's tip. In Zebra Crosslink, persisted `fin` advances only after
@@ -843,7 +845,7 @@ By actual reads, the widest consumer of the slot is the visualizer, not consensu
 and the RPC notification methods in `zebra-crosslink/zebra-rpc/src/methods.rs` wait on them.
 Every `set_final_block` call sends on that channel, so a notification carries the same
 overloaded value at the same moments: on the decide path before `handle_crosslink_finalize`
-succeeds, on PoS-store restore, and through the testing setter.
+succeeds, on restore from the database, and through the testing setter.
 
 ### 5.4 Current staking rewards
 
@@ -951,12 +953,15 @@ round.
 the `pos_payout` flag (§5.4, §6.2) as a pure function of the `BftChain` and a `ReadStateService`,
 called under the read lock from the retain loop that filters blocks about to be committed.
 
-A second copy of the decided bft-chain lives in the PoS store file. The decide path appends a
-record holding the `BftBlock`, its fat pointer, the roster and the proposal signatures;
-`BftRunner::restore` replays the file at startup to rebuild the chain, the roster and
-`tenderlink`'s `ingest_startup_data`, and recomputes the watermark `prev_finalized_bc_height`
-from each record's snapshot. The restore path unwraps a state lookup for the last stored block,
-so a finalized database behind the file ends the process (§5.2).
+The decided bft-chain is persisted in the finalized database, in three column families keyed by
+BFT height: `bft_block_by_height`, `bft_fat_pointer_by_height` and `bft_proposal_sigs_by_height`.
+`BftRunner::finish_decision` writes all three in one batch once the decision's snapshot has
+committed, so a crash in between leaves the chain one height short and that height is decided
+again on the next run. `BftRunner::restore` reads them back at startup to rebuild the chain and
+`tenderlink`'s `ingest_startup_data`, recomputing each height's roster from the bonds at its
+snapshot and the watermark `prev_finalized_bc_height` from the same lookup. A database past the
+activation height holding no decided chain, or a decided chain whose snapshot the database does
+not hold, ends the process with a message rather than being migrated or re-bootstrapped (§5.2).
 
 `force_feed_bft_block` injects a decided bft-block without `Π_bft`, as a message to the `sync`
 thread. Its only caller is `test_format.rs`, through `TFLServiceCalls::force_feed_pos`.
@@ -986,7 +991,7 @@ it departs from.
   as part of Tail Confirmation, rejecting a block whose headers do not each name the one below
   as parent (§6.2). The type does not: `BftBlock::try_from` checks only the header count and
   logs that its documented validations are unimplemented, and the deserialization path used
-  for network and PoS-store blocks does not call `try_from` at all. The snapshot is named by hash only; a consumer that needs
+  for network and stored blocks does not call `try_from` at all. The snapshot is named by hash only; a consumer that needs
   its height asks the chain, and the fat-pointer check is handed a height lookup for that
   purpose (§6.2).
 - **The candidate height is clamped, and the clamp is not `prune_σ`.** The proposal path
@@ -1112,8 +1117,8 @@ are not, and these divergences follow from that:
 - A decision and its commit are one event (§5.2). The decide path calls
   `handle_crosslink_finalize` directly and parks a decision the commit rejects for retry on a
   later tick, and `tenderlink` does not start the next round until the decide closure returns.
-- The decided bft-chain is stored twice, in memory and in the PoS store file, and is restored
-  from the file with its roster bytes rather than recomputed (§5.5, §8.1).
+- The decided bft-chain is held in memory as well as in the database, and every reader takes the
+  in-memory copy; the database is read only at startup (§5.5).
 - The roster read answers from the finalized database alone, so it is correct only while the
   decide path commits the snapshot it has just decided (§8.1).
 
@@ -1189,7 +1194,7 @@ irreducible. The moves marked "moved" are done (§5.5); the rest are ahead:
 | `bft_blocks`, `bft_block_hash_to_height`, `fat_pointer_to_tip`, `finalizers_at_current_height` | moved: `BftChain` in `new_network::bft`, still in memory rather than in the database |
 | `latest_final_block` | moved to `BftChain`; becomes `fin` in `zebra-state`, with one writer and the §3.2 update rule (§6.1) |
 | `propose_new_bft_block`, `BftRunner::validate`, `handle_new_decided_bft_block`, `call_from_state_to_crosslink_to_ask_about_fat_pointers` | moved: `BftRunner::{propose, validate, decide}` and `admit_fat_pointer`, each reading one consistent view on the writer thread |
-| the PoS store file | dies; its records become database rows, and its roster is recomputed rather than restored |
+| the PoS store file | gone; its records are database rows keyed by BFT height, and the roster is recomputed from bonds rather than stored |
 | `TFLServiceInternal`, `tfl_service_main_loop`, `TFLServiceHandle`, the tower service over `TFLServiceRequest`, and the reentrancy constraint it imposes | the reentrancy constraint is gone; the rest die; every finality arm is answered by the state service or by a channel it publishes |
 | the wallet, faucet and staking arms | survive as calls rather than as a service: they relay to the `wallet` crate and read no finality quantity |
 | `viz2.rs` | survives as a view over the state service and a published diagnostic snapshot, holding no state of its own; where it lives is a packaging question |
@@ -1293,14 +1298,14 @@ stored, or consumed.
 
 - **The derivation has one accessor.** `BftBlock::snapshot_block_hash` is the only place
   `parent(headers[0])` is computed. `BftRunner::decide`, the BFT validation path,
-  the PoS-store restore path and its replay watermark `prev_finalized_bc_height`,
+  the restore path and its replay watermark `prev_finalized_bc_height`,
   `test_format.rs`, and `viz2.rs` (both the live viz response and `VizScene`) read it, and the
   finality-diagram tests in `zebrad/tests/crosslink.rs` and `viz2::scene_tests` assert marker
   positions derived from it. A second derivation makes the node, the GUI, and the tests
   disagree about which block is final.
 - **The roster is a function of a block, not of committing it.** `BftChain::roster`
   is filled from `FinalizedState::db::aggregated_stakes` at `snapshot(B_{H−1})`, on the decide
-  path and on the PoS-store restore path alike, and `terminated_finalizers_at` takes that same
+  path and on the restore path alike, and `terminated_finalizers_at` takes that same
   block's height. Nothing reads stakes from the reply to `handle_crosslink_finalize`, which now
   returns the hash alone, so the roster no longer depends on a decision and a commit being one
   event. The read goes to the finalized database, so it answers for committed blocks only:
@@ -1316,12 +1321,11 @@ stored, or consumed.
   carries headers starting at `BOOTSTRAP_ROSTER_HEIGHT`, so its snapshot, and the roster for
   BFT height 1, is the block below that height.
 - **A derivation change is a network-wide consensus change.** Nodes running two derivations
-  disagree on the finalized block and on the roster. PoS stores and databases written under
-  the old derivation are deleted, not migrated. A PoS-store record
-  holds the `BftBlock`, the fat pointer, `BftChain::roster`, and the proposal
-  signatures; restore reads the roster bytes back verbatim and recomputes the replay watermark
-  `prev_finalized_bc_height` from each stored block's snapshot, so an old store loaded by new code yields
-  rosters that disagree with the stored votes, which travel by roster index.
+  disagree on the finalized block and on the roster. Databases written under the old derivation
+  are deleted, not migrated. A stored decision holds the `BftBlock`, the fat pointer and the
+  proposal signatures; restore recomputes both the roster and the replay watermark
+  `prev_finalized_bc_height` from each stored block's snapshot, so an old database loaded by new
+  code yields rosters that disagree with the stored votes, which travel by roster index.
 - **`fin` moves only forward.** `candidate(bc_best)` falls below `fin` after a benign reorg
   (§3.2), and `WriteBlockWorkerTask::handle_crosslink_finalize` returns success for a hash the
   database already holds, so a caller that stores whatever it committed can move `fin`
@@ -1345,7 +1349,7 @@ stored, or consumed.
   `fixup_aggregated_stakes` in `stake_fixup.rs`, and the wallet projection in `lib.rs` must
   change together (§5.4).
 - **Header order is a property of the honest producer.** `BftBlock::try_from` checks only the
-  header count, and the network and PoS-store deserialization path does not call it. Code that
+  header count, and the network and stored-block deserialization path does not call it. Code that
   reads `headers[0]` as the deepest header relies on the producer, not on validation.
 - **`NonFinalizedState` holds less than the finalized chain needs.** It lives in memory, it drops
   the lowest-work chain past `MAX_NON_FINALIZED_CHAIN_FORKS` (10), and it drops chains that do
@@ -1367,12 +1371,11 @@ stored, or consumed.
 - **A switch onto the finalized chain replaces bond state.** Bonds tracked along that chain while
   it was a side chain must agree with what the chain produces once it becomes `bc_best`; one
   implementation of the bond update serves both (§5.4).
-- **The decided bft-chain is stored twice.** It is held in memory and appended to the PoS store
-  file, whose records carry the roster as well as the block, the fat pointer and the proposal
-  signatures. Restore reads those roster bytes back rather than recomputing them from bonds,
-  which is the second derivation the first bullet of this list warns against, and it unwraps a
-  state lookup that a database behind the file makes fail (§5.5). One store, with the roster
-  recomputed, removes all three.
+- **The decided bft-chain is stored in the finalized database, without its roster.** The rows
+  carry the block, the fat pointer and the proposal signatures; restore recomputes each height's
+  roster from the bonds at that height's snapshot. Storing the roster instead would be the second
+  derivation the first bullet of this list warns against: a roster that disagreed with the stored
+  votes would re-index every one of them through seats that never voted (§5.5).
 - **`MAX_BLOCK_REORG_HEIGHT` is asserted against the bootstrap gap.**
   `ZcashCrosslinkParameters::bootstrap_is_valid` requires
   `activation_height − roster_height > MAX_BLOCK_REORG_HEIGHT`, and a `const _: () = assert!` on

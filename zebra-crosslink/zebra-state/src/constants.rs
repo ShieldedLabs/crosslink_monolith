@@ -89,7 +89,7 @@ const DATABASE_FORMAT_VERSION: u64 = 31;
 ///   the current width). New CFs are created and the wider records are read in place when the
 ///   database is opened, so this is a major bump that is restorable from the previous major
 ///   database format version (no resync, no data migration).
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.
