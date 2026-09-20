@@ -44,6 +44,7 @@ elasticsearch = [
 [dependencies]
 zcash_keys = { workspace = true }
 tenderlink = { workspace = true }
+ed25519-zebra = { workspace = true }
 static_assertions = "1.1.0"
 blake3 = "1.8.2"
 rand = { workspace = true }

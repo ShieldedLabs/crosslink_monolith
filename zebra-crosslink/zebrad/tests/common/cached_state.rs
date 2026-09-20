@@ -144,7 +144,7 @@ pub async fn start_state_service_with_cache_dir(
     // These tests don't need UTXOs to be verified efficiently, because they use cached states.
     // The block writer drops here: cached-state tests only read, so the tip never moves.
     let (state_service, read_state_service, latest_chain_tip, chain_tip_change, _block_writer) =
-        zebra_state::init(config, network, Height::MAX, 0, std::sync::Arc::new(|_,_,_,_| Some(zebra_state::CrosslinkVerdict::Accept { pos_payout: true }))).await;
+        zebra_state::init(config, network, Height::MAX, 0).await;
     Ok((
         state_service,
         read_state_service,

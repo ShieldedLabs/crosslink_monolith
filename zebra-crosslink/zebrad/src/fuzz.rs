@@ -111,16 +111,11 @@ impl Ingest {
             // so the sync loop's STP thread binds an ephemeral port and never connects.
             let config = zebra_state::config::Config::ephemeral();
 
-            // Trivial always-pass fat-pointer gate, matching init_test. The gate only governs
-            // PoW<->PoS linkage, which the block-bytes fuzzer is not exercising.
-            let gate: zebra_state::ClosureToCallIntoCrosslinkFromState =
-                Arc::new(|_, _, _, _| Some(zebra_state::CrosslinkVerdict::Accept { pos_payout: true }));
-
             // spawn_init is the public constructor (the zebra_state::service module is private).
             // It returns the block_writer that sync() must own -- which the init_test/
             // init_test_services helpers discard, so they can't be used here.
             let (_state, read_state, latest_chain_tip, _tip_change, block_writer) =
-                zebra_state::spawn_init(config.clone(), &network, Height::MAX, 0, gate.clone())
+                zebra_state::spawn_init(config.clone(), &network, Height::MAX, 0)
                     .await
                     .expect("state init task");
 
@@ -146,7 +141,9 @@ impl Ingest {
                     read_state,
                     handle,
                     verify_fns,
-                    gate,
+                    // No BFT: the block-bytes fuzzer never exercises PoW<->PoS linkage, and
+                    // every fat pointer it produces is null or unresolvable.
+                    None,
                     block_writer,
                     genesis,
                 );

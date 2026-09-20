@@ -1520,6 +1520,20 @@ pub enum ReadRequest {
     /// bond state, so this covers committed blocks only.
     CrosslinkAggregatedStakes(block::Hash),
 
+    /// The fat pointer a block template at this PoW height should carry, extending this node.s
+    /// best tip: the newest decided bft-block the height may cite under the sigma-confirmation
+    /// rule and `do_not_include_until_bc_height`, whose snapshot lies on the best chain; else
+    /// the parent.s own pointer (honest context selection, FINALITY.md §3.4).
+    CrosslinkFatPointerToBftChainTip(u64),
+
+    /// The roster for the next BFT height to decide: the stakes at the bft-tip.s snapshot, or
+    /// the last non-empty roster when those are empty.
+    CrosslinkRoster,
+
+    /// Tenderlink.s latest round-state snapshot: what this node has heard from each finalizer
+    /// at its current height.
+    CrosslinkRecencyStatus,
+
     /// Performs contextual validation of the given block, but does not commit it to the state.
     ///
     /// It is the caller's responsibility to perform semantic validation.
@@ -1612,6 +1626,9 @@ impl ReadRequest {
             ReadRequest::BlockInfo(_) => "block_info",
             ReadRequest::CrosslinkAggregatedStakes(_) => "crosslink_aggregated_stakes",
             ReadRequest::CrosslinkIsAncestor { .. } => "crosslink_is_ancestor",
+            ReadRequest::CrosslinkFatPointerToBftChainTip(_) => "crosslink_fat_pointer_to_bft_chain_tip",
+            ReadRequest::CrosslinkRoster => "crosslink_roster",
+            ReadRequest::CrosslinkRecencyStatus => "crosslink_recency_status",
             ReadRequest::Depth(_) => "depth",
             ReadRequest::Block(_) => "block",
             ReadRequest::AnyChainBlock(_) => "any_chain_block",

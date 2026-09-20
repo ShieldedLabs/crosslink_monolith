@@ -408,7 +408,7 @@ pub async fn service_viz_requests(
                 let mut leaving = false;
                 for _ in 0..256 {
                     let Ok(request) = request_queue.try_recv() else { break };
-                    crate::BFT_PAUSE.store(request.bft_pause, std::sync::atomic::Ordering::Relaxed);
+                    zebra_state::new_network::bft::BFT_PAUSE.store(request.bft_pause, std::sync::atomic::Ordering::Relaxed);
                     if request.view_exit {
                         leaving = true;
                         break;
@@ -489,7 +489,7 @@ pub async fn service_viz_requests(
             // unknown (fresh restart) the ack alone bounds the window; corrects itself
             // on the first decided-block ingest.
             let page_lo = (bc_tip_height + 1).saturating_sub(BC_PAGE_SIZE);
-            let finalized_lo = tfl_handle.internal.lock().await.latest_final_block
+            let finalized_lo = zebra_state::new_network::bft::bft_chain().read().unwrap().latest_final_block
                 .map(|(h, _)| h.0 as u64)
                 .unwrap_or(u64::MAX);
             // lo = ack clamped to [page_lo, finalized_lo]; when finality lags below the
@@ -536,12 +536,12 @@ pub async fn service_viz_requests(
             // Steady-state this touches nothing but newly decided blocks.
             {
                 {
-                    let internal = tfl_handle.internal.lock().await;
+                    let internal = zebra_state::new_network::bft::bft_chain().read().unwrap();
                     // bounded per cycle so a bulk load (PoS store replay) doesn't hash the
                     // whole chain under one lock hold
-                    let scan_end = (bft_checked_n + 4096).min(internal.bft_blocks.len());
+                    let scan_end = (bft_checked_n + 4096).min(internal.blocks.len());
                     while bft_checked_n < scan_end {
-                        let b = &internal.bft_blocks[bft_checked_n];
+                        let b = &internal.blocks[bft_checked_n];
                         if b.headers.is_empty() { break; } // placeholder: recheck once filled
                         let hash = Hash32::from_bytes(b.snapshot_block_hash().0);
                         bft_candidate_hashes.push(hash);
@@ -587,7 +587,7 @@ pub async fn service_viz_requests(
 
             for _ in 0..256 {
                 if let Ok(request) = request_queue.try_recv() {
-                    crate::BFT_PAUSE.store(request.bft_pause, std::sync::atomic::Ordering::Relaxed);
+                    zebra_state::new_network::bft::BFT_PAUSE.store(request.bft_pause, std::sync::atomic::Ordering::Relaxed);
 
                     if !request.load_instrs_path.is_empty() {
                         match test_format::TF::read_from_file(std::path::Path::new(&request.load_instrs_path)) {
@@ -649,8 +649,8 @@ pub async fn service_viz_requests(
                             let blocks: Vec<Arc<Block>> = pages.into_iter().flatten().map(|(_, _, block)| block).collect();
 
                             let (bft_blocks, fat_pointer_to_tip) = {
-                                let internal = handle.internal.lock().await;
-                                (internal.bft_blocks.clone(), internal.fat_pointer_to_tip.clone())
+                                let internal = zebra_state::new_network::bft::bft_chain().read().unwrap();
+                                (internal.blocks.clone(), internal.fat_pointer_to_tip.clone())
                             };
                             // The signed fat pointer to BFT block i rides in block i+1; the tip's rides alone.
                             let fat_ptr_to = |i: usize| {
@@ -743,20 +743,20 @@ pub async fn service_viz_requests(
                         }
                     }
 
-                    let mut internal = tfl_handle.internal.lock().await;
+                    let internal = zebra_state::new_network::bft::bft_chain().read().unwrap();
                     let mut response = zebra_gui::ResponseFromZebra::_0();
                     response.reset_blocks = live_reset;
                     live_reset = false;
                     response.bc_attested = bc_attested.clone();
-                    response.bft_recency = internal.recency_status.clone(); // TODO: do we want a better way of communicating singleton data
+                    response.bft_recency = zebra_state::new_network::bft::bft_recency_status(); // TODO: do we want a better way of communicating singleton data
                     {
                         // Terminated finalizers, derived the same way tenderlink filters its roster:
                         // a pure function of the hardfork schedule at the current working height (the
                         // next block to decide) and the current finalized BC height. Identical source
                         // means the viz display and the actual consensus roster always agree.
-                        let working_bft_height = internal.bft_blocks.len() as u64;
+                        let working_bft_height = internal.blocks.len() as u64;
                         let finalized_bc_height = internal.latest_final_block.map(|(h, _)| h.0 as u64).unwrap_or(0);
-                        response.blacklisted_finalizers = crate::terminated_finalizers_at(
+                        response.blacklisted_finalizers = zebra_state::new_network::bft::terminated_finalizers_at(
                             &tfl_handle.config.hardforks, working_bft_height, finalized_bc_height,
                         )
                         .iter()
@@ -769,7 +769,7 @@ pub async fn service_viz_requests(
                     } else {
                         0
                     };
-                    response.bft_tip_height = (internal.bft_blocks.len() as u64).saturating_sub(1);
+                    response.bft_tip_height = (internal.blocks.len() as u64).saturating_sub(1);
                     response.peer_strings = internal.peer_strings.clone();
                     response.pow_peer_count = zebra_state::new_network::POW_PEER_COUNT
                         .load(std::sync::atomic::Ordering::Relaxed);
@@ -854,7 +854,7 @@ pub async fn service_viz_requests(
                     // its page cap — which cuts the oldest indices — would cut exactly the era
                     // that was jumped to. Nothing else is served: a BFT catch-up burst past
                     // the margin stays hidden until PoW blocks referencing it exist.
-                    let bft_hash_to_height = &internal.bft_block_hash_to_height;
+                    let bft_hash_to_height = &internal.hash_to_height;
                     let extent_over = |lists: &[&Vec<(ZebBlockHeight, ZebBlockHash, Arc<Block>)>]| -> Option<(usize, usize)> {
                         let mut extent: Option<(usize, usize)> = None;
                         for list in lists {
@@ -878,12 +878,12 @@ pub async fn service_viz_requests(
                     // the just-decided tail is still news, same as the margin above the
                     // newest pointer.
                     let near_tip_extent = extent_over(&[&seq_blocks, &frontier_blocks]).or_else(|| {
-                        let n = internal.bft_blocks.len();
+                        let n = internal.blocks.len();
                         (n > 0).then(|| (n.saturating_sub(BFT_TIP_MARGIN), n - 1))
                     });
                     let mut jump_extent = extent_over(&[&backfill_blocks, &pos_jump_blocks]);
                     // the asked-for BFT block itself, in case the era's fat pointers just miss it
-                    if request.bft_want_height != u64::MAX && (request.bft_want_height as usize) < internal.bft_blocks.len() {
+                    if request.bft_want_height != u64::MAX && (request.bft_want_height as usize) < internal.blocks.len() {
                         let want = request.bft_want_height as usize;
                         jump_extent = Some(match jump_extent {
                             None => (want, want),
@@ -896,14 +896,14 @@ pub async fn service_viz_requests(
                             // each extent's page cap cuts its oldest indices, never the newest:
                             // under pressure (catch-up, deep scrolling) the tip lane must keep
                             // moving, and a jumped-to era must show the era that was asked for
-                            let hi = (hi + BFT_TIP_MARGIN).min(internal.bft_blocks.len().saturating_sub(1));
+                            let hi = (hi + BFT_TIP_MARGIN).min(internal.blocks.len().saturating_sub(1));
                             let lo = lo.max((hi + 1).saturating_sub(BFT_PAGE_SIZE));
                             bft_indices.extend(lo..=hi);
                         }
                     }
 
                     for i in bft_indices {
-                        let b = &internal.bft_blocks[i];
+                        let b = &internal.blocks[i];
                         // Out-of-order BFT ingest pads the chain with empty-headers placeholder
                         // blocks; nothing to show until the real block arrives.
                         if b.headers.is_empty() { continue; }
@@ -959,8 +959,8 @@ pub async fn service_viz_requests(
                             response.what_block_it_is = want;
                             response.block_inspection = pow_inspection(bc.as_ref());
                         } else {
-                            let internal = tfl_handle.internal.lock().await;
-                            for b in internal.bft_blocks.iter() {
+                            let internal = zebra_state::new_network::bft::bft_chain().read().unwrap();
+                            for b in internal.blocks.iter() {
                                 let this_hash = Hash32::from_bytes(b.blake3_hash().0);
                                 if want == this_hash {
                                     response.what_block_it_is = want;

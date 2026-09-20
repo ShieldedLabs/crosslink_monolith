@@ -1449,7 +1449,7 @@ impl StakeTxId {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct RosterMember {
     #[serde(with = "hex")]
     pub pub_key: [u8; 32],

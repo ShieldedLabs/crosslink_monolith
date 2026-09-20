@@ -2143,14 +2143,11 @@ where
     // TODO: remove
     async fn get_tfl_roster_zec(&self) -> Option<Vec<TFLStakerZec>> {
         let ret = self
-            .tfl_service
+            .read_state
             .clone()
-            .ready()
-            .await
-            .unwrap()
-            .call(TFLServiceRequest::Roster)
+            .oneshot(ReadRequest::CrosslinkRoster)
             .await;
-        if let Ok(TFLServiceResponse::Roster(roster)) = ret {
+        if let Ok(ReadResponse::CrosslinkRoster(roster)) = ret {
             let mut new_roster = Vec::with_capacity(roster.len());
             for m in &roster {
                 new_roster.push(TFLStakerZec(
@@ -2167,14 +2164,11 @@ where
 
     async fn get_tfl_roster_zats(&self) -> Option<Vec<RosterMember>> {
         let ret = self
-            .tfl_service
+            .read_state
             .clone()
-            .ready()
-            .await
-            .unwrap()
-            .call(TFLServiceRequest::Roster)
+            .oneshot(ReadRequest::CrosslinkRoster)
             .await;
-        if let Ok(TFLServiceResponse::Roster(roster)) = ret {
+        if let Ok(ReadResponse::CrosslinkRoster(roster)) = ret {
             Some(roster)
         } else {
             tracing::error!(?ret, "Bad tfl service return.");
@@ -2184,14 +2178,11 @@ where
 
     async fn get_tfl_fat_pointer_to_bft_chain_tip(&self) -> Option<FatPointerToBftBlock> {
         let ret = self
-            .tfl_service
+            .read_state
             .clone()
-            .ready()
-            .await
-            .unwrap()
-            .call(TFLServiceRequest::FatPointerToBFTChainTip(u64::MAX))
+            .oneshot(ReadRequest::CrosslinkFatPointerToBftChainTip(u64::MAX))
             .await;
-        if let Ok(TFLServiceResponse::FatPointerToBFTChainTip(fat_pointer)) = ret {
+        if let Ok(ReadResponse::CrosslinkFatPointerToBftChainTip(fat_pointer)) = ret {
             Some(fat_pointer)
         } else {
             tracing::error!(?ret, "Bad tfl service return.");
@@ -2535,12 +2526,12 @@ where
 
     async fn get_tfl_recency_status(&self) -> Option<zebra_state::crosslink::TFLRecencyStatus> {
         let res = self
-            .tfl_service
+            .read_state
             .clone()
-            .oneshot(TFLServiceRequest::FinalizersRecencyStatus)
+            .oneshot(ReadRequest::CrosslinkRecencyStatus)
             .await;
         match res {
-            Ok(TFLServiceResponse::FinalizersRecencyStatus(status)) => {
+            Ok(ReadResponse::CrosslinkRecencyStatus(status)) => {
                 Some(status)
             }
             Err(err) => {
@@ -3766,17 +3757,14 @@ where
                     // template forever and the chain would deadlock at that height.
                     let fat_pointer = {
                         let ret = self
-                            .tfl_service
+                            .read_state
                             .clone()
-                            .ready()
-                            .await
-                            .unwrap()
-                            .call(TFLServiceRequest::FatPointerToBFTChainTip(
+                            .oneshot(ReadRequest::CrosslinkFatPointerToBftChainTip(
                                 next_height.0 as u64,
                             ))
                             .await;
                         match ret {
-                            Ok(TFLServiceResponse::FatPointerToBFTChainTip(fp)) => fp,
+                            Ok(ReadResponse::CrosslinkFatPointerToBftChainTip(fp)) => fp,
                             _ => zcash_primitives::bft::FatPointerToBftBlock::null(),
                         }
                     };
@@ -3863,15 +3851,12 @@ where
 
         let fat_pointer = {
             let ret = self
-                .tfl_service
+                .read_state
                 .clone()
-                .ready()
-                .await
-                .unwrap()
-                .call(TFLServiceRequest::FatPointerToBFTChainTip(height.0 as u64))
+                .oneshot(ReadRequest::CrosslinkFatPointerToBftChainTip(height.0 as u64))
                 .await;
             match ret {
-                Ok(TFLServiceResponse::FatPointerToBFTChainTip(fp)) => fp,
+                Ok(ReadResponse::CrosslinkFatPointerToBftChainTip(fp)) => fp,
                 _ => zcash_primitives::bft::FatPointerToBftBlock::null(),
             }
         };

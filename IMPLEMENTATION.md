@@ -5,7 +5,7 @@ code to it. Each stage names the FINALITY.md sections it implements, the code it
 the condition under which it is done. Where this file and FINALITY.md disagree, FINALITY.md is
 right and this file is corrected.
 
-Stages 1 to 4 are done. Stages 5 to 8 move finality state out of
+Stages 1 to 5 are done. Stages 6 to 8 move finality state out of
 `zebra-crosslink/zebra-crosslink` into `zebra-state` (FINALITY.md §7.1), each of them for a race
 or a coupling that the crate boundary creates; they leave the crate holding no finality state.
 Stage 9 then gives the node the second chain state that FINALITY.md §4.3 requires, so that a BFT
@@ -314,10 +314,11 @@ on stages 5 and 6.
   follow `bft_final_snapshot`. That is the interim of FINALITY.md §4.3 and carries an `@Todo`
   naming stage 9; the node never requires a resync.
 
-Deletes: `TFLServiceInternal::latest_final_block`, `set_final_block`, `final_change_tx`,
+Deletes: `BftChain::latest_final_block`, `set_final_block` with `set_final_block_if_activated`,
+`BftChain::final_change_tx`,
 `TFLServiceRequest::SetFinalBlockHash` with the RPC that reaches it,
 `Request::CrosslinkFinalizeBlock` with `crosslink_finalize_via_new_network`,
-`CROSSLINK_FINALIZE_SENDER` and the queue behind them, the unbounded retry loop on the decide
+`CROSSLINK_FINALIZE_SENDER` and the queue behind them, the parked-decision retry on the decide
 path, and with it the coupling that makes BFT progress wait on a finalized-state write
 (FINALITY.md §5.2).
 

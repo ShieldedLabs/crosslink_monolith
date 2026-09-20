@@ -13,6 +13,7 @@ use tenderlink::{SliceWrite, SliceRead};
 use tenderlink::{dbg_panic, dbg_verify};
 
 mod checkpoint;
+pub mod bft;
 use checkpoint::Checkpoint;
 
 // ---------------------------------------------------------------------------
@@ -1300,33 +1301,15 @@ fn eviction_index(blocks_to_commit: &[(Hash, std::sync::Arc<Block>)], read_state
     Some(blocks_to_commit.len() - 1)
 }
 
-/// The [`CrosslinkChainView`](crate::CrosslinkChainView) for one block being admitted.
-///
-/// Every question admission asks is about that one block, so the candidate is baked in here
-/// rather than passed to each call. The candidate is not committed yet, so its ancestry is its
-/// parent's ancestry plus the parent itself.
-struct AdmissionChainView<'a> {
-    read_state: &'a ReadState,
-    parent_hash: block::Hash,
-}
-
-impl crate::CrosslinkChainView for AdmissionChainView<'_> {
-    fn height_of(&self, hash: block::Hash) -> Option<block::Height> {
-        self.read_state.known_block(hash).map(|known| known.height)
-    }
-
-    fn is_ancestor_of_candidate(&self, hash: block::Hash) -> Option<bool> {
-        self.read_state.is_ancestor_of(hash, self.parent_hash)
-    }
-}
-
 pub fn sync(
     config: &crate::config::Config,
     read_state: ReadState,
     // tfl_service: TFLService, // no TFLServiceHandle. Sadge!
     rt: tokio::runtime::Handle,
     verify_fns: VerifyFns,
-    crosslink_gate: crate::ClosureToCallIntoCrosslinkFromState,
+    // The finalizer identity and BFT peers; `None` runs no BFT at all (every non-null fat
+    // pointer then stays unresolvable, so only pre-activation chains sync).
+    bft: Option<bft::BftLaunch>,
     // The block writer. This loop owns it, so every mutation of the chain state happens on
     // this thread, in a known order, with the result available synchronously.
     mut block_writer: crate::service::write::WriteBlockWorkerTask,
@@ -1356,6 +1339,10 @@ pub fn sync(
         tracing::info!("NewNet: Starting at height={} hash={:?} finalized_height={} finalized_hash={}", tip_height.0, tip_hash, finalized_tip_height.0, finalized_tip_hash);
         assert!(finalized_tip_height <= tip_height);
     }
+
+    // BFT restores its persisted chain against the bc-chain, so this runs after genesis is in.
+    let mut bft_runner = bft::BftRunner::new(bft, config, &read_state, &mut block_writer, rt.clone());
+    let crosslink_params = read_state.network().crosslink_parameters();
 
     // Keypair setup
     let network_keypair;
@@ -1482,6 +1469,8 @@ pub fn sync(
     // Main sync loop
     loop {
         let loop_start = std::time::Instant::now();
+
+        bft_runner.tick(&read_state, &mut block_writer);
 
         if loop_start > next_console_status_print {
             let mut my_peers_to_print = Vec::new();
@@ -2891,15 +2880,9 @@ pub fn sync(
                             format!("{{hash:{} ovd:{} sigs:{}}}", hex::encode(&v[0..32]), hex::encode(&v[32..]), fp.signatures.len())
                         };
 
-                        // The gate needs the height of whatever PoW block the carried
-                        // certificate finalizes, and whether that block lies on this block's own
-                        // ancestry; only the state can answer either. See `CrosslinkChainView`.
-                        // Every chain is searched, because the block being admitted may be
-                        // extending a side chain.
-                        let chain_view = AdmissionChainView { read_state: &read_state, parent_hash };
                         let (gate, defer_msg) = if let Some(parent_fp) = parent_fat_pointer {
                             let msg = format!("child fp {} / parent fp {} not resolvable yet", fp_brief(&child_fat_pointer), fp_brief(&parent_fp));
-                            ((crosslink_gate)(parent_fp, child_fat_pointer, block::Height(height), &chain_view), msg)
+                            (bft::admit_fat_pointer(&bft::bft_chain().read().unwrap(), &crosslink_params, &read_state, parent_hash, &parent_fp, &child_fat_pointer, block::Height(height)), msg)
                         } else {
                             // known_block() saw the parent but any_chain_block_header() did not;
                             // the two views disagreeing is itself worth seeing in the log.
@@ -3041,11 +3024,8 @@ pub fn sync(
 
         let _ = any_blocks_in_the_queue_can_make_progress;
 
-        // Sleep remainder of tick
-        let elapsed = loop_start.elapsed();
-        if elapsed < tick_duration {
-            std::thread::sleep(tick_duration - elapsed);
-        }
+        // The remainder of the tick goes to BFT requests, so a round does not wait out the tick.
+        bft_runner.wait(loop_start + tick_duration, &read_state, &mut block_writer);
     }
 }
 

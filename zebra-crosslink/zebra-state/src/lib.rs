@@ -71,7 +71,6 @@ pub use service::{
     non_finalized_state::{BondStatusInChain, NonFinalizedState},
     spawn_init, spawn_init_read_only,
     watch_receiver::WatchReceiver,
-    ClosureToCallIntoCrosslinkFromState, CrosslinkChainView, CrosslinkChainViewRef,
     CrosslinkVerdict,
     OutputLocation, ReadState,
     State, TransactionIndex,

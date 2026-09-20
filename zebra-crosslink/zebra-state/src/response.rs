@@ -424,6 +424,15 @@ pub enum ReadResponse {
     /// finalizer at a block, or `None` for a block the finalized state does not hold.
     CrosslinkAggregatedStakes(Option<Vec<([u8; 32], u64)>>),
 
+    /// Response to [`ReadRequest::CrosslinkFatPointerToBftChainTip`].
+    CrosslinkFatPointerToBftChainTip(zcash_primitives::bft::FatPointerToBftBlock),
+
+    /// Response to [`ReadRequest::CrosslinkRoster`].
+    CrosslinkRoster(Vec<zcash_primitives::transaction::RosterMember>),
+
+    /// Response to [`ReadRequest::CrosslinkRecencyStatus`].
+    CrosslinkRecencyStatus(zcash_primitives::bft::TFLRecencyStatus),
+
     /// Response to [`ReadRequest::Depth`] with the depth of the specified block.
     Depth(Option<u32>),
 
@@ -714,6 +723,9 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::IsTransparentOutputSpent(_)
             | ReadResponse::CrosslinkIsAncestor(_)
             | ReadResponse::CrosslinkAggregatedStakes(_)
+            | ReadResponse::CrosslinkFatPointerToBftChainTip(_)
+            | ReadResponse::CrosslinkRoster(_)
+            | ReadResponse::CrosslinkRecencyStatus(_)
             | ReadResponse::ForkPoint(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }

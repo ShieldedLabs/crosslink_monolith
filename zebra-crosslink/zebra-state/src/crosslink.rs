@@ -45,20 +45,12 @@ pub enum TFLServiceRequest {
     BlockFinalityStatus(BlockHeight, BlockHash),
     /// Get the finality status of a transaction
     TxFinalityStatus(zebra_chain::transaction::Hash),
-    /// Get the finalizer roster
-    Roster,
-    /// Get the fat pointer to the BFT chain tip, suitable for a PoW block at the given height.
-    /// The handler walks back from the tip to find the most recent BFT block whose
-    /// `do_not_include_until_bc_height` is <= the proposed PoW block height.
-    FatPointerToBFTChainTip(u64),
     /// Send a staking command transaction
     StakingCmd(String),
     /// faucet
     Faucet(String),
     /// For crosslink testnet 1
     TotalIssuanceFromKey(Vec<zcash_keys::keys::UnifiedFullViewingKey>, BlockHeight, BlockHeight),
-    /// Finalizer recency status
-    FinalizersRecencyStatus,
     /// Get UFVK for wallet
     WalletUfvk,
     /// Send staking action from wallet
@@ -88,18 +80,12 @@ pub enum TFLServiceResponse {
     BlockFinalityStatus(Option<TFLBlockFinality>),
     /// Finality status of a transaction
     TxFinalityStatus(Option<TFLBlockFinality>),
-    /// Finalizer roster
-    Roster(Vec<zcash_primitives::transaction::RosterMember>),
-    /// Fat pointer to the BFT chain tip
-    FatPointerToBFTChainTip(zcash_primitives::bft::FatPointerToBftBlock),
     /// Send a staking command transaction
     StakingCmd,
     /// Faucet
     Faucet(Result<u64, String>),
     /// Response to [`ReadRequest::TotalIssuanceFromKey`]
     TotalIssuanceFromKey(Result<Vec<ScanInfo>, String>),
-    /// Finalizer recency status + reference UTC
-    FinalizersRecencyStatus(TFLRecencyStatus),
     /// Get UFVK for wallet
     WalletUfvk(Option<String>),
     /// Send staking action from wallet

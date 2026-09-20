@@ -9845,6 +9845,7 @@ dependencies = [
  "derive-getters",
  "derive-new",
  "dirs",
+ "ed25519-zebra",
  "elasticsearch",
  "futures",
  "halo2_proofs",

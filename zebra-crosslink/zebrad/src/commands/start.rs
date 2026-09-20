@@ -437,10 +437,6 @@ impl StartCmd {
 
         info!("opening database, this may take a few minutes");
 
-        let actual_closure: Arc<std::sync::Mutex<Option<zebra_state::ClosureToCallIntoCrosslinkFromState>>> = Arc::new(std::sync::Mutex::new(None));
-        let actual_closure2 = Arc::clone(&actual_closure);
-        let actual_closure3 = Arc::clone(&actual_closure);
-
         let mut state_config = config.state.clone();
         // config.crosslink.hardforks is already canonical and merged (see ZebradConfig::load)
         state_config.hardfork_schedule = Arc::new(HardForkSchedule::from_canonical(config.crosslink.hardforks.clone()));
@@ -452,14 +448,6 @@ impl StartCmd {
                 max_checkpoint_height,
                 config.sync.checkpoint_verify_concurrency_limit
                     * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
-                Arc::new(move |fat_pointer_a, fat_pointer_b, height, height_of| {
-                    if let Some(closure) = actual_closure.lock().unwrap().as_mut() {
-                        (closure)(fat_pointer_a, fat_pointer_b, height, height_of)
-                    } else {
-                        tracing::error!("State -> Crosslink closure not yet initialized.");
-                        None
-                    }
-                }),
             )
             .await
             .expect("failed to join the state initialisation task");
@@ -574,8 +562,6 @@ impl StartCmd {
             let state = state.clone();
             let read_only_state_service = read_only_state_service.clone();
             zebra_crosslink::service::spawn_new_tfl_service(
-                global_seed,
-                path_to_pos_store_file,
                 Arc::new(move |req| {
                     let state = state.clone();
                     Box::pin(async move { state.clone().ready().await?.call(req).await })
@@ -590,7 +576,6 @@ impl StartCmd {
                 }),
                 config.crosslink.clone(),
                 config.network.network.crosslink_parameters(),
-                actual_closure2,
             )
         };
         let tfl_service = BoxService::new(tfl_handle);
@@ -618,6 +603,26 @@ impl StartCmd {
             assert_eq!(genesis_block_for_new_network.hash(), config.network.network.genesis_hash(),
                 "genesis hash does not match the configured network genesis; consider editing your config");
             let sync_block_verifier = block_verifier_router.clone();
+
+            // The finalizer identity: derived from the node seed unless the config names one.
+            let bft_key_seed = config.crosslink.explicit_bft_key_seed.clone().unwrap_or_else(|| format!("Crosslink default finalizer identity seed {:?}", global_seed));
+            let (_, bft_signing_key, bft_public_key) = wallet::bft::finalizer_key_from_seed(bft_key_seed.as_bytes());
+            *wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap() = bft_public_key;
+            let finalizer_address = wallet::bft::FinalizerAddress::create(&bft_signing_key);
+            info!("finalizer address: {}", finalizer_address.encode());
+            *wallet::TENDERLINK_ADDRESS.lock().unwrap() = Some(finalizer_address);
+            *wallet::TENDERLINK_SIGNING_KEY.lock().unwrap() = Some(bft_signing_key.clone());
+            let public_address = config.crosslink.public_address.clone().unwrap_or_else(|| {
+                use rand::RngCore;
+                format!("127.0.0.1:{}", rand::thread_rng().next_u32() % 45869 + 2000)
+            });
+            info!("public IP: {}", public_address);
+            let bft_launch = zebra_state::new_network::bft::BftLaunch {
+                signing_key: bft_signing_key,
+                public_address,
+                peer_addresses: config.crosslink.bft_peers.clone(),
+                pos_store_path: path_to_pos_store_file,
+            };
             tokio::task::spawn_blocking(move || {
                 use zebra_state::new_network::BlockCommitError;
 
@@ -630,18 +635,7 @@ impl StartCmd {
                     check_cheap: zebra_consensus::sync_verify::block_check_cheap,
                     verify_expensive: zebra_consensus::sync_verify::block_verify_expensive,
                 };
-                // The same state -> crosslink closure the state service holds, so new_network
-                // can run the fat-pointer gate itself rather than discovering it at commit time.
-                let crosslink_gate: zebra_state::ClosureToCallIntoCrosslinkFromState =
-                    Arc::new(move |fat_pointer_a, fat_pointer_b, height, height_of| {
-                        if let Some(closure) = actual_closure3.lock().unwrap().as_mut() {
-                            (closure)(fat_pointer_a, fat_pointer_b, height, height_of)
-                        } else {
-                            tracing::error!("NewNet -> Crosslink closure not yet initialized.");
-                            None
-                        }
-                    });
-                zebra_state::new_network::sync(&config.state, sync_read_state, /* tfl_service2, */ tokio::runtime::Handle::current(), verify_fns, crosslink_gate, block_writer, genesis_block_for_new_network)
+                zebra_state::new_network::sync(&config.state, sync_read_state, tokio::runtime::Handle::current(), verify_fns, Some(bft_launch), block_writer, genesis_block_for_new_network)
             });
         }
 

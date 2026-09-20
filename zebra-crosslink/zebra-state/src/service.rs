@@ -41,7 +41,6 @@ use zebra_chain::{
 };
 
 use zebra_chain::block::Height;
-use zcash_primitives::bft::FatPointerToBftBlock;
 
 use crate::{
     constants::{
@@ -186,39 +185,11 @@ pub(crate) struct StateService {
     /// Set to `f64::NAN` if `finalized_state_queued_blocks` is empty, because grafana shows NaNs
     /// as a break in the graph.
 
-    #[derivative(Debug = "ignore")]
-    closure_to_call_crosslink: ClosureToCallIntoCrosslinkFromState,
-
     /// the slash index blocks verification at hardfork activations; set at init
     hardfork_schedule: Arc<HardForkSchedule>,
 }
 
-/// What bc-block admission may ask the chain about the block it is admitting.
-///
-/// Two of the rules admission enforces need the chain rather than the block's own bytes. The
-/// sigma-confirmation rule is a statement about two PoW heights: the height of the block being
-/// admitted, and the height of the PoW block that the certificate that block carries finalizes.
-/// The Last Final Snapshot rule (FINALITY.md §3.4) additionally requires that same block to lie
-/// on the ancestry of the block being admitted. A certificate names the block by hash only, so
-/// both questions go to the chain.
-///
-/// `None` from either method means "not known here (yet)", which admission treats as a defer
-/// rather than a rejection.
-pub trait CrosslinkChainView {
-    /// The height of `hash` in any chain this state holds — finalized or not, best chain or
-    /// side chain.
-    fn height_of(&self, hash: block::Hash) -> Option<block::Height>;
-
-    /// Whether `hash` is an ancestor of the block being admitted.
-    ///
-    /// The view is built for one candidate block, so the candidate is not named here.
-    fn is_ancestor_of_candidate(&self, hash: block::Hash) -> Option<bool>;
-}
-
-/// [`CrosslinkChainView`] as admission receives it.
-pub type CrosslinkChainViewRef<'a> = &'a dyn CrosslinkChainView;
-
-/// What the crosslink fat-pointer gate decided about a block.
+/// What the crosslink fat-pointer gate ([`new_network::bft::admit_fat_pointer`](crate::new_network::bft::admit_fat_pointer)) decided about a block.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum CrosslinkVerdict {
     /// Permanently invalid (e.g. `do_not_include_until_bc_height` violated, or the certificate
@@ -236,21 +207,6 @@ pub enum CrosslinkVerdict {
         pos_payout: bool,
     },
 }
-
-/// Return type for the crosslink fat-pointer gate closure.
-/// - `None` — defer: re-queue the block and retry on a later flush (BFT block not yet loaded,
-///   or the PoW block its certificate finalizes is not known here yet).
-/// - `Some(verdict)` — see [`CrosslinkVerdict`].
-pub type ClosureToCallIntoCrosslinkFromState = Arc<
-    dyn for<'a> Fn(
-            FatPointerToBftBlock,
-            FatPointerToBftBlock,
-            block::Height,
-            CrosslinkChainViewRef<'a>,
-        ) -> Option<CrosslinkVerdict>
-        + Send
-        + Sync,
->;
 
 /// A read-only service for accessing Zebra's cached blockchain state.
 ///
@@ -366,7 +322,6 @@ impl StateService {
         network: &Network,
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
-        closure_to_call_crosslink: ClosureToCallIntoCrosslinkFromState,
     ) -> (
         Self,
         ReadStateService,
@@ -476,7 +431,6 @@ impl StateService {
             pending_utxos,
             last_prune: Instant::now(),
             read_service: read_service.clone(),
-            closure_to_call_crosslink,
             hardfork_schedule: config.hardfork_schedule.clone(),
         };
         timer.finish_desc("initializing state service");
@@ -1134,6 +1088,26 @@ impl Service<ReadRequest> for ReadStateService {
                 state.is_ancestor_of(ancestor, descendant),
             )),
 
+            ReadRequest::CrosslinkFatPointerToBftChainTip(proposed_pow_height) => {
+                let chain = crate::new_network::bft::bft_chain().read().unwrap();
+                Ok(ReadResponse::CrosslinkFatPointerToBftChainTip(
+                    crate::new_network::bft::fat_pointer_for_template(
+                        &chain,
+                        &state.network.crosslink_parameters(),
+                        &state,
+                        proposed_pow_height,
+                    ),
+                ))
+            }
+
+            ReadRequest::CrosslinkRoster => Ok(ReadResponse::CrosslinkRoster(
+                crate::new_network::bft::bft_chain().read().unwrap().roster.clone(),
+            )),
+
+            ReadRequest::CrosslinkRecencyStatus => Ok(ReadResponse::CrosslinkRecencyStatus(
+                crate::new_network::bft::bft_recency_status(),
+            )),
+
             // Used by the StateService.
             ReadRequest::Depth(hash) => Ok(ReadResponse::Depth(read::depth(
                 state.latest_best_chain(),
@@ -1665,7 +1639,6 @@ pub async fn init(
     network: &Network,
     max_checkpoint_height: block::Height,
     checkpoint_verify_concurrency_limit: usize,
-    closure_to_call_crosslink: ClosureToCallIntoCrosslinkFromState,
 ) -> (
     BoxService<Request, Response, BoxError>,
     ReadStateService,
@@ -1679,7 +1652,6 @@ pub async fn init(
             network,
             max_checkpoint_height,
             checkpoint_verify_concurrency_limit,
-            closure_to_call_crosslink,
         )
         .await;
 
@@ -1762,7 +1734,6 @@ pub fn spawn_init(
     network: &Network,
     max_checkpoint_height: block::Height,
     checkpoint_verify_concurrency_limit: usize,
-    closure_to_call_crosslink: ClosureToCallIntoCrosslinkFromState,
 ) -> tokio::task::JoinHandle<(
     BoxService<Request, Response, BoxError>,
     ReadStateService,
@@ -1777,7 +1748,6 @@ pub fn spawn_init(
             &network,
             max_checkpoint_height,
             checkpoint_verify_concurrency_limit,
-            closure_to_call_crosslink,
         )
         .await
     })
@@ -1793,7 +1763,7 @@ pub async fn init_test(
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, _, _, _, _block_writer) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, Arc::new(|_,_,_,_| Some(crate::CrosslinkVerdict::Accept { pos_payout: true }))).await;
+        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0).await;
 
     Buffer::new(BoxService::new(state_service), 1)
 }
@@ -1814,7 +1784,7 @@ pub async fn init_test_services(
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, read_state_service, latest_chain_tip, chain_tip_change, _block_writer) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, std::sync::Arc::new(|_,_,_,_| Some(crate::CrosslinkVerdict::Accept { pos_payout: true }))).await;
+        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0).await;
 
     let state_service = Buffer::new(BoxService::new(state_service), 1);
 

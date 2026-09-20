@@ -699,20 +699,20 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                 let c = ctx.clone();
                                                 s.work = Work::Pending(ctx.rt.spawn(async move {
                                                     match c
-                                                        .tfl
+                                                        .read_state
                                                         .clone()
-                                                        .oneshot(TFLServiceRequest::Roster)
+                                                        .oneshot(ReadRequest::CrosslinkRoster)
                                                         .await
                                                         .map_err(internal)?
                                                     {
-                                                        TFLServiceResponse::Roster(roster) => {
+                                                        ReadResponse::CrosslinkRoster(roster) => {
                                                             let mut data = Vec::new();
                                                             for member in &roster {
                                                                 member.write_to_vec(&mut data);
                                                             }
                                                             Ok(Work::Items([enc(&Bytes { data })].into()))
                                                         }
-                                                        _ => Err((GRPC_INTERNAL, "unexpected TFL response".into())),
+                                                        _ => Err((GRPC_INTERNAL, "unexpected state response".into())),
                                                     }
                                                 }));
                                             }

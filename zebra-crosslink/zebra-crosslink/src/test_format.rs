@@ -618,7 +618,7 @@ pub(crate) async fn handle_instr(
             // let mut file = std::fs::File::create(&path).expect("valid file");
             // file.write_all(instr.data_slice(bytes)).expect("write success");
 
-            let (force_feed_ok, msg) = match (internal_handle.call.force_feed_pos)(Arc::new(block), fat_ptr).await {
+            let (force_feed_ok, msg) = match zebra_state::new_network::bft::force_feed_bft_block(Arc::new(block), fat_ptr).await {
                 Ok(()) => (true, "PoS force feed ok".to_string()),
                 Err(msg) => (false, msg),
             };
@@ -654,7 +654,7 @@ pub(crate) async fn handle_instr(
 
         TestInstr::ExpectPoSChainLength(h) => {
             let expect = h as usize;
-            let actual = internal_handle.internal.lock().await.bft_blocks.len();
+            let actual = zebra_state::new_network::bft::bft_chain().read().unwrap().blocks.len();
             test_check(
                 flags,
                 expect == actual,
@@ -683,11 +683,13 @@ pub(crate) async fn handle_instr(
 
         TestInstr::ExpectRosterIncludes(pub_key, stake) => {
             let key = PubKeyID(pub_key);
-            let internal = internal_handle.internal.lock().await;
-            let finalizer = internal
-                .finalizers_at_current_height
+            let finalizer = zebra_state::new_network::bft::bft_chain()
+                .read()
+                .unwrap()
+                .roster
                 .iter()
-                .find(|x| PubKeyID(x.pub_key) == key);
+                .find(|x| PubKeyID(x.pub_key) == key)
+                .cloned();
 
             if let Some(finalizer) = finalizer {
                 test_check(
@@ -708,9 +710,10 @@ pub(crate) async fn handle_instr(
         }
 
         TestInstr::RosterForceInclude(pub_key, stake) => {
-            let mut internal = internal_handle.internal.lock().await;
-            internal
-                .finalizers_at_current_height
+            zebra_state::new_network::bft::bft_chain()
+                .write()
+                .unwrap()
+                .roster
                 .push(RosterMember { pub_key, voting_power: stake, txids: Vec::new() });
         }
     }
