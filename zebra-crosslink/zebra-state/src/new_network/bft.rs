@@ -1153,17 +1153,6 @@ impl BftRunner {
             }
         }
 
-        // The decision is stored after its snapshot commits, so a crash in between leaves the
-        // BFT chain one height short and that height is decided again on the next run.
-        if let Err(err) = block_writer.finalized_state.db.write_bft_decision(
-            block.height,
-            &block,
-            &fat_pointer,
-            &proposal_sigs,
-        ) {
-            tracing::error!("could not store BFT decision at height {}: {err}", block.height);
-        }
-
         // The returned roster is for the NEXT height (tenderlink advances to it after this
         // decision): its index is the new chain length. Exclude finalizers terminated at that
         // height, inclusive, so they are already out of the roster that will vote on a hardfork
@@ -1172,6 +1161,18 @@ impl BftRunner {
         let terminated = terminated_finalizers_at(hardforks, next_bft_height, new_final_height.0 as u64);
         let roster = tenderlink_roster_from_internal(&chain.roster, &terminated);
         drop(chain);
+
+        // The decision is stored after its snapshot commits, so a crash in between leaves the
+        // BFT chain one height short and that height is decided again on the next run. It is
+        // also stored after the chain lock is dropped, so readers never wait on a disk write.
+        if let Err(err) = block_writer.finalized_state.db.write_bft_decision(
+            block.height,
+            &block,
+            &fat_pointer,
+            &proposal_sigs,
+        ) {
+            tracing::error!("could not store BFT decision at height {}: {err}", block.height);
+        }
 
         match reply {
             DecisionReply::Tenderlink(reply) => {
@@ -1210,8 +1211,9 @@ impl BftRunner {
                     tracing::error!(
                         "this database is past the BFT activation height ({}) but holds no decided \
                          BFT chain, so it predates BFT storage in the finalized database. Delete \
-                         the state directory and resync.",
+                         {} and resync.",
                         activation_height,
+                        block_writer.finalized_state.db.path().display(),
                     );
                     std::process::exit(1);
                 }
@@ -1280,8 +1282,9 @@ impl BftRunner {
                     // this is a damaged database rather than a configuration mistake.
                     tracing::error!(
                         "the decided BFT chain finalizes block {}, which this database does not \
-                         hold. Delete the state directory and resync.",
+                         hold. Delete {} and resync.",
                         new_final_hash,
+                        block_writer.finalized_state.db.path().display(),
                     );
                     std::process::exit(1);
                 }

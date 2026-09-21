@@ -18,7 +18,9 @@ BOND=20000000; ROSTER_HEIGHT=75; ACTIVATION_HEIGHT=275
 PORT=(8232 8242); PID=(); FAIL=0
 
 rpc() { curl -s -m 300 -X POST "http://127.0.0.1:${PORT[$1]}" -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":${3:-[]}}"; }
-tip() { rpc "$1" getblockchaininfo | jq -r '.result.blocks // 0'; }
+# Never empty: an RPC that times out or answers unparseably reports 0, so a `-lt` against it
+# stays a comparison instead of erroring out and ending the loop that made it.
+tip() { t=$(rpc "$1" getblockchaininfo | jq -r '.result.blocks // 0' 2>/dev/null); case "$t" in ''|*[!0-9]*) t=0;; esac; echo "$t"; }
 logs() { cat "$OUT"/node$1.log* "$OUT"/node$1.err* 2>/dev/null | tr -d '\r'; }
 log() { echo "$(date +%T) tip=$(tip 0) $*"; }
 fail() { echo "FAIL: $*"; FAIL=1; }
@@ -98,7 +100,7 @@ restart_nodes() {
   for k in 0 1; do start_node $k; done
   # The tip is not expected back at $BEFORE here: a hard kill drops whatever the non-finalized
   # state held above the crosslink-finalized height, and node 0 re-mines it in `mine_to`.
-  for k in 0 1; do until t=$(tip $k) && [ -n "$t" ] && [ "$t" -gt 0 ]; do sleep 2; done; done
+  for k in 0 1; do until [ "$(tip $k)" -gt 0 ]; do sleep 2; done; done
   echo "$(date +%T) restart: both nodes back at tip $(tip 0)"
 }
 
@@ -110,6 +112,9 @@ mine_to() {
 }
 RESTART_HEIGHT=$(( (ACTIVATION_HEIGHT + TARGET) / 2 ))
 mine_to "$RESTART_HEIGHT"
+# A restart below the activation height would test nothing, so stop rather than report four
+# confusing failures about a BFT chain that was never built.
+[ "$(tip 0)" -gt "$ACTIVATION_HEIGHT" ] || { fail "mining stopped at $(tip 0), below the activation height $ACTIVATION_HEIGHT"; exit 1; }
 sleep 5
 restart_nodes
 mine_to "$TARGET"

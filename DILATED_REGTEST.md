@@ -10,7 +10,8 @@ server, tenderlink and the finality rules together, which no unit test does.
 Runs from Git Bash on Windows or a Linux shell; needs `curl`, `jq` and a debug `zebrad` built
 with `phuild.bat zebra-crosslink Debug Win64 -p zebrad`. Everything it writes goes to
 `zebra-crosslink/dilated_regtest/out/` (ignored by git): the rendered node configs, both
-state directories and both nodes' logs. Exit status 0 is a pass.
+state directories and both nodes' logs, with the pre-restart logs kept beside them as
+`node<n>.log.1`. Exit status 0 is a pass.
 
 ## What it does
 
