@@ -1188,35 +1188,50 @@ fn crosslink_gen_pow_fork() {
 // non-negative, and coinbase outputs can't fund it before they mature (100 blocks).
 // `target_finalizer` is a FinalizerAddress (a signed capability), not a bare key: consensus
 // verifies its embedded signature (delegation.rs `addr.verify()`), so it must be minted from a
-// real signing key via `FinalizerAddress::create`. The roster is keyed on its pub_key
-// (`target_finalizer_pk`). The bond's own `signature` is not consensus-checked, so a placeholder
-// is fine.
+// real signing key via `FinalizerAddress::create`. The bond key is a real key for the same
+// reason: consensus verifies the action's signature against it (check::staking_action_signature),
+// so `bond_seed` names a key rather than supplying the pubkey bytes directly.
 fn staking_tx_create_bond(
-    bond_key: [u8; 32],
+    bond_seed: &[u8],
     target_finalizer: zcash_primitives::bft::FinalizerAddress,
     amount_zats: u64,
 ) -> Arc<Transaction> {
     use zcash_primitives::transaction::StakingAction;
+    use zebra_chain::transaction::HashType;
 
-    Arc::new(Transaction::VCrosslink {
-        // must match NetworkUpgrade::current at the block's height (default regtest
-        // activates everything through NU6 at height 1)
-        network_upgrade: NetworkUpgrade::Nu6,
-        lock_time: LockTime::unlocked(),
-        expiry_height: BlockHeight(0),
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        sapling_shielded_data: None,
-        orchard_shielded_data: None,
-        ironwood_shielded_data: None,
-        staking_action: Some(StakingAction::CreateNewDelegationBond {
-            amount_zats,
-            unique_pubkey: bond_key,
-            bond_salt: [0; 32],
-            target_finalizer,
-            signature: [0; 64],
-        }),
-    })
+    let (_, bond_signing_key, bond_pub_key) =
+        zebra_crosslink::rng_private_public_key_from_address(bond_seed);
+
+    // must match NetworkUpgrade::current at the block's height: regtest activates every upgrade
+    // at height 1, so this is the last row of REGTEST_NETWORK_UPGRADES and moves with it (NU6
+    // until 57d335cc added NU6.1 through NU6.3).
+    let network_upgrade = NetworkUpgrade::Nu6_3;
+    let tx_with_signature = |signature: [u8; 64]| {
+        Arc::new(Transaction::VCrosslink {
+            network_upgrade,
+            lock_time: LockTime::unlocked(),
+            expiry_height: BlockHeight(0),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+            staking_action: Some(StakingAction::CreateNewDelegationBond {
+                amount_zats,
+                unique_pubkey: bond_pub_key.0,
+                bond_salt: [0; 32],
+                target_finalizer,
+                signature,
+            }),
+        })
+    };
+
+    // The sighash covers the action without its signature (`sa.unsigned().tree_hash()` in
+    // sighash.rs), so signing what the unsigned transaction hashes to leaves that hash unchanged.
+    let sighash = tx_with_signature([0; 64])
+        .sighash(network_upgrade, HashType::ALL, Arc::new(Vec::new()), None)
+        .expect("a staking-only VCrosslink transaction has a sighash");
+    tx_with_signature(bond_signing_key.sign(sighash.as_ref()).into())
 }
 
 #[test]
@@ -1239,7 +1254,7 @@ fn crosslink_pow_block_with_staking_tx() {
     // (height 1 carries the reserved all-zero commitment), so this exercises both the
     // merkle root and the auth-data commitment accounting for the extra transaction
     let block_with_tx =
-        gen.next_block_with_txs(&miner_addr, &[staking_tx_create_bond([0xcd; 32], target, 0)]);
+        gen.next_block_with_txs(&miner_addr, &[staking_tx_create_bond(b"staking-bond", target, 0)]);
     assert_eq!(block_with_tx.transactions.len(), 2);
     tf.push_instr_load_pow(&block_with_tx, 0);
 
@@ -1253,7 +1268,7 @@ fn crosslink_pow_block_with_staking_tx() {
     let mut tampered = gen.next_block(&miner_addr).as_ref().clone();
     tampered
         .transactions
-        .push(staking_tx_create_bond([0xee; 32], target, 0));
+        .push(staking_tx_create_bond(b"staking-bond-tampered", target, 0));
     tf.push_instr_load_pow(&tampered, SHOULD_FAIL);
     tf.push_instr_expect_pow_chain_length(5, 0);
 
@@ -1387,7 +1402,7 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
     // snapshot height 1, and the roster snapshot taken at finalization only sees bonds
     // already in the finalized state. Amount 0 as the bond can't be funded (see
     // staking_tx_create_bond).
-    let staking_tx = staking_tx_create_bond([0xcd; 32], target, 0);
+    let staking_tx = staking_tx_create_bond(b"newcomer-bond", target, 0);
     let mut gen = BlockGen::init_at_genesis_plus_1_with_txs(
         network,
         BlockGen::REGTEST_GENESIS_HASH,
