@@ -1,6 +1,6 @@
 # Crosslink finality implementation plan
 
-[`FINALITY.md`](./FINALITY.md) defines the behavior. This file orders the work that brings the
+[`FINALITY.md`](./crosslink_book/src/FINALITY.md) defines the behavior. This file orders the work that brings the
 code to it. Each stage names the FINALITY.md sections it implements, the code it touches, and
 the condition under which it is done. Where this file and FINALITY.md disagree, FINALITY.md is
 right and this file is corrected.

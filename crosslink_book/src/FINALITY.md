@@ -29,10 +29,10 @@ It keeps three layers apart:
 
 Where a section mixes layers, a paragraph opens with its layer in bold. The ordered
 implementation work, and the questions that still need a design pass, are in
-[`IMPLEMENTATION.md`](./IMPLEMENTATION.md).
+[`IMPLEMENTATION.md`](../../IMPLEMENTATION.md).
 
 A companion visual explanation is in
-[`FINALITY_DIAGRAM.html`](./FINALITY_DIAGRAM.html).
+[`FINALITY_DIAGRAM.html`](../../FINALITY_DIAGRAM.html).
 
 ## 1. Scope and source maturity
 
@@ -1253,7 +1253,7 @@ headers, satisfies every dependency.
 
 ## 8. Implementation status and pitfalls
 
-The ordered implementation work is in [`IMPLEMENTATION.md`](./IMPLEMENTATION.md). This section
+The ordered implementation work is in [`IMPLEMENTATION.md`](../../IMPLEMENTATION.md). This section
 records the current-tree facts that work starts from.
 
 **Current tree.** The final-block accessor returns only the stored Crosslink value and never
@@ -1396,7 +1396,7 @@ stored, or consumed.
 ## 9. Open decisions
 
 Payout design belongs to separate work, recorded here for context. Implementation questions
-that need a design pass are in [`IMPLEMENTATION.md`](./IMPLEMENTATION.md).
+that need a design pass are in [`IMPLEMENTATION.md`](../../IMPLEMENTATION.md).
 
 ### 9.1 Objective reward trigger and reward economics
 
