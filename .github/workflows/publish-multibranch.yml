@@ -1,0 +1,76 @@
+name: Publish (multi-branch)
+
+on:
+  push:
+    branches-ignore:
+      # Avoid infinite recursion! This action pushes to `gh-pages`:
+      - gh-pages
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Allow only one concurrent deployment, skipping runs queued between the run
+# in-progress and latest queued. However, do NOT cancel in-progress runs as we
+# want to allow these production deployments to complete.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  render-and-publish-multibranch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: read
+
+    steps:
+      - name: Setup Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Restore Nix store cache
+        id: nix-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: /tmp/nix-closure
+          key: nix-devshell-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix') }}
+
+      - name: Import cached Nix store paths
+        if: steps.nix-cache.outputs.cache-hit == 'true'
+        run: nix-store --import < /tmp/nix-closure/store.nar
+
+      - name: Checkout `${{ github.ref }}`
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Render `${{ github.ref }}` to `gh-pages`
+        run: |
+          git config user.name 'github_actions'
+          git config user.email 'actions@github.com'
+          nix develop -c .github/scripts/multi-branch-render.sh
+
+      - name: Push to `gh-pages`
+        run: git push origin gh-pages:gh-pages
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: docs
+
+  deploy-pages:
+    needs: render-and-publish-multibranch
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

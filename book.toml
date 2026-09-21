@@ -1,0 +1,17 @@
+[book]
+title = "Zcash Crosslink: A Visual Tour"
+authors = ["nobody"]
+language = "en"
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+# Copied from https://github.com/zodl-inc/tfl-book
+[preprocessor.katex]
+macros = "macros.txt"
+renderer = ["html"]
+fleqn = true
+trust = true
+
+[output.html]
+additional-js = ["mermaid.min.js", "mermaid-init.js", "mermaid-common-styles.js"]
