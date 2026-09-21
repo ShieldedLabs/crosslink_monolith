@@ -62,6 +62,7 @@ use zcash_primitives::transaction::sighash::{signature_hash, SignableInput};
 use zcash_primitives::transaction::txid::TxIdDigester;
 use zcash_primitives::transaction::{Authorized, Transaction, TransactionData, TxVersion, Unauthorized};
 pub use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakingActionRequest, StakeTxId};
+pub use zcash_primitives::transaction::{STAKING_DAY_WINDOW, STAKING_PERIOD};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight as LRZBlockHeight, BranchId, MAX_BLOCK_REORG_HEIGHT};
 use zcash_protocol::memo::MemoBytes;
