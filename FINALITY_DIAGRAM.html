@@ -90,9 +90,9 @@
     svg .rail-pos { fill: none; stroke: var(--pos); stroke-width: 4; opacity: .72; }
     svg .pointer-pow { fill: none; stroke: var(--pow); stroke-width: 3; }
     svg .pointer-pos { fill: none; stroke: var(--pos); stroke-width: 3; }
+    svg .header-pos { fill: none; stroke: var(--pos); stroke-width: 1.75; opacity: .65; }
     svg .guide { fill: none; stroke: #70869c; stroke-width: 2; stroke-dasharray: 6 6; }
     svg .old-branch { fill: none; stroke: var(--old); stroke-width: 3; stroke-dasharray: 7 6; }
-    svg .tail-bracket { fill: none; stroke: var(--pos); stroke-width: 2; stroke-dasharray: 4 3; }
     svg .pow-node { fill: var(--pow-node-bg); stroke: var(--pow); stroke-width: 2.5; }
     svg .pos-node { fill: var(--pos-node-bg); stroke: var(--pos); stroke-width: 2.5; }
     svg .node-text { font-size: 12px; font-weight: 700; text-anchor: middle; dominant-baseline: middle; }
@@ -234,6 +234,11 @@
     between <code>bc_best</code> and <code>fin</code>, and nothing bounds
     how far the best chain runs ahead of <code>fin</code>.
   </p>
+  <p class="lede">
+    Two layers appear below. The Book is Crosslink 2 as the pinned TFL Book specifies it.
+    Zebra Crosslink is the Book's construction without Stalled Mode, with sticky fork choice
+    (§6), persisted <code>fin</code>, and every remaining CL2 validity rule. This tree implements it, except where noted.
+  </p>
   <p class="lede">See the <a href="./FINALITY.md">full semantic and implementation analysis</a>.</p>
   </header>
 
@@ -261,16 +266,18 @@
     <h2>1. How <code>candidate(H)</code> crosses both chains</h2>
     <p class="subhead">
       Arrows are committed references, not message flow. Newer blocks are at the top; parent
-      links run downward.
+      links run downward. Tenderlink decides each BFT block on its own, and the fat pointer in
+      <code>context_bft</code> carries the signatures of that decision, so the cited block is
+      final and <code>LF(H)</code> is that block itself. The Book's generic BFT protocol can
+      instead finalize an ancestor of the cited block.
     </p>
     <div class="svg-wrap">
       <svg viewBox="0 0 1100 720" role="img" aria-labelledby="candidate-title candidate-desc">
         <title id="candidate-title">Candidate calculation across parallel PoW and PoS chains</title>
-        <desc id="candidate-desc">PoW block P10 points to PoS block S6. Its last final PoS ancestor is S4. S4 points to PoW header P6, whose parent P5 is the snapshot. P10 pruned by sigma is P7, and the last common ancestor of P5 and P7 is candidate P5.</desc>
+        <desc id="candidate-desc">PoW block P10 points to PoS block S6, which is final, so LF(P10) is S6. S6 points to PoW header P6, whose parent P5 is the snapshot. P10 pruned by sigma is P7, and the last common ancestor of P5 and P7 is candidate P5.</desc>
         <defs>
           <marker id="pow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#58a6ff"/></marker>
           <marker id="pos-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#ff6b7d"/></marker>
-          <marker id="lf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#ffb3bd"/></marker>
           <marker id="muted-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#70869c"/></marker>
         </defs>
 
@@ -292,35 +299,35 @@
         <g transform="translate(262 570)"><circle class="pow-node" r="20"/><text class="node-text">P3</text></g>
         <g transform="translate(262 630)"><circle class="pow-node" r="20"/><text class="node-text">P2</text></g>
 
-        <g transform="translate(838 140)"><circle class="pos-node" r="24"/><text class="node-text">S6</text></g>
+        <g transform="translate(838 140)"><circle class="pos-node" r="27"/><circle r="33" fill="none" stroke="var(--lf)" stroke-width="3"/><text class="node-text">S6</text></g>
         <g transform="translate(838 245)"><circle class="pos-node" r="20"/><text class="node-text">S5</text></g>
-        <g transform="translate(838 350)"><circle class="pos-node" r="27"/><circle r="33" fill="none" stroke="var(--lf)" stroke-width="3"/><text class="node-text">S4</text></g>
+        <g transform="translate(838 350)"><circle class="pos-node" r="20"/><text class="node-text">S4</text></g>
         <g transform="translate(838 455)"><circle class="pos-node" r="20"/><text class="node-text">S3</text></g>
         <g transform="translate(838 560)"><circle class="pos-node" r="20"/><text class="node-text">S2</text></g>
         <g transform="translate(838 630)"><circle class="pos-node" r="20"/><text class="node-text">S1</text></g>
 
-        <path class="pointer-pow" d="M288 112 C470 85 640 105 812 136" marker-end="url(#pow-arrow)"/>
+        <path class="pointer-pow" d="M288 112 L803 134" marker-end="url(#pow-arrow)"/>
         <rect class="callout" x="450" y="82" width="205" height="42" rx="9"/>
         <text class="formula" x="552" y="108" text-anchor="middle" style="fill:var(--pow)">P10.context_bft = S6</text>
 
-        <path d="M838 168 V316" fill="none" stroke="var(--lf)" stroke-width="5" marker-end="url(#lf-arrow)"/>
-        <rect class="callout" x="884" y="220" width="174" height="49" rx="9"/>
-        <text class="formula" x="971" y="241" text-anchor="middle" style="fill:var(--lf)">LF(P10) = S4</text>
-        <text class="micro" x="971" y="258" text-anchor="middle">last final in S6's context</text>
+        <rect class="callout" x="890" y="116" width="174" height="49" rx="9"/>
+        <text class="formula" x="977" y="137" text-anchor="middle" style="fill:var(--lf)">LF(P10) = S6</text>
+        <text class="micro" x="977" y="154" text-anchor="middle">the cited block is final</text>
 
-        <path class="pointer-pos" d="M810 350 C620 324 475 346 285 373" marker-end="url(#pos-arrow)"/>
-        <path class="tail-bracket" d="M305 245 h20 M325 245 V375 M305 375 h20"/>
-        <rect class="callout" x="405" y="307" width="310" height="58" rx="9"/>
-        <text class="formula" x="560" y="330" text-anchor="middle" style="fill:var(--pos)">S4.headers_bc = [P6, P7, P8]</text>
-        <text class="micro" x="560" y="350" text-anchor="middle">deepest first; headers_bc[0] = P6</text>
+        <path class="header-pos" d="M806 147 L286 243" marker-end="url(#pos-arrow)"/>
+        <path class="header-pos" d="M807 152 L288 307" marker-end="url(#pos-arrow)"/>
+        <path class="header-pos" d="M808 157 L285 369" marker-end="url(#pos-arrow)"/>
+        <rect class="callout" x="520" y="290" width="270" height="58" rx="9"/>
+        <text class="formula" x="655" y="313" text-anchor="middle" style="fill:var(--pos)">S6.headers_bc = [P6, P7, P8]</text>
+        <text class="micro" x="655" y="333" text-anchor="middle">deepest first; headers_bc[0] = P6</text>
 
         <path class="guide" d="M222 375 C175 385 175 430 222 440" marker-end="url(#muted-arrow)"/>
-        <text class="formula" x="77" y="401" style="fill:var(--candidate)">snapshot(S4)</text>
+        <text class="formula" x="77" y="401" style="fill:var(--candidate)">snapshot(S6)</text>
         <text class="small" x="77" y="420">= parent(P6) = P5</text>
 
         <path class="guide" d="M315 115 C380 155 380 270 315 310" marker-end="url(#muted-arrow)"/>
-        <text class="formula" x="390" y="205">prune_sigma(P10)</text>
-        <text class="small" x="390" y="224">= P7 when sigma = 3</text>
+        <text class="formula" x="380" y="150">prune_sigma(P10)</text>
+        <text class="small" x="380" y="169">= P7 when sigma = 3</text>
 
         <rect x="67" y="665" width="966" height="42" rx="10" fill="rgba(244,196,94,.08)" stroke="rgba(244,196,94,.55)"/>
         <text class="formula" x="550" y="691" text-anchor="middle" style="fill:var(--candidate)">candidate(P10) = lca(snapshot(LF(P10)), prune_sigma(P10)) = lca(P5, P7) = P5</text>
@@ -360,14 +367,16 @@
 
         <g transform="translate(560 100)"><circle class="pos-node" r="22"/><text class="node-text">S6</text></g>
         <g transform="translate(560 210)"><circle class="pos-node" r="18"/><text class="node-text">S5</text></g>
-        <g transform="translate(560 320)"><circle class="pos-node" r="22"/><text class="node-text">S4</text></g>
+        <g transform="translate(560 320)"><circle class="pos-node" r="18"/><text class="node-text">S4</text></g>
         <g transform="translate(560 430)"><circle class="pos-node" r="18"/><text class="node-text">S3</text></g>
         <g transform="translate(560 515)"><circle class="pos-node" r="18"/><text class="node-text">S2</text></g>
 
-        <path class="pointer-pow" d="M255 73 C345 50 445 62 537 94" marker-end="url(#pow-arrow-2)"/>
-        <text class="micro" x="397" y="61" text-anchor="middle">context_bft</text>
-        <path class="pointer-pos" d="M536 318 C440 294 350 293 250 295" marker-end="url(#pos-arrow-2)"/>
-        <text class="micro" x="395" y="284" text-anchor="middle">headers_bc = [P6, P7, P8]</text>
+        <path class="pointer-pow" d="M255 73 L537 94" marker-end="url(#pow-arrow-2)"/>
+        <text class="micro" x="397" y="74" text-anchor="middle">context_bft</text>
+        <path class="header-pos" d="M539 106 L250 186" marker-end="url(#pos-arrow-2)"/>
+        <path class="header-pos" d="M540 111 L251 239" marker-end="url(#pos-arrow-2)"/>
+        <path class="header-pos" d="M541 116 L250 292" marker-end="url(#pos-arrow-2)"/>
+        <text class="micro" x="418" y="226">headers_bc = [P6, P7, P8]</text>
 
         <rect class="callout" x="700" y="70" width="330" height="105" rx="12" style="stroke:var(--pow)"/>
         <text class="label" x="720" y="98" style="fill:var(--pow)">bc_best_tip = P10</text>
@@ -427,7 +436,7 @@
     <div class="scenarios">
       <article class="scenario">
         <h3>Before: fin advances</h3>
-        <p><code>bc_best_tip = P10</code> carries context S6, whose last final block S4 yields <code>candidate = P5</code>, so <code>fin</code> advances to P5.</p>
+        <p><code>bc_best_tip = P10</code> cites S6, whose snapshot P5 is <code>candidate</code>, so <code>fin</code> advances to P5.</p>
         <svg viewBox="0 0 510 650" role="img" aria-label="Before reorg, parallel PoW and PoS chains">
           <defs>
             <marker id="pow-before" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#58a6ff"/></marker>
@@ -451,14 +460,17 @@
 
           <g transform="translate(375 95)"><circle class="pos-node" r="20"/><text class="node-text">S6</text></g>
           <g transform="translate(375 205)"><circle class="pos-node" r="16"/><text class="node-text">S5</text></g>
-          <g transform="translate(375 315)"><circle class="pos-node" r="20"/><text class="node-text">S4</text></g>
+          <g transform="translate(375 315)"><circle class="pos-node" r="16"/><text class="node-text">S4</text></g>
           <g transform="translate(375 425)"><circle class="pos-node" r="16"/><text class="node-text">S3</text></g>
           <g transform="translate(375 535)"><circle class="pos-node" r="16"/><text class="node-text">S2</text></g>
 
-          <path class="pointer-pow" d="M168 67 C230 45 305 58 353 89" marker-end="url(#pow-before)"/>
-          <text class="micro" x="260" y="51" text-anchor="middle">context_bft</text>
-          <path class="pointer-pos" d="M353 312 C290 285 230 282 163 289" marker-end="url(#pos-before)"/>
-          <text class="micro" x="260" y="276" text-anchor="middle">headers_bc = [P6, P7, P8]</text>
+          <path class="pointer-pow" d="M168 67 L353 89" marker-end="url(#pow-before)"/>
+          <text class="micro" x="260" y="69" text-anchor="middle">context_bft</text>
+          <path class="header-pos" d="M357 103 L163 178" marker-end="url(#pos-before)"/>
+          <path class="header-pos" d="M358 108 L163 233" marker-end="url(#pos-before)"/>
+          <path class="header-pos" d="M359 113 L163 287" marker-end="url(#pos-before)"/>
+          <text class="micro" x="402" y="90">S6.headers_bc =</text>
+          <text class="micro" x="402" y="104">[P6, P7, P8]</text>
 
           <text class="label" x="25" y="338" style="fill:var(--candidate)">candidate</text>
           <text class="label" x="25" y="360" style="fill:var(--fin)">fin</text>
@@ -475,7 +487,6 @@
           <defs>
             <marker id="pow-after" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#58a6ff"/></marker>
             <marker id="pos-after" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#ff6b7d"/></marker>
-            <marker id="lf-after" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#ffb3bd"/></marker>
           </defs>
           <text class="label" x="155" y="28" text-anchor="middle" style="fill:var(--pow)">PoW</text>
           <text class="label" x="385" y="28" text-anchor="middle" style="fill:var(--pos)">PoS</text>
@@ -505,13 +516,14 @@
           <g transform="translate(385 425)"><circle class="pos-node" r="20"/><text class="node-text">S3</text></g>
           <g transform="translate(385 535)"><circle class="pos-node" r="16"/><text class="node-text">S2</text></g>
 
-          <path class="pointer-pow" d="M178 68 C255 58 320 118 368 198" marker-end="url(#pow-after)"/>
-          <text class="micro" x="282" y="102" text-anchor="middle">Q10.context_bft = S5</text>
-          <path d="M385 223 V401" fill="none" stroke="var(--lf)" stroke-width="4" marker-end="url(#lf-after)"/>
-          <text class="micro" x="436" y="312" text-anchor="middle" style="fill:var(--lf)">LF(Q10) = S3</text>
-          <path class="pointer-pos" d="M363 420 C300 398 235 372 176 350" marker-end="url(#pos-after)"/>
-          <text class="micro" x="300" y="382" text-anchor="middle">S3.headers_bc = [P5, P6, P7]</text>
-          <text class="micro" x="310" y="444" text-anchor="middle">snapshot(S3) = parent(P5) = P4</text>
+          <path class="pointer-pow" d="M178 68 L368 198" marker-end="url(#pow-after)"/>
+          <text class="micro" x="215" y="48">Q10.context_bft = S5</text>
+          <path class="header-pos" d="M369 207 L173 233" marker-end="url(#pos-after)"/>
+          <path class="header-pos" d="M369 211 L173 287" marker-end="url(#pos-after)"/>
+          <path class="header-pos" d="M370 216 L183 342" marker-end="url(#pos-after)"/>
+          <text class="micro" x="405" y="200">S5.headers_bc =</text>
+          <text class="micro" x="405" y="214">[P5, P6, P7]</text>
+          <text class="micro" x="192" y="425">snapshot(S5) = parent(P5) = P4</text>
 
           <text class="label" x="20" y="349" style="fill:var(--fin)">fin</text>
           <text class="label" x="15" y="404" style="fill:var(--candidate)">candidate</text>
@@ -523,7 +535,7 @@
     </div>
 
     <div class="protocol-note">
-      <p><strong>Why this is benign:</strong> S3 carries <code>[P5, P6, P7]</code>, so <code>snapshot(S3) = P4</code>. Its child S4 carries <code>[P6, P7, P8]</code>, so <code>snapshot(S4) = P5</code>. The snapshots are linear, and both the old P chain and new Q chain contain <code>fin = P5</code>. Only the derived candidate moved backward.</p>
+      <p><strong>Why this is benign:</strong> S5 carries <code>[P5, P6, P7]</code>, so <code>snapshot(S5) = P4</code>. Its child S6 carries <code>[P6, P7, P8]</code>, so <code>snapshot(S6) = P5</code>. The snapshots are linear, and both the old P chain and new Q chain contain <code>fin = P5</code>. Only the derived candidate moved backward.</p>
     </div>
 
     <div class="rules">
@@ -569,8 +581,8 @@
         <rect x="25" y="18" width="1050" height="45" rx="11" fill="rgba(255,85,79,.09)" stroke="rgba(255,85,79,.7)"/>
         <text class="label" x="550" y="46" text-anchor="middle" style="fill:var(--hazard)">PREFIX-CONSISTENCY FAILURE AT σ: fin = P5 conflicts with raw bc_best = C8</text>
 
-        <text class="title" x="190" y="92" text-anchor="middle" style="fill:var(--pow)">PoW / raw χ</text>
-        <text class="title" x="590" y="92" text-anchor="middle" style="fill:var(--pos)">PoS / BFT</text>
+        <text class="title" x="190" y="80" text-anchor="middle" style="fill:var(--pow)">PoW / raw χ</text>
+        <text class="title" x="590" y="80" text-anchor="middle" style="fill:var(--pos)">PoS / BFT</text>
         <path class="rail-pow" d="M190 125 V515" marker-end="url(#pow-failure)"/>
         <path class="rail-pos" d="M590 140 V515" marker-end="url(#pos-failure)"/>
 
@@ -583,11 +595,12 @@
         <g transform="translate(190 455)"><circle class="pow-node" r="16"/><text class="node-text">P2</text></g>
         <g transform="translate(190 510)"><circle class="pow-node" r="16"/><text class="node-text">P1</text></g>
 
-        <path class="old-branch" d="M210 390 C245 375 275 360 290 345 S305 310 310 290 S315 255 320 235 S325 200 330 180"/>
+        <path class="old-branch" d="M210 390 C245 375 275 360 290 345 S305 310 310 290 S315 255 320 235 S325 200 330 180 S337 145 340 125"/>
         <g transform="translate(290 345)"><circle r="15" fill="var(--old-node-bg)" stroke="var(--old)" stroke-width="2" stroke-dasharray="5 4"/><text class="node-text">P4</text></g>
         <g transform="translate(310 290)"><circle r="21" fill="var(--fin-node-bg)" stroke="var(--fin)" stroke-width="4"/><text class="node-text">P5</text></g>
         <g transform="translate(320 235)"><circle r="15" fill="var(--old-node-bg)" stroke="var(--old)" stroke-width="2" stroke-dasharray="5 4"/><text class="node-text">P6</text></g>
         <g transform="translate(330 180)"><circle r="15" fill="var(--old-node-bg)" stroke="var(--old)" stroke-width="2" stroke-dasharray="5 4"/><text class="node-text">P7</text></g>
+        <g transform="translate(340 125)"><circle r="15" fill="var(--old-node-bg)" stroke="var(--old)" stroke-width="2" stroke-dasharray="5 4"/><text class="node-text">P8</text></g>
         <text class="label" x="344" y="285" style="fill:var(--fin)">fin = P5</text>
         <text class="micro" x="344" y="303" style="fill:var(--fin)">finalized client view</text>
 
@@ -596,19 +609,21 @@
         <g transform="translate(590 360)"><circle class="pos-node" r="16"/><text class="node-text">S3</text></g>
         <g transform="translate(590 470)"><circle class="pos-node" r="16"/><text class="node-text">S2</text></g>
 
-        <path class="pointer-pos" d="M567 247 C490 220 410 220 338 234" marker-end="url(#pos-failure)"/>
-        <text class="micro" x="458" y="205" text-anchor="middle">S4.headers_bc starts at P6</text>
-        <text class="micro" x="458" y="222" text-anchor="middle">therefore snapshot(S4) = P5</text>
+        <path class="header-pos" d="M569 242 L357 129" marker-end="url(#pos-failure)"/>
+        <path class="header-pos" d="M568 246 L347 183" marker-end="url(#pos-failure)"/>
+        <path class="header-pos" d="M568 250 L337 236" marker-end="url(#pos-failure)"/>
+        <text class="micro" x="390" y="340">S4.headers_bc = [P6, P7, P8]</text>
+        <text class="micro" x="390" y="357">so snapshot(S4) = P5</text>
 
-        <path class="pointer-pow" d="M214 123 C335 100 470 225 570 350" marker-end="url(#pow-failure)"/>
-        <text class="micro" x="395" y="124" text-anchor="middle">older context: candidate(C8) = P3</text>
+        <path class="pointer-pow" d="M214 128 L570 350" marker-end="url(#pow-failure)"/>
+        <text class="micro" x="560" y="395" text-anchor="end">older context: candidate(C8) = P3</text>
 
         <g transform="translate(590 104)" opacity=".65"><circle r="18" fill="var(--pos-node-bg)" stroke="var(--hazard)" stroke-width="2" stroke-dasharray="5 4"/><text class="node-text">S6</text></g>
-        <path d="M570 102 C470 110 365 165 220 231" fill="none" stroke="var(--hazard)" stroke-width="3" stroke-dasharray="7 5"/>
-        <g transform="translate(425 142)">
+        <path d="M570 100 C470 66 300 56 208 222" fill="none" stroke="var(--hazard)" stroke-width="3" stroke-dasharray="7 5"/>
+        <g transform="translate(425 81)">
           <path d="M-10 -10 L10 10 M10 -10 L-10 10" stroke="var(--hazard)" stroke-width="5"/>
         </g>
-        <text class="micro" x="430" y="165" text-anchor="middle" style="fill:var(--hazard)">abstract CL2: rejected S6 proposal</text>
+        <text class="micro" x="470" y="112" text-anchor="middle" style="fill:var(--hazard)">abstract CL2: rejected S6 proposal</text>
 
         <rect class="callout" x="725" y="105" width="340" height="68" rx="11" style="stroke:var(--hazard)"/>
         <text class="label" x="745" y="132" style="fill:var(--hazard)">1. Prefix Consistency at σ failed</text>
@@ -641,8 +656,9 @@
       <p><strong>This is the abstract CL2 safety path, not a claim about current Zebra.</strong>
       With BFT Final Agreement and objective enforcement of Linearity and Tail Confirmation,
       the BFT snapshot history cannot cross to C, so the finalized client view remains P5 while
-      C is dominant. The current Zebra prototype does not implement those two validity rules
-      and cannot claim this outcome from its present validation code.</p>
+      C is dominant. Current Zebra enforces both rules in BFT validation, so this outcome rests
+      on BFT Final Agreement alone. It does not follow raw <code>bc_best</code> onto C, though; see
+      its response below.</p>
     </div>
 
     <div class="comparison">
@@ -651,8 +667,8 @@
         <p>Subject to the stated BFT assumptions, keep raw <code>bc_best = C8</code>; keep <code>fin = P5</code>; and prevent valid BFT snapshots from crossing forks. With Stalled Mode omitted, nothing restricts later C blocks: spends accumulate past <code>fin</code> for as long as C dominates, and would be rolled back if the best chain returns to P.</p>
       </article>
       <article>
-        <h3>Current Zebra prototype response</h3>
-        <p>Physical Crosslink finalization makes the committed branch canonical and makes the conflicting branch ineligible for activation. This locally enforces <code>canonical_finalized_tip ⪯ canonical_tip</code> — not the stronger property that a <code>sigma</code>-deep unfinalized prefix can never be displaced. That policy point and the successful database-commit boundary are not protocol <code>fin</code>; CL2 does not mandate this constraint, so adopting it is a Zebra decision that needs its own ZIP or ADR.</p>
+        <h3>Zebra Crosslink response</h3>
+        <p>Sticky fork choice (§6): the node commits up to <code>fin</code>, which discards every chain that does not contain it, and rejects blocks that fork below its finalized tip. C8 never becomes its best chain, whatever C's work; the node stays on P, reports the refused switch on stdout, and keeps <code>fin = P5</code>. This enforces <code>fin ⪯ bc_best</code>, not the stronger property that an unfinalized <code>sigma</code>-deep prefix can never be displaced. Raw CL2 does not impose this rule; it is a Zebra Crosslink decision.</p>
       </article>
     </div>
 
@@ -836,12 +852,13 @@
     </div>
 
     <div class="warning-note">
-      <p><strong>The last column is the one that applies to the current Zebra prototype</strong>, once it computes protocol <code>fin</code>. The other two columns assume BFT Final Agreement and enforcement of the Linearity rule, as the abstract outcome in §4 does. The prototype enforces neither Linearity nor Last Final Snapshot.</p>
+      <p><strong>The sticky column is the one that applies to Zebra Crosslink</strong>, which enforces Linearity and Last Final Snapshot. The first two columns assume BFT Final Agreement, as the abstract outcome in §4 does; the last column shows what changes if validation stops enforcing Linearity.</p>
     </div>
 
     <div class="protocol-note">
       <p><strong>What the Book says about changes of this kind:</strong> its honest-production instruction excludes BFT-derived information when choosing among bc-valid chains (§5). Its <a href="https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/security-analysis.md#L15-L23">liveness analysis</a> attributes its tractability to leaving fork choice unmodified, in contrast with Casper FFG, whose fork choice follows the justified checkpoint. Under sticky fork choice a node never switches to a lighter chain and never switches because <code>fin</code> advanced, but it can refuse a switch; the Book has no liveness argument for that. The Book declines its own change because nothing useful can be said about <code>snapshot(B)</code> once BFT may be subverted. A subverted BFT still cannot place <code>fin</code> off the node's best chain or above <code>prune_sigma(bc_best)</code>, but by finalizing a <code>sigma</code>-confirmed prefix before a Prefix Consistency failure would displace it, it decides which branch the node keeps; the Book has no safety argument for that either.</p>
-      <p><strong>Current Zebra:</strong> the rule needs protocol <code>fin</code>, which Zebra does not yet compute; the prototype's current finalized-branch collapse uses the BFT-decided marker as its floor instead. Zebra also commits the root of any best chain longer than <code>MAX_BLOCK_REORG_HEIGHT</code> (99), so on a Zebra node the effective floor is the higher of <code>fin</code> and that depth-committed block.</p>
+      <p><strong>In Zebra:</strong> on each <code>bc_best</code> change the node computes <code>candidate(bc_best)</code>, finalizes up to it when it is ahead of <code>fin</code>, and stores <code>fin</code> in the finalized database so the floor survives a restart. A BFT decision advances only <code>bft_final_snapshot</code>; <code>fin</code> moves at the next best-chain change. A refused switch is reported on stdout; a persisted hazard record is still to do.</p>
+      <p>Zebra also commits the root of any best chain longer than <code>MAX_BLOCK_REORG_HEIGHT</code> (99 in the tree; 999 is intended), so the effective floor is the higher of <code>fin</code> and that depth-committed block. While the chain to <code>bft_final_snapshot</code> forks from <code>bc_best</code>, the node holds that commit at the fork point for up to <code>CONFLICT_HOLD_DEPTH</code> blocks, then commits and reports that it can no longer follow <code>bft_final_snapshot</code>. The planned replacement is a second finalized state that follows the BFT branch.</p>
     </div>
   </section>
 
