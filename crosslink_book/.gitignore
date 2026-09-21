@@ -1,0 +1,10 @@
+# mdbook build output
+/book/
+
+# nix build result
+/result
+
+# mermaid generated files
+/mermaid.min.js
+/mermaid-init.js
+.claude
