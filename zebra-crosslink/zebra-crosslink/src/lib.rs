@@ -282,14 +282,6 @@ async fn _block_prev_hash_from_hash(call: &TFLServiceCalls, hash: ZebBlockHash) 
     }
 }
 
-/// Only Crosslink's own marker. A reorg-depth location is a different quantity and reporting
-/// one here would present a probabilistic guess as Crosslink finality; see FINALITY.md.
-async fn tfl_final_block_height_hash(
-    internal_handle: &TFLServiceHandle,
-) -> Option<(ZebBlockHeight, ZebBlockHash)> {
-    zebra_state::new_network::fin::fin()
-}
-
 // NAME: rng_sk_pk_from_addr
 // The derivation itself is shared with the wallet (see `bft::finalizer_key_from_seed`),
 // which needs the same key to authorize finalizer reward conversions.
@@ -410,53 +402,6 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle) -> Result<(), 
     // keeps the service task alive, since zebrad treats its exit as a shutdown.
     loop {
         tokio::time::sleep(MAIN_LOOP_SLEEP_INTERVAL).await;
-    }
-}
-
-async fn tfl_block_finality_from_height_hash(
-    internal_handle: TFLServiceHandle,
-    height: ZebBlockHeight,
-    hash: ZebBlockHash,
-) -> Result<Option<TFLBlockFinality>, TFLServiceError> {
-    // TODO: None is no longer ever returned
-    let call = internal_handle.call.clone();
-    let block_hdr = (call.state)(StateRequest::BlockHeader(hash.into()));
-    let (final_height, final_hash) = match tfl_final_block_height_hash(&internal_handle).await {
-        Some(v) => v,
-        // Before the first Crosslink decision nothing is final, so neither is this block. This is
-        // an answer, not an error: reporting no final block is left to FinalBlockHeightHash.
-        None => return Ok(Some(TFLBlockFinality::NotYetFinalized)),
-    };
-
-    if height > final_height {
-        // N.B. this may be invalidated by the time it is received
-        Ok(Some(TFLBlockFinality::NotYetFinalized))
-    } else {
-        let cmp_hash = if height == final_height {
-            final_hash // we already have the hash at the final height, no point in re-getting it
-        } else {
-            match (call.state)(StateRequest::BlockHeader(height.into())).await {
-                Ok(StateResponse::BlockHeader { hash, .. }) => hash,
-
-                Err(err) => return Err(TFLServiceError::Misc(err.to_string())),
-
-                _ => {
-                    return Err(TFLServiceError::Misc(
-                        "Invalid BlockHeader response type".to_string(),
-                    ))
-                }
-            }
-        };
-
-        // We have the hash of the block at the given height from the best chain.
-        // If it matches the queried hash then our block is on the best chain under the finalization
-        // height & is thus finalized.
-        // Otherwise it can't be finalized.
-        Ok(Some(if hash == cmp_hash {
-            TFLBlockFinality::Finalized
-        } else {
-            TFLBlockFinality::CantBeFinalized
-        }))
     }
 }
 
@@ -662,52 +607,6 @@ async fn tfl_service_incoming_request(
 
     #[allow(unreachable_patterns)]
     match request {
-        TFLServiceRequest::IsTFLActivated => Ok(TFLServiceResponse::IsTFLActivated(
-            zebra_state::new_network::bft::bft_chain().read().unwrap().is_activated,
-        )),
-
-        TFLServiceRequest::FinalBlockHeightHash => Ok(TFLServiceResponse::FinalBlockHeightHash(
-            tfl_final_block_height_hash(&internal_handle).await,
-        )),
-
-        TFLServiceRequest::FinalBlockRx => Ok(TFLServiceResponse::FinalBlockRx(
-            zebra_state::new_network::fin::fin_change_rx(),
-        )),
-
-        TFLServiceRequest::BlockFinalityStatus(height, hash) => {
-            match tfl_block_finality_from_height_hash(internal_handle.clone(), height, hash).await {
-                Ok(val) => Ok(TFLServiceResponse::BlockFinalityStatus({ val })), // N.B. may still be None
-                Err(err) => Err(err),
-            }
-        }
-
-        TFLServiceRequest::TxFinalityStatus(hash) => Ok(TFLServiceResponse::TxFinalityStatus({
-            if let Ok(StateResponse::Transaction(Some(tx))) =
-                (call.state)(StateRequest::Transaction(hash)).await
-            {
-                let (final_height, _final_hash) =
-                    match tfl_final_block_height_hash(&internal_handle).await {
-                        Some(v) => v,
-                        // Nothing is final yet, so neither is this transaction; see
-                        // tfl_block_finality_from_height_hash.
-                        None => {
-                            return Ok(TFLServiceResponse::TxFinalityStatus(Some(
-                                TFLBlockFinality::NotYetFinalized,
-                            )));
-                        }
-                    };
-
-                if tx.height <= final_height {
-                    // TODO: CantBeFinalized
-                    Some(TFLBlockFinality::Finalized)
-                } else {
-                    Some(TFLBlockFinality::NotYetFinalized)
-                }
-            } else {
-                None
-            }
-        })),
-
         // wallet
         TFLServiceRequest::Faucet(request) => {
             Ok(TFLServiceResponse::Faucet({

@@ -665,12 +665,16 @@ pub(crate) async fn handle_instr(
         TestInstr::ExpectPoWBlockFinality(hash, f) => {
             let expect = f;
             let height = block_height_from_hash(&internal_handle.call.clone(), hash).await;
-            let actual = if let Some(height) = height {
-                tfl_block_finality_from_height_hash(internal_handle.clone(), height, hash).await
-            } else {
-                Ok(None)
-            }
-            .expect("valid response, even if None");
+            // The state service answers `fin` and the best chain in one read (FINALITY.md
+            // §7.2), so the harness asks it exactly as the RPC does.
+            let actual = match (internal_handle.call.read_state)(
+                zebra_state::ReadRequest::CrosslinkBlockFinality(hash),
+            )
+            .await
+            {
+                Ok(zebra_state::ReadResponse::CrosslinkBlockFinality(finality)) => Some(finality),
+                _ => None,
+            };
             test_check(
                 flags,
                 expect == actual,

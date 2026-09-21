@@ -5,10 +5,9 @@ code to it. Each stage names the FINALITY.md sections it implements, the code it
 the condition under which it is done. Where this file and FINALITY.md disagree, FINALITY.md is
 right and this file is corrected.
 
-Stages 1 to 7 are done. Stage 8 moves the rest of the finality state out of
-`zebra-crosslink/zebra-crosslink` into `zebra-state` (FINALITY.md §7.1), each of them for a race
-or a coupling that the crate boundary creates; they leave the crate holding no finality state.
-Stage 9 then gives the node the second chain state that FINALITY.md §4.3 requires, so that a BFT
+Stages 1 to 8 are done, so `zebra-crosslink/zebra-crosslink` holds no finality state and
+answers no finality question.
+Stage 9 gives the node the second chain state that FINALITY.md §4.3 requires, so that a BFT
 branch conflicting with the depth commit is recorded rather than abandoned.
 Removing what is left of the crate afterwards is separate work, in
 [`CRATE_REMOVAL.md`](./CRATE_REMOVAL.md); it depends on these stages, nothing depends on it, and

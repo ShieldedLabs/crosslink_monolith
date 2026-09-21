@@ -481,6 +481,80 @@ fn crosslink_reject_pos_with_signature_on_different_data() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// The finality read path, before and after the first decision (FINALITY.md §7.2).
+///
+/// Every case of the block-status row is asserted against a populated state through the same
+/// [`ReadRequest::CrosslinkBlockFinality`] the RPC issues: a block this node does not hold, a
+/// block on the best chain while `fin` is unset, and the same block once `fin` has reached it.
+///
+/// @Todo: the two finalized-tip RPCs return `fin` itself, which this reads only through the
+/// block status above it. Asserting on that request directly needs a test-format instruction
+/// stage 3 did not define; a JSON-RPC level test needs a harness that does not exist.
+#[test]
+fn crosslink_finality_reads_before_and_after_the_first_decision() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+
+    // A hash no block has: the absent case of the block-status row.
+    let unknown = zebra_chain::block::Hash([0x11u8; 32]);
+    tf.push_instr_expect_pow_block_finality(
+        &unknown,
+        Some(TFLBlockFinality::CantBeFinalized),
+        0,
+    );
+
+    let mut pow = vec![gen.tip.clone()];
+    for _ in 2..=8 {
+        pow.push(gen.next_block(&miner_addr));
+    }
+    for block in &pow {
+        tf.push_instr_load_pow(block, 0);
+    }
+
+    // Nothing has decided, so `fin` is unset and every block this node holds is above it.
+    for block in &pow {
+        tf.push_instr_expect_pow_block_finality(
+            &block.hash(),
+            Some(TFLBlockFinality::NotYetFinalized),
+            0,
+        );
+    }
+    tf.push_instr_expect_pow_block_finality(
+        &unknown,
+        Some(TFLBlockFinality::CantBeFinalized),
+        0,
+    );
+
+    // Decide over pow[4..7], whose snapshot is pow[3], and cite it: `fin` reaches pow[3].
+    let bft = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
+    tf.push_instr_load_pos(&bft, 0);
+    gen.next_block(&miner_addr);
+    pow.push(point_tip_at_bft(&mut gen, &bft.0.fat_ptr));
+    tf.push_instr_load_pow(pow.last().unwrap(), 0);
+
+    for (i, block) in pow.iter().enumerate() {
+        let finality = if i <= 3 {
+            TFLBlockFinality::Finalized
+        } else {
+            TFLBlockFinality::NotYetFinalized
+        };
+        tf.push_instr_expect_pow_block_finality(&block.hash(), Some(finality), 0);
+    }
+    tf.push_instr_expect_pow_block_finality(
+        &unknown,
+        Some(TFLBlockFinality::CantBeFinalized),
+        0,
+    );
+
+    test_bytes(tf.write_to_bytes());
+}
+
 #[test]
 fn crosslink_test_basic_finality() {
     set_test_name(function_name!());
@@ -511,20 +585,24 @@ fn crosslink_test_basic_finality() {
         genb = gen.clone()
     }
 
+    // Nothing is loaded yet, so every one of these is a block this node does not hold, which
+    // the FINALITY.md §7.2 table answers the same way as a block off the best chain.
     for i2 in 0..n {
-        tf.push_instr_expect_pow_block_finality(&pow[i2].hash(), None, 0);
+        tf.push_instr_expect_pow_block_finality(
+            &pow[i2].hash(),
+            Some(TFLBlockFinality::CantBeFinalized),
+            0,
+        );
     }
 
     for i in 0..n {
         tf.push_instr_load_pow(&pow[i], 0);
 
         for i2 in 0..n {
-            let finality = if i2 > i {
-                None
-            } else if i2 == 3 && i == 3 {
-                Some(TFLBlockFinality::NotYetFinalized)
-            } else if i2 == 2 && i > 3 {
-                Some(TFLBlockFinality::NotYetFinalized)
+            // `pow[2]` and `pow[3]` are the two children of `pow[1]`, and the fork choice takes
+            // `pow[3]`, so `pow[2]` is off the best chain from the moment its sibling arrives.
+            let finality = if i2 > i || (i2 == 2 && i >= 3) {
+                Some(TFLBlockFinality::CantBeFinalized)
             } else {
                 Some(TFLBlockFinality::NotYetFinalized)
             };
@@ -561,13 +639,8 @@ fn crosslink_test_basic_finality() {
 
         for i2 in 0..n {
             let finality = if i2 == 2 {
-                // unpicked sidechain
-                if i < 1 {
-                    Some(TFLBlockFinality::NotYetFinalized)
-                } else {
-                    // Some(TFLBlockFinality::CantBeFinalized)
-                    None
-                }
+                // The branch the fork choice did not take.
+                Some(TFLBlockFinality::CantBeFinalized)
             } else if i2 < LINKS[i] {
                 // A BFT block over `pow[k..k+3]` finalizes the PARENT of its deepest header --
                 // the carried headers are the sigma confirmations above the snapshot -- so the
@@ -926,7 +999,7 @@ fn crosslink_pow_follows_the_heaviest_chain_until_fin_moves_to_the_decided_branc
     tf.push_instr_expect_pow_chain_length(19, 0);
     tf.push_instr_expect_pow_block_finality(
         &pow[9].hash(),
-        Some(TFLBlockFinality::NotYetFinalized),
+        Some(TFLBlockFinality::CantBeFinalized),
         0,
     );
 

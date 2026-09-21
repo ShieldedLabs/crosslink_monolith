@@ -1090,6 +1090,44 @@ impl Service<ReadRequest> for ReadStateService {
                 crate::new_network::bft::bft_recency_status(),
             )),
 
+            ReadRequest::CrosslinkFinalizedTip => Ok(ReadResponse::CrosslinkFinalizedTip(
+                crate::new_network::fin::fin(),
+            )),
+
+            ReadRequest::CrosslinkFinalizedTipChange => {
+                Ok(ReadResponse::CrosslinkFinalizedTipChange(
+                    crate::response::CrosslinkFinListener(crate::new_network::fin::fin_change_rx()),
+                ))
+            }
+
+            ReadRequest::CrosslinkBlockFinality(hash) => {
+                Ok(ReadResponse::CrosslinkBlockFinality(
+                    crate::new_network::fin::block_finality(
+                        &state.latest_non_finalized_state(),
+                        &state.db,
+                        hash,
+                    ),
+                ))
+            }
+
+            ReadRequest::CrosslinkTxFinality(hash) => {
+                // One read of the best chain answers both halves: which block mined the
+                // transaction, and where that block sits relative to `fin`.
+                let non_finalized_state = state.latest_non_finalized_state();
+                let mined = read::mined_transaction(
+                    non_finalized_state.best_chain().cloned(),
+                    &state.db,
+                    hash,
+                );
+                Ok(ReadResponse::CrosslinkTxFinality(
+                    mined.map(|tx| crate::new_network::fin::finality_at_height(tx.height)),
+                ))
+            }
+
+            ReadRequest::CrosslinkIsActivated => Ok(ReadResponse::CrosslinkIsActivated(
+                crate::new_network::bft::bft_chain().read().unwrap().is_activated,
+            )),
+
             // Used by the StateService.
             ReadRequest::Depth(hash) => Ok(ReadResponse::Depth(read::depth(
                 state.latest_best_chain(),

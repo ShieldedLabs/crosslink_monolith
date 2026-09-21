@@ -18,8 +18,11 @@ use crate::service::non_finalized_state::NonFinalizedState;
 
 static FIN: RwLock<Option<(Height, Hash)>> = RwLock::new(None);
 
-static FIN_CHANGE: std::sync::LazyLock<tokio::sync::broadcast::Sender<(Height, Hash)>> =
-    std::sync::LazyLock::new(|| tokio::sync::broadcast::channel(16).0);
+/// Published beside the chain-tip channels, and read through the state service rather than
+/// imported (FINALITY.md §7.2). A watch rather than a broadcast: `fin` is monotone, so a
+/// subscriber that fell behind wants the latest value and nothing else.
+static FIN_CHANGE: std::sync::LazyLock<tokio::sync::watch::Sender<Option<(Height, Hash)>>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(None).0);
 
 /// The block this node has finalized, or `None` before it has finalized any.
 pub fn fin() -> Option<(Height, Hash)> {
@@ -27,7 +30,7 @@ pub fn fin() -> Option<(Height, Hash)> {
 }
 
 /// A subscription to every advance of `fin`.
-pub fn fin_change_rx() -> tokio::sync::broadcast::Receiver<(Height, Hash)> {
+pub fn fin_change_rx() -> tokio::sync::watch::Receiver<Option<(Height, Hash)>> {
     FIN_CHANGE.subscribe()
 }
 
@@ -35,6 +38,7 @@ pub fn fin_change_rx() -> tokio::sync::broadcast::Receiver<(Height, Hash)> {
 pub(crate) fn load(db: &ZebraDb) {
     if let Some((height, hash)) = db.crosslink_fin() {
         *FIN.write().unwrap() = Some((height, hash));
+        FIN_CHANGE.send_replace(Some((height, hash)));
         tracing::info!("crosslink fin: restored at height {} ({})", height.0, hash);
     }
 }
@@ -62,7 +66,47 @@ pub(crate) fn advance(db: &ZebraDb, height: Height, hash: Hash) {
     }
 
     *FIN.write().unwrap() = Some((height, hash));
-    let _ = FIN_CHANGE.send((height, hash));
+    FIN_CHANGE.send_replace(Some((height, hash)));
+}
+
+/// The finality status of the bc-block `hash` (FINALITY.md §7.2).
+///
+/// `fin` and the best chain are read together here, so the answer cannot mix two moments. The
+/// three states are the table's: at or below `fin` on the best chain, on the best chain above
+/// it, or not on the best chain at all -- which is also the answer for a block this node has
+/// never seen.
+///
+/// @Todo: §7.2 carries a confirmation count with the middle state. The count is not carried
+/// here because it would change `TFLBlockFinality`, and with it the test format stage 3 set.
+pub fn block_finality(
+    non_finalized_state: &NonFinalizedState,
+    db: &ZebraDb,
+    hash: Hash,
+) -> crate::crosslink::TFLBlockFinality {
+    use crate::crosslink::TFLBlockFinality::*;
+
+    let height = non_finalized_state
+        .best_chain()
+        .and_then(|chain| chain.height_by_hash(hash))
+        .or_else(|| db.height(hash));
+
+    let Some(height) = height else {
+        return CantBeFinalized;
+    };
+
+    finality_at_height(height)
+}
+
+/// The finality status of a block on the best chain at `height`.
+///
+/// `fin` lies on the best chain and so does the block, so the height decides ancestry.
+pub fn finality_at_height(height: Height) -> crate::crosslink::TFLBlockFinality {
+    use crate::crosslink::TFLBlockFinality::*;
+
+    match fin() {
+        Some((fin_height, _)) if height <= fin_height => Finalized,
+        _ => NotYetFinalized,
+    }
 }
 
 /// `candidate(H) = lca(snapshot(LF(H)), prune_σ(H))` for the best chain `H` (FINALITY.md §3.1).

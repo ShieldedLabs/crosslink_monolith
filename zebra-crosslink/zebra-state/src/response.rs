@@ -387,6 +387,24 @@ impl PartialEq for NonFinalizedBlocksListener {
 
 impl Eq for NonFinalizedBlocksListener {}
 
+/// A subscription to every change of the block this node has finalized (FINALITY.md §7.2).
+///
+/// A newtype because [`ReadResponse`] compares its variants and a watch receiver does not: two
+/// subscriptions to the same channel are the same value, which is what that comparison means
+/// here. The same shape as [`NonFinalizedBlocksListener`], for the same reason.
+#[derive(Clone, Debug)]
+pub struct CrosslinkFinListener(
+    pub tokio::sync::watch::Receiver<Option<(block::Height, block::Hash)>>,
+);
+
+impl PartialEq for CrosslinkFinListener {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.same_channel(&other.0)
+    }
+}
+
+impl Eq for CrosslinkFinListener {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a read-only
 /// [`ReadStateService`](crate::service::ReadStateService)'s [`ReadRequest`].
@@ -428,6 +446,22 @@ pub enum ReadResponse {
 
     /// Response to [`ReadRequest::CrosslinkRecencyStatus`].
     CrosslinkRecencyStatus(zcash_primitives::bft::TFLRecencyStatus),
+
+    /// Response to [`ReadRequest::CrosslinkFinalizedTip`]. `None` before the first `fin`.
+    CrosslinkFinalizedTip(Option<(block::Height, block::Hash)>),
+
+    /// Response to [`ReadRequest::CrosslinkFinalizedTipChange`].
+    CrosslinkFinalizedTipChange(CrosslinkFinListener),
+
+    /// Response to [`ReadRequest::CrosslinkBlockFinality`].
+    CrosslinkBlockFinality(crate::crosslink::TFLBlockFinality),
+
+    /// Response to [`ReadRequest::CrosslinkTxFinality`]. `None` when no block this node holds
+    /// mined the transaction.
+    CrosslinkTxFinality(Option<crate::crosslink::TFLBlockFinality>),
+
+    /// Response to [`ReadRequest::CrosslinkIsActivated`].
+    CrosslinkIsActivated(bool),
 
     /// Response to [`ReadRequest::Depth`] with the depth of the specified block.
     Depth(Option<u32>),
@@ -722,6 +756,11 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::CrosslinkFatPointerToBftChainTip(_)
             | ReadResponse::CrosslinkRoster(_)
             | ReadResponse::CrosslinkRecencyStatus(_)
+            | ReadResponse::CrosslinkFinalizedTip(_)
+            | ReadResponse::CrosslinkFinalizedTipChange(_)
+            | ReadResponse::CrosslinkBlockFinality(_)
+            | ReadResponse::CrosslinkTxFinality(_)
+            | ReadResponse::CrosslinkIsActivated(_)
             | ReadResponse::ForkPoint(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }

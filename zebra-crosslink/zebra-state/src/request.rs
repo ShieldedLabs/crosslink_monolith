@@ -1528,6 +1528,25 @@ pub enum ReadRequest {
     /// at its current height.
     CrosslinkRecencyStatus,
 
+    /// The block this node has finalized (FINALITY.md §7.2), or `None` before the first one.
+    CrosslinkFinalizedTip,
+
+    /// A subscription to every change of the block this node has finalized.
+    CrosslinkFinalizedTipChange,
+
+    /// The finality status of a bc-block, read against `fin` and the best chain together so the
+    /// answer cannot mix two moments (FINALITY.md §§5.5, 7.2).
+    CrosslinkBlockFinality(block::Hash),
+
+    /// The finality status of the block a transaction was mined in.
+    ///
+    /// Returns [`ReadResponse::CrosslinkTxFinality(None)`](ReadResponse::CrosslinkTxFinality)
+    /// when no block this node holds mined it, which is the mempool case of the same table row.
+    CrosslinkTxFinality(transaction::Hash),
+
+    /// Whether the Crosslink BFT chain has bootstrapped.
+    CrosslinkIsActivated,
+
     /// Performs contextual validation of the given block, but does not commit it to the state.
     ///
     /// It is the caller's responsibility to perform semantic validation.
@@ -1623,6 +1642,11 @@ impl ReadRequest {
             ReadRequest::CrosslinkFatPointerToBftChainTip(_) => "crosslink_fat_pointer_to_bft_chain_tip",
             ReadRequest::CrosslinkRoster => "crosslink_roster",
             ReadRequest::CrosslinkRecencyStatus => "crosslink_recency_status",
+            ReadRequest::CrosslinkFinalizedTip => "crosslink_finalized_tip",
+            ReadRequest::CrosslinkFinalizedTipChange => "crosslink_finalized_tip_change",
+            ReadRequest::CrosslinkBlockFinality(_) => "crosslink_block_finality",
+            ReadRequest::CrosslinkTxFinality(_) => "crosslink_tx_finality",
+            ReadRequest::CrosslinkIsActivated => "crosslink_is_activated",
             ReadRequest::Depth(_) => "depth",
             ReadRequest::Block(_) => "block",
             ReadRequest::AnyChainBlock(_) => "any_chain_block",

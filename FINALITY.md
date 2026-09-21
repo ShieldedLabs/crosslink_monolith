@@ -769,13 +769,12 @@ Both markers take `snapshot(new_block) = parent(new_block.headers[0])` from
 `BftBlock::snapshot_block_hash`, the one accessor through which every reader derives the
 finalized block (§8.1).
 
-When `fin` is absent, `tfl_final_block_height_hash` returns `None`. It previously
-substituted a Zebra reorg-depth location derived from the state block locator, so that the API
-changed semantics depending on whether Crosslink had produced a value; that substitution and
-its helper have been removed. Removing it was safe because the substitution reached only three
-readers, all RPC-facing: `tfl_block_finality_from_height_hash`, the `FinalBlockHeightHash`
-service request, and the `TxFinalityStatus` service request. Every consensus-, state-, and
-GUI-side reader takes `fin` directly and never saw the substituted value.
+When `fin` is absent, the finality RPCs return `None`. They previously substituted a Zebra
+reorg-depth location derived from the state block locator, so that the API changed semantics
+depending on whether Crosslink had produced a value; that substitution and its helper have been
+removed. Removing it was safe because the substitution reached only the RPC-facing readers of
+the marker: the finalized-tip, block-status and transaction-status answers. Every consensus-,
+state-, and GUI-side reader takes `fin` directly and never saw the substituted value.
 
 The Crosslink service no longer carries a second copy of the marker: `current_bc_final`, which
 was written during startup restore and read nowhere, has been deleted.
@@ -811,10 +810,11 @@ at or below that tip and never naming a block the database lacks.
 
 `fin` reaches:
 
-- the `get_tfl_final_block_*`, block-finality and transaction-finality RPC methods, through
-  `tfl_final_block_height_hash`;
+- the `get_tfl_final_block_*`, block-finality and transaction-finality RPC methods, through the
+  `CrosslinkFinalizedTip`, `CrosslinkBlockFinality` and `CrosslinkTxFinality` read requests;
 - the GUI's finalized row and its visualization paging lower bound; and
-- the notification subscribers of `fin::fin_change_rx`.
+- the notification subscribers of `fin::fin_change_rx`, reached through
+  `CrosslinkFinalizedTipChange`.
 
 `bft_final_snapshot` reaches irreversible state commitment only indirectly, through the conflict
 hold that delays it (§4.3). Its other readers are the BFT proposal path's `+40` clamp, the
@@ -826,10 +826,12 @@ roster share one derivation.
 snapshot: the chain holding that block answers if it is still non-finalized, and the finalized
 database answers otherwise (§8.1). That read is the node's own and is separate from any commit.
 
-`TFLServiceRequest::FinalBlockRx` returns subscribers to `fin::fin_change_rx`, and the RPC
-notification methods in `zebra-crosslink/zebra-rpc/src/methods.rs` wait on them. Every
-`fin::advance` publishes on that channel, so a notification names a block this node has already
-committed.
+`fin::fin_change_rx` is a `tokio::sync::watch`, published beside the chain-tip channels and
+handed out by the `CrosslinkFinalizedTipChange` read request; the RPC notification methods in
+`zebra-crosslink/zebra-rpc/src/methods.rs` wait on it. Every `fin::advance` publishes on that
+channel after the database row is written, so a notification names a block this node has already
+committed. A watch rather than a broadcast: `fin` is monotone, so a subscriber that fell behind
+wants the latest value and nothing else.
 
 ### 5.4 Current staking rewards
 
@@ -913,11 +915,13 @@ holds only the BFT message and error counters and the two BFT connection strings
 `zebrad` treats the service task's exit as a node shutdown.
 
 Nothing on a consensus path calls that service, and nothing calls into it from `zebra-state`.
-Its callers outside the crate are `zebra-crosslink/zebra-rpc/src/methods.rs` — the finality
-methods and the staking, wallet and faucet commands — and one site in
-`zebra-crosslink/zebrad/src/lightwalletd.rs`, which asks for `Faucet`. The roster, the block
-template's fat pointer and the recency status are `ReadStateService` requests
-(`CrosslinkRoster`, `CrosslinkFatPointerToBftChainTip`, `CrosslinkRecencyStatus`).
+Its callers outside the crate are `zebra-crosslink/zebra-rpc/src/methods.rs` — the staking,
+wallet and faucet commands — and one site in `zebra-crosslink/zebrad/src/lightwalletd.rs`, which
+asks for `Faucet`. No finality answer reaches it. The roster, the block template's fat pointer,
+the recency status, activation, and every finality answer are `ReadStateService` requests
+(`CrosslinkRoster`, `CrosslinkFatPointerToBftChainTip`, `CrosslinkRecencyStatus`,
+`CrosslinkIsActivated`, `CrosslinkFinalizedTip`, `CrosslinkFinalizedTipChange`,
+`CrosslinkBlockFinality`, `CrosslinkTxFinality`).
 
 `BftChain` in `new_network::bft` is the decided bft-chain: `blocks` and `hash_to_height`,
 `fat_pointer_to_tip`, `roster` — the validator set read at the snapshot of the previous decided
@@ -949,9 +953,9 @@ not hold, ends the process with a message rather than being migrated or re-boots
 `force_feed_bft_block` injects a decided bft-block without `Π_bft`, as a message to the `sync`
 thread. Its only caller is `test_format.rs`, through `TFLServiceCalls::force_feed_pos`.
 
-`tfl_block_finality_from_height_hash` answers block status with two state requests and the final
-marker between them, so its reads can straddle a reorganization. It also builds a `BlockHeader`
-request that it never awaits.
+`fin::block_finality` answers block status inside one read request, against `fin` and the best
+chain taken from the same state snapshot, so the answer cannot straddle a reorganization. A
+block the node does not hold is not in its best chain, which is the answer it gives for one.
 
 ## 6. Current tree: divergences from Zebra Crosslink
 
@@ -1081,8 +1085,8 @@ itself.
 
 ### 6.6 Ordering and notification
 
-- The visible marker advances, and `FinalBlockRx` subscribers are notified, only after the
-  commit it names has succeeded (§5.2).
+- The visible marker advances, and the `fin` watch channel's subscribers are notified, only
+  after the commit it names has succeeded (§5.2).
 - `bft_final_snapshot` advances without any commit, and nothing outside `zebra-state` reads it,
   so a decision is not visible as finality until `fin` reaches it (§5.1).
 
@@ -1210,9 +1214,10 @@ non-finalized state, or a watch channel published beside the existing chain-tip 
 is served by a component that keeps its own copy of the value (§7.1). Block and transaction
 status read `fin` and the best chain together, so they cannot report two different moments.
 
-**Current tree.** Every row keyed on `local_finalized_tip` reads `fin`, but reaches it as a
-crate-level import rather than through the state service (§5.3, §5.5). The finality RPCs return
-no value while `fin` is unset.
+**Current tree.** Every row keyed on `local_finalized_tip` is served by a `ReadStateService`
+request, except the GUI's, which still reaches `fin` as a crate-level import (§6.7). The
+finality RPCs return no value while `fin` is unset. `TFLBlockFinality` carries no confirmation
+count with its middle state, because the count would change the test format.
 
 ### 7.3 Consensus-sensitive roster and hardfork inputs
 
@@ -1254,15 +1259,17 @@ records the current-tree facts that work starts from.
 **Current tree.** The final-block accessor returns only the stored Crosslink value and never
 substitutes the legacy reorg-depth marker; `tfl_reorg_final_block_height_hash` and
 `tfl_final_block_height_hash_pre_locked` no longer exist. Before Crosslink produces a value,
-finality queries return `None`. No regression test covers the absent and present cases, and
-there is no test harness for these RPC methods; the cases are covered at the `ReadStateService`
-request level instead, and a JSON-RPC harness remains separate work. `fin::advance` publishes
-every marker write on `FinalBlockRx`, after state commitment.
+finality queries return `None`. There is no test harness for these RPC methods, so the absent
+and present cases are covered at the `ReadStateService` request level, by
+`crosslink_finality_reads_before_and_after_the_first_decision`; a JSON-RPC harness remains
+separate work. `fin::advance` publishes every marker write on the `fin` watch channel, after
+state commitment.
 
 **Current tree.** `fin` is computed by `candidate(bc_best)`, moved only where the best chain
 changes, held where the candidate regresses, and persisted, so it is the CL2 quantity and
-`local_finalized_tip` is an accurate name for it. What is left is where its readers reach it
-from (§7.2) and the hazard record a refused switch should leave (§6.1).
+`local_finalized_tip` is an accurate name for it. Its readers reach it through the state service
+(§7.2), except the GUI's (§6.7). What is left is the hazard record a refused switch should leave
+(§6.1).
 
 ### 8.1 Implementation pitfalls
 

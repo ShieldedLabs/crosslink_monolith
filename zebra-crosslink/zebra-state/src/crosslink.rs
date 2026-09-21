@@ -33,16 +33,6 @@ pub enum TFLBlockFinality {
 /// These map one to one to the variants of the same name in [`TFLServiceResponse`].
 #[derive(Clone, Debug)]
 pub enum TFLServiceRequest {
-    /// Is the TFL service activated yet?
-    IsTFLActivated,
-    /// Get the final block hash
-    FinalBlockHeightHash,
-    /// Get a receiver for the final block hash
-    FinalBlockRx,
-    /// Get the finality status of a block
-    BlockFinalityStatus(BlockHeight, BlockHash),
-    /// Get the finality status of a transaction
-    TxFinalityStatus(zebra_chain::transaction::Hash),
     /// Send a staking command transaction
     StakingCmd(String),
     /// faucet
@@ -66,16 +56,6 @@ pub enum TFLServiceRequest {
 /// These map one to one to the variants of the same name in [`TFLServiceRequest`].
 #[derive(Debug)]
 pub enum TFLServiceResponse {
-    /// Is the TFL service activated yet?
-    IsTFLActivated(bool),
-    /// Final block hash
-    FinalBlockHeightHash(Option<(BlockHeight, BlockHash)>),
-    /// Receiver for the final block hash
-    FinalBlockRx(broadcast::Receiver<(BlockHeight, BlockHash)>),
-    /// Finality status of a block
-    BlockFinalityStatus(Option<TFLBlockFinality>),
-    /// Finality status of a transaction
-    TxFinalityStatus(Option<TFLBlockFinality>),
     /// Send a staking command transaction
     StakingCmd,
     /// Faucet

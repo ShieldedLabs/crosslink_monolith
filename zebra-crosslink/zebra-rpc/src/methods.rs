@@ -1400,6 +1400,39 @@ where
         self.end_of_support_height = end_of_support_height;
         self
     }
+
+    /// The block this node has finalized, read through the state service (FINALITY.md §7.2).
+    ///
+    /// @Todo: the client exposure condition of FINALITY.md §3.5 applies to every answer built
+    /// from this value: a node should not present `fin` to a client that cannot act on it yet.
+    async fn crosslink_finalized_tip(
+        &self,
+    ) -> Option<(zebra_chain::block::Height, zebra_chain::block::Hash)> {
+        match self.read_state.clone().oneshot(ReadRequest::CrosslinkFinalizedTip).await {
+            Ok(ReadResponse::CrosslinkFinalizedTip(tip)) => tip,
+            other => {
+                tracing::error!(?other, "bad state service return");
+                None
+            }
+        }
+    }
+
+    /// A subscription to every change of the block this node has finalized.
+    async fn crosslink_finalized_tip_change(
+        &self,
+    ) -> Option<
+        tokio::sync::watch::Receiver<
+            Option<(zebra_chain::block::Height, zebra_chain::block::Hash)>,
+        >,
+    > {
+        match self.read_state.clone().oneshot(ReadRequest::CrosslinkFinalizedTipChange).await {
+            Ok(ReadResponse::CrosslinkFinalizedTipChange(listener)) => Some(listener.0),
+            other => {
+                tracing::error!(?other, "bad state service return");
+                None
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -2103,18 +2136,11 @@ where
     }
 
     async fn is_tfl_activated(&self) -> Option<bool> {
-        let ret = self
-            .tfl_service
-            .clone()
-            .ready()
-            .await
-            .unwrap()
-            .call(TFLServiceRequest::IsTFLActivated)
-            .await;
-        if let Ok(TFLServiceResponse::IsTFLActivated(is_activated)) = ret {
+        let ret = self.read_state.clone().oneshot(ReadRequest::CrosslinkIsActivated).await;
+        if let Ok(ReadResponse::CrosslinkIsActivated(is_activated)) = ret {
             Some(is_activated)
         } else {
-            tracing::error!(?ret, "Bad tfl service return.");
+            tracing::error!(?ret, "bad state service return");
             None
         }
     }
@@ -2190,85 +2216,40 @@ where
     }
 
     async fn get_tfl_final_block_hash(&self) -> Option<GetBlockHash> {
-        let ret = self
-            .tfl_service
-            .clone()
-            .ready()
-            .await
-            .unwrap()
-            .call(TFLServiceRequest::FinalBlockHeightHash)
-            .await;
-        if let Ok(TFLServiceResponse::FinalBlockHeightHash(val)) = ret {
-            val.map(|height_hash| GetBlockHash(height_hash.1))
-        } else {
-            tracing::error!(?ret, "Bad tfl service return.");
-            None
-        }
+        self.crosslink_finalized_tip().await.map(|(_, hash)| GetBlockHash(hash))
     }
 
     async fn get_tfl_final_block_height_and_hash(&self) -> Option<GetBlockHeightAndHashResponse> {
-        let ret = self
-            .tfl_service
-            .clone()
-            .ready()
+        self.crosslink_finalized_tip()
             .await
-            .unwrap()
-            .call(TFLServiceRequest::FinalBlockHeightHash)
-            .await;
-        if let Ok(TFLServiceResponse::FinalBlockHeightHash(val)) = ret {
-            val.map(|height_hash| GetBlockHeightAndHashResponse {
-                height: height_hash.0,
-                hash: height_hash.1,
-            })
-        } else {
-            tracing::error!(?ret, "Bad tfl service return.");
-            None
-        }
+            .map(|(height, hash)| GetBlockHeightAndHashResponse { height, hash })
     }
 
     async fn get_tfl_block_finality_from_hash(
         &self,
         hash: GetBlockHash,
     ) -> Option<TFLBlockFinality> {
-        if let Ok(zebra_state::Response::BlockHeader { height, .. }) = self
-            .state
+        // One request: `fin` and the best chain are read in the same state snapshot, so the two
+        // halves of the answer cannot come from different moments (FINALITY.md §5.5).
+        let ret = self
+            .read_state
             .clone()
-            .ready()
-            .await
-            .unwrap()
-            .call(zebra_state::Request::BlockHeader(hash.0.into()))
-            .await
-        {
-            if let Ok(TFLServiceResponse::BlockFinalityStatus(ret)) = self
-                .tfl_service
-                .clone()
-                .ready()
-                .await
-                .unwrap()
-                .call(TFLServiceRequest::BlockFinalityStatus(height, hash.0))
-                .await
-            {
-                ret
-            } else {
-                None
-            }
+            .oneshot(ReadRequest::CrosslinkBlockFinality(hash.0))
+            .await;
+        if let Ok(ReadResponse::CrosslinkBlockFinality(finality)) = ret {
+            Some(finality)
         } else {
+            tracing::error!(?ret, "bad state service return");
             None
         }
     }
 
     async fn get_tfl_tx_finality_from_hash(&self, hash: GetTxHash) -> Option<TFLBlockFinality> {
-        if let Ok(TFLServiceResponse::TxFinalityStatus(ret)) = self
-            .tfl_service
-            .clone()
-            .ready()
-            .await
-            .unwrap()
-            .call(TFLServiceRequest::TxFinalityStatus(hash.0))
-            .await
-        {
-            ret
+        let ret = self.read_state.clone().oneshot(ReadRequest::CrosslinkTxFinality(hash.0)).await;
+        if let Ok(ReadResponse::CrosslinkTxFinality(finality)) = ret {
+            finality
         } else {
+            tracing::error!(?ret, "bad state service return");
             None
         }
     }
@@ -2303,27 +2284,15 @@ where
         // ALT: transfer ownership of channel to TFL
 
         let id = rand::thread_rng().next_u32();
-        let rx = self
-            .tfl_service
-            .clone()
-            .ready()
-            .await
-            .unwrap()
-            .call(TFLServiceRequest::FinalBlockRx)
-            .await;
-        if let Ok(TFLServiceResponse::FinalBlockRx(mut rx)) = rx {
-            loop {
-                let rx_res = rx.recv().await;
-                if let Ok(block) = rx_res {
-                    tracing::info!("{:x}: RX new block: {:?}", id, block);
-                } else {
-                    tracing::error!(?rx_res, "Bad channel TX");
-                }
-            }
-        } else {
-            tracing::error!(?rx, "Bad tfl service return.");
+        let Some(mut rx) = self.crosslink_finalized_tip_change().await else {
+            return Ok(());
         };
-    
+
+        while rx.changed().await.is_ok() {
+            let tip = *rx.borrow_and_update();
+            tracing::info!("{:x}: RX new final block: {:?}", id, tip);
+        }
+
         Ok(())
     }
 
@@ -2331,21 +2300,7 @@ where
         &self,
         hash: GetBlockHash,
     ) -> Option<TFLBlockFinality> {
-        let mut rx = {
-            if let Ok(TFLServiceResponse::FinalBlockRx(rx)) = self
-                .tfl_service
-                .clone()
-                .ready()
-                .await
-                .unwrap()
-                .call(TFLServiceRequest::FinalBlockRx)
-                .await
-            {
-                rx
-            } else {
-                return None;
-            }
-        };
+        let mut rx = self.crosslink_finalized_tip_change().await?;
 
         loop {
             let status = self.get_tfl_block_finality_from_hash(hash).await;
@@ -2356,8 +2311,8 @@ where
                 }
                 Some(status) => {
                     if status == TFLBlockFinality::NotYetFinalized {
-                        drop(rx.recv().await);
-                        // now we can retry and might get a different finality status
+                        // Wait for `fin` to move, then ask again.
+                        rx.changed().await.ok()?;
                     } else {
                         return Some(status);
                     }
@@ -2372,48 +2327,35 @@ where
         // ALT: transfer ownership of channel to TFL
 
         let id = rand::thread_rng().next_u32();
-        let rx = self
-            .tfl_service
-            .clone()
-            .ready()
-            .await
-            .unwrap()
-            .call(TFLServiceRequest::FinalBlockRx)
-            .await;
-
-        if let Ok(TFLServiceResponse::FinalBlockRx(mut rx)) = rx {
-            loop {
-                let rx_res = rx.recv().await;
-                if let Ok(block_hash) = rx_res {
-                    let txs_res = self
-                        .read_state
-                        .clone()
-                        .oneshot(zebra_state::ReadRequest::TransactionIdsForBlock(
-                            block_hash.into(),
-                        ))
-                        .await;
-                    if let Ok(txs) = txs_res {
-                        tracing::info!(
-                            "{:x}: RX new block {:?}, with transactions: {:?}",
-                            id,
-                            block_hash,
-                            txs
-                        );
-                    } else {
-                        tracing::error!(
-                            ?txs_res,
-                            "Couldn't read transactions for new final block {:?}",
-                            block_hash
-                        );
-                    }
-                } else {
-                    tracing::error!(?rx_res, "Bad channel TX");
-                }
-            }
-        } else {
-            tracing::error!(?rx, "Bad tfl service return.");
+        let Some(mut rx) = self.crosslink_finalized_tip_change().await else {
+            return Ok(());
         };
-    
+
+        while rx.changed().await.is_ok() {
+            let Some((_, block_hash)) = *rx.borrow_and_update() else {
+                continue;
+            };
+            let txs_res = self
+                .read_state
+                .clone()
+                .oneshot(zebra_state::ReadRequest::TransactionIdsForBlock(block_hash.into()))
+                .await;
+            if let Ok(txs) = txs_res {
+                tracing::info!(
+                    "{:x}: RX new final block {:?}, with transactions: {:?}",
+                    id,
+                    block_hash,
+                    txs
+                );
+            } else {
+                tracing::error!(
+                    ?txs_res,
+                    "could not read transactions for new final block {:?}",
+                    block_hash
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -2421,44 +2363,18 @@ where
         &self,
         hash: GetTxHash,
     ) -> Option<TFLBlockFinality> {
-        let mut rx = {
-            if let Ok(TFLServiceResponse::FinalBlockRx(rx)) = self
-                .tfl_service
-                .clone()
-                .ready()
-                .await
-                .unwrap()
-                .call(TFLServiceRequest::FinalBlockRx)
-                .await
-            {
-                rx
-            } else {
-                return None;
-            }
-        };
+        let mut rx = self.crosslink_finalized_tip_change().await?;
 
         // TODO (perf): calculate height once, then early out for most iterations
         loop {
-            match if let Ok(TFLServiceResponse::TxFinalityStatus(ret)) = self
-                .tfl_service
-                .clone()
-                .ready()
-                .await
-                .unwrap()
-                .call(TFLServiceRequest::TxFinalityStatus(hash.0))
-                .await
-            {
-                ret
-            } else {
-                None
-            } {
+            match self.get_tfl_tx_finality_from_hash(hash).await {
                 None => {
                     return None;
                 }
                 Some(status) => {
                     if status == TFLBlockFinality::NotYetFinalized {
-                        drop(rx.recv().await);
-                        // now we can retry and might get a different finality status
+                        // Wait for `fin` to move, then ask again.
+                        rx.changed().await.ok()?;
                     } else {
                         return Some(status);
                     }
