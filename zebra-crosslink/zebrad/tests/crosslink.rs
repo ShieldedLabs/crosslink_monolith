@@ -556,32 +556,8 @@ fn crosslink_test_basic_finality() {
         // A decision alone moves nothing (FINALITY.md §4.3): `fin` follows `candidate(bc_best)`,
         // so the chain has to cite the decision before the blocks below its snapshot are final.
         // These blocks sit above `pow[n]`, so they change none of the expectations below.
-        let fat_pointer_to_bft_block = FatPointerToBftBlock {
-            vote_for_block_without_finalizer_public_key: bft
-                .0
-                .fat_ptr
-                .vote_for_block_without_finalizer_public_key,
-            signatures: bft
-                .0
-                .fat_ptr
-                .signatures
-                .iter()
-                .map(|sig| FatPointerSignature {
-                    pub_key: sig.pub_key,
-                    vote_signature: sig.vote_signature,
-                })
-                .collect(),
-        };
         gen.next_block(&miner_addr);
-        gen.tip = Arc::new(Block {
-            header: Arc::new(BlockHeader {
-                version: 5,
-                fat_pointer_to_bft_block,
-                ..*gen.tip.header
-            }),
-            ..gen.tip.as_ref().clone()
-        });
-        tf.push_instr_load_pow(&gen.tip, 0);
+        tf.push_instr_load_pow(&point_tip_at_bft(&mut gen, &bft.0.fat_ptr), 0);
 
         for i2 in 0..n {
             let finality = if i2 == 2 {

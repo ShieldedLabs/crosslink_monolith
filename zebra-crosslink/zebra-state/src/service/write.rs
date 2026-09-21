@@ -265,13 +265,9 @@ impl WriteBlockWorkerTask {
         }
 
         self.conflict_abandoned = Some(decided_hash);
-        println!(
+        tracing::error!(
             "crosslink: committing past the block decided at height {} after holding {} blocks; this node can no longer follow that decision",
             decided_height.0, CONFLICT_HOLD_DEPTH,
-        );
-        tracing::error!(
-            "crosslink: committing past the block decided at height {}; this node can no longer follow that decision",
-            decided_height.0,
         );
 
         false
