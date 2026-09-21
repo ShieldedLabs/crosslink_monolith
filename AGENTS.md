@@ -39,6 +39,11 @@ The scripts perform the required sequence:
 4. Push the extracted subtree history to `crosslink_book-upstream/code`.
 5. Push the resulting monolith history to `origin/dev`.
 
+Subtree pushes use `git subtree push --rejoin`. The first push after enabling
+this may still scan the full monolith history; the rejoin commit it creates is
+the checkpoint that makes later pushes incremental. Preserve these rejoin
+commits when merging monolith history.
+
 Do not replace this sequence with an ordinary topology-flattening rebase while
 subtree merge commits are local-only. If the monolith remote advances after a
 subtree operation, merge it with `git pull --no-rebase`.

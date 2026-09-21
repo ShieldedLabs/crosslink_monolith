@@ -113,7 +113,9 @@ if [[ "$command" == "push" ]]; then
   remote="${prefix}-upstream"
 
   echo "Pushing subtree '$prefix' to $remote/$branch"
-  git subtree push --prefix="$prefix" "$remote" "$branch"
+  # Record the split as a bookkeeping merge so later pushes only need to
+  # process history added since this checkpoint.
+  git subtree push --rejoin --prefix="$prefix" "$remote" "$branch"
   exit 0
 fi
 
