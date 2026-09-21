@@ -39,11 +39,11 @@ The scripts perform the required sequence:
 4. Push the extracted subtree history to `crosslink_book-upstream/code`.
 5. Push the resulting monolith history to `origin/dev`.
 
-Subtree pushes record a no-content rejoin checkpoint with the standard
-`git-subtree-mainline` and `git-subtree-split` trailers. This custom checkpoint
-supports the repository's squashed, unrelated subtree history, which Git's
-built-in `git subtree push --rejoin` does not. Preserve these rejoin commits
-when merging monolith history so later splits remain incremental.
+Subtree pushes intentionally do not use `--rejoin` or create rejoin checkpoint
+commits. A rejoin makes the extracted book commit a parent of a monolith
+commit, which makes the entire `crosslink_book` history reachable from the
+monolith branch. Native subtree pushes may rescan monolith history; that cost is
+intentional to keep the repositories' commit histories disconnected.
 
 Do not replace this sequence with an ordinary topology-flattening rebase while
 subtree merge commits are local-only. If the monolith remote advances after a

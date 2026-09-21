@@ -113,48 +113,7 @@ if [[ "$command" == "push" ]]; then
   remote="${prefix}-upstream"
 
   echo "Pushing subtree '$prefix' to $remote/$branch"
-  git diff --quiet && git diff --cached --quiet \
-    || { echo 'error: subtree push requires a clean tracked worktree' >&2; exit 1; }
-
-  # Git's built-in `push --rejoin` cannot create its bookkeeping merge when a
-  # subtree was added with --squash: the two histories have no merge base and
-  # git-subtree omits --allow-unrelated-histories. Build the same checkpoint
-  # explicitly after validating that its split tree matches the local subtree.
-  git fetch "$remote" "$branch"
-  mainline="$(git rev-parse HEAD)"
-  remote_commit="$(git rev-parse "$remote/$branch^{commit}")"
-  subtree_tree="$(git rev-parse "HEAD:$prefix")"
-  remote_tree="$(git rev-parse "$remote_commit^{tree}")"
-
-  if [[ "$subtree_tree" == "$remote_tree" ]]; then
-    echo "Subtree already matches $remote/$branch; reusing its tip."
-    split_commit="$remote_commit"
-  else
-    split_commit="$(git subtree split --prefix="$prefix" HEAD)"
-    split_tree="$(git rev-parse "$split_commit^{tree}")"
-    [[ "$subtree_tree" == "$split_tree" ]] \
-      || { echo 'error: split tree does not match the local subtree' >&2; exit 1; }
-    git push "$remote" "$split_commit:refs/heads/$branch"
-  fi
-
-  head_checkpoint_dir="$(git log -1 --format=%B HEAD \
-    | sed -n 's/^git-subtree-dir: //p' | tail -n 1)"
-  head_checkpoint_split="$(git log -1 --format=%B HEAD \
-    | sed -n 's/^git-subtree-split: //p' | tail -n 1)"
-  if [[ "$head_checkpoint_dir" == "$prefix" \
-    && "$head_checkpoint_split" == "$split_commit" ]]
-  then
-    echo 'An incremental subtree checkpoint already covers this split.'
-  else
-    checkpoint_message="$(printf \
-      "Split '%s/' into commit '%s'\n\ngit-subtree-dir: %s\ngit-subtree-mainline: %s\ngit-subtree-split: %s" \
-      "$prefix" "$split_commit" "$prefix" "$mainline" "$split_commit")"
-    checkpoint_commit="$(printf '%s\n' "$checkpoint_message" \
-      | git commit-tree "$mainline^{tree}" -p "$mainline" -p "$split_commit")"
-    git update-ref -m "checkpoint subtree split for $prefix" \
-      HEAD "$checkpoint_commit" "$mainline"
-    echo "Recorded incremental subtree checkpoint $checkpoint_commit."
-  fi
+  git subtree push --prefix="$prefix" "$remote" "$branch"
   exit 0
 fi
 
