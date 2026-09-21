@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+
+# Adapted from ShieldedLabs/zcash-dev-suite's subtree management tool.
+set -euo pipefail
+set +x
+
+usage() {
+  echo "Usage: $0 <command> [options]"
+  echo "Commands:"
+  echo "  add <prefix> <remote-url> <branch>  Add a new subtree and track remote"
+  echo "  ls                                  List tracked subtrees"
+  echo "  pull <prefix> <branch>              Pull a tracked remote into a subtree"
+  echo "  diff <prefix> <branch>              Compare a subtree with its remote"
+  echo "  push <prefix> <branch>              Push a subtree to its remote"
+  echo "  rm <prefix>                         Remove a subtree and its remote"
+  exit 1
+}
+
+[[ $# -gt 0 ]] || usage
+command="$1"
+
+if [[ "$command" == "add" ]]; then
+  [[ $# -eq 4 ]] || usage
+  prefix="$2"
+  remote_url="$3"
+  branch="$4"
+
+  echo "Adding subtree '$prefix' from $remote_url@$branch"
+  git subtree add --prefix="$prefix" "$remote_url" "$branch" --squash
+
+  echo "Tracking remote as '${prefix}-upstream'"
+  git remote add "${prefix}-upstream" "$remote_url" \
+    || echo "Remote already exists: ${prefix}-upstream"
+  exit 0
+fi
+
+if [[ "$command" == "ls" ]]; then
+  [[ $# -eq 1 ]] || usage
+  table_format="%-20s %-55s %-20s %-12s"
+
+  printf "$table_format\n" "Prefix" "Remote URL" "Subtree Split" "Local Commit"
+  echo "------------------------------------------------------------------------------------------------------------------"
+
+  git log --grep='^git-subtree-dir:' --pretty=format:'COMMIT:%H%n%B' \
+  | awk '
+      BEGIN { RS="COMMIT:"; ORS="" }
+      {
+        split($0, lines, "\n")
+        local_commit = lines[1]
+        prefix = ""
+        split_commit = ""
+        for (i = 2; i <= length(lines); i++) {
+          if (lines[i] ~ /^git-subtree-dir:/) {
+            split(lines[i], d, ": ")
+            prefix = d[2]
+          }
+          if (lines[i] ~ /^git-subtree-split:/) {
+            split(lines[i], s, ": ")
+            split_commit = s[2]
+          }
+        }
+        if (prefix != "" && split_commit != "" && !(prefix in seen)) {
+          seen[prefix] = 1
+          printf "%s %s %s\n", prefix, substr(split_commit, 1, 10), substr(local_commit, 1, 10)
+        }
+      }
+    ' \
+  | while read -r prefix split_commit local_commit; do
+      if [[ -d "$prefix" ]]; then
+        remote="${prefix}-upstream"
+        url="$(git remote get-url "$remote" 2>/dev/null || echo unknown)"
+        printf "$table_format\n" "$prefix" "$url" "$split_commit" "$local_commit"
+      fi
+    done
+  exit 0
+fi
+
+if [[ "$command" == "pull" ]]; then
+  [[ $# -eq 3 ]] || usage
+  prefix="$2"
+  branch="$3"
+  remote="${prefix}-upstream"
+
+  echo "Pulling subtree '$prefix' from $remote/$branch"
+  git subtree pull --prefix="$prefix" "$remote" "$branch" --squash
+  exit 0
+fi
+
+if [[ "$command" == "diff" ]]; then
+  [[ $# -eq 3 ]] || usage
+  prefix="$2"
+  branch="$3"
+  remote="${prefix}-upstream"
+
+  echo "Fetching latest from $remote..."
+  git fetch "$remote" --quiet
+
+  echo "Comparing local '$prefix/' against $remote/$branch..."
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' EXIT
+  git archive "$remote/$branch" | tar -x -C "$tmpdir"
+
+  diff_status=0
+  git --no-pager diff --no-index -- "$tmpdir" "$prefix" || diff_status=$?
+  [[ "$diff_status" -le 1 ]] || exit "$diff_status"
+  exit 0
+fi
+
+if [[ "$command" == "push" ]]; then
+  [[ $# -eq 3 ]] || usage
+  prefix="$2"
+  branch="$3"
+  remote="${prefix}-upstream"
+
+  echo "Pushing subtree '$prefix' to $remote/$branch"
+  git subtree push --prefix="$prefix" "$remote" "$branch"
+  exit 0
+fi
+
+if [[ "$command" == "rm" ]]; then
+  [[ $# -eq 2 ]] || usage
+  prefix="$2"
+  remote="${prefix}-upstream"
+
+  echo "Are you sure you want to delete the subtree '$prefix' and remote '$remote'? [y/N]"
+  read -r confirm
+  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    echo 'Aborted.'
+    exit 1
+  fi
+
+  echo "Removing subtree folder '$prefix/'..."
+  git rm -r "$prefix"
+  git commit -m "Removed subtree '$prefix' and unlinked '$remote'"
+
+  if git remote get-url "$remote" > /dev/null 2>&1; then
+    git remote remove "$remote"
+  else
+    echo "Remote '$remote' not found. Skipping."
+  fi
+  exit 0
+fi
+
+echo "Unknown command: $command"
+usage
