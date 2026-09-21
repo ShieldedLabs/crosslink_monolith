@@ -78,7 +78,7 @@ pub(crate) fn advance(db: &ZebraDb, height: Height, hash: Hash) {
 ///
 /// @Todo: §7.2 carries a confirmation count with the middle state. The count is not carried
 /// here because it would change `TFLBlockFinality`, and with it the test format stage 3 set.
-pub fn block_finality(
+pub(crate) fn block_finality(
     non_finalized_state: &NonFinalizedState,
     db: &ZebraDb,
     hash: Hash,
@@ -100,7 +100,7 @@ pub fn block_finality(
 /// The finality status of a block on the best chain at `height`.
 ///
 /// `fin` lies on the best chain and so does the block, so the height decides ancestry.
-pub fn finality_at_height(height: Height) -> crate::crosslink::TFLBlockFinality {
+pub(crate) fn finality_at_height(height: Height) -> crate::crosslink::TFLBlockFinality {
     use crate::crosslink::TFLBlockFinality::*;
 
     match fin() {
