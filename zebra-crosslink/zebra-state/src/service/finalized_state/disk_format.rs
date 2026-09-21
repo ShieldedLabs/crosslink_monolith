@@ -11,6 +11,7 @@ pub mod bft;
 pub mod block;
 pub mod chain;
 pub mod delegation;
+pub mod fin;
 pub mod shielded;
 pub mod transparent;
 pub mod upgrade;

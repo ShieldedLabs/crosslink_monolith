@@ -89,7 +89,7 @@ const DATABASE_FORMAT_VERSION: u64 = 31;
 ///   the current width). New CFs are created and the wider records are read in place when the
 ///   database is opened, so this is a major bump that is restorable from the previous major
 ///   database format version (no resync, no data migration).
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 2;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.
@@ -136,6 +136,16 @@ pub const MAX_LEGACY_CHAIN_BLOCKS: usize = 100_000;
 /// This limits non-finalized chain memory, in the worst case, to around:
 /// `10 forks * 1000 blocks * 2 MB per block = 20 GB`
 pub const MAX_NON_FINALIZED_CHAIN_FORKS: usize = 10;
+
+/// How far past the fork point the reorg-depth commit is held while it conflicts with
+/// `bft_final_snapshot`.
+///
+/// Committing a block drops every non-finalized chain that forks below it, so a commit that
+/// conflicts with Π_bft's decision would leave this node unable to follow that decision
+/// (FINALITY.md §4.3). The commit therefore waits. The wait is bounded because the held blocks
+/// stay in the non-finalized state, which would otherwise grow without limit: at this depth the
+/// node gives up on the decision instead, and says so.
+pub const CONFLICT_HOLD_DEPTH: u32 = 999;
 
 /// The maximum number of block hashes allowed in `getblocks` responses in the Zcash network protocol.
 pub const MAX_FIND_BLOCK_HASHES_RESULTS: u32 = 500;

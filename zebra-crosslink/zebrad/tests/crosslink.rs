@@ -553,6 +553,36 @@ fn crosslink_test_basic_finality() {
         let bft = next_pos(pos_h, fat_ptr, &window, &[]);
         tf.push_instr_load_pos(&bft, 0);
 
+        // A decision alone moves nothing (FINALITY.md §4.3): `fin` follows `candidate(bc_best)`,
+        // so the chain has to cite the decision before the blocks below its snapshot are final.
+        // These blocks sit above `pow[n]`, so they change none of the expectations below.
+        let fat_pointer_to_bft_block = FatPointerToBftBlock {
+            vote_for_block_without_finalizer_public_key: bft
+                .0
+                .fat_ptr
+                .vote_for_block_without_finalizer_public_key,
+            signatures: bft
+                .0
+                .fat_ptr
+                .signatures
+                .iter()
+                .map(|sig| FatPointerSignature {
+                    pub_key: sig.pub_key,
+                    vote_signature: sig.vote_signature,
+                })
+                .collect(),
+        };
+        gen.next_block(&miner_addr);
+        gen.tip = Arc::new(Block {
+            header: Arc::new(BlockHeader {
+                version: 5,
+                fat_pointer_to_bft_block,
+                ..*gen.tip.header
+            }),
+            ..gen.tip.as_ref().clone()
+        });
+        tf.push_instr_load_pow(&gen.tip, 0);
+
         for i2 in 0..n {
             let finality = if i2 == 2 {
                 // unpicked sidechain
@@ -844,6 +874,13 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
     let bft = next_pos(pos_h, fat_ptr, &pow[10..13], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
+    // h14 cites that decision. The decision alone finalizes nothing (FINALITY.md §4.3): `fin`
+    // reaches h10 only once the best chain carries the fat pointer, and it is `fin` that the
+    // fork below has to conflict with.
+    gen.next_block(&miner_addr);
+    pow.push(point_tip_at_bft(&mut gen, &bft.0.fat_ptr));
+    tf.push_instr_load_pow(pow.last().unwrap(), 0);
+
     // A second, distinct, valid transparent P2PKH miner (a different coinbase => different
     // block hashes, so the fork actually competes). Tex addresses are rejected by the
     // Ironwood v6 coinbase builder ("Address not supported for miner rewards").
@@ -853,71 +890,196 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
     for _ in 10..18 {
         tf.push_instr_load_pow(&genb.next_block(&miner_addr2), SHOULD_FAIL);
     }
-    tf.push_instr_expect_pow_chain_length(14, 0);
+    tf.push_instr_expect_pow_chain_length(15, 0);
 
     test_bytes(tf.write_to_bytes());
 }
 
-// NOTE: this behaviour appears to differ from Daira-Emma's expectations
+// The fork-choice floor of FINALITY.md §4.3: a decision does not move the node, `fin` does, and
+// `fin` moves only where the best chain changes. The old shape of this test asserted the
+// opposite -- that deciding a snapshot collapsed the node onto that branch -- which is the
+// behaviour §4.3 replaces.
 #[test]
-fn crosslink_pow_switch_to_finalized_chain_fork_even_though_longer_chain_exists() {
+fn crosslink_pow_follows_the_heaviest_chain_until_fin_moves_to_the_decided_branch() {
     set_test_name(function_name!());
     let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
-    let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
-    let mut pow = vec![gen.tip.clone()];
-    tf.push_instr_load_pow(&gen.tip, 0);
-
-    for _ in 2..8 {
-        pow.push(gen.next_block(&miner_addr));
-        tf.push_instr_load_pow(&gen.tip, 0);
-    }
-
-    for i in 0..3 {
-        let bft = next_pos(pos_h, fat_ptr, &pow[i..i+3], &[]);
-        tf.push_instr_load_pos(&bft, 0);
-    }
-
-    for _ in 8..10 {
-        pow.push(gen.next_block(&miner_addr));
-        tf.push_instr_load_pow(&gen.tip, 0);
-    }
-    let mut genb = gen.clone(); // fork
-
-    for _ in 10..19 {
-        tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
-    }
-    tf.push_instr_expect_pow_chain_length(19, 0);
-
-    // small sidechain
     // A second, distinct, valid transparent P2PKH miner (a different coinbase => different
     // block hashes, so the fork actually competes). Tex addresses are rejected by the
     // Ironwood v6 coinbase builder ("Address not supported for miner rewards").
     let miner_addr2 = zcash_keys::address::Address::Transparent(
         zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
     );
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut pow = vec![gen.tip.clone()];
+    tf.push_instr_load_pow(&gen.tip, 0);
+
+    // Heights 1..9, common to both branches.
+    for _ in 2..10 {
+        pow.push(gen.next_block(&miner_addr));
+        tf.push_instr_load_pow(&gen.tip, 0);
+    }
+    for i in 0..3 {
+        let bft = next_pos(pos_h, fat_ptr, &pow[i..i + 3], &[]);
+        tf.push_instr_load_pos(&bft, 0);
+    }
+
+    // Branch A: heights 10..18, the heaviest chain for most of this test.
+    let mut genb = gen.clone(); // fork
+    for _ in 10..19 {
+        tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
+    }
+    tf.push_instr_expect_pow_chain_length(19, 0);
+
+    // Branch B: heights 10..13, a side chain of four blocks. pow[9..13].
     for _ in 10..14 {
         pow.push(genb.next_block(&miner_addr2));
         tf.push_instr_load_pow(&genb.tip, 0);
     }
-    // small sidechain currently ignored
     tf.push_instr_expect_pow_chain_length(19, 0);
 
-    // finalize the small sidechain: snapshot h10 = pow[9], its first block
+    // Decide a bft-block whose snapshot is pow[9], branch B's first block: headers 11..13 put
+    // the snapshot at their parent. Under §4.3 this moves `bft_final_snapshot` and nothing else
+    // -- the node stays on branch A, and the decided block is not final on it.
     let bft = next_pos(pos_h, fat_ptr, &pow[10..13], &[]);
     tf.push_instr_load_pos(&bft, 0);
+    tf.push_instr_expect_pow_chain_length(19, 0);
+    tf.push_instr_expect_pow_block_finality(
+        &pow[9].hash(),
+        Some(TFLBlockFinality::NotYetFinalized),
+        0,
+    );
 
-    tf.push_instr_expect_pow_chain_length(14, 0);
+    // Branch A still extends, because `fin` is below the fork.
+    tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
+    tf.push_instr_expect_pow_chain_length(20, 0);
 
+    let fat_pointer_to_bft_block = FatPointerToBftBlock {
+        vote_for_block_without_finalizer_public_key: bft
+            .0
+            .fat_ptr
+            .vote_for_block_without_finalizer_public_key,
+        signatures: bft
+            .0
+            .fat_ptr
+            .signatures
+            .iter()
+            .map(|sig| FatPointerSignature {
+                pub_key: sig.pub_key,
+                vote_signature: sig.vote_signature,
+            })
+            .collect(),
+    };
+
+    // Branch B overtakes: heights 14..21, the last of them citing the decided bft-block. Only
+    // the tip's pointer matters, since `candidate` reads the best tip.
+    for _ in 14..21 {
+        pow.push(genb.next_block(&miner_addr2));
+        tf.push_instr_load_pow(&genb.tip, 0);
+    }
+    genb.next_block(&miner_addr2);
+    genb.tip = Arc::new(Block {
+        header: Arc::new(BlockHeader {
+            version: 5,
+            fat_pointer_to_bft_block,
+            ..*genb.tip.header
+        }),
+        ..genb.tip.as_ref().clone()
+    });
+    pow.push(genb.tip.clone());
+    tf.push_instr_load_pow(&genb.tip, 0);
+
+    // Branch B is now the best chain and its tip cites the decision, so `fin` reaches pow[9].
+    tf.push_instr_expect_pow_chain_length(22, 0);
+    tf.push_instr_expect_pow_block_finality(&pow[9].hash(), Some(TFLBlockFinality::Finalized), 0);
+
+    // With `fin` on branch B, branch A is gone: a block extending it forks below the finalized
+    // tip, which is the fork-choice floor as Zebra enforces it (§4.3, §6.3).
     tf.push_instr_load_pow(&gen.next_block(&miner_addr), SHOULD_FAIL);
-    tf.push_instr_expect_pow_chain_length(14, 0);
+    tf.push_instr_expect_pow_chain_length(22, 0);
 
-    tf.push_instr_load_pow(&genb.next_block(&miner_addr2), 0);
-    tf.push_instr_expect_pow_chain_length(15, 0);
+    test_bytes(tf.write_to_bytes());
+}
+
+// Last Final Snapshot (FINALITY.md §3.1, §6.2): a bc-block may cite a bft-block only if its own
+// ancestry contains that bft-block's snapshot. The test needs the decided snapshot to sit on a
+// branch the citing block is not on, which is possible only now that deciding does not commit.
+#[test]
+fn crosslink_reject_pow_block_citing_a_snapshot_off_its_own_chain() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let miner_addr2 = zcash_keys::address::Address::Transparent(
+        zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
+    );
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut pow = vec![gen.tip.clone()];
+    tf.push_instr_load_pow(&gen.tip, 0);
+
+    // Heights 1..9, common to both branches.
+    for _ in 2..10 {
+        pow.push(gen.next_block(&miner_addr));
+        tf.push_instr_load_pow(&gen.tip, 0);
+    }
+    for i in 0..3 {
+        let bft = next_pos(pos_h, fat_ptr, &pow[i..i + 3], &[]);
+        tf.push_instr_load_pos(&bft, 0);
+    }
+
+    // Branch A, heights 10..13: the best chain, and the one that will cite the bft-block.
+    let mut genb = gen.clone(); // fork
+    for _ in 10..14 {
+        tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
+    }
+
+    // Branch B, heights 10..13: pow[9..13], holding the snapshot that gets decided.
+    for _ in 10..14 {
+        pow.push(genb.next_block(&miner_addr2));
+        tf.push_instr_load_pow(&genb.tip, 0);
+    }
+
+    let bft = next_pos(pos_h, fat_ptr, &pow[10..13], &[]);
+    tf.push_instr_load_pos(&bft, 0);
+    tf.push_instr_expect_pos_chain_length(4, 0);
+
+    let fat_pointer_to_bft_block = FatPointerToBftBlock {
+        vote_for_block_without_finalizer_public_key: bft
+            .0
+            .fat_ptr
+            .vote_for_block_without_finalizer_public_key,
+        signatures: bft
+            .0
+            .fat_ptr
+            .signatures
+            .iter()
+            .map(|sig| FatPointerSignature {
+                pub_key: sig.pub_key,
+                vote_signature: sig.vote_signature,
+            })
+            .collect(),
+    };
+
+    // Branch A's height 14 cites a bft-block whose snapshot is branch B's height 10. It is σ + 1
+    // above that snapshot, so only Last Final Snapshot can refuse it.
+    gen.next_block(&miner_addr);
+    gen.tip = Arc::new(Block {
+        header: Arc::new(BlockHeader {
+            version: 5,
+            fat_pointer_to_bft_block,
+            ..*gen.tip.header
+        }),
+        ..gen.tip.as_ref().clone()
+    });
+    tf.push_instr_load_pow(&gen.tip, SHOULD_FAIL);
+    tf.push_instr_expect_pow_chain_length(14, 0);
 
     test_bytes(tf.write_to_bytes());
 }
@@ -1674,16 +1836,20 @@ fn diagram_scene_3(fork_flags: u32) -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
     pow.push(point_tip_at_bft(&mut gen, &bft1.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
-    // Snapshot P5. Everything after this conflicts with it.
+    // Snapshot P5. Everything after this conflicts with it. P9 cites it: a decision alone
+    // moves nothing (FINALITY.md §4.3), so without the citation `fin` would stop at P4.
     let bft2 = next_pos(pos_h, fat_ptr, &pow[5..8], &[]);
     tf.push_instr_load_pos(&bft2, 0);
+    gen.next_block(&miner_addr);
+    pow.push(point_tip_at_bft(&mut gen, &bft2.0.fat_ptr));
+    tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
     // C4..C6 carry no BFT pointer: bft0's snapshot is P3, and the sigma-confirmation rule in
     // the fat-pointer check lets nothing below P3 + sigma + 1 = 7 carry that certificate.
-    // C7..C9 then cite bft0, whose headers sit on the branch this one conflicts with -- the
+    // C7..C10 then cite bft0, whose headers sit on the branch this one conflicts with -- the
     // point of the scene.
     let mut fork: Vec<Arc<Block>> = Vec::new();
-    for height in 4..=9 {
+    for height in 4..=10 {
         fork_gen.next_block(&fork_addr);
         if height >= 7 {
             fork.push(point_tip_at_bft(&mut fork_gen, &bft0.0.fat_ptr));
@@ -1693,8 +1859,8 @@ fn diagram_scene_3(fork_flags: u32) -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
         tf.push_instr_load_pow(fork.last().unwrap(), fork_flags);
     }
 
-    assert_eq!(pow.len(), 8);
-    assert_eq!(fork.len(), 6);
+    assert_eq!(pow.len(), 9);
+    assert_eq!(fork.len(), 7);
     assert_eq!(
         fork[0].header.previous_block_hash,
         pow[2].hash(),
@@ -1718,7 +1884,7 @@ fn crosslink_write_finality_diagram_scenes() {
         pow1.iter().map(|b| b.hash()).collect::<Vec<_>>(),
         pow2.iter().map(|b| b.hash()).collect::<Vec<_>>()
     );
-    assert_eq!(pow3.len() + fork3.len(), 14);
+    assert_eq!(pow3.len() + fork3.len(), 16);
     assert_eq!(fork2.len(), 3);
 
     for (tf, name) in [
@@ -1785,7 +1951,7 @@ fn crosslink_finality_diagram_3_conflicting_fork_is_refused() {
     set_test_name(function_name!());
     let (mut tf, pow, _fork) = diagram_scene_3(SHOULD_FAIL);
 
-    tf.push_instr_expect_pow_chain_length(9, 0);
+    tf.push_instr_expect_pow_chain_length(10, 0);
     tf.push_instr_expect_pos_chain_length(3, 0);
     tf.push_instr_expect_pow_block_finality(&pow[4].hash(), Some(TFLBlockFinality::Finalized), 0);
 

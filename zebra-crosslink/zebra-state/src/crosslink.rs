@@ -39,8 +39,6 @@ pub enum TFLServiceRequest {
     FinalBlockHeightHash,
     /// Get a receiver for the final block hash
     FinalBlockRx,
-    /// Set final block hash
-    SetFinalBlockHash(BlockHash),
     /// Get the finality status of a block
     BlockFinalityStatus(BlockHeight, BlockHash),
     /// Get the finality status of a transaction
@@ -74,8 +72,6 @@ pub enum TFLServiceResponse {
     FinalBlockHeightHash(Option<(BlockHeight, BlockHash)>),
     /// Receiver for the final block hash
     FinalBlockRx(broadcast::Receiver<(BlockHeight, BlockHash)>),
-    /// Set final block hash
-    SetFinalBlockHash(Option<BlockHeight>),
     /// Finality status of a block
     BlockFinalityStatus(Option<TFLBlockFinality>),
     /// Finality status of a transaction

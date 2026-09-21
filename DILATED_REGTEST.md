@@ -31,7 +31,7 @@ state directories and both nodes' logs, with the pre-restart logs kept beside th
    50 blocks.
 5. Kills both nodes, moves their logs aside and starts them again against the same state
    directories, then mines on to `TARGET` (default 450). The kill is hard, so each node comes
-   back at its crosslink-finalized height rather than its old tip and re-mines the difference.
+   back at its committed height rather than its old tip and re-mines the difference.
 6. Checks both nodes and prints `PASS` or every failed check.
 
 ## What it checks
@@ -46,8 +46,9 @@ state directories and both nodes' logs, with the pre-restart logs kept beside th
 - The final height is within 40 blocks of the tip on both nodes.
 - Both nodes resumed BFT from their database after the restart, at no lower a height than they
   had decided before it, and neither re-ran the bootstrap. The resumed height may be one short
-  of the decisions counted in the pre-restart log: a decision commits its snapshot before its
-  row is written, so a kill in between loses that row and the height is decided again.
+  of the decisions counted in the pre-restart log: a decision advances `bft_final_snapshot`
+  before its row is written, so a kill in between loses that row and the height is decided
+  again.
 - Both nodes decided further BFT blocks after the restart.
 - No `pos.chain` file exists anywhere under the output directory.
 

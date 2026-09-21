@@ -214,7 +214,8 @@ impl VizScene {
 
         // The finalized marker this node would publish for these blocks: the newest BFT
         // block's `snapshot`, i.e. the parent of its `headers[0]`. That is
-        // `latest_final_block`'s own derivation, so the viz shows what this tree does.
+        // `candidate`'s own derivation before the sigma clamp, so the viz shows the point `fin`
+        // is heading for rather than a guess of its own.
         let bft_tip_block = bft.iter().max_by_key(|b| b.height);
         let finalized_hash = bft_tip_block
             .filter(|b| !b.headers.is_empty())
@@ -489,13 +490,13 @@ pub async fn service_viz_requests(
             // unknown (fresh restart) the ack alone bounds the window; corrects itself
             // on the first decided-block ingest.
             let page_lo = (bc_tip_height + 1).saturating_sub(BC_PAGE_SIZE);
-            let finalized_lo = zebra_state::new_network::bft::bft_chain().read().unwrap().latest_final_block
+            let finalized_lo = zebra_state::new_network::fin::fin()
                 .map(|(h, _)| h.0 as u64)
                 .unwrap_or(u64::MAX);
             // lo = ack clamped to [page_lo, finalized_lo]; when finality lags below the
             // page floor, the trailing min wins and the window extends down to it,
             // bounded at a few pages: a restart mid-finality-catch-up can leave
-            // latest_final_block a whole chain below the tip, and an unbounded window
+            // `fin` a whole chain below the tip, and an unbounded window
             // would then serve everything down to ~0 every cycle.
             let sanity_lo = (bc_tip_height + 1).saturating_sub(4 * BC_PAGE_SIZE);
             let req_lo_height = ZebBlockHeight(bc_ack_height.max(page_lo).min(finalized_lo).max(sanity_lo).min(bc_tip_height) as u32);
@@ -755,7 +756,7 @@ pub async fn service_viz_requests(
                         // next block to decide) and the current finalized BC height. Identical source
                         // means the viz display and the actual consensus roster always agree.
                         let working_bft_height = internal.blocks.len() as u64;
-                        let finalized_bc_height = internal.latest_final_block.map(|(h, _)| h.0 as u64).unwrap_or(0);
+                        let finalized_bc_height = internal.bft_final_snapshot.map(|(h, _)| h.0 as u64).unwrap_or(0);
                         response.blacklisted_finalizers = zebra_state::new_network::bft::terminated_finalizers_at(
                             &tfl_handle.config.hardforks, working_bft_height, finalized_bc_height,
                         )
@@ -764,8 +765,8 @@ pub async fn service_viz_requests(
                         .collect();
                     }
                     response.bc_tip_height = bc_tip_height;
-                    response.bc_finalized_tip_height = if let Some(latest_finalized_block) = internal.latest_final_block {
-                        latest_finalized_block.0.0 as u64
+                    response.bc_finalized_tip_height = if let Some(fin) = zebra_state::new_network::fin::fin() {
+                        fin.0.0 as u64
                     } else {
                         0
                     };
@@ -1083,10 +1084,10 @@ mod scene_tests {
     fn diagram_scene_3_forks_below_the_marker() {
         let scene = scene("finality_diagram_3_conflicting_fork.zeccltf");
 
-        // Eight blocks on the branch the BFT chain finalized, six on the heavier one.
-        assert_eq!(scene.bc_blocks.len(), 14);
-        assert_eq!(scene.bc_tip_height, 9);
-        assert_eq!(best_heights(&scene), (1..=9).collect::<Vec<_>>());
+        // Nine blocks on the branch the BFT chain finalized, seven on the heavier one.
+        assert_eq!(scene.bc_blocks.len(), 16);
+        assert_eq!(scene.bc_tip_height, 10);
+        assert_eq!(best_heights(&scene), (1..=10).collect::<Vec<_>>());
 
         assert_eq!(scene.bc_finalized_tip_height, 5);
         assert_eq!(finalized_heights(&scene), (1..=5).collect::<Vec<_>>());
@@ -1099,7 +1100,7 @@ mod scene_tests {
             .find(|b| b.this_height == 5 && b.is_finalized)
             .expect("a finalized block at height 5");
         assert!(!finalized_block.is_best_chain);
-        for height in 4..=8 {
+        for height in 4..=9 {
             assert!(
                 at_height(&scene, height).iter().any(|b| !b.is_best_chain),
                 "the abandoned branch is still drawn at height {height}"

@@ -155,6 +155,30 @@ impl ZebraDb {
 
 }
 
+
+/// Sum active bonds by target finalizer, then add each finalizer's own reward bank (a virtual
+/// bond on itself).
+///
+/// The one definition of the validator set at a block. The finalized path builds its inputs from
+/// the database plus the committing batch's own writes; `Chain` builds them from the bond state
+/// it carries along its own branch. Both add up here, so a roster read answers the same on
+/// either side of the finalized tip (FINALITY.md §8.1).
+pub(crate) fn aggregate_stakes(
+    active_bonds: impl IntoIterator<Item = ([u8; 32], u64)>,
+    banks: impl IntoIterator<Item = ([u8; 32], u64)>,
+) -> Vec<([u8; 32], u64)> {
+    let mut stakes_by_finalizer: HashMap<[u8; 32], u64> = HashMap::new();
+    for (finalizer, amount) in active_bonds {
+        *stakes_by_finalizer.entry(finalizer).or_insert(0) += amount;
+    }
+    for (finalizer, bank) in banks {
+        if bank != 0 {
+            *stakes_by_finalizer.entry(finalizer).or_insert(0) += bank;
+        }
+    }
+    stakes_by_finalizer.into_iter().collect()
+}
+
 /// The last value a block's batch writes per bond key, per bond column family.
 ///
 /// [`DiskWriteBatch::prepare_aggregated_stakes_batch`] lays these over the database's
@@ -301,7 +325,8 @@ impl DiskWriteBatch {
         hash: block::Hash,
         overlay: &BondBatchOverlay,
     ) {
-        let mut stakes_by_finalizer: HashMap<[u8; 32], u64> = HashMap::new();
+        let mut active_bonds: Vec<([u8; 32], u64)> = Vec::new();
+        let mut banks: Vec<([u8; 32], u64)> = Vec::new();
 
         let mut unseen: HashSet<BondKey> = overlay
             .bonds
@@ -316,7 +341,7 @@ impl DiskWriteBatch {
             if status.is_active() {
                 let bond = overlay.bonds.get(&key).unwrap_or(&bond);
                 let amount: u64 = bond.amount.into();
-                *stakes_by_finalizer.entry(bond.target_finalizer).or_insert(0) += amount;
+                active_bonds.push((bond.target_finalizer, amount));
             }
         }
 
@@ -343,23 +368,21 @@ impl DiskWriteBatch {
                 continue;
             };
             let amount: u64 = bond.amount.into();
-            *stakes_by_finalizer.entry(bond.target_finalizer).or_insert(0) += amount;
+            active_bonds.push((bond.target_finalizer, amount));
         }
 
         for (finalizer, bank) in db.all_finalizer_rewards() {
             let bank = overlay.banks.get(&finalizer).copied().unwrap_or(bank);
-            if bank != 0 {
-                *stakes_by_finalizer.entry(finalizer).or_insert(0) += bank;
-            }
+            banks.push((finalizer, bank));
         }
         for (finalizer, bank) in &overlay.banks {
             // banks first credited in this block have no db row yet
-            if *bank != 0 && !db.finalizer_reward_by_key_cf().zs_contains(finalizer) {
-                *stakes_by_finalizer.entry(*finalizer).or_insert(0) += bank;
+            if !db.finalizer_reward_by_key_cf().zs_contains(finalizer) {
+                banks.push((*finalizer, *bank));
             }
         }
 
-        let aggregated: Vec<([u8; 32], u64)> = stakes_by_finalizer.into_iter().collect();
+        let aggregated = aggregate_stakes(active_bonds, banks);
         let cf = db.db.cf_handle(AGGREGATED_STAKES_BY_HASH).unwrap();
         self.zs_insert(&cf, hash, AggregatedStakes(aggregated));
     }

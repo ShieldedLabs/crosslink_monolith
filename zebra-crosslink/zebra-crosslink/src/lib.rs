@@ -287,7 +287,7 @@ async fn _block_prev_hash_from_hash(call: &TFLServiceCalls, hash: ZebBlockHash) 
 async fn tfl_final_block_height_hash(
     internal_handle: &TFLServiceHandle,
 ) -> Option<(ZebBlockHeight, ZebBlockHash)> {
-    zebra_state::new_network::bft::bft_chain().read().unwrap().latest_final_block
+    zebra_state::new_network::fin::fin()
 }
 
 // NAME: rng_sk_pk_from_addr
@@ -671,11 +671,7 @@ async fn tfl_service_incoming_request(
         )),
 
         TFLServiceRequest::FinalBlockRx => Ok(TFLServiceResponse::FinalBlockRx(
-            zebra_state::new_network::bft::bft_chain().read().unwrap().final_change_tx.subscribe(),
-        )),
-
-        TFLServiceRequest::SetFinalBlockHash(hash) => Ok(TFLServiceResponse::SetFinalBlockHash(
-            tfl_set_finality_by_hash(internal_handle.clone(), hash).await,
+            zebra_state::new_network::fin::fin_change_rx(),
         )),
 
         TFLServiceRequest::BlockFinalityStatus(height, hash) => {
@@ -817,16 +813,6 @@ async fn tfl_service_incoming_request(
 
         TFLServiceRequest::WalletUfvk => Ok(TFLServiceResponse::WalletUfvk(wallet::USER_UFVK_STRING.lock().unwrap().clone())),
     }
-}
-
-async fn tfl_set_finality_by_hash(
-    internal_handle: TFLServiceHandle,
-    hash: ZebBlockHash,
-) -> Option<ZebBlockHeight> {
-    // ALT: Result with no success val?
-    // TODO: sanity checks
-    let height = block_height_from_hash(&internal_handle.call, hash).await?;
-    zebra_state::new_network::bft::set_final_block_if_activated(height, hash).then_some(height)
 }
 
 trait SatSubAffine<D> {

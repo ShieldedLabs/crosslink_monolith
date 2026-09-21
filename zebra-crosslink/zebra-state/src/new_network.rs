@@ -14,6 +14,7 @@ use tenderlink::{dbg_panic, dbg_verify};
 
 mod checkpoint;
 pub mod bft;
+pub mod fin;
 use checkpoint::Checkpoint;
 
 // ---------------------------------------------------------------------------
@@ -1182,45 +1183,6 @@ pub enum IngestOutcome {
     },
 }
 
-/// A crosslink-finalization request, with a channel for the result.
-///
-/// BFT finalization used to reach the write task through the state service. new_network owns
-/// the writer now, so the request comes here instead. This is the narrow version of routing BFT
-/// through new_network -- it moves the finalize call, not the chain sync.
-pub struct CrosslinkFinalizeRequest {
-    pub hash: Hash,
-    pub reply: tokio::sync::oneshot::Sender<Result<Hash, String>>,
-}
-
-static CROSSLINK_FINALIZE_SENDER: std::sync::OnceLock<
-    tokio::sync::mpsc::Sender<CrosslinkFinalizeRequest>,
-> = std::sync::OnceLock::new();
-
-/// Ask new_network to crosslink-finalize `hash`, and wait for the result.
-pub async fn crosslink_finalize_via_new_network(
-    hash: Hash,
-    timeout: std::time::Duration,
-) -> Result<Hash, String> {
-    let Some(tx) = CROSSLINK_FINALIZE_SENDER.get() else {
-        return Err("new_network is not running".to_string());
-    };
-
-    let permit = match tokio::time::timeout(timeout, tx.reserve()).await {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(_)) => return Err("new_network stopped accepting finalizations".to_string()),
-        Err(_) => return Err("timed out waiting for the finalize queue".to_string()),
-    };
-
-    let (reply, rx) = tokio::sync::oneshot::channel();
-    permit.send(CrosslinkFinalizeRequest { hash, reply });
-
-    match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("new_network dropped the finalize reply channel".to_string()),
-        Err(_) => Err("timed out waiting for the finalize result".to_string()),
-    }
-}
-
 /// A block submitted from outside new_network, with a channel for the verdict.
 pub struct BlockSubmission {
     pub block: std::sync::Arc<Block>,
@@ -1317,9 +1279,6 @@ pub fn sync(
 ) {
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::channel(BLOCK_SUBMISSION_QUEUE_LEN);
     let _ = BLOCK_SUBMISSION_SENDER.set(submit_tx);
-
-    let (finalize_tx, mut finalize_rx) = tokio::sync::mpsc::channel(64);
-    let _ = CROSSLINK_FINALIZE_SENDER.set(finalize_tx);
 
     // Commit genesis before anything waits on a tip. This loop owns the writer, so nothing else
     // can do it -- and `get_tips_blocking` below spins until a finalized tip exists, which would
@@ -1518,35 +1477,6 @@ pub fn sync(
                     }
                 }
                 *PEER_ATTESTED_BLOCKS.lock().unwrap() = attested;
-            }
-        }
-
-        // Crosslink finalization: the BFT side asks, this loop performs it. It used to reach
-        // the write task through the state service, which can no longer reach the writer.
-        loop {
-            match finalize_rx.try_recv() {
-                Ok(CrosslinkFinalizeRequest { hash, reply }) => {
-                    // Only finalize blocks we actually hold. Finalizing anything else would push
-                    // finalized_height past the best-chain tip and violate the
-                    // finalized_height <= tip_height invariant. Replying with an error stalls the
-                    // BFT decision (the caller retries forever) while PoW proceeds.
-                    let held = block_writer.non_finalized_state.any_chain_contains(&hash)
-                            || block_writer.finalized_state.db.contains_hash(hash);
-
-                    let result = if held {
-                        block_writer
-                            .handle_crosslink_finalize(hash)
-                            .map_err(|err| format!("{err:?}"))
-                    } else {
-                        Err(format!(
-                            "BFT finalized {hash}, which we do not have; stalling finalization"
-                        ))
-                    };
-
-                    let _ = reply.send(result);
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(err) => { tracing::error!("crosslink finalize queue: {err:?}"); break; }
             }
         }
 

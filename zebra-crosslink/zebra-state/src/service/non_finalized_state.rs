@@ -281,9 +281,29 @@ impl NonFinalizedState {
 
         chain_filter(&mut self.chain_set);
 
+        // The chain holding `bft_final_snapshot` is exempt: dropping it would lose the only copy
+        // of a block Π_bft has decided, which this node may still have to switch to
+        // (FINALITY.md §4.3). Every other chain is still dropped lowest-work first, so the
+        // exemption costs at most one extra chain.
+        let decided = crate::new_network::bft::bft_chain()
+            .read()
+            .unwrap()
+            .bft_final_snapshot
+            .map(|(_, hash)| hash);
+
         while self.chain_set.len() > MAX_NON_FINALIZED_CHAIN_FORKS {
-            // The first chain is the chain with the lowest work.
-            self.chain_set.pop_first();
+            // The chains are ordered by work, so the first one that may be dropped is the
+            // lowest-work chain that does not hold the decided block.
+            let drop_me = self
+                .chain_set
+                .iter()
+                .find(|chain| decided.map_or(true, |hash| !chain.contains_block_hash(hash)))
+                .cloned();
+
+            // Every remaining chain holds the decided block, so none of them may be dropped.
+            let Some(drop_me) = drop_me else { break };
+
+            self.chain_set.remove(&drop_me);
         }
 
         self.update_metrics_bars();
@@ -760,6 +780,37 @@ impl NonFinalizedState {
                     .contains_key(orchard_nullifier)
             })
             .unwrap_or(false)
+    }
+
+    /// The validator set as of `hash`, from whichever held chain carries that block.
+    ///
+    /// A roster read for a block above the finalized tip answers from here; below it, from the
+    /// database. The two agree because both aggregate the same way (FINALITY.md §8.1).
+    pub fn aggregated_stakes_at(&self, hash: block::Hash) -> Option<Vec<([u8; 32], u64)>> {
+        self.chain_set
+            .iter()
+            .rev()
+            .find_map(|chain| chain.aggregated_stakes_at(hash))
+    }
+
+    /// Whether committing `block` would leave `decided` on no chain this node holds.
+    ///
+    /// Committing a block drops every chain that does not hold it, so the answer is yes exactly
+    /// when some chain holds `decided` and none of those chains holds `block`. A `decided` block
+    /// this node has never seen is not protected here: there is no chain to keep.
+    pub fn commit_would_drop(&self, decided: block::Hash, block: block::Hash) -> bool {
+        let mut held = false;
+
+        for chain in &self.chain_set {
+            if chain.contains_block_hash(decided) {
+                if chain.contains_block_hash(block) {
+                    return false;
+                }
+                held = true;
+            }
+        }
+
+        held
     }
 
     /// Return the non-finalized portion of the current best chain.

@@ -72,8 +72,9 @@ pub struct BftChain {
     pub roster: Vec<RosterMember>,
     /// True once tenderlink is running.
     pub is_activated: bool,
-    pub latest_final_block: Option<(Height, Hash)>,
-    pub final_change_tx: tokio::sync::broadcast::Sender<(Height, Hash)>,
+    /// The snapshot of the last decided bft-block: what `Π_bft` has finalized, which is not
+    /// necessarily on this node.s best chain and is never the node.s own `fin` (FINALITY.md §2).
+    pub bft_final_snapshot: Option<(Height, Hash)>,
     pub peer_strings: Vec<String>,
 }
 
@@ -84,8 +85,7 @@ static BFT_CHAIN: LazyLock<RwLock<BftChain>> = LazyLock::new(|| {
         fat_pointer_to_tip: FatPointerToBftBlock::null(),
         roster: Vec::new(),
         is_activated: false,
-        latest_final_block: None,
-        final_change_tx: tokio::sync::broadcast::channel(16).0,
+        bft_final_snapshot: None,
         peer_strings: Vec::new(),
     })
 });
@@ -101,22 +101,6 @@ static RECENCY_STATUS: LazyLock<tokio::sync::watch::Sender<TFLRecencyStatus>> =
 /// Tenderlink's latest round-state snapshot.
 pub fn bft_recency_status() -> TFLRecencyStatus {
     RECENCY_STATUS.borrow().clone()
-}
-
-/// Set the final block by hand, for the debug `SetFinalBlockHash` request. Refused before BFT is
-/// running, when there is no finality to override.
-pub fn set_final_block_if_activated(height: Height, hash: Hash) -> bool {
-    let mut chain = BFT_CHAIN.write().unwrap();
-    if !chain.is_activated {
-        return false;
-    }
-    set_final_block(&mut chain, height, hash);
-    true
-}
-
-fn set_final_block(chain: &mut BftChain, height: Height, hash: Hash) {
-    chain.latest_final_block = Some((height, hash));
-    let _ = chain.final_change_tx.send((height, hash));
 }
 
 /// What tenderlink (and the test harness) ask the sync thread.
@@ -546,8 +530,8 @@ pub fn fat_pointer_for_template(
         .unwrap_or_else(FatPointerToBftBlock::null)
 }
 
-/// A decision whose snapshot could not be finalized yet. Retried every tick; the reply waits.
-struct ParkedDecision {
+/// A decided bft-block, on its way to being recorded and answered.
+struct DecidedBlock {
     new_final_hash: Hash,
     new_final_height: Height,
     block: BftBlock,
@@ -571,7 +555,6 @@ pub(super) struct BftRunner {
     /// Held until BFT starts (a loaded chain, or the bootstrap genesis); `None` once tenderlink
     /// is spawned, or when this node runs no BFT at all.
     launch: Option<BftLaunch>,
-    parked: Option<ParkedDecision>,
     /// A bootstrap genesis that has been decided but whose commit has not finished yet, so
     /// tenderlink cannot be started from it. Waiting on the reply here would freeze the sync
     /// thread, which is the only thread that can retry the commit.
@@ -603,10 +586,10 @@ impl BftRunner {
             params: read_state.network().crosslink_parameters(),
             hardforks: config.hardfork_schedule.clone(),
             launch,
-            parked: None,
             pending_bootstrap: None,
             next_diagnostic: std::time::Instant::now(),
         };
+        crate::new_network::fin::load(&block_writer.finalized_state.db);
         if runner.launch.is_some() {
             runner.restore(read_state, block_writer);
         }
@@ -615,8 +598,6 @@ impl BftRunner {
 
     /// Work that runs at the start of every tick.
     pub(super) fn tick(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
-        self.retry_parked(block_writer);
-
         // Crosslink bootstrap: the first accepted PoW block at the activation height (h2)
         // finalizes h1 through a deterministic genesis decision, and BFT starts at height 1 with
         // h1's roster. A network whose BFT is supplied has no activation height and never
@@ -630,7 +611,7 @@ impl BftRunner {
 
         if self.next_diagnostic.elapsed() >= DIAGNOSTIC_INTERVAL {
             self.next_diagnostic = std::time::Instant::now();
-            let latest_final = BFT_CHAIN.read().unwrap().latest_final_block;
+            let latest_final = BFT_CHAIN.read().unwrap().bft_final_snapshot;
             if let (Some((tip_height, _)), Some((final_height, _))) = (read_state.best_tip(), latest_final) {
                 if tip_height < final_height {
                     tracing::info!("Our PoW tip is {} blocks away from the latest final block.", final_height - tip_height);
@@ -651,12 +632,6 @@ impl BftRunner {
             if now >= deadline {
                 return;
             }
-            // A parked decision blocks the queue: tenderlink waits on its reply, and a force-fed
-            // block behind it must see it finished first.
-            if self.parked.is_some() {
-                std::thread::sleep(deadline - now);
-                return;
-            }
             match self.rx.recv_timeout(deadline - now) {
                 Ok(request) => self.handle(request, read_state, block_writer),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return,
@@ -669,7 +644,7 @@ impl BftRunner {
     }
 
     fn drain(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
-        while self.parked.is_none() {
+        loop {
             match self.rx.try_recv() {
                 Ok(request) => self.handle(request, read_state, block_writer),
                 Err(_) => break,
@@ -734,7 +709,7 @@ impl BftRunner {
         let finality_candidate_height = Height(tip_height.0 - sigma as u32);
 
         let chain = BFT_CHAIN.read().unwrap();
-        let latest_final_block = chain.latest_final_block;
+        let bft_final_snapshot = chain.bft_final_snapshot;
         // The parent bft-block's snapshot, for the Linearity check below. A parent carrying no
         // headers is a placeholder from out-of-order ingest and names no snapshot.
         let parent_snapshot_hash = chain
@@ -750,11 +725,11 @@ impl BftRunner {
         let parent_do_not_include = chain.blocks.last().map_or(0, |p| p.do_not_include_until_bc_height);
         drop(chain);
 
-        let is_improved_final = latest_final_block.map_or(true, |(h, _)| finality_candidate_height > h);
+        let is_improved_final = bft_final_snapshot.map_or(true, |(h, _)| finality_candidate_height > h);
         if !is_improved_final {
             tracing::info!(
                 "candidate block can't be final: height {}, final height: {:?}",
-                finality_candidate_height.0, latest_final_block
+                finality_candidate_height.0, bft_final_snapshot
             );
             return None;
         }
@@ -766,7 +741,7 @@ impl BftRunner {
         // what block validity actually requires, so the departure costs finality speed rather
         // than validity.
         let finality_candidate_height = Height(
-            finality_candidate_height.0.min(latest_final_block.map_or(u32::MAX, |(h, _)| h.0 + 40)),
+            finality_candidate_height.0.min(bft_final_snapshot.map_or(u32::MAX, |(h, _)| h.0 + 40)),
         );
 
         let Some(candidate_hash) = read_state.best_chain_block_hash(finality_candidate_height) else {
@@ -1088,37 +1063,31 @@ impl BftRunner {
         chain.hash_to_height.insert(new_block.blake3_hash(), insert_i as u64);
         chain.blocks[insert_i] = new_block.clone();
         chain.fat_pointer_to_tip = fat_pointer.clone();
-        set_final_block(&mut chain, new_final_height, new_final_hash);
+        chain.bft_final_snapshot = Some((new_final_height, new_final_hash));
         drop(chain);
 
-        self.parked = Some(ParkedDecision { new_final_hash, new_final_height, block: new_block, fat_pointer, proposal_sigs, reply });
-        self.retry_parked(block_writer);
+        // A decision no longer commits. It advances `bft_final_snapshot`, which may name a block
+        // on a chain that is not `bc_best`; `fin` moves only where the best chain changes, and
+        // only by the §3.2 rule (FINALITY.md §4.3).
+        self.finish_decision(
+            DecidedBlock { new_final_hash, new_final_height, block: new_block, fat_pointer, proposal_sigs, reply },
+            block_writer,
+        );
     }
 
-    /// Finalize the parked decision's snapshot; on success finish the decision and reply.
-    fn retry_parked(&mut self, block_writer: &mut WriteBlockWorkerTask) {
-        let Some(parked) = self.parked.as_ref() else { return; };
-        match block_writer.handle_crosslink_finalize(parked.new_final_hash) {
-            Ok(hash) => {
-                tracing::info!("Successfully crosslink-finalized {}", hash);
-                let parked = self.parked.take().unwrap();
-                self.finish_decision(parked, block_writer);
-            }
-            Err(err) => {
-                tracing::error!("could not crosslink-finalize {}: {err:?}; retrying next tick", parked.new_final_hash);
-            }
-        }
-    }
-
-    fn finish_decision(&mut self, decision: ParkedDecision, block_writer: &mut WriteBlockWorkerTask) {
-        let ParkedDecision { new_final_hash, new_final_height, block, fat_pointer, proposal_sigs, reply } = decision;
+    fn finish_decision(&mut self, decision: DecidedBlock, block_writer: &mut WriteBlockWorkerTask) {
+        let DecidedBlock { new_final_hash, new_final_height, block, fat_pointer, proposal_sigs, reply } = decision;
         let hardforks = self.hardforks.rules();
 
         // The roster the next height votes with is the stake at this block's snapshot, read from
         // the chain rather than taken from the finalize result (FINALITY.md §7). The finalize
         // above put the snapshot in the finalized database, which is the only place that holds
         // aggregated stakes.
-        let got_stakes = block_writer.finalized_state.db.aggregated_stakes(&new_final_hash).unwrap_or_default();
+        let got_stakes = block_writer
+            .non_finalized_state
+            .aggregated_stakes_at(new_final_hash)
+            .or_else(|| block_writer.finalized_state.db.aggregated_stakes(&new_final_hash))
+            .unwrap_or_default();
 
         let mut chain = BFT_CHAIN.write().unwrap();
         if !got_stakes.is_empty() {
@@ -1162,9 +1131,14 @@ impl BftRunner {
         let roster = tenderlink_roster_from_internal(&chain.roster, &terminated);
         drop(chain);
 
-        // The decision is stored after its snapshot commits, so a crash in between leaves the
-        // BFT chain one height short and that height is decided again on the next run. It is
-        // also stored after the chain lock is dropped, so readers never wait on a disk write.
+        tracing::info!(
+            "Successfully decided BFT block at height {} finalizing {}",
+            block.height, new_final_hash,
+        );
+
+        // The decision is stored after the chain lock is dropped, so readers never wait on a
+        // disk write. A crash before the row lands leaves the BFT chain one height short and
+        // that height is decided again on the next run.
         if let Err(err) = block_writer.finalized_state.db.write_bft_decision(
             block.height,
             &block,
@@ -1254,7 +1228,11 @@ impl BftRunner {
                 if let Some(known) = read_state.known_block(snapshot) {
                     prev_finalized_bc_height = known.height.0 as u64;
                 }
-                let stakes = block_writer.finalized_state.db.aggregated_stakes(&snapshot).unwrap_or_default();
+                let stakes = block_writer
+                    .non_finalized_state
+                    .aggregated_stakes_at(snapshot)
+                    .or_else(|| block_writer.finalized_state.db.aggregated_stakes(&snapshot))
+                    .unwrap_or_default();
                 // Empty stakes are the ghost roster of `finish_decision`: the previous roster is
                 // carried forward rather than replaced, so replay reproduces what voted.
                 if !stakes.is_empty() {
@@ -1305,7 +1283,7 @@ impl BftRunner {
             chain.blocks = blocks;
             chain.fat_pointer_to_tip = fat_pointer_to_tip;
             if new_final_hash != Hash([0; 32]) {
-                set_final_block(&mut chain, new_final_height, new_final_hash);
+                chain.bft_final_snapshot = Some((new_final_height, new_final_hash));
             }
         }
 

@@ -166,6 +166,11 @@ pub struct ChainInner {
     /// twin of `bond_rewards`, for exact reverting.
     pub(crate) finalizer_commissions: Vec<Vec<([u8; 32], u64)>>,
 
+    /// The validator set as of each block in this chain, indexed the same way, from the same
+    /// aggregation the finalized path uses. A roster read at a block this chain holds but the
+    /// finalized state does not answers from here (FINALITY.md §8.1).
+    pub(crate) aggregated_stakes: Vec<Vec<([u8; 32], u64)>>,
+
     /// Pre-block target finalizers for bonds that were retargeted at each block height.
     /// Indexed by block position in the chain (0 = first non-finalized block).
     /// Stores the target finalizer BEFORE the retarget, so we can restore it on revert.
@@ -364,6 +369,7 @@ impl Chain {
             bond_rewards: Vec::new(),
             finalizer_rewards: finalized_finalizer_rewards.into_iter().collect(),
             finalizer_commissions: Vec::new(),
+            aggregated_stakes: Vec::new(),
             bond_retargets: Vec::new(),
             bond_burns: Vec::new(),
             sprout_anchors: MultiSet::new(),
@@ -501,6 +507,10 @@ impl Chain {
         } else {
             Vec::new()
         };
+
+        if !self.aggregated_stakes.is_empty() {
+            self.aggregated_stakes.remove(0);
+        }
 
         // Discard bond retargets for this block (not needed for finalized state)
         if !self.bond_retargets.is_empty() {
@@ -654,6 +664,16 @@ impl Chain {
         let hash = self.blocks.get(&height)?.hash;
 
         Some(hash)
+    }
+
+    /// The validator set as of `hash`, if this chain holds that block.
+    ///
+    /// The per-block vector is indexed from this chain's root, the same way `bond_rewards` is.
+    pub fn aggregated_stakes_at(&self, hash: block::Hash) -> Option<Vec<([u8; 32], u64)>> {
+        let height = self.height_by_hash(hash)?;
+        let root_height = *self.blocks.keys().next()?;
+        let index = height.0.checked_sub(root_height.0)? as usize;
+        self.aggregated_stakes.get(index).cloned()
     }
 
     /// Returns the [`Height`] for `hash`, if it exists in this chain.
@@ -2194,6 +2214,17 @@ impl Chain {
             self.bond_rewards.push(bond_rewards);
             self.finalizer_commissions.push(commissions);
         }
+
+        // The validator set as of this block, taken once its bond state is final. `Chain` is the
+        // only place that knows it for a block the finalized state does not hold yet.
+        let stakes = crate::service::finalized_state::zebra_db::delegation::aggregate_stakes(
+            self.delegation_bonds
+                .values()
+                .filter(|(_, status)| matches!(status, BondStatusInChain::Active))
+                .map(|(bond, _)| (bond.target_finalizer, u64::from(bond.amount))),
+            self.finalizer_rewards.iter().map(|(finalizer, bank)| (*finalizer, *bank)),
+        );
+        self.aggregated_stakes.push(stakes);
         Ok(())
     }
 
@@ -2300,6 +2331,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
             // Block being finalized - rewards already extracted by pop_root, nothing to do here
         } else {
             // Block being reverted from tip, reverse the rewards
+            self.aggregated_stakes.pop();
             let rewards = self.bond_rewards.pop().expect("rewards must exist for tip block");
             for (bond_key, reward_amount) in rewards {
                 // Subtract reward from bond amount

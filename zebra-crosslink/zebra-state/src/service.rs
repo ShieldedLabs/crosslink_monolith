@@ -838,24 +838,6 @@ impl Service<Request> for StateService {
                 .boxed()
             }
 
-            // BFT finalization is routed to new_network, which owns the block writer.
-            Request::CrosslinkFinalizeBlock(finalized) => {
-
-                // Await the channel response, flatten the result, map receive errors to
-                // `CommitCheckpointVerifiedError::WriteTaskExited`.
-                // Then flatten the nested Result and convert any errors to a BoxError.
-                async move {
-                    crate::new_network::crosslink_finalize_via_new_network(
-                        finalized,
-                        std::time::Duration::from_secs(30),
-                    )
-                    .await
-                    .map(Response::CrosslinkFinalized)
-                    .map_err(BoxError::from)
-                }
-                .boxed()
-            }
-
             Request::AwaitUtxo(outpoint) => {
                 let timer = CodeTimer::start();
                 // Prepare the AwaitUtxo future from PendingUxtos.

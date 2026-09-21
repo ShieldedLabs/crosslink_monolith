@@ -44,10 +44,6 @@ pub enum Response {
     /// Response to [`Request::Depth`] with the depth of the specified block.
     Depth(Option<u32>),
 
-    /// Response to [`Request::CrosslinkFinalizeBlock`]
-    /// Contains the finalized block hash and an array of (target_finalizer, total_stake) for all active bonds
-    CrosslinkFinalized(block::Hash),
-
     /// Response to [`Request::Tip`] with the current best chain tip.
     //
     // TODO: remove this request, and replace it with a call to

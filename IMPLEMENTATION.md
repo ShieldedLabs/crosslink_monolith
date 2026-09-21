@@ -5,7 +5,7 @@ code to it. Each stage names the FINALITY.md sections it implements, the code it
 the condition under which it is done. Where this file and FINALITY.md disagree, FINALITY.md is
 right and this file is corrected.
 
-Stages 1 to 6 are done. Stages 7 and 8 move the rest of the finality state out of
+Stages 1 to 7 are done. Stage 8 moves the rest of the finality state out of
 `zebra-crosslink/zebra-crosslink` into `zebra-state` (FINALITY.md §7.1), each of them for a race
 or a coupling that the crate boundary creates; they leave the crate holding no finality state.
 Stage 9 then gives the node the second chain state that FINALITY.md §4.3 requires, so that a BFT
@@ -326,14 +326,17 @@ path, and with it the coupling that makes BFT progress wait on a finalized-state
 
 Two test consequences, neither a workaround:
 
-- `crosslink_pow_switch_to_finalized_chain_fork_even_though_longer_chain_exists` asserts the
+- `crosslink_pow_switch_to_finalized_chain_fork_even_though_longer_chain_exists` asserted the
   collapse onto a decided branch. Under §4.3 the node instead keeps the branch containing `fin`,
   follows the heavier chain when `fin` is below the fork, and waits for a chain containing
-  `snapshot(B)` to become best again before finality resumes (§3.4). The test is rewritten to
-  that behavior: it is the only test of the fork-choice floor.
-- Last Final Snapshot becomes testable. FINALITY.md §8.1 records that it cannot be tested while
-  the decide path commits every snapshot, because the violating block's parent is gone before
-  the block can be offered. This stage removes that, and adds the test.
+  `snapshot(B)` to become best again before finality resumes (§3.4). It is rewritten to that
+  behavior as
+  `crosslink_pow_follows_the_heaviest_chain_until_fin_moves_to_the_decided_branch`: it is the
+  only test of the fork-choice floor.
+- Last Final Snapshot becomes testable. FINALITY.md §8.1 recorded that it could not be tested
+  while the decide path committed every snapshot, because the violating block's parent was gone
+  before the block could be offered. This stage removes that, and adds
+  `crosslink_reject_pow_block_citing_a_snapshot_off_its_own_chain`.
 
 Either test may want something the test format cannot express, such as waiting for a chain
 containing `snapshot(B)` to become best again. Where it does, the stage reports the gap and moves

@@ -45,8 +45,8 @@ pub mod column_family;
 
 mod disk_db;
 pub(crate) mod disk_format;
-mod zebra_db;
-pub use zebra_db::{bft, slashing};
+pub(crate) mod zebra_db;
+pub use zebra_db::{bft, fin, slashing};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
@@ -121,6 +121,8 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "bft_block_by_height",
     "bft_fat_pointer_by_height",
     "bft_proposal_sigs_by_height",
+    // The node-local finalized marker.
+    "crosslink_fin",
     // Legacy slash-index column families, empty and unused since Retarget actions
     // began carrying their `from` finalizer (burn sets are computed lazily at
     // activation now); still registered so existing databases open.

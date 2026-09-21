@@ -27,7 +27,7 @@ fail() { echo "FAIL: $*"; FAIL=1; }
 sample() {
   for n in 0 1; do
     L=$(logs $n)
-    echo "$(date +%T) node$n tip=$(tip $n) fin=$(rpc $n get_tfl_final_block_height_and_hash | jq -r '.result.height // "-"') decided=$(echo "$L" | grep -c 'Successfully crosslink-finalized') payouts=$(echo "$L" | grep -c 'PoS payout decision.*payout=true') advanced=$(echo "$L" | grep -c 'cert_advanced=true') errors=$(echo "$L" | grep -c ' ERROR ')"
+    echo "$(date +%T) node$n tip=$(tip $n) fin=$(rpc $n get_tfl_final_block_height_and_hash | jq -r '.result.height // "-"') decided=$(echo "$L" | grep -c 'Successfully decided BFT block') payouts=$(echo "$L" | grep -c 'PoS payout decision.*payout=true') advanced=$(echo "$L" | grep -c 'cert_advanced=true') errors=$(echo "$L" | grep -c ' ERROR ')"
   done
 }
 stop_nodes() {
@@ -85,7 +85,7 @@ staked=$(tip 0); log "positions: $(rpc 0 wallet_staking_positions | jq -c '.resu
 
 #-- mine to the restart point, restart both nodes against the same state, then mine on to TARGET
 restart_nodes() {
-  for k in 0 1; do DEC_BEFORE[$k]=$(logs $k | grep -c "Successfully crosslink-finalized"); done
+  for k in 0 1; do DEC_BEFORE[$k]=$(logs $k | grep -c "Successfully decided BFT block"); done
   BEFORE=$(tip 0); echo "$(date +%T) restart: stopping both nodes at tip $BEFORE"
   stop_nodes
   for p in "${PID[@]}"; do
@@ -99,7 +99,7 @@ restart_nodes() {
   PID=()
   for k in 0 1; do start_node $k; done
   # The tip is not expected back at $BEFORE here: a hard kill drops whatever the non-finalized
-  # state held above the crosslink-finalized height, and node 0 re-mines it in `mine_to`.
+  # state held above the committed height, and node 0 re-mines it in `mine_to`.
   for k in 0 1; do until [ "$(tip $k)" -gt 0 ]; do sleep 2; done; done
   echo "$(date +%T) restart: both nodes back at tip $(tip 0)"
 }
@@ -134,7 +134,7 @@ for k in 0 1; do
   # One decision may have committed without its row being written, so the resumed height is
   # allowed to be one short of what the pre-restart log counted.
   [ -z "$h" ] || [ "$h" -ge $(( ${DEC_BEFORE[$k]} - 1 )) ] || fail "node$k resumed BFT at height $h, behind the ${DEC_BEFORE[$k]} blocks it had decided"
-  after=$(echo "$P" | grep -c "Successfully crosslink-finalized")
+  after=$(echo "$P" | grep -c "Successfully decided BFT block")
   [ "$after" -ge 1 ] || fail "node$k decided no BFT blocks after the restart"
 done
 [ -z "$(find "$OUT" -name pos.chain 2>/dev/null)" ] || fail "a PoS store file still exists under $OUT"
@@ -144,7 +144,7 @@ for k in 0 1; do
   echo "$L" | grep -q "empty roster" && fail "node$k has an empty bootstrap roster"
   bad=$(echo "$L" | grep ' ERROR ' | grep -vc 'not yet implemented: all the documented validations')
   [ "$bad" = 0 ] || fail "node$k logged $bad unexpected ERROR lines"
-  dec=$(echo "$L" | grep -c 'Successfully crosslink-finalized'); need=$(( (TARGET - ACTIVATION_HEIGHT) / 4 ))
+  dec=$(echo "$L" | grep -c 'Successfully decided BFT block'); need=$(( (TARGET - ACTIVATION_HEIGHT) / 4 ))
   [ "$dec" -ge "$need" ] || fail "node$k decided $dec BFT blocks, expected at least $need"
   fin=$(rpc $k get_tfl_final_block_height_and_hash | jq -r '.result.height // 0')
   [ $((T0 - fin)) -le 40 ] || fail "node$k final height $fin lags tip $T0 by more than 40"

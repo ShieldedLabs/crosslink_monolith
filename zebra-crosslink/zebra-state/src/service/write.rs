@@ -18,7 +18,7 @@ use zebra_chain::{
 };
 
 use crate::{
-    constants::MAX_BLOCK_REORG_HEIGHT,
+    constants::{CONFLICT_HOLD_DEPTH, MAX_BLOCK_REORG_HEIGHT},
     service::{
         check,
         finalized_state::{FinalizedState, ZebraDb},
@@ -139,6 +139,13 @@ pub struct WriteBlockWorkerTask {
     /// Errors propagated down to queued child blocks: if a parent was rejected, every
     /// descendant is rejected with the same error.
     parent_error_map: IndexMap<block::Hash, ValidateContextError>,
+    /// The best chain tip as of the last commit, so the `fin` update runs on a change of best
+    /// chain rather than on every commit (FINALITY.md §3.2).
+    last_best_tip: Option<block::Hash>,
+
+    /// The decided block this node has already given up following, so the conflict is reported
+    /// once rather than on every commit past it.
+    conflict_abandoned: Option<block::Hash>,
 }
 
 impl WriteBlockWorkerTask {
@@ -167,6 +174,8 @@ impl WriteBlockWorkerTask {
             non_finalized_state_sender,
             prev_finalized_note_commitment_trees: None,
             parent_error_map: IndexMap::new(),
+            last_best_tip: None,
+            conflict_abandoned: None,
         }
     }
 
@@ -207,6 +216,123 @@ impl WriteBlockWorkerTask {
         genesis: std::sync::Arc<zebra_chain::block::Block>,
     ) -> Result<block::Hash, BoxError> {
         self.commit_checkpoint_verified(crate::CheckpointVerifiedBlock::from(genesis))
+    }
+
+    /// Whether the next reorg-depth commit is held because it conflicts with the decided block.
+    ///
+    /// Committing the best chain's root drops every chain that forks below it, so while Π_bft's
+    /// decision sits on a chain that is not the best chain, the commit waits at the fork point:
+    /// this node has to stay able to switch to that decision (FINALITY.md §4.3). The held blocks
+    /// stay in the non-finalized state, so the wait ends [`CONFLICT_HOLD_DEPTH`] blocks past the
+    /// fork; past that the node commits, and can no longer follow the decision.
+    ///
+    /// @Todo: Stage 9 replaces giving up with the persisted hazard record and the recovery it
+    /// drives. Until then the operator is told and the node keeps running; it never resyncs.
+    fn crosslink_conflict_hold(&mut self) -> bool {
+        let Some((decided_height, decided_hash)) = crate::new_network::bft::bft_chain()
+            .read()
+            .unwrap()
+            .bft_final_snapshot
+        else {
+            return false;
+        };
+
+        if self.conflict_abandoned == Some(decided_hash) {
+            return false;
+        }
+
+        // A decided block that is already committed cannot be dropped by a later commit.
+        if self.finalized_state.db.height(decided_hash).is_some() {
+            return false;
+        }
+
+        let Some(best_chain) = self.non_finalized_state.best_chain() else {
+            return false;
+        };
+        let root_hash = best_chain.non_finalized_root_hash();
+        let held_len = best_chain.len() as u32;
+
+        if !self.non_finalized_state.commit_would_drop(decided_hash, root_hash) {
+            return false;
+        }
+
+        if held_len <= MAX_BLOCK_REORG_HEIGHT + CONFLICT_HOLD_DEPTH {
+            tracing::debug!(
+                "holding the commit at {root_hash}: it would drop the chain holding the decided block at height {}",
+                decided_height.0,
+            );
+            return true;
+        }
+
+        self.conflict_abandoned = Some(decided_hash);
+        println!(
+            "crosslink: committing past the block decided at height {} after holding {} blocks; this node can no longer follow that decision",
+            decided_height.0, CONFLICT_HOLD_DEPTH,
+        );
+        tracing::error!(
+            "crosslink: committing past the block decided at height {}; this node can no longer follow that decision",
+            decided_height.0,
+        );
+
+        false
+    }
+
+    /// Advance `fin` if the new best chain offers a candidate above it (FINALITY.md §3.2, §4.3).
+    ///
+    /// A change of best chain is the protocol's trigger, not a BFT decision and not every
+    /// commit: a decision names a snapshot that may sit on a chain this node is not following,
+    /// and only the chain the node actually selected can move its own finalized marker.
+    fn crosslink_update_fin(&mut self) {
+        let sigma = self
+            .finalized_state
+            .network()
+            .crosslink_parameters()
+            .bc_confirmation_depth_sigma;
+
+        let candidate = {
+            let chain = crate::new_network::bft::bft_chain().read().unwrap();
+            crate::new_network::fin::candidate(
+                &chain,
+                &self.non_finalized_state,
+                &self.finalized_state.db,
+                sigma,
+            )
+        };
+        let Some((height, hash)) = candidate else {
+            return;
+        };
+
+        if let Some((fin_height, fin_hash)) = crate::new_network::fin::fin() {
+            // A candidate at or below `fin` is the benign reorg case: keep `fin`, record nothing.
+            if height <= fin_height {
+                return;
+            }
+            // `fin ⪯ N`. Both lie on the best chain, so ancestry reduces to the height test
+            // above plus the best chain still holding `fin` itself at its own height.
+            let holds_fin = self
+                .non_finalized_state
+                .best_chain()
+                .and_then(|c| c.hash_by_height(fin_height))
+                .or_else(|| self.finalized_state.db.hash(fin_height))
+                == Some(fin_hash);
+            if !holds_fin {
+                // The refused switch of FINALITY.md §4.3. Zebra rejects blocks forking below its
+                // finalized tip, so the chain never entered the node's view in the first place.
+                // @Todo: persist the hazard record this stands in for (FINALITY.md §3.2).
+                warn!(
+                    "crosslink fin: a candidate at height {} arrived on a chain that does not hold \
+                     fin at height {}; fin stays where it is",
+                    height.0, fin_height.0,
+                );
+                return;
+            }
+        }
+
+        if let Err(err) = self.handle_crosslink_finalize(hash) {
+            warn!("crosslink fin: could not finalize {} at height {}: {err}", hash, height.0);
+            return;
+        }
+        crate::new_network::fin::advance(&self.finalized_state.db, height, hash);
     }
 
     /// Crosslink-finalize `hash` and everything it implicitly finalizes.
@@ -313,6 +439,10 @@ impl WriteBlockWorkerTask {
             .expect("just successfully inserted a non-finalized block above")
             > MAX_BLOCK_REORG_HEIGHT
         {
+            if self.crosslink_conflict_hold() {
+                break;
+            }
+
             tracing::trace!("finalizing block past the reorg limit");
             let contextually_verified_with_trees = self.non_finalized_state.finalize();
 
@@ -321,6 +451,14 @@ impl WriteBlockWorkerTask {
                         .expect(
                             "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
                         ).1.into();
+        }
+
+        // The protocol's `fin` trigger is a change of best chain, so it runs here rather than on
+        // every commit or on a BFT decision (FINALITY.md §3.2).
+        let best_tip = self.non_finalized_state.best_chain().and_then(|c| c.tip_block()).map(|b| b.hash);
+        if best_tip.is_some() && best_tip != self.last_best_tip {
+            self.last_best_tip = best_tip;
+            self.crosslink_update_fin();
         }
 
         // Update the metrics if semantic and contextual validation passes

@@ -492,25 +492,6 @@ pub trait Rpc {
     #[method(name = "get_tfl_tx_finality_from_hash")]
     async fn get_tfl_tx_finality_from_hash(&self, hash: GetTxHash) -> Option<TFLBlockFinality>;
 
-    /// Specify finalized block for testing
-    /// TODO: Regtest mode only
-    ///
-    /// zcashd reference: none
-    /// method: post
-    /// tags: tfl
-    ///
-    /// ## Example Usage
-    /// ```bash
-    /// curl -X POST -H "Content-Type: application/json" -d \
-    /// '{ "jsonrpc": "2.0", "method": "set_tfl_finality_by_hash", "params": ["000000000ec8908cff52ae51841273e79f08d140b41ae4a4827575ed28b7b34a"], "id": 1 }' \
-    /// http://127.0.0.1:8232
-    /// ```
-    /// *(The `address:port` matches the value in `zebrad.toml > [rpc] > listen_addr`)*
-    ///
-    /// For experimenting, the [`getbestblockhash`](RpcServer::get_best_block_hash) method provides the tip, which won't yet be final.
-    #[method(name = "set_tfl_finality_by_hash")]
-    async fn set_tfl_finality_by_hash(&self, hash: GetBlockHash) -> Result<block::Height>;
-
     /// Placeholder function for subscribing to new final block changes.
     /// (JSON-RPC pub-sub not implemented, as that will be obviated my move to gRPC).
     ///
@@ -576,9 +557,8 @@ pub trait Rpc {
     /// ```
     /// *(The `address:port` matches the value in `zebrad.toml > [rpc] > listen_addr`)*
     ///
-    /// For experimenting, this is easiest to trigger by manually calling the
-    /// [`set_tfl_finality_by_hash`](RpcServer::set_tfl_finality_by_hash) method from another terminal
-    /// for the block hash passed here (e.g. the tip).
+    /// For experimenting, finality advances on its own once BFT is running; mine or wait for the
+    /// block hash passed here to fall behind the tip.
     #[method(name = "notify_tfl_block_becomes_final_by_hash")]
     async fn notify_tfl_block_becomes_final_by_hash(
         &self,
@@ -601,9 +581,8 @@ pub trait Rpc {
     ///
     /// For experimenting, the [`getblock`](RpcServer::get_block) method's result includes transactions.
     ///
-    /// This is easiest to trigger by manually calling the [`set_tfl_finality_by_hash`](RpcServer::set_tfl_finality_by_hash)
-    /// method from another terminal for the block that contains the transaction hash
-    /// passed here (e.g. the tip).
+    /// Finality advances on its own once BFT is running; the transaction becomes final when the
+    /// block holding it falls behind `fin`.
     // TODO: "by_id"?
     #[method(name = "notify_tfl_tx_becomes_final_by_hash")]
     async fn notify_tfl_tx_becomes_final_by_hash(
@@ -2291,42 +2270,6 @@ where
             ret
         } else {
             None
-        }
-    }
-
-    async fn set_tfl_finality_by_hash(&self, hash: GetBlockHash) -> Result<block::Height> {
-        let regtest_override = true;
-        if regtest_override || self.network.is_regtest() {
-            let val = self
-                .tfl_service
-                .clone()
-                .ready()
-                .await
-                .unwrap()
-                .call(TFLServiceRequest::SetFinalBlockHash(hash.0))
-                .await;
-
-            if let Ok(TFLServiceResponse::SetFinalBlockHash(ret)) = val {
-                ret.ok_or_else(|| {
-                    ErrorObject::borrowed(
-                        ErrorCode::MethodNotFound.code(),
-                        "Cannot set finality: TFL is not yet activated",
-                        None,
-                    )
-                })
-            } else {
-                Err(ErrorObject::owned(
-                    ErrorCode::InternalError.code(),
-                    format!("Failed read from: {:?}", val).as_str(),
-                    None::<()>,
-                ))
-            }
-        } else {
-            Err(ErrorObject::borrowed(
-                ErrorCode::MethodNotFound.code(),
-                "Setting finality by fiat is only available on regtest networks",
-                None,
-            ))
         }
     }
 

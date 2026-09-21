@@ -852,9 +852,6 @@ pub enum Request {
     /// documentation for details.
     ///
     /// [0]: (crate::error::CommitCheckpointVerifiedError)
-    /// * [`Response::Depth(Some(depth))`](Response::Depth) if the block is in the best chain;
-    /// * [`Response::Depth(None)`](Response::Depth) otherwise.
-    CrosslinkFinalizeBlock(block::Hash),
 
     /// Computes the depth in the current best chain of the block identified by the given hash.
     ///
@@ -1079,8 +1076,6 @@ impl Request {
         match self {
             Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
-            Request::CrosslinkFinalizeBlock(_) => "crosslink_finalize_block",
-
             Request::AwaitUtxo(_) => "await_utxo",
             Request::Depth(_) => "depth",
             Request::Tip => "tip",
@@ -1510,9 +1505,8 @@ pub enum ReadRequest {
     /// `aggregated_stakes_by_hash` in the finalized database.
     ///
     /// The BFT roster for height `H` is the stakes at `snapshot(B_{H-1})` (FINALITY.md §7).
-    /// Reading them here rather than taking them from the reply to
-    /// [`Request::CrosslinkFinalizeBlock`] keeps the roster a function of a block rather than
-    /// of the act of committing it.
+    /// The roster is a function of a block, not of the act of committing it: nothing reads it
+    /// from a finalization reply (FINALITY.md §8.1).
     ///
     /// Returns
     /// [`ReadResponse::CrosslinkAggregatedStakes(None)`](ReadResponse::CrosslinkAggregatedStakes)
@@ -1725,8 +1719,7 @@ impl TryFrom<Request> for ReadRequest {
             }
 
             Request::CommitSemanticallyVerifiedBlock(_)
-            | Request::CommitCheckpointVerifiedBlock(_)
-            | Request::CrosslinkFinalizeBlock(_) => Err("ReadService does not write blocks"),
+            | Request::CommitCheckpointVerifiedBlock(_) => Err("ReadService does not write blocks"),
 
             Request::AwaitUtxo(_) => Err("ReadService does not track pending UTXOs. \
                      Manually convert the request to ReadRequest::AnyChainUtxo, \
