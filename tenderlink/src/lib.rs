@@ -106,6 +106,8 @@ fn is_timeout(e: std::io::ErrorKind) -> bool{
 pub struct NetworkStats {
     bytes_sent: usize,
     packets_sent: usize,
+    messages_processed: usize,
+    process_time: std::time::Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -1669,6 +1671,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         }
 
         if net_stats_window_start.elapsed() >= 10*ONE_SECOND {
+            // Messages retired per second of time spent in the receive loop, not per wall second.
+            // During a flood this is the service rate the receive queue has to beat the arrival rate with.
+            if net_stats.messages_processed >= 10_000 {
+                let secs = net_stats.process_time.as_secs_f64();
+                println!("{my_port}: receive loop processed {} messages in {:.3}s busy over the last 10s = {:.0} messages/s",
+                         net_stats.messages_processed, secs, net_stats.messages_processed as f64 / secs.max(1e-9));
+            }
             net_stats = NetworkStats::default();
             net_stats_window_start = tokio::time::Instant::now();
         }
@@ -2165,9 +2174,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         let mut connection_keys_to_disconnect = Vec::new();
 
         // READ
-        'process_packets: while messages_received.len() > 0 {
+        let read_start = std::time::Instant::now();
+        net_stats.messages_processed += messages_received.len();
+        'process_packets: while let Some((key, packet)) = messages_received.pop_front() {
             let (connection_key, mut peer, msg) = {
-                let (key, packet) = messages_received.remove(0);
                 let Some(peer) = peers.get_mut(&key)
                 else {
                     continue;
@@ -2558,6 +2568,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 bft_address_map.last_packet_utcs.insert(*pk, chrono::Utc::now().timestamp());
             }
         }
+
+        net_stats.process_time += read_start.elapsed();
 
         current_connections.retain(|(address, _)| !connection_keys_to_disconnect.contains(&address.connection_key()));
 
