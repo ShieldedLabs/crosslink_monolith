@@ -1224,10 +1224,23 @@ pub struct ScanInfo {
     pub coinbases_value: u64,
     pub coinbase_max_height: u32,
 
+    /// Bonds that are not burned; `bonds_value` is their accumulated rewards.
     pub bonds: Vec<ScanBond>,
     pub bonds_value: u64,
 
+    /// Bonds burned by a hardfork slash, kept out of `bonds`, `bonds_value` and `total_value`
+    /// until it is decided how burned stake counts toward issuance.
+    #[serde(default)]
+    pub burned_bonds: Vec<ScanBond>,
+    /// The burned bonds' principal, which the burn destroyed.
+    #[serde(default)]
+    pub burned_bonds_initial_value: u64,
+    /// The rewards the burned bonds had accumulated up to and including their burn block.
+    #[serde(default)]
+    pub burned_bonds_value: u64,
+
     pub max_height_seen: u32,
+    /// `coinbases_value + bonds_value`; burned bonds are not included.
     pub total_value: u64,
 }
 

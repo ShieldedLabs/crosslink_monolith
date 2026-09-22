@@ -71,6 +71,7 @@ mod pending_utxos;
 mod queued_blocks;
 pub(crate) mod read;
 pub mod stake_fixup;
+pub mod staking_replay;
 mod traits;
 pub mod write;
 

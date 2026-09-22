@@ -419,8 +419,8 @@ async fn total_issuance_from_key(
     let t_wall = std::time::Instant::now();
     PROF.reset();
 
-    let mut delegation_bonds = HashMap::new();
-    let mut finalizer_rewards: HashMap<[u8; 32], u64> = HashMap::new();
+    let hardfork_schedule = zebra_chain::parameters::HardForkSchedule::from_canonical(internal_handle.config.hardforks.clone());
+    let mut staking = zebra_state::StakingReplay::new(&hardfork_schedule);
     // The certificate carried by the previously scanned block, to tell whether the next one
     // advances it. `None` until the first block of the range, whose parent is outside it.
     let mut prev_fat_pointer: Option<FatPointerToBftBlock> = None;
@@ -523,21 +523,16 @@ async fn total_issuance_from_key(
 
             if let (Some(staking_action), Some((_, txid_lrz))) = (staking_action, &parsed) {
                 debug_assert_eq!(*txid_lrz, tx.hash().0, "txids from zebra/librustzcash disagree");
-                let mut bond_retargets = vec![HashMap::new()];
                 // Note(Sam): It seems weird that the bonds never get deleted. I don't know what I was
                 // thinking when I did that. But it makes this code easy.
-                let _ = timed(&PROF.replay_ns, || zebra_state::update_chain_tip_with_delegation_bond(
-                    &mut zebra_chain::value_balance::ValueBalance::zero(),
-                    &mut delegation_bonds,
-                    &mut bond_retargets,
-                    &mut finalizer_rewards,
-                    staking_action,
-                    &zebra_chain::transaction::Hash(*txid_lrz),
-                    zebra_state::TransactionLocation {
-                        height: ZebBlockHeight(height),
-                        index: zebra_state::TransactionIndex::from_index(tx_i.try_into().unwrap()),
-                    }
-                ));
+                let location = zebra_state::TransactionLocation {
+                    height: ZebBlockHeight(height),
+                    index: zebra_state::TransactionIndex::from_index(tx_i.try_into().unwrap()),
+                };
+                let replayed = timed(&PROF.replay_ns, || staking.apply_staking_action(staking_action, &zebra_chain::transaction::Hash(*txid_lrz), location));
+                if let Err(err) = replayed {
+                    return Err(format!("failed to replay the staking action of tx {tx_i} at height {height}: {err}"));
+                }
             }
 
             if let Some((tx_lrz, txid_lrz)) = &parsed {
@@ -568,26 +563,48 @@ async fn total_issuance_from_key(
         if height != 0
             && block_pays_pos_issuance(&internal_handle, ZebBlockHeight(height), &fat_pointer, &parent_fat_pointer).await?
         {
-            timed(&PROF.replay_ns, || zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds, &mut finalizer_rewards));
+            timed(&PROF.replay_ns, || staking.apply_block_reward());
+        }
+
+        // The live path burns after the activation block's staking actions and reward.
+        if height != 0 && staking.slash_activates_at(ZebBlockHeight(height)) {
+            let mut window_blocks = Vec::new();
+            for window_height in zebra_state::slash_window(ZebBlockHeight(height)) {
+                match (call.read_state)(StateReadRequest::Block(window_height.into())).await {
+                    Ok(StateReadResponse::Block(Some(window_block))) => window_blocks.push(window_block),
+                    _ => return Err(format!("failed to get block at height {} in the slash window", window_height.0)),
+                }
+            }
+            if let Some(slash) = timed(&PROF.replay_ns, || staking.apply_slash_burns(ZebBlockHeight(height), window_blocks)) {
+                println!("applied hardfork slash burns at height {height}: {} bond(s) burned for {} terminated finalizer(s)", slash.burned.len(), slash.finalizers.len());
+            }
         }
         prev_fat_pointer = Some(fat_pointer);
     }
 
     for scan_info in &mut scan_infos {
         let mut bonds_value = 0;
-        for bond in &scan_info.bonds {
-            match delegation_bonds.get(&bond.pk.0) {
-                Some(bond_info) => {
-                    let initial_val: u64 = bond.initial_val;
-                    let final_val = u64::from(bond_info.0.amount);
-                    let issuance_gained = final_val - initial_val;
-                    println!("bond {:?}: initial value = {}; final value = {}; gained {}", bond, initial_val, final_val, issuance_gained);
-                    bonds_value += issuance_gained;
-                },
-                None => return Err(format!("couldn't find bond {:?}", bond)),
+        let mut kept_bonds = Vec::with_capacity(scan_info.bonds.len());
+        for bond in std::mem::take(&mut scan_info.bonds) {
+            let Some((bond_state, status)) = staking.delegation_bonds.get(&bond.pk.0) else {
+                return Err(format!("couldn't find bond {:?}", bond));
+            };
+            let initial_val: u64 = bond.initial_val;
+            let final_val = u64::from(bond_state.amount);
+            let issuance_gained = final_val - initial_val;
+            let burned = *status == zebra_state::BondStatusInChain::Burned;
+            println!("bond {:?}: initial value = {}; final value = {}; gained {}; burned {}", bond, initial_val, final_val, issuance_gained, burned);
+            if burned {
+                scan_info.burned_bonds_initial_value += initial_val;
+                scan_info.burned_bonds_value += issuance_gained;
+                scan_info.burned_bonds.push(bond);
+            } else {
+                bonds_value += issuance_gained;
+                kept_bonds.push(bond);
             }
         }
 
+        scan_info.bonds = kept_bonds;
         scan_info.bonds_value = bonds_value;
         scan_info.total_value = scan_info.coinbases_value + scan_info.bonds_value;
         println!("final scan info: {scan_info:?}");

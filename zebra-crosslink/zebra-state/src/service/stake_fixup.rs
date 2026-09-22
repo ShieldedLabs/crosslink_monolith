@@ -8,26 +8,19 @@
 //! live commit path uses, and refuses to write unless the replay reproduces
 //! every row already on disk. Run it via `zebrad --fixup-db-stake`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use zebra_chain::{
-    amount::{Amount, NonNegative, MAX_MONEY},
     block::{self, Height},
     parameters::Network,
-    value_balance::ValueBalance,
 };
 
 use crate::{
-    constants::{state_database_format_version_in_code, POS_BLOCK_REWARD_ZATS, STATE_DATABASE_KIND},
+    constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     service::{
-        burn_delegation_bonds,
-        finalized_state::{
-            disk_format::{AggregatedStakes, BondKey, DelegationBond, TransactionLocation},
-            slashing::{slash_burn_set, SLASH_ANALYSIS_WINDOW},
-            ZebraDb, STATE_COLUMN_FAMILIES_IN_CODE,
-        },
+        finalized_state::{disk_format::AggregatedStakes, ZebraDb, STATE_COLUMN_FAMILIES_IN_CODE},
         non_finalized_state::BondStatusInChain,
-        update_bonds_with_pos_issuance, update_chain_tip_with_delegation_bond,
+        staking_replay::StakingReplay,
     },
     BoxError, Config, HashOrHeight,
 };
@@ -116,11 +109,7 @@ pub fn fixup_aggregated_stakes(
         );
     }
 
-    // At a rule's activation height A, the live commit path burns every bond
-    // that delegated to a terminated finalizer anywhere in (A - W, A], computed
-    // lazily at activation from the bond state plus the window's Retarget
-    // `from`s (`slash_burn_set`). The replay does exactly the same.
-    let slash_rules: Vec<SlashRule> = config
+    let activations: Vec<String> = config
         .hardfork_schedule
         .rules()
         .iter()
@@ -128,20 +117,9 @@ pub fn fixup_aggregated_stakes(
             !rule.terminated_finalizers.is_empty()
                 && rule.pow_activation_height <= u64::from(tip_height.0)
         })
-        .map(|rule| {
-            let activation =
-                u32::try_from(rule.pow_activation_height).expect("at most the tip height");
-            SlashRule {
-                activation,
-                finalizers: rule.terminated_finalizers.iter().map(|f| f.0).collect(),
-            }
-        })
+        .map(|rule| rule.pow_activation_height.to_string())
         .collect();
-    if !slash_rules.is_empty() {
-        let activations: Vec<String> = slash_rules
-            .iter()
-            .map(|rule| rule.activation.to_string())
-            .collect();
+    if !activations.is_empty() {
         println!(
             "replaying hardfork slash burns activating at height(s) {}",
             activations.join(", "),
@@ -152,8 +130,7 @@ pub fn fixup_aggregated_stakes(
         "replaying staking history from genesis to height {}",
         tip_height.0,
     );
-    let mut bonds: HashMap<BondKey, (DelegationBond, BondStatusInChain)> = HashMap::new();
-    let mut finalizer_rewards: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut replay = StakingReplay::new(&config.hardfork_schedule);
     // The previous block's certificate, to decide whether the next block advances it. Genesis
     // carries none, which is exactly the null pointer every pre-activation block also carries.
     let mut prev_fat_pointer = zebra_chain::block::FatPointerToBftBlock::null();
@@ -171,30 +148,6 @@ pub fn fixup_aggregated_stakes(
                 .block(HashOrHeight::Height(height))
                 .ok_or_else(|| format!("no block at height {h}, below the finalized tip"))?;
 
-            // Scratch pools: `update_chain_tip_with_delegation_bond` debits
-            // unbonded amounts from the bonded pool, and the real pool values
-            // are irrelevant here, so seed enough balance that it cannot fail.
-            let mut pools: ValueBalance<NonNegative> = ValueBalance::zero();
-            pools.set_staking_bonded_amount(
-                Amount::try_from(MAX_MONEY).expect("constant is in range"),
-            );
-            let mut retargets = vec![HashMap::new()];
-
-            for (transaction_index, transaction) in block.transactions.iter().enumerate() {
-                if let Some(staking_action) = transaction.staking_action() {
-                    update_chain_tip_with_delegation_bond(
-                        &mut pools,
-                        &mut bonds,
-                        &mut retargets,
-                        &mut finalizer_rewards,
-                        staking_action,
-                        &transaction.hash(),
-                        TransactionLocation::from_usize(height, transaction_index),
-                    )?;
-
-                }
-            }
-
             // Variable payout: a block mints only if it ADVANCES the certificate. That half of the
             // rule is visible here, in the block headers. The other half -- that the certificate
             // is fresh, `gap <= sigma + FINALITY_LIVENESS_ALLOWANCE` -- is NOT: the finalized
@@ -206,40 +159,34 @@ pub fn fixup_aggregated_stakes(
             let cert_advanced = block.header.fat_pointer_to_bft_block.points_at_block_hash()
                 != prev_fat_pointer.points_at_block_hash();
             prev_fat_pointer = block.header.fat_pointer_to_bft_block.clone();
-            if cert_advanced {
-                update_bonds_with_pos_issuance(POS_BLOCK_REWARD_ZATS, &mut bonds, &mut finalizer_rewards);
-            }
 
             // The live path burns after the activation block's own staking
             // actions and rewards (`NonFinalizedState::commit_new_chain`), so
             // the burned bonds still collect this block's reward and this
             // block's snapshot already excludes them.
-            for rule in slash_rules.iter().filter(|rule| rule.activation == h) {
-                let window_start = h.saturating_sub(SLASH_ANALYSIS_WINDOW);
-                let window_blocks = ((window_start + 1)..=h).map(|wh| {
-                    db.block(HashOrHeight::Height(Height(wh)))
-                        .expect("every height at or below the activation is finalized")
-                });
-                let burn_set = slash_burn_set(&bonds, window_blocks, &rule.finalizers, height);
-                burn_delegation_bonds(&mut bonds, &burn_set);
+            let block_at = |wh: Height| {
+                db.block(HashOrHeight::Height(wh))
+                    .expect("every height at or below the activation is finalized")
+            };
+            if let Some(slash) = replay.apply_block(height, &block, cert_advanced, block_at)? {
                 println!(
                     "applied hardfork slash burns at height {h}: {} bond(s) burned for {} \
                      terminated finalizer(s)",
-                    burn_set.len(),
-                    rule.finalizers.len(),
+                    slash.burned.len(),
+                    slash.finalizers.len(),
                 );
             }
         }
 
         let mut stakes_by_finalizer: HashMap<[u8; 32], u64> = HashMap::new();
-        for (bond, status) in bonds.values() {
+        for (bond, status) in replay.delegation_bonds.values() {
             if *status == BondStatusInChain::Active {
                 let amount: u64 = bond.amount.into();
                 *stakes_by_finalizer.entry(bond.target_finalizer).or_insert(0) += amount;
             }
         }
         // Each bank is a virtual bond on its own finalizer.
-        for (finalizer, bank) in &finalizer_rewards {
+        for (finalizer, bank) in &replay.finalizer_rewards {
             if *bank != 0 {
                 *stakes_by_finalizer.entry(*finalizer).or_insert(0) += bank;
             }
@@ -313,13 +260,6 @@ pub fn fixup_aggregated_stakes(
         fills.len(),
     );
     Ok(())
-}
-
-/// One hardfork slash rule active within the replay range, with the delegation
-/// runs on its terminated finalizers tracked from genesis.
-struct SlashRule {
-    activation: u32,
-    finalizers: BTreeSet<[u8; 32]>,
 }
 
 fn format_stakes(stakes: &[([u8; 32], u64)]) -> String {

@@ -2,6 +2,15 @@
 
 use zebrad::application::{boot, APPLICATION};
 
+// Memory profiling
+// #[cfg(not(target_env = "msvc"))]
+// #[global_allocator]
+// static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+// 
+// // #[global_allocator]
+// // static ALLOC: std::alloc::System = std::alloc::System;
+
+
 /// Process entry point for `zebrad`
 fn main() {
     // Enable backtraces by default for zebrad, but allow users to override it.
