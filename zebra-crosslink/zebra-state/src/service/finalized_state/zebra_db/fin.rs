@@ -34,7 +34,8 @@ impl ZebraDb {
         hash: block::Hash,
     ) -> Result<(), rocksdb::Error> {
         let mut batch = DiskWriteBatch::new();
-        self.crosslink_fin_cf()
+        // zs_insert writes into the batch and returns it; the batch is committed below.
+        let _ = self.crosslink_fin_cf()
             .with_batch_for_writing(&mut batch)
             .zs_insert(&FinKey, &FinMarker { height, hash });
         self.db.write(batch)

@@ -9,10 +9,9 @@ use std::{
     sync::Arc,
 };
 
-use indexmap::IndexMap;
 use tokio::sync::watch;
 use zebra_chain::{
-    block::{self, Block, Hash, Height},
+    block::{self, Block},
     parameters::Network,
     sprout::{self},
     transparent,

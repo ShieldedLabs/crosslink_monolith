@@ -2,19 +2,18 @@
 
 use std::{sync::Arc, time::Duration};
 
-use futures::{stream::FuturesUnordered, StreamExt};
+
 use proptest::{
     num::usize::BinarySearch,
     prelude::*,
     strategy::{NewTree, ValueTree},
     test_runner::TestRunner,
 };
-use tokio::time::timeout;
-use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
+use tower::{buffer::Buffer, util::BoxService};
 
 use zebra_chain::{
     block::{Block, Height},
-    fmt::{humantime_seconds, SummaryDebug},
+    fmt::SummaryDebug,
     history_tree::HistoryTree,
     parameters::{Network, NetworkUpgrade},
     primitives::zcash_history::BlockCommitmentTreeRoots,

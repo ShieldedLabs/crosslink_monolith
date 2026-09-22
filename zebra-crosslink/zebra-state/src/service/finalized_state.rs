@@ -35,18 +35,16 @@ use crate::{
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     error::CommitCheckpointVerifiedError,
     request::{FinalizableBlock, FinalizedBlock, Treestate},
-    service::{check, QueuedCheckpointVerified},
+    service::{check, queued_blocks::QueuedCheckpointVerified},
     CheckpointVerifiedBlock, Config, StateInitError, ValidateContextError,
 };
-
-pub use zcash_primitives::transaction::SLASH_ANALYSIS_WINDOW;
 
 pub mod column_family;
 
 mod disk_db;
 pub(crate) mod disk_format;
 pub(crate) mod zebra_db;
-pub use zebra_db::{bft, fin, slashing};
+pub use zebra_db::{bft, slashing};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;

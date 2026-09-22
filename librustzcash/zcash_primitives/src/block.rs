@@ -227,11 +227,11 @@ impl BlockHeader {
         Ok(())
     }
 
-    pub fn read<R: Read>(mut reader: R) -> io::Result<Self> {
+    pub fn read<R: Read>(reader: R) -> io::Result<Self> {
         Ok(BlockHeader::from_data(Self::read_data(reader)?))
     }
 
-    pub fn write<W: Write>(&self, mut writer: W) -> io::Result<()> {
+    pub fn write<W: Write>(&self, writer: W) -> io::Result<()> {
         Self::write_data(&self.data, writer)
     }
 }

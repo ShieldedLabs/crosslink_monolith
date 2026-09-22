@@ -173,11 +173,15 @@ pub struct Config {
     #[cfg(feature = "elasticsearch")]
     /// The elasticsearch database password.
     pub elasticsearch_password: RedactedString,
+    /// The elasticsearch database password.
     pub elasticsearch_password: String,
-    
+
     /// New Networking
+    /// Seed string the node derives its network identity from. `None` means generate one.
     pub network_identity_seed_string: Option<String>,
+    /// UDP port this node listens on for the crosslink peer protocol.
     pub network_local_port: u16,
+    /// Addresses of peers to connect to on startup.
     pub network_initial_peers: Vec<String>,
 
     /// Lite checkpoint: the synced chain must contain `hash` at `height`
@@ -187,6 +191,7 @@ pub struct Config {
     #[serde(with = "network_checkpoint_toml")]
     pub network_checkpoint: Option<NetworkCheckpoint>,
 
+    /// Hard-fork rules for this network. Not read from the config file; filled in by the caller.
     #[serde(skip)]
     pub hardfork_schedule: Arc<HardForkSchedule>,
 }

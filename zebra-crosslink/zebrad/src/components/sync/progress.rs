@@ -6,7 +6,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::Utc;
 use num_integer::div_ceil;
 
 use tokio::sync::watch;

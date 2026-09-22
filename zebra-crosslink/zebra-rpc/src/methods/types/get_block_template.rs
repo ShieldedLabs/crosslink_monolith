@@ -24,8 +24,6 @@ use tower::{Service, ServiceExt};
 use zcash_keys::address::Address;
 use zcash_protocol::memo::MemoBytes;
 use zcash_primitives::bft::*;
-use zcash_protocol::PoolType;
-use zcash_script::script::Evaluable;
 
 use zcash_script::{opcode::PushValue, pv::push_value};
 use zebra_chain::{
@@ -553,10 +551,13 @@ impl From<Address> for MinerParams {
 /// Errors that can occur when creating [`MinerParams`].
 #[derive(Debug, thiserror::Error)]
 pub enum MinerParamsError {
+    /// `mining.miner_address` was not set.
     #[error("Missing miner address")]
     MissingAddr,
+    /// `mining.miner_address` did not parse as an address this network can pay.
     #[error("Invalid miner address: {0}")]
     InvalidAddr(zcash_address::ConversionError<&'static str>),
+    /// `mining.miner_memo` was longer than a shielded memo allows.
     #[error(transparent)]
     InvalidMemo(#[from] zcash_protocol::memo::Error),
 }

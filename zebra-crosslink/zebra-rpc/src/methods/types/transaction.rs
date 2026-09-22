@@ -494,6 +494,7 @@ pub struct OutputObject {
     coinbase: bool,
 }
 impl OutputObject {
+    /// Build the RPC object for one transparent output of a mined transaction.
     pub fn from_output(
         output: &zebra_chain::transparent::Output,
         best_block: String,

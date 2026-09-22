@@ -15,6 +15,7 @@ use zebra_chain::{
     work::difficulty::CompactDifficulty,
 };
 
+#[cfg(test)]
 use crate::response::KnownBlockLocation;
 use crate::{constants::MIN_TRANSPARENT_COINBASE_MATURITY, HashOrHeight, KnownBlock};
 

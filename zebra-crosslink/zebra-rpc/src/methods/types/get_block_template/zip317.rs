@@ -56,6 +56,9 @@ type SelectedMempoolTx = VerifiedUnminedTx;
 ///
 /// [ZIP-317]: https://zips.z.cash/zip-0317#block-production
 #[allow(clippy::too_many_arguments)]
+// `CoinbaseCache` is private to this module's parent. This function is public so the block
+// template builder can call it; widening the cache would expose it past the builder.
+#[allow(private_interfaces)]
 pub fn select_mempool_transactions(
     net: &Network,
     height: Height,

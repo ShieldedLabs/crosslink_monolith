@@ -4,7 +4,7 @@ use std::{sync::Arc, time::Duration};
 
 use zebra_chain::{
     amount::{Amount, DeferredPoolBalanceChange, NonNegative},
-    block::{self, Block, Height},
+    block::{Block, Height},
     history_tree::NonEmptyHistoryTree,
     orchard,
     parallel::tree::NoteCommitmentTrees,
@@ -234,6 +234,7 @@ fn finalize_pops_from_best_chain_for_network(network: Network) -> Result<()> {
 /// Build an empty `NonFinalizedState` and an ephemeral `FinalizedState` with a
 /// populated value pool — the shared setup for the invalidate/reconsider
 /// regression tests below.
+#[allow(dead_code)]
 fn new_invalidate_test_state(network: &Network) -> (NonFinalizedState, FinalizedState) {
     let state = NonFinalizedState::new(network, Default::default());
     let finalized_state = FinalizedState::new(

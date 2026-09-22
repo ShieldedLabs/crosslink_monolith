@@ -25,6 +25,7 @@ pub type QueuedCheckpointVerified = (
 );
 
 /// A queued semantically verified block, and its corresponding [`Result`] channel.
+#[allow(dead_code)]
 pub type QueuedSemanticallyVerified = (
     SemanticallyVerifiedBlock,
     oneshot::Sender<Result<block::Hash, CommitSemanticallyVerifiedError>>,
@@ -32,6 +33,7 @@ pub type QueuedSemanticallyVerified = (
 
 /// A queue of blocks, awaiting the arrival of parent blocks.
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct QueuedBlocks {
     /// Blocks awaiting their parent blocks for contextual verification.
     blocks: HashMap<block::Hash, QueuedSemanticallyVerified>,
@@ -43,6 +45,7 @@ pub struct QueuedBlocks {
     known_utxos: HashMap<transparent::OutPoint, transparent::Utxo>,
 }
 
+#[allow(dead_code)]
 impl QueuedBlocks {
     /// Queue a block for eventual verification and commit.
     ///
@@ -237,6 +240,7 @@ impl QueuedBlocks {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub(crate) struct SentHashes {
     /// A list of previously sent block batches, each batch is in increasing height order.
@@ -258,6 +262,7 @@ pub(crate) struct SentHashes {
     pub(crate) can_fork_chain_at_hashes: bool,
 }
 
+#[allow(dead_code)]
 impl SentHashes {
     /// Creates a new [`SentHashes`] with the block hashes and UTXOs in the provided non-finalized state.
     pub fn new(non_finalized_state: &NonFinalizedState) -> Self {

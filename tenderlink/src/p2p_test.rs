@@ -1,4 +1,4 @@
-
+#![allow(unused_variables, unused_mut, unused_imports, unused_must_use)]
 use std::net::Ipv6Addr;
 use static_assertions::const_assert;
 

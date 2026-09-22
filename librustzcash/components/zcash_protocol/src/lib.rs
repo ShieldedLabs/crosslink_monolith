@@ -9,6 +9,8 @@
 //!
 
 #![no_std]
+// `zcash_unstable = "zfuture"` is a real in-development cfg, checked by name.
+#![allow(unexpected_cfgs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, doc(auto_cfg))]
 // Catch documentation errors caused by code changes.

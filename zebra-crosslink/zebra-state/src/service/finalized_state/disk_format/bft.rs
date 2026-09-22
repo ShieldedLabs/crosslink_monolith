@@ -6,7 +6,6 @@
 //! validator set that disagrees with the votes, which travel by roster index (FINALITY.md §8.1).
 
 use zcash_primitives::bft::{BftBlock, FatPointerToBftBlock, TMSig};
-use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize};
 
 use crate::service::finalized_state::disk_format::{FromDisk, IntoDisk};
 

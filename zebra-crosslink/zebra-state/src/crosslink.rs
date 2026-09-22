@@ -2,11 +2,7 @@
 
 use std::fmt;
 
-use tokio::sync::broadcast;
-
-use zebra_chain::block::{Hash as BlockHash, Height as BlockHeight};
-
-use serde_with::serde_as;
+use zebra_chain::block::Height as BlockHeight;
 
 pub use zcash_primitives::bft::{FinalizerRecencyStatus, TFLRecencyStatus, ScanBond, ScanInfo, WalletSpendableFunds, WalletStakingPositions};
 use zcash_primitives::transaction::StakingActionRequest;

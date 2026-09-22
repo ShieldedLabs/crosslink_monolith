@@ -9,6 +9,8 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, doc(auto_cfg))]
+// `zcash_unstable = "zfuture"` is a real in-development cfg, checked by name.
+#![allow(unexpected_cfgs)]
 // Catch documentation errors caused by code changes.
 #![deny(rustdoc::broken_intra_doc_links)]
 // Present to reduce refactoring noise from changing all the imports inside this crate for

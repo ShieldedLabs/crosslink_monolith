@@ -16,10 +16,8 @@ use std::{
     sync::Arc,
 };
 
-use zcash_primitives::transaction::StakingActionKind;
-
 use zebra_chain::{
-    amount::{Amount, NegativeAllowed, NonNegative},
+    amount::{Amount, NonNegative},
     block::Height,
     block_info::BlockInfo,
     history_tree::HistoryTree,
@@ -32,7 +30,7 @@ use crate::{
     request::FinalizedBlock,
     service::finalized_state::{
         disk_db::DiskWriteBatch,
-        disk_format::{chain::HistoryTreeParts, BondKey, RawBytes},
+        disk_format::{chain::HistoryTreeParts, RawBytes},
         zebra_db::{metrics::value_pool_metrics, ZebraDb},
         TypedColumnFamily,
     },

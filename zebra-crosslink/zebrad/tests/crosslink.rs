@@ -177,6 +177,7 @@ const REGTEST_BLOCK_BYTES: &[&[u8]] = &[
 ];
 const REGTEST_BLOCK_BYTES_N: usize = REGTEST_BLOCK_BYTES.len();
 
+#[allow(dead_code)]
 fn regtest_block_hashes() -> [BlockHash; REGTEST_BLOCK_BYTES_N] {
     let mut hashes = [BlockHash([0; 32]); REGTEST_BLOCK_BYTES_N];
     for i in 0..REGTEST_BLOCK_BYTES_N {
@@ -574,7 +575,7 @@ fn crosslink_test_basic_finality() {
     );
     let n = 18; // TODO: this fails with higher numbers due to block verification
     let mut pow = vec![gen.tip.clone()];
-    let mut side: Vec<Arc<Block>> = vec![];
+    let _side: Vec<Arc<Block>> = vec![];
     let mut genb = gen.clone();
     for i2 in 1..n+1 {
         if i2 == 2 {

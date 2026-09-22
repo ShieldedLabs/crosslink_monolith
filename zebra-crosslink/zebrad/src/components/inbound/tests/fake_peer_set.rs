@@ -6,7 +6,7 @@ use std::{collections::HashSet, iter, net::SocketAddr, str::FromStr, sync::Arc, 
 
 use futures::FutureExt;
 use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
-use tower::{buffer::Buffer, builder::ServiceBuilder, util::BoxService, Service, ServiceExt};
+use tower::{buffer::Buffer, builder::ServiceBuilder, util::BoxService, ServiceExt};
 use tracing::{Instrument, Span};
 
 use zebra_chain::{
@@ -997,7 +997,7 @@ async fn setup(
     let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change, mut block_writer) =
         zebra_state::init(state_config.clone(), &network, Height::MAX, 0).await;
 
-    let mut state_service = ServiceBuilder::new().buffer(1).service(state);
+    let state_service = ServiceBuilder::new().buffer(1).service(state);
 
     // Download task panics and timeouts are propagated to the tests that use Groth16 verifiers.
     let (block_verifier, _transaction_verifier, _groth16_download_handle, _max_checkpoint_height) =

@@ -3,7 +3,7 @@
 //! This is the code that starts `zebrad`, and launches its tasks and services.
 //! See [the crate docs](crate) and [the start docs](crate::commands::start) for more details.
 
-use std::{env, fmt::Write as _, io::Write as _, ops::Deref, process, sync::Arc};
+use std::{env, fmt::Write as _, io::Write as _, process, sync::Arc};
 
 use abscissa_core::{
     application::{self, AppCell},
@@ -15,12 +15,7 @@ use abscissa_core::{
 use semver::{BuildMetadata, Version};
 
 use tokio::sync::watch;
-use zebra_chain::{
-    block::Height,
-    parameters::{subsidy::FundingStreamReceiver, testnet, Magic},
-};
 use zebra_network::constants::PORT_IN_USE_ERROR;
-use zebra_rpc::config::mining::ZcashAddress;
 use zebra_state::{
     constants::LOCK_FILE_ERROR, state_database_format_version_in_code,
     state_database_format_version_on_disk,

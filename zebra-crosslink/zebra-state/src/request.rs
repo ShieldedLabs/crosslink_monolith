@@ -1095,8 +1095,6 @@ impl Request {
             Request::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             Request::BestChainBlockHash(_) => "best_chain_block_hash",
             Request::KnownBlock(_) => "known_block",
-            Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
-            Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
             Request::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
             Request::BondInfo(_) => "bond_info",
             Request::FinalizerRewardBalance(_) => "finalizer_reward_balance",
@@ -1127,6 +1125,7 @@ pub enum ReadRequest {
     /// with the current best chain tip.
     Tip,
 
+    /// Returns the finalized tip, which lags the best tip by the blocks still open to reorg.
     FinalizedTip,
 
     /// Returns [`ReadResponse::TipPoolValues(Option<(Height, block::Hash, ValueBalance)>)`](ReadResponse::TipPoolValues)
@@ -1685,7 +1684,6 @@ impl ReadRequest {
             ReadRequest::TipBlockSize => "tip_block_size",
             ReadRequest::NonFinalizedBlocksListener { .. } => "non_finalized_blocks_listener",
             ReadRequest::IsTransparentOutputSpent(_) => "is_transparent_output_spent",
-            ReadRequest::NonFinalizedBlocksListener { .. } => "non_finalized_blocks_listener",
             ReadRequest::BondInfo(_) => "bond_info",
             ReadRequest::FinalizerRewardBalance(_) => "finalizer_reward_balance",
             ReadRequest::FinalizerRewardBalances => "finalizer_reward_balances",

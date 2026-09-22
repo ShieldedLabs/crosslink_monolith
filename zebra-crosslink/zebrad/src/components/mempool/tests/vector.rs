@@ -738,7 +738,7 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
         .to_network()
         .expect("configured network is valid");
 
-    let genesis_block: Arc<Block> = zebra_test::vectors::BLOCK_TESTNET_GENESIS_BYTES
+    let _genesis_block: Arc<Block> = zebra_test::vectors::BLOCK_TESTNET_GENESIS_BYTES
         .zcash_deserialize_into()
         .unwrap();
     let block1: Arc<Block> = zebra_test::vectors::BLOCK_TESTNET_1_BYTES
@@ -1171,7 +1171,7 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
     let block2: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_2_BYTES
         .zcash_deserialize_into()
         .unwrap();
-    let block3: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_3_BYTES
+    let _block3: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_3_BYTES
         .zcash_deserialize_into()
         .unwrap();
     let block4: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_4_BYTES
@@ -2114,7 +2114,7 @@ async fn setup_with_mempool_config(
     let state_config = StateConfig::ephemeral();
     let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change, mut block_writer) =
         zebra_state::init(state_config, network, Height::MAX, 0).await;
-    let mut state_service = ServiceBuilder::new().buffer(10).service(state);
+    let state_service = ServiceBuilder::new().buffer(10).service(state);
 
     let tx_verifier = MockService::build().for_unit_tests();
 

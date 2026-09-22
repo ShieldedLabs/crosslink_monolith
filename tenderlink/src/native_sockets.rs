@@ -1,3 +1,4 @@
+#![allow(unused_unsafe)]
 pub use std::net::Ipv6Addr;
 
 pub const ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY: usize = 1184;

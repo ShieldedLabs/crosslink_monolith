@@ -84,13 +84,14 @@ impl ZebraDb {
     ) -> Result<(), rocksdb::Error> {
         let height = BftHeight(height);
         let mut batch = DiskWriteBatch::new();
-        self.bft_block_by_height_cf()
+        // zs_insert writes into the batch and returns it; the batch is committed below.
+        let _ = self.bft_block_by_height_cf()
             .with_batch_for_writing(&mut batch)
             .zs_insert(&height, &StoredBftBlock(block.clone()));
-        self.bft_fat_pointer_by_height_cf()
+        let _ = self.bft_fat_pointer_by_height_cf()
             .with_batch_for_writing(&mut batch)
             .zs_insert(&height, &StoredFatPointer(fat_pointer.clone()));
-        self.bft_proposal_sigs_by_height_cf()
+        let _ = self.bft_proposal_sigs_by_height_cf()
             .with_batch_for_writing(&mut batch)
             .zs_insert(&height, &ProposalSignatures(proposal_sigs.to_vec()));
         self.db.write(batch)

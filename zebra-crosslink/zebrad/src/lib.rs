@@ -151,6 +151,7 @@ pub mod commands;
 pub mod components;
 pub mod config;
 pub mod fuzz;
+/// The bundled lightwalletd process Zebra can launch alongside the node.
 pub mod lightwalletd;
 pub mod prelude;
 

@@ -33,8 +33,10 @@ use zebra_chain::{
     block::{genesis::regtest_genesis_block, Block, Height},
     chain_tip::ChainTip,
     parameters::Network,
-    serialization::{ZcashDeserialize, ZcashSerialize},
+    serialization::ZcashDeserialize,
 };
+#[cfg(test)]
+use zebra_chain::serialization::ZcashSerialize;
 use zebra_crosslink::uhh;
 use zebra_state::new_network::{submit_block_to_new_network, IngestOutcome, VerifyFns};
 

@@ -6,6 +6,7 @@
 //! against one consistent view on one thread. Tenderlink's closures marshal a request to that
 //! thread and await one reply. Other readers (the RPC, the visualizer, the test harness) take the
 //! read lock on [`bft_chain`].
+#![allow(missing_docs)]
 
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
@@ -25,7 +26,7 @@ use zcash_primitives::block::{
 };
 use zcash_primitives::transaction::RosterMember;
 use zebra_chain::block::{Hash, Header, Height};
-use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize};
+use zebra_chain::serialization::ZcashSerialize;
 
 use super::ReadState;
 use crate::service::finalized_state::bft::StoredDecision;

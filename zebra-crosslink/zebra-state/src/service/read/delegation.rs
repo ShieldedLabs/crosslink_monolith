@@ -39,6 +39,7 @@ pub fn delegation_bond(
 /// Check if a bond exists and is active in the state.
 ///
 /// Searches both non-finalized and finalized state.
+#[allow(dead_code)]
 pub fn is_bond_active(
     finalized_state: &ZebraDb,
     non_finalized_state: Option<&Chain>,
@@ -60,6 +61,7 @@ pub fn is_bond_active(
 /// Check if a bond exists and is unbonding in the state.
 ///
 /// Searches both non-finalized and finalized state.
+#[allow(dead_code)]
 pub fn is_bond_unbonding(
     finalized_state: &ZebraDb,
     non_finalized_state: Option<&Chain>,
@@ -84,6 +86,7 @@ pub fn is_bond_unbonding(
 /// Check if a bond exists and is withdrawn in the state.
 ///
 /// Searches both non-finalized and finalized state.
+#[allow(dead_code)]
 pub fn is_bond_withdrawn(
     finalized_state: &ZebraDb,
     non_finalized_state: Option<&Chain>,
@@ -108,6 +111,7 @@ pub fn is_bond_withdrawn(
 /// Check if a bond exists in the state (in any status).
 ///
 /// Searches both non-finalized and finalized state.
+#[allow(dead_code)]
 pub fn bond_exists(
     finalized_state: &ZebraDb,
     non_finalized_state: Option<&Chain>,

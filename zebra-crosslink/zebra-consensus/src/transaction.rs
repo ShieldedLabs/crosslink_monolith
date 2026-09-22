@@ -1527,6 +1527,7 @@ impl AsyncChecks {
     /// Push a set of checks into the set.
     ///
     /// This method can be daisy-chained.
+    #[allow(dead_code)]
     pub fn and(mut self, checks: AsyncChecks) -> Self {
         self.0.extend(checks.0);
         self

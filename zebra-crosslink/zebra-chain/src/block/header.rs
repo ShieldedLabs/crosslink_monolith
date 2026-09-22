@@ -11,8 +11,7 @@ use crate::{
     serialization::{TrustedPreallocate, MAX_HEADERS_PER_MESSAGE},
     work::{difficulty::CompactDifficulty, equihash::Solution},
 };
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io;
+
 
 use super::{merkle, Commitment, CommitmentError, Hash, Height};
 
@@ -21,6 +20,7 @@ use proptest_derive::Arbitrary;
 pub use zcash_primitives::transaction::CommandBuf;
 use zcash_primitives::bft;
 
+/// `CommandBuf` wrapped so it can be stored in a header and serialized as its text.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct CommandBuf2(pub CommandBuf);
 impl serde::Serialize for CommandBuf2 {

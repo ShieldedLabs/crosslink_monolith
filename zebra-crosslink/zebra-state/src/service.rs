@@ -24,7 +24,6 @@ use std::{
 };
 
 use futures::future::FutureExt;
-use tokio::sync::oneshot;
 use tower::{util::BoxService, Service, ServiceExt};
 use tracing::{instrument, Instrument, Span};
 use derivative::Derivative;
@@ -34,19 +33,16 @@ use tower::buffer::Buffer;
 
 use zebra_chain::{
     block::{self, CountedHeader, HeightDiff},
-    diagnostic::{task::WaitForPanics, CodeTimer},
+    diagnostic::CodeTimer,
     parameters::{HardForkSchedule, Network, NetworkUpgrade},
     serialization::ZcashSerialize,
     subtree::NoteCommitmentSubtreeIndex,
 };
 
-use zebra_chain::block::Height;
-
 use crate::{
     constants::{
         MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS, MAX_LEGACY_CHAIN_BLOCKS,
     },
-    error::{CommitBlockError, CommitCheckpointVerifiedError},
     request::TimedSpan,
     response::{BondInfoResponse, KnownBlock, NonFinalizedBlocksListener},
     service::{
@@ -55,11 +51,10 @@ use crate::{
         finalized_state::{FinalizedState, ZebraDb},
         non_finalized_state::{Chain, NonFinalizedState},
         pending_utxos::PendingUtxos,
-        queued_blocks::QueuedBlocks,
         read::find,
         watch_receiver::WatchReceiver,
     },
-    BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, Config, ReadRequest,
+    BoxError, CheckpointVerifiedBlock, Config, ReadRequest,
     ValidateContextError,
     ReadResponse, Request, Response, SemanticallyVerifiedBlock, StateInitError,
 };
@@ -86,8 +81,6 @@ pub mod arbitrary;
 mod tests;
 
 pub use finalized_state::{OutputLocation, TransactionIndex, TransactionLocation};
-
-use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified};
 
 pub use self::traits::{ReadState, State};
 
@@ -383,7 +376,7 @@ impl StateService {
                  blocks above its finalized tip"
             );
         }
-        let skip_backup_task = config.debug_skip_non_finalized_state_backup_task;
+        let _skip_backup_task = config.debug_skip_non_finalized_state_backup_task;
         let (non_finalized_state, non_finalized_state_sender, non_finalized_state_receiver) =
             NonFinalizedState::new(network, config.hardfork_schedule.clone())
                 .with_backup(
@@ -419,11 +412,11 @@ impl StateService {
         let read_service =
             ReadStateService::new(&finalized_state, None, non_finalized_state_receiver);
 
-        let full_verifier_utxo_lookahead = max_checkpoint_height
+        let _full_verifier_utxo_lookahead = max_checkpoint_height
             - HeightDiff::try_from(checkpoint_verify_concurrency_limit)
                 .expect("fits in HeightDiff");
-        let full_verifier_utxo_lookahead =
-            full_verifier_utxo_lookahead.unwrap_or(block::Height::MIN);
+        let _full_verifier_utxo_lookahead =
+            _full_verifier_utxo_lookahead.unwrap_or(block::Height::MIN);
         let pending_utxos = PendingUtxos::default();
 
         let state = Self {
@@ -496,6 +489,7 @@ impl StateService {
     }
 
     /// Assert some assumptions about the semantically verified `block` before it is queued.
+    #[allow(dead_code)]
     fn assert_block_can_be_validated(&self, block: &SemanticallyVerifiedBlock) {
         // required by `Request::CommitSemanticallyVerifiedBlock` call
         assert!(

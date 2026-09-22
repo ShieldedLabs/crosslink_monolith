@@ -272,6 +272,7 @@ impl ZebradConfig {
         Ok(config)
     }
 
+    /// Config used by the crosslink testnet: known peers, a local RPC, and the internal miner on.
     pub fn crosslink_default() -> Self {
         use zebra_chain::{
             block::Height,

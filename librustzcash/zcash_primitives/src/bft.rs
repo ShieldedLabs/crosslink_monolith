@@ -210,7 +210,7 @@ impl BftBlock {
         // serializes the corrected 0-based height directly.
         let serialized_height = if self.version < 2 { self.height + 1 } else { self.height };
         writer.write_u32::<LittleEndian>(serialized_height)?;
-        self.previous_block_fat_ptr.zcash_serialize(&mut writer);
+        let _ = self.previous_block_fat_ptr.zcash_serialize(&mut writer);
         // The former `finalization_candidate_height` field was always 0 and has been
         // removed. Keep its 4-byte slot, written as zero, so v1 block bytes — and thus
         // hashes and finalizer signatures — are byte-for-byte identical to before.
@@ -267,7 +267,7 @@ impl BftBlock {
             ));
         }
         let mut array = Vec::new();
-        for i in 0..header_count {
+        for _ in 0..header_count {
             // array.push(zebra_chain::block::Header::zcash_deserialize(&mut reader)?);
             array.push(BcBlockHeaderWrap::read_data(&mut reader)?);
         }
@@ -533,7 +533,7 @@ impl Blake3Hash {
 // impl ZcashSerialize for Blake3Hash {
     #[allow(clippy::unwrap_in_result)]
     pub fn zcash_serialize<W: std::io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
-        writer.write_all(&self.0);
+        writer.write_all(&self.0)?;
         Ok(())
     }
 // }
@@ -568,8 +568,8 @@ impl BftBlockAndFatPointerToIt {
 
 // impl ZcashSerialize for BftBlockAndFatPointerToIt {
     pub fn zcash_serialize<W: std::io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
-        self.block.zcash_serialize(&mut writer);
-        self.fat_ptr.zcash_serialize(&mut writer);
+        self.block.zcash_serialize(&mut writer)?;
+        self.fat_ptr.zcash_serialize(&mut writer)?;
         Ok(())
     }
 // }
@@ -872,7 +872,7 @@ impl<'de> serde::Deserialize<'de> for FinalizerAddress {
 
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub struct HashKey(pub [u8; 32]);
-impl HashKey { const NIL: Self = Self([0;32]); }
+impl HashKey { #[allow(dead_code)] const NIL: Self = Self([0;32]); }
 impl HashKey {
     pub fn hasher(&self)            -> blake3::Hasher { blake3::Hasher::new_keyed(&self.0) }
     pub fn hash(&self, data: &[u8]) -> [u8; 32]       { *blake3::keyed_hash(&self.0, data).as_bytes() }

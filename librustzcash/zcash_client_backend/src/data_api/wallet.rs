@@ -125,7 +125,6 @@ use {
     zcash_protocol::{consensus::NetworkConstants, value::BalanceError},
 };
 use zcash_primitives::transaction::StakingAction;
-use zcash_primitives::transaction::StakingActionKind;
 
 pub mod input_selection;
 use input_selection::{
@@ -1675,6 +1674,8 @@ struct BuildState<P, AccountId> {
     )>,
     #[cfg(feature = "transparent-inputs")]
     utxos_spent: Vec<OutPoint>,
+    // Moved into the builder below; kept here so the build inputs stay in one place.
+    #[allow(dead_code)]
     staking_action: Option<StakingAction>,
 }
 
@@ -2534,7 +2535,7 @@ where
     }
 
     if let Some(sa) = staking_action {
-        builder.put_staking_action(sa);
+        let _ = builder.put_staking_action(sa);
     }
 
     Ok(BuildState {

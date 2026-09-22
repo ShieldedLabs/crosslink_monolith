@@ -70,9 +70,9 @@ pub struct RawTransaction {
     ///
     /// * height 0: the transaction is in the mempool
     /// * height 0xffffffffffffffff: the transaction has been mined on a fork that
-    ///    is not currently the main chain
+    ///   is not currently the main chain
     /// * any other height: the transaction has been mined in the main chain at the
-    ///    given height
+    ///   given height
     #[prost(uint64, tag = "2")]
     pub height: u64,
 }
@@ -419,6 +419,17 @@ pub mod compact_tx_streamer_client {
     pub struct CompactTxStreamerClient<T> {
         inner: tonic::client::Grpc<T>,
     }
+    impl CompactTxStreamerClient<tonic::transport::Channel> {
+        /// Attempt to create a new client by connecting to a given endpoint.
+        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
+        where
+            D: TryInto<tonic::transport::Endpoint>,
+            D::Error: Into<StdError>,
+        {
+            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
+            Ok(Self::new(conn))
+        }
+    }
     impl<T> CompactTxStreamerClient<T>
     where
         T: tonic::client::GrpcService<tonic::body::Body>,
@@ -593,7 +604,7 @@ pub mod compact_tx_streamer_client {
         /// Return a list of consecutive compact blocks in the specified range,
         /// which is inclusive of `range.end`.
         ///
-        /// If range.start <= range.end, blocks are returned increasing height order;
+        /// If range.start \<= range.end, blocks are returned increasing height order;
         /// otherwise blocks are returned in decreasing height order.
         pub async fn get_block_range(
             &mut self,

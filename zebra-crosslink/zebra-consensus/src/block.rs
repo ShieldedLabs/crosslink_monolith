@@ -14,6 +14,7 @@ use std::{
     task::{Context, Poll},
 };
 
+#[cfg(test)]
 use chrono::Utc;
 use futures::stream::FuturesUnordered;
 use futures_util::FutureExt;

@@ -11,7 +11,7 @@ use std::{cmp::min, sync::Arc, thread::available_parallelism, time::Duration};
 use color_eyre::Report;
 use futures::{stream::FuturesUnordered, StreamExt};
 use thread_priority::{ThreadBuilder, ThreadPriority};
-use tokio::{select, sync::watch, task::JoinHandle, time::sleep};
+use tokio::{select, sync::watch, task::JoinHandle};
 use tower::Service;
 use tracing::{Instrument, Span};
 
@@ -318,7 +318,7 @@ pub async fn generate_block_templates<
     SyncStatus,
     AddressBook,
 >(
-    network: Network,
+    _network: Network,
     rpc: RpcImpl<
         Mempool,
         TFLService,

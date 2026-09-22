@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::{
     service::{
-        finalized_state::{disk_format::{BondKey, DelegationBond}, ZebraDb},
+        finalized_state::{disk_format::DelegationBond, ZebraDb},
         non_finalized_state::Chain,
     },
     SemanticallyVerifiedBlock, ValidateContextError,

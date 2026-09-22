@@ -74,7 +74,7 @@ fn build_zallet_for_qa_tests() {
 
         let profile = "debug".to_string();
 
-        let target_dir = env::var("CARGO_TARGET_DIR")
+        let _target_dir = env::var("CARGO_TARGET_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| std::env::current_dir().expect("failed to get current dir"))
             .join("../target")

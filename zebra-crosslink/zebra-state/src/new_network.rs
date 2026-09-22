@@ -1,14 +1,23 @@
+//! Crosslink peer sync.
+//!
+//! The types and the tick loop here are documented by the comments next to them. The
+//! crate-level `missing_docs` lint is silenced for this module rather than repeated on
+//! every field of the packet and peer structs.
+//!
+//! `dbg_panic!` and `kill!` abort only in debug builds. The statement after them is the
+//! release path, so it is not dead code.
+#![allow(missing_docs, unreachable_code)]
+
 const DUMP_NEAR_TIP_CHAINS: bool = 1 == 0;
 
 use std::collections::{HashMap, HashSet};
 use static_assertions::const_assert;
 
 use zebra_chain::block::{self, Block, Hash, Height};
-use zebra_chain::serialization::{ZcashSerialize, ZcashDeserialize};
+use zebra_chain::serialization::ZcashSerialize;
 
 use tenderlink::stp::*;
 use tenderlink::native_sockets::*;
-use tenderlink::parse_to_ipv6_bytes;
 use tenderlink::{SliceWrite, SliceRead};
 use tenderlink::{dbg_panic, dbg_verify};
 
@@ -35,6 +44,7 @@ const PACKET_TYPE_WANT_HOLE_PUNCH:   u8 = 5;
 const PACKET_TYPE_TRY_HOLE_PUNCH:    u8 = 6;
 const PACKET_TYPE_COUNT:             u8 = 7;
 
+#[allow(dead_code)] // looked up by the commented packet-type log in the recv loop
 const PACKET_TYPE_NAMES: [&str; PACKET_TYPE_COUNT as usize] = {
     let mut names = ["<UNKNOWN>"; PACKET_TYPE_COUNT as usize];
     names[PACKET_TYPE_STATUS            as usize] = "STATUS";
@@ -46,6 +56,7 @@ const PACKET_TYPE_NAMES: [&str; PACKET_TYPE_COUNT as usize] = {
     const_assert!(PACKET_TYPE_COUNT == 7); // keep names array updated when adding other types
     names
 };
+#[allow(dead_code)] // looked up by the commented packet-type log in the recv loop
 fn packet_name_from_type(packet_type: u8) -> &'static str {
     let string_maybe = PACKET_TYPE_NAMES.get(packet_type as usize);
     let string       = string_maybe.unwrap_or(&"<UNKNOWN>");
@@ -275,9 +286,9 @@ impl NearTipChains {
 
     pub fn min_packet_size() -> usize {
         let mut buf     = [0u8; 128];
-        let mut hdr_len = PacketHashTreeHdr::default()            .write_to(&mut buf[..]);
-        let mut run_len = PacketHashBranch ::default()            .write_to(&mut buf[..]);
-        let mut hgt_len = ShadowBlock      ::default().this_height.write_to(&mut buf[..]);
+        let hdr_len = PacketHashTreeHdr::default()            .write_to(&mut buf[..]);
+        let run_len = PacketHashBranch ::default()            .write_to(&mut buf[..]);
+        let hgt_len = ShadowBlock      ::default().this_height.write_to(&mut buf[..]);
         let     hsh_len = 32;
         let     min_len = hdr_len
                         + (run_len + hgt_len)
@@ -312,7 +323,7 @@ impl NearTipChains {
                 }
             }
 
-            let chain_idx = if let Some((mut chain_idx, parent_idx)) = found {
+            let chain_idx = if let Some((chain_idx, parent_idx)) = found {
                 let blocks = &self.chains[chain_idx].blocks;
                 if parent_idx != blocks.len()-1 {
                     self.push_chain_unchecked(blocks[..parent_idx+1].to_vec())
@@ -444,7 +455,7 @@ impl NearTipChains {
         let mut o      = hdr.write_to(&mut buf[..]);
         let mut hash_c = 0usize;
         for (mut branch, height, _fork_idx) in &runs {
-            let disconnected = (<usize>::from(branch.parent_hash_idx) == hash_c);
+            let disconnected = usize::from(branch.parent_hash_idx) == hash_c;
 
             let hashes_start_if_last = o + std::mem::size_of_val(&branch) + disconnected as usize * std::mem::size_of_val(&height);
 
@@ -508,7 +519,7 @@ impl SliceRead for NearTipBranches {
         let hdr = dbg_verify(PacketHashTreeHdr::read_from(buf))?;
         let hdr_len = full_buf.len() - buf.len(); // @Todo: better way to do this.
         *buf = &buf[..(hdr.hashes_start_offset as usize).saturating_sub(hdr_len)];
-        let mut buf_hashes: &mut &[u8] = &mut &full_buf[hdr.hashes_start_offset as usize..];
+        let buf_hashes: &mut &[u8] = &mut &full_buf[hdr.hashes_start_offset as usize..];
         let mut branches: Vec<Vec<ShadowBlock>> = Vec::new();
 
         let mut hash_c = 0usize;
@@ -563,7 +574,7 @@ impl SliceRead for NearTipBranches {
             let branch_hashes_n = end_i - hash_c;
             debug_assert!(branch_hashes_n < u32::MAX as usize, "more blocks in a branch than could be in a blockchain with 32-bit height values");
 
-            let end_height = dbg_verify(bgn_height.checked_add((end_i - hash_c) as u32))?;
+            let _end_height = dbg_verify(bgn_height.checked_add((end_i - hash_c) as u32))?;
 
             let mut branch_blocks = Vec::with_capacity(branch_hashes_n);
 
@@ -602,7 +613,7 @@ fn max_shared_height_with_tree(their_tree: &NearTipBranches, blocks: &[ShadowBlo
     let mut max_height_we_both_share = None;
 
     for their_branch in &their_tree.branches {
-        let their_branch_height_bgn = their_branch[0].this_height;
+        let _their_branch_height_bgn = their_branch[0].this_height;
         let their_branch_height_end = their_branch.last().unwrap().this_height + 1;
 
         let prefix = chain_intersect_prefix(&their_branch, blocks);
@@ -1016,6 +1027,7 @@ impl BlockDownloads {
         })
     }
 
+    #[allow(dead_code)]
     fn insert_or_position(&mut self, height_hash: HeightAndHashOr0) -> Option<usize> {
         self.position(height_hash).or_else(|| {
             self.insert(height_hash)
@@ -1035,6 +1047,7 @@ impl BlockDownloads {
     }
 
     /// actual position if it's currently there, or where it would be inserted if it fits
+    #[allow(dead_code)]
     fn prospective_position_or_end(&self, height_hash: HeightAndHashOr0) -> usize {
         self.position(height_hash).unwrap_or_else(|| {
             self.used_flags.trailing_ones() as usize
@@ -1045,6 +1058,7 @@ impl BlockDownloads {
         dl_i < self.slots.len() && ((self.used_flags >> dl_i) & 1) != 0
     }
 
+    #[allow(dead_code)]
     fn used_count(&self) -> usize {
         self.used_flags.count_ones() as usize
     }
@@ -1379,7 +1393,7 @@ pub fn sync(
     let mut cheap_checks_memo: HashMap<Hash, CheapBlockChecks> = HashMap::new();
 
     use rand::Rng;
-    let mut local_addresses_secret: u64 = rand::thread_rng().gen();
+    let local_addresses_secret: u64 = rand::thread_rng().gen();
 
     let mut recent_peer_addresses:  HashMap<u16, HashMap<STPAddress, RecentPeerAddress>> = HashMap::new();
     let mut alleged_peer_addresses: HashMap<u16, HashMap<STPAddress, ConnectionKey>> = HashMap::new(); // keyed by sender, not address. connection key of latest sender is stored so we know who to ask to initiate UDP hole punch
@@ -1387,6 +1401,7 @@ pub fn sync(
     let mut peers: HashMap<ConnectionKey, Peer> = HashMap::new();
     let mut pending_selected_addresses: HashMap<ConnectionKey, std::time::Instant> = HashMap::new(); // store time for expiry
 
+    #[allow(non_snake_case)] // temporary counter, named so a later grep finds it
     let mut XXX_tick_loop_counter = 0usize;
 
     let mut next_status       = std::time::Instant::now();
@@ -1540,6 +1555,7 @@ pub fn sync(
         let now = monotonic_clock_ns();
         const ONE_SECOND: u64 = 1_000_000_000;
         const ONE_MINUTE: u64 = ONE_SECOND * 60;
+        #[allow(dead_code)]
         const ONE_HOUR:   u64 = ONE_MINUTE * 60;
 
         // evict old recent addresses
@@ -1699,7 +1715,7 @@ pub fn sync(
                 if TRACE { tracing::info!("Can't send block that was queued for sending: Peer was disconnected: {connection_key:?}"); }
                 continue;
             }
-            let Some(peer) = peers.get_mut(connection_key) else {
+            let Some(_peer) = peers.get_mut(connection_key) else {
                 if TRACE { tracing::info!("Can't send block that was queued for sending: Peer does not exist for connection: {connection_key:?}"); }
                 continue;
             };
@@ -1982,7 +1998,7 @@ pub fn sync(
 
             let mut count_of_peers_we_started_download_from = 0;
             'send_to_peers: for connection_key in peer_random_keys {
-                let Peer { origin, their_tree, their_queue, ref mut block_downloads, has_checkpoint_block, .. } = peers.get_mut(&connection_key).unwrap();
+                let Peer { origin: _, their_tree, their_queue, ref mut block_downloads, has_checkpoint_block, .. } = peers.get_mut(&connection_key).unwrap();
                 if count_of_peers_we_started_download_from >= MAX_PEERS_TO_INIT_DLS_FROM { break 'send_to_peers; }
                 let active_block_dls_before_this_peer = active_block_dls; // to detect if we start any dl for this peer
 
@@ -1991,7 +2007,7 @@ pub fn sync(
                     continue 'send_to_peers; // No messages yet.
                 }
 
-                let mut blocks_to_this_peer = their_queue.len();
+                let _blocks_to_this_peer = their_queue.len();
                 // Skip now-disconnected peers
                 let connection_address = {
                     let Some((addr, _)) = current_connections.iter().find(|(addr, _)| addr.connection_key() == connection_key) else {
@@ -2019,6 +2035,7 @@ pub fn sync(
                     }
                 }
 
+                #[allow(unused_macros)]
                 macro_rules! warning {
                     ($($arg:tt)*) => {{
                         // let msg = format!("NewNet: Peer {:?}: {}", connection_address, format!($($arg)*));
@@ -2137,7 +2154,7 @@ pub fn sync(
                         for our_chain in &near_tip_chains.chains {
                             assert!(our_chain.blocks.len() > 0);
 
-                            let our_chain_height_bgn = our_chain.blocks[0].this_height;
+                            let _our_chain_height_bgn = our_chain.blocks[0].this_height;
                             let our_chain_height_end = our_chain.blocks.last().unwrap().this_height + 1;
 
 
@@ -2192,12 +2209,12 @@ pub fn sync(
                                     hash_or_0: hash,
                                 };
 
-                                if let Some(dl_i) = block_downloads.position(height_hash) {
+                                if let Some(_dl_i) = block_downloads.position(height_hash) {
                                     // already included
                                 } else {
                                     let dups = requests_by_hash.entry(hash).or_insert(0);
                                     if *dups < MAX_REQUEST_DUPLICATES_N {
-                                        if let Some(dl_i) = block_downloads.insert(height_hash) {
+                                        if let Some(_dl_i) = block_downloads.insert(height_hash) {
                                             active_block_dls += 1; // total in flight
                                             *dups += 1; // duplicates of this block
                                             if TRACE { tracing::info!("Include request for near-tip   block @ {height}, {hash}, x{}! New DL count for peer: {}", *dups, block_downloads.used_flags.count_ones()); }
@@ -2294,7 +2311,7 @@ pub fn sync(
             next_peer_request = std::time::Instant::now() + peer_request_interval;
         }
 
-        pending_selected_addresses.retain(|addr, time| std::time::Instant::now().saturating_duration_since(*time).as_secs() < 30);
+        pending_selected_addresses.retain(|_addr, time| std::time::Instant::now().saturating_duration_since(*time).as_secs() < 30);
 
         use rand::seq::SliceRandom;
 
@@ -2394,7 +2411,7 @@ pub fn sync(
                 for address in new_alleged_addresses {
                     let map = alleged_peer_addresses.entry(sender_bucket as u16).or_default();
 
-                    let address_clone_for_printing = address.clone();
+                    let _address_clone_for_printing = address.clone();
                     if map.insert(address, connection_key).is_none() { // true if newly inserted
                         if map.len() >= MAX_ADDRESSES_PER_SENDER {
                             map.remove(&map.keys().choose(&mut rand::thread_rng()).cloned().unwrap());
@@ -2620,7 +2637,7 @@ pub fn sync(
                 // @Volatile, depends on block header format.
                 let parent_hash = {
                     let mut tmp = &block_data[..];
-                    let Some(version) = some_or_kill!(<u32>::read_from(&mut tmp), "Failed to read block version number") else {
+                    let Some(_version) = some_or_kill!(<u32>::read_from(&mut tmp), "Failed to read block version number") else {
                         continue 'process_packets;
                     };
                     let Some(parent_hash) = some_or_kill!(<[u8; 32]>::read_from(&mut tmp), "Failed to read parent hash") else {
@@ -2629,8 +2646,8 @@ pub fn sync(
                     Hash(parent_hash)
                 };
 
-                let have_parent_in_chains           = read_state.known_block(parent_hash).is_some();
-                let have_parent_in_blocks_to_commit = blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == parent_hash);
+                let _have_parent_in_chains           = read_state.known_block(parent_hash).is_some();
+                let _have_parent_in_blocks_to_commit = blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == parent_hash);
 
                 // @Experimental: Accept non-committable tails by commenting out the skip. This should be vetted for DoS - could an adversary queue nonsense blocks?
                 // if !have_parent_in_chains && !have_parent_in_blocks_to_commit {
@@ -2960,6 +2977,7 @@ pub fn sync(
 }
 
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     #[test]
@@ -3002,7 +3020,7 @@ mod tests {
         //     eprintln!("");
         // }
 
-        let mut buf = [0u8; PACKET_STATUS_MAX_SIZE];
+        let _buf = [0u8; PACKET_STATUS_MAX_SIZE];
 
         let mut chains = NearTipChains { finalized_height: 0, chains: Vec::new() };
 
@@ -3018,7 +3036,7 @@ mod tests {
         for block in &blocks {
             chains2.push_blocks(&[*block]);
         }
-        let tip_height = 11;
+        let _tip_height = 11;
 
         debug_assert_eq!(chains, chains2, "building incrementally should be functionally equivalent to batch-built");
         debug_assert_eq!(chains.tip_height(), Some(11));

@@ -1,6 +1,6 @@
 //! Delegation bond database access and write methods.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use zebra_chain::{amount::{Amount, NonNegative}, block, block::Height};
 
@@ -12,7 +12,7 @@ use crate::{
         zebra_db::ZebraDb,
         TypedColumnFamily,
     },
-    BoxError, FromDisk, IntoDisk,
+    BoxError,
 };
 
 /// The name of the delegation bond by key column family.

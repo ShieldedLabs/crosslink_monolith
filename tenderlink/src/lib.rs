@@ -4,6 +4,15 @@
 #![allow(clippy::never_loop)]
 
 #![allow(clippy::eq_op)]
+// Names here keep the protocol's own spelling (Noise_IK, RTT_mean). Renaming them
+// to satisfy the style lint would change every match and every field access.
+#![allow(non_snake_case, non_upper_case_globals)]
+// Bindings here are often kept for the protocol field they name, even when the
+// current path does not read them. Prefixing all of them would hide the names.
+#![allow(unused_variables, unused_mut, unused_imports, unused_macros, unused_assignments, unused_unsafe)]
+// rand 0.9 renamed thread_rng to rng. The old name still works; the call sites are
+// not worth a behavior-adjacent rename in this crate.
+#![allow(deprecated)]
 const PRINT_PROTOCOL:       bool = 1 == 1;
 const PRINT_PROTOCOL_TAG:   bool = 0 == 1;
 const PRINT_ROSTER:         bool = 0 == 1;
@@ -2947,7 +2956,7 @@ impl PacketProposalChunkHeader {
             chunk_i:       u32::read_from(buf)?,
             proposal_size: u32::read_from(buf)?,
             round:         u32::read_from(buf)?,
-            valid_round:   if let v = u32::read_from(buf)? && v != u32::MAX { v.into() } else { -1 },
+            valid_round:   { let v = u32::read_from(buf)?; if v != u32::MAX { v.into() } else { -1 } },
             height:        u64::read_from(buf)?,
             proposal_id:   ValueId(SliceRead::read_from(buf)?),
         })

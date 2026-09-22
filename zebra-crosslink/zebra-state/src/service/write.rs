@@ -1,21 +1,11 @@
 //! Writing blocks to the finalized and non-finalized states.
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::path::Path;
 
 use indexmap::IndexMap;
-use tokio::sync::{
-    mpsc::{UnboundedReceiver, UnboundedSender},
-    oneshot, watch,
-};
+use tokio::sync::watch;
 
-use tracing::Span;
-use zebra_chain::{
-    block::{self, Height},
-    parameters::Network,
-};
+use zebra_chain::block;
 
 use crate::{
     constants::{CONFLICT_HOLD_DEPTH, MAX_BLOCK_REORG_HEIGHT},
@@ -23,10 +13,9 @@ use crate::{
         check,
         finalized_state::{FinalizedState, ZebraDb},
         non_finalized_state::NonFinalizedState,
-        queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender,
     },
-    BoxError, CommitSemanticallyVerifiedError, SemanticallyVerifiedBlock, ValidateContextError,
+    BoxError, SemanticallyVerifiedBlock, ValidateContextError,
 };
 use zebra_chain::parallel::tree::NoteCommitmentTrees;
 
@@ -389,7 +378,7 @@ impl WriteBlockWorkerTask {
         let child_hash = queued_child.hash;
         let parent_hash = queued_child.block.header.previous_block_hash;
 
-        let queued_block_height = queued_child.block.coinbase_height().expect("committed block should have a coinbase height").0;
+        let _queued_block_height = queued_child.block.coinbase_height().expect("committed block should have a coinbase height").0;
 
         // If the parent block was marked as rejected, also reject all its children.
         //

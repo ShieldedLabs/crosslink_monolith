@@ -76,14 +76,14 @@
 //!
 //! Some of the diagnostic features are optional, and need to be enabled at compile-time.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use abscissa_core::{config, Command, FrameworkError};
 use color_eyre::eyre::{eyre, Report};
 use futures::FutureExt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
-use tokio::{pin, select, sync::{oneshot, watch}, time::timeout};
+use tokio::{pin, select, sync::{oneshot, watch}};
 use tower::{builder::ServiceBuilder, util::BoxService, ServiceExt};
 use tracing_futures::Instrument;
 
@@ -132,7 +132,9 @@ pub struct StartCmd {
 /// reduces single-peer throughput for block propagation.
 ///
 /// See `book/src/user/troubleshooting.md`.
+/// Nothing calls this yet; kept so the check can be wired into startup without rewriting it.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn check_tcp_slow_start_after_idle() {
     const PATH: &str = "/proc/sys/net/ipv4/tcp_slow_start_after_idle";
 
@@ -162,8 +164,7 @@ fn check_tcp_slow_start_after_idle() {
     );
 }
 
-#[cfg(not(target_os = "linux"))]
-fn check_tcp_slow_start_after_idle() {}
+
 
 impl StartCmd {
     /// Extra time Zebra waits for the zcashd-compat supervisor task beyond the
@@ -343,8 +344,8 @@ impl StartCmd {
                 // },
                 mining: zebra_rpc::config::mining::Config {
                     miner_address: Some(config.mining.miner_address.clone().unwrap_or_else(||{
+                        #[allow(unused_imports)] // trait method; rustc reports it unused in the lib target
                         use zcash_address::ToAddress;
-
                         let t_addr = wallet::default_p2pkh_from_entropy(&config.network.network, &global_seed).expect("unable to initialize miner");
                         info!("Miner address unspecified. Mining to {}", wallet::string_from_t_addr(&config.network.network, t_addr));
                         t_addr.to_zcash_address(config.network.network.kind().into())
@@ -496,7 +497,7 @@ impl StartCmd {
             .await;
 
         info!("initializing syncer");
-        let (mut syncer, sync_status) = ChainSync::new(
+        let (syncer, sync_status) = ChainSync::new(
             &config,
             max_checkpoint_height,
             peer_set.clone(),
@@ -593,7 +594,7 @@ impl StartCmd {
             };
             assert_eq!(genesis_block_for_new_network.hash(), config.network.network.genesis_hash(),
                 "genesis hash does not match the configured network genesis; consider editing your config");
-            let sync_block_verifier = block_verifier_router.clone();
+            let _sync_block_verifier = block_verifier_router.clone();
 
             // The finalizer identity: derived from the node seed unless the config names one.
             let bft_key_seed = config.crosslink.explicit_bft_key_seed.clone().unwrap_or_else(|| format!("Crosslink default finalizer identity seed {:?}", global_seed));
@@ -614,7 +615,7 @@ impl StartCmd {
                 peer_addresses: config.crosslink.bft_peers.clone(),
             };
             tokio::task::spawn_blocking(move || {
-                use zebra_state::new_network::BlockCommitError;
+
 
                 // Synchronous verification entry points. Passed as plain fn pointers because
                 // zebra-state cannot depend on zebra-consensus (the dependency runs the other

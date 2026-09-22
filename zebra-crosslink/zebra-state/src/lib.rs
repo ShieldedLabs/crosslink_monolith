@@ -23,6 +23,7 @@ pub mod config;
 // Most constants are exported by default
 pub mod constants;
 
+/// Crosslink peer sync: the near-tip block exchange that replaced Zebra's inbound downloader.
 pub mod new_network;
 
 // Allow use in external tests

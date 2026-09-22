@@ -40,7 +40,7 @@ use crate::{
     service::{
         check,
         finalized_state::disk_format::{
-            self, BondKey, BondStatus, DelegationBond,
+            self, BondKey,
         },
     },
     ContextuallyVerifiedBlock, HashOrHeight, OutputLocation, TransactionLocation,

@@ -1,4 +1,5 @@
 #![allow(unsafe_code)]
+#![allow(unused_variables, unused_mut, unused_imports, unused_macros, unused_assignments)]
 use std::collections::{HashMap, VecDeque};
 use rand::SeedableRng;
 use static_assertions::const_assert;
@@ -351,7 +352,7 @@ pub fn fmt_prefixed_byte_str_rev(f: &mut std::fmt::Formatter<'_>, pre: &str, byt
 
 impl std::fmt::Debug for IdentityKeyPair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        format!("IdentityKeyPair {{ magic1: {}, private: \"", self.magic1);
+        let _ = format!("IdentityKeyPair {{ magic1: {}, private: \"", self.magic1);
         fmt_byte_str(f, &self.private)?;
         fmt_prefixed_byte_str(f, "\", public: \"",                &self.public)?;
         write!(f, "\" }}")
@@ -784,13 +785,12 @@ pub fn get_connected_mut<'a>(m: &'a mut HashMap::<ConnectionKey, ConnectionTrack
 
 pub fn connection_state_string(state: &ConnectionState) -> &'static str {
     match state {
-        ConnectionState::SendingClientHelloPlaintext { .. } => { return "SendingClientHelloPlaintext"; },
-        ConnectionState::SendingClientHello          { .. } => { return "SendingClientHello"; },
-        ConnectionState::SendingServerHelloPlaintext { .. } => { return "SendingServerHelloPlaintext"; },
-        ConnectionState::SendingServerHello          { .. } => { return "SendingServerHello"; },
-        ConnectionState::Connected(_)                        => { return "Connected"; },
-    };
-    return "<INVALID>";
+        ConnectionState::SendingClientHelloPlaintext { .. } => "SendingClientHelloPlaintext",
+        ConnectionState::SendingClientHello          { .. } => "SendingClientHello",
+        ConnectionState::SendingServerHelloPlaintext { .. } => "SendingServerHelloPlaintext",
+        ConnectionState::SendingServerHello          { .. } => "SendingServerHello",
+        ConnectionState::Connected(_)                        => "Connected",
+    }
 }
 
 pub fn connect_to_endpoint(

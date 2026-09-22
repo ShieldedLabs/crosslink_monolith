@@ -5,10 +5,7 @@
 //! [`crate::constants::state_database_format_version_in_code()`] must be incremented
 //! each time the database format (column, serialization, etc) changes.
 
-use zebra_chain::{
-    amount::{Amount, NonNegative},
-    serialization::{ZcashDeserializeInto, ZcashSerialize},
-};
+use zebra_chain::amount::{Amount, NonNegative};
 
 use crate::service::finalized_state::disk_format::{
     block::TransactionLocation, FromDisk, IntoDisk,

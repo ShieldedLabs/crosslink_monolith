@@ -63,7 +63,7 @@ use zcash_primitives::transaction::RosterMember;
 use zcash_primitives::bft::{FatPointerToBftBlock, ScanInfo};
 
 use zebra_chain::{
-    amount::{self, Amount, NegativeAllowed, NonNegative},
+    amount::{Amount, NegativeAllowed, NonNegative},
     block::{
         self, Block, Commitment, Height, SerializedBlock, TryIntoHeight,
     },
@@ -87,8 +87,10 @@ use zebra_chain::{
     },
 };
 use zebra_consensus::{
-    funding_stream_address, router::service_trait::BlockVerifierService, RouterError,
+    funding_stream_address, router::service_trait::BlockVerifierService,
 };
+#[cfg(test)]
+use zebra_consensus::RouterError;
 use zebra_network::{address_book_peers::AddressBookPeers, types::PeerServices, PeerSocketAddr};
 use zebra_node_services::mempool::{self, CreatedOrSpent, MempoolService};
 use zebra_state::{
@@ -156,6 +158,7 @@ pub(super) const PARAM_START_INDEX_DESC: &str =
 pub(super) const PARAM_LIMIT_DESC: &str = "The maximum number of subtrees to return.";
 pub(super) const PARAM_REQUEST_DESC: &str = "The request object containing the parameters.";
 pub(super) const PARAM_STRING_DESC: &str = "A Crosslink staking command string.";
+#[allow(dead_code)]
 pub(super) const PARAM_STAKING_ACTION_DESC: &str =
     "The staking action to submit from the attached wallet.";
 pub(super) const PARAM_VALUE_ZATS_DESC: &str =
@@ -1219,7 +1222,9 @@ where
 
     tfl_service: TFLService,
 
-    /// A handle to the state service.
+    /// A handle to the state service. Reads go through `read_state`; this is kept so the
+    /// constructor still takes the same service the rest of the node is wired with.
+    #[allow(dead_code)]
     state: State,
 
     /// A handle to the state service.
@@ -2273,7 +2278,7 @@ where
                     .send(jsonrpsee::SubscriptionMessage::from("RPC: hi".to_string()))
                     .await;
                 // TODO: await/poll
-                this.stream_tfl_new_final_block_hash().await;
+                let _ = this.stream_tfl_new_final_block_hash().await;
             }
         });
     }
@@ -4925,7 +4930,9 @@ pub struct GetBondInfoResponse {
     // new,
     schemars::JsonSchema,
 )]
+/// Request for the regtest faucet: the address to pay.
 pub struct FaucetRequest {
+    /// Transparent or unified address the faucet should pay.
     pub address: String,
 }
 
@@ -4940,7 +4947,9 @@ pub struct FaucetRequest {
     // Getters,
     // new,
 )]
+/// What the faucet paid, in zatoshis.
 pub struct FaucetResponse {
+    /// Zatoshis sent to the requested address.
     pub amount: u64,
 }
 
@@ -6051,5 +6060,6 @@ pub enum AddNodeCommand {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct GetTxOutResponse(Option<types::transaction::OutputObject>);
+/// A finalizer's 32-byte public key and the ZEC it currently has staked.
 #[derive(Clone, serde::Serialize)]
 pub struct TFLStakerZec(#[serde(with = "hex")] [u8; 32], Zec<NonNegative>);

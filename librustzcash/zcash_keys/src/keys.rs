@@ -218,6 +218,7 @@ pub use bond::BondSpendingKey;
 /// Typecode under which the bond spending key is carried in the `unstable` USK encoding.
 ///
 /// TODO(@Prod): placeholder at the top of the parseable range, not a registered value.
+#[allow(dead_code)] // placeholder typecode, not yet wired into the USK encoding
 const CROSSLINK_BOND_TYPECODE: u32 = 0x0200_0000;
 
 /// A set of spending keys that are all associated with a single ZIP-0032 account identifier.

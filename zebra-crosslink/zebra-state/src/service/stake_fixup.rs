@@ -120,7 +120,7 @@ pub fn fixup_aggregated_stakes(
     // that delegated to a terminated finalizer anywhere in (A - W, A], computed
     // lazily at activation from the bond state plus the window's Retarget
     // `from`s (`slash_burn_set`). The replay does exactly the same.
-    let mut slash_rules: Vec<SlashRule> = config
+    let slash_rules: Vec<SlashRule> = config
         .hardfork_schedule
         .rules()
         .iter()

@@ -4,7 +4,7 @@
 use std::{
     env,
     fs,
-    io::{self, Read},
+    io,
     path::{Path, PathBuf},
 };
 // use walkdir::WalkDir;

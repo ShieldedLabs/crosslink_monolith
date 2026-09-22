@@ -23,7 +23,6 @@ use zebra_consensus::router::service_trait::BlockVerifierService;
 use zebra_network::AddressBookPeers;
 use zebra_node_services::mempool::MempoolService;
 use zebra_state::{ReadState as ReadStateService, State as StateService};
-use zebra_node_services::mempool;
 use zebra_state::crosslink::{TFLServiceRequest, TFLServiceResponse};
 
 use crate::{

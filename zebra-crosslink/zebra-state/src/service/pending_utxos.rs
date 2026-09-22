@@ -40,6 +40,7 @@ impl PendingUtxos {
     /// the given [`transparent::OutPoint`] that the [`transparent::Utxo`] has
     /// arrived.
     #[inline]
+    #[allow(dead_code)]
     pub fn respond(&mut self, outpoint: &transparent::OutPoint, utxo: transparent::Utxo) {
         if let Some(sender) = self.0.remove(outpoint) {
             // Adding the outpoint as a field lets us cross-reference
@@ -51,6 +52,7 @@ impl PendingUtxos {
 
     /// Check the list of pending UTXO requests against the supplied
     /// [`transparent::OrderedUtxo`] index.
+    #[allow(dead_code)]
     pub fn check_against_ordered(
         &mut self,
         ordered_utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,

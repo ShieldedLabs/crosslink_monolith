@@ -5,7 +5,7 @@ use std::{collections::HashMap, fmt, ops::Neg, sync::Arc};
 use halo2::pasta::pallas;
 
 use crate::{
-    amount::{Amount, DeferredPoolBalanceChange, NegativeAllowed, NonNegative},
+    amount::{DeferredPoolBalanceChange, NegativeAllowed},
     block::merkle::AuthDataRoot,
     fmt::DisplayToDebug,
     ironwood, orchard,
