@@ -494,6 +494,50 @@ impl UnreliableSendBuffer {
     }
 }
 
+// The network thread keeps reading sockets whether or not the consumer keeps up, so without a
+// bound a flood of peer traffic (such as BFT round data re-sent during a stall) grows this queue
+// until the process is killed. Drop-oldest matches the send side, and both protocols tolerate it:
+// this is the unreliable channel, BFT round data is re-sent every tick, and block chunks are
+// re-requested. The cap covers the accumulating queue only; the batch the consumer last took is
+// its own, so the worst case is about twice this.
+pub const MAX_RECV_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+pub struct ReceiveQueue {
+    pub messages: VecDeque<(ConnectionKey, Vec<u8>)>,
+    pub bytes: usize,
+    pub peak_bytes: usize,
+    pub peak_messages: usize,
+    pub dropped_messages: u64,
+    pub dropped_bytes: u64,
+}
+
+impl ReceiveQueue {
+    // Counts the queue slot too, so a flood of tiny messages is bounded as well as large ones.
+    pub fn entry_bytes(buf: &Vec<u8>) -> usize {
+        buf.capacity() + std::mem::size_of::<(ConnectionKey, Vec<u8>)>()
+    }
+
+    pub fn push(&mut self, key: ConnectionKey, buf: Vec<u8>, cap_bytes: usize) {
+        self.bytes += Self::entry_bytes(&buf);
+        self.messages.push_back((key, buf));
+        while self.bytes > cap_bytes {
+            let Some((_, m)) = self.messages.pop_front() else { break; };
+            let n = Self::entry_bytes(&m);
+            self.bytes -= n;
+            self.dropped_messages += 1;
+            self.dropped_bytes += n as u64;
+        }
+        self.peak_bytes = self.peak_bytes.max(self.bytes);
+        self.peak_messages = self.peak_messages.max(self.messages.len());
+    }
+
+    pub fn take(&mut self) -> VecDeque<(ConnectionKey, Vec<u8>)> {
+        self.bytes = 0;
+        std::mem::take(&mut self.messages)
+    }
+}
+
 fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], unreliable_send_buffer: &mut UnreliableSendBuffer) -> bool {
     let mut send = false;
     let mut cursor = 0;
@@ -958,6 +1002,7 @@ impl ReassemblySlot {
     }
 }
 
+pub const MAX_JUMBOGRAM_LEN: usize = 1 << 23;
 
 pub const ACK_BUFFER_TIME_NS: u64 = 50_000_000;
 
@@ -971,7 +1016,7 @@ pub struct NetworkThreadPush {
 #[derive(Default)]
 pub struct NetworkThreadPull {
     pub current_connections: Vec<(STPAddress, [u8; 64])>,
-    pub received_unreliable_messages: Vec<(ConnectionKey, Vec<u8>)>,
+    pub received_unreliable_messages: VecDeque<(ConnectionKey, Vec<u8>)>,
 }
 
 struct NetworkThreadInner {
@@ -1014,7 +1059,8 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
         let mut packet_memory_recv      = new_packet_memory(); // Incoming Decrypted
         let mut packet_memory_send      = new_packet_memory(); // Outgoing Decrypted
 
-        let mut received_unreliable_messages: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
+        let mut receive_queue = ReceiveQueue::default();
+        let mut receive_queue_report_time_ns = 0u64;
 
         let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
         let mut server_nym_sockets: Vec<NymSockHandle> = Vec::new();
@@ -1083,7 +1129,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         None
                     }
                 }).collect();
-                std::mem::swap(&mut resp.received_unreliable_messages, &mut received_unreliable_messages);
+                resp.received_unreliable_messages = receive_queue.take();
 
                 #[allow(unsafe_code)]
                 unsafe {
@@ -1596,6 +1642,11 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                     connections_map.remove(&connection_key);
                                     break 'conn;
                                 }
+                                if frag_offset + frag_len > MAX_JUMBOGRAM_LEN as u64 {
+                                    if VERBOSE { println!("Error, frag_offset + frag_len ({}) exceeds MAX_JUMBOGRAM_LEN from {connection_key:?}. Disconnecting...", frag_offset + frag_len); }
+                                    connections_map.remove(&connection_key);
+                                    break 'conn;
+                                }
 
                                 //if OVERLY_VERBOSE { println!("Fragment from {:?}: R:{} F:{} ID:{} L:{} O:{}", connection_key, is_reliable, is_fin, package_id, frag_len, frag_offset); }
                                 
@@ -1608,7 +1659,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                 }
                                 if complete {
                                     let completed = std::mem::replace(&mut existing_connection.unreliable_reassembly[slot_idx], ReassemblySlot::new());
-                                    received_unreliable_messages.push((connection_key, completed.buf));
+                                    receive_queue.push(connection_key, completed.buf, MAX_RECV_QUEUE_BYTES);
                                 }
                             }
 
@@ -1620,6 +1671,18 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
 
 //////// BEGIN SEND ////////////////////////////////////////////////////////////////////////
                 let current_time_now_ns = monotonic_clock_ns();
+
+                if receive_queue_report_time_ns + 10_000_000_000 <= current_time_now_ns {
+                    if receive_queue.dropped_messages > 0 || receive_queue.peak_bytes > MAX_RECV_QUEUE_BYTES / 8 {
+                        println!("STP port {my_port}: receive queue peaked at {} messages / {} B in the last 10s (cap {MAX_RECV_QUEUE_BYTES} B); dropped {} messages / {} B",
+                                 receive_queue.peak_messages, receive_queue.peak_bytes, receive_queue.dropped_messages, receive_queue.dropped_bytes);
+                    }
+                    receive_queue.peak_messages = receive_queue.messages.len();
+                    receive_queue.peak_bytes = receive_queue.bytes;
+                    receive_queue.dropped_messages = 0;
+                    receive_queue.dropped_bytes = 0;
+                    receive_queue_report_time_ns = current_time_now_ns;
+                }
                 connections_map.retain(|connection_key, connection_tracking_data| {match &mut connection_tracking_data.connection_state {
                     ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
                         if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {

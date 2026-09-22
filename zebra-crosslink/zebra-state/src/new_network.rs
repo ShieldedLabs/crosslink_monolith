@@ -2331,8 +2331,7 @@ pub fn sync(
         packets_to_send = Vec::new();
 
         // Process received packets
-        'process_packets: while packets_received.len() > 0 {
-            let (connection_key, msg) = packets_received.remove(0);
+        'process_packets: while let Some((connection_key, msg)) = packets_received.pop_front() {
 
             // Skip processing packets from now-disconnected peers
             let connection_address = {
