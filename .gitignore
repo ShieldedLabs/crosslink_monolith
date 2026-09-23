@@ -6,6 +6,8 @@
 *.user
 */x64/Release
 */*/x64/Release
+*/x64/Debug
+*/*/x64/Debug
 
 # JetBrains developer files.
 *.idea
