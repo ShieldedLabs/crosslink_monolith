@@ -485,6 +485,7 @@ pub struct TMState {
     update_peers_cmd_closure: ClosureToUpdatePeers,
     bft_access_closure: ClosureToAccessBft,
 }
+
 impl TMState {
     fn init(
         my_signing_key: SigningKey, my_pub_key: PubKeyID, my_port: u16,
@@ -662,24 +663,57 @@ impl TMState {
     }
 
     fn check_and_incorporate_msg(&mut self, height: u64, round: u32, chunk_i: usize, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], roster_i: usize, packet_type: u8, signed_data: &[u8], sig: TMSig) -> TMStatus {
-        let ctx_str  = self.ctx_str(roster);
-        let pkt_str = format!("{:20} {}.{}.{}", packet_name_from_tag(packet_type), height, round, chunk_i);
-
         if height != self.height {
+            // let ctx_str  = self.ctx_str(roster);
+            // let pkt_str = format!("{:20} {}.{}.{}", packet_name_from_tag(packet_type), height, round, chunk_i);
             // eprintln!("{ctx_str} {ANSI_GRY}BFT{ANSI_RST}: received [{}] when we're at height {}", pkt_str, self.height);
             return TMStatus::Fail;
         }
 
         // check if in (active) roster
         if roster_i >= active_roster_len(roster) {
+            let ctx_str  = self.ctx_str(roster);
+            let pkt_str = format!("{:20} {}.{}.{}", packet_name_from_tag(packet_type), height, round, chunk_i);
             eprintln!("{ctx_str} ({}): {ANSI_RED}BFT FAULT{ANSI_RST}: {} is not in the active roster.", pkt_str, roster_i);
             return TMStatus::Fail;
         }
 
         let from_pub_key = roster[roster_i].pub_key;
 
+        // Vote signed data is reconstructed from the signer, step, height, round, and value at every call site.
+        // A proposal chunk's signed data is its header plus its bytes, so it only counts as a repeat if both
+        // match what was stored; a matching signature alone would let a copied signature skip verification.
+        let is_vote = packet_type == PACKET_TYPE_PREVOTE_SIGNATURES || packet_type == PACKET_TYPE_PRECOMMIT_SIGNATURES;
+        if (is_vote || packet_type == PACKET_TYPE_PROPOSAL_CHUNK) && sig != TMSig::NIL {
+            if let Ok(round_i) = self.rounds_data.binary_search_by_key(&(height, round), |el| (el.height, el.round)) {
+                let round_data = &self.rounds_data[round_i];
+                if is_vote {
+                    let is_precommit = (packet_type == PACKET_TYPE_PRECOMMIT_SIGNATURES) as usize;
+                    if value_id == ValueId::NIL {
+                        if round_data.msg_nil_sigs[roster_i][is_precommit] == sig { return TMStatus::Pass; }
+                    } else if round_data.msg_val_sigs[roster_i][is_precommit] == (value_id, sig) {
+                        return TMStatus::Pass;
+                    }
+                } else if chunk_i < round_data.proposal_sigs.len() && round_data.proposal_sigs[chunk_i] == sig &&
+                          round_data.proposal_id == value_id && round_data.proposal_valid_round == valid_round {
+                    let hdr = PacketProposalChunkHeader {
+                        chunk_i: chunk_i as u32, proposal_size: round_data.proposal.0.len() as u32,
+                        round, valid_round, height, proposal_id: value_id,
+                    };
+                    let mut hdr_buf = [0u8; PacketProposalChunkHeader::SERIALIZED_SIZE];
+                    hdr.write_to(&mut hdr_buf);
+                    let (chunk_o, chunk_size) = round_data.proposal.chunk_o_size(chunk_i);
+                    if signed_data.len() == hdr_buf.len() + chunk_size && signed_data[..hdr_buf.len()] == hdr_buf &&
+                       signed_data[hdr_buf.len()..] == round_data.proposal.0[chunk_o..chunk_o + chunk_size] {
+                        return TMStatus::Pass;
+                    }
+                }
+            }
+        }
+
+        let pkt_str = format!("{:20} {}.{}.{}", packet_name_from_tag(packet_type), height, round, chunk_i);
         // pkt_str += &format!(" from {} ({})", roster_i, from_pub_key);
-        let ctx_str = format!("{ctx_str} [{} from {} {:?}]", pkt_str, roster_i, from_pub_key);
+        let ctx_str = format!("{} [{} from {} {:?}]", self.ctx_str(roster), pkt_str, roster_i, from_pub_key);
 
         // check if data was signed by pub key. Vote namespacing: mix in this height's
         // namespace (nil -> unchanged). `height == self.height` is guaranteed above, so
@@ -3121,6 +3155,248 @@ use helpers::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dup_state() -> (TMState, [SortedRosterMember; 1]) {
+        let key = SigningKey::from([7u8; 32]);
+        let pub_key = PubKeyID(VerificationKeyBytes::from(&key).into());
+        let roster = [SortedRosterMember { pub_key, stake: 1, cumulative_stake: 1 }];
+        let mut state = TMState::init(
+            key, pub_key, 0,
+            ClosureToProposeNewBlock(Arc::new(|| Box::pin(async { None }))),
+            ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
+            ClosureToPushDecidedBlock(Arc::new(|_, _, _| Box::pin(async { (Vec::new(), [0; 32]) }))),
+            ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
+            ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
+        );
+        state.insert_round(0, 0, &roster);
+        (state, roster)
+    }
+
+    #[test]
+    fn dup_vote_preserves_counts() {
+        let (mut state, roster) = dup_state();
+        let value_id = ValueId([1; 32]);
+        let signed_data = make_vote_sign_datas(roster[0].pub_key, false, 0, 0, value_id)[1];
+        let sig = TMSig(sign_with_namespace(&state.my_signing_key, &signed_data, &state.vote_namespace));
+        assert_eq!(state.check_and_incorporate_msg(0, 0, 0, value_id, -2, &roster, 0,
+            PACKET_TYPE_PREVOTE_SIGNATURES, &signed_data, sig), TMStatus::Indeterminate);
+        let counts = state.rounds_data[0].counts;
+        assert_eq!(state.check_and_incorporate_msg(0, 0, 0, value_id, -2, &roster, 0,
+            PACKET_TYPE_PREVOTE_SIGNATURES, &signed_data, sig), TMStatus::Pass);
+        assert!(state.rounds_data[0].counts == counts);
+    }
+
+    #[test]
+    fn dup_different_value_is_fault() {
+        let (mut state, roster) = dup_state();
+        for (value_id, expected) in [(ValueId([1; 32]), TMStatus::Indeterminate),
+                                     (ValueId([2; 32]), TMStatus::Fail)] {
+            let signed_data = make_vote_sign_datas(roster[0].pub_key, false, 0, 0, value_id)[1];
+            let sig = TMSig(sign_with_namespace(&state.my_signing_key, &signed_data, &state.vote_namespace));
+            assert_eq!(state.check_and_incorporate_msg(0, 0, 0, value_id, -2, &roster, 0,
+                PACKET_TYPE_PREVOTE_SIGNATURES, &signed_data, sig), expected);
+        }
+        assert!(state.sig_fault_printed.is_empty());
+        assert_eq!(state.rounds_data[0].msg_val_sigs[0][0].0, ValueId([1; 32]));
+    }
+
+    fn chunk_msg(key: &SigningKey, namespace: &[u8; 32], proposal: &BlockValue, proposal_id: ValueId, round: u32, valid_round: i64, chunk_i: usize) -> (Vec<u8>, TMSig) {
+        let hdr = PacketProposalChunkHeader {
+            chunk_i: chunk_i as u32, proposal_size: proposal.0.len() as u32, round, valid_round, height: 0, proposal_id,
+        };
+        let mut data = vec![0u8; PacketProposalChunkHeader::SERIALIZED_SIZE];
+        hdr.write_to(&mut data);
+        let (chunk_o, chunk_size) = proposal.chunk_o_size(chunk_i);
+        data.extend_from_slice(&proposal.0[chunk_o..chunk_o + chunk_size]);
+        let sig = TMSig(sign_with_namespace(key, &data, namespace));
+        (data, sig)
+    }
+
+    fn dup_chunk_state() -> (TMState, [SortedRosterMember; 1], BlockValue, ValueId) {
+        let (state, roster) = dup_state();
+        let proposal = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let proposal_id = proposal.id_from_value(&state.hash_keys);
+        (state, roster, proposal, proposal_id)
+    }
+
+    #[test]
+    fn dup_chunk_preserves_state() {
+        let (mut state, roster, proposal, proposal_id) = dup_chunk_state();
+        let (data, sig) = chunk_msg(&state.my_signing_key, &state.vote_namespace, &proposal, proposal_id, 0, -1, 1);
+        assert_ne!(state.check_and_incorporate_msg(0, 0, 1, proposal_id, -1, &roster, 0, PACKET_TYPE_PROPOSAL_CHUNK, &data, sig), TMStatus::Fail);
+        let stored = state.rounds_data[0].proposal.0.clone();
+        assert_eq!(state.check_and_incorporate_msg(0, 0, 1, proposal_id, -1, &roster, 0, PACKET_TYPE_PROPOSAL_CHUNK, &data, sig), TMStatus::Pass);
+        assert_eq!(state.rounds_data[0].proposal_sigs_n, 1);
+        assert!(state.rounds_data[0].proposal.0 == stored);
+    }
+
+    #[test]
+    fn dup_chunk_copied_sig_on_other_bytes_is_verified() {
+        let (mut state, roster, proposal, proposal_id) = dup_chunk_state();
+        let (data, sig) = chunk_msg(&state.my_signing_key, &state.vote_namespace, &proposal, proposal_id, 0, -1, 0);
+        assert_ne!(state.check_and_incorporate_msg(0, 0, 0, proposal_id, -1, &roster, 0, PACKET_TYPE_PROPOSAL_CHUNK, &data, sig), TMStatus::Fail);
+        let stored = state.rounds_data[0].proposal.0.clone();
+
+        let mut other = data.clone();
+        *other.last_mut().unwrap() ^= 1;
+        assert_eq!(state.check_and_incorporate_msg(0, 0, 0, proposal_id, -1, &roster, 0, PACKET_TYPE_PROPOSAL_CHUNK, &other, sig), TMStatus::Fail);
+
+        let mut other = data.clone();
+        other.push(0);
+        assert_eq!(state.check_and_incorporate_msg(0, 0, 0, proposal_id, -1, &roster, 0, PACKET_TYPE_PROPOSAL_CHUNK, &other, sig), TMStatus::Fail);
+
+        assert!(state.rounds_data[0].proposal.0 == stored);
+        assert_eq!(state.rounds_data[0].proposal_sigs[0], sig);
+        assert_eq!(state.rounds_data[0].proposal_sigs_n, 1);
+    }
+
+    #[test]
+    fn dup_chunk_other_header_is_not_shortcut() {
+        let (mut state, roster, proposal, proposal_id) = dup_chunk_state();
+        let (data, sig) = chunk_msg(&state.my_signing_key, &state.vote_namespace, &proposal, proposal_id, 0, -1, 0);
+        assert_ne!(state.check_and_incorporate_msg(0, 0, 0, proposal_id, -1, &roster, 0, PACKET_TYPE_PROPOSAL_CHUNK, &data, sig), TMStatus::Fail);
+
+        let mut other = data.clone();
+        PacketProposalChunkHeader { chunk_i: 0, proposal_size: proposal.0.len() as u32, round: 0, valid_round: 0, height: 0, proposal_id }.write_to(&mut other);
+        assert_eq!(state.check_and_incorporate_msg(0, 0, 0, proposal_id, 0, &roster, 0, PACKET_TYPE_PROPOSAL_CHUNK, &other, sig), TMStatus::Fail);
+        assert_eq!(state.rounds_data[0].proposal_valid_round, -1);
+    }
+
+    #[ignore]
+    #[test]
+    #[allow(non_snake_case)]
+    fn dup_vote_bench() {
+        use std::hint::black_box;
+        use core::arch::x86_64::{_rdtsc, _mm_lfence};
+        use rand::seq::SliceRandom;
+
+        fn env_or(name: &str, default: usize) -> usize { std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default) }
+        let ROSTER_N = env_or("BENCH_ROSTER", 100);
+        let ROUNDS_N = env_or("BENCH_ROUNDS", 4) as u32;
+        let TRIALS   = env_or("BENCH_TRIALS", 31);
+        let CHUNKS_N = env_or("BENCH_CHUNKS", 5);
+        const COLD_N: usize = 300;
+
+        struct Msg { r: u32, i: usize, chunk_i: usize, pt: u8, v: ValueId, valid_round: i64, data: Vec<u8>, sig: TMSig }
+
+        fn q(v: &[f64], p: f64) -> f64 {
+            let mut v = v.to_vec();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[((v.len() - 1) as f64 * p).round() as usize]
+        }
+        fn summary(name: &str, v: &[f64]) {
+            println!("  {name:<28} median {:>9.1}  p10 {:>9.1}  p90 {:>9.1}  min {:>9.1}  max {:>9.1}", q(v, 0.5), q(v, 0.1), q(v, 0.9), q(v, 0.0), q(v, 1.0));
+        }
+        fn ticks() -> u64 { unsafe { _mm_lfence(); let t = _rdtsc(); _mm_lfence(); t } }
+
+        let t0 = std::time::Instant::now();
+        let c0 = ticks();
+        while t0.elapsed().as_millis() < 200 {}
+        let ns_per_tick = t0.elapsed().as_nanos() as f64 / (ticks() - c0) as f64;
+
+        let mut evict = vec![0u8; 128 << 20];
+        let mut evict_sum = 0u64;
+
+        let namespace = [9u8; 32];
+        let keys: Vec<SigningKey> = (0..ROSTER_N).map(|i| { let mut b = [0u8; 32]; b[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes()); SigningKey::from(b) }).collect();
+        let roster: Vec<SortedRosterMember> = keys.iter().enumerate().map(|(i, k)| SortedRosterMember {
+            pub_key: PubKeyID(VerificationKeyBytes::from(k).into()), stake: 1, cumulative_stake: i as u64 + 1 }).collect();
+        let me = ROSTER_N / 2;
+        let mut state = TMState::init(
+            keys[me].clone(), roster[me].pub_key, 0,
+            ClosureToProposeNewBlock(Arc::new(|| Box::pin(async { None }))),
+            ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
+            ClosureToPushDecidedBlock(Arc::new(|_, _, _| Box::pin(async { (Vec::new(), [0; 32]) }))),
+            ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
+            ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
+        );
+        state.vote_namespace = namespace;
+        for r in 0..ROUNDS_N { state.insert_round(r as usize, r, &roster); }
+
+        let (mut votes, mut chunks) = (Vec::new(), Vec::new());
+        for r in 0..ROUNDS_N {
+            let proposer = (r as usize * 7 + 1) % ROSTER_N;
+            let proposal = BlockValue((0..CHUNKS_N * PROPOSAL_CHUNK_DATA_SIZE).map(|j| (j as u32 ^ r) as u8).collect());
+            let proposal_id = proposal.id_from_value(&state.hash_keys);
+            for chunk_i in 0..CHUNKS_N {
+                let (data, sig) = chunk_msg(&keys[proposer], &namespace, &proposal, proposal_id, r, -1, chunk_i);
+                assert_ne!(state.check_and_incorporate_msg(0, r, chunk_i, proposal_id, -1, &roster, proposer, PACKET_TYPE_PROPOSAL_CHUNK, &data, sig), TMStatus::Fail);
+                chunks.push(Msg { r, i: proposer, chunk_i, pt: PACKET_TYPE_PROPOSAL_CHUNK, v: proposal_id, valid_round: -1, data, sig });
+            }
+            for i in 0..ROSTER_N {
+                for is_precommit in [false, true] {
+                    let v = if (i + is_precommit as usize + r as usize) % 2 == 0 { proposal_id } else { ValueId::NIL };
+                    let data = make_vote_sign_datas(roster[i].pub_key, is_precommit, 0, r, v)[(v != ValueId::NIL) as usize].to_vec();
+                    let sig = TMSig(sign_with_namespace(&keys[i], &data, &namespace));
+                    let pt = if is_precommit { PACKET_TYPE_PRECOMMIT_SIGNATURES } else { PACKET_TYPE_PREVOTE_SIGNATURES };
+                    assert_ne!(state.check_and_incorporate_msg(0, r, 0, v, -2, &roster, i, pt, &data, sig), TMStatus::Fail);
+                    votes.push(Msg { r, i, chunk_i: 0, pt, v, valid_round: -2, data, sig });
+                }
+            }
+        }
+        votes.shuffle(&mut ChaCha20Rng::seed_from_u64(1));
+        chunks.shuffle(&mut ChaCha20Rng::seed_from_u64(2));
+        let counts: Vec<_> = state.rounds_data.iter().map(|rd| (rd.counts, rd.proposal_sigs_n)).collect();
+
+        for (kind, msgs) in [("votes", &votes), ("proposal chunks", &chunks)] {
+            let call = |state: &mut TMState, m: &Msg| -> TMStatus {
+                black_box(state).check_and_incorporate_msg(0, m.r, m.chunk_i, m.v, m.valid_round, &roster, m.i, m.pt, black_box(&m.data[..]), black_box(m.sig))
+            };
+            let verify = |m: &Msg| -> bool {
+                black_box(m.sig).verify_with_namespace(roster[m.i].pub_key, black_box(&m.data[..]), &namespace).is_ok()
+            };
+            let run = |state: &mut TMState, shortcut: bool| -> f64 {
+                let t = ticks();
+                for m in msgs.iter() {
+                    if shortcut { assert_eq!(call(state, m), TMStatus::Pass); } else { assert!(verify(m)); }
+                }
+                (ticks() - t) as f64 * ns_per_tick / msgs.len() as f64
+            };
+
+            let (mut on, mut off, mut ratio) = (Vec::new(), Vec::new(), Vec::new());
+            run(&mut state, true); run(&mut state, false);
+            for trial in 0..TRIALS {
+                let (a, b) = if trial % 2 == 0 { let a = run(&mut state, true); (a, run(&mut state, false)) }
+                             else               { let b = run(&mut state, false); (run(&mut state, true), b) };
+                on.push(a); off.push(b); ratio.push(b / a);
+            }
+
+            let (mut cold_on, mut cold_off) = (Vec::new(), Vec::new());
+            for k in 0..2 * COLD_N {
+                let shortcut = k % 2 == 0;
+                for j in (0..evict.len()).step_by(64) { evict[j] = evict[j].wrapping_add(1); evict_sum += evict[j] as u64; }
+                let m = &msgs[(k / 2 * 7) % msgs.len()];
+                let t = ticks();
+                let ok = if shortcut { call(&mut state, m) == TMStatus::Pass } else { verify(m) };
+                let dt = (ticks() - t) as f64 * ns_per_tick;
+                assert!(ok);
+                if shortcut { cold_on.push(dt) } else { cold_off.push(dt) }
+            }
+            let mut empty = Vec::new();
+            for _ in 0..1000 { let t = ticks(); empty.push((ticks() - t) as f64 * ns_per_tick); }
+
+            println!("{kind}: {} distinct duplicates, {ROSTER_N} validators, {ROUNDS_N} rounds, {CHUNKS_N} chunks per proposal, {TRIALS} paired trials (ns per call)", msgs.len());
+            summary("warm, shortcut", &on);
+            summary("warm, bare verify", &off);
+            summary("warm, paired ratio", &ratio);
+            summary("cold, shortcut", &cold_on);
+            summary("cold, bare verify", &cold_off);
+            summary("timer overhead", &empty);
+            println!("  cold ratio of medians (timer overhead subtracted): {:.0}x",
+                     (q(&cold_off, 0.5) - q(&empty, 0.5)) / (q(&cold_on, 0.5) - q(&empty, 0.5)));
+        }
+        assert!(state.rounds_data.iter().map(|rd| (rd.counts, rd.proposal_sigs_n)).zip(&counts).all(|(a, b)| a == *b));
+        black_box(evict_sum);
+    }
+
+    #[test]
+    fn dup_zero_signature_does_not_match_empty_slot() {
+        let (mut state, roster) = dup_state();
+        let signed_data = make_vote_sign_datas(roster[0].pub_key, false, 0, 0, ValueId::NIL)[0];
+        assert_eq!(state.check_and_incorporate_msg(0, 0, 0, ValueId::NIL, -2, &roster, 0,
+            PACKET_TYPE_PREVOTE_SIGNATURES, &signed_data, TMSig::NIL), TMStatus::Fail);
+        assert_eq!(state.rounds_data[0].msg_nil_sigs[0][0], TMSig::NIL);
+    }
 
     // #[ignore]
     // #[test]
