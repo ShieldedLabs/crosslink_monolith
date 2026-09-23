@@ -731,6 +731,10 @@ impl ErrBuf {
     }
 }
 
+
+// @Todo: off-chain/finality representation — model best-chain membership and finality
+// independently, so the GUI can distinguish an ordinary side-chain transaction from one
+// finalized as off-chain because its expiry passed or a nullifier was finalized spent elsewhere.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TxStatus {
     OnBc,
@@ -906,8 +910,11 @@ impl WalletTx {
     // TODO:
     // pub fn expired_unmined() -> bool {}
 
-    // TODO: split shielding/unshielding/shielded/transparent/mixed from
-    // send/recv/self-send/coinbase
+    // @Todo: Unshield kind and explicit shielded-pool transition kinds (originally
+    // Sapling -> Orchard; use the current Ironwood equivalents), kept independent from
+    // send/receive/self-send/coinbase so transparent, shielded, and mixed flows are visible.
+    // Also recover and define the meeting notes' unspecified "other" transaction kinds and
+    // finish the transaction-presentation cleanup left over from the previous workshop.
     // TODO: staking
     pub fn kind(&self) -> WalletTxKind {
         if let Some(staking_action) = &self.staking_action {
@@ -1006,6 +1013,8 @@ pub struct WalletState {
     pub staked_balance:  u64, // in zats
     pub withdrawable_balance:  u64, // in zats
 
+    // @Todo: note view — expose received, unspent, and spent transparent and shielded
+    // notes through WalletState so zebra-gui can render them; DUMP_NOTES is console-only.
     // pub debug_user_account: Option<ManualAccount>,
 
     pub user_local_txs_n: usize,
@@ -3649,7 +3658,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     const MAX_BLOCKS_TO_DOWNLOAD_AT_TIME: u64 = 1024;
 
     // NOTE: current model is to reorg this many blocks back
-    // ALT: have checkpoints every 16/32 blocks and always sync from the start of one of these
+    // @Todo: checkpoint batching and rounded reorg rewinds. The meeting notes proposed
+    // checkpoints every 8 or 16 blocks and rounding a reorg target down to the nearest
+    // checkpoint; a later alternative considered 16/32 blocks and always syncing from the
+    // start of one. Choose and document the interval before replacing per-block checkpoints.
     const REWIND_DISTANCE: u64 = (MAX_BLOCK_REORG_HEIGHT as u64 + 1); // must exceed max reorg height
 
     const T_ADDR_RECHECK_WINDOW: u64 = REWIND_DISTANCE;

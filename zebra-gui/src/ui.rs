@@ -3093,7 +3093,10 @@ pub fn ui_left_pane(ui: &mut Context,
                                         WalletTxKind::Send         => ICON_UP_SMALL,
                                         WalletTxKind::SelfSend     => ICON_DOWN_SMALL,
                                         WalletTxKind::Receive      => ICON_DOWN_SMALL,
-                                        WalletTxKind::Mine         => ICON_MONEY_1, // TODO: pickaxe/tools icon
+                                        // @Todo: transaction icon wishlist — use a mining/pickaxe icon for coinbase;
+                                        // consider a lock for confirmations/finality, a Crosslink icon, and a per-tx
+                                        // health indicator. Recover and verify any remaining items from the external Trello list.
+                                        WalletTxKind::Mine         => ICON_MONEY_1,
                                         WalletTxKind::Shield       => ICON_SHIELD,
                                         WalletTxKind::Stake        => ICON_LINK_1,
                                         WalletTxKind::BeginUnstake => ICON_LINK_EXT_ALT,
