@@ -899,6 +899,19 @@ pub fn consensus_branch_id(
     Ok(())
 }
 
+/// A staking action's amount must be at most `MAX_MONEY`. The amount is read off the wire
+/// unchecked, and value balances, bond records and pool updates all convert it to an [`Amount`].
+pub fn staking_action_amount(tx: &Transaction) -> Result<(), TransactionError> {
+    let Some(staking_action) = tx.staking_action() else {
+        return Ok(());
+    };
+    let amount_zats = staking_action.amount_zats();
+    if amount_zats > zebra_chain::amount::MAX_MONEY as u64 {
+        return Err(TransactionError::StakingActionAmountInvalid { amount_zats });
+    }
+    Ok(())
+}
+
 /// Every staking action must be signed by the bond key it names, over the shielded sighash.
 ///
 /// That sighash commits to the spent outputs (ZIP 244 S.2), so the caller passes the sighasher

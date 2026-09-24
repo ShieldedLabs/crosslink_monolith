@@ -1646,34 +1646,43 @@ impl Transaction {
     }
 
     /// Return the staking value balance.
-    pub fn staking_action_value_balance(&self) -> ValueBalance<NegativeAllowed> {
-        match self {
-            Self::VCrosslink {
-                staking_action,
-                ..
-            } => {
-                if let Some(staking_action) = staking_action {
-                    if staking_action.kind() == StakingActionKind::CreateNewDelegationBond {
-                        ValueBalance::from_staking_bonded_amount(Amount::new(staking_action.amount_zats() as i64).neg())
-                    } else if staking_action.kind() == StakingActionKind::WithdrawDelegationBond {
-                        ValueBalance::from_staking_unbonded_amount(Amount::new(staking_action.amount_zats() as i64).constrain().unwrap())
-                    } else if staking_action.kind() == StakingActionKind::ConvertFinalizerRewardToDelegationBond {
-                        // Unlike unbonding, the amount is in the action, so the pool-to-pool
-                        // move can be expressed here: the finalizer bank pays out (positive,
-                        // like an input) and the new bond takes it in (negative, like an
-                        // output). Net zero for the transaction's own balance.
-                        let amount = Amount::new(staking_action.amount_zats() as i64);
-                        let mut vb: ValueBalance<NegativeAllowed> = ValueBalance::from_finalizer_rewards_amount(amount.constrain().unwrap());
-                        vb.set_staking_bonded_amount(amount.neg());
-                        vb
-                    } else {
-                        ValueBalance::zero() // Note(Sam): I would have liked to have the transfer between bonded and unbonded pools to occur here but I do not think it is possible.
-                    }
-                } else {
-                    ValueBalance::zero()
-                }
-            },
-            _ => ValueBalance::zero(),
+    ///
+    /// The action's amount comes off the wire unchecked, so an amount above `MAX_MONEY` is an
+    /// error here rather than a panic. Consensus rejects such an amount before this is reached
+    /// (`check::staking_action_amount`); this keeps any other caller from aborting the node.
+    pub fn staking_action_value_balance(&self) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
+        let Self::VCrosslink { staking_action: Some(staking_action), .. } = self else {
+            return Ok(ValueBalance::zero());
+        };
+        let amount = |pool_error: fn(AmountError) -> ValueBalanceError| {
+            Amount::<NonNegative>::try_from(staking_action.amount_zats()).map_err(pool_error)
+        };
+
+        match staking_action.kind() {
+            StakingActionKind::CreateNewDelegationBond => {
+                let amount = amount(ValueBalanceError::StakingBonded)?;
+                Ok(ValueBalance::from_staking_bonded_amount(amount.neg()))
+            }
+            StakingActionKind::WithdrawDelegationBond => {
+                let amount = amount(ValueBalanceError::StakingUnbonded)?;
+                Ok(ValueBalance::from_staking_unbonded_amount(
+                    amount.constrain().expect("a non-negative amount is a valid signed amount"),
+                ))
+            }
+            StakingActionKind::ConvertFinalizerRewardToDelegationBond => {
+                // Unlike unbonding, the amount is in the action, so the pool-to-pool
+                // move can be expressed here: the finalizer bank pays out (positive,
+                // like an input) and the new bond takes it in (negative, like an
+                // output). Net zero for the transaction's own balance.
+                let amount = amount(ValueBalanceError::FinalizerRewards)?;
+                let mut vb: ValueBalance<NegativeAllowed> = ValueBalance::from_finalizer_rewards_amount(
+                    amount.constrain().expect("a non-negative amount is a valid signed amount"),
+                );
+                vb.set_staking_bonded_amount(amount.neg());
+                Ok(vb)
+            }
+            // Note(Sam): I would have liked to have the transfer between bonded and unbonded pools to occur here but I do not think it is possible.
+            _ => Ok(ValueBalance::zero()),
         }
     }
 
@@ -1704,7 +1713,7 @@ impl Transaction {
             + self.sapling_value_balance()
             + self.orchard_value_balance()
             + self.ironwood_value_balance()
-            + self.staking_action_value_balance()
+            + self.staking_action_value_balance()?
     }
 
     /// Returns the value balances for this transaction.

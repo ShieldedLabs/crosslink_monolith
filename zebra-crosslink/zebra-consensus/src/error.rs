@@ -332,6 +332,9 @@ pub enum TransactionError {
     #[error("staking action signature does not verify against bond key {bond_key:?}")]
     StakingActionSignatureInvalid { bond_key: [u8; 32] },
 
+    #[error("staking action amount {amount_zats} is above MAX_MONEY")]
+    StakingActionAmountInvalid { amount_zats: u64 },
+
     #[error("finalizer reward conversion is not authorized by finalizer {finalizer:?}: bad key or signature")]
     StakingActionFinalizerAuthorizationInvalid { finalizer: [u8; 32] },
 }
@@ -466,6 +469,7 @@ impl TransactionError {
             | IronwoodProofSize
             | StakingActionBondKeyInvalid { .. }
             | StakingActionSignatureInvalid { .. }
+            | StakingActionAmountInvalid { .. }
             | StakingActionFinalizerAuthorizationInvalid { .. }
             | BothVPubsNonZero
             | DisabledAddToSproutPool

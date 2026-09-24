@@ -473,6 +473,57 @@ fn v5_transaction_with_no_outputs_fails_verification() {
     }
 }
 
+/// A staking amount above MAX_MONEY is rejected, not a panic. The amount comes off the wire
+/// unchecked, and converting it to an Amount asserted; the profiles set panic = "abort", so one
+/// relayed transaction took down every node that verified it. No key is needed: the finalizer
+/// capability can be minted from any key, and the bond signature is only checked after the
+/// value balance.
+#[tokio::test]
+async fn mempool_rejects_oversized_staking_amount() {
+    use zcash_primitives::{
+        bft::{finalizer_key_from_seed, FinalizerAddress},
+        transaction::StakingAction,
+    };
+
+    let network = Network::new_regtest(Default::default());
+    let state = service_fn(|request: zebra_state::Request| async move {
+        match request {
+            zebra_state::Request::BondInfo(_) => Ok::<_, tower::BoxError>(zebra_state::Response::BondInfo(None)),
+            zebra_state::Request::FinalizerRewardBalance(_) => Ok(zebra_state::Response::FinalizerRewardBalance(0)),
+            other => panic!("unexpected state request {other:?}"),
+        }
+    });
+    let verifier = MempoolTxVerifier::new_for_tests(&network, state);
+
+    let transaction = Transaction::VCrosslink {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(0),
+        inputs: vec![],
+        outputs: vec![],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+        staking_action: Some(StakingAction::CreateNewDelegationBond {
+            amount_zats: zebra_chain::amount::MAX_MONEY as u64 + 1,
+            unique_pubkey: finalizer_key_from_seed(b"bond").2 .0,
+            bond_salt: [0; 32],
+            target_finalizer: FinalizerAddress::create(&finalizer_key_from_seed(b"target").1),
+            signature: [0; 64],
+        }),
+    };
+
+    // Height 10 is inside the first staking day window, so the window rule doesn't reject it first.
+    let result = verifier
+        .oneshot(MempoolRequest { transaction: transaction.into(), height: Height(10) })
+        .await;
+
+    assert!(
+        matches!(result, Err(TransactionError::StakingActionAmountInvalid { .. })),
+        "expected StakingActionAmountInvalid, got {result:?}"
+    );
+}
+
 #[ignore] // [ACTIVATION HEIGHT PROBLEM]
 #[tokio::test]
 async fn mempool_request_with_missing_input_is_rejected() {

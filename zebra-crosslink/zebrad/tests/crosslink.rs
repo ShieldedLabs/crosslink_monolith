@@ -2007,3 +2007,33 @@ fn crosslink_finality_diagram_3_conflicting_fork_is_refused() {
 
     test_bytes(tf.write_to_bytes());
 }
+
+/// A staking amount above MAX_MONEY is rejected like any invalid block. It used to abort the node:
+/// the amount comes off the wire unchecked, converting it to an Amount asserted, and the profiles
+/// set panic = "abort". The block is valid in every other way, so nothing rejects it earlier.
+#[test]
+fn crosslink_reject_pow_block_with_oversized_staking_amount() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    tf.push_instr_load_pow(&gen.tip, 0);
+
+    let target = zcash_primitives::bft::FinalizerAddress::create(
+        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").1,
+    );
+    let oversized = zebra_chain::amount::MAX_MONEY as u64 + 1;
+    let block = gen.next_block_with_txs(
+        &miner_addr,
+        &[staking_tx_create_bond(b"oversized-bond", target, oversized)],
+    );
+    tf.push_instr_load_pow(&block, SHOULD_FAIL);
+
+    // Answering this needs the node still running, with its chain unchanged.
+    tf.push_instr_expect_pow_chain_length(2, 0);
+
+    test_bytes(tf.write_to_bytes());
+}

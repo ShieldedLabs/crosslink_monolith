@@ -1031,6 +1031,7 @@ fn check_structure_and_network_rules(
     let network_upgrade = NetworkUpgrade::current(network, height);
 
     check::has_inputs_and_outputs(tx)?;
+    check::staking_action_amount(tx)?;
     check::has_enough_orchard_flags(tx)?;
     // NU6.3 / Ironwood flag rules (no-ops for pre-v6 transactions).
     check::has_enough_ironwood_flags(tx)?;
