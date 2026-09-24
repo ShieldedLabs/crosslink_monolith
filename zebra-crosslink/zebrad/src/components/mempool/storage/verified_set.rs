@@ -75,6 +75,11 @@ pub struct VerifiedSet {
     /// action per bond, so a block template never carries two actions that the bond's state
     /// can't both allow.
     bond_keys: HashSet<[u8; 32]>,
+
+    /// The finalizers whose reward banks are drawn on by conversions. Each conversion creates a
+    /// fresh bond, so `bond_keys` doesn't stop two of them: each can fit the bank on its own while
+    /// both together exceed it, and a template carrying both is then rejected.
+    converting_finalizers: HashSet<[u8; 32]>,
 }
 
 impl Drop for VerifiedSet {
@@ -144,6 +149,7 @@ impl VerifiedSet {
         self.orchard_nullifiers.clear();
         self.ironwood_nullifiers.clear();
         self.bond_keys.clear();
+        self.converting_finalizers.clear();
         self.created_outputs.clear();
         self.transactions_serialized_size = 0;
         self.total_cost = 0;
@@ -168,13 +174,14 @@ impl VerifiedSet {
             return Err(SameEffectsTipRejectionError::SpendConflict);
         }
 
-        let bond_key = transaction
-            .transaction
-            .transaction
-            .staking_action()
-            .map(|staking_action| staking_action.bond_key());
+        let staking_action = transaction.transaction.transaction.staking_action();
+        let bond_key = staking_action.map(|staking_action| staking_action.bond_key());
         if bond_key.is_some_and(|bond_key| self.bond_keys.contains(&bond_key)) {
             return Err(SameEffectsTipRejectionError::BondActionConflict);
+        }
+        let converting_finalizer = staking_action.and_then(|staking_action| staking_action.reward_bank_finalizer());
+        if converting_finalizer.is_some_and(|finalizer| self.converting_finalizers.contains(&finalizer)) {
+            return Err(SameEffectsTipRejectionError::RewardBankConflict);
         }
 
         // This likely only needs to check that the transaction hash of the outpoint is still in the mempool,
@@ -203,6 +210,7 @@ impl VerifiedSet {
         self.orchard_nullifiers.extend(tx.orchard_nullifiers());
         self.ironwood_nullifiers.extend(tx.ironwood_nullifiers());
         self.bond_keys.extend(bond_key);
+        self.converting_finalizers.extend(converting_finalizer);
 
         self.transactions_serialized_size += transaction.transaction.size;
         self.total_cost += transaction.cost();
@@ -385,6 +393,9 @@ impl VerifiedSet {
 
         if let Some(staking_action) = tx.staking_action() {
             self.bond_keys.remove(&staking_action.bond_key());
+            if let Some(finalizer) = staking_action.reward_bank_finalizer() {
+                self.converting_finalizers.remove(&finalizer);
+            }
         }
     }
 

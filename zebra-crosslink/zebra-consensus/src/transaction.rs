@@ -628,6 +628,7 @@ where
         let bond_key = staking_action.bond_key();
 
         let zs::Response::BondInfo(bond_info) = state
+            .clone()
             .oneshot(zs::Request::BondInfo(bond_key))
             .await
             .map_err(TransactionError::from)?
@@ -635,7 +636,28 @@ where
             unreachable!("BondInfo request always responds with BondInfo")
         };
 
-        check_staking_action_bond_state(staking_action.kind(), bond_key, staking_action.amount_zats(), bond_info, height)
+        let finalizer_bank = if staking_action.kind() == StakingActionKind::ConvertFinalizerRewardToDelegationBond {
+            let zs::Response::FinalizerRewardBalance(balance) = state
+                .oneshot(zs::Request::FinalizerRewardBalance(staking_action.target_finalizer_pk()))
+                .await
+                .map_err(TransactionError::from)?
+            else {
+                unreachable!("FinalizerRewardBalance request always responds with FinalizerRewardBalance")
+            };
+            balance
+        } else {
+            0
+        };
+
+        check_staking_action_bond_state(
+            staking_action.kind(),
+            bond_key,
+            staking_action.amount_zats(),
+            staking_action.from_finalizer_address().map(|from| from.pub_key.0),
+            finalizer_bank,
+            bond_info,
+            height,
+        )
     }
 
     /// Validates mempool lock-time consensus rules.
@@ -789,10 +811,17 @@ where
 /// Checks that a staking action of `kind` applies to the bond described by `bond_info` at
 /// `height`: the key is fresh for a new bond, and otherwise the bond has the status the action
 /// needs, the withdrawal amount matches, and the staking action delay has passed.
+///
+/// Every rule `validate_delegation_bonds` applies to a block must be applied here too, or the
+/// mempool admits an action that spoils every block template carrying it: the mined block is
+/// rejected, and the action stays pending, so the next template carries it again.
+/// `finalizer_bank` is the target finalizer's reward bank at the tip, read only for a conversion.
 fn check_staking_action_bond_state(
     kind: zcash_primitives::transaction::StakingActionKind,
     bond_key: [u8; 32],
     amount_zats: u64,
+    from_finalizer: Option<[u8; 32]>,
+    finalizer_bank: u64,
     bond_info: Option<zs::BondInfoResponse>,
     height: block::Height,
 ) -> Result<(), TransactionError> {
@@ -805,7 +834,16 @@ fn check_staking_action_bond_state(
 
     match (kind, bond_info) {
         (StakingActionKind::Null, _) => Ok(()),
-        (StakingActionKind::CreateNewDelegationBond | StakingActionKind::ConvertFinalizerRewardToDelegationBond, None) => Ok(()),
+        (StakingActionKind::CreateNewDelegationBond, None) => Ok(()),
+        (StakingActionKind::ConvertFinalizerRewardToDelegationBond, None) => {
+            if amount_zats == 0 {
+                return invalid("the conversion is of zero zats");
+            }
+            if finalizer_bank < amount_zats {
+                return invalid("the finalizer's reward bank cannot cover the conversion");
+            }
+            Ok(())
+        }
         (StakingActionKind::CreateNewDelegationBond | StakingActionKind::ConvertFinalizerRewardToDelegationBond, Some(_)) => {
             invalid("the bond key already exists")
         }
@@ -828,6 +866,9 @@ fn check_staking_action_bond_state(
         (StakingActionKind::RetargetDelegationBond, Some(info)) => {
             if info.status != ACTIVE {
                 return invalid("the bond is not active");
+            }
+            if from_finalizer != Some(info.target_finalizer) {
+                return invalid("from_finalizer is not the bond's current target");
             }
             Ok(())
         }

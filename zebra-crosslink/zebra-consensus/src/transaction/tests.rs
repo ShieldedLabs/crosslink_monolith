@@ -4847,12 +4847,25 @@ mod staking_signature {
 
         const KEY: [u8; 32] = [1; 32];
         const LAST_ACTION: u32 = 1000;
+        const TARGET: [u8; 32] = [7; 32];
+        const OTHER: [u8; 32] = [8; 32];
         let bond = |status| {
-            Some(BondInfoResponse { amount: Amount::try_from(500u64).unwrap(), status, last_action_height: LAST_ACTION })
+            Some(BondInfoResponse {
+                amount: Amount::try_from(500u64).unwrap(),
+                status,
+                last_action_height: LAST_ACTION,
+                target_finalizer: TARGET,
+            })
         };
         let ready = Height(LAST_ACTION + STAKING_ACTION_DELAY);
         let early = Height(LAST_ACTION + STAKING_ACTION_DELAY - 1);
-        let check = |kind, amount, bond_info, height| check_staking_action_bond_state(kind, KEY, amount, bond_info, height);
+        let check = |kind, amount, bond_info, height| check_staking_action_bond_state(kind, KEY, amount, None, 0, bond_info, height);
+        let retarget = |from, bond_info, height| {
+            check_staking_action_bond_state(RetargetDelegationBond, KEY, 0, from, 0, bond_info, height)
+        };
+        let convert = |amount, bank, bond_info| {
+            check_staking_action_bond_state(ConvertFinalizerRewardToDelegationBond, KEY, amount, None, bank, bond_info, ready)
+        };
 
         assert!(check(CreateNewDelegationBond, 500, None, ready).is_ok());
         assert!(check(CreateNewDelegationBond, 500, bond(0), ready).is_err());
@@ -4868,8 +4881,17 @@ mod staking_signature {
         assert!(check(WithdrawDelegationBond, 500, bond(0), ready).is_err());
         assert!(check(WithdrawDelegationBond, 500, bond(2), ready).is_err());
 
-        assert!(check(RetargetDelegationBond, 0, bond(0), early).is_ok());
-        assert!(check(RetargetDelegationBond, 0, bond(3), ready).is_err());
+        // A retarget must name the bond's current target, as block validation requires.
+        assert!(retarget(Some(TARGET), bond(0), early).is_ok());
+        assert!(retarget(Some(OTHER), bond(0), ready).is_err());
+        assert!(retarget(None, bond(0), ready).is_err());
+        assert!(retarget(Some(TARGET), bond(3), ready).is_err());
+
+        // A conversion must be covered by the finalizer's reward bank, and create a fresh bond.
+        assert!(convert(500, 500, None).is_ok());
+        assert!(convert(501, 500, None).is_err());
+        assert!(convert(0, 500, None).is_err());
+        assert!(convert(500, 500, bond(0)).is_err());
     }
 
     /// ZIP 215 accepts small-order keys, and under one the all-zero signature verifies over

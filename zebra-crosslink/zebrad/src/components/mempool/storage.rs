@@ -91,6 +91,11 @@ pub enum SameEffectsTipRejectionError {
         "transaction rejected because another transaction in the mempool already acts on its bond"
     )]
     BondActionConflict,
+
+    #[error(
+        "transaction rejected because another transaction in the mempool already converts its finalizer's reward bank"
+    )]
+    RewardBankConflict,
 }
 
 /// Transactions rejected based only on their effects (spends, outputs, transaction header).

@@ -651,6 +651,8 @@ pub struct BondInfoResponse {
     pub status: u8,
     /// The block height of the last staking action on this bond.
     pub last_action_height: u32,
+    /// The finalizer the bond's stake currently points at.
+    pub target_finalizer: [u8; 32],
 }
 
 /// A structure with the information needed from the state to build a `getblocktemplate` RPC response.

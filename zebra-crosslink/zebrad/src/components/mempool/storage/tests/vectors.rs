@@ -342,6 +342,52 @@ fn unbonding(bond_key: [u8; 32]) -> zcash_primitives::transaction::StakingAction
     }
 }
 
+fn conversion(bond_key: [u8; 32], finalizer: [u8; 32]) -> zcash_primitives::transaction::StakingAction {
+    zcash_primitives::transaction::StakingAction::ConvertFinalizerRewardToDelegationBond {
+        unique_pubkey: bond_key,
+        signature: [0; 64],
+        bond_salt: [0; 32],
+        this_finalizer: finalizer,
+        amount_zats: 100,
+        finalizer_signature: [0; 64],
+    }
+}
+
+/// Conversions from one finalizer's reward bank each create a fresh bond, so the per-bond rule
+/// can't separate them. The mempool holds at most one per finalizer: two that each fit the bank
+/// can exceed it together, and a template carrying both would be rejected.
+#[test]
+fn mempool_holds_one_conversion_per_finalizer() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let mut storage: Storage = Storage::new(&config::Config {
+        tx_cost_limit: 160_000_000,
+        eviction_memory_time: EVICTION_MEMORY_TIME,
+        ..Default::default()
+    });
+
+    let first = staking_transaction(conversion([1; 32], [9; 32]), 0);
+    let same_bank = staking_transaction(conversion([2; 32], [9; 32]), 0);
+    let other_bank = staking_transaction(conversion([3; 32], [8; 32]), 0);
+
+    storage.insert(first, Vec::new(), None)?;
+    assert_eq!(
+        storage.insert(same_bank.clone(), Vec::new(), None),
+        Err(MempoolError::StorageEffectsTip(
+            SameEffectsTipRejectionError::RewardBankConflict
+        ))
+    );
+    storage.insert(other_bank, Vec::new(), None)?;
+    assert_eq!(storage.transaction_count(), 2);
+
+    storage.remove_staking_transactions();
+    storage.clear_tip_rejections();
+    storage.insert(same_bank, Vec::new(), None)?;
+    assert_eq!(storage.transaction_count(), 1);
+
+    Ok(())
+}
+
 /// The mempool holds at most one staking action per bond, and frees the bond when that action
 /// leaves.
 #[test]

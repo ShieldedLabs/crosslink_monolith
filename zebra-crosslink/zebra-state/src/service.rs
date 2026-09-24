@@ -1583,6 +1583,7 @@ impl Service<ReadRequest> for ReadStateService {
                             BondStatus::Unbonding { unbonded_at } => unbonded_at.height.0,
                             BondStatus::Withdrawn { withdrawn_at } => withdrawn_at.height.0,
                         },
+                        target_finalizer: bond.target_finalizer,
                     }
                 });
 

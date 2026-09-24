@@ -1687,6 +1687,15 @@ impl StakingAction {
         }
     }
 
+    /// The finalizer whose reward bank this action draws on: `this_finalizer` for a
+    /// conversion, none for every other action.
+    pub fn reward_bank_finalizer(&self) -> Option<[u8; 32]> {
+        match self {
+            StakingAction::ConvertFinalizerRewardToDelegationBond { this_finalizer, .. } => Some(*this_finalizer),
+            _ => None,
+        }
+    }
+
     /// Retarget's claimed current target. Consensus validates it two ways: the
     /// capability itself must verify, and its key must equal the bond's actual
     /// current target in state.
