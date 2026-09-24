@@ -173,7 +173,7 @@ pub fn crypto_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
 }
 
 pub const MAGIC2_BLOCK_SIZE: usize = 1 + 32 * 8; // 257 bytes: 1 byte count + 32 × 8-byte magic2 values. Always send full block for constant-size.
-pub const MAGIC2_APP_CROSSLINK: u64 = 0x1804a931197a4b62;
+pub const MAGIC2_APP_CROSSLINK: u64 = 0x5d747212563144d9;
 const SERVER_SUPPORTED_MAGIC2: &[u64] = &[MAGIC2_APP_CROSSLINK];
 
 pub fn build_magic2_client_block() -> [u8; MAGIC2_BLOCK_SIZE] {
