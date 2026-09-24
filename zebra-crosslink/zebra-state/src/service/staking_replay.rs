@@ -34,7 +34,7 @@ use crate::{
         burn_delegation_bonds,
         finalized_state::{
             disk_format::{BondKey, DelegationBond, TransactionLocation},
-            slashing::{slash_burn_set, SLASH_ANALYSIS_WINDOW},
+            slashing::slash_burn_set,
         },
         non_finalized_state::BondStatusInChain,
         update_bonds_with_pos_issuance, update_chain_tip_with_delegation_bond,
@@ -178,10 +178,4 @@ impl StakingReplay {
     }
 }
 
-/// The heights whose blocks decide the burns of a slash activating at `activation`:
-/// `(activation - SLASH_ANALYSIS_WINDOW, activation)`, the blocks whose Retargets can move
-/// a bond off a finalizer it was on at the end of a block in the window. The activation
-/// block is not among them, because the burn lands before its staking actions.
-pub fn slash_window(activation: Height) -> impl Iterator<Item = Height> {
-    (activation.0.saturating_sub(SLASH_ANALYSIS_WINDOW) + 1..activation.0).map(Height)
-}
+pub use crate::service::finalized_state::slashing::slash_window;

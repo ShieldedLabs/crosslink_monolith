@@ -2233,10 +2233,10 @@ impl Chain {
     // from this chain or the finalized db. See `slash_burn_set` for why those two
     // sources are complete.
     pub fn slash_window_burns(&self, db: &crate::service::finalized_state::ZebraDb, finalizers: &[[u8; 32]], activation: Height) -> BTreeSet<BondKey> {
-        use crate::service::finalized_state::slashing::slash_burn_set;
+        use crate::service::finalized_state::slashing::{slash_burn_set, slash_window};
 
         let slashed_finalizers: std::collections::BTreeSet<[u8; 32]> = finalizers.iter().copied().collect();
-        let window_blocks = crate::service::staking_replay::slash_window(activation).map(|height| {
+        let window_blocks = slash_window(activation).map(|height| {
             self.block(crate::HashOrHeight::Height(height)).map(|cvb| cvb.block.clone())
                 .or_else(|| db.block(crate::HashOrHeight::Height(height)))
                 .expect("every height below activation is finalized or in this chain")

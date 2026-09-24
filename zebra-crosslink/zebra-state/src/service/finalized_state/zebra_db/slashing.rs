@@ -11,6 +11,14 @@
 //! or unbonding from, a terminated finalizer) with a read of the blocks after `A - W`
 //! and below `A` (whose Retarget `from`s name every bond that left one inside the window).
 //! No genesis scan, no persistent index, no background catch-up.
+//!
+//! @Note: Unbond names no `from`, so an unbonding bond is found through its status instead,
+//! which keeps the target and dates the unbond. Adding `from` to Unbond, to find it in the
+//! scan like Retarget, was tried and dropped: it changes the wire format and adds a
+//! consensus rule, and the Unbonding status can't go anyway. Issuance and the roster need
+//! to know which bonds are active, and the withdrawal delay needs the unbond height;
+//! finding that height by scanning back for the unbond would cost a node an unbounded scan
+//! per withdrawal, triggered for free by withdrawals that turn out invalid.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -24,22 +32,35 @@ use crate::service::{
     non_finalized_state::BondStatusInChain,
 };
 
+/// The heights of the blocks whose staking actions decide the burns of a slash
+/// activating at `activation`: `(activation - W, activation)`. An action there can move
+/// a bond off a finalizer it was on at the end of a block in the window. The activation
+/// block is not among them, because the burn lands before its staking actions.
+pub fn slash_window(activation: Height) -> impl Iterator<Item = Height> {
+    slash_window_heights(activation).map(Height)
+}
+
+fn slash_window_heights(activation: Height) -> std::ops::Range<u32> {
+    activation.0.saturating_sub(SLASH_ANALYSIS_WINDOW) + 1..activation.0
+}
+
 /// The burn set for a hardfork activating at `activation`: every bond delegated
 /// to a finalizer in `slashed` at the end of any block in `[activation - W, activation)`.
 ///
 /// `bonds` is the bond state at the end of block `activation - 1`, before any of the
 /// activation block's staking actions, and `window_blocks` yields the blocks at
-/// heights `(activation - W, activation)`, in any order — no state is threaded
-/// between them. A bond that leaves `T` in block `activation - W` itself is spared:
-/// it is no longer on `T` at the end of that block.
+/// [`slash_window`]`(activation)`, in any order — no state is threaded between them.
+/// A bond that leaves `T` in block `activation - W` itself is spared: it is no longer
+/// on `T` at the end of that block.
 ///
 /// Every delegation stretch onto a slashed finalizer is caught by exactly one of
 /// two checks:
-/// - the stretch reaches the present: the bond still targets `T` in `bonds`,
-///   either Active or Unbonding (unbonding keeps the target, and `unbonded_at`
-///   dates the stretch's end, so a bond that unbonded at or before the window start
-///   is spared, however long before the window it was created);
-/// - the stretch ended with an in-window Retarget: that action's `from` is `T`.
+/// - the stretch reaches the present: the bond still targets `T` in `bonds`, either
+///   Active, or Unbonding with its unbond in one of the [`slash_window`] blocks
+///   (unbonding keeps the target, and `unbonded_at` dates the stretch's end);
+/// - the stretch ended with a Retarget in one of the [`slash_window`] blocks: that
+///   action's `from` is `T`.
+/// Both read the same heights, so the window has one fencepost.
 /// A stretch that *began* in the window needs no check of its own — it either
 /// still stands (first case) or ended by retarget (second) or by unbonding
 /// (first, via the kept target).
@@ -56,7 +77,7 @@ pub fn slash_burn_set(
 ) -> BTreeSet<BondKey> {
     use zcash_primitives::transaction::StakingAction;
 
-    let window_start = activation.0.saturating_sub(SLASH_ANALYSIS_WINDOW);
+    let window_heights = slash_window_heights(activation);
     let mut burned = BTreeSet::new();
 
     for (bond_key, (bond, status)) in bonds {
@@ -65,7 +86,7 @@ pub fn slash_burn_set(
         }
         let in_window = match status {
             BondStatusInChain::Active => true,
-            BondStatusInChain::Unbonding { unbonded_at } => unbonded_at.height.0 > window_start,
+            BondStatusInChain::Unbonding { unbonded_at } => window_heights.contains(&unbonded_at.height.0),
             BondStatusInChain::Withdrawn { .. } | BondStatusInChain::Burned => false,
         };
         if in_window {
@@ -128,6 +149,11 @@ mod tests {
         slash_burn_set(bonds, std::iter::empty(), &BTreeSet::from([SLASHED]), Height(ACTIVATION))
     }
 
+    #[test]
+    fn slash_window_is_the_blocks_after_the_window_start_and_below_activation() {
+        let heights: Vec<u32> = super::slash_window(Height(ACTIVATION)).map(|h| h.0).collect();
+        assert_eq!((heights[0], *heights.last().unwrap()), (821, 1049));
+    }
     #[test]
     fn bond_created_before_window_and_unbonded_inside_it_is_burned() {
         let key = [1; 32];
