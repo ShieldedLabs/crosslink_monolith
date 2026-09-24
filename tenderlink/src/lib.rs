@@ -478,6 +478,12 @@ pub struct TMState {
     /// failing index in each packet.
     sig_fault_printed: std::collections::HashSet<(u64, u32, usize, u8)>,
 
+    /// Dedup for the always-on "PoW block needed" warning: one line per distinct
+    /// (height, round, needed block hash). The branch that emits it is re-entered
+    /// on every consensus update while the height is stuck, so without this a
+    /// single stall produces thousands of identical lines.
+    block_needed_warned: std::collections::HashSet<(u64, u32, [u8; 32])>,
+
     propose_closure: ClosureToProposeNewBlock,
     validate_closure: ClosureToValidateProposedBlock,
     push_block_closure: ClosureToPushDecidedBlock,
@@ -510,6 +516,7 @@ impl TMState {
             rounds_data: Vec::new(),
             recent_commit_round_cache: Vec::new(),
             sig_fault_printed: std::collections::HashSet::new(),
+            block_needed_warned: std::collections::HashSet::new(),
 
             propose_closure,
             validate_closure,
@@ -1213,6 +1220,35 @@ impl TMState {
                 match self.rounds_data[i].proposal_checked_validity.1 {
                     TMStatusReason::NeedsBlock { hash } => {
                         if PRINT_BLOCK_NEEDED { println!("{ctx_str} {ANSI_YLW}BLOCK NEEDED{ANSI_RST} hash: {:?}...", hash); }
+
+                        // This is a terminal condition, not a transient one: the proposal is
+                        // complete and has a precommit supermajority, so the value would be
+                        // decided if it could be validated. Validation returns Indeterminate
+                        // only because the referenced PoW block is absent locally, and nothing
+                        // re-requests it -- we wait on ordinary gossip, which may never deliver
+                        // it. The height then stops advancing with no error of its own.
+                        //
+                        // Deduped per (height, round, hash) like `sig_fault_printed`, because
+                        // re-delivered votes re-enter this branch on every update and would
+                        // otherwise flood.
+                        let key = (self.rounds_data[i].height, self.rounds_data[i].round, hash);
+                        if self.block_needed_warned.insert(key) {
+                            // Reversed, so it matches how Zebra renders a block hash and can be
+                            // compared against the node's own log line for the same block.
+                            let needed: String =
+                                hash.iter().rev().map(|b| format!("{b:02x}")).collect();
+                            tracing::warn!(
+                                needed_pow_block = %needed,
+                                bft_height = self.rounds_data[i].height,
+                                round = self.rounds_data[i].round,
+                                yes_precommits = counts.yes_precommits,
+                                threshold = big_threshold,
+                                "BFT: cannot validate a proposal that already has a precommit \
+                                 supermajority because its PoW block is missing locally; this \
+                                 height cannot advance until that block arrives, and it is not \
+                                 actively re-requested",
+                            );
+                        }
                     },
                     _ => {
                     }
