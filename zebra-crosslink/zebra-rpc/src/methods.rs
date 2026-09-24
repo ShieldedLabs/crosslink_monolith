@@ -3377,7 +3377,8 @@ where
     ) -> Result<GetBlockTemplateResponse> {
         use types::get_block_template::{
             check_parameters, check_synced_to_tip, fetch_chain_info, fetch_mempool_transactions,
-            validate_block_proposal, zip317::select_mempool_transactions,
+            validate_block_proposal,
+            zip317::{remove_with_dependents, select_mempool_transactions, selected_transaction},
         };
 
         // Clone Services
@@ -3736,6 +3737,41 @@ where
             Some(&coinbase_cache),
             &fat_pointer,
         );
+
+        // The mempool checks each staking action against the tip on its own, in code separate from
+        // block validation, so a selection can still hold one the block would be rejected for:
+        // two actions that can't both apply, or a rule the mempool check lacks. The state applies
+        // them in block order with the block's own rules; anything it names is left out, with
+        // whatever spends its outputs.
+        let (staking_positions, staking_actions): (Vec<usize>, Vec<_>) = mempool_txs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, selected)| {
+                let staking_action = selected_transaction(selected).transaction.transaction.staking_action()?;
+                Some((i, *staking_action))
+            })
+            .unzip();
+        let mempool_txs = if staking_actions.is_empty() {
+            mempool_txs
+        } else {
+            let response = self
+                .read_state
+                .clone()
+                .oneshot(ReadRequest::InvalidStakingActions { height, staking_actions })
+                .await
+                .map_misc_error()?;
+            let ReadResponse::InvalidStakingActions(invalid) = response else {
+                unreachable!("InvalidStakingActions request always responds with InvalidStakingActions")
+            };
+            if !invalid.is_empty() {
+                tracing::info!(
+                    invalid_count = invalid.len(),
+                    "leaving staking actions the block would be rejected for out of the template"
+                );
+            }
+            let invalid: Vec<usize> = invalid.into_iter().map(|i| staking_positions[i]).collect();
+            remove_with_dependents(mempool_txs, &invalid)
+        };
 
         tracing::debug!(
             selected_mempool_tx_hashes = ?mempool_txs

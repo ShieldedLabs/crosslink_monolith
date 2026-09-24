@@ -1564,6 +1564,32 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::FinalizerRewardBalances(banks))
             }
 
+            ReadRequest::InvalidStakingActions { height, staking_actions } => {
+                // A block's bond rules read its parent chain, which also carries every bond and
+                // reward bank the finalized state has. With no non-finalized chain the parent is
+                // the finalized tip, so seed one from it, as committing the block would.
+                let chain = state.latest_best_chain().or_else(|| {
+                    let finalized_tip_height = state.db.finalized_tip_height()?;
+                    Some(Arc::new(Chain::new(
+                        &state.network,
+                        finalized_tip_height,
+                        state.db.note_commitment_trees_for_tip(),
+                        state.db.history_tree(),
+                        state.db.finalized_value_pool(),
+                        state.db.all_bonds(),
+                        state.db.all_finalizer_rewards(),
+                    )))
+                });
+                let invalid = match chain {
+                    Some(chain) => check::delegation::invalid_staking_actions(&staking_actions, height, &chain, &state.db),
+                    // An empty state has no bonds, so only a create can be valid, and a template
+                    // for the genesis block carries no mempool transactions anyway.
+                    None => Vec::new(),
+                };
+
+                Ok(ReadResponse::InvalidStakingActions(invalid))
+            }
+
             ReadRequest::BondInfo(bond_key) => {
                 let best_chain = state.latest_best_chain();
                 let bond_info = read::delegation::delegation_bond(&state.db, best_chain.as_deref(), &bond_key);

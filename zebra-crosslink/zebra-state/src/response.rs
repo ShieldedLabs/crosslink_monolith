@@ -620,6 +620,10 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::FinalizerRewardBalances`]: (finalizer, zatoshis), non-zero banks only.
     FinalizerRewardBalances(Vec<([u8; 32], u64)>),
 
+    /// Response to [`ReadRequest::InvalidStakingActions`]: the indices of the actions the block
+    /// would be rejected for, in increasing order.
+    InvalidStakingActions(Vec<usize>),
+
     /// Response to [`ReadRequest::SidechainForks`], strongest fork first.
     SidechainForks(Vec<SidechainFork>),
 
@@ -775,6 +779,7 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::SolutionRate(_)
             | ReadResponse::TipBlockSize(_)
             | ReadResponse::SidechainForks(_)
+            | ReadResponse::InvalidStakingActions(_)
             | ReadResponse::BlockSequence(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }

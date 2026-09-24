@@ -1593,6 +1593,17 @@ pub enum ReadRequest {
     /// Returns [`ReadResponse::FinalizerRewardBalances`].
     FinalizerRewardBalances,
 
+    /// Applies the staking actions in order, as a block at `height` on the best chain would, and
+    /// names the ones that block would be rejected for.
+    ///
+    /// Returns [`ReadResponse::InvalidStakingActions`].
+    InvalidStakingActions {
+        /// The height of the block the actions would be in.
+        height: block::Height,
+        /// The actions, in block order.
+        staking_actions: Vec<zcash_primitives::transaction::StakingAction>,
+    },
+
     /// Returns the tip of every non-finalized chain other than the best chain, with the height
     /// at which it leaves the best chain.
     ///
@@ -1687,6 +1698,7 @@ impl ReadRequest {
             ReadRequest::BondInfo(_) => "bond_info",
             ReadRequest::FinalizerRewardBalance(_) => "finalizer_reward_balance",
             ReadRequest::FinalizerRewardBalances => "finalizer_reward_balances",
+            ReadRequest::InvalidStakingActions { .. } => "invalid_staking_actions",
             ReadRequest::SidechainForks => "sidechain_forks",
             ReadRequest::BlockSequence { .. } => "block_sequence",
         }

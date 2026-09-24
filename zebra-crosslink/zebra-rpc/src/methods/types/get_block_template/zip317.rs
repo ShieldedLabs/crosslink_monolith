@@ -153,6 +153,46 @@ pub fn select_mempool_transactions(
     selected_txs
 }
 
+/// The transaction a selected template entry carries.
+pub fn selected_transaction(selected: &SelectedMempoolTx) -> &VerifiedUnminedTx {
+    #[cfg(not(test))]
+    return selected;
+    #[cfg(test)]
+    return &selected.1;
+}
+
+/// Removes the entries of `selected` at `invalid`, and every entry that spends an output of a
+/// removed one, directly or through another removed entry.
+pub fn remove_with_dependents(selected: Vec<SelectedMempoolTx>, invalid: &[usize]) -> Vec<SelectedMempoolTx> {
+    if invalid.is_empty() {
+        return selected;
+    }
+
+    let mut removed: HashSet<transaction::Hash> = invalid
+        .iter()
+        .map(|&i| selected_transaction(&selected[i]).transaction.id.mined_id())
+        .collect();
+
+    // Spenders can sit anywhere in the selection, so repeat until a pass removes nothing.
+    loop {
+        let before = removed.len();
+        for entry in &selected {
+            let tx = selected_transaction(entry);
+            if tx.transaction.transaction.spent_outpoints().any(|outpoint| removed.contains(&outpoint.hash)) {
+                removed.insert(tx.transaction.id.mined_id());
+            }
+        }
+        if removed.len() == before {
+            break;
+        }
+    }
+
+    selected
+        .into_iter()
+        .filter(|entry| !removed.contains(&selected_transaction(entry).transaction.id.mined_id()))
+        .collect()
+}
+
 /// Returns the number of bytes a block uses outside its transaction data: the block header,
 /// which on Crosslink also carries the fat pointer to the BFT chain, and the transaction count.
 ///
