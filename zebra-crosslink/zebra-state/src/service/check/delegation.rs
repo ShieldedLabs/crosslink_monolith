@@ -1,6 +1,6 @@
 //! Delegation bond validation for contextual checks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     service::{
@@ -63,7 +63,8 @@ pub fn invalid_staking_actions(
 #[derive(Default)]
 struct InBlockBonds {
     new_bonds: HashMap<[u8; 32], DelegationBond>,
-    unbonding_bonds: HashMap<[u8; 32], ()>,
+    // bonds that unbonded or withdrew earlier in the block; see `apply`
+    unbonded_or_withdrawn: HashSet<[u8; 32]>,
     // bond_key -> target after in-block retargets, so a second retarget in the
     // same block validates its `from` against the first one's `to`
     retargets: HashMap<[u8; 32], [u8; 32]>,
@@ -83,6 +84,20 @@ impl InBlockBonds {
         use zcash_primitives::transaction::StakingActionKind;
 
         let bond_key = staking_action.bond_key();
+
+        // Once a bond unbonds or withdraws, no later action on it in the same block can be valid:
+        // retarget and unbond need an active bond, withdrawal needs STAKING_ACTION_DELAY blocks
+        // after the unbond, and the key already exists for a create. The per-kind checks below
+        // read the chain, which doesn't show this block's earlier actions, so this is checked once
+        // for every kind. Without it, retarget after unbond was accepted (STAKING_AUDIT S3), and a
+        // second withdrawal of the same bond was accepted and then panicked the commit, which
+        // expects every withdrawal to find its bond unbonding.
+        if self.unbonded_or_withdrawn.contains(&bond_key) {
+            return Err(ValidateContextError::InvalidDelegationBond(format!(
+                "delegation bond already unbonded or withdrawn earlier in this block: {:?}",
+                bond_key
+            )));
+        }
 
         // The target finalizer is a capability: the address embeds the
         // finalizer key's signature over the standard message, and an action
@@ -136,13 +151,11 @@ impl InBlockBonds {
                     bond_key,
                     height,
                     &self.new_bonds,
-                    &self.unbonding_bonds,
                     non_finalized_chain,
                     finalized_state,
                 )?;
 
-                // Track this unbonding for subsequent validation in this block
-                self.unbonding_bonds.insert(bond_key, ());
+                self.unbonded_or_withdrawn.insert(bond_key);
             }
             StakingActionKind::WithdrawDelegationBond => {
                 // Check that bond exists, is unbonding, and withdrawal amount matches bond amount
@@ -152,6 +165,8 @@ impl InBlockBonds {
                     staking_action.amount_zats(),
                     non_finalized_chain,
                 )?;
+
+                self.unbonded_or_withdrawn.insert(bond_key);
             }
             StakingActionKind::RetargetDelegationBond => {
                 // Check that bond exists and is active
@@ -307,18 +322,9 @@ fn validate_bond_for_unbonding(
     bond_key: [u8; 32],
     height: zebra_chain::block::Height,
     block_new_bonds: &HashMap<[u8; 32], DelegationBond>,
-    block_unbonding_bonds: &HashMap<[u8; 32], ()>,
     non_finalized_chain: &Chain,
     finalized_state: &ZebraDb,
 ) -> Result<(), ValidateContextError> {
-    // Check if already unbonding in this block
-    if block_unbonding_bonds.contains_key(&bond_key) {
-        return Err(ValidateContextError::InvalidDelegationBond(format!(
-            "delegation bond already unbonding in block: {:?}",
-            bond_key
-        )));
-    }
-
     if block_new_bonds.contains_key(&bond_key) {
         return validate_staking_action_delay(bond_key, height, height);
     }
@@ -538,7 +544,7 @@ mod tests {
         let finalized_state = finalized_state();
         let chain = chain_with(BondStatus::Active);
         let unbond_at = |height| {
-            validate_bond_for_unbonding(KEY, Height(height), &HashMap::new(), &HashMap::new(), &chain, &finalized_state.db)
+            validate_bond_for_unbonding(KEY, Height(height), &HashMap::new(), &chain, &finalized_state.db)
         };
 
         assert!(unbond_at(CREATED + STAKING_ACTION_DELAY - 1).is_err());
@@ -551,7 +557,7 @@ mod tests {
         let chain = chain_with(BondStatus::Active);
         let block_new_bonds = HashMap::from([([2; 32], bond())]);
 
-        assert!(validate_bond_for_unbonding([2; 32], Height(500), &block_new_bonds, &HashMap::new(), &chain, &finalized_state.db).is_err());
+        assert!(validate_bond_for_unbonding([2; 32], Height(500), &block_new_bonds, &chain, &finalized_state.db).is_err());
     }
 
     #[test]
@@ -582,5 +588,48 @@ mod tests {
         // The staking action delay applies here too.
         let early = Height(CREATED + STAKING_ACTION_DELAY - 1);
         assert_eq!(invalid_staking_actions(&[unbond(KEY)], early, &chain, &finalized_state.db), vec![0]);
+    }
+
+    /// STAKING_AUDIT S3: a retarget that is valid on its own is rejected after the same bond
+    /// unbonds earlier in the block, because an unbonding bond keeps its target.
+    #[test]
+    fn retarget_after_unbonding_in_the_same_block_is_rejected() {
+        use zcash_primitives::{bft::{finalizer_key_from_seed, FinalizerAddress}, transaction::StakingAction};
+
+        let from = FinalizerAddress::create(&finalizer_key_from_seed(b"from").1);
+        let to = FinalizerAddress::create(&finalizer_key_from_seed(b"to").1);
+        let bond = DelegationBond::new(Amount::try_from(1000u64).unwrap(), from.pub_key.0, loc(CREATED));
+        let chain = Chain::new(
+            &Network::Mainnet,
+            Height(CREATED),
+            NoteCommitmentTrees::default(),
+            Default::default(),
+            ValueBalance::zero(),
+            [(KEY, bond, BondStatus::Active)],
+            std::iter::empty(),
+        );
+        let finalized_state = finalized_state();
+        let height = Height(CREATED + STAKING_ACTION_DELAY);
+
+        let retarget = StakingAction::RetargetDelegationBond { unique_pubkey: KEY, signature: [0; 64], from_finalizer: from, to_finalizer: to };
+        let unbond = StakingAction::BeginDelegationUnbonding { unique_pubkey: KEY, signature: [0; 64] };
+
+        assert_eq!(invalid_staking_actions(&[retarget], height, &chain, &finalized_state.db), Vec::<usize>::new());
+        assert_eq!(invalid_staking_actions(&[unbond, retarget], height, &chain, &finalized_state.db), vec![1]);
+    }
+
+    /// A second withdrawal of one bond in a block must be rejected here: the commit expects each
+    /// withdrawal to find its bond unbonding, and panics on the second.
+    #[test]
+    fn second_withdrawal_in_the_same_block_is_rejected() {
+        use zcash_primitives::transaction::StakingAction;
+
+        let unbonded = CREATED + 400;
+        let chain = chain_with(BondStatus::Unbonding { unbonded_at: loc(unbonded) });
+        let finalized_state = finalized_state();
+        let height = Height(unbonded + STAKING_ACTION_DELAY);
+
+        let withdraw = StakingAction::WithdrawDelegationBond { amount_zats: 1000, unique_pubkey: KEY, signature: [0; 64] };
+        assert_eq!(invalid_staking_actions(&[withdraw, withdraw], height, &chain, &finalized_state.db), vec![1]);
     }
 }
