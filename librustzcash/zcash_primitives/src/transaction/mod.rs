@@ -1499,9 +1499,19 @@ pub const STAKING_ACTION_DELAY: u32 = STAKING_DAY_WINDOW + 5;
 // there is not much point to slashing bonds older than that; any smart attacker will
 // likely have already withdrawn their stake. That's why the staking period exists: to
 // give the community time to notice malicious stake and burn it. If vGloriousFuture
-// prevents bond withdrawal until next finalization, a much longer window is warranted,
+// prevents bond withdrawal until next finalization, and if the stated reason to slash
+// is that a BFT stall has occurred, then a much longer window is possible & warranted,
 // but it would require chasing BFT fat pointers. For now, this is the simple answer.
-pub const SLASH_ANALYSIS_WINDOW: u32 = 2 * STAKING_PERIOD;
+//
+// A slash activating at `A` burns every bond delegated to a slashed finalizer at the end
+// of any block in `[A - W, A)`, and burns it before block `A`'s staking actions. Config
+// validation puts `A` at the first block of a staking day, so `A - W` is the first
+// block after the staking day at `A - 2 * STAKING_PERIOD`. Withdrawal needs
+// `STAKING_ACTION_DELAY` (more than one day window) after unbonding, so it always falls
+// in a later staking day than the unbond. A bond still delegated at the end of `A - W`
+// therefore unbonds no earlier than the day at `A - STAKING_PERIOD` and withdraws no
+// earlier than `A`, where it is already burned.
+pub const SLASH_ANALYSIS_WINDOW: u32 = 2 * STAKING_PERIOD - STAKING_DAY_WINDOW;
 
 /// Blake2b-256 personalization for the staking-action leaf of the transaction
 /// hash tree (also used by the txid/auth digests in `txid.rs`).

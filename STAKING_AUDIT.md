@@ -46,6 +46,8 @@ Slashing burns bonds that pointed at the slashed finalizer at any point in the w
 
 **Fix.** Either burn (or claw back) bonds withdrawn inside the window, or require the unbonding period before withdrawal to be at least the slash window.
 
+**Status.** Fixed. A slash activating at `A` burns every bond delegated to a slashed finalizer at the end of any block in `[A - W, A)`, with `W = SLASH_ANALYSIS_WINDOW = 2 * STAKING_PERIOD - STAKING_DAY_WINDOW`, and burns it before block `A`'s staking actions, which then see the bonds as burned. Activation heights are multiples of `STAKING_PERIOD`, so `A - W` is the first block after a staking day, and a withdrawal always lands in a later staking day than its unbond. A bond still delegated at the end of block `A - W` therefore withdraws no earlier than `A`, too late. The mempool and the block template check staking actions against the bonds as block `A` sees them, recomputed on every request, so neither holds an action on a bond about to be burned.
+
 ## S3. Consensus accepts retargeting a bond that unbonded earlier in the same block
 
 **Severity: Medium**

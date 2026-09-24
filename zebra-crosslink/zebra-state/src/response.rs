@@ -108,7 +108,7 @@ pub enum Response {
     /// Response to [`Request::CheckBlockProposalValidity`]
     ValidBlockProposal,
 
-    /// Response to [`Request::BondInfo`] with bond information.
+    /// Response to [`Request::BondInfo`] and [`Request::BondInfoForBlock`] with bond information.
     BondInfo(Option<BondInfoResponse>),
 
     /// Response to [`Request::FinalizerRewardBalance`]: unconverted commission, in zatoshis.
@@ -609,7 +609,8 @@ pub enum ReadResponse {
 
     /// Response to [`ReadRequest::IsTransparentOutputSpent`]
     IsTransparentOutputSpent(bool),
-    /// Response to [`ReadRequest::BondInfo`] with bond value and status.
+    /// Response to [`ReadRequest::BondInfo`] and [`ReadRequest::BondInfoForBlock`] with bond
+    /// value and status.
     ///
     /// Returns `None` if the bond does not exist.
     BondInfo(Option<BondInfoResponse>),

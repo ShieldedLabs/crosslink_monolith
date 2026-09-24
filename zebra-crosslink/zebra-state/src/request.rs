@@ -1059,6 +1059,18 @@ pub enum Request {
     /// * [`Response::BondInfo(None)`](Response::BondInfo) otherwise.
     BondInfo([u8; 32]),
 
+    /// Looks up a delegation bond as a block at `height` on the best chain would see it. That
+    /// differs from [`Request::BondInfo`] only at a hardfork's activation height, whose slash
+    /// burns land before the block's staking actions.
+    ///
+    /// Returns [`Response::BondInfo`], like [`Request::BondInfo`].
+    BondInfoForBlock {
+        /// The bond's key.
+        bond_key: [u8; 32],
+        /// The height of the block.
+        height: block::Height,
+    },
+
     /// Looks up a finalizer's unconverted reward-bank balance by its public key.
     ///
     /// Returns [`Response::FinalizerRewardBalance`], zero for an unknown finalizer.
@@ -1097,6 +1109,7 @@ impl Request {
             Request::KnownBlock(_) => "known_block",
             Request::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
             Request::BondInfo(_) => "bond_info",
+            Request::BondInfoForBlock { .. } => "bond_info_for_block",
             Request::FinalizerRewardBalance(_) => "finalizer_reward_balance",
             Request::FinalizerRewardBalances => "finalizer_reward_balances",
         }
@@ -1583,6 +1596,18 @@ pub enum ReadRequest {
     /// * [`ReadResponse::BondInfo(None)`](ReadResponse::BondInfo) otherwise.
     BondInfo([u8; 32]),
 
+    /// Looks up a delegation bond as a block at `height` on the best chain would see it. That
+    /// differs from [`ReadRequest::BondInfo`] only at a hardfork's activation height, whose slash
+    /// burns land before the block's staking actions.
+    ///
+    /// Returns [`ReadResponse::BondInfo`], like [`ReadRequest::BondInfo`].
+    BondInfoForBlock {
+        /// The bond's key.
+        bond_key: [u8; 32],
+        /// The height of the block.
+        height: block::Height,
+    },
+
     /// Looks up a finalizer's unconverted reward-bank balance by its public key.
     ///
     /// Returns [`ReadResponse::FinalizerRewardBalance`], zero for an unknown finalizer.
@@ -1696,6 +1721,7 @@ impl ReadRequest {
             ReadRequest::NonFinalizedBlocksListener { .. } => "non_finalized_blocks_listener",
             ReadRequest::IsTransparentOutputSpent(_) => "is_transparent_output_spent",
             ReadRequest::BondInfo(_) => "bond_info",
+            ReadRequest::BondInfoForBlock { .. } => "bond_info_for_block",
             ReadRequest::FinalizerRewardBalance(_) => "finalizer_reward_balance",
             ReadRequest::FinalizerRewardBalances => "finalizer_reward_balances",
             ReadRequest::InvalidStakingActions { .. } => "invalid_staking_actions",
@@ -1766,6 +1792,7 @@ impl TryFrom<Request> for ReadRequest {
             ),
 
             Request::BondInfo(bond_key) => Ok(ReadRequest::BondInfo(bond_key)),
+            Request::BondInfoForBlock { bond_key, height } => Ok(ReadRequest::BondInfoForBlock { bond_key, height }),
             Request::FinalizerRewardBalance(finalizer) => Ok(ReadRequest::FinalizerRewardBalance(finalizer)),
             Request::FinalizerRewardBalances => Ok(ReadRequest::FinalizerRewardBalances),
         }

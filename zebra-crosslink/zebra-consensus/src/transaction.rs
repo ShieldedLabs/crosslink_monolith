@@ -609,9 +609,10 @@ where
         + 'static,
     Mempool::Future: Send + 'static,
 {
-    /// Checks a staking action against its bond at the best chain tip, so the mempool only holds
-    /// actions the next block could include. Blocks get the same rules from contextual validation
-    /// in the state, against the chain they extend.
+    /// Checks a staking action against its bond as the next block, at `height`, would see it, so
+    /// the mempool only holds actions that block could include. That is the bond at the best
+    /// chain tip, unless a slash activating at `height` burns it first. Blocks get the same rules
+    /// from contextual validation in the state, against the chain they extend.
     async fn check_mempool_staking_action_bond_state(
         tx: &Transaction,
         height: block::Height,
@@ -629,11 +630,11 @@ where
 
         let zs::Response::BondInfo(bond_info) = state
             .clone()
-            .oneshot(zs::Request::BondInfo(bond_key))
+            .oneshot(zs::Request::BondInfoForBlock { bond_key, height })
             .await
             .map_err(TransactionError::from)?
         else {
-            unreachable!("BondInfo request always responds with BondInfo")
+            unreachable!("BondInfoForBlock request always responds with BondInfo")
         };
 
         let finalizer_bank = if staking_action.kind() == StakingActionKind::ConvertFinalizerRewardToDelegationBond {

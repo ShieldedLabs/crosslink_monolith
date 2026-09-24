@@ -488,7 +488,7 @@ async fn mempool_rejects_oversized_staking_amount() {
     let network = Network::new_regtest(Default::default());
     let state = service_fn(|request: zebra_state::Request| async move {
         match request {
-            zebra_state::Request::BondInfo(_) => Ok::<_, tower::BoxError>(zebra_state::Response::BondInfo(None)),
+            zebra_state::Request::BondInfoForBlock { .. } => Ok::<_, tower::BoxError>(zebra_state::Response::BondInfo(None)),
             zebra_state::Request::FinalizerRewardBalance(_) => Ok(zebra_state::Response::FinalizerRewardBalance(0)),
             other => panic!("unexpected state request {other:?}"),
         }

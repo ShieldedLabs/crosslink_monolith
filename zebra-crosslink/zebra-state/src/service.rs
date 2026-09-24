@@ -761,6 +761,52 @@ impl ReadStateService {
             .borrow_mapped(|non_finalized_state| non_finalized_state.best_chain().cloned())
     }
 
+    /// The chain a block at `height` on the best tip is validated against: the best chain, or
+    /// with none, one seeded from the finalized tip, as committing the block would. If a slash
+    /// activates at `height`, its burns are applied, because they land before the block's
+    /// staking actions.
+    ///
+    /// Built afresh on every call and never cached: the burn set depends on the chain below
+    /// `height`, which changes with every new block and reorg.
+    fn chain_for_block_at(&self, height: block::Height) -> Option<Arc<Chain>> {
+        let (best_chain, hardfork_schedule) = self.non_finalized_state_receiver.with_watch_data(|non_finalized_state| {
+            (non_finalized_state.best_chain().cloned(), non_finalized_state.hardfork_schedule.clone())
+        });
+        let (mut chain, tip_height) = match best_chain {
+            Some(chain) => {
+                let tip_height = chain.non_finalized_tip_height();
+                (chain, tip_height)
+            }
+            None => {
+                let finalized_tip_height = self.db.finalized_tip_height()?;
+                let chain = Arc::new(Chain::new(
+                    &self.network,
+                    finalized_tip_height,
+                    self.db.note_commitment_trees_for_tip(),
+                    self.db.history_tree(),
+                    self.db.finalized_value_pool(),
+                    self.db.all_bonds(),
+                    self.db.all_finalizer_rewards(),
+                ));
+                (chain, finalized_tip_height)
+            }
+        };
+
+        let activating_rule = hardfork_schedule
+            .rule_active_at(height.0 as u64)
+            .filter(|rule| rule.pow_activation_height == height.0 as u64);
+        if let Some(rule) = activating_rule {
+            // A block at any other height isn't the next one on this chain, so its window
+            // blocks aren't all in it; its burns wait for the chain to reach it.
+            if tip_height.0 + 1 == height.0 {
+                let finalizers: Vec<[u8; 32]> = rule.terminated_finalizers.iter().map(|f| f.0).collect();
+                Arc::make_mut(&mut chain).apply_slash_burns(&self.db, &finalizers, height);
+            }
+        }
+
+        Some(chain)
+    }
+
     /// Test-only access to the inner database.
     /// Can be used to modify the database without doing any consensus checks.
     #[cfg(any(test, feature = "proptest-impl"))]
@@ -927,6 +973,7 @@ impl Service<Request> for StateService {
             | Request::FindBlockHeaders { .. }
             | Request::CheckBestChainTipNullifiersAndAnchors(_)
             | Request::BondInfo(_)
+            | Request::BondInfoForBlock { .. }
             | Request::FinalizerRewardBalance(_)
             | Request::FinalizerRewardBalances => {
                 // Redirect the request to the concurrent ReadStateService
@@ -1566,21 +1613,8 @@ impl Service<ReadRequest> for ReadStateService {
 
             ReadRequest::InvalidStakingActions { height, staking_actions } => {
                 // A block's bond rules read its parent chain, which also carries every bond and
-                // reward bank the finalized state has. With no non-finalized chain the parent is
-                // the finalized tip, so seed one from it, as committing the block would.
-                let chain = state.latest_best_chain().or_else(|| {
-                    let finalized_tip_height = state.db.finalized_tip_height()?;
-                    Some(Arc::new(Chain::new(
-                        &state.network,
-                        finalized_tip_height,
-                        state.db.note_commitment_trees_for_tip(),
-                        state.db.history_tree(),
-                        state.db.finalized_value_pool(),
-                        state.db.all_bonds(),
-                        state.db.all_finalizer_rewards(),
-                    )))
-                });
-                let invalid = match chain {
+                // reward bank the finalized state has.
+                let invalid = match state.chain_for_block_at(height) {
                     Some(chain) => check::delegation::invalid_staking_actions(&staking_actions, height, &chain, &state.db),
                     // An empty state has no bonds, so only a create can be valid, and a template
                     // for the genesis block carries no mempool transactions anyway.
@@ -1591,29 +1625,13 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::BondInfo(bond_key) => {
-                let best_chain = state.latest_best_chain();
-                let bond_info = read::delegation::delegation_bond(&state.db, best_chain.as_deref(), &bond_key);
+                let bond_info = read::delegation::delegation_bond(&state.db, state.latest_best_chain().as_deref(), &bond_key);
+                Ok(ReadResponse::BondInfo(bond_info.map(bond_info_response)))
+            }
 
-                let response = bond_info.map(|(bond, status)| {
-                    use crate::service::finalized_state::disk_format::BondStatus;
-                    BondInfoResponse {
-                        amount: bond.amount,
-                        status: match status {
-                            BondStatus::Active => 0,
-                            BondStatus::Unbonding { .. } => 1,
-                            BondStatus::Withdrawn { .. } => 2,
-                            BondStatus::Burned => 3,
-                        },
-                        last_action_height: match status {
-                            BondStatus::Active | BondStatus::Burned => bond.created_at.height.0,
-                            BondStatus::Unbonding { unbonded_at } => unbonded_at.height.0,
-                            BondStatus::Withdrawn { withdrawn_at } => withdrawn_at.height.0,
-                        },
-                        target_finalizer: bond.target_finalizer,
-                    }
-                });
-
-                Ok(ReadResponse::BondInfo(response))
+            ReadRequest::BondInfoForBlock { bond_key, height } => {
+                let bond_info = read::delegation::delegation_bond(&state.db, state.chain_for_block_at(height).as_deref(), &bond_key);
+                Ok(ReadResponse::BondInfo(bond_info.map(bond_info_response)))
             }
 
             // Used by the visualizer to render forks alongside the best chain: it follows each
@@ -1975,6 +1993,25 @@ pub fn update_chain_tip_with_delegation_bond(
 use finalized_state::disk_format::{BondKey, DelegationBond};
 use non_finalized_state::BondStatusInChain;
 use std::collections::BTreeSet;
+
+fn bond_info_response((bond, status): (DelegationBond, finalized_state::disk_format::BondStatus)) -> BondInfoResponse {
+    use finalized_state::disk_format::BondStatus;
+    BondInfoResponse {
+        amount: bond.amount,
+        status: match status {
+            BondStatus::Active => 0,
+            BondStatus::Unbonding { .. } => 1,
+            BondStatus::Withdrawn { .. } => 2,
+            BondStatus::Burned => 3,
+        },
+        last_action_height: match status {
+            BondStatus::Active | BondStatus::Burned => bond.created_at.height.0,
+            BondStatus::Unbonding { unbonded_at } => unbonded_at.height.0,
+            BondStatus::Withdrawn { withdrawn_at } => withdrawn_at.height.0,
+        },
+        target_finalizer: bond.target_finalizer,
+    }
+}
 
 pub fn burn_delegation_bonds(delegation_bonds: &mut HashMap<BondKey, (DelegationBond, BondStatusInChain)>, burn_set: &BTreeSet<BondKey>) -> Vec<(BondKey, BondStatusInChain)> {
     let mut reverts = Vec::new();

@@ -2,11 +2,12 @@
 //!
 //! Anything that reconstructs bonds from blocks instead of reading them from a `Chain`
 //! uses this: the aggregated-stakes repair (`stake_fixup`) and the wallet issuance scan in
-//! zebra-crosslink. The live path applies the same three steps in the same order:
+//! zebra-crosslink. The live path applies the same three steps in the same order: at a
+//! rule's activation height the hardfork slash burns come first, then
 //! `Chain::update_chain_tip_with_block_except_trees` applies each transaction's staking
-//! action and then the block reward if the block pays one, and the hardfork slash burns
-//! follow at a rule's activation height. A replay that pays the reward per transaction or
-//! skips the burns drifts from the stored stakes from the first multi-transaction block on.
+//! action and then the block reward if the block pays one. A replay that pays the reward per
+//! transaction or skips the burns drifts from the stored stakes from the first
+//! multi-transaction block on.
 //!
 //! Whether a block pays the reward depends on the BFT certificate it carries, which the
 //! callers see differently, so they decide it and pass it in.
@@ -78,9 +79,9 @@ impl StakingReplay {
         Self { delegation_bonds: HashMap::new(), finalizer_rewards: HashMap::new(), slash_rules }
     }
 
-    /// Applies one block: its staking actions in transaction order, then the block reward if
-    /// `pays_reward`, then any hardfork slash burns activating at `height`. `block_at` must
-    /// return the block at any height in the slash window below and including `height`.
+    /// Applies one block: any hardfork slash burns activating at `height`, then its staking
+    /// actions in transaction order, then the block reward if `pays_reward`. `block_at` must
+    /// return the block at any height in [`slash_window`]`(height)`.
     ///
     /// Genesis carries no staking state and the live path skips it, so height 0 is a no-op.
     pub fn apply_block(
@@ -93,6 +94,12 @@ impl StakingReplay {
         if height.0 == 0 {
             return Ok(None);
         }
+
+        let slash = if self.slash_activates_at(height) {
+            self.apply_slash_burns(height, slash_window(height).map(block_at))
+        } else {
+            None
+        };
 
         for (transaction_index, transaction) in block.transactions.iter().enumerate() {
             if let Some(staking_action) = transaction.staking_action() {
@@ -107,14 +114,12 @@ impl StakingReplay {
         if pays_reward {
             self.apply_block_reward();
         }
-        if !self.slash_activates_at(height) {
-            return Ok(None);
-        }
-        Ok(self.apply_slash_burns(height, slash_window(height).map(block_at)))
+        Ok(slash)
     }
 
     /// Applies one transaction's staking action. Call for every staking transaction of a
-    /// block, in block order, before [`StakingReplay::apply_block_reward`].
+    /// block, in block order, after [`StakingReplay::apply_slash_burns`] and before
+    /// [`StakingReplay::apply_block_reward`].
     pub fn apply_staking_action(
         &mut self,
         staking_action: &StakingAction,
@@ -140,8 +145,7 @@ impl StakingReplay {
     }
 
     /// Pays the block's staking reward. Call once per paying non-genesis block, after all of
-    /// its staking actions and before its slash burns, which still leaves burned bonds that
-    /// block's reward.
+    /// its staking actions.
     pub fn apply_block_reward(&mut self) {
         update_bonds_with_pos_issuance(POS_BLOCK_REWARD_ZATS, &mut self.delegation_bonds, &mut self.finalizer_rewards);
     }
@@ -152,8 +156,8 @@ impl StakingReplay {
     }
 
     /// Burns the bonds of every hardfork activating exactly at `height`. `window_blocks`
-    /// must yield the blocks at [`slash_window`]`(height)`, in any order. Call after the
-    /// block's reward.
+    /// must yield the blocks at [`slash_window`]`(height)`, in any order. Call before the
+    /// block's staking actions, so the bonds are those at the end of the previous block.
     pub fn apply_slash_burns(
         &mut self,
         height: Height,
@@ -174,7 +178,10 @@ impl StakingReplay {
     }
 }
 
-/// The heights whose blocks decide the burns of a slash activating at `activation`.
+/// The heights whose blocks decide the burns of a slash activating at `activation`:
+/// `(activation - SLASH_ANALYSIS_WINDOW, activation)`, the blocks whose Retargets can move
+/// a bond off a finalizer it was on at the end of a block in the window. The activation
+/// block is not among them, because the burn lands before its staking actions.
 pub fn slash_window(activation: Height) -> impl Iterator<Item = Height> {
-    (activation.0.saturating_sub(SLASH_ANALYSIS_WINDOW) + 1..=activation.0).map(Height)
+    (activation.0.saturating_sub(SLASH_ANALYSIS_WINDOW) + 1..activation.0).map(Height)
 }

@@ -160,10 +160,10 @@ pub fn fixup_aggregated_stakes(
                 != prev_fat_pointer.points_at_block_hash();
             prev_fat_pointer = block.header.fat_pointer_to_bft_block.clone();
 
-            // The live path burns after the activation block's own staking
-            // actions and rewards (`NonFinalizedState::commit_new_chain`), so
-            // the burned bonds still collect this block's reward and this
-            // block's snapshot already excludes them.
+            // The live path burns before the activation block's own staking
+            // actions and reward (`NonFinalizedState::validate_and_commit`), so
+            // the burned bonds collect no reward from this block and its
+            // snapshot excludes them.
             let block_at = |wh: Height| {
                 db.block(HashOrHeight::Height(wh))
                     .expect("every height at or below the activation is finalized")

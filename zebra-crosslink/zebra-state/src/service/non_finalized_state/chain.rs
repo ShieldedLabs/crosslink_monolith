@@ -2228,40 +2228,32 @@ impl Chain {
         Ok(())
     }
 
-    // Lazy burn-set computation at activation: the chain's bond state (which at
-    // this point includes the activation block's own staking actions) plus a
-    // read of the W blocks below activation, each block from this chain or the
-    // finalized db. See `slash_burn_set` for why those two sources are complete.
+    // Lazy burn-set computation at activation: the chain's bond state at the end of
+    // block `activation - 1` plus a read of the `slash_window` blocks, each block
+    // from this chain or the finalized db. See `slash_burn_set` for why those two
+    // sources are complete.
     pub fn slash_window_burns(&self, db: &crate::service::finalized_state::ZebraDb, finalizers: &[[u8; 32]], activation: Height) -> BTreeSet<BondKey> {
-        use crate::service::finalized_state::slashing::{slash_burn_set, SLASH_ANALYSIS_WINDOW};
+        use crate::service::finalized_state::slashing::slash_burn_set;
 
         let slashed_finalizers: std::collections::BTreeSet<[u8; 32]> = finalizers.iter().copied().collect();
-        let window_start = activation.0.saturating_sub(SLASH_ANALYSIS_WINDOW);
-
-        let window_blocks = ((window_start + 1)..=activation.0).map(|h| {
-            let height = Height(h);
+        let window_blocks = crate::service::staking_replay::slash_window(activation).map(|height| {
             self.block(crate::HashOrHeight::Height(height)).map(|cvb| cvb.block.clone())
                 .or_else(|| db.block(crate::HashOrHeight::Height(height)))
-                .expect("every height at or below activation is finalized or in this chain")
+                .expect("every height below activation is finalized or in this chain")
         });
 
         slash_burn_set(&self.inner.delegation_bonds, window_blocks, &slashed_finalizers, activation)
     }
 
-    // burn at activation and record the pre-burn status so reorg can revert
-    pub(crate) fn apply_slash_burns(&mut self, db: &crate::service::finalized_state::ZebraDb, finalizers: &[[u8; 32]], activation: Height) {
+    // Burns before the activation block is pushed, and returns the pre-burn statuses for
+    // `record_slash_burns` to file under that block once it is pushed.
+    pub(crate) fn apply_slash_burns(&mut self, db: &crate::service::finalized_state::ZebraDb, finalizers: &[[u8; 32]], activation: Height) -> Vec<(BondKey, BondStatusInChain)> {
         let burn_set = self.slash_window_burns(db, finalizers, activation);
-        tracing::info!(
-            "hardfork slash burns at height {}: burned {} bond(s) for {} terminated finalizer(s): {:?}",
-            activation.0,
-            burn_set.len(),
-            finalizers.len(),
-            burn_set.iter().map(hex::encode).collect::<Vec<_>>(),
-        );
-        let reverts = crate::service::burn_delegation_bonds(&mut self.inner.delegation_bonds, &burn_set);
-        if let Some(last) = self.inner.bond_burns.last_mut() {
-            last.extend(reverts);
-        }
+        crate::service::burn_delegation_bonds(&mut self.inner.delegation_bonds, &burn_set)
+    }
+
+    pub(crate) fn record_slash_burns(&mut self, reverts: Vec<(BondKey, BondStatusInChain)>) {
+        self.inner.bond_burns.last_mut().expect("the activation block was just pushed").extend(reverts);
     }
 }
 

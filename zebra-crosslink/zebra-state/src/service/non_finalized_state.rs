@@ -483,7 +483,7 @@ impl NonFinalizedState {
     #[tracing::instrument(level = "debug", skip(self, finalized_state, new_chain))]
     fn validate_and_commit(
         &self,
-        new_chain: Arc<Chain>,
+        mut new_chain: Arc<Chain>,
         prepared: SemanticallyVerifiedBlock,
         finalized_state: &ZebraDb,
     ) -> Result<Arc<Chain>, ValidateContextError> {
@@ -498,6 +498,28 @@ impl NonFinalizedState {
             &new_chain.spent_utxos,
             finalized_state,
         )?;
+
+        // At a hardfork's PoW activation height A, burn every bond delegated to a slashed
+        // finalizer at the end of any block in [A - W, A). The burn is part of the state at
+        // the end of A - 1, so it comes before A's own staking actions are validated: none of
+        // them may withdraw, unbond or retarget a burned bond. This lives here, not in
+        // commit_block, so that a block starting a new chain (parent == finalized tip, via
+        // commit_new_chain) burns too.
+        let slash_burns = match self.hardfork_schedule.rule_active_at(height.0 as u64) {
+            Some(rule) if rule.pow_activation_height == height.0 as u64 => {
+                let finalizers: Vec<[u8; 32]> = rule.terminated_finalizers.iter().map(|f| f.0).collect();
+                let burns = Arc::make_mut(&mut new_chain).apply_slash_burns(finalized_state, &finalizers, height);
+                tracing::info!(
+                    "hardfork slash burns at height {}: burned {} bond(s) for {} terminated finalizer(s): {:?}",
+                    height.0,
+                    burns.len(),
+                    finalizers.len(),
+                    burns.iter().map(|(bond_key, _)| hex::encode(bond_key)).collect::<Vec<_>>(),
+                );
+                burns
+            }
+            _ => Vec::new(),
+        };
 
         // Validate delegation bonds
         // Reads from disk
@@ -540,16 +562,8 @@ impl NonFinalizedState {
         let mut chain =
             Self::validate_and_update_parallel(new_chain, contextual, sprout_final_treestates)?;
 
-        // At a hardfork's PoW activation height, burn every bond that delegated to a
-        // slashed finalizer anywhere in [A - W, A). This lives here — not in
-        // commit_block — so that a block starting a new chain (parent == finalized
-        // tip, via commit_new_chain) burns too; both commit paths funnel through
-        // this function after the push.
-        if let Some(rule) = self.hardfork_schedule.rule_active_at(height.0 as u64) {
-            if rule.pow_activation_height == height.0 as u64 {
-                let finalizers: Vec<[u8; 32]> = rule.terminated_finalizers.iter().map(|f| f.0).collect();
-                Arc::make_mut(&mut chain).apply_slash_burns(finalized_state, &finalizers, height);
-            }
+        if !slash_burns.is_empty() {
+            Arc::make_mut(&mut chain).record_slash_burns(slash_burns);
         }
 
         Ok(chain)

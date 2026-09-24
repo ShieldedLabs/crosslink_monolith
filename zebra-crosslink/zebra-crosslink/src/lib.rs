@@ -475,6 +475,20 @@ async fn total_issuance_from_key(
             return Err(format!("block at height {height} had 0 transactions"));
         }
 
+        // The live path burns before the activation block's staking actions.
+        if height != 0 && staking.slash_activates_at(ZebBlockHeight(height)) {
+            let mut window_blocks = Vec::new();
+            for window_height in zebra_state::slash_window(ZebBlockHeight(height)) {
+                match (call.read_state)(StateReadRequest::Block(window_height.into())).await {
+                    Ok(StateReadResponse::Block(Some(window_block))) => window_blocks.push(window_block),
+                    _ => return Err(format!("failed to get block at height {} in the slash window", window_height.0)),
+                }
+            }
+            if let Some(slash) = timed(&PROF.replay_ns, || staking.apply_slash_burns(ZebBlockHeight(height), window_blocks)) {
+                println!("applied hardfork slash burns at height {height}: {} bond(s) burned for {} terminated finalizer(s)", slash.burned.len(), slash.finalizers.len());
+            }
+        }
+
         for (tx_i, tx) in block.transactions.iter().enumerate() {
             PROF.txs.fetch_add(1, Relaxed);
             let is_coinbase = tx.is_coinbase();
@@ -566,19 +580,6 @@ async fn total_issuance_from_key(
             timed(&PROF.replay_ns, || staking.apply_block_reward());
         }
 
-        // The live path burns after the activation block's staking actions and reward.
-        if height != 0 && staking.slash_activates_at(ZebBlockHeight(height)) {
-            let mut window_blocks = Vec::new();
-            for window_height in zebra_state::slash_window(ZebBlockHeight(height)) {
-                match (call.read_state)(StateReadRequest::Block(window_height.into())).await {
-                    Ok(StateReadResponse::Block(Some(window_block))) => window_blocks.push(window_block),
-                    _ => return Err(format!("failed to get block at height {} in the slash window", window_height.0)),
-                }
-            }
-            if let Some(slash) = timed(&PROF.replay_ns, || staking.apply_slash_burns(ZebBlockHeight(height), window_blocks)) {
-                println!("applied hardfork slash burns at height {height}: {} bond(s) burned for {} terminated finalizer(s)", slash.burned.len(), slash.finalizers.len());
-            }
-        }
         prev_fat_pointer = Some(fat_pointer);
     }
 
