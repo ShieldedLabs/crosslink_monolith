@@ -42,9 +42,15 @@ use crate::service::{
 /// A stretch that *began* in the window needs no check of its own — it either
 /// still stands (first case) or ended by retarget (second) or by unbonding
 /// (first, via the kept target).
-/// @Todo: Withdrawn bonds are skipped, but nothing stops a bond from unbonding and
-/// withdrawing inside the window (the only wait is `STAKING_ACTION_DELAY`, far
-/// shorter than W), so a delegator who leaves fast enough escapes the burn.
+///
+/// NOTE: Withdrawn bonds are skipped, so a bond that unbonds and withdraws inside the
+/// window escapes the burn. This is accepted, not an oversight. Unbond and withdraw
+/// must each land in a staking day window, `STAKING_ACTION_DELAY` apart, and the
+/// delay is longer than the day window, so the earliest withdrawal falls in the next
+/// staking period's window: 81 to 150 blocks after the unbond, about one staking week.
+/// W is two staking weeks, and the activation height is chosen by whoever configures
+/// the hardfork, so it can come less than W after the misbehaviour. A delegator who
+/// leaves as soon as the misbehaviour is visible can therefore be gone by activation.
 pub fn slash_burn_set(
     bonds: &HashMap<BondKey, (DelegationBond, BondStatusInChain)>,
     window_blocks: impl IntoIterator<Item = Arc<Block>>,
@@ -193,7 +199,7 @@ mod tests {
         assert_eq!(burn_set(&bonds), BTreeSet::from([active, unbonded_just_inside]));
     }
 
-    // Records the escape noted on `slash_burn_set`; flip it if withdrawal becomes slashable.
+    // The accepted escape noted on `slash_burn_set`.
     #[test]
     fn bond_withdrawn_inside_window_escapes_burn() {
         let key = [1; 32];
