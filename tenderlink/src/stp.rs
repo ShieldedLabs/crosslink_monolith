@@ -922,6 +922,7 @@ pub struct ReassemblySlot {
     pub buf: Vec<u8>,
     pub total_len: Option<u32>,
     pub received: Vec<(u32, u32)>, // sorted non-overlapping non-adjacent ranges: [start, end)
+    pub package_id: u16,
 }
 
 impl ReassemblySlot {
@@ -930,6 +931,7 @@ impl ReassemblySlot {
             buf: Vec::new(),
             total_len: None,
             received: Vec::new(),
+            package_id: 0,
         }
     }
     
@@ -1439,7 +1441,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
 //////// BEGIN ORDINARY PACKET HANDLING  ////////////////////////////////////////////////////////////////////
                         if let ConnectionState::Connected(state) = &mut existing_connection.connection_state {
                             let non_virtual_nonce = (first_six_bytes >> 16) as u32;
-                            let nonce = non_virtual_nonce; // @Todo: convert this to virtual.
+                            let nonce = non_virtual_nonce; // @Todo: Convert this to virtual, like the package ID in unreliable reassembly below.
     
                             let payload;
                             if let Some(cipher) = &mut state.cipher {
@@ -1663,10 +1665,33 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
 
                                 //if OVERLY_VERBOSE { println!("Fragment from {:?}: R:{} F:{} ID:{} L:{} O:{}", connection_key, is_reliable, is_fin, package_id, frag_len, frag_offset); }
                                 
+                                let package_id = package_id as u16;
                                 let slot_idx = package_id as usize % existing_connection.unreliable_reassembly.len();
+
+                                // A slot is reused every 1024 packages, and insert() happily merges fragments
+                                // that are adjacent without overlapping, so a partial package left behind by
+                                // packet loss would be completed by a later package's fragments into one
+                                // spliced message. The slot remembers whose fragments it holds: a newer package
+                                // evicts it, and a late fragment of an older package is dropped.
+                                // @Todo: Make the package ID virtual. The receiver keeps the high bits of the
+                                // newest ID it has seen and widens each 16-bit ID to the 64-bit value nearest
+                                // it, and the slot stores that. Until then, a partial package that sits in its
+                                // slot for a full 65536-package wrap can still be spliced with the package that
+                                // wraps around onto its ID. The nonce above has the same @Todo.
+                                {
+                                    let slot = &mut existing_connection.unreliable_reassembly[slot_idx];
+                                    let slot_in_use = slot.total_len.is_some() || !slot.received.is_empty();
+                                    if slot_in_use && slot.package_id != package_id {
+                                        if (package_id.wrapping_sub(slot.package_id) as i16) < 0 { continue; }
+                                        *slot = ReassemblySlot::new();
+                                    }
+                                    slot.package_id = package_id;
+                                }
+
                                 let (mut success, mut complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
                                 if !success {
                                     existing_connection.unreliable_reassembly[slot_idx] = ReassemblySlot::new();
+                                    existing_connection.unreliable_reassembly[slot_idx].package_id = package_id;
                                     (success, complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
                                     assert!(success);
                                 }

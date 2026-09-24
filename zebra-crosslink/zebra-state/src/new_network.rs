@@ -516,8 +516,14 @@ impl SliceRead for NearTipBranches {
         let full_buf = *buf;
         let hdr = dbg_verify(PacketHashTreeHdr::read_from(buf))?;
         let hdr_len = full_buf.len() - buf.len(); // @Todo: better way to do this.
-        *buf = &buf[..(hdr.hashes_start_offset as usize).saturating_sub(hdr_len)];
-        let mut buf_hashes: &mut &[u8] = &mut &full_buf[hdr.hashes_start_offset as usize..];
+        let hashes_start = hdr.hashes_start_offset as usize;
+        if hashes_start < hdr_len || hashes_start > full_buf.len() {
+            println!("received invalid Hash Tree packet (hashes start offset)");
+            dbg_panic!("received invalid Hash Tree packet (hashes start offset)");
+            return None;
+        }
+        *buf = &buf[..hashes_start - hdr_len];
+        let mut buf_hashes: &mut &[u8] = &mut &full_buf[hashes_start..];
         let mut branches: Vec<Vec<ShadowBlock>> = Vec::new();
 
         let mut hash_c = 0usize;
