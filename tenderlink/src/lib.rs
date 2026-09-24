@@ -444,6 +444,32 @@ const ROSTER_MAX_N: usize = 100;
 fn active_roster_len(roster: &[SortedRosterMember]) -> usize { usize::min(ROSTER_MAX_N, roster.len()) }
 fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
 
+// Tendermint line 28 needs 2f+1 prevotes for the value in the round the proposal cites, vr, not in the
+// current round: nobody can cast the first current-round yes prevote for a re-proposal, so counting the
+// current round leaves split locks with no way out. The count is bound to the value rather than to round
+// vr's proposal, because a node can hold a round's prevotes without ever receiving its proposal, and
+// until the proposal arrives the stored prevotes may name several values. Stake and threshold both come
+// from round vr's own roster. Stored votes were signature-checked on arrival.
+fn has_prevote_certificate(rounds_data: &[RoundData], height: u64, round: u32, vr: i64, value_id: ValueId) -> bool {
+    let Ok(vr) = u32::try_from(vr) else { return false; };
+    if vr >= round { return false; }
+    let Ok(vr_i) = rounds_data.binary_search_by_key(&(height, vr), |el| (el.height, el.round)) else { return false; };
+    let rd = &rounds_data[vr_i];
+
+    let roster_n = active_roster_len(&rd.roster);
+    let total_stake: u64 = rd.roster[..roster_n].iter().map(|m| m.stake).sum();
+    if total_stake == 0 { return false; }
+    let mut value_stake = 0;
+    for i in 0..roster_n.min(rd.msg_val_sigs.len()) {
+        let (vote_value_id, sig) = rd.msg_val_sigs[i][0];
+        if vote_value_id == value_id && sig != TMSig::NIL { value_stake += rd.roster[i].stake; }
+    }
+
+    let f = TMState::f_from_n(total_stake);
+    let big_threshold = if f == 0 { total_stake } else { 2*f + 1 };
+    big_threshold <= value_stake
+}
+
 
 
 #[derive(Debug)]
@@ -1070,9 +1096,9 @@ impl TMState {
             if (on_roster &&
                 is_current_height_and_round &&
                 has_enough_info_to_determine_validity &&
-                big_threshold <= counts.yes_prevotes &&
                 self.step == TMStep::Propose &&
-                0 <= self.rounds_data[i].proposal_valid_round && self.rounds_data[i].proposal_valid_round < self.round as i64) // we have received the proposal value
+                0 <= self.rounds_data[i].proposal_valid_round && self.rounds_data[i].proposal_valid_round < self.round as i64 && // we have received the proposal value
+                has_prevote_certificate(&self.rounds_data, self.height, self.round, self.rounds_data[i].proposal_valid_round, self.rounds_data[i].proposal_id))
             {
                 if self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass && (
                     self.locked_value_round.1 <= self.rounds_data[i].proposal_valid_round ||
@@ -3396,6 +3422,171 @@ mod tests {
         assert_eq!(state.check_and_incorporate_msg(0, 0, 0, ValueId::NIL, -2, &roster, 0,
             PACKET_TYPE_PREVOTE_SIGNATURES, &signed_data, TMSig::NIL), TMStatus::Fail);
         assert_eq!(state.rounds_data[0].msg_nil_sigs[0][0], TMSig::NIL);
+    }
+
+    const LINE28_V: ValueId = ValueId([1; 32]);
+    const LINE28_W: ValueId = ValueId([2; 32]);
+    const LINE28_SIG: TMSig = TMSig([1; 64]);
+
+    fn line28_round(round: u32, stakes: &[u64]) -> RoundData {
+        let roster: Vec<SortedRosterMember> = stakes.iter().enumerate().map(|(i, &stake)| SortedRosterMember {
+            pub_key: PubKeyID([i as u8 + 1; 32]), stake, cumulative_stake: stakes[..=i].iter().sum() }).collect();
+        let roster_n = active_roster_len(&roster);
+        RoundData {
+            height: 0, round,
+            msg_val_sigs: vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n],
+            msg_nil_sigs: vec![[TMSig::NIL; 2]; roster_n],
+            roster,
+            ..RoundData::EMPTY
+        }
+    }
+
+    fn line28_prevote(rd: &mut RoundData, voters: &[usize], value_id: ValueId) {
+        for &i in voters { rd.msg_val_sigs[i][0] = (value_id, LINE28_SIG); }
+    }
+
+    // Four equal stakes: f = 1, so the threshold is 3.
+    fn line28_rounds(cited_voters: &[usize], current_voters: &[usize]) -> Vec<RoundData> {
+        let mut cited   = line28_round(1, &[1, 1, 1, 1]);
+        let mut current = line28_round(2, &[1, 1, 1, 1]);
+        line28_prevote(&mut cited,   cited_voters,   LINE28_V);
+        line28_prevote(&mut current, current_voters, LINE28_V);
+        vec![line28_round(0, &[1, 1, 1, 1]), cited, current]
+    }
+
+    #[test]
+    fn line28_certificate_with_no_current_round_prevotes() {
+        assert!( has_prevote_certificate(&line28_rounds(&[0, 1, 2], &[]), 0, 2, 1, LINE28_V));
+        assert!(!has_prevote_certificate(&line28_rounds(&[0, 1],    &[]), 0, 2, 1, LINE28_V));
+    }
+
+    #[test]
+    fn line28_current_round_quorum_is_not_a_certificate() {
+        assert!(!has_prevote_certificate(&line28_rounds(&[], &[0, 1, 2, 3]), 0, 2, 1, LINE28_V));
+    }
+
+    #[test]
+    fn line28_missing_cited_round() {
+        let rounds = line28_rounds(&[0, 1, 2], &[]);
+        let without_cited = [rounds[0].clone(), rounds[2].clone()];
+        assert!(!has_prevote_certificate(&without_cited, 0, 2, 1, LINE28_V));
+        assert!(!has_prevote_certificate(&rounds, 1, 2, 1, LINE28_V));
+    }
+
+    #[test]
+    fn line28_out_of_range_vr() {
+        let rounds = line28_rounds(&[0, 1, 2], &[0, 1, 2]);
+        for vr in [-1, -2, 2, 3, u32::MAX as i64, u32::MAX as i64 + 2, i64::MIN, i64::MAX] {
+            assert!(!has_prevote_certificate(&rounds, 0, 2, vr, LINE28_V), "vr {vr}");
+        }
+        assert!(has_prevote_certificate(&rounds, 0, 3, 2, LINE28_V));
+    }
+
+    #[test]
+    fn line28_certificate_for_other_value() {
+        let mut rounds = line28_rounds(&[], &[]);
+        line28_prevote(&mut rounds[1], &[0, 1, 2], LINE28_W);
+        assert!(!has_prevote_certificate(&rounds, 0, 2, 1, LINE28_V));
+        assert!( has_prevote_certificate(&rounds, 0, 2, 1, LINE28_W));
+
+        line28_prevote(&mut rounds[1], &[3], LINE28_V);
+        assert!(!has_prevote_certificate(&rounds, 0, 2, 1, LINE28_V));
+    }
+
+    #[test]
+    fn line28_precommits_are_not_prevotes() {
+        let mut rounds = line28_rounds(&[], &[]);
+        for i in 0..4 { rounds[1].msg_val_sigs[i][1] = (LINE28_V, LINE28_SIG); }
+        assert!(!has_prevote_certificate(&rounds, 0, 2, 1, LINE28_V));
+    }
+
+    #[test]
+    fn line28_unequal_weights() {
+        // Total 8: f = 2, so the threshold is 5.
+        let mut rounds = vec![line28_round(0, &[5, 1, 1, 1]), line28_round(1, &[5, 1, 1, 1])];
+        line28_prevote(&mut rounds[1], &[1, 2, 3], LINE28_V);
+        assert!(!has_prevote_certificate(&rounds, 0, 2, 1, LINE28_V));
+        line28_prevote(&mut rounds[1], &[0], LINE28_V);
+        assert!( has_prevote_certificate(&rounds, 0, 2, 1, LINE28_V));
+
+        let mut rounds = vec![line28_round(1, &[4, 1, 1, 1, 1])];
+        line28_prevote(&mut rounds[0], &[0], LINE28_V);
+        assert!(!has_prevote_certificate(&rounds, 0, 2, 1, LINE28_V));
+        line28_prevote(&mut rounds[0], &[1], LINE28_V);
+        assert!( has_prevote_certificate(&rounds, 0, 2, 1, LINE28_V));
+    }
+
+    #[test]
+    fn line28_nil_and_value_from_one_signer_count_once() {
+        let mut rounds = line28_rounds(&[0, 1], &[]);
+        for i in 0..3 { rounds[1].msg_nil_sigs[i][0] = LINE28_SIG; }
+        assert!(!has_prevote_certificate(&rounds, 0, 2, 1, LINE28_V));
+        line28_prevote(&mut rounds[1], &[2], LINE28_V);
+        assert!( has_prevote_certificate(&rounds, 0, 2, 1, LINE28_V));
+    }
+
+    #[test]
+    fn line28_inactive_roster_members_ignored() {
+        // The first ROSTER_MAX_N members are active with stake 1 each (f = 33, threshold 67); one more,
+        // inactive, carries enough stake to outvote them all and has a vote slot anyway.
+        let mut stakes = vec![1u64; ROSTER_MAX_N];
+        stakes.push(1000);
+        let mut rounds = vec![line28_round(1, &stakes)];
+        rounds[0].msg_val_sigs.push([(LINE28_V, LINE28_SIG), (ValueId::NIL, TMSig::NIL)]);
+        let voters: Vec<usize> = (0..66).collect();
+        line28_prevote(&mut rounds[0], &voters, LINE28_V);
+        assert!(!has_prevote_certificate(&rounds, 0, 2, 1, LINE28_V));
+        line28_prevote(&mut rounds[0], &[66], LINE28_V);
+        assert!( has_prevote_certificate(&rounds, 0, 2, 1, LINE28_V));
+    }
+
+    // Wiring: a node at round 2 holding a re-proposal that cites round 1 prevotes for it through line 28,
+    // using round 1's prevotes delivered without round 1's proposal, and with no current-round prevotes.
+    fn line28_bft_update_prevote(cited_voters: &[usize]) -> (TMStep, (ValueId, TMSig)) {
+        let keys: Vec<SigningKey> = (0..4).map(|i| SigningKey::from([i as u8 + 1; 32])).collect();
+        let mut roster: Vec<SortedRosterMember> = keys.iter().enumerate().map(|(i, k)| SortedRosterMember {
+            pub_key: PubKeyID(VerificationKeyBytes::from(k).into()), stake: 1, cumulative_stake: i as u64 + 1 }).collect();
+        let mut state = TMState::init(
+            keys[0].clone(), roster[0].pub_key, 0,
+            ClosureToProposeNewBlock(Arc::new(|| Box::pin(async { None }))),
+            ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
+            ClosureToPushDecidedBlock(Arc::new(|_, _, _| Box::pin(async { (Vec::new(), [0; 32]) }))),
+            ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
+            ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
+        );
+        state.round = 2;
+
+        let proposal = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let proposal_id = proposal.id_from_value(&state.hash_keys);
+        for &i in cited_voters {
+            let data = make_vote_sign_datas(roster[i].pub_key, false, 0, 1, proposal_id)[1];
+            let sig = TMSig(sign_with_namespace(&keys[i], &data, &state.vote_namespace));
+            assert_eq!(state.check_and_incorporate_msg(0, 1, 0, proposal_id, -2, &roster, i,
+                PACKET_TYPE_PREVOTE_SIGNATURES, &data, sig), TMStatus::Indeterminate);
+        }
+        for chunk_i in 0..proposal.chunks_n() {
+            let (data, sig) = chunk_msg(&keys[1], &state.vote_namespace, &proposal, proposal_id, 2, 1, chunk_i);
+            assert_eq!(state.check_and_incorporate_msg(0, 2, chunk_i, proposal_id, 1, &roster, 1,
+                PACKET_TYPE_PROPOSAL_CHUNK, &data, sig), TMStatus::Pass);
+        }
+
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(state.bft_update(&mut roster));
+        let round_i = state.rounds_data.binary_search_by_key(&(0, 2), |el| (el.height, el.round)).unwrap();
+        (state.step, state.rounds_data[round_i].msg_val_sigs[0][0])
+    }
+
+    #[test]
+    fn line28_bft_update_prevotes_cited_value() {
+        let (step, (value_id, sig)) = line28_bft_update_prevote(&[1, 2, 3]);
+        assert_eq!(step, TMStep::Prevote);
+        assert!(value_id != ValueId::NIL && sig != TMSig::NIL);
+    }
+
+    #[test]
+    fn line28_bft_update_without_certificate_waits() {
+        let (step, (_, sig)) = line28_bft_update_prevote(&[1, 2]);
+        assert_eq!(step, TMStep::Propose);
+        assert_eq!(sig, TMSig::NIL);
     }
 
     // #[ignore]
