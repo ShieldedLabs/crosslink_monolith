@@ -88,7 +88,7 @@ use zebra_chain::{
 use zebra_consensus::{funding_stream_address, ParameterCheckpoint, RouterError};
 use zebra_network::{address_book_peers::AddressBookPeers, PeerSocketAddr};
 use zebra_node_services::mempool;
-use zebra_state::crosslink::{TFLBlockFinality, TFLServiceRequest, TFLServiceResponse};
+use zebra_state::crosslink::{TFLBftBlockInfo, TFLBftInternalStats, TFLBlockFinality, TFLFinalityStatus, TFLQuorumMember, TFLRoundDiagnosis, TFLServiceRequest, TFLServiceResponse};
 use zebra_state::{HashOrHeight, OutputLocation, ReadRequest, ReadResponse, TransactionLocation};
 
 use crate::{
@@ -536,6 +536,115 @@ pub trait Rpc {
     #[method(name = "get_tfl_recency_status")]
     async fn get_tfl_recency_status(&self) -> Option<zebra_state::crosslink::TFLRecencyStatus>;
 
+    /// Summarise BFT finality health: is finality working, and if not, why not?
+    ///
+    /// One call covering this node's BFT position (height/round/step, time since the last
+    /// decision), how finality relates to the PoW chain (tip, finalized height, gap), and
+    /// whether enough voting power is online to decide a block at all. `healthy` is true
+    /// when nothing was flagged; otherwise `diagnosis` explains what is wrong in plain
+    /// terms. Start here, then use `get_tfl_quorum_status` or `get_tfl_round_diagnosis`
+    /// for detail.
+    ///
+    /// Finalizer keys here and in the other diagnostic methods are hex in display order,
+    /// matching the node's log lines and `get_tfl_recency_status` -- note this is the
+    /// opposite orientation to `get_tfl_roster_zats`, which is why these methods do the
+    /// roster join for you.
+    ///
+    /// zcashd reference: none
+    /// method: post
+    /// tags: tfl
+    ///
+    /// ## Example Usage
+    /// ```bash
+    /// curl -X POST -H "Content-Type: application/json" -d \
+    /// '{ "jsonrpc": "2.0", "method": "get_tfl_finality_status", "params": [], "id": 1 }' \
+    /// http://127.0.0.1:8232
+    /// ```
+    #[method(name = "get_tfl_finality_status")]
+    async fn get_tfl_finality_status(&self) -> Result<TFLFinalityStatus>;
+
+    /// List each active finalizer with its voting power, liveness and votes at this node's
+    /// current BFT height, already joined together.
+    ///
+    /// Use it to answer "who is holding up finality?" -- the offline rows, and their
+    /// combined power, are what stands between the chain and a quorum.
+    ///
+    /// zcashd reference: none
+    /// method: post
+    /// tags: tfl
+    ///
+    /// ## Example Usage
+    /// ```bash
+    /// curl -X POST -H "Content-Type: application/json" -d \
+    /// '{ "jsonrpc": "2.0", "method": "get_tfl_quorum_status", "params": [], "id": 1 }' \
+    /// http://127.0.0.1:8232
+    /// ```
+    #[method(name = "get_tfl_quorum_status")]
+    async fn get_tfl_quorum_status(&self) -> Result<Vec<TFLQuorumMember>>;
+
+    /// Explain why each round at the current BFT height has not decided.
+    ///
+    /// The structured form of the node's `DECIDE_WAIT` log line. It separates the two
+    /// failure modes that look identical from outside: a round short of precommit power
+    /// (`precommit_power_short_by` above zero, `silent` naming who has not voted) from one
+    /// whose proposal cannot be validated (`proposal_blocked_on_block` naming the PoW block
+    /// this node is missing).
+    ///
+    /// zcashd reference: none
+    /// method: post
+    /// tags: tfl
+    ///
+    /// ## Example Usage
+    /// ```bash
+    /// curl -X POST -H "Content-Type: application/json" -d \
+    /// '{ "jsonrpc": "2.0", "method": "get_tfl_round_diagnosis", "params": [], "id": 1 }' \
+    /// http://127.0.0.1:8232
+    /// ```
+    #[method(name = "get_tfl_round_diagnosis")]
+    async fn get_tfl_round_diagnosis(&self) -> Result<Vec<TFLRoundDiagnosis>>;
+
+    /// Report the sizes of the BFT layer's in-memory structures.
+    ///
+    /// Sample alongside the process's RSS to tell BFT-side accumulation apart from growth
+    /// elsewhere in the node: `recent_commit_round_cache_len` currently retains every
+    /// completed height, so it rises for as long as the process runs.
+    ///
+    /// zcashd reference: none
+    /// method: post
+    /// tags: tfl
+    ///
+    /// ## Example Usage
+    /// ```bash
+    /// curl -X POST -H "Content-Type: application/json" -d \
+    /// '{ "jsonrpc": "2.0", "method": "get_tfl_bft_internal_stats", "params": [], "id": 1 }' \
+    /// http://127.0.0.1:8232
+    /// ```
+    #[method(name = "get_tfl_bft_internal_stats")]
+    async fn get_tfl_bft_internal_stats(&self) -> Result<TFLBftInternalStats>;
+
+    /// Inspect one decided BFT block, by 0-based BFT height (omit for the chain tip).
+    ///
+    /// `candidate_hash` is the PoW block this BFT block finalizes, in display order, so it
+    /// can be handed straight to `getblock` -- which is how you check what a given BFT
+    /// height actually finalized. Returns null for a height this node does not hold.
+    ///
+    /// # Parameters
+    ///
+    /// - `height`: (numeric, optional) 0-based BFT height; defaults to the BFT chain tip.
+    ///
+    /// zcashd reference: none
+    /// method: post
+    /// tags: tfl
+    ///
+    /// ## Example Usage
+    /// ```bash
+    /// curl -X POST -H "Content-Type: application/json" -d \
+    /// '{ "jsonrpc": "2.0", "method": "get_tfl_bft_block", "params": [109411], "id": 1 }' \
+    /// http://127.0.0.1:8232
+    /// ```
+    #[method(name = "get_tfl_bft_block")]
+    async fn get_tfl_bft_block(&self, height: Option<u64>) -> Result<Option<TFLBftBlockInfo>>;
+
     /// Get the UFVK for the attached wallet
     #[method(name = "get_wallet_ufvk")]
     async fn get_wallet_ufvk(&self) -> Option<String>;
@@ -964,6 +1073,38 @@ pub trait Rpc {
     /// method: post
     /// tags: network
     async fn add_node(&self, addr: PeerSocketAddr, command: AddNodeCommand) -> Result<()>;
+}
+
+/// Send one request to the TFL service, mapping a transport failure to a JSON-RPC error.
+///
+/// The `get_tfl_*` diagnostic methods are read-only and independent of each other, so they
+/// dispatch through `oneshot` rather than holding the service ready across calls.
+async fn tfl_request<TFLService>(
+    tfl_service: TFLService,
+    request: TFLServiceRequest,
+) -> Result<TFLServiceResponse>
+where
+    TFLService: Service<
+            TFLServiceRequest,
+            Response = TFLServiceResponse,
+            Error = zebra_node_services::BoxError,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    TFLService::Future: Send,
+{
+    tfl_service.oneshot(request).await.map_misc_error()
+}
+
+/// The TFL service answered a request with the response to a different one. Requests and
+/// responses are paired one to one, so this cannot happen unless the two enums drift apart.
+fn unexpected_tfl_response(method: &str) -> ErrorObject<'static> {
+    ErrorObject::owned(
+        server::error::LegacyCode::Misc.into(),
+        format!("{method}: unexpected response type from the TFL service"),
+        None::<()>,
+    )
 }
 
 /// RPC method implementations.
@@ -2314,6 +2455,41 @@ where
                     }
                 }
             }
+        }
+    }
+
+    async fn get_tfl_finality_status(&self) -> Result<TFLFinalityStatus> {
+        match tfl_request(self.tfl_service.clone(), TFLServiceRequest::FinalityStatus).await? {
+            TFLServiceResponse::FinalityStatus(status) => Ok(status),
+            _ => Err(unexpected_tfl_response("get_tfl_finality_status")),
+        }
+    }
+
+    async fn get_tfl_quorum_status(&self) -> Result<Vec<TFLQuorumMember>> {
+        match tfl_request(self.tfl_service.clone(), TFLServiceRequest::QuorumStatus).await? {
+            TFLServiceResponse::QuorumStatus(members) => Ok(members),
+            _ => Err(unexpected_tfl_response("get_tfl_quorum_status")),
+        }
+    }
+
+    async fn get_tfl_round_diagnosis(&self) -> Result<Vec<TFLRoundDiagnosis>> {
+        match tfl_request(self.tfl_service.clone(), TFLServiceRequest::RoundDiagnosis).await? {
+            TFLServiceResponse::RoundDiagnosis(rounds) => Ok(rounds),
+            _ => Err(unexpected_tfl_response("get_tfl_round_diagnosis")),
+        }
+    }
+
+    async fn get_tfl_bft_internal_stats(&self) -> Result<TFLBftInternalStats> {
+        match tfl_request(self.tfl_service.clone(), TFLServiceRequest::BftInternalStats).await? {
+            TFLServiceResponse::BftInternalStats(stats) => Ok(stats),
+            _ => Err(unexpected_tfl_response("get_tfl_bft_internal_stats")),
+        }
+    }
+
+    async fn get_tfl_bft_block(&self, height: Option<u64>) -> Result<Option<TFLBftBlockInfo>> {
+        match tfl_request(self.tfl_service.clone(), TFLServiceRequest::BftBlockInfo(height)).await? {
+            TFLServiceResponse::BftBlockInfo(block) => Ok(block),
+            _ => Err(unexpected_tfl_response("get_tfl_bft_block")),
         }
     }
 

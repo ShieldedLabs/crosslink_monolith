@@ -441,7 +441,7 @@ impl Timeout {
 
 
 const ROSTER_MAX_N: usize = 100;
-fn active_roster_len(roster: &[SortedRosterMember]) -> usize { usize::min(ROSTER_MAX_N, roster.len()) }
+pub fn active_roster_len(roster: &[SortedRosterMember]) -> usize { usize::min(ROSTER_MAX_N, roster.len()) }
 fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
 
 // Tendermint line 28 needs 2f+1 prevotes for the value in the round the proposal cites, vr, not in the
@@ -684,7 +684,7 @@ impl TMState {
         self.rounds_data[round_i].active_timeout = Some(Timeout::new(now, self.height, self.round, TMStep::Propose));
     }
 
-    fn f_from_n(n: u64) -> u64 {
+    pub fn f_from_n(n: u64) -> u64 {
         (n - 1) / 3
     }
 

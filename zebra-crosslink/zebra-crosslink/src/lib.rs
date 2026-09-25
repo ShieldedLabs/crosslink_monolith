@@ -294,6 +294,19 @@ pub(crate) struct TFLServiceInternal {
 
     recency_status: TFLRecencyStatus,
 
+    // Diagnostic snapshots of the BFT layer, refreshed from the live tenderlink state once
+    // per BFT tick (see ClosureToAccessBft) and served verbatim by the get_tfl_* diagnostic
+    // RPCs. Snapshotting is the only way to read tenderlink state from an RPC: TMState lives
+    // inside the BFT loop and is reachable solely through that callback.
+    quorum_status: Vec<TFLQuorumMember>,
+    round_diagnosis: Vec<TFLRoundDiagnosis>,
+    bft_rounds_data_len: usize,
+    bft_commit_cache_len: usize,
+    /// When this node last appended a decided BFT block. `None` until the first decision
+    /// of this process -- a restart does not carry it over, since the replayed chain says
+    /// nothing about when those blocks were decided in wall-clock terms.
+    last_decision_utc: Option<i64>,
+
     current_bc_final: Option<(ZebBlockHeight, ZebBlockHash)>,
     path_to_pos_store_file: PathBuf,
 }
@@ -776,6 +789,7 @@ async fn handle_new_decided_bft_block(
     internal.bft_block_hash_to_height.insert(new_block.blake3_hash(), insert_i as u64);
     internal.bft_blocks[insert_i] = new_block.clone();
     internal.fat_pointer_to_tip = fat_pointer.clone();
+    internal.last_decision_utc = Some(chrono::Utc::now().timestamp());
     internal.latest_final_block = Some((new_final_height, new_final_hash));
 
     // Note(Sam): IT IS VERY IMPORTANT THAT WE DROP THE LOCK BECAUSE ZEBRA_STATE MAY CALL US BACK.
@@ -1519,7 +1533,136 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     //     println!("LIVENESS recent_commit_round_cache: height: {}, round: {}", data.height, data.round);
                     // }
 
+                    // Diagnostic snapshots for the get_tfl_* RPCs. TMState is reachable only
+                    // from inside this callback, so anything an RPC needs has to be copied out
+                    // here. Kept to O(rounds at current height x roster), the same order of work
+                    // the recency scan above already does each tick.
+                    //
+                    // A finalizer counts as online if we have had a direct connection inside this
+                    // window. Two BFT ticks is far too tight and a minute is too slow to notice a
+                    // finalizer dropping, so this matches the interval operators already poll at.
+                    const ONLINE_SECS: i64 = 120;
+
+                    // Power comes from the roster of the newest round at our current height:
+                    // that is the roster consensus is voting under right now, which is what the
+                    // quorum arithmetic below has to agree with.
+                    let roster_now: &[tenderlink::SortedRosterMember] = bft_state
+                        .rounds_data
+                        .iter()
+                        .filter(|r| r.height == bft_state.height)
+                        .max_by_key(|r| r.round)
+                        .map(|r| r.roster.as_slice())
+                        .unwrap_or(&[]);
+                    let roster_now = &roster_now[..tenderlink::active_roster_len(roster_now)];
+                    let total_power: u64 = roster_now.iter().map(|m| m.stake).sum();
+
+                    let quorum_status: Vec<TFLQuorumMember> = roster_now
+                        .iter()
+                        .map(|m| {
+                            let st = finalizer_statuses
+                                .iter()
+                                .find(|(key, _)| *key == m.pub_key)
+                                .map(|(_, st)| st);
+                            let last_seen = st.and_then(|st| st.last_direct_connection_utc);
+                            TFLQuorumMember {
+                                pub_key: m.pub_key,
+                                voting_power: m.stake,
+                                power_pct: if total_power == 0 {
+                                    0.0
+                                } else {
+                                    100.0 * m.stake as f64 / total_power as f64
+                                },
+                                is_me: m.pub_key == bft_state.my_pub_key,
+                                online: last_seen.is_some_and(|t| now_utc - t < ONLINE_SECS),
+                                last_seen_utc: last_seen,
+                                secs_since_seen: last_seen.map(|t| now_utc - t),
+                                prevoted: st.is_some_and(|st| st.no_yes_votes_in_my_height[0][1] > 0),
+                                precommitted: st.is_some_and(|st| st.no_yes_votes_in_my_height[1][1] > 0),
+                                highest_round_vote: st.map_or(0, |st| st.highest_round_vote),
+                            }
+                        })
+                        .collect();
+
+                    let round_diagnosis: Vec<TFLRoundDiagnosis> = bft_state
+                        .rounds_data
+                        .iter()
+                        .filter(|rd| rd.height == bft_state.height)
+                        .map(|rd| {
+                            let active_n = tenderlink::active_roster_len(&rd.roster);
+                            let round_power: u64 =
+                                rd.roster[..active_n].iter().map(|m| m.stake).sum();
+                            let f = if round_power == 0 {
+                                0
+                            } else {
+                                tenderlink::TMState::f_from_n(round_power)
+                            };
+                            let threshold = if f == 0 { round_power } else { 2 * f + 1 };
+
+                            // Same per-member encoding as the DECIDE_WAIT log line, so a support
+                            // request quoting one can be read against the other.
+                            let n = active_n.min(rd.msg_val_sigs.len());
+                            let mut votes = String::with_capacity(n);
+                            let mut silent = Vec::new();
+                            for i in 0..n {
+                                votes.push(if rd.msg_val_sigs[i][1].1 != TMSig::NIL {
+                                    'C'
+                                } else if rd.msg_nil_sigs[i][1] != TMSig::NIL {
+                                    'n'
+                                } else if rd.msg_val_sigs[i][0].1 != TMSig::NIL
+                                    || rd.msg_nil_sigs[i][0] != TMSig::NIL
+                                {
+                                    'p'
+                                } else {
+                                    silent.push(rd.roster[i].pub_key);
+                                    '.'
+                                });
+                            }
+
+                            let (status, reason) = rd.proposal_checked_validity;
+                            TFLRoundDiagnosis {
+                                height: rd.height,
+                                round: rd.round,
+                                proposal_present: !rd.proposal.0.is_empty(),
+                                proposal_sigs_have: rd.proposal_sigs_n,
+                                proposal_sigs_want: rd.proposal_sigs.len(),
+                                proposal_validity: format!("{:?}", status),
+                                proposal_blocked_on_block: match reason {
+                                    // NeedsBlock carries the hash in internal byte order; render
+                                    // it the way the node logs and getblock expect.
+                                    tenderlink::TMStatusReason::NeedsBlock { hash } => {
+                                        Some(ZebBlockHash(hash).to_string())
+                                    }
+                                    tenderlink::TMStatusReason::None => None,
+                                },
+                                proposal_is_faulty: rd.proposal_is_faulty,
+                                total_power: round_power,
+                                f,
+                                quorum_threshold: threshold,
+                                yes_prevote_power: rd.counts.yes_prevotes,
+                                yes_precommit_power: rd.counts.yes_precommits,
+                                precommit_power_short_by: threshold
+                                    .saturating_sub(rd.counts.yes_precommits),
+                                votes,
+                                silent,
+                            }
+                        })
+                        .collect();
+
+                    let rounds_data_len = bft_state.rounds_data.len();
+                    let commit_cache_len = bft_state.recent_commit_round_cache.len();
+
                     let mut internal = tfl_handle.internal.lock().await;
+                    // Between a decision and the next round being started there is briefly no
+                    // round at the current height, and so no roster to read power from. That
+                    // carries no information, so keep the last real snapshot rather than
+                    // publishing an empty one -- otherwise the health check flaps to
+                    // "no active roster" for a tick at every single decision.
+                    if !quorum_status.is_empty() {
+                        internal.quorum_status = quorum_status;
+                    }
+                    internal.round_diagnosis = round_diagnosis;
+                    internal.bft_rounds_data_len = rounds_data_len;
+                    internal.bft_commit_cache_len = commit_cache_len;
                     internal.recency_status = TFLRecencyStatus {
                         now_utc,
                         my_height: bft_state.height,
@@ -1958,6 +2101,203 @@ async fn tfl_service_incoming_request(
         }
 
         TFLServiceRequest::StakingCmd(String) => Err(TFLServiceError::NotImplemented),
+
+        // crosslink diagnostics
+        TFLServiceRequest::FinalityStatus => {
+            // Read the PoW tip before taking the internal lock: the BFT loop contends for it
+            // every tick, and this request must not hold it across an await.
+            let pow_tip = if let Ok(StateResponse::Tip(val)) = (call.state)(StateRequest::Tip).await
+            {
+                val
+            } else {
+                None
+            };
+
+            let internal = internal_handle.internal.lock().await;
+            let now_utc = chrono::Utc::now().timestamp();
+
+            let total_power: u64 = internal.quorum_status.iter().map(|m| m.voting_power).sum();
+            let online_power: u64 = internal
+                .quorum_status
+                .iter()
+                .filter(|m| m.online)
+                .map(|m| m.voting_power)
+                .sum();
+            let quorum_threshold = if total_power == 0 {
+                0
+            } else {
+                let f = tenderlink::TMState::f_from_n(total_power);
+                if f == 0 { total_power } else { 2 * f + 1 }
+            };
+
+            let pow_tip_height = pow_tip.map(|(height, _hash)| height.0);
+            let finalized_height = internal.latest_final_block.map(|(height, _hash)| height.0);
+            let finality_gap = match (pow_tip_height, finalized_height) {
+                (Some(tip), Some(fin)) => Some(tip.saturating_sub(fin)),
+                _ => None,
+            };
+            let secs_since_last_decision = internal.last_decision_utc.map(|t| now_utc - t);
+
+            // Thresholds for "worth telling the operator about". A BFT height normally decides
+            // in seconds, and finality normally trails the PoW chain by far less than the
+            // 100-block reorg limit, so both of these are quiet in healthy operation.
+            const STALL_SECS: i64 = 300;
+            const WIDE_FINALITY_GAP: u32 = 100;
+
+            let mut diagnosis = Vec::new();
+
+            if !internal.tfl_is_activated {
+                diagnosis.push("TFL is not activated on this node yet".to_string());
+            }
+
+            if total_power == 0 {
+                diagnosis.push(
+                    "no active roster is visible: the BFT layer has not started, or this node \
+                     has not yet synced a roster"
+                        .to_string(),
+                );
+            } else if online_power < quorum_threshold {
+                let offline: Vec<&TFLQuorumMember> =
+                    internal.quorum_status.iter().filter(|m| !m.online).collect();
+                diagnosis.push(format!(
+                    "online voting power {} is below the {} needed to decide a block: {} of {} \
+                     finalizers have not been seen recently. Finality cannot advance until \
+                     enough of them come back.",
+                    online_power,
+                    quorum_threshold,
+                    offline.len(),
+                    internal.quorum_status.len(),
+                ));
+            }
+
+            if let Some(secs) = secs_since_last_decision {
+                if secs > STALL_SECS {
+                    diagnosis.push(format!(
+                        "no BFT block has been decided in {secs}s (stuck at height {})",
+                        internal.recency_status.my_height,
+                    ));
+                }
+            }
+
+            // The single most common cause of a wedged round on an otherwise healthy node: the
+            // proposal is fine, but this node does not hold the PoW block it finalizes.
+            for rd in &internal.round_diagnosis {
+                if let Some(hash) = &rd.proposal_blocked_on_block {
+                    diagnosis.push(format!(
+                        "round {}.{} cannot validate its proposal: this node does not hold PoW \
+                         block {hash}. Check that PoW sync is advancing.",
+                        rd.height, rd.round,
+                    ));
+                }
+            }
+
+            // Rounds 1-4 are routine (a height that needs a few rounds still decides promptly),
+            // so only a round count that indicates repeated failure is worth reporting -- a
+            // health check that fires during normal operation gets ignored.
+            const HIGH_ROUND: u32 = 5;
+            if internal.recency_status.my_round >= HIGH_ROUND {
+                diagnosis.push(format!(
+                    "height {} is at round {}: earlier rounds repeatedly failed to decide",
+                    internal.recency_status.my_height, internal.recency_status.my_round,
+                ));
+            }
+
+            if let Some(gap) = finality_gap {
+                if gap > WIDE_FINALITY_GAP {
+                    diagnosis.push(format!("finality trails the PoW chain by {gap} blocks"));
+                }
+            }
+
+            Ok(TFLServiceResponse::FinalityStatus(TFLFinalityStatus {
+                now_utc,
+                bft_height: internal.recency_status.my_height,
+                bft_round: internal.recency_status.my_round,
+                bft_step: match internal.recency_status.my_step {
+                    0 => "propose",
+                    1 => "prevote",
+                    _ => "precommit",
+                }
+                .to_string(),
+                bft_locked_round: internal.recency_status.my_locked_round,
+                bft_valid_round: internal.recency_status.my_valid_round,
+                bft_chain_len: internal.bft_blocks.len() as u64,
+                last_decision_utc: internal.last_decision_utc,
+                secs_since_last_decision,
+                pow_tip_height,
+                finalized_height,
+                finality_gap,
+                roster_n: internal.quorum_status.len(),
+                total_power,
+                online_power,
+                online_power_pct: if total_power == 0 {
+                    0.0
+                } else {
+                    100.0 * online_power as f64 / total_power as f64
+                },
+                quorum_threshold,
+                quorum_online: total_power > 0 && online_power >= quorum_threshold,
+                healthy: diagnosis.is_empty(),
+                diagnosis,
+            }))
+        }
+
+        TFLServiceRequest::QuorumStatus => {
+            let internal = internal_handle.internal.lock().await;
+            Ok(TFLServiceResponse::QuorumStatus(internal.quorum_status.clone()))
+        }
+
+        TFLServiceRequest::RoundDiagnosis => {
+            let internal = internal_handle.internal.lock().await;
+            Ok(TFLServiceResponse::RoundDiagnosis(internal.round_diagnosis.clone()))
+        }
+
+        TFLServiceRequest::BftInternalStats => {
+            let internal = internal_handle.internal.lock().await;
+            Ok(TFLServiceResponse::BftInternalStats(TFLBftInternalStats {
+                rounds_data_len: internal.bft_rounds_data_len,
+                recent_commit_round_cache_len: internal.bft_commit_cache_len,
+                bft_blocks_len: internal.bft_blocks.len(),
+                bft_block_index_len: internal.bft_block_hash_to_height.len(),
+                pos_chain_bytes: std::fs::metadata(&internal.path_to_pos_store_file)
+                    .ok()
+                    .map(|m| m.len()),
+                peers: internal.peer_strings.clone(),
+            }))
+        }
+
+        TFLServiceRequest::BftBlockInfo(height) => {
+            let internal = internal_handle.internal.lock().await;
+            let tip_i = internal.bft_blocks.len().saturating_sub(1);
+            let i = height.map_or(tip_i, |h| h as usize);
+
+            Ok(TFLServiceResponse::BftBlockInfo(
+                internal.bft_blocks.get(i).map(|block| {
+                    // Signatures over a block live in its *child's* back-pointer; the tip's
+                    // are the only ones held separately.
+                    let signature_count = if i + 1 < internal.bft_blocks.len() {
+                        internal.bft_blocks[i + 1].previous_block_fat_ptr.signatures.len()
+                    } else {
+                        internal.fat_pointer_to_tip.signatures.len()
+                    };
+
+                    TFLBftBlockInfo {
+                        height: i as u64,
+                        // BFT block hashes are raw blake3, matching pos.chain and fat pointers.
+                        hash: block.blake3_hash().to_string(),
+                        version: block.version,
+                        header_count: block.headers.len(),
+                        // The finalization candidate is the first carried PoW header. Rendered
+                        // in display order so it can be passed straight to getblock.
+                        candidate_hash: block.headers.first().map(|header| {
+                            ZebBlockHash(BlockHash::from_header_data(header).0).to_string()
+                        }),
+                        do_not_include_until_bc_height: block.do_not_include_until_bc_height,
+                        signature_count,
+                        hardfork_count: block.hardforks.len(),
+                    }
+                }),
+            ))
+        }
 
         TFLServiceRequest::WalletUfvk => Ok(TFLServiceResponse::WalletUfvk(wallet::USER_UFVK_STRING.lock().unwrap().clone())),
     }
