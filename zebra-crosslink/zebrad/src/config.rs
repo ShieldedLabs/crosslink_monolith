@@ -240,7 +240,7 @@ impl ZebradConfig {
         // to running with no config file.
         config.state
             .cache_dir
-            .push("crosslink_nightly_20260921");
+            .push("crosslink_nightly_20260926");
 
         // Merge user-led hardforks with the ones shipped in the executable, validate
         // them, and store the canonical (sorted, deduplicated) list back. Building
@@ -311,6 +311,8 @@ impl ZebradConfig {
                     .with_slow_start_interval(Height(0))
                     .with_genesis_hash("05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38")
                     .expect("Crosslink testnet genesis hash is well-formed")
+                    .clear_checkpoints()
+                    .expect("Crosslink genesis-only checkpoint list is valid")
                     .with_funding_streams(vec![testnet::ConfiguredFundingStreams {
                         height_range: Some(Height(1)..Height(99_999_999)),
                         recipients: Some(vec![testnet::ConfiguredFundingStreamRecipient {

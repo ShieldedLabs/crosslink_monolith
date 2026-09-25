@@ -1,0 +1,17 @@
+[crosslink]
+explicit_bft_key_seed = "64.177.122.73:12301"
+
+yields
+
+zfinv13U71PPf2nfFvxajjRIbWoq7Cdn5lqOopH_CbP-hJCZTVX5seDeXU-SroOi2arJQ3IMiGkFq00vg-_fw6C5DdMdsbbGD5yrP7o9Yz3RpJsc6uzh9DP1u1jY1Ro2nDFVwJ
+
+
+;
+
+
+[crosslink]
+explicit_bft_key_seed = "45.32.186.234:12301"
+
+yields
+
+zfinv1XyBqy7TI36OmthAnK2sgFNjuSOEqTMkUziDbyY_p_-sONTrwkIetPKETwa3c8Xhkbg2ej_ToChbjEDl8cHuwX5mdQKCIdMCXx1bFhLWonMWyo12nOFxq3QYutz5M84UM
