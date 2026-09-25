@@ -181,6 +181,7 @@ pub fn spawn_new_tfl_service(
         bft_rounds_data_len: 0,
         bft_commit_cache_len: 0,
         last_decision_utc: None,
+        service_started_utc: chrono::Utc::now().timestamp(),
     }));
 
     let handle_mtx = Arc::new(std::sync::Mutex::new(None));

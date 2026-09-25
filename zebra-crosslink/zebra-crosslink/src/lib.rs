@@ -306,6 +306,10 @@ pub(crate) struct TFLServiceInternal {
     /// of this process -- a restart does not carry it over, since the replayed chain says
     /// nothing about when those blocks were decided in wall-clock terms.
     last_decision_utc: Option<i64>,
+    /// When this process started. Used as the stall baseline before the first decision:
+    /// a node that has *never* decided is the most stalled state there is, so the stall
+    /// check must not be skipped just because `last_decision_utc` is still `None`.
+    service_started_utc: i64,
 
     current_bc_final: Option<(ZebBlockHeight, ZebBlockHash)>,
     path_to_pos_store_file: PathBuf,
@@ -2137,6 +2141,11 @@ async fn tfl_service_incoming_request(
                 _ => None,
             };
             let secs_since_last_decision = internal.last_decision_utc.map(|t| now_utc - t);
+            // Before the first decision there is no `last_decision_utc`, but "has never decided"
+            // is precisely the worst stall. Measure from process start in that case, so the
+            // check below cannot be silently skipped.
+            let stalled_secs = now_utc - internal.last_decision_utc.unwrap_or(internal.service_started_utc);
+            let ever_decided = internal.last_decision_utc.is_some();
 
             // Thresholds for "worth telling the operator about". A BFT height normally decides
             // in seconds, and finality normally trails the PoW chain by far less than the
@@ -2170,13 +2179,48 @@ async fn tfl_service_incoming_request(
                 ));
             }
 
-            if let Some(secs) = secs_since_last_decision {
-                if secs > STALL_SECS {
-                    diagnosis.push(format!(
-                        "no BFT block has been decided in {secs}s (stuck at height {})",
+            if stalled_secs > STALL_SECS {
+                diagnosis.push(if ever_decided {
+                    format!(
+                        "no BFT block has been decided in {stalled_secs}s (stuck at height {})",
                         internal.recency_status.my_height,
-                    ));
-                }
+                    )
+                } else {
+                    format!(
+                        "no BFT block has been decided since this node started {stalled_secs}s ago                          (stuck at height {})",
+                        internal.recency_status.my_height,
+                    )
+                });
+            }
+
+            // Liveness is measured from packet traffic, so a node whose votes are all being
+            // rejected -- a roster-size or vote-namespace divergence -- still reports full
+            // connectivity while consensus is dead. Cross-check connectivity against votes
+            // actually counted at this height: hearing everyone but counting nobody is the
+            // signature of that split, and it is invisible in the power figures alone.
+            let votes_counted = internal
+                .round_diagnosis
+                .iter()
+                .map(|rd| rd.votes.chars().filter(|c| *c != '.').count())
+                .max()
+                .unwrap_or(0);
+            let prevote_power_seen = internal
+                .round_diagnosis
+                .iter()
+                .map(|rd| rd.yes_prevote_power)
+                .max()
+                .unwrap_or(0);
+            if !internal.round_diagnosis.is_empty()
+                && quorum_threshold > 0
+                && online_power >= quorum_threshold
+                && votes_counted <= 1
+                && prevote_power_seen == 0
+            {
+                diagnosis.push(format!(
+                    "{} finalizers appear online but none of their votes are being counted at                      height {}: this node is hearing the network and agreeing with nobody.                      Check for a roster-size or vote-namespace divergence, e.g. a hardfork rule                      in this node's config that the rest of the network has not applied.",
+                    internal.quorum_status.iter().filter(|m| m.online).count(),
+                    internal.recency_status.my_height,
+                ));
             }
 
             // The single most common cause of a wedged round on an otherwise healthy node: the
