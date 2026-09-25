@@ -176,6 +176,12 @@ pub fn spawn_new_tfl_service(
         current_bc_final: None,
         path_to_pos_store_file: path_to_pos_store_file.clone(),
         recency_status: TFLRecencyStatus::default(),
+        quorum_status: Vec::new(),
+        round_diagnosis: Vec::new(),
+        bft_rounds_data_len: 0,
+        bft_commit_cache_len: 0,
+        last_decision_utc: None,
+        service_started_utc: chrono::Utc::now().timestamp(),
     }));
 
     let handle_mtx = Arc::new(std::sync::Mutex::new(None));
