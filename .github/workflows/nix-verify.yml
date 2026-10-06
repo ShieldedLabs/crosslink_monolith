@@ -1,17 +1,22 @@
 name: Nix Verification
 
 on:
+  # PR runs report the status check that `main`'s branch protection requires
+  # before a merge/squash. `dev` is not protected, so its runs only report.
   pull_request:
   push:
     branches:
       - main
+      - dev
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# One run per PR or branch: a newer push cancels any queued or in-progress run
+# for the same ref, so a burst of pushes verifies only the most recent commit.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -36,6 +41,9 @@ jobs:
       - name: Verify root nix build
         working-directory: ${{ github.workspace }}
         run: nix build --print-build-logs
+      - name: Verify root nix flake check
+        working-directory: ${{ github.workspace }}
+        run: nix flake check --print-build-logs
       - name: Verify nix build
         run: nix build --print-build-logs
       - name: Verify nix develop cargo build
