@@ -14,5 +14,6 @@
     ./toolchain.nix
     ./packages.nix
     ./checks.nix
+    ./devshells.nix
   ];
 }
