@@ -13,5 +13,6 @@
   imports = [
     ./toolchain.nix
     ./packages.nix
+    ./checks.nix
   ];
 }
