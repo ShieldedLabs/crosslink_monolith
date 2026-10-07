@@ -6,7 +6,7 @@
 # right at `${src}`, with no way to point them at a nested manifest). So
 # `crateSrc` here is rooted at `zebra-crosslink/` itself. But the GUI
 # on sibling directories (`zebra-gui`, `wallet`, `clay-rs`, `librustzcash`,
-# `tenderlink`, `patches`) that live *outside* that workspace. `postUnpack`
+# `tenderlink`) that live *outside* that workspace. `postUnpack`
 # copies those into place next to the unpacked source before cargo ever
 # runs, so `../zebra-gui` etc. resolve exactly as they do in the working
 # tree.
@@ -57,7 +57,6 @@
         "clay-rs" = ../clay-rs;
         "librustzcash" = ../librustzcash;
         "tenderlink" = ../tenderlink;
-        "patches" = ../patches;
       };
 
       # NB: `postUnpack` runs with `$PWD` at the *parent* of the unpacked
