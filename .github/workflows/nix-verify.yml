@@ -16,27 +16,23 @@ concurrency:
 
 jobs:
   nix-verify:
-    name: Verify nix build and develop
+    name: Verify nix build, flake check, and develop
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: zebra-crosslink
     steps:
       - uses: actions/checkout@v4
       - name: Install Nix
         uses: nixbuild/nix-quick-install-action@v30
       - uses: nix-community/cache-nix-action@v6
         with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'zebra-crosslink/flake.lock', 'flake.nix', 'zebra-crosslink/flake.nix', 'zebra-crosslink/flake/**/*.nix') }}  # yamllint disable-line rule:line-length
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'flake/**/*.nix') }}  # yamllint disable-line rule:line-length
           restore-prefixes-first-match: nix-${{ runner.os }}-
           purge: true
           purge-prefixes: nix-${{ runner.os }}-
           purge-created: 0
           purge-primary-key: never
-      - name: Verify root nix build
-        working-directory: ${{ github.workspace }}
-        run: nix build --print-build-logs
       - name: Verify nix build
         run: nix build --print-build-logs
+      - name: Verify nix flake check
+        run: nix flake check --print-build-logs
       - name: Verify nix develop cargo build
-        run: nix develop --command cargo build
+        run: nix develop --command cargo build --manifest-path ./zebra-crosslink/Cargo.toml
