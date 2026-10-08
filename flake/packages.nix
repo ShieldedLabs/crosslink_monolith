@@ -3,8 +3,7 @@
 # The default package is a unix-like tree: `./result/bin/` holds the GUI
 # binary (`zebrad`, which opens the visualizer unless run `--headless`), and `./result/doc/`
 # holds the rendered book.
-{ ... }:
-{
+{ ... }: {
   perSystem =
     {
       pkgs,
@@ -68,8 +67,6 @@
       };
     in
     {
-      packages = {
-        inherit zebrad book default;
-      };
+      packages = { inherit zebrad book default; };
     };
 }

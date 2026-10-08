@@ -23,8 +23,7 @@
 # now-stubbed `wallet` workspace member and fails to compile against its
 # empty placeholder API. Every package/check below simply builds against
 # the real source instead.
-{ inputs, ... }:
-{
+{ inputs, ... }: {
   perSystem =
     { system, ... }:
     let

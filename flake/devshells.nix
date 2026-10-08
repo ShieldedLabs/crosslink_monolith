@@ -9,8 +9,7 @@
 #
 # builds against the working tree (siblings like `../zebra-gui` resolve in
 # place, no copying needed).
-{ ... }:
-{
+{ ... }: {
   perSystem =
     {
       pkgs,
@@ -27,7 +26,7 @@
           cargo-nextest
           mdbook
           mdbook-mermaid
-          nixfmt-rfc-style
+          nixfmt
           yamllint
         ];
 
