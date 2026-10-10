@@ -317,6 +317,13 @@ pub trait Rpc {
     #[method(name = "get_tfl_roster_zats")]
     async fn get_tfl_roster_zats(&self) -> Option<Vec<RosterMember>>;
 
+    /// BFT roster with each member's verified finalizer address, when the chain has revealed one.
+    ///
+    /// Same stake data as `get_tfl_roster_zats`. `finalizer_address` is the `zfinv1` string
+    /// instead of null. Keys the chain has not revealed stay null.
+    #[method(name = "get_tfl_roster_with_addresses")]
+    async fn get_tfl_roster_with_addresses(&self) -> Option<Vec<RosterMember>>;
+
     /// Get the fat pointer to the BFT Chain tip. TODO: Example
     #[method(name = "get_tfl_fat_pointer_to_bft_chain_tip")]
     async fn get_tfl_fat_pointer_to_bft_chain_tip(&self) -> Option<FatPointerToBftBlock>;
@@ -1948,6 +1955,27 @@ where
             .call(TFLServiceRequest::Roster)
             .await;
         if let Ok(TFLServiceResponse::Roster(roster)) = ret {
+            Some(roster)
+        } else {
+            tracing::error!(?ret, "Bad tfl service return.");
+            None
+        }
+    }
+
+    async fn get_tfl_roster_with_addresses(&self) -> Option<Vec<RosterMember>> {
+        let ret = self
+            .read_state
+            .clone()
+            .oneshot(ReadRequest::CrosslinkRosterWithAddresses)
+            .await;
+        if let Ok(ReadResponse::CrosslinkRosterWithAddresses(pairs)) = ret {
+            let roster = pairs
+                .into_iter()
+                .map(|(mut member, address)| {
+                    member.finalizer_address = address;
+                    member
+                })
+                .collect();
             Some(roster)
         } else {
             tracing::error!(?ret, "Bad tfl service return.");
