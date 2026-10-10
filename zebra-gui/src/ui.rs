@@ -1221,12 +1221,12 @@ fn display_str(chunks: &[u64; 4]) -> String {
     display_str_with_edge_bytes(chunks, 4)
 }
 
-fn format_stake_amount(stake_amount: i64) -> String {
-    let full = stake_amount / 100_000_000;
-    let part = stake_amount % 100_000_000;
-    let part_str = format!("{part}00");
-    let trim_part = part_str.trim_end_matches("0");
-    format!("{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)])
+/// Bond-row amount, in the same cTAZ text as the section totals.
+///
+/// The fraction is zero-padded (`str_from_ctaz`). Printing `part` without that
+/// padding shifts the decimal: 0.01 cTAZ reads `0.100 cTAZ`.
+fn format_stake_amount(stake_amount: u64) -> String {
+    format!("{} cTAZ", str_from_ctaz(stake_amount))
 }
 
 fn chunkify(bytes: &[u8; 32]) -> [u64; 4] {
@@ -2513,7 +2513,6 @@ pub fn ui_left_pane(ui: &mut Context,
                                             h.finish() as u32
                                         };
 
-                                        let stake_amount = initial as i64;
                                         if index > 0 { // separator
                                             let colour = {
                                                 let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
@@ -2581,7 +2580,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 let str = if initial == u64::MAX {
                                                     frame_strf!(data, "...")
                                                 } else {
-                                                    frame_strf!(data, "{}", format_stake_amount(stake_amount))
+                                                    frame_strf!(data, "{}", format_stake_amount(initial))
                                                 };
                                                 if ui.hovered(id) {
                                                     colour = WHITE;
@@ -2761,7 +2760,6 @@ pub fn ui_left_pane(ui: &mut Context,
                                             continue;
                                         }
 
-                                        let stake_amount = initial as i64;
                                         if index > 0 { // separator
                                             let colour = {
                                                 let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
@@ -2845,7 +2843,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 let str = if initial == u64::MAX {
                                                     frame_strf!(data, "...")
                                                 } else {
-                                                    frame_strf!(data, "{}", format_stake_amount(stake_amount))
+                                                    frame_strf!(data, "{}", format_stake_amount(initial))
                                                 };
                                                 if ui.hovered(id) {
                                                     colour = WHITE;
@@ -5461,5 +5459,32 @@ mod roster_identity_tests {
 
         member.finalizer_address = Some(wallet::bft::FinalizerAddress { pub_key: pk, sig: wallet::bft::TMSig([0; 64]) });
         assert_eq!(roster_member_identity(&member).2, raw_pk);
+    }
+}
+
+#[cfg(test)]
+mod stake_amount_tests {
+    use super::*;
+
+    #[test]
+    fn edit_stake_rows_match_the_padded_total() {
+        // Fractions below 0.1 cTAZ used to drop their leading zeros, so 0.01,
+        // 0.001 and 0.1 all read `0.100 cTAZ` on the bond row.
+        let cases = [
+            (0u64, "0.000 cTAZ"),
+            (1, "0.000 cTAZ"),
+            (100_000, "0.001 cTAZ"),
+            (1_000_000, "0.010 cTAZ"),
+            (10_000_000, "0.100 cTAZ"),
+            (105_000_000, "1.050 cTAZ"),
+            (150_000_000, "1.500 cTAZ"),
+            (500_000_000, "5.000 cTAZ"),
+            (100_012_345, "1.00012 cTAZ"),
+            (112_345_678, "1.12345 cTAZ"),
+        ];
+        for (zats, shown) in cases {
+            assert_eq!(format_stake_amount(zats), shown, "{zats} zats");
+            assert_eq!(format_stake_amount(zats), format!("{} cTAZ", str_from_ctaz(zats)));
+        }
     }
 }
