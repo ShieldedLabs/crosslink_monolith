@@ -3808,9 +3808,12 @@ mod tests {
     }
 
     // A network of four engines with equal stake (f = 1, threshold 3) and no sockets. Each engine is the
-    // real state machine with its own key; `split_gossip` stands in for the send loop by handing one
-    // node everything another holds for round 0 of height 0, which is what peers send each other. A node
-    // that has decided the height serves the round from its cache, as it does to a peer that is behind.
+    // real state machine with its own key; `split_gossip` stands in for the send loop, handing one node
+    // what another would send it for round 0 of height 0 and no more: the proposal chunks it holds, its
+    // nil votes, and the value votes for one value, its proposal's or else the first it saw, because a
+    // vote packet carries one value. A node that has decided the height serves the round from its cache,
+    // chunks and precommits, as it does to a peer that is behind. Delivery is immediate and in a fixed
+    // order, which the real loop is not.
     fn split_engine(keys: &[SigningKey], roster: &[SortedRosterMember], i: usize, proposes: Option<BlockValue>) -> TMState {
         let decided_roster = roster.to_vec();
         TMState::init(
@@ -3834,8 +3837,9 @@ mod tests {
 
     fn split_gossip(nodes: &mut [TMState], roster: &[SortedRosterMember], from: usize, to: usize) {
         let is_round = |rd: &&RoundData| (rd.height, rd.round) == (0, 0);
-        let Some(rd) = nodes[from].rounds_data.iter().find(is_round)
-            .or_else(|| nodes[from].recent_commit_round_cache.iter().find(is_round)).cloned() else { return; };
+        let live = nodes[from].rounds_data.iter().find(is_round).cloned();
+        let from_cache = live.is_none();
+        let Some(rd) = live.or_else(|| nodes[from].recent_commit_round_cache.iter().find(is_round).cloned()) else { return; };
         let proposer = TMState::proposer_from_height_round(&nodes[from].hash_keys, roster, 0, 0).0.unwrap();
 
         for chunk_i in 0..rd.proposal_sigs.len() {
@@ -3851,12 +3855,16 @@ mod tests {
             nodes[to].check_and_incorporate_msg(0, 0, chunk_i, rd.proposal_id, rd.proposal_valid_round, roster, proposer,
                 PACKET_TYPE_PROPOSAL_CHUNK, &data, rd.proposal_sigs[chunk_i]);
         }
-        for voter in 0..rd.msg_val_sigs.len() {
-            for is_precommit in 0..2 {
+        for is_precommit in 0..2 {
+            if from_cache && is_precommit == 0 { continue; }
+            let packet_value_id = if rd.proposal_id != ValueId::NIL { rd.proposal_id } else {
+                rd.msg_val_sigs.iter().map(|votes| votes[is_precommit]).find(|vote| vote.1 != TMSig::NIL).map_or(ValueId::NIL, |vote| vote.0)
+            };
+            for voter in 0..rd.msg_val_sigs.len() {
                 let (value_id, sig) = rd.msg_val_sigs[voter][is_precommit];
                 let nil_sig         = rd.msg_nil_sigs[voter][is_precommit];
                 for (value_id, sig) in [(value_id, sig), (ValueId::NIL, nil_sig)] {
-                    if sig == TMSig::NIL { continue; }
+                    if sig == TMSig::NIL || (value_id != ValueId::NIL && value_id != packet_value_id) { continue; }
                     let data = make_vote_sign_datas(roster[voter].pub_key, is_precommit != 0, 0, 0, value_id)[1];
                     nodes[to].check_and_incorporate_msg(0, 0, 0, value_id, -2, roster, voter,
                         PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit as u8, &data, sig);
@@ -3945,10 +3953,16 @@ mod tests {
     // Line 34 is "2f+1 PREVOTE for anything". A node that drops prevotes for a value it did not accept
     // never counts that many when the finalizers split two and two over two values from one proposer.
     // With no prevote timeout nothing moves a node out of the prevote step, so the height never ends.
+    //
+    // The restarted proposer is left out. Peers hand it both of its own values in turn and it drops what
+    // it holds, votes included, each time, so it never keeps 2f+1 in view; the other three time out and
+    // it follows them into the next round by line 47 or 55.
     #[test]
     fn line34_two_and_two_over_a_restarted_proposers_values_starts_the_prevote_timeout() {
+        let (_, _, proposer, _) = split_finalizers();
         let nodes = split_network(Split::ProposerRestarts);
         for (i, &(height, round, step, prevote_timeout_started)) in nodes.iter().enumerate() {
+            if i == proposer { continue; }
             assert!(height > 0 || round > 0 || prevote_timeout_started,
                 "node {i} is at height {height} round {round} in {step:?} with no prevote timeout, so nothing will move it; all nodes: {nodes:?}");
         }
@@ -3989,6 +4003,8 @@ mod tests {
             let rd = &node.rounds_data[0];
             let case = format!("other vote first: {other_first}, before the proposal: {other_before_proposal}");
             assert_eq!(rd.msg_val_sigs[twice][0].0, id, "{case}");
+            assert_eq!(rd.other_vote(twice, 0).0, other_id, "its other vote is kept beside it; {case}");
+            assert_eq!(rd.stake_voting_for(0, other_id), 1, "{case}");
             assert_eq!((rd.counts.yes_prevotes, rd.counts.prevotes), (3, 3), "{case}");
         }
     }
