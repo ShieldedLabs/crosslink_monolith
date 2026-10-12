@@ -840,16 +840,7 @@ fn check_staking_action_bond_state(
 
     match (kind, bond_info) {
         (StakingActionKind::Null, _) => Ok(()),
-        (StakingActionKind::CreateNewDelegationBond, None) => {
-            // Same rule as `validate_delegation_bonds`: from the season 2 upgrade a new bond's
-            // amount must be a power of 10 zats.
-            if height.0 >= zcash_primitives::SEASON_2_UPGRADE_BLOCK_HEIGHT_1
-                && !zcash_primitives::is_power_of_10_zats(amount_zats)
-            {
-                return invalid("the new bond's amount is not a power of 10 zats");
-            }
-            Ok(())
-        }
+        (StakingActionKind::CreateNewDelegationBond, None) => Ok(()),
         (StakingActionKind::ConvertFinalizerRewardToDelegationBond, None) => {
             if amount_zats == 0 {
                 return invalid("the conversion is of zero zats");

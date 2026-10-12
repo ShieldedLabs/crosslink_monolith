@@ -127,17 +127,6 @@ impl InBlockBonds {
 
         match staking_action.kind() {
             StakingActionKind::CreateNewDelegationBond => {
-                // From the season 2 upgrade, a new bond's amount must be a power of 10 zats.
-                if height.0 >= zcash_primitives::SEASON_2_UPGRADE_BLOCK_HEIGHT_1
-                    && !zcash_primitives::is_power_of_10_zats(staking_action.amount_zats())
-                {
-                    return Err(ValidateContextError::InvalidDelegationBond(format!(
-                        "new delegation bond amount {} zats is not a power of 10: {:?}",
-                        staking_action.amount_zats(),
-                        bond_key
-                    )));
-                }
-
                 // Check that bond doesn't already exist
                 validate_create_new_bond(
                     bond_key,
@@ -666,6 +655,13 @@ mod tests {
         assert_eq!(invalid_at(ACTIVATION - 1, 1500), Vec::<usize>::new());
         assert_eq!(invalid_at(ACTIVATION, 1500), vec![0]);
         assert_eq!(invalid_at(ACTIVATION, 1000), Vec::<usize>::new());
+
+        // Only a new bond is restricted: a conversion takes whatever the bank holds.
+        let convert = StakingAction::ConvertFinalizerRewardToDelegationBond {
+            unique_pubkey: [3; 32], signature: [0; 64], bond_salt: [0; 32], this_finalizer: [4; 32],
+            amount_zats: 1500, finalizer_signature: [0; 64],
+        };
+        assert!(convert.amount_is_valid_at(ACTIVATION));
     }
 
     /// A second withdrawal of one bond in a block must be rejected here: the commit expects each

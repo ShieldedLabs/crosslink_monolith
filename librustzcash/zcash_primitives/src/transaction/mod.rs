@@ -1699,16 +1699,17 @@ impl StakingAction {
 
     /// Whether this action's amount is allowed in a block at `height`.
     ///
-    /// From the rule's activation height on, an action that mints a bond (Create or Convert)
-    /// must carry a power of 10 zats. A withdrawal is exempt: it must equal the bond's
-    /// balance, which rewards have grown past the amount it was created with.
+    /// From the rule's activation height on, a new bond (CreateNewDelegationBond) must carry a
+    /// power of 10 zats. Every other action is exempt: a conversion of a finalizer's reward
+    /// bank takes whatever the bank holds, and a withdrawal must equal the bond's balance,
+    /// which rewards have grown past the amount it was created with.
     pub fn amount_is_valid_at(&self, height: u32) -> bool {
         if height < crate::SEASON_2_UPGRADE_BLOCK_HEIGHT_1 {
             return true;
         }
-        match self.bond_terms() {
-            Some((_, amount_zats, _)) => is_power_of_10(amount_zats),
-            None => true,
+        match self {
+            StakingAction::CreateNewDelegationBond { amount_zats, .. } => is_power_of_10(*amount_zats),
+            _ => true,
         }
     }
 

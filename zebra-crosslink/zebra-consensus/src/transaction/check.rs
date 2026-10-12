@@ -902,8 +902,8 @@ pub fn consensus_branch_id(
 /// A staking action's amount must be at most `MAX_MONEY`. The amount is read off the wire
 /// unchecked, and value balances, bond records and pool updates all convert it to an [`Amount`].
 ///
-/// Once [`StakingAction::amount_is_valid_at`] activates, an action that mints a bond must also
-/// carry a power of 10 zats.
+/// Once [`StakingAction::amount_is_valid_at`] activates, a new bond must also carry a power
+/// of 10 zats.
 ///
 /// [`StakingAction::amount_is_valid_at`]: zcash_primitives::transaction::StakingAction::amount_is_valid_at
 pub fn staking_action_amount(tx: &Transaction, height: Height) -> Result<(), TransactionError> {
