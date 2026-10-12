@@ -14,17 +14,18 @@ Runs from Git Bash on Windows or a Linux shell; needs `curl`, `jq` and a debug `
 with `phuild.bat zebra-crosslink Debug Win64 -p zebrad`. Everything it writes goes to
 `zebra-crosslink/dilated_regtest/out/` (ignored by git): the rendered node configs, both
 state directories and both nodes' logs, with the pre-restart logs kept beside them as
-`node<n>.log.1`. Exit status 0 is a pass.
+`node<n>.log.1`. Exit status 0 is a pass. A run that has not finished after two minutes of wall
+clock stops its nodes and fails.
 
 ## What it does
 
 1. Renders `node0.toml.in` and `node1.toml.in` with the repository path and the launch time
-   as `start_unix_time`, so apparent time starts at the real launch and runs 90x faster. Both
-   nodes start with the internal miner off.
+   as `start_unix_time`, so apparent time starts at the real launch and runs 90x faster. Node 0
+   starts with the internal miner on, node 1 with it off.
 2. Waits for node 0's wallet to finish its first sync pass, mines four blocks with the regtest
    `generate` RPC (coinbase to the wallet's miner account; coinbase maturity is two blocks on
    this tree) and moves 0.5 ZEC to the user account through `requestfaucetdonation`.
-3. Bonds 0.2 ZEC to each node's finalizer address through `wallet_staking_action`, taking the
+3. Bonds 0.1 ZEC to each node's finalizer address through `wallet_staking_action`, taking the
    addresses from each node's own `finalizer address:` startup line, and mines each
    transaction in. The bonds go in on the first staking day, at or above the staking height
    (150); staking actions are illegal below it. Both bonds must be in the chain before the
@@ -71,8 +72,7 @@ tip by 124 blocks mid-run; with both corrected they decide about 80 and finality
 single digits. Transport and the wallet's proving time are real. BFT then keeps pace with PoW:
 one BFT block per PoW block, with the fat pointer advancing every one to three blocks. In a
 debug build `generate` takes about three seconds per block, so a run to 450 takes some twenty
-minutes; the internal miner mines about four times faster but cannot be switched on from
-outside the GUI, which is what keeps the test on `generate`.
+minutes. Node 0's internal miner mines alongside it, at about three blocks a second.
 
 Mining must not pause once stake is placed. While the tip sits within σ of the last final
 height every proposal is empty, both nodes prevote nil and each round's timeouts grow with the

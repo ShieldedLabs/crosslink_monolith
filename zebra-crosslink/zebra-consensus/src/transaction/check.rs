@@ -906,7 +906,7 @@ pub fn consensus_branch_id(
 /// of 10 zats.
 ///
 /// [`StakingAction::amount_is_valid_at`]: zcash_primitives::transaction::StakingAction::amount_is_valid_at
-pub fn staking_action_amount(tx: &Transaction, height: Height) -> Result<(), TransactionError> {
+pub fn staking_action_amount(tx: &Transaction, height: Height, network: &Network) -> Result<(), TransactionError> {
     let Some(staking_action) = tx.staking_action() else {
         return Ok(());
     };
@@ -914,7 +914,7 @@ pub fn staking_action_amount(tx: &Transaction, height: Height) -> Result<(), Tra
     if amount_zats > zebra_chain::amount::MAX_MONEY as u64 {
         return Err(TransactionError::StakingActionAmountInvalid { amount_zats });
     }
-    if !staking_action.amount_is_valid_at(height.0) {
+    if !staking_action.amount_is_valid_at(network, height.0) {
         return Err(TransactionError::StakingActionAmountNotPowerOf10 { amount_zats });
     }
     Ok(())

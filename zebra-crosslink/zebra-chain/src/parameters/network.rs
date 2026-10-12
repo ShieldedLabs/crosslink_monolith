@@ -460,6 +460,13 @@ impl zcash_protocol::consensus::Parameters for Network {
         &self,
         nu: zcash_protocol::consensus::NetworkUpgrade,
     ) -> Option<zcash_protocol::consensus::BlockHeight> {
+        // Zebra has no upgrade of its own for this one: it changes staking rules only.
+        if nu == zcash_protocol::consensus::NetworkUpgrade::FeaturenetUpgrade1 {
+            return match self {
+                Network::Mainnet => None,
+                Network::Testnet(_) => zcash_protocol::consensus::TEST_NETWORK.activation_height(nu),
+            };
+        }
         NetworkUpgrade::from(nu)
             .activation_height(self)
             .map(|Height(h)| zcash_protocol::consensus::BlockHeight::from_u32(h))

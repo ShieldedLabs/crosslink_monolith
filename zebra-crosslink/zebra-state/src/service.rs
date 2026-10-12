@@ -2069,7 +2069,7 @@ pub fn pos_block_reward(height: block::Height, network: &Network) -> u64 {
     pos_subsidy(height, network, subsidy).map(u64::from).unwrap_or_default()
 }
 
-/// Legacy (before `SEASON_2_UPGRADE_BLOCK_HEIGHT_1`) PoS issuance payout, kept bit-for-bit
+/// Legacy (before `FeaturenetUpgrade1`) PoS issuance payout, kept bit-for-bit
 /// for consensus compatibility. See [`update_bonds_with_pos_issuance`].
 ///
 /// Pays one block's PoS issuance. Each active bond earns its stake-weighted share of
@@ -2226,7 +2226,7 @@ fn update_bonds_with_pos_issuance_legacy(
 
 /// Pays one block's PoS issuance, `bond_reward_total`.
 ///
-/// Before `SEASON_2_UPGRADE_BLOCK_HEIGHT_1` this is the legacy per-bond 90/10 split
+/// Before `FeaturenetUpgrade1` this is the legacy per-bond 90/10 split
 /// ([`update_bonds_with_pos_issuance_legacy`]). From that height on, the issuance is split
 /// once at the top: one part in [`FINALIZER_COMMISSION_DIVISOR`] (rounded down) is the
 /// finalizer pool and the rest is the bond pool.
@@ -2242,6 +2242,7 @@ fn update_bonds_with_pos_issuance_legacy(
 /// A pool with nobody to pay is left unpaid (burned). Returns the amounts actually paid, per
 /// bond and per finalizer, so a revert can undo exactly what was done.
 pub fn update_bonds_with_pos_issuance(
+    network: &Network,
     height: block::Height,
     bond_reward_total: u64,
     delegation_bonds: &mut HashMap<finalized_state::disk_format::BondKey, (finalized_state::disk_format::DelegationBond, non_finalized_state::BondStatusInChain)>,
@@ -2252,7 +2253,8 @@ pub fn update_bonds_with_pos_issuance(
     use crate::constants::FINALIZER_COMMISSION_DIVISOR;
     use zcash_primitives::bft::ACTIVE_ROSTER_MAX_N;
 
-    if height.0 < zcash_primitives::SEASON_2_UPGRADE_BLOCK_HEIGHT_1 {
+    use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+    if !network.is_nu_active(NetworkUpgrade::FeaturenetUpgrade1, height.0.into()) {
         return update_bonds_with_pos_issuance_legacy(bond_reward_total, delegation_bonds, finalizer_rewards);
     }
 

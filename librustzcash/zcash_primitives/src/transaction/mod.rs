@@ -24,7 +24,7 @@ use corez::io::{self, Read, Write};
 use ::transparent::bundle::{self as transparent, OutPoint, TxIn, TxOut};
 use zcash_encoding::{CompactSize, Vector};
 use zcash_protocol::{
-    consensus::{BlockHeight, BranchId},
+    consensus::{BlockHeight, BranchId, NetworkUpgrade, Parameters},
     value::{BalanceError, ZatBalance, Zatoshis},
 };
 // `valid_in_branch` matches on every branch by bare name.
@@ -1699,12 +1699,12 @@ impl StakingAction {
 
     /// Whether this action's amount is allowed in a block at `height`.
     ///
-    /// From the rule's activation height on, a new bond (CreateNewDelegationBond) must carry a
+    /// From [`NetworkUpgrade::FeaturenetUpgrade1`] on, a new bond (CreateNewDelegationBond) must carry a
     /// power of 10 zats. Every other action is exempt: a conversion of a finalizer's reward
     /// bank takes whatever the bank holds, and a withdrawal must equal the bond's balance,
     /// which rewards have grown past the amount it was created with.
-    pub fn amount_is_valid_at(&self, height: u32) -> bool {
-        if height < crate::SEASON_2_UPGRADE_BLOCK_HEIGHT_1 {
+    pub fn amount_is_valid_at<P: Parameters>(&self, params: &P, height: u32) -> bool {
+        if !params.is_nu_active(NetworkUpgrade::FeaturenetUpgrade1, BlockHeight::from_u32(height)) {
             return true;
         }
         match self {

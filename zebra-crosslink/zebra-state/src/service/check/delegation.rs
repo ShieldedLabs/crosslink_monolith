@@ -118,7 +118,7 @@ impl InBlockBonds {
         // The transaction verifier checks this too, but against the height the transaction
         // entered the mempool at. A template built later, past the activation height, relies on
         // this one to leave the transaction out.
-        if !staking_action.amount_is_valid_at(height.0) {
+        if !staking_action.amount_is_valid_at(&non_finalized_chain.network(), height.0) {
             return Err(ValidateContextError::InvalidDelegationBond(format!(
                 "bond amount {} is not a power of 10 zats: {:?}",
                 staking_action.amount_zats(), bond_key
@@ -635,15 +635,25 @@ mod tests {
         use zcash_primitives::{
             bft::{finalizer_key_from_seed, FinalizerAddress},
             transaction::{is_power_of_10, StakingAction},
-            SEASON_2_UPGRADE_BLOCK_HEIGHT_1 as ACTIVATION,
         };
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 
         for (n, expected) in [(0, false), (1, true), (10, true), (11, false), (20, false), (1000, true), (10u64.pow(19), true), (u64::MAX, false)] {
             assert_eq!(is_power_of_10(n), expected, "{n}");
         }
 
+        let network = Network::new_default_testnet();
+        let ACTIVATION = u32::from(network.activation_height(NetworkUpgrade::FeaturenetUpgrade1).unwrap());
         let finalized_state = finalized_state();
-        let chain = chain_with(BondStatus::Active);
+        let chain = Chain::new(
+            &network,
+            Height(CREATED),
+            NoteCommitmentTrees::default(),
+            Default::default(),
+            ValueBalance::zero(),
+            [(KEY, bond(), BondStatus::Active)],
+            std::iter::empty(),
+        );
         let target_finalizer = FinalizerAddress::create(&finalizer_key_from_seed(b"target").1);
         let create = |amount_zats| StakingAction::CreateNewDelegationBond {
             amount_zats, unique_pubkey: [2; 32], bond_salt: [0; 32], target_finalizer, signature: [0; 64],
@@ -661,7 +671,7 @@ mod tests {
             unique_pubkey: [3; 32], signature: [0; 64], bond_salt: [0; 32], this_finalizer: [4; 32],
             amount_zats: 1500, finalizer_signature: [0; 64],
         };
-        assert!(convert.amount_is_valid_at(ACTIVATION));
+        assert!(convert.amount_is_valid_at(&network, ACTIVATION));
     }
 
     /// A second withdrawal of one bond in a block must be rejected here: the commit expects each

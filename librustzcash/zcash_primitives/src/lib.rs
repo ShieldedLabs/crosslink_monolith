@@ -30,6 +30,3 @@ pub mod bft;
 pub(crate) mod encoding;
 pub mod merkle_tree;
 pub mod transaction;
-
-/// Block height of the first Season 2 upgrade.
-pub const SEASON_2_UPGRADE_BLOCK_HEIGHT_1: u32 = 45000;

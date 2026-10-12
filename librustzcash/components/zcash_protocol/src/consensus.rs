@@ -502,6 +502,7 @@ impl Parameters for MainNetwork {
             NetworkUpgrade::Nu6_3 => Some(BlockHeight(3_428_143)),
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => None,
+            NetworkUpgrade::FeaturenetUpgrade1 => None,
         }
     }
 }
@@ -551,6 +552,7 @@ impl Parameters for TestNetwork {
             NetworkUpgrade::Nu6_3 => Some(BlockHeight(1)),
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => None,
+            NetworkUpgrade::FeaturenetUpgrade1 => Some(BlockHeight(45_000)),
         }
     }
 }
@@ -632,6 +634,9 @@ pub enum NetworkUpgrade {
     /// [Nu7 (proposed)]: https://z.cash/upgrade/nu7/
     #[cfg(zcash_unstable = "nu7")]
     Nu7,
+    /// The first Crosslink featurenet upgrade. It changes staking rules only, so it keeps
+    /// the consensus branch ID of [`NetworkUpgrade::Nu6_3`].
+    FeaturenetUpgrade1,
 }
 
 #[cfg(feature = "std")]
@@ -652,6 +657,7 @@ impl fmt::Display for NetworkUpgrade {
             NetworkUpgrade::Nu6_3 => write!(f, "Nu6.3"),
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => write!(f, "Nu7"),
+            NetworkUpgrade::FeaturenetUpgrade1 => write!(f, "FeaturenetUpgrade1"),
         }
     }
 }
@@ -674,6 +680,7 @@ impl NetworkUpgrade {
             NetworkUpgrade::Nu6_3 => BranchId::Nu6_3,
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => BranchId::Nu7,
+            NetworkUpgrade::FeaturenetUpgrade1 => BranchId::Nu6_3,
         }
     }
 }
