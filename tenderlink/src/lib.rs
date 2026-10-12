@@ -265,6 +265,13 @@ pub struct RoundData {
     // legitimately sign both (e.g. NIL this life, a value last life), so NIL + value is not
     // equivocation -- only two different *value* votes are. Both slots count toward the tallies.
     pub msg_nil_sigs: Vec<[TMSig; 2]>, // prevote then precommit
+    // A finalizer's latest value vote that is not the one in `msg_val_sigs`: it signed two values in
+    // the step. `msg_val_sigs` keeps its vote for the proposal we hold when it has one, so this is its
+    // vote for something else. It adds nothing to `counts`, which already has the finalizer from its
+    // other vote. It is read when asking how much stake is behind one particular value: a 2f+1 for a
+    // value we do not hold must not be hidden by what the same finalizers also signed. Newest wins,
+    // so a finalizer cannot fill memory, and may be shorter than `msg_val_sigs` (see `other_vote`).
+    pub msg_other_sigs: Vec<[(ValueId, TMSig); 2]>, // prevote then precommit
     pub roster: Vec<SortedRosterMember>,
 
     pub counts: ConsensusCounts,
@@ -293,6 +300,7 @@ impl RoundData {
         // TODO: probably put both step messages next to each other
         msg_val_sigs: Vec::new(),
         msg_nil_sigs: Vec::new(),
+        msg_other_sigs: Vec::new(),
         roster: Vec::new(),
         counts: ConsensusCounts::ZERO,
 
@@ -305,6 +313,109 @@ impl RoundData {
         self.proposal_sigs_n > 0 && self.proposal_sigs_n == self.proposal_sigs.len()
     }
 
+    fn other_vote(&self, roster_i: usize, is_precommit: usize) -> (ValueId, TMSig) {
+        self.msg_other_sigs.get(roster_i).map_or((ValueId::NIL, TMSig::NIL), |votes| votes[is_precommit])
+    }
+
+    fn set_other_vote(&mut self, roster_i: usize, is_precommit: usize, vote: (ValueId, TMSig)) {
+        if self.msg_other_sigs.len() <= roster_i {
+            self.msg_other_sigs.resize(roster_i + 1, [(ValueId::NIL, TMSig::NIL); 2]);
+        }
+        self.msg_other_sigs[roster_i][is_precommit] = vote;
+    }
+
+    /// Stake of the active roster that voted for exactly `value_id` in this step, whatever else the
+    /// same finalizers signed.
+    fn stake_voting_for(&self, is_precommit: usize, value_id: ValueId) -> u64 {
+        let roster_n = active_roster_len(&self.roster).min(self.msg_val_sigs.len());
+        (0..roster_n).filter(|&i| {
+            let (val_id, val_sig) = self.msg_val_sigs[i][is_precommit];
+            let (other_id, other_sig) = self.other_vote(i, is_precommit);
+            (val_id == value_id && val_sig != TMSig::NIL) || (other_id == value_id && other_sig != TMSig::NIL)
+        }).map(|i| self.roster[i].stake).sum()
+    }
+
+    /// Makes `msg_val_sigs` hold every finalizer's vote for `value_id` that we have, moving what was
+    /// there to `msg_other_sigs`. `counts` is stale afterwards.
+    fn prefer_votes_for(&mut self, value_id: ValueId) {
+        for roster_i in 0..self.msg_val_sigs.len() {
+            for is_precommit in 0..2 {
+                let other = self.other_vote(roster_i, is_precommit);
+                if other.0 == value_id && other.1 != TMSig::NIL {
+                    let displaced = self.msg_val_sigs[roster_i][is_precommit];
+                    self.msg_val_sigs[roster_i][is_precommit] = other;
+                    self.set_other_vote(roster_i, is_precommit, displaced);
+                }
+            }
+        }
+    }
+
+    fn recount(&mut self, roster: &[SortedRosterMember]) {
+        let mut counts = ConsensusCounts::ZERO;
+        for (roster_i, sig) in self.msg_val_sigs.iter().enumerate() {
+            counts = counts + ConsensusCounts::from(&(*sig, self.msg_nil_sigs[roster_i], roster[roster_i].stake, self.proposal_id));
+        }
+        self.counts = counts;
+    }
+
+    /// 2f+1 of the active roster's stake, as `bft_update` computes it.
+    fn big_threshold(roster: &[SortedRosterMember]) -> u64 {
+        let total: u64 = roster[..active_roster_len(roster)].iter().map(|m| m.stake).sum();
+        let f = TMState::f_from_n(total.max(1));
+        if f == 0 { total } else { 2*f + 1 }
+    }
+
+    /// Whether the proposal we hold has 2f+1 precommits: it is decided, whether or not we have its
+    /// bytes yet. Not before the proposal is known, when every value vote is provisionally for it.
+    fn proposal_is_certified(&self, roster: &[SortedRosterMember]) -> bool {
+        let big_threshold = Self::big_threshold(roster);
+        self.proposal_id != ValueId::NIL && big_threshold > 0 && big_threshold <= self.counts.yes_precommits
+    }
+
+    /// Throws away the bytes received for the proposal, keeping which proposal it is.
+    fn restart_proposal_assembly(&mut self) {
+        self.proposal                  = BlockValue(Vec::new());
+        self.proposal_sigs             = Vec::new();
+        self.proposal_sigs_n           = 0;
+        self.proposal_checked_validity = (TMStatus::Indeterminate, TMStatusReason::None);
+        self.proposal_is_faulty        = false;
+    }
+
+    /// Called when a precommit for `value_id` has just been stored. If `value_id` is not the proposal
+    /// we hold and now has 2f+1 precommits, it is decided, so it replaces ours: the votes stay, the
+    /// bytes of ours go, and its bytes are taken as they arrive. Only one value can get there with
+    /// at most f faulty, and a value that has is never given up for another.
+    fn adopt_if_certified(&mut self, value_id: ValueId, roster: &[SortedRosterMember], ctx_str: &str) -> bool {
+        if self.proposal_id == ValueId::NIL || self.proposal_id == value_id || self.proposal_is_certified(roster) {
+            return false;
+        }
+        let big_threshold = Self::big_threshold(roster);
+        if big_threshold == 0 || self.stake_voting_for(1, value_id) < big_threshold {
+            return false;
+        }
+        eprintln!("{ctx_str} {ANSI_YLW}BFT{ANSI_RST} at {}.{}: {} has 2f+1 precommits and is not the proposal we hold ({}). Taking it...",
+            self.height, self.round, value_id, self.proposal_id);
+        self.prefer_votes_for(value_id);
+        self.restart_proposal_assembly();
+        self.proposal_id          = value_id;
+        self.proposal_valid_round = -1;
+        self.recount(roster);
+        true
+    }
+
+    /// The same question asked of every value we hold a precommit for, for when the proposal has
+    /// only just become known and the precommits were already here.
+    fn adopt_any_certified(&mut self, roster: &[SortedRosterMember], ctx_str: &str) -> bool {
+        for roster_i in 0..self.msg_val_sigs.len() {
+            for (value_id, sig) in [self.msg_val_sigs[roster_i][1], self.other_vote(roster_i, 1)] {
+                if sig != TMSig::NIL && self.adopt_if_certified(value_id, roster, ctx_str) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn flush_for_amnesiac_proposer(&mut self, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], proposal_size: u32) {
         let roster_n = active_roster_len(roster);
         *self = RoundData {
@@ -314,6 +425,7 @@ impl RoundData {
             proposal_valid_round: valid_round,
             msg_val_sigs:         vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n],
             msg_nil_sigs:         vec![[TMSig::NIL; 2]; roster_n],
+            msg_other_sigs:       vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n],
             roster:               Vec::from(&roster[0..roster_n]),
             active_timeout:       self.active_timeout.clone(),
             timeout_triggered:    self.timeout_triggered,
@@ -507,11 +619,7 @@ fn has_prevote_certificate(rounds_data: &[RoundData], height: u64, round: u32, v
     let roster_n = active_roster_len(&rd.roster);
     let total_stake: u64 = rd.roster[..roster_n].iter().map(|m| m.stake).sum();
     if total_stake == 0 { return false; }
-    let mut value_stake = 0;
-    for i in 0..roster_n.min(rd.msg_val_sigs.len()) {
-        let (vote_value_id, sig) = rd.msg_val_sigs[i][0];
-        if vote_value_id == value_id && sig != TMSig::NIL { value_stake += rd.roster[i].stake; }
-    }
+    let value_stake = rd.stake_voting_for(0, value_id);
 
     let f = TMState::f_from_n(total_stake);
     let big_threshold = if f == 0 { total_stake } else { 2*f + 1 };
@@ -692,6 +800,7 @@ impl TMState {
             round,
             msg_val_sigs: vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n], // TODO: just use ROSTER_MAX_N?
             msg_nil_sigs: vec![[TMSig::NIL; 2]; roster_n],
+            msg_other_sigs: vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n],
             roster: roster.to_vec(),
             vote_namespace: self.vote_namespace,
             ..RoundData::EMPTY
@@ -870,9 +979,42 @@ impl TMState {
                 let Some(hdr) = PacketProposalChunkHeader::read_from(&mut &signed_data[..])
                 else { return TMStatus::Fail; };
 
+                // The header is the proposer's word for how much to allocate and where this chunk goes.
+                let proposal_size = hdr.proposal_size as usize;
+                let chunks_n      = proposal_size.div_ceil(PROPOSAL_CHUNK_DATA_SIZE);
+                if proposal_size > PROPOSAL_MAX_SIZE || chunk_i >= chunks_n {
+                    eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}.{}: proposer {} sent chunk {} of a {}-byte value (at most {} bytes). Ignoring...",
+                        height, round, chunk_i, roster_i, chunk_i, proposal_size, PROPOSAL_MAX_SIZE);
+                    return TMStatus::Fail;
+                }
+
+                // A proposal with 2f+1 precommits is decided: it is the round's proposal whatever else
+                // its proposer signed, and its bytes are whatever hashes to its id. So nothing sent
+                // under its id can condemn it: a chunk that does not fit a partial assembly restarts
+                // it, and one that does not fit a whole, hash-checked value is refused.
+                let mut certified = round_data.proposal_is_certified(roster);
+                if round_data.proposal_id != ValueId::NIL && round_data.proposal_id != value_id &&
+                   (certified || round_data.proposal_sigs_n == 0) {
+                    return TMStatus::Fail;
+                }
+
                 // "have they previously proposed a different value?"
                 if is_prev_seen_round && round_data.proposal_sigs_n > 0 {
-                    if is_my_proposal &&
+                    if certified {
+                        if round_data.has_full_proposal() && !round_data.proposal_is_faulty {
+                            // Whole, and it hashed to its id when it was completed: these are the bytes.
+                            // A chunk that disagrees is not part of the value and must not cost us it.
+                            let is_ours = round_data.proposal.0.len() == proposal_size && round_data.proposal_sigs[chunk_i] == sig;
+                            return if is_ours { TMStatus::Pass } else { TMStatus::Fail };
+                        }
+                        if round_data.proposal_is_faulty ||
+                           round_data.proposal.0.len() != proposal_size || round_data.proposal_valid_round != valid_round ||
+                           (round_data.proposal_sigs[chunk_i] != TMSig::NIL && round_data.proposal_sigs[chunk_i] != sig) {
+                            eprintln!("{ctx_str} {ANSI_YLW}BFT{ANSI_RST} at {}.{}.{}: chunk does not fit what we have of the decided value {}. Starting it again...",
+                                height, round, chunk_i, round_data.proposal_id);
+                            round_data.restart_proposal_assembly();
+                        }
+                    } else if is_my_proposal &&
                       (round_data.proposal.0.len() != hdr.proposal_size as usize ||
                        round_data.proposal_id != value_id ||
                        round_data.proposal_valid_round != valid_round) { // Amnesiac Proposer's Dilemma
@@ -897,9 +1039,10 @@ impl TMState {
                             return TMStatus::Fail;
                         }
                     }
-                } else {
-                    round_data.proposal.0    = vec![0;          hdr.proposal_size as usize];
-                    round_data.proposal_sigs = vec![TMSig::NIL; round_data.proposal.chunks_n()];
+                }
+                if round_data.proposal_sigs_n == 0 {
+                    round_data.proposal.0    = vec![0;          proposal_size];
+                    round_data.proposal_sigs = vec![TMSig::NIL; chunks_n];
                 }
 
                 // Preliminary checks now finished (although not infallible from here) //////////////////////////
@@ -907,6 +1050,7 @@ impl TMState {
                 // TODO: check expected proposer here if not above
                 let (chunk_o, chunk_size) = round_data.proposal.chunk_o_size(chunk_i);
                 let packet_chunk_o        = PacketProposalChunkHeader::SERIALIZED_SIZE;
+                if signed_data.len() < packet_chunk_o + chunk_size { return TMStatus::Fail; }
                 let chunk_data            = &signed_data[packet_chunk_o..packet_chunk_o + chunk_size];
 
                 if round_data.proposal_sigs[chunk_i] == TMSig::NIL { // value chunk not seen before
@@ -919,19 +1063,26 @@ impl TMState {
 
                         // Votes that arrived before the proposal were all tallied as for it. Some may be
                         // for another value; they stay, and stop counting as yes votes.
-                        let mut check_counts = ConsensusCounts::ZERO;
-                        for (roster_i, sig) in round_data.msg_val_sigs.iter().enumerate() {
-                            check_counts = check_counts + ConsensusCounts::from(&(*sig, round_data.msg_nil_sigs[roster_i], roster[roster_i].stake, value_id));
+                        round_data.prefer_votes_for(value_id);
+                        round_data.recount(roster);
+                        // The precommits may have got here first, and for another value: nothing looked
+                        // for a certificate while there was no proposal to compare against.
+                        if round_data.adopt_any_certified(roster, &ctx_str) {
+                            return TMStatus::Fail; // this chunk was for the value just given up
                         }
-                        round_data.counts = check_counts;
+                        certified = round_data.proposal_is_certified(roster);
                     }
 
                     if round_data.proposal_sigs_n == round_data.proposal_sigs.len() {
                         let check_value_id = round_data.proposal.id_from_value(&self.hash_keys);
                         if round_data.proposal_id != check_value_id {
-                            round_data.proposal_is_faulty = true;
                             eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST}: proposer's value_id does not match our calculation: {} != {}",
                                 round_data.proposal_id, check_value_id);
+                            if certified {
+                                round_data.restart_proposal_assembly();
+                            } else {
+                                round_data.proposal_is_faulty = true;
+                            }
                             return TMStatus::Fail;
                         }
                     }
@@ -990,11 +1141,20 @@ impl TMState {
                         // first would decide whether this node can ever count it toward the proposal, and
                         // nodes that heard them in different orders would disagree on a 2f+1 for good.
                         let is_for_held_proposal = round_data.proposal_id != ValueId::NIL && value_id == round_data.proposal_id;
-                        if !is_for_held_proposal {
-                            eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}: finalizer {} voted on 2 different values ({:?}, {:?}). Ignoring latest...", height, round, roster_i, (value_id, sig), old_val_sig);
-                            return TMStatus::Fail;
+                        let other = round_data.other_vote(roster_i, is_precommit);
+                        if other.1 == TMSig::NIL {
+                            eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}: finalizer {} voted on 2 different values ({:?}, {:?}). Keeping both...", height, round, roster_i, (value_id, sig), old_val_sig);
                         }
-                        eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}: finalizer {} voted on 2 different values ({:?}, {:?}). Keeping the one for the proposal...", height, round, roster_i, (value_id, sig), old_val_sig);
+                        if !is_for_held_proposal {
+                            // Its second value goes beside the first, the newest replacing any earlier one.
+                            if other.0 == value_id && other.1 != TMSig::NIL {
+                                return TMStatus::Pass; // already have it
+                            }
+                            round_data.set_other_vote(roster_i, is_precommit, (value_id, sig));
+                            if is_precommit == 1 { round_data.adopt_if_certified(value_id, roster, &ctx_str); }
+                            return TMStatus::Pass;
+                        }
+                        round_data.set_other_vote(roster_i, is_precommit, old_val_sig);
                     }
                 }
                 // Checks now finished //////////////////////////
@@ -1009,6 +1169,7 @@ impl TMState {
                 let new_cs = ConsensusCounts::from(&(round_data.msg_val_sigs[roster_i], round_data.msg_nil_sigs[roster_i], roster[roster_i].stake, round_data.proposal_id));
                 let d = new_cs - old_cs; // add 1 to counts that have been updated by this message
                 round_data.counts = round_data.counts + d;
+                if is_precommit == 1 && value_id != ValueId::NIL { round_data.adopt_if_certified(value_id, roster, &ctx_str); }
 
                 if PRINT_BFT_UPDATE && (
                     d.anys           |
@@ -2316,6 +2477,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 };
                 let proposal_size = hdr.proposal_size as usize;
                 let chunk_i       = hdr.chunk_i       as usize;
+                // Nothing is verified yet: these two fields are whatever the peer wrote.
+                if proposal_size > PROPOSAL_MAX_SIZE || chunk_i >= proposal_size.div_ceil(PROPOSAL_CHUNK_DATA_SIZE) {
+                    eprintln!("{:05}: couldn't read proposal chunk: chunk {} of a {}-byte value", my_port, chunk_i, proposal_size);
+                    continue;
+                }
                 let chunk_size = usize::min(PROPOSAL_CHUNK_DATA_SIZE, proposal_size - chunk_i * PROPOSAL_CHUNK_DATA_SIZE);
                 let packet_size = chunk_size + PROPOSAL_PACKET_EXTRA;
 
@@ -3002,6 +3168,9 @@ pub const PEER_ATTESTATION_SERIALIZED_SIZE: usize = // @Volatile.
 
 pub const PROPOSAL_PACKET_EXTRA:    usize = (PACKET_HEADER_SIZE + PACKET_STATUS_SIZE + 56 + 64);
 pub const PROPOSAL_CHUNK_DATA_SIZE: usize = PATH_MTU - PROPOSAL_PACKET_EXTRA;
+/// The largest value a proposer may propose. A node allocates the size the first chunk's header
+/// names before it has any of the bytes, so the header must not be able to name an arbitrary one.
+pub const PROPOSAL_MAX_SIZE:        usize = 1 << 20;
 
 // NOTE(azmr): this is:
 // - conservative in terms of max chunks, value_id, & arrival order
@@ -3260,10 +3429,10 @@ mod tests {
     }
 
     #[test]
-    fn dup_different_value_is_fault() {
+    fn dup_different_value_is_kept_beside_the_first() {
         let (mut state, roster) = dup_state();
         for (value_id, expected) in [(ValueId([1; 32]), TMStatus::Indeterminate),
-                                     (ValueId([2; 32]), TMStatus::Fail)] {
+                                     (ValueId([2; 32]), TMStatus::Pass)] {
             let signed_data = make_vote_sign_datas(roster[0].pub_key, false, 0, 0, value_id)[1];
             let sig = TMSig(sign_with_namespace(&state.my_signing_key, &signed_data, &state.vote_namespace));
             assert_eq!(state.check_and_incorporate_msg(0, 0, 0, value_id, -2, &roster, 0,
@@ -3271,6 +3440,8 @@ mod tests {
         }
         assert!(state.sig_fault_printed.is_empty());
         assert_eq!(state.rounds_data[0].msg_val_sigs[0][0].0, ValueId([1; 32]));
+        assert_eq!(state.rounds_data[0].other_vote(0, 0).0, ValueId([2; 32]));
+        assert_eq!(state.rounds_data[0].counts.prevotes, 1, "one finalizer, counted once");
     }
 
     fn chunk_msg(key: &SigningKey, namespace: &[u8; 32], proposal: &BlockValue, proposal_id: ValueId, round: u32, valid_round: i64, chunk_i: usize) -> (Vec<u8>, TMSig) {
@@ -3701,6 +3872,8 @@ mod tests {
         // restart, so it comes back as a fresh engine with the same key and proposes B, which reaches
         // the third node first. Two nodes hold A and two hold B.
         ProposerRestarts,
+        // It sends A to two nodes and B to the third, and otherwise takes part for A. Three hold A.
+        ProposerGivesOneNodeAnotherValue,
     }
 
     // Runs the network from the start of height 0 and returns, per node, its height, round, step and
@@ -3732,11 +3905,27 @@ mod tests {
                 rt.block_on(nodes[proposer].start_round(&roster, Instant::now(), 0));
                 split_gossip(&mut nodes, &roster, proposer, others[2]);
             }
+            Split::ProposerGivesOneNodeAnotherValue => {
+                split_gossip(&mut nodes, &roster, proposer, others[0]);
+                split_gossip(&mut nodes, &roster, proposer, others[1]);
+                let id_b = value_b.id_from_value(&nodes[proposer].hash_keys);
+                for chunk_i in 0..value_b.chunks_n() {
+                    let (data, sig) = chunk_msg(&keys[proposer], &nodes[proposer].vote_namespace, &value_b, id_b, 0, -1, chunk_i);
+                    assert_eq!(nodes[others[2]].check_and_incorporate_msg(0, 0, chunk_i, id_b, -1, &roster, proposer,
+                        PACKET_TYPE_PROPOSAL_CHUNK, &data, sig), TMStatus::Pass);
+                }
+            }
         }
+
+        // A proposer that set out to split the network does not listen to its own second value. Its
+        // engine would: handed B back, it drops A and its own votes with it.
+        let deaf = match split { Split::ProposerGivesOneNodeAnotherValue => Some((others[2], proposer)), _ => None };
 
         for _ in 0..16 {
             for i in 0..4 { rt.block_on(nodes[i].bft_update(&mut rosters[i])); }
-            for from in 0..4 { for to in 0..4 { if from != to { split_gossip(&mut nodes, &roster, from, to); } } }
+            for from in 0..4 { for to in 0..4 {
+                if from != to && Some((from, to)) != deaf { split_gossip(&mut nodes, &roster, from, to); }
+            } }
         }
 
         nodes.iter().map(|node| {
@@ -3801,6 +3990,158 @@ mod tests {
             let case = format!("other vote first: {other_first}, before the proposal: {other_before_proposal}");
             assert_eq!(rd.msg_val_sigs[twice][0].0, id, "{case}");
             assert_eq!((rd.counts.yes_prevotes, rd.counts.prevotes), (3, 3), "{case}");
+        }
+    }
+
+    // Line 49 decides on the proposal plus 2f+1 precommits for it. A proposer can give 2f+1 finalizers,
+    // itself among them, one value and the rest another. The 2f+1 decide. A node that holds the other
+    // value and refuses the decided one as a second proposal can never decide that height, from the
+    // round or from catch-up, and the proposer then only has to stop voting for the remaining 2f to be
+    // short of a quorum for good.
+    #[test]
+    fn line49_node_given_another_value_decides_what_the_rest_decided() {
+        let nodes = split_network(Split::ProposerGivesOneNodeAnotherValue);
+        for (i, &(height, ..)) in nodes.iter().enumerate() {
+            assert_eq!(height, 1, "node {i} did not decide height 0; all nodes: {nodes:?}");
+        }
+    }
+
+    fn split_vote(node: &mut TMState, keys: &[SigningKey], roster: &[SortedRosterMember], i: usize, is_precommit: bool, value_id: ValueId) -> TMStatus {
+        let data = make_vote_sign_datas(roster[i].pub_key, is_precommit, 0, 0, value_id)[1];
+        let sig = TMSig(sign_with_namespace(&keys[i], &data, &node.vote_namespace));
+        node.check_and_incorporate_msg(0, 0, 0, value_id, -2, roster, i, PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit as u8, &data, sig)
+    }
+
+    // Hands `node` every chunk of `value` as the round-0 proposer signed it, under the id `as_id`.
+    fn split_chunks(node: &mut TMState, keys: &[SigningKey], roster: &[SortedRosterMember], proposer: usize, value: &BlockValue, as_id: ValueId, only: Option<usize>) {
+        for chunk_i in 0..value.chunks_n() {
+            if only.is_some_and(|only| only != chunk_i) { continue; }
+            let (data, sig) = chunk_msg(&keys[proposer], &node.vote_namespace, value, as_id, 0, -1, chunk_i);
+            node.check_and_incorporate_msg(0, 0, chunk_i, as_id, -1, roster, proposer, PACKET_TYPE_PROPOSAL_CHUNK, &data, sig);
+        }
+    }
+
+    // The decision of the other three used a precommit from a finalizer that also precommitted the value
+    // this node holds, and that one reached this node first. It still counts toward what was decided.
+    #[test]
+    fn line49_decided_value_counts_a_finalizer_that_also_precommitted_ours() {
+        let (keys, roster, proposer, others) = split_finalizers();
+        let me = others[2];
+        let value_a = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let value_b = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| (i as u8).wrapping_add(1)).collect());
+
+        let mut node = split_engine(&keys, &roster, me, None);
+        node.insert_round(0, 0, &roster);
+        let (id_a, id_b) = (value_a.id_from_value(&node.hash_keys), value_b.id_from_value(&node.hash_keys));
+        split_chunks(&mut node, &keys, &roster, proposer, &value_b, id_b, None);
+
+        split_vote(&mut node, &keys, &roster, proposer, true, id_b);
+        split_vote(&mut node, &keys, &roster, proposer, true, id_a);
+        split_vote(&mut node, &keys, &roster, others[0], true, id_a);
+        assert_eq!(node.rounds_data[0].proposal_id, id_b);
+        split_vote(&mut node, &keys, &roster, others[1], true, id_a);
+        assert_eq!(node.rounds_data[0].proposal_id, id_a, "three of four precommitted A");
+        assert_eq!(node.rounds_data[0].counts.yes_precommits, 3);
+
+        // B is no longer taken, nor is a third value with fewer precommits.
+        split_chunks(&mut node, &keys, &roster, proposer, &value_b, id_b, None);
+        split_vote(&mut node, &keys, &roster, others[0], true, ValueId([9; 32]));
+        assert_eq!(node.rounds_data[0].proposal_id, id_a);
+
+        split_chunks(&mut node, &keys, &roster, proposer, &value_a, id_a, None);
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(node.bft_update(&mut roster.clone()));
+        assert_eq!(node.height, 1);
+    }
+
+    // The precommits for the decided value can reach a node before any proposal does, a node that was
+    // behind for one. Being handed the other value next must not leave it holding that.
+    #[test]
+    fn line49_precommits_that_came_before_any_proposal_still_decide() {
+        let (keys, roster, proposer, others) = split_finalizers();
+        let value_a = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let value_b = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| (i as u8).wrapping_add(1)).collect());
+
+        let mut node = split_engine(&keys, &roster, others[2], None);
+        node.insert_round(0, 0, &roster);
+        let (id_a, id_b) = (value_a.id_from_value(&node.hash_keys), value_b.id_from_value(&node.hash_keys));
+        for i in [proposer, others[0], others[1]] { split_vote(&mut node, &keys, &roster, i, true, id_a); }
+        split_chunks(&mut node, &keys, &roster, proposer, &value_b, id_b, Some(0));
+        assert_eq!(node.rounds_data[0].proposal_id, id_a);
+
+        split_chunks(&mut node, &keys, &roster, proposer, &value_a, id_a, None);
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(node.bft_update(&mut roster.clone()));
+        assert_eq!(node.height, 1);
+    }
+
+    // A node that has the whole decided value keeps it: a chunk the proposer signed with other bytes
+    // under the same id is not part of the value.
+    #[test]
+    fn line49_a_conflicting_chunk_does_not_cost_a_node_the_decided_value_it_has() {
+        let (keys, roster, proposer, others) = split_finalizers();
+        let value   = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let garbage = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| (i as u8).wrapping_mul(3)).collect());
+
+        let mut node = split_engine(&keys, &roster, others[2], None);
+        node.insert_round(0, 0, &roster);
+        let id = value.id_from_value(&node.hash_keys);
+        split_chunks(&mut node, &keys, &roster, proposer, &value, id, None);
+        for i in [proposer, others[0], others[1]] { split_vote(&mut node, &keys, &roster, i, true, id); }
+        split_chunks(&mut node, &keys, &roster, proposer, &garbage, id, Some(1));
+        assert!(node.rounds_data[0].has_full_proposal());
+
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(node.bft_update(&mut roster.clone()));
+        assert_eq!(node.height, 1);
+    }
+
+    // The proposer can sign wrong bytes under the id of the value that was decided. Whether they arrive
+    // before or after the precommits, they cost a retry and no more: the bytes of a decided value are
+    // whatever hashes to its id.
+    #[test]
+    fn line49_wrong_bytes_under_a_decided_id_do_not_condemn_it() {
+        let (keys, roster, proposer, others) = split_finalizers();
+        let me = others[2];
+        let value   = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let garbage = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| (i as u8).wrapping_mul(3)).collect());
+
+        for garbage_completes_first in [false, true] {
+            let mut node = split_engine(&keys, &roster, me, None);
+            node.insert_round(0, 0, &roster);
+            let id = value.id_from_value(&node.hash_keys);
+
+            split_chunks(&mut node, &keys, &roster, proposer, &garbage, id, Some(1));
+            if garbage_completes_first {
+                // The whole thing arrives and does not hash to its id, before anyone has precommitted.
+                split_chunks(&mut node, &keys, &roster, proposer, &value, id, Some(0));
+                assert!(node.rounds_data[0].proposal_is_faulty);
+            }
+            for i in [proposer, others[0], others[1]] { split_vote(&mut node, &keys, &roster, i, true, id); }
+
+            // Peers keep sending the real value; two rounds of it are enough.
+            split_chunks(&mut node, &keys, &roster, proposer, &value, id, None);
+            split_chunks(&mut node, &keys, &roster, proposer, &value, id, None);
+            tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(node.bft_update(&mut roster.clone()));
+            assert_eq!(node.height, 1, "garbage completes first: {garbage_completes_first}");
+        }
+    }
+
+    // A chunk's header says how big the value is and which chunk this is. Neither is believed past the
+    // limit: the size is allocated on sight.
+    #[test]
+    fn proposal_chunk_header_cannot_name_an_arbitrary_size_or_index() {
+        let (keys, roster, proposer, others) = split_finalizers();
+        let mut node = split_engine(&keys, &roster, others[2], None);
+        node.insert_round(0, 0, &roster);
+        let id = ValueId([7; 32]);
+
+        for (proposal_size, chunk_i) in [(PROPOSAL_MAX_SIZE as u32 + 1, 0), (u32::MAX, 0), (0, 0), (PROPOSAL_CHUNK_DATA_SIZE as u32, 1)] {
+            let hdr = PacketProposalChunkHeader { chunk_i, proposal_size, round: 0, valid_round: -1, height: 0, proposal_id: id };
+            let mut data = vec![0u8; PacketProposalChunkHeader::SERIALIZED_SIZE];
+            hdr.write_to(&mut data);
+            data.extend_from_slice(&[0u8; PROPOSAL_CHUNK_DATA_SIZE]);
+            let sig = TMSig(sign_with_namespace(&keys[proposer], &data, &node.vote_namespace));
+            assert_eq!(node.check_and_incorporate_msg(0, 0, chunk_i as usize, id, -1, &roster, proposer,
+                PACKET_TYPE_PROPOSAL_CHUNK, &data, sig), TMStatus::Fail, "size {proposal_size}, chunk {chunk_i}");
+            assert!(node.rounds_data[0].proposal.0.is_empty(), "size {proposal_size}, chunk {chunk_i}");
         }
     }
 
