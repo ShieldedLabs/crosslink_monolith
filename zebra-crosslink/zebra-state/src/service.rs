@@ -2069,6 +2069,9 @@ pub fn pos_block_reward(height: block::Height, network: &Network) -> u64 {
     pos_subsidy(height, network, subsidy).map(u64::from).unwrap_or_default()
 }
 
+/// Legacy (before `SEASON_2_UPGRADE_BLOCK_HEIGHT_1`) PoS issuance payout, kept bit-for-bit
+/// for consensus compatibility. See [`update_bonds_with_pos_issuance`].
+///
 /// Pays one block's PoS issuance. Each active bond earns its stake-weighted share of
 /// `bond_reward_total`; of that share, one part in [`FINALIZER_COMMISSION_DIVISOR`]
 /// (rounded down) is the commission credited to the bond's target finalizer in
@@ -2090,7 +2093,7 @@ pub fn pos_block_reward(height: block::Height, network: &Network) -> u64 {
 /// Returns the amounts actually paid, per bond and per finalizer, so a revert can
 /// undo exactly what was done without recomputing. Both are empty when nothing is
 /// at stake.
-pub fn update_bonds_with_pos_issuance(
+fn update_bonds_with_pos_issuance_legacy(
     bond_reward_total: u64,
     delegation_bonds: &mut HashMap<finalized_state::disk_format::BondKey, (finalized_state::disk_format::DelegationBond, non_finalized_state::BondStatusInChain)>,
     finalizer_rewards: &mut HashMap<[u8; 32], u64>,
@@ -2216,6 +2219,111 @@ pub fn update_bonds_with_pos_issuance(
     let commission_per_finalizer: Vec<([u8; 32], u64)> = commission_per_finalizer.into_iter().collect();
     for (finalizer, commission) in &commission_per_finalizer {
         *finalizer_rewards.entry(*finalizer).or_insert(0) += commission;
+    }
+
+    (reward_per_bond, commission_per_finalizer)
+}
+
+/// Pays one block's PoS issuance, `bond_reward_total`.
+///
+/// Before `SEASON_2_UPGRADE_BLOCK_HEIGHT_1` this is the legacy per-bond 90/10 split
+/// ([`update_bonds_with_pos_issuance_legacy`]). From that height on, the issuance is split
+/// once at the top: one part in [`FINALIZER_COMMISSION_DIVISOR`] (rounded down) is the
+/// finalizer pool and the rest is the bond pool.
+///
+/// * The bond pool is shared by all active bonds in proportion to their amounts, with no
+///   regard to whether their target finalizer is in the active roster. The rounding
+///   remainder goes to the biggest bond.
+/// * The finalizer pool is shared by the finalizers in the active roster (top
+///   [`ACTIVE_ROSTER_MAX_N`] by active bonds plus bank) in proportion to that same stake, and
+///   credited to their banks. The rounding remainder goes to the biggest roster finalizer.
+///
+/// A pool with nobody to pay is left unpaid (burned). Returns the amounts actually paid, per
+/// bond and per finalizer, so a revert can undo exactly what was done.
+pub fn update_bonds_with_pos_issuance(
+    height: block::Height,
+    bond_reward_total: u64,
+    delegation_bonds: &mut HashMap<finalized_state::disk_format::BondKey, (finalized_state::disk_format::DelegationBond, non_finalized_state::BondStatusInChain)>,
+    finalizer_rewards: &mut HashMap<[u8; 32], u64>,
+    ) -> (Vec<([u8; 32], u64)>, Vec<([u8; 32], u64)>)
+{
+    use zebra_chain::amount::Amount;
+    use crate::constants::FINALIZER_COMMISSION_DIVISOR;
+    use zcash_primitives::bft::ACTIVE_ROSTER_MAX_N;
+
+    if height.0 < zcash_primitives::SEASON_2_UPGRADE_BLOCK_HEIGHT_1 {
+        return update_bonds_with_pos_issuance_legacy(bond_reward_total, delegation_bonds, finalizer_rewards);
+    }
+
+    let finalizer_pool = bond_reward_total / FINALIZER_COMMISSION_DIVISOR;
+    let bond_pool = bond_reward_total - finalizer_pool;
+
+    // Stake per finalizer as of this block's state (active bonds plus bank), before any
+    // payment below, and the roster ranked from it exactly as in the legacy path.
+    let mut stakes: HashMap<[u8; 32], u64> = HashMap::new();
+    for (bond, status) in delegation_bonds.values() {
+        if *status == non_finalized_state::BondStatusInChain::Active {
+            *stakes.entry(bond.target_finalizer).or_insert(0) += bond.amount.zatoshis() as u64;
+        }
+    }
+    for (finalizer, bank) in finalizer_rewards.iter() {
+        if *bank != 0 {
+            *stakes.entry(*finalizer).or_insert(0) += bank;
+        }
+    }
+    let mut ranked: Vec<(u64, [u8; 32])> = stakes.into_iter().map(|(k, v)| (v, k)).collect();
+    ranked.sort_by_key(|&(stake, key)| std::cmp::Reverse((stake, key)));
+    let roster: Vec<(u64, [u8; 32])> = ranked.into_iter().take(ACTIVE_ROSTER_MAX_N).collect();
+
+    // Bond pool: every active bond, stake-weighted, remainder to the biggest bond
+    // (ties to the smallest key).
+    let mut reward_per_bond: Vec<([u8; 32], u64)> = Vec::new();
+    let mut total_bonded = 0u64;
+    let mut biggest_bond: Option<([u8; 32], u64)> = None;
+    for (bond_key, (bond, status)) in delegation_bonds.iter() {
+        if *status != non_finalized_state::BondStatusInChain::Active { continue; }
+        let amount = bond.amount.zatoshis() as u64;
+        total_bonded += amount;
+        if biggest_bond.map_or(true, |(k, a)| amount > a || (amount == a && *bond_key < k)) {
+            biggest_bond = Some((*bond_key, amount));
+        }
+    }
+    if let (Some((biggest_key, _)), true) = (biggest_bond, total_bonded > 0) {
+        let mut paid = 0u64;
+        for (bond_key, (bond, status)) in delegation_bonds.iter_mut() {
+            if *status != non_finalized_state::BondStatusInChain::Active { continue; }
+            let reward = ((bond.amount.zatoshis() as u128 * bond_pool as u128) / total_bonded as u128) as u64;
+            paid += reward;
+            bond.amount = (bond.amount + Amount::new(reward as i64)).unwrap();
+            reward_per_bond.push((*bond_key, reward));
+        }
+        let remainder = bond_pool - paid;
+        if remainder > 0 {
+            let (bond, _) = delegation_bonds.get_mut(&biggest_key).expect("checked earlier");
+            bond.amount = (bond.amount + Amount::new(remainder as i64)).unwrap();
+            match reward_per_bond.iter_mut().find(|(k, _)| *k == biggest_key) {
+                Some((_, r)) => *r += remainder,
+                None => reward_per_bond.push((biggest_key, remainder)),
+            }
+        }
+    }
+
+    // Finalizer pool: roster members by stake (roster is sorted biggest first, ties to the
+    // larger key, so the biggest is the first entry).
+    let mut commission_per_finalizer: Vec<([u8; 32], u64)> = Vec::new();
+    let roster_stake: u64 = roster.iter().map(|&(stake, _)| stake).sum();
+    if roster_stake > 0 {
+        let mut paid = 0u64;
+        for &(stake, finalizer) in &roster {
+            let reward = ((stake as u128 * finalizer_pool as u128) / roster_stake as u128) as u64;
+            paid += reward;
+            commission_per_finalizer.push((finalizer, reward));
+        }
+        commission_per_finalizer[0].1 += finalizer_pool - paid;
+        commission_per_finalizer.retain(|&(_, r)| r > 0);
+        for (finalizer, reward) in &commission_per_finalizer {
+            *finalizer_rewards.entry(*finalizer).or_insert(0) += reward;
+        }
     }
 
     (reward_per_bond, commission_per_finalizer)

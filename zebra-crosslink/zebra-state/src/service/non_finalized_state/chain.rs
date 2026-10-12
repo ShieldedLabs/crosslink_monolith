@@ -2213,7 +2213,7 @@ impl Chain {
             let _ = pos_payout; // variable reward disabled; see above
             let (bond_rewards, commissions) = if height.0 > 0 {
                 let reward = crate::service::pos_block_reward(height, &self.network);
-                crate::service::update_bonds_with_pos_issuance(reward, delegation_bonds, finalizer_rewards)
+                crate::service::update_bonds_with_pos_issuance(height, reward, delegation_bonds, finalizer_rewards)
             } else {
                 (Vec::new(), Vec::new())
             };
