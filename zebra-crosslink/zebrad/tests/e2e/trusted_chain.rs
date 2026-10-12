@@ -162,6 +162,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
             | NetworkUpgrade::Nu6_1
             | NetworkUpgrade::Nu6_2
             | NetworkUpgrade::Nu6_3
+            | NetworkUpgrade::FeaturenetUpgrade1
             | NetworkUpgrade::Nu7 => {
                 ChainHistoryBlockTxAuthCommitmentHash::from_commitments(&hist_root, &auth_root)
                     .bytes_in_serialized_order()

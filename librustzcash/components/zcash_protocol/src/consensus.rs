@@ -507,6 +507,11 @@ impl Parameters for MainNetwork {
     }
 }
 
+/// The Crosslink testnet activation height of [`NetworkUpgrade::FeaturenetUpgrade1`]. The node's
+/// Testnet and Regtest schedules take it from here, so the node and the wallet, which builds
+/// against [`TestNetwork`], cannot disagree on which branch ID a height uses.
+pub const TESTNET_FEATURENET_UPGRADE_1_HEIGHT: u32 = 48_000;
+
 /// Marker struct for the test network.
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub struct TestNetwork;
@@ -552,7 +557,9 @@ impl Parameters for TestNetwork {
             NetworkUpgrade::Nu6_3 => Some(BlockHeight(1)),
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => None,
-            NetworkUpgrade::FeaturenetUpgrade1 => Some(BlockHeight(45_000)),
+            NetworkUpgrade::FeaturenetUpgrade1 => {
+                Some(BlockHeight(TESTNET_FEATURENET_UPGRADE_1_HEIGHT))
+            }
         }
     }
 }
@@ -634,8 +641,7 @@ pub enum NetworkUpgrade {
     /// [Nu7 (proposed)]: https://z.cash/upgrade/nu7/
     #[cfg(zcash_unstable = "nu7")]
     Nu7,
-    /// The first Crosslink featurenet upgrade. It changes staking rules only, so it keeps
-    /// the consensus branch ID of [`NetworkUpgrade::Nu6_3`].
+    /// The first Crosslink featurenet upgrade, a hard fork of the staking rules.
     FeaturenetUpgrade1,
 }
 
@@ -680,7 +686,7 @@ impl NetworkUpgrade {
             NetworkUpgrade::Nu6_3 => BranchId::Nu6_3,
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => BranchId::Nu7,
-            NetworkUpgrade::FeaturenetUpgrade1 => BranchId::Nu6_3,
+            NetworkUpgrade::FeaturenetUpgrade1 => BranchId::FeaturenetUpgrade1,
         }
     }
 }
@@ -700,6 +706,7 @@ const UPGRADES_IN_ORDER: &[NetworkUpgrade] = &[
     NetworkUpgrade::Nu6_1,
     NetworkUpgrade::Nu6_2,
     NetworkUpgrade::Nu6_3,
+    NetworkUpgrade::FeaturenetUpgrade1,
     #[cfg(zcash_unstable = "nu7")]
     NetworkUpgrade::Nu7,
 ];
@@ -764,6 +771,8 @@ pub enum BranchId {
     Nu6_2,
     /// The consensus rules to be deployed by [`NetworkUpgrade::Nu6_3`].
     Nu6_3,
+    /// The consensus rules deployed by [`NetworkUpgrade::FeaturenetUpgrade1`].
+    FeaturenetUpgrade1,
     /// The consensus rules to be deployed by [`NetworkUpgrade::Nu7`].
     #[cfg(zcash_unstable = "nu7")]
     Nu7,
@@ -788,6 +797,7 @@ impl TryFrom<u32> for BranchId {
             0x4dec_4df0 => Ok(BranchId::Nu6_1),
             0x5437_f330 => Ok(BranchId::Nu6_2),
             0x37a5_165b => Ok(BranchId::Nu6_3),
+            0x4654_5531 => Ok(BranchId::FeaturenetUpgrade1),
             #[cfg(zcash_unstable = "nu7")]
             0xffff_ffff => Ok(BranchId::Nu7),
             _ => Err("Unknown consensus branch ID"),
@@ -809,6 +819,7 @@ impl From<BranchId> for u32 {
             BranchId::Nu6_1 => 0x4dec_4df0,
             BranchId::Nu6_2 => 0x5437_f330,
             BranchId::Nu6_3 => 0x37a5_165b,
+            BranchId::FeaturenetUpgrade1 => 0x4654_5531,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => 0xffff_ffff,
         }
@@ -848,6 +859,7 @@ impl BranchId {
             BranchId::Nu6_1 => NetworkUpgrade::Nu6_1,
             BranchId::Nu6_2 => NetworkUpgrade::Nu6_2,
             BranchId::Nu6_3 => NetworkUpgrade::Nu6_3,
+            BranchId::FeaturenetUpgrade1 => NetworkUpgrade::FeaturenetUpgrade1,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => NetworkUpgrade::Nu7,
         })
@@ -911,6 +923,14 @@ impl BranchId {
             BranchId::Nu6_3 => params
                 .activation_height(NetworkUpgrade::Nu6_3)
                 .map(|lower| {
+                    (
+                        lower,
+                        params.activation_height(NetworkUpgrade::FeaturenetUpgrade1),
+                    )
+                }),
+            BranchId::FeaturenetUpgrade1 => params
+                .activation_height(NetworkUpgrade::FeaturenetUpgrade1)
+                .map(|lower| {
                     #[cfg(zcash_unstable = "nu7")]
                     let upper = params.activation_height(NetworkUpgrade::Nu7);
                     #[cfg(not(zcash_unstable = "nu7"))]
@@ -934,7 +954,7 @@ impl BranchId {
         match self {
             Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1
             | Nu6_2 => true,
-            BranchId::Nu6_3 => true,
+            BranchId::Nu6_3 | BranchId::FeaturenetUpgrade1 => true,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => false,
         }
@@ -946,7 +966,7 @@ impl BranchId {
         match self {
             Sprout | Overwinter => false,
             Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
-            BranchId::Nu6_3 => true,
+            BranchId::Nu6_3 | BranchId::FeaturenetUpgrade1 => true,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => true,
         }
@@ -958,7 +978,7 @@ impl BranchId {
         match self {
             Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy => false,
             Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
-            BranchId::Nu6_3 => true,
+            BranchId::Nu6_3 | BranchId::FeaturenetUpgrade1 => true,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => true,
         }
@@ -973,7 +993,7 @@ impl BranchId {
             Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy => None,
             Nu5 | Nu6 | Nu6_1 => Some(OrchardProtocolRevision::InsecureV1),
             Nu6_2 => Some(OrchardProtocolRevision::V2),
-            Nu6_3 => Some(OrchardProtocolRevision::V3),
+            Nu6_3 | FeaturenetUpgrade1 => Some(OrchardProtocolRevision::V3),
             #[cfg(zcash_unstable = "nu7")]
             Nu7 => Some(OrchardProtocolRevision::V3),
         }
@@ -1023,6 +1043,7 @@ pub mod testing {
             BranchId::Nu6_1,
             BranchId::Nu6_2,
             BranchId::Nu6_3,
+            BranchId::FeaturenetUpgrade1,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7,
         ])

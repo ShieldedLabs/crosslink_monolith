@@ -192,6 +192,9 @@ impl From<&BTreeMap<Height, NetworkUpgrade>> for ConfiguredActivationHeights {
                 NetworkUpgrade::Nu6_1 => &mut configured_activation_heights.nu6_1,
                 NetworkUpgrade::Nu6_2 => &mut configured_activation_heights.nu6_2,
                 NetworkUpgrade::Nu6_3 => &mut configured_activation_heights.nu6_3,
+                NetworkUpgrade::FeaturenetUpgrade1 => {
+                    &mut configured_activation_heights.featurenet_upgrade_1
+                }
                 NetworkUpgrade::Nu7 => &mut configured_activation_heights.nu7,
                 #[cfg(zcash_unstable = "zfuture")]
                 NetworkUpgrade::ZFuture => &mut configured_activation_heights.zfuture,
@@ -375,6 +378,9 @@ pub struct ConfiguredActivationHeights {
     /// Activation height for `NU6.3` (Ironwood) network upgrade.
     #[serde(rename = "NU6.3")]
     pub nu6_3: Option<u32>,
+    /// Activation height for the `FeaturenetUpgrade1` network upgrade.
+    #[serde(rename = "FeaturenetUpgrade1")]
+    pub featurenet_upgrade_1: Option<u32>,
     /// Activation height for `NU7` network upgrade.
     #[serde(rename = "NU7")]
     pub nu7: Option<u32>,
@@ -400,6 +406,7 @@ impl ConfiguredActivationHeights {
             nu6_1,
             nu6_2,
             nu6_3,
+            featurenet_upgrade_1,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -418,6 +425,12 @@ impl ConfiguredActivationHeights {
         let nu6_1 = nu6_1.or(nu6);
         let nu6_2 = nu6_2.or(nu6_1);
         let nu6_3 = nu6_3.or(nu6_2);
+        // The wallet builds against hardcoded parameters, so Regtest takes the featurenet upgrade
+        // at the height they name, unless the heights configured around it leave it no room.
+        let featurenet_upgrade_1 = featurenet_upgrade_1.or(
+            Some(zcash_protocol::consensus::TESTNET_FEATURENET_UPGRADE_1_HEIGHT)
+                .filter(|&h| nu6_3.is_some_and(|n| n < h) && nu7.map_or(true, |n| n > h)),
+        );
 
         Self {
             before_overwinter,
@@ -431,6 +444,7 @@ impl ConfiguredActivationHeights {
             nu6_1,
             nu6_2,
             nu6_3,
+            featurenet_upgrade_1,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -625,6 +639,7 @@ impl ParametersBuilder {
             nu6_1,
             nu6_2,
             nu6_3,
+            featurenet_upgrade_1,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -654,6 +669,7 @@ impl ParametersBuilder {
                 .chain(nu6_1.into_iter().map(|h| (h, Nu6_1)))
                 .chain(nu6_2.into_iter().map(|h| (h, Nu6_2)))
                 .chain(nu6_3.into_iter().map(|h| (h, Nu6_3)))
+                .chain(featurenet_upgrade_1.into_iter().map(|h| (h, FeaturenetUpgrade1)))
                 .chain(nu7.into_iter().map(|h| (h, Nu7)));
 
             #[cfg(zcash_unstable = "zfuture")]

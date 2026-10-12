@@ -354,7 +354,7 @@ pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 // Next upgrade values, uncomment on activation:
 //   pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_170); // NU7 Testnet
 //   pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_180); // NU7 Mainnet
-pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_160); // NU6.3 (Mainnet + Testnet)
+pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_165); // FeaturenetUpgrade1
 
 /// The default RTT estimate for peer responses.
 ///

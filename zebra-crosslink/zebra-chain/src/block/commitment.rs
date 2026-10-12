@@ -137,7 +137,7 @@ impl Commitment {
             // block. Match every post-Heartwood upgrade *at the Heartwood activation height* instead.
             //
             // See <https://zips.z.cash/zip-0221> and the [protocol specification §7.6](https://zips.z.cash/protocol/protocol.pdf).
-            (Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7, activation_height)
+            (Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1 | Nu7, activation_height)
                 if height == activation_height
                     && Some(height) == Heartwood.activation_height(network) =>
             {
@@ -148,7 +148,7 @@ impl Commitment {
                 }
             }
             (Heartwood | Canopy, _) => Ok(ChainHistoryRoot(ChainHistoryMmrRootHash(bytes))),
-            (Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7, _) => Ok(ChainHistoryBlockTxAuthCommitment(
+            (Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1 | Nu7, _) => Ok(ChainHistoryBlockTxAuthCommitment(
                 ChainHistoryBlockTxAuthCommitmentHash(bytes),
             )),
 

@@ -86,8 +86,8 @@ type TxVerifier = Buffer<
 >;
 type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, State>;
 
-/// The number of NU6.3 heights where stale NU6.2 branch IDs receive no peer score.
-const NU6_3_BRANCH_ID_GRACE_PERIOD: i64 = 40;
+/// The number of heights around a branch ID change where stale branch IDs receive no peer score.
+const BRANCH_ID_GRACE_PERIOD: i64 = 40;
 
 /// Returns the mempool peer score after applying branch ID activation policy.
 fn adjusted_mempool_misbehavior_score(
@@ -96,25 +96,29 @@ fn adjusted_mempool_misbehavior_score(
     verification_height: Height,
     network: &Network,
 ) -> u32 {
-    let is_nu6_3_grace_mismatch = matches!(error, TransactionError::WrongConsensusBranchId)
-        && NetworkUpgrade::Nu6_3
-            .activation_height(network)
-            .is_some_and(|activation_height| {
-                let expected_upgrade = NetworkUpgrade::current(network, verification_height);
-                let height_offset = verification_height - activation_height;
+    let is_grace_mismatch = matches!(error, TransactionError::WrongConsensusBranchId)
+        && [
+            (NetworkUpgrade::Nu6_2, NetworkUpgrade::Nu6_3),
+            (NetworkUpgrade::Nu6_3, NetworkUpgrade::FeaturenetUpgrade1),
+        ]
+        .into_iter()
+        .any(|(old, new)| {
+            new.activation_height(network)
+                .is_some_and(|activation_height| {
+                    let expected_upgrade = NetworkUpgrade::current(network, verification_height);
+                    let height_offset = verification_height - activation_height;
 
-                match (transaction_upgrade, expected_upgrade) {
-                    (Some(NetworkUpgrade::Nu6_2), NetworkUpgrade::Nu6_3) => {
-                        (0..NU6_3_BRANCH_ID_GRACE_PERIOD).contains(&height_offset)
+                    if transaction_upgrade == Some(old) && expected_upgrade == new {
+                        (0..BRANCH_ID_GRACE_PERIOD).contains(&height_offset)
+                    } else if transaction_upgrade == Some(new) && expected_upgrade == old {
+                        (-BRANCH_ID_GRACE_PERIOD..0).contains(&height_offset)
+                    } else {
+                        false
                     }
-                    (Some(NetworkUpgrade::Nu6_3), NetworkUpgrade::Nu6_2) => {
-                        (-NU6_3_BRANCH_ID_GRACE_PERIOD..0).contains(&height_offset)
-                    }
-                    _ => false,
-                }
-            });
+                })
+        });
 
-    if is_nu6_3_grace_mismatch {
+    if is_grace_mismatch {
         0
     } else {
         error.mempool_misbehavior_score()

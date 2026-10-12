@@ -126,9 +126,18 @@ impl Version {
                 170_160
             }
             (Mainnet, Nu6_3) => 170_160,
+            (Testnet(params), FeaturenetUpgrade1)
+                if params.is_default_testnet() || params.is_regtest() =>
+            {
+                170_165
+            }
+            (Mainnet, FeaturenetUpgrade1) => 170_165,
             (Testnet(params), Nu7) if params.is_default_testnet() || params.is_regtest() => 170_170,
             (Mainnet, Nu7) => 170_180,
 
+            // The Crosslink testnet is a custom testnet. It keeps peers from before the featurenet
+            // upgrade until that upgrade activates, so nodes can be upgraded ahead of the fork.
+            (Testnet(_), upgrade) if upgrade < FeaturenetUpgrade1 => 170_160,
             // It should be fine to reject peers with earlier network protocol versions on custom testnets for now.
             (Testnet(_), _) => CURRENT_NETWORK_PROTOCOL_VERSION.0,
 
@@ -227,6 +236,29 @@ mod test {
         version_consistent(&Network::new_default_testnet())
     }
 
+    #[test]
+    fn custom_testnet_keeps_older_peers_until_featurenet_upgrade() {
+        let _init_guard = zebra_test::init();
+
+        let network = zebra_chain::parameters::testnet::Parameters::build()
+            .with_network_magic(zebra_chain::parameters::Magic([b'C', b'l', b'T', b'1']))
+            .expect("magic is not reserved")
+            .to_network()
+            .expect("parameters are valid");
+        let activation = FeaturenetUpgrade1
+            .activation_height(&network)
+            .expect("custom testnets schedule the featurenet upgrade by default");
+
+        assert_eq!(
+            Version::min_remote_for_height(&network, block::Height(activation.0 - 1)),
+            Version(170_160)
+        );
+        assert_eq!(
+            Version::min_remote_for_height(&network, activation),
+            CURRENT_NETWORK_PROTOCOL_VERSION
+        );
+    }
+
     /// Check that the min_specified_for_upgrade and min_specified_for_height functions
     /// are consistent for `network`.
     fn version_consistent(network: &Network) {
@@ -234,7 +266,10 @@ mod test {
 
         let highest_network_upgrade = NetworkUpgrade::current(network, block::Height::MAX);
         assert!(
-            matches!(highest_network_upgrade, Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7),
+            matches!(
+                highest_network_upgrade,
+                Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1 | Nu7
+            ),
             "expected coverage of all network upgrades: \
             add the new network upgrade to the list in this test"
         );
@@ -251,6 +286,7 @@ mod test {
             Nu6_1,
             Nu6_2,
             Nu6_3,
+            FeaturenetUpgrade1,
             Nu7,
         ] {
             let height = network_upgrade.activation_height(network);

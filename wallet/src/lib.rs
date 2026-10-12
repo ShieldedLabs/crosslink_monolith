@@ -2202,7 +2202,7 @@ impl ManualWallet {
             println!("stake_ironwood_to_finalizer: invalid finalizer address capability");
             return None;
         }
-        // From the season 2 upgrade consensus only accepts new bonds of a power of 10 zats.
+        // From FeaturenetUpgrade1 consensus only accepts new bonds of a power of 10 zats.
         if !zcash_primitives::transaction::is_power_of_10(exact_amount_to_send) {
             println!("stake_ironwood_to_finalizer: bond amount {exact_amount_to_send} zats is not a power of 10");
             return None;
