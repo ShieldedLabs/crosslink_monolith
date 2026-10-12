@@ -59,11 +59,12 @@ pub static DBG_TRAPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 pub fn dbg_verify<T>(t: Option<T>) -> Option<T> {
     #[cfg(debug_assertions)] {
         if t.is_none() { dbg_break(); }
-
-        #[cfg(not(target_arch = "x86_64"))]
-        return Some(t.unwrap());
     }
 
+    #[cfg(all(debug_assertions, not(target_arch = "x86_64")))]
+    return Some(t.unwrap());
+
+    #[cfg(not(all(debug_assertions, not(target_arch = "x86_64"))))]
     t
 }
 pub fn verify<T>(t: Option<T>) -> T {
