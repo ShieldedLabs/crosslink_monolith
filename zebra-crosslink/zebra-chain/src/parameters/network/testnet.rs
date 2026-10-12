@@ -425,12 +425,6 @@ impl ConfiguredActivationHeights {
         let nu6_1 = nu6_1.or(nu6);
         let nu6_2 = nu6_2.or(nu6_1);
         let nu6_3 = nu6_3.or(nu6_2);
-        // The wallet builds against hardcoded parameters, so Regtest takes the featurenet upgrade
-        // at the height they name, unless the heights configured around it leave it no room.
-        let featurenet_upgrade_1 = featurenet_upgrade_1.or(
-            Some(zcash_protocol::consensus::TESTNET_FEATURENET_UPGRADE_1_HEIGHT)
-                .filter(|&h| nu6_3.is_some_and(|n| n < h) && nu7.map_or(true, |n| n > h)),
-        );
 
         Self {
             before_overwinter,
@@ -449,6 +443,21 @@ impl ConfiguredActivationHeights {
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
         }
+        .with_default_featurenet_upgrade()
+    }
+
+    /// Schedules the featurenet upgrade at the height the wallet's hardcoded parameters name,
+    /// unless these heights name one already or leave it no room.
+    ///
+    /// A config file written before the upgrade existed lists every height but this one, and
+    /// without the default its node would never activate the upgrade.
+    pub fn with_default_featurenet_upgrade(mut self) -> Self {
+        let Self { nu6_3, nu7, .. } = self;
+        self.featurenet_upgrade_1 = self.featurenet_upgrade_1.or(
+            Some(zcash_protocol::consensus::TESTNET_FEATURENET_UPGRADE_1_HEIGHT)
+                .filter(|&h| nu6_3.is_some_and(|n| n < h) && nu7.map_or(true, |n| n > h)),
+        );
+        self
     }
 }
 
