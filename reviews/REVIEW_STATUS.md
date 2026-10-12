@@ -1,12 +1,13 @@
-# Code review status: 26 reported findings and 15 test-format leads
+# Code review status: 28 reported findings and 15 test-format leads
 
-Tracking table. One row per finding. Five sources feed it:
+Tracking table. One row per finding. Six sources feed it:
 
 - **Consensus review** (`C` rows): 11 reports in `crosslink-e99404e3de7cc-review/`, validated at `dev` @ `e99404e3de7cc`.
 - **GUI review** (`G` rows): 10 reports in `crosslink-d00b6a44ef594-gui-review/`, validated at `dev` @ `d00b6a44ef594`.
 - **Sync follow-up** (`S` row): 1 report in `crosslink-e56e35f85a98f-sync-review/`, a lead raised while re-checking commit `e56e35f8` and validated at `dev` @ `e56e35f85a98f`.
 - **Test-format review** (`F` and `T` rows): 15 leads on `test_format.rs` and `zebrad/tests/crosslink.rs`, raised at `dev` @ `8ea4db1f`. They have no report files and no severity. The two sessions that own that code checked them and disputed none; see the section below.
 - **Tenderlink certificate review** (`K` rows): 4 reports in `tenderlink-6705b3ca5e234-certificate-review/`, from an adversarial review of a change to `tenderlink/src/lib.rs` before it was committed, on top of `dev` @ `6705b3ca5e234`. The change landed as `5a6577e2`.
+- **Tenderlink second review** (`K5`, `K6`): 2 reports in `tenderlink-5a6577e2726e5-review/`, from a second, read-only review of the same two commits, validated at `dev` @ `5a6577e2726e5`.
 
 Status is assessed against `dev` @ `e56e35f85` on 2026-10-01, except the `K` rows, which are assessed against `5a6577e2` on 2026-10-12. Every assessment outside the `K` rows is from reading code, and nothing was built or run for those reviews or for this table. The `K` findings were each confirmed by running a scenario against the engine. Narrative, quotes and fix plans are in the report files. The structure every report follows, and the row formats used below, are in [`SECURITY-ISSUE-TEMPLATE.md`](SECURITY-ISSUE-TEMPLATE.md).
 
@@ -91,6 +92,15 @@ Raised by an adversarial review subagent on 2026-10-12, against the change that 
 | K4 | [Faulty flag on correct bytes before the certificate is never cleared](tenderlink-6705b3ca5e234-certificate-review/medium/a-faulty-flag-set-on-correct-bytes-before-the-certificate-is-never-cleared-because-the-real-chunks-return-at-the-repeat-check-so-the-node-never-decides.md) | medium | adversary | launch | CLEAR | unit | tenderlink | Real chunks, then a conflicting chunk, then the certificate: the node holds the right bytes and never decides. Same outcome before `6705b3ca`, so not a regression. Deliberately not fixed yet |
 | K3 | [Third value vote hides a line 28 certificate](tenderlink-6705b3ca5e234-certificate-review/low/a-third-value-vote-replaces-the-second-in-the-other-slot-so-a-triple-signer-can-hide-a-line-28-prevote-certificate.md) | low | adversary | any | CLEAR | unit | tenderlink | Needs a finalizer signing three prevotes in a round; intermittent. Before `6705b3ca` the second value was refused outright, which was worse |
 
+## Tenderlink second review (2)
+
+Raised by a second, independent review subagent on 2026-10-12, validated at `dev` @ `5a6577e2726e5`. Both findings are in code that predates the two tenderlink commits. This review was read only: nothing was built or run for it, and it was cut short, so its README says which of its questions went unanswered. A later run of a four-engine network with real timers, not written up as a report, found no finding of its own to add here. The Fires column uses the consensus values.
+
+| # | Finding | Sev | Fires | Gate | Status | Test | Owner | Notes |
+|-|-|-|-|-|-|-|-|-|
+| K5 | [Vote packet indexes past the 18-slot array](tenderlink-5a6577e2726e5-review/high/a-crafted-vote-packet-indexes-past-the-18-slot-array-so-any-connected-peer-aborts-a-finalizer-node.md) | high | adversary | any | CLEAR | unit | tenderlink | Any connected peer aborts the release node with one vote packet whose vote count exceeds 18; predates the two commits, not a regression. Confirmed by a standalone repro in both profiles |
+| K6 | [2f+1 quorum below two thirds when stake is not 3f+1](tenderlink-5a6577e2726e5-review/high/the-2f-plus-1-threshold-is-below-two-thirds-when-total-stake-is-not-3f-plus-1-so-f-equivocators-can-certify-two-values.md) | high | adversary | any | DECIDE | unit | tenderlink | With a roster whose stake is not 3f+1 (e.g. 12 equal finalizers), f equivocators certify two values and fork the height; predates the commits; the new adopt path and its comment rest on the false single-value premise. Confirmed by standalone arithmetic |
+
 ## Test-format review (15 leads)
 
 Raised by `/code-review xhigh` on 2026-10-01 against the binary test format and its scenario tests. These rows have no report file, so the Notes column carries the whole lead. `F` rows are about the format and harness in `zebra-crosslink/zebra-crosslink/src/test_format.rs`; `T` rows are about the scenarios in `zebra-crosslink/zebrad/tests/crosslink.rs`.
@@ -123,20 +133,20 @@ Status of these 15: **6 FIXED**, **2 PARTIAL**, **1 DECIDE**, **6 CLEAR**. Line 
 
 ## Roll-up
 
-The tables in this section count the 26 reported findings. The test-format leads are counted above.
+The tables in this section count the 28 reported findings. The test-format leads are counted above.
 
 | Status | High | Medium | Low | Total |
 |-|-|-|-|-|
 | FIXED | 0 | 2 | 0 | **2** |
 | PARTIAL | 0 | 0 | 0 | 0 |
-| CLEAR (obvious fix, pending) | 2 | 7 | 10 | **19** |
-| DECIDE | 3 | 1 | 0 | **4** |
+| CLEAR (obvious fix, pending) | 3 | 7 | 10 | **20** |
+| DECIDE | 4 | 1 | 0 | **5** |
 | MEASURE | 0 | 0 | 1 | 1 |
-| total | 5 | 10 | 11 | **26** |
+| total | 7 | 10 | 11 | **28** |
 
-By trigger, consensus rows: **6 honest**, **4 adversary**, **1 config**. All 10 GUI rows fire in ordinary use. The sync row needs a dishonest peer. The 4 tenderlink rows need a dishonest proposer or finalizer.
+By trigger, consensus rows: **6 honest**, **4 adversary**, **1 config**. All 10 GUI rows fire in ordinary use. The sync row needs a dishonest peer. The 6 tenderlink rows need a dishonest proposer, finalizer or peer.
 
-By gate: **3 fork** (C2, C7, C11), **11 launch** (C1, C3, C4, C6, C10, G1, G2, G3, K1, K2, K4), **12 any**.
+By gate: **3 fork** (C2, C7, C11), **11 launch** (C1, C3, C4, C6, C10, G1, G2, G3, K1, K2, K4), **14 any**.
 
 By test route, what CI would actually catch on a bad push:
 
@@ -145,12 +155,12 @@ By test route, what CI would actually catch on a bad push:
 | `test-format`, `dilated` | 0 | n/a |
 | `cargo` (K1, K2) | 2 | not confirmed: `cargo test` in `tenderlink/` is not known to run in CI |
 | **covered subtotal** | **2** | |
-| `unit` (easy, unwritten) | 13 | no |
+| `unit` (easy, unwritten) | 15 | no |
 | `intg` (easy, unwritten) | 7 | no |
 | `hard` | 3 | no |
 | `none` | 1 | never |
 
-**2 of 26 are covered by a test, and none by something confirmed to run automatically.** 20 of the rest have a cheap route.
+**2 of 28 are covered by a test, and none by something confirmed to run automatically.** 22 of the rest have a cheap route.
 
 ## What the table makes obvious
 
@@ -295,6 +305,12 @@ Recommendation numbers are the ones each report uses. Alternatives and rollout i
 | K4.3 | Add a test: real chunks, a conflicting chunk, three precommits, real chunks again; assert the height advances | OPEN | The reviewer's scratch scenario exists outside the repo and only prints |
 | K3.1 | Do not let a newer other-value prevote displace one that completes a 2f+1, or latch the certificate per round | OPEN | Not started |
 | K3.3 | Add a `line28_*` test with one finalizer signing three prevotes | OPEN | The reviewer's scratch scenario exists outside the repo and only prints |
+| K5.1 | Reject a vote packet whose `no_votes_n + yes_votes_n` exceeds the 18-slot array before the read loop, widening to `usize` there and in the receive loop | OPEN | Not started |
+| K5.2 | Build the signing round with `round \| 0x8000_0000`, not `round + 0x8000_0000`, to remove the overflow-checks-only panic | OPEN | Not started |
+| K5.4 | Add a unit test: `read_from` with 10+10 and 255+255 vote counts returns `None` rather than panicking | OPEN | Standalone repro exists under the review scratch directory |
+| K6.1 | Replace `2f+1` with a strict `floor(2n/3)+1` quorum in `big_threshold`, `bft_update`, `has_prevote_certificate`, and `proposal_is_certified` | OPEN | Not started |
+| K6.2 | Correct or delete the `adopt_if_certified` single-value comment | OPEN | Not started |
+| K6.4 | Add tests: `big_threshold(n) > 2n/3` for a range of `n`; a 5-finalizer engine test that at most one value is certified under one equivocator | OPEN | Standalone arithmetic check exists under the review scratch directory |
 
 ---
 
