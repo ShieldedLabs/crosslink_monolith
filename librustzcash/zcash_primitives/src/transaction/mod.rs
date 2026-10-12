@@ -1637,6 +1637,17 @@ pub enum StakingAction {
     },
 }
 
+/// Whether `n` is 1, 10, 100, and so on. Zero is not.
+pub const fn is_power_of_10(mut n: u64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    while n % 10 == 0 {
+        n /= 10;
+    }
+    n == 1
+}
+
 impl StakingAction {
     pub fn kind(&self) -> StakingActionKind {
         match self {
@@ -1683,6 +1694,21 @@ impl StakingAction {
             StakingAction::ConvertFinalizerRewardToDelegationBond { this_finalizer, amount_zats, bond_salt, .. } =>
                 Some((*this_finalizer, *amount_zats, *bond_salt)),
             _ => None,
+        }
+    }
+
+    /// Whether this action's amount is allowed in a block at `height`.
+    ///
+    /// From the rule's activation height on, an action that mints a bond (Create or Convert)
+    /// must carry a power of 10 zats. A withdrawal is exempt: it must equal the bond's
+    /// balance, which rewards have grown past the amount it was created with.
+    pub fn amount_is_valid_at(&self, height: u32) -> bool {
+        if height < crate::SEASON_2_UPGRADE_BLOCK_HEIGHT_1 {
+            return true;
+        }
+        match self.bond_terms() {
+            Some((_, amount_zats, _)) => is_power_of_10(amount_zats),
+            None => true,
         }
     }
 
