@@ -117,6 +117,17 @@ impl InBlockBonds {
 
         match staking_action.kind() {
             StakingActionKind::CreateNewDelegationBond => {
+                // From the season 2 upgrade, a new bond's amount must be a power of 10 zats.
+                if height.0 >= zcash_primitives::SEASON_2_UPGRADE_BLOCK_HEIGHT_1
+                    && !zcash_primitives::is_power_of_10_zats(staking_action.amount_zats())
+                {
+                    return Err(ValidateContextError::InvalidDelegationBond(format!(
+                        "new delegation bond amount {} zats is not a power of 10: {:?}",
+                        staking_action.amount_zats(),
+                        bond_key
+                    )));
+                }
+
                 // Check that bond doesn't already exist
                 validate_create_new_bond(
                     bond_key,

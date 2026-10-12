@@ -4925,6 +4925,15 @@ mod staking_signature {
 
         assert!(check(CreateNewDelegationBond, 500, None, ready).is_ok());
         assert!(check(CreateNewDelegationBond, 500, bond(0), ready).is_err());
+        // From the season 2 upgrade a new bond must be a power of 10 zats; before it, any amount.
+        let season_2 = Height(zcash_primitives::SEASON_2_UPGRADE_BLOCK_HEIGHT_1);
+        let before_season_2 = Height(zcash_primitives::SEASON_2_UPGRADE_BLOCK_HEIGHT_1 - 1);
+        assert!(check(CreateNewDelegationBond, 500, None, before_season_2).is_ok());
+        assert!(check(CreateNewDelegationBond, 500, None, season_2).is_err());
+        assert!(check(CreateNewDelegationBond, 0, None, season_2).is_err());
+        for amount in [1, 10, 1_000, 10_000_000, 100_000_000, 10_000_000_000_000_000_000] {
+            assert!(check(CreateNewDelegationBond, amount, None, season_2).is_ok(), "{amount}");
+        }
 
         assert!(check(BeginDelegationUnbonding, 0, None, ready).is_err());
         assert!(check(BeginDelegationUnbonding, 0, bond(0), ready).is_ok());

@@ -33,3 +33,9 @@ pub mod transaction;
 
 /// Block height of the first Season 2 upgrade.
 pub const SEASON_2_UPGRADE_BLOCK_HEIGHT_1: u32 = 45000;
+
+/// Whether `zats` is a power of 10 (1, 10, 100, ...). From
+/// [`SEASON_2_UPGRADE_BLOCK_HEIGHT_1`] a newly created delegation bond must have such an amount.
+pub fn is_power_of_10_zats(zats: u64) -> bool {
+    (0..=19u32).any(|exp| 10u64.pow(exp) == zats)
+}
