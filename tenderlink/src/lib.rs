@@ -355,10 +355,10 @@ pub struct TMMsg {
 #[derive(Clone, Copy, PartialEq)]
 pub struct ConsensusCounts {
     pub anys: u64,
-    pub prevotes: u64,
+    pub prevotes: u64, // nil_prevotes + yes_prevotes + prevotes for a different value
     pub nil_prevotes: u64,
     pub yes_prevotes: u64,
-    pub precommits: u64,
+    pub precommits: u64, // nil_precommits + yes_precommits + precommits for a different value
     pub yes_precommits: u64,
 }
 impl ConsensusCounts {
@@ -397,9 +397,10 @@ impl std::ops::Sub for ConsensusCounts {
         }
     }
 }
-impl From<&([(ValueId, TMSig); 2], [TMSig; 2], u64)> for ConsensusCounts {
-    fn from(val: &([(ValueId, TMSig); 2], [TMSig; 2], u64)) -> ConsensusCounts {
-        let (val, nil, stake) = val;
+// One finalizer's contribution: its value votes, its nil votes, its stake, and the round's proposal.
+impl From<&([(ValueId, TMSig); 2], [TMSig; 2], u64, ValueId)> for ConsensusCounts {
+    fn from(val: &([(ValueId, TMSig); 2], [TMSig; 2], u64, ValueId)) -> ConsensusCounts {
+        let (val, nil, stake, proposal_id) = val;
         let has_sigs     = [(val[0].1 != TMSig::NIL) as usize, (val[1].1 != TMSig::NIL) as usize];
         let has_nil_sigs = [(nil[0]   != TMSig::NIL) as usize, (nil[1]   != TMSig::NIL) as usize];
         let has_any_sigs = has_sigs[0] | has_sigs[1] | has_nil_sigs[0] | has_nil_sigs[1]; // TODO: confirm prevote + precommit from the same person counts as 1
@@ -407,9 +408,17 @@ impl From<&([(ValueId, TMSig); 2], [TMSig; 2], u64)> for ConsensusCounts {
         // A dual voter (NIL + value in the same step) counts once toward the any-vote
         // totals but toward both the nil and yes tallies, so nv+yv can exceed v; every
         // condition consumes each count independently, so the overlap is harmless.
+        //
+        // A vote for a value other than the round's proposal is a vote all the same: it counts toward
+        // the any-vote totals, which is what lines 34, 47 and 55 wait on, and toward neither tally.
+        // When the proposer signs two values the finalizers can split over them, and a node that
+        // counted only its own side would never see 2f+1 votes and never time the step out. Until
+        // the proposal is known every value vote is taken to be for it; the tally is redone when the
+        // proposal arrives.
+        let is_for_proposal = |value_id: ValueId| (*proposal_id == ValueId::NIL || value_id == *proposal_id) as usize;
         let mut status = [[0,0], [0,0]];
-        status[0][(val[0].0 != ValueId::NIL) as usize] = has_sigs[0];
-        status[1][(val[1].0 != ValueId::NIL) as usize] = has_sigs[1];
+        status[0][1] = has_sigs[0] & is_for_proposal(val[0].0);
+        status[1][1] = has_sigs[1] & is_for_proposal(val[1].0);
         status[0][0] |= has_nil_sigs[0];
         status[1][0] |= has_nil_sigs[1];
 
@@ -908,27 +917,13 @@ impl TMState {
                     if round_data.proposal_id == ValueId::NIL { // first time we've seen any proposal chunks
                         round_data.proposal_id = value_id;
 
-                        let mut prev_sig_had_fault = false;
-                        // check whether speculative adds to round data were for the actual proposal
-                        for roster_i in 0..round_data.msg_val_sigs.len() {
-                            let msg_val: &mut [(ValueId, TMSig); 2] = &mut round_data.msg_val_sigs[roster_i];
-                            for is_precommit in 0..2 {
-                                if msg_val[is_precommit].0 != ValueId::NIL && msg_val[is_precommit].0 != value_id {
-                                    prev_sig_had_fault = true;
-                                    eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}: finalizer {} {} on non-proposed value {}. Ignoring...", height, round, roster_i, ["prevoted","precommitted"][is_precommit], value_id);
-                                    msg_val[is_precommit] = (ValueId::NIL, TMSig::NIL);
-                                }
-                            }
+                        // Votes that arrived before the proposal were all tallied as for it. Some may be
+                        // for another value; they stay, and stop counting as yes votes.
+                        let mut check_counts = ConsensusCounts::ZERO;
+                        for (roster_i, sig) in round_data.msg_val_sigs.iter().enumerate() {
+                            check_counts = check_counts + ConsensusCounts::from(&(*sig, round_data.msg_nil_sigs[roster_i], roster[roster_i].stake, value_id));
                         }
-
-                        if prev_sig_had_fault { // recompute from scratch
-                            // NOTE: this does NOT imply the current packet/proposal is faulty, so we should continue with it
-                            let mut check_counts = ConsensusCounts::ZERO;
-                            for (roster_i, sig) in round_data.msg_val_sigs.iter().enumerate() {
-                                check_counts = check_counts + ConsensusCounts::from(&(*sig, round_data.msg_nil_sigs[roster_i], roster[roster_i].stake));
-                            }
-                            round_data.counts = check_counts;
-                        }
+                        round_data.counts = check_counts;
                     }
 
                     if round_data.proposal_sigs_n == round_data.proposal_sigs.len() {
@@ -971,10 +966,8 @@ impl TMState {
                 } else if round_data.proposal_sigs_n == 0 {
                     // if we don't have a real proposal yet we can't check for validity
                     TMStatus::Indeterminate
-                } else if round_data.proposal_id != value_id {
-                    eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}: finalizer {} voted on non-proposed value {}. Ignoring...", height, round, roster_i, value_id);
-                    return TMStatus::Fail;
                 } else {
+                    // Including a vote for a value other than the proposal we hold: see ConsensusCounts.
                     TMStatus::Pass
                 };
 
@@ -989,23 +982,31 @@ impl TMState {
                 } else {
                     let old_val_sig = round_data.msg_val_sigs[roster_i][is_precommit];
                     if old_val_sig.1 != TMSig::NIL {
-                        if old_val_sig.0 != value_id {
+                        if old_val_sig.0 == value_id {
+                            return TMStatus::Pass; // already have it
+                        }
+                        // The slot holds one value vote. A vote for the proposal we hold takes it from a
+                        // vote for any other value: otherwise whichever of a finalizer's two votes arrived
+                        // first would decide whether this node can ever count it toward the proposal, and
+                        // nodes that heard them in different orders would disagree on a 2f+1 for good.
+                        let is_for_held_proposal = round_data.proposal_id != ValueId::NIL && value_id == round_data.proposal_id;
+                        if !is_for_held_proposal {
                             eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}: finalizer {} voted on 2 different values ({:?}, {:?}). Ignoring latest...", height, round, roster_i, (value_id, sig), old_val_sig);
                             return TMStatus::Fail;
                         }
-                        return TMStatus::Pass; // already have it
+                        eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}: finalizer {} voted on 2 different values ({:?}, {:?}). Keeping the one for the proposal...", height, round, roster_i, (value_id, sig), old_val_sig);
                     }
                 }
                 // Checks now finished //////////////////////////
 
                 // Add the signature to the list & update counts
-                let old_cs = ConsensusCounts::from(&(round_data.msg_val_sigs[roster_i], round_data.msg_nil_sigs[roster_i], roster[roster_i].stake));
+                let old_cs = ConsensusCounts::from(&(round_data.msg_val_sigs[roster_i], round_data.msg_nil_sigs[roster_i], roster[roster_i].stake, round_data.proposal_id));
                 if value_id == ValueId::NIL {
                     round_data.msg_nil_sigs[roster_i][is_precommit] = sig;
                 } else {
                     round_data.msg_val_sigs[roster_i][is_precommit] = (value_id, sig);
                 }
-                let new_cs = ConsensusCounts::from(&(round_data.msg_val_sigs[roster_i], round_data.msg_nil_sigs[roster_i], roster[roster_i].stake));
+                let new_cs = ConsensusCounts::from(&(round_data.msg_val_sigs[roster_i], round_data.msg_nil_sigs[roster_i], roster[roster_i].stake, round_data.proposal_id));
                 let d = new_cs - old_cs; // add 1 to counts that have been updated by this message
                 round_data.counts = round_data.counts + d;
 
@@ -1023,7 +1024,7 @@ impl TMState {
                 {
                     let mut check_counts = ConsensusCounts::ZERO;
                     for (i, sig) in round_data.msg_val_sigs.iter().enumerate() {
-                        check_counts = check_counts + ConsensusCounts::from(&(*sig, round_data.msg_nil_sigs[i], roster[i].stake));
+                        check_counts = check_counts + ConsensusCounts::from(&(*sig, round_data.msg_nil_sigs[i], roster[i].stake, round_data.proposal_id));
                     }
                     if check_counts != round_data.counts {
                         eprintln!("{ctx_str} {ANSI_RED}BFT ERROR{ANSI_RST}: counts don't match: incremental: {:?}, absolute: {:?}", round_data.counts, check_counts);
@@ -1931,7 +1932,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                     packet.value_id = value_id;
                                 }
                                 if value_id != ValueId::NIL && value_id != packet.value_id {
-                                    eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST}: local mismatch: {:?} vs {:?}", packet.value_id, value_id);
+                                    // A vote for a value other than the proposal we hold. We count it but do
+                                    // not pass it on: a packet carries one value. Its signer sends it itself.
                                     continue;
                                 }
 
@@ -2184,10 +2186,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         let big_threshold = if f == 0 { total_active_stake } else { 2*f + 1 };
                         for rd in bft_state.rounds_data.iter().filter(|r| r.height == bft_state.height && r.counts.yes_precommits > 0) {
                             // Per-member vote fill, one char per active roster index:
-                            // C yes-precommit (counts toward yc), n nil-precommit, p prevote only, . silent.
+                            // C yes-precommit (counts toward yc), o precommit for another value, n nil-precommit,
+                            // p prevote only, . silent.
                             let n = active_roster_len(&rd.roster).min(rd.msg_val_sigs.len());
                             let fill: String = (0..n).map(|i| {
-                                if      rd.msg_val_sigs[i][1].1 != TMSig::NIL { 'C' }
+                                if      rd.msg_val_sigs[i][1].1 != TMSig::NIL {
+                                    if rd.proposal_id == ValueId::NIL || rd.msg_val_sigs[i][1].0 == rd.proposal_id { 'C' } else { 'o' }
+                                }
                                 else if rd.msg_nil_sigs[i][1]   != TMSig::NIL { 'n' }
                                 else if rd.msg_val_sigs[i][0].1 != TMSig::NIL ||
                                         rd.msg_nil_sigs[i][0]   != TMSig::NIL { 'p' }
@@ -3629,6 +3634,174 @@ mod tests {
         let (step, (_, sig)) = line28_bft_update_prevote(&[1, 2]);
         assert_eq!(step, TMStep::Propose);
         assert_eq!(sig, TMSig::NIL);
+    }
+
+    // A network of four engines with equal stake (f = 1, threshold 3) and no sockets. Each engine is the
+    // real state machine with its own key; `split_gossip` stands in for the send loop by handing one
+    // node everything another holds for round 0 of height 0, which is what peers send each other. A node
+    // that has decided the height serves the round from its cache, as it does to a peer that is behind.
+    fn split_engine(keys: &[SigningKey], roster: &[SortedRosterMember], i: usize, proposes: Option<BlockValue>) -> TMState {
+        let decided_roster = roster.to_vec();
+        TMState::init(
+            keys[i].clone(), roster[i].pub_key, 0,
+            ClosureToProposeNewBlock(Arc::new(move || { let value = proposes.clone(); Box::pin(async move { value }) })),
+            ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
+            ClosureToPushDecidedBlock(Arc::new(move |_, _, _| { let roster = decided_roster.clone(); Box::pin(async move { (roster, [0; 32]) }) })),
+            ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
+            ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
+        )
+    }
+
+    // Keys and roster of the four finalizers, the round-0 proposer of height 0, and the other three.
+    fn split_finalizers() -> (Vec<SigningKey>, Vec<SortedRosterMember>, usize, [usize; 3]) {
+        let keys: Vec<SigningKey> = (0..4).map(|i| SigningKey::from([i as u8 + 1; 32])).collect();
+        let roster: Vec<SortedRosterMember> = keys.iter().enumerate().map(|(i, k)| SortedRosterMember {
+            pub_key: PubKeyID(VerificationKeyBytes::from(k).into()), stake: 1, cumulative_stake: i as u64 + 1 }).collect();
+        let proposer = TMState::proposer_from_height_round(&HashKeys::default(), &roster, 0, 0).0.unwrap();
+        (keys, roster, proposer, [(proposer + 1) % 4, (proposer + 2) % 4, (proposer + 3) % 4])
+    }
+
+    fn split_gossip(nodes: &mut [TMState], roster: &[SortedRosterMember], from: usize, to: usize) {
+        let is_round = |rd: &&RoundData| (rd.height, rd.round) == (0, 0);
+        let Some(rd) = nodes[from].rounds_data.iter().find(is_round)
+            .or_else(|| nodes[from].recent_commit_round_cache.iter().find(is_round)).cloned() else { return; };
+        let proposer = TMState::proposer_from_height_round(&nodes[from].hash_keys, roster, 0, 0).0.unwrap();
+
+        for chunk_i in 0..rd.proposal_sigs.len() {
+            if rd.proposal_sigs[chunk_i] == TMSig::NIL { continue; }
+            let hdr = PacketProposalChunkHeader {
+                chunk_i: chunk_i as u32, proposal_size: rd.proposal.0.len() as u32, round: 0,
+                valid_round: rd.proposal_valid_round, height: 0, proposal_id: rd.proposal_id,
+            };
+            let mut data = vec![0u8; PacketProposalChunkHeader::SERIALIZED_SIZE];
+            hdr.write_to(&mut data);
+            let (chunk_o, chunk_size) = rd.proposal.chunk_o_size(chunk_i);
+            data.extend_from_slice(&rd.proposal.0[chunk_o..chunk_o + chunk_size]);
+            nodes[to].check_and_incorporate_msg(0, 0, chunk_i, rd.proposal_id, rd.proposal_valid_round, roster, proposer,
+                PACKET_TYPE_PROPOSAL_CHUNK, &data, rd.proposal_sigs[chunk_i]);
+        }
+        for voter in 0..rd.msg_val_sigs.len() {
+            for is_precommit in 0..2 {
+                let (value_id, sig) = rd.msg_val_sigs[voter][is_precommit];
+                let nil_sig         = rd.msg_nil_sigs[voter][is_precommit];
+                for (value_id, sig) in [(value_id, sig), (ValueId::NIL, nil_sig)] {
+                    if sig == TMSig::NIL { continue; }
+                    let data = make_vote_sign_datas(roster[voter].pub_key, is_precommit != 0, 0, 0, value_id)[1];
+                    nodes[to].check_and_incorporate_msg(0, 0, 0, value_id, -2, roster, voter,
+                        PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit as u8, &data, sig);
+                }
+            }
+        }
+    }
+
+    // How the round-0 proposer of height 0 comes to have signed two values, A and B.
+    enum Split {
+        None,
+        // It sends A, which reaches two nodes, then restarts. Nothing of a round is kept across a
+        // restart, so it comes back as a fresh engine with the same key and proposes B, which reaches
+        // the third node first. Two nodes hold A and two hold B.
+        ProposerRestarts,
+    }
+
+    // Runs the network from the start of height 0 and returns, per node, its height, round, step and
+    // whether its round-0 prevote timeout started.
+    //
+    // After the split is set up every node hears everything, many times over. Nothing sleeps and no
+    // clock is advanced. The timers are real, so a node may or may not have timed a step out by the end;
+    // the tests assert only what holds either way.
+    fn split_network(split: Split) -> Vec<(u64, u32, TMStep, bool)> {
+        let (keys, roster, proposer, others) = split_finalizers();
+
+        let value_a = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let value_b = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| (i as u8).wrapping_add(1)).collect());
+
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut rosters: Vec<Vec<SortedRosterMember>> = vec![roster.clone(); 4];
+        let mut nodes: Vec<TMState> = (0..4).map(|i| {
+            let mut node = split_engine(&keys, &roster, i, if i == proposer { Some(value_a.clone()) } else { None });
+            rt.block_on(node.start_round(&roster, Instant::now(), 0));
+            node
+        }).collect();
+
+        match split {
+            Split::None => {}
+            Split::ProposerRestarts => {
+                split_gossip(&mut nodes, &roster, proposer, others[0]);
+                split_gossip(&mut nodes, &roster, proposer, others[1]);
+                nodes[proposer] = split_engine(&keys, &roster, proposer, Some(value_b.clone()));
+                rt.block_on(nodes[proposer].start_round(&roster, Instant::now(), 0));
+                split_gossip(&mut nodes, &roster, proposer, others[2]);
+            }
+        }
+
+        for _ in 0..16 {
+            for i in 0..4 { rt.block_on(nodes[i].bft_update(&mut rosters[i])); }
+            for from in 0..4 { for to in 0..4 { if from != to { split_gossip(&mut nodes, &roster, from, to); } } }
+        }
+
+        nodes.iter().map(|node| {
+            let prevote_timeout_started = node.rounds_data.iter()
+                .find(|rd| (rd.height, rd.round) == (0, 0)).is_some_and(|rd| rd.timeout_triggered[0]);
+            (node.height, node.round, node.step, prevote_timeout_started)
+        }).collect()
+    }
+
+    #[test]
+    fn split_network_with_one_proposal_decides() {
+        for (i, (height, ..)) in split_network(Split::None).into_iter().enumerate() {
+            assert_eq!(height, 1, "node {i} did not decide height 0");
+        }
+    }
+
+    // Line 34 is "2f+1 PREVOTE for anything". A node that drops prevotes for a value it did not accept
+    // never counts that many when the finalizers split two and two over two values from one proposer.
+    // With no prevote timeout nothing moves a node out of the prevote step, so the height never ends.
+    #[test]
+    fn line34_two_and_two_over_a_restarted_proposers_values_starts_the_prevote_timeout() {
+        let nodes = split_network(Split::ProposerRestarts);
+        for (i, &(height, round, step, prevote_timeout_started)) in nodes.iter().enumerate() {
+            assert!(height > 0 || round > 0 || prevote_timeout_started,
+                "node {i} is at height {height} round {round} in {step:?} with no prevote timeout, so nothing will move it; all nodes: {nodes:?}");
+        }
+    }
+
+    // A finalizer can sign two prevotes in a round, by restarting or on purpose. A node holding the
+    // proposal counts that finalizer for it in whatever order the two arrive, and whether or not the
+    // first came before the proposal: nodes that heard them in different orders must agree on a 2f+1,
+    // or one locks a value the others can never prevote.
+    #[test]
+    fn line36_vote_for_the_held_proposal_counts_whatever_else_its_signer_voted() {
+        let (keys, roster, proposer, others) = split_finalizers();
+        let (me, with_me, twice) = (others[2], others[1], others[0]);
+        let value = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let other_id = ValueId([9; 32]);
+
+        for (other_first, other_before_proposal) in [(false, false), (true, false), (true, true)] {
+            let mut node = split_engine(&keys, &roster, me, None);
+            node.insert_round(0, 0, &roster);
+            let id = value.id_from_value(&node.hash_keys);
+            let prevote = |node: &mut TMState, i: usize, value_id: ValueId| {
+                let data = make_vote_sign_datas(roster[i].pub_key, false, 0, 0, value_id)[1];
+                let sig = TMSig(sign_with_namespace(&keys[i], &data, &node.vote_namespace));
+                node.check_and_incorporate_msg(0, 0, 0, value_id, -2, &roster, i, PACKET_TYPE_PREVOTE_SIGNATURES, &data, sig);
+            };
+
+            if other_first && other_before_proposal { prevote(&mut node, twice, other_id); }
+            for chunk_i in 0..value.chunks_n() {
+                let (data, sig) = chunk_msg(&keys[proposer], &node.vote_namespace, &value, id, 0, -1, chunk_i);
+                node.check_and_incorporate_msg(0, 0, chunk_i, id, -1, &roster, proposer, PACKET_TYPE_PROPOSAL_CHUNK, &data, sig);
+            }
+            if other_first && !other_before_proposal { prevote(&mut node, twice, other_id); }
+            prevote(&mut node, twice, id);
+            if !other_first { prevote(&mut node, twice, other_id); }
+            prevote(&mut node, with_me, id);
+            tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(node.bft_update(&mut roster.clone()));
+
+            let rd = &node.rounds_data[0];
+            let case = format!("other vote first: {other_first}, before the proposal: {other_before_proposal}");
+            assert_eq!(rd.msg_val_sigs[twice][0].0, id, "{case}");
+            assert_eq!((rd.counts.yes_prevotes, rd.counts.prevotes), (3, 3), "{case}");
+        }
     }
 
     // #[ignore]
