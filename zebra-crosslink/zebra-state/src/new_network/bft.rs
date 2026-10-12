@@ -1693,7 +1693,7 @@ fn recency_status_from(bft_state: &TMState, bft_key_address_map: &BftAddressMap)
             };
 
             // Simple (not weighted) counts.
-            let cs = ConsensusCounts::from(&(round.msg_val_sigs[roster_i], round.msg_nil_sigs[roster_i], 1));
+            let cs = ConsensusCounts::from(&(round.msg_val_sigs[roster_i], round.msg_nil_sigs[roster_i], 1, round.proposal_id));
             if cs.anys > 0 && is_my_height {
                 st.1.no_yes_votes_in_my_height[0][0] += cs.nil_prevotes;
                 st.1.no_yes_votes_in_my_height[0][1] += cs.yes_prevotes;
