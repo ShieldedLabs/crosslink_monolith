@@ -3386,10 +3386,8 @@ pub fn run_instances(i: usize) {
     rt.block_on(std::future::pending::<()>())
 }
 
-pub mod stp;
 pub mod p2p_test;
-pub mod native_sockets;
-pub mod nym_sockets;
+pub use shielded_transport_pigeon::{stp, native_sockets, nym_sockets};
 pub mod helpers;
 
 use helpers::*;

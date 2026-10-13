@@ -14,6 +14,7 @@ split-debuginfo = "unpacked"  # produce separate .pdb files
 lto = false
 
 [dependencies]
+shielded_transport_pigeon = "0.2.0"
 blake3 = "1.8.2"
 byteorder = "1.5.0"
 ed25519-zebra = "4.1.0"
@@ -34,8 +35,8 @@ zebra-debug-time = { path = "../zebra-crosslink/zebra-debug-time" }
 chrono = { version = "0.4.40", default-features = false, features = ["clock"] }
 
 [dependencies.snow]
-git = "https://github.com/ShieldedLabs/snow.git"
-rev = "54369eb3829d6563ef7e5d5f17c09b08a77bca6e"
+package = "shielded_labs_snow"
+version = "0.10.0"
 default-features = false
 features = [
     "use-curve25519",
