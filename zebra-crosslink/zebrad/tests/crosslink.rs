@@ -1354,10 +1354,16 @@ impl BlockGen {
 
     /// The total fee `txs` pay, which the block's coinbase must include (NU6 onward requires its
     /// outputs to equal the subsidy plus the fees exactly). A transaction whose value doesn't
-    /// balance contributes nothing: tests build such transactions to check they are rejected.
+    /// balance contributes nothing: tests build such transactions to check they are rejected. So
+    /// does one that spends an output this generator does not hold, an output already spent for
+    /// one: `value_balance` panics on a missing output, it does not return an error.
     fn fees(&self, txs: &[Arc<Transaction>]) -> zebra_chain::amount::Amount<zebra_chain::amount::NonNegative> {
         let mut total = zebra_chain::amount::Amount::zero();
         for tx in txs {
+            let spends_an_unheld_output = tx.inputs().iter()
+                .filter_map(|input| input.outpoint())
+                .any(|outpoint| !self.utxos.contains_key(&outpoint));
+            if spends_an_unheld_output { continue; }
             let Ok(value_balance) = tx.value_balance(&self.utxos) else { continue };
             let Ok(fee) = value_balance.remaining_transaction_value() else { continue };
             total = (total + fee).expect("test fees fit in an amount");
