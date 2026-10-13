@@ -1670,6 +1670,188 @@ fn forged_signature(spend: &Transaction) -> Transaction {
     tx
 }
 
+/// Loads blocks mined to `key` until `count` of its coinbase outputs are spendable by the next
+/// block, and returns those, oldest first.
+fn matured_coinbases(
+    tf: &mut TF,
+    gen: &mut BlockGen,
+    key: &TestKey,
+    count: usize,
+) -> Vec<(zebra_chain::transparent::OutPoint, zebra_chain::transparent::Output)> {
+    let miner = key.address();
+    let lock_script = key.lock_script();
+    loop {
+        let next_height = gen.tip.coinbase_height().expect("generated blocks have a height").0 + 1;
+        let mut matured: Vec<_> = gen
+            .utxos
+            .iter()
+            .filter(|(_, utxo)| {
+                utxo.from_coinbase
+                    && utxo.output.lock_script == lock_script
+                    && next_height >= utxo.height.0 + zebra_chain::transparent::MIN_TRANSPARENT_COINBASE_MATURITY
+            })
+            .map(|(outpoint, utxo)| (utxo.height, *outpoint, utxo.output.clone()))
+            .collect();
+        if matured.len() >= count {
+            matured.sort_by_key(|(height, outpoint, _)| (*height, outpoint.hash.0, outpoint.index));
+            return matured.into_iter().take(count).map(|(_, outpoint, output)| (outpoint, output)).collect();
+        }
+        tf.push_instr_load_pow(&gen.next_block(&miner), 0);
+    }
+}
+
+/// The mempool verified a transaction while its input was unspent; then a block spends that
+/// input with a different transaction. The verdict the mempool reached is stale, and nothing may
+/// keep acting on it: the transaction leaves the mempool, a block carrying it is refused, it
+/// cannot be submitted again, and the node's next template leaves it out.
+#[test]
+fn crosslink_mempool_verdict_goes_stale_when_a_block_spends_the_input() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+
+    let network = regtest_network(&HARNESS_PARAMETERS);
+    let key = TestKey::new(b"crosslink test miner");
+    let miner = key.address();
+    let other_key = TestKey::new(b"another key");
+    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    let input = matured_coinbases(&mut tf, &mut gen, &key, 1).remove(0);
+
+    let in_mempool = transparent_spend(&key, input.clone());
+    let fee = mempool_fee(&in_mempool);
+    let conflicting = signed_tx(
+        Some(&key),
+        &[input.clone()],
+        vec![zebra_chain::transparent::Output::new((input.1.value - fee).expect("the input covers the fee"), other_key.lock_script())],
+        None,
+        0,
+    );
+    assert_ne!(in_mempool.hash(), conflicting.hash());
+
+    tf.push_instr_submit_tx(&in_mempool, 0);
+    tf.push_instr_expect_mempool_contains(&in_mempool, 0);
+
+    let spent_utxo = gen.utxos[&input.0].clone();
+    let spends_it_first = gen.next_block_with_txs(&miner, &[conflicting.clone()]);
+    tf.push_instr_load_pow(&spends_it_first, 0);
+    tf.push_instr_expect_pow_tip(&spends_it_first.hash(), 0);
+    tf.push_instr_expect_mempool_absent(&in_mempool, 0);
+
+    // with the input spent, the stale transaction is dead: a block extending the tip with it
+    // double-spends, and the mempool refuses it. The generator building that block is told the
+    // input is unspent, so the block is well-formed (its coinbase claims the fee) and wrong
+    // only in spending it twice.
+    let mut double_spend_gen = gen.clone();
+    double_spend_gen.utxos.insert(input.0, spent_utxo);
+    let double_spend = double_spend_gen.next_block_with_txs(&miner, &[in_mempool.clone()]);
+    // The node does not commit it, which the tip check below pins. But its verdict today is
+    // "already known", not a rejection: new_network takes any commit error whose text contains
+    // "Duplicate" for a duplicate block, and the state's double-spend errors are named
+    // DuplicateTransparentSpend and Duplicate*Nullifier. When that is fixed this load is refused:
+    // make it SHOULD_FAIL and add the reason.
+    tf.push_instr_load_pow(&double_spend, 0);
+    tf.push_instr_expect_pow_tip(&spends_it_first.hash(), 0);
+    tf.push_instr_expect_pow_tip(&double_spend.hash(), SHOULD_FAIL);
+    tf.push_instr_submit_tx(&in_mempool, SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("inputs were spent", 0);
+    tf.push_instr_expect_mempool_absent(&in_mempool, 0);
+
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// A transaction mined on a branch that then loses a reorg is unmined again. The mempool filed
+/// it as mined when its block arrived; that record must not outlive the block. It can be
+/// submitted again, and the node's own template mines it.
+#[test]
+fn crosslink_tx_mined_on_a_losing_branch_can_be_mined_again() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+
+    let network = regtest_network(&HARNESS_PARAMETERS);
+    let key = TestKey::new(b"crosslink test miner");
+    let miner = key.address();
+    let other_miner = Address::Transparent(zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]));
+    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    let input = matured_coinbases(&mut tf, &mut gen, &key, 1).remove(0);
+    let spend = transparent_spend(&key, input);
+
+    tf.push_instr_submit_tx(&spend, 0);
+    tf.push_instr_expect_mempool_contains(&spend, 0);
+    let mut winning_gen = gen.clone();
+    let mined_in = gen.next_block_with_txs(&miner, &[spend.clone()]);
+    tf.push_instr_load_pow(&mined_in, 0);
+    tf.push_instr_expect_mempool_absent(&spend, 0);
+    tf.push_instr_expect_mempool_rejected(&spend, SHOULD_FAIL);
+
+    // a longer branch from the same parent, without the transaction
+    tf.push_instr_load_pow(&winning_gen.next_block(&other_miner), 0);
+    let winning_tip = winning_gen.next_block(&other_miner);
+    tf.push_instr_load_pow(&winning_tip, 0);
+    tf.push_instr_expect_pow_tip(&winning_tip.hash(), 0);
+
+    // unmined, so it is wanted again
+    tf.push_instr_submit_tx(&spend, 0);
+    tf.push_instr_expect_mempool_contains(&spend, 0);
+    tf.push_instr_mine_from_template_into(1, 0);
+    tf.push_instr_expect_pow_tip_slot(1, 0);
+    tf.push_instr_expect_mempool_absent(&spend, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// One transaction spends a chain output, an output still in the mempool, and another chain
+/// output, in that order. The outputs it spends must be matched to its inputs by position
+/// whether they come from the chain or the mempool (upstream zebra PR 10356 appended the
+/// mempool ones last, so every signature check ran against the wrong output). It is verified
+/// in the mempool, then again in the block the node's template mines both into.
+#[test]
+fn crosslink_tx_spending_chain_and_mempool_outputs_in_mixed_order() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+
+    let network = regtest_network(&HARNESS_PARAMETERS);
+    let key = TestKey::new(b"crosslink test miner");
+    let miner = key.address();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    let mut coinbases = matured_coinbases(&mut tf, &mut gen, &key, 3);
+    let (second_chain, first_chain, parent_input) = (coinbases.remove(2), coinbases.remove(1), coinbases.remove(0));
+
+    let parent = transparent_spend(&key, parent_input);
+    let from_mempool = (zebra_chain::transparent::OutPoint::from_usize(parent.hash(), 0), parent.outputs()[0].clone());
+    let inputs = [first_chain, from_mempool, second_chain];
+    // the three inputs hold different amounts, so a signature checked against the wrong one fails
+    assert_ne!(inputs[0].1.value, inputs[1].1.value);
+    let total = inputs
+        .iter()
+        .fold(zebra_chain::amount::Amount::<zebra_chain::amount::NonNegative>::zero(), |sum, (_, output)| {
+            (sum + output.value).expect("test amounts fit")
+        });
+    let outputs = |fee: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>| {
+        vec![zebra_chain::transparent::Output::new((total - fee).expect("the inputs cover the fee"), key.lock_script())]
+    };
+    let fee = mempool_fee(&signed_tx(Some(&key), &inputs, outputs(zebra_chain::amount::Amount::zero()), None, 0));
+    let mixed = signed_tx(Some(&key), &inputs, outputs(fee), None, 0);
+
+    tf.push_instr_submit_tx(&parent, 0);
+    tf.push_instr_expect_mempool_contains(&parent, 0);
+    tf.push_instr_submit_tx(&mixed, 0);
+    tf.push_instr_expect_mempool_contains(&mixed, 0);
+
+    tf.push_instr_mine_from_template_into(1, 0);
+    tf.push_instr_expect_pow_tip_slot(1, 0);
+    tf.push_instr_expect_mempool_absent(&parent, 0);
+    tf.push_instr_expect_mempool_absent(&mixed, 0);
+    tf.push_instr_expect_mempool_rejected(&mixed, SHOULD_FAIL);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 /// The instructions no scenario used before: RECV_TX, EXPECT_MEMPOOL_REJECTED (including that a
 /// mined transaction is not "rejected"), EXPECT_POOL_TOTALS, EXPECT_FINALIZER_BANK, and the
 /// load-rejected helper.
