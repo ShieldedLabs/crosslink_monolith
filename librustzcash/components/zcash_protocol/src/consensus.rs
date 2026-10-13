@@ -510,7 +510,7 @@ impl Parameters for MainNetwork {
 /// The Crosslink testnet activation height of [`NetworkUpgrade::FeaturenetUpgrade1`]. The node's
 /// Testnet and Regtest schedules take it from here, so the node and the wallet, which builds
 /// against [`TestNetwork`], cannot disagree on which branch ID a height uses.
-pub const TESTNET_FEATURENET_UPGRADE_1_HEIGHT: u32 = 48_000;
+pub const TESTNET_FEATURENET_UPGRADE_1_HEIGHT: u32 = 55_296;
 
 /// Marker struct for the test network.
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
