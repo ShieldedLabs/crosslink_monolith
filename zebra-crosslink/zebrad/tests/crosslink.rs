@@ -301,6 +301,54 @@ fn test_format_node_config_round_trips_the_network() {
     assert_eq!(crosslink_parameters_for_test(&bytes), HARNESS_PARAMETERS);
 }
 
+/// A test file moves a network upgrade, and the node runs with the moved height.
+/// FeaturenetUpgrade1 activates far beyond any scenario by default; here the file's node config
+/// puts it at height 4. The node shows it took effect at exactly that height: a block there built
+/// for the default schedule, whose coinbase is still the older upgrade's, is refused, and one
+/// built for the moved schedule is accepted, as is the node's own next block.
+#[test]
+fn crosslink_upgrade_height_set_by_the_test_file() {
+    use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
+
+    set_test_name(function_name!());
+    let params = HARNESS_PARAMETERS;
+    let activation = 4;
+    let node_config = node_config_with_activation_heights(ConfiguredActivationHeights {
+        featurenet_upgrade_1: Some(activation),
+        ..Default::default()
+    });
+    let mut tf = TF::new_with_node_config(&params, &node_config);
+
+    let network = test_network(&params, &node_config);
+    let default_schedule = regtest_network(&params);
+    assert_ne!(NetworkUpgrade::current(&network, BlockHeight(activation - 1)), NetworkUpgrade::FeaturenetUpgrade1);
+    assert_eq!(NetworkUpgrade::current(&network, BlockHeight(activation)), NetworkUpgrade::FeaturenetUpgrade1);
+    assert_ne!(NetworkUpgrade::current(&default_schedule, BlockHeight(activation)), NetworkUpgrade::FeaturenetUpgrade1);
+
+    let key = TestKey::new(b"crosslink test miner");
+    let miner = key.address();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    for _ in 2..activation {
+        tf.push_instr_load_pow(&gen.next_block(&miner), 0);
+    }
+
+    // the same chain, continued by a generator that thinks the upgrade is still far off
+    let mut default_gen = gen.clone();
+    default_gen.network = default_schedule;
+    tf.push_instr_load_pow(&default_gen.next_block(&miner), SHOULD_FAIL);
+
+    let first_after = gen.next_block(&miner);
+    tf.push_instr_load_pow(&first_after, 0);
+    tf.push_instr_expect_pow_tip(&first_after.hash(), 0);
+    tf.push_instr_mine_from_template_into(1, 0);
+    tf.push_instr_expect_pow_tip_slot(1, 0);
+    tf.push_instr_expect_pow_chain_length(activation as usize + 2, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 /// Rewrite the checked-in binaries in `crosslink-test-data` from the current block format.
 ///
 /// A tool rather than a test, so it is `#[ignore]`d like `read_from_file` and runs only when
@@ -1915,11 +1963,41 @@ fn crosslink_mempool_and_staking_state_instructions() {
     tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &[bond]), 0);
     tf.push_instr_expect_bond(bond_key, TF_BOND_ACTIVE, TEST_STAKE_IGNORED, 0);
     tf.push_instr_expect_pool_totals(0, TEST_STAKE_IGNORED, TEST_STAKE_IGNORED, SHOULD_FAIL);
+    // whatever the bond and the target's bank now hold, it is what the chain implies
+    tf.push_instr_expect_staking_replay_matches(0);
+    tf.push_instr_load_pow(&gen.next_block(&miner), 0);
+    tf.push_instr_expect_staking_replay_matches(0);
 
     // the load-rejected helper: a body that doesn't match the merkle root
     let mut tampered = gen.next_block(&miner).as_ref().clone();
     tampered.transactions.push(tampered.transactions[0].clone());
     tf.push_instr_load_pow_rejected(&tampered, "merkle");
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// RPC methods exist with the parameters clients send. A method that no longer exists answers
+/// "Method not found", and one that exists but gets malformed parameters answers "Invalid
+/// params", so a method can be checked for existence without its arguments being valid.
+/// wallet_staking_action went missing in a merge and nothing failed for two months.
+#[test]
+fn crosslink_rpc_methods_exist() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+
+    let network = regtest_network(&HARNESS_PARAMETERS);
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
+
+    tf.push_instr_call_rpc("getblockcount", "[]", 0);
+    tf.push_instr_call_rpc("getbestblockhash", "[]", 0);
+    tf.push_instr_call_rpc("no_such_method", "[]", SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("Method not found", 0);
+    tf.push_instr_call_rpc("wallet_staking_action", "[]", SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("Invalid params", 0);
+    tf.push_instr_expect_node_alive(0);
 
     test_bytes(tf.write_to_bytes());
 }

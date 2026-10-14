@@ -105,8 +105,10 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::CHECK_POW as usize] = "CHECK_POW";
     strs[TFInstr::CHECK_POS as usize] = "CHECK_POS";
     strs[TFInstr::SET_TIME as usize] = "SET_TIME";
+    strs[TFInstr::CALL_RPC as usize] = "CALL_RPC";
+    strs[TFInstr::EXPECT_STAKING_REPLAY_MATCHES as usize] = "EXPECT_STAKING_REPLAY_MATCHES";
 
-    const_assert!(TFInstr::COUNT == 26);
+    const_assert!(TFInstr::COUNT == 28);
     strs
 };
 
@@ -190,7 +192,18 @@ impl TFInstr {
     /// returns it to the real clock. Covers the clock reads that go through zebra_debug_time
     /// (header timestamp rules, template times), not the node's real-time timers.
     pub const SET_TIME: TFInstrKind = 25;
-    pub const COUNT: TFInstrKind = 26;
+    /// Calls the node's RPC method named in the data, with the JSON params after it (the data
+    /// is `method`, a newline, then the params array or object), through the same method table
+    /// the RPC server serves. Accepted when the call returns a result, rejected when it returns
+    /// an error; the message carries the JSON either way, so EXPECT_REJECTION_REASON can pin an
+    /// error, such as a method that no longer exists.
+    pub const CALL_RPC: TFInstrKind = 26;
+    /// Every bond and finalizer bank the node holds at its best tip is what replaying the best
+    /// chain's staking actions and rewards from genesis gives, with the node's own hardfork
+    /// schedule and slash window. Catches state the node accumulated that the chain does not
+    /// imply, such as a reward paid twice.
+    pub const EXPECT_STAKING_REPLAY_MATCHES: TFInstrKind = 27;
+    pub const COUNT: TFInstrKind = 28;
 
     pub fn str_from_kind(kind: TFInstrKind) -> &'static str {
         let kind = kind as usize;
@@ -274,6 +287,8 @@ impl TFInstr {
             Some(TestInstr::CheckPoW { block, now }) => str += &format!("{} at time {now}", block.hash()),
             Some(TestInstr::CheckPoS(block)) => str += &block.blake3_hash().to_string(),
             Some(TestInstr::SetTime(unix_time)) => str += &unix_time.to_string(),
+            Some(TestInstr::CallRpc { method, params }) => str += &format!("{method} {params}"),
+            Some(TestInstr::ExpectStakingReplayMatches) => {}
             Some(TestInstr::ExpectPoWTip { hash, slot }) | Some(TestInstr::ExpectFinalizedTip { hash, slot }) => {
                 str += &match hash {
                     Some(hash) => hash.to_string(),
@@ -603,6 +618,16 @@ impl TF {
     }
 
     /// The node's clock reads `unix_time` until set again; 0 returns it to the real clock.
+    /// `params` is the JSON params array or object, e.g. `[]` or `["abc", 1]`.
+    pub fn push_instr_call_rpc(&mut self, method: &str, params: &str, flags: u32) {
+        let data = format!("{method}\n{params}");
+        self.push_instr_ex(TFInstr::CALL_RPC, flags, data.as_bytes(), [0; 2])
+    }
+
+    pub fn push_instr_expect_staking_replay_matches(&mut self, flags: u32) {
+        self.push_instr_ex(TFInstr::EXPECT_STAKING_REPLAY_MATCHES, flags, &[0; 0], [0; 2])
+    }
+
     pub fn push_instr_set_time(&mut self, unix_time: u64, flags: u32) {
         self.push_instr_ex(TFInstr::SET_TIME, flags, &[0; 0], [unix_time, 0])
     }
@@ -945,7 +970,7 @@ pub fn crosslink_parameters_for_test(bytes: &[u8]) -> ZcashCrosslinkParameters {
 }
 
 pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> {
-    const_assert!(TFInstr::COUNT == 26);
+    const_assert!(TFInstr::COUNT == 28);
     match instr.kind {
         TFInstr::LOAD_POW => {
             let block = Block::zcash_deserialize(instr.data_slice(bytes)).ok()?;
@@ -1043,6 +1068,12 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
             Some(TestInstr::CheckPoS(block_and_fat_ptr.0.block))
         }
         TFInstr::SET_TIME => Some(TestInstr::SetTime(instr.val[0])),
+        TFInstr::CALL_RPC => {
+            let text = std::str::from_utf8(instr.data_slice(bytes)).ok()?;
+            let (method, params) = text.split_once('\n')?;
+            Some(TestInstr::CallRpc { method: method.to_string(), params: params.to_string() })
+        }
+        TFInstr::EXPECT_STAKING_REPLAY_MATCHES => Some(TestInstr::ExpectStakingReplayMatches),
         TFInstr::EXPECT_POW_TIP | TFInstr::EXPECT_FINALIZED_TIP => {
             let data = instr.data_slice(bytes);
             let hash = if data.is_empty() { None } else { Some(ZebBlockHash(data.try_into().ok()?)) };
@@ -1095,6 +1126,8 @@ pub(crate) enum TestInstr {
     CheckPoW { block: Block, now: u64 },
     CheckPoS(BftBlock),
     SetTime(u64),
+    CallRpc { method: String, params: String },
+    ExpectStakingReplayMatches,
     RosterForceInclude([u8; 32], u64),   // public address
     ExpectRosterIncludes([u8; 32], u64), // public address
 }
@@ -1184,6 +1217,20 @@ pub(crate) async fn handle_instr(
                 Ok(Err(msg)) => test_check_outcome(false, false, &format!("CHECK_POS: no verdict: {msg}")),
                 Err(_) => test_check_outcome(false, false, &format!("CHECK_POS: no verdict within {NODE_ANSWER_WAIT:?}")),
             }
+        }
+
+        TestInstr::CallRpc { method, params } => match internal_handle.call.rpc_call.get() {
+            None => test_check_outcome(false, false, "CALL_RPC: the node has no RPC implementation"),
+            Some(rpc_call) => match tokio::time::timeout(NODE_ANSWER_WAIT, rpc_call(method.clone(), params)).await {
+                Ok(Ok(result)) => test_check(flags, true, &format!("CALL_RPC {method}: result {result}")),
+                Ok(Err(error)) => test_check(flags, false, &format!("CALL_RPC {method}: error {error}")),
+                Err(_) => test_check_outcome(false, false, &format!("CALL_RPC {method}: no verdict within {NODE_ANSWER_WAIT:?}")),
+            },
+        },
+
+        TestInstr::ExpectStakingReplayMatches => {
+            let (holds, message) = staking_replay_matches(internal_handle).await;
+            test_check(flags, holds, &message);
         }
 
         TestInstr::SetTime(unix_time) => {
@@ -1586,6 +1633,86 @@ const STP_PACKET_SETTLE: Duration = Duration::from_secs(1);
 /// How long to watch a peer advertise a block the node already has. The node never requests it,
 /// so there is no verdict to wait for, only a kill to rule out.
 const KNOWN_BLOCK_SETTLE: Duration = Duration::from_secs(2);
+
+/// Replays the best chain's staking from genesis and compares the result with the node's bonds
+/// and finalizer banks. `holds` is false on any difference; a read the node did not answer is a
+/// failure too, since the comparison could not be made.
+async fn staking_replay_matches(internal_handle: &TFLServiceHandle) -> (bool, String) {
+    use zebra_state::{BondStatusInChain, StakingReplay};
+
+    let tip = match tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.state)(StateRequest::Tip)).await {
+        Ok(Ok(StateResponse::Tip(Some((height, _))))) => height.0,
+        other => return (false, format!("staking replay: no verdict, the tip request answered {other:?}")),
+    };
+    let mut blocks: Vec<Arc<Block>> = Vec::with_capacity(tip as usize + 1);
+    for height in 0..=tip {
+        let request = zebra_state::ReadRequest::Block(zebra_chain::block::Height(height).into());
+        match tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.read_state)(request)).await {
+            Ok(Ok(zebra_state::ReadResponse::Block(Some(block)))) => blocks.push(block),
+            other => return (false, format!("staking replay: no verdict, block {height} answered {other:?}")),
+        }
+    }
+
+    let hardfork_schedule = zebra_chain::parameters::HardForkSchedule::from_canonical(internal_handle.config.hardforks.clone());
+    let mut replay = StakingReplay::new(&hardfork_schedule, internal_handle.params.staking.slash_analysis_window());
+    for (height, block) in blocks.iter().enumerate() {
+        // Every block pays issuance: variable reward is disabled in Chain::push, and the stake
+        // repair tool (stake_fixup.rs) replays with the same rule. If that changes, so must this.
+        let pays_reward = true;
+        let block_at = |at: zebra_chain::block::Height| blocks[at.0 as usize].clone();
+        let height = zebra_chain::block::Height(height as u32);
+        if let Err(err) = replay.apply_block(&internal_handle.network, height, block, pays_reward, block_at) {
+            return (false, format!("staking replay: the chain does not replay at height {}: {err:?}", height.0));
+        }
+    }
+
+    let mut differences = Vec::new();
+    for (key, (bond, status)) in &replay.delegation_bonds {
+        let replayed_status: u8 = match status {
+            BondStatusInChain::Active => 0,
+            BondStatusInChain::Unbonding { .. } => 1,
+            BondStatusInChain::Withdrawn { .. } => 2,
+            BondStatusInChain::Burned => 3,
+        };
+        let answer = tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.state)(StateRequest::BondInfo(*key))).await;
+        match answer {
+            Ok(Ok(StateResponse::BondInfo(Some(info)))) => {
+                if info.amount != bond.amount || info.status != replayed_status || info.target_finalizer != bond.target_finalizer {
+                    differences.push(format!(
+                        "bond {}: replay has amount {} status {replayed_status}, node has amount {} status {}",
+                        hex32(key),
+                        u64::from(bond.amount),
+                        u64::from(info.amount),
+                        info.status
+                    ));
+                }
+            }
+            Ok(Ok(StateResponse::BondInfo(None))) => differences.push(format!("bond {}: in the replay, not in the node", hex32(key))),
+            other => return (false, format!("staking replay: no verdict, bond {} answered {other:?}", hex32(key))),
+        }
+    }
+
+    let node_banks = match tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.state)(StateRequest::FinalizerRewardBalances)).await {
+        Ok(Ok(StateResponse::FinalizerRewardBalances(banks))) => banks,
+        other => return (false, format!("staking replay: no verdict, the banks request answered {other:?}")),
+    };
+    let replayed_banks: std::collections::BTreeMap<[u8; 32], u64> =
+        replay.finalizer_rewards.iter().filter(|(_, bank)| **bank != 0).map(|(finalizer, bank)| (*finalizer, *bank)).collect();
+    let node_banks: std::collections::BTreeMap<[u8; 32], u64> = node_banks.into_iter().filter(|(_, bank)| *bank != 0).collect();
+    for finalizer in replayed_banks.keys().chain(node_banks.keys()).collect::<std::collections::BTreeSet<_>>() {
+        let (replayed, node) = (replayed_banks.get(finalizer), node_banks.get(finalizer));
+        if replayed != node {
+            differences.push(format!("bank of {}: replay has {replayed:?}, node has {node:?}", PubKeyID(*finalizer)));
+        }
+    }
+
+    let checked = format!("{} bonds and {} banks over {} blocks", replay.delegation_bonds.len(), replayed_banks.len(), blocks.len());
+    if differences.is_empty() {
+        (true, format!("staking replay matches the node: {checked}"))
+    } else {
+        (false, format!("staking replay differs from the node ({checked}): {}", differences.join("; ")))
+    }
+}
 
 /// Hashes of blocks the node built during the test, by the slot MINE_FROM_TEMPLATE put them in.
 static TEST_BLOCK_SLOTS: Mutex<Vec<(u64, ZebBlockHash)>> = Mutex::new(Vec::new());

@@ -556,6 +556,7 @@ impl StartCmd {
 
         let mempool2 = mempool.clone();
         let block_from_template = Arc::new(std::sync::OnceLock::new());
+        let rpc_call = Arc::new(std::sync::OnceLock::new());
         info!("spawning tfl service task");
         let (tfl_handle, tfl_service_task_handle) = {
             let state = state.clone();
@@ -590,6 +591,7 @@ impl StartCmd {
                     })
                 },
                 block_from_template.clone(),
+                rpc_call.clone(),
                 config.crosslink.clone(),
                 config.network.network.crosslink_parameters(),
                 config.network.network.clone(),
@@ -681,9 +683,9 @@ impl StartCmd {
         // every network the test harness runs.
         {
             use zebra_rpc::methods::RpcServer as _;
-            let rpc_impl = rpc_impl.clone();
+            let template_rpc = rpc_impl.clone();
             let _ = block_from_template.set(Arc::new(move || {
-                let rpc_impl = rpc_impl.clone();
+                let rpc_impl = template_rpc.clone();
                 Box::pin(async move {
                     let template = rpc_impl
                         .get_block_template(None)
@@ -697,6 +699,27 @@ impl StartCmd {
                         rpc_impl.network(),
                     )
                     .map_err(|err| format!("the template does not make a block: {err}"))
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+            }));
+
+            // The method table the RPC server serves, called in process: no port, but the same
+            // dispatch and parameter parsing a client gets.
+            let module = rpc_impl.clone().into_rpc();
+            let _ = rpc_call.set(Arc::new(move |method: String, params: String| {
+                let module = module.clone();
+                Box::pin(async move {
+                    let method = serde_json::to_string(&method).expect("a string serializes");
+                    let request = format!(r#"{{"jsonrpc":"2.0","id":1,"method":{method},"params":{params}}}"#);
+                    let (response, _) = module
+                        .raw_json_request(&request, 1)
+                        .await
+                        .map_err(|err| format!("the request is not valid JSON-RPC: {err}"))?;
+                    let response: serde_json::Value =
+                        serde_json::from_str(&response).map_err(|err| format!("the response is not JSON: {err}"))?;
+                    match response.get("error") {
+                        Some(error) => Err(error.to_string()),
+                        None => Ok(response.get("result").map(ToString::to_string).unwrap_or_default()),
+                    }
                 }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
             }));
         }
