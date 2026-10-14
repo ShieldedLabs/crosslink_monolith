@@ -3511,6 +3511,8 @@ fn crosslink_payout_changes_rule_at_featurenet_upgrade_1() {
     assert_ne!(old_rule, model, "the two payout rules pay this block the same, so it cannot tell them apart");
     tf.push_instr_load_pow(&gen.next_block(&miner), 0);
     model.expect(&mut tf);
+    // And the replay the wallet scanner uses agrees with the node, across the change of rule.
+    tf.push_instr_expect_staking_replay_matches(0);
 
     test_bytes(tf.write_to_bytes());
 }
@@ -3551,6 +3553,7 @@ fn crosslink_new_bonds_must_be_a_power_of_10_from_featurenet_upgrade_1() {
     tf.push_instr_load_pow_rejected(&gen.clone().next_block_with_txs(&miner, &[refused]), "power of 10");
     let accepted = bond(&gen, b"after-the-upgrade-power-of-10", 100_000_000);
     tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &[accepted]), 0);
+    tf.push_instr_expect_staking_replay_matches(0);
 
     test_bytes(tf.write_to_bytes());
 }
