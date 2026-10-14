@@ -344,6 +344,9 @@ pub enum TransactionError {
     #[error("staking action amount {amount_zats} is above MAX_MONEY")]
     StakingActionAmountInvalid { amount_zats: u64 },
 
+    #[error("staking action amount {amount_zats} is not a power of 10 zats")]
+    StakingActionAmountNotPowerOf10 { amount_zats: u64 },
+
     #[error("finalizer reward conversion is not authorized by finalizer {finalizer:?}: bad key or signature")]
     StakingActionFinalizerAuthorizationInvalid { finalizer: [u8; 32] },
 }
@@ -479,6 +482,7 @@ impl TransactionError {
             | StakingActionBondKeyInvalid { .. }
             | StakingActionSignatureInvalid { .. }
             | StakingActionAmountInvalid { .. }
+            | StakingActionAmountNotPowerOf10 { .. }
             | StakingActionFinalizerAuthorizationInvalid { .. }
             | BothVPubsNonZero
             | DisabledAddToSproutPool

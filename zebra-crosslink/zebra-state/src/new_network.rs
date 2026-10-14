@@ -2000,7 +2000,7 @@ pub fn sync(
                         serialized_blocks.insert(hash, serialized);
                     }
                     None => {
-                        tracing::warn!("NewNet: Couldn't get block for hash {hash}!");
+                        // tracing::warn!("NewNet: Couldn't get block for hash {hash}!");
                         continue;
                     }
                 }

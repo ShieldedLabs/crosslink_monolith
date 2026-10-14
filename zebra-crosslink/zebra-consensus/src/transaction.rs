@@ -1056,7 +1056,7 @@ fn check_structure_and_network_rules(
     let network_upgrade = NetworkUpgrade::current(network, height);
 
     check::has_inputs_and_outputs(tx)?;
-    check::staking_action_amount(tx)?;
+    check::staking_action_amount(tx, height, network)?;
     check::has_enough_orchard_flags(tx)?;
     // NU6.3 / Ironwood flag rules (no-ops for pre-v6 transactions).
     check::has_enough_ironwood_flags(tx)?;
@@ -1473,7 +1473,8 @@ fn verify_v4_transaction_network_upgrade(
         | NetworkUpgrade::Nu6
         | NetworkUpgrade::Nu6_1
         | NetworkUpgrade::Nu6_2
-        | NetworkUpgrade::Nu6_3 => Ok(()),
+        | NetworkUpgrade::Nu6_3
+        | NetworkUpgrade::FeaturenetUpgrade1 => Ok(()),
 
         #[cfg(zcash_unstable = "zfuture")]
         NetworkUpgrade::ZFuture => Ok(()),
@@ -1512,6 +1513,7 @@ fn verify_v5_transaction_network_upgrade(
         | NetworkUpgrade::Nu6_1
         | NetworkUpgrade::Nu6_2
         | NetworkUpgrade::Nu6_3
+        | NetworkUpgrade::FeaturenetUpgrade1
         | NetworkUpgrade::Nu7 => Ok(()),
 
         #[cfg(zcash_unstable = "zfuture")]
@@ -1539,7 +1541,7 @@ fn verify_v6_transaction_network_upgrade(
     network_upgrade: NetworkUpgrade,
 ) -> Result<(), TransactionError> {
     match network_upgrade {
-        NetworkUpgrade::Nu6_3 | NetworkUpgrade::Nu7 => Ok(()),
+        NetworkUpgrade::Nu6_3 | NetworkUpgrade::FeaturenetUpgrade1 | NetworkUpgrade::Nu7 => Ok(()),
 
         #[cfg(zcash_unstable = "zfuture")]
         NetworkUpgrade::ZFuture => Ok(()),

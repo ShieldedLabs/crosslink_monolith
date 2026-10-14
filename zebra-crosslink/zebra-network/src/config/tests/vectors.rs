@@ -5,7 +5,7 @@ use zebra_chain::{
     block::Height,
     parameters::{
         testnet::{self, ConfiguredFundingStreams},
-        Network,
+        Network, NetworkUpgrade,
     },
 };
 
@@ -194,5 +194,23 @@ fn should_allow_unshielded_coinbase_spends_rejected_on_testnet() {
         err.to_string()
             .contains("should_allow_unshielded_coinbase_spends"),
         "unexpected error: {err}"
+    );
+}
+
+/// Checks that a configured Testnet schedules the featurenet upgrade when its activation heights
+/// were written before the upgrade existed.
+#[test]
+fn configured_testnet_schedules_unnamed_featurenet_upgrade() {
+    let _init_guard = zebra_test::init();
+
+    let toml = "network = 'Testnet'\ninitial_testnet_peers = []\n\n[testnet_parameters]\nnetwork_magic = [67, 108, 84, 49]\n\n[testnet_parameters.activation_heights]\n'NU6.3' = 1\n";
+    let config: Config = toml::from_str(toml).expect("configured Testnet parses");
+    let scheduled =
+        |network: &Network| NetworkUpgrade::FeaturenetUpgrade1.activation_height(network);
+
+    assert!(scheduled(&config.network).is_some());
+    assert_eq!(
+        scheduled(&config.network),
+        scheduled(&Network::new_default_testnet())
     );
 }

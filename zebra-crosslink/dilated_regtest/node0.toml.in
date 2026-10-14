@@ -17,7 +17,7 @@ eviction_memory_time = "1h"
 tx_cost_limit = 80000000
 
 [mining]
-internal_miner = false
+internal_miner = true
 miner_address = "tmRB9AEVsxNAQsqtJPqJUje9KCaAijpS77z"
 
 [network]

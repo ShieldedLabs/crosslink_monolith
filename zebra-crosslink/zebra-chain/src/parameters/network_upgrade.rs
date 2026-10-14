@@ -64,6 +64,8 @@ pub enum NetworkUpgrade {
     /// The Zcash protocol after the NU6.3 (Ironwood) upgrade.
     #[serde(rename = "NU6.3")]
     Nu6_3,
+    /// The Zcash protocol after the first Crosslink featurenet upgrade.
+    FeaturenetUpgrade1,
     /// The Zcash protocol after the NU7 upgrade.
     #[serde(rename = "NU7")]
     Nu7,
@@ -141,6 +143,10 @@ pub(super) const MAINNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] 
 pub(super) const TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] = &[
     (block::Height(0), Genesis),
     (block::Height(1), Nu6_3),
+    (
+        block::Height(zcash_protocol::consensus::TESTNET_FEATURENET_UPGRADE_1_HEIGHT),
+        FeaturenetUpgrade1,
+    ),
 ];
 
 /// The Consensus Branch Id, used to bind transactions and blocks to a
@@ -236,6 +242,8 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (Nu6_2, ConsensusBranchId(0x5437f330)),
     // The NU6.3 (Ironwood) consensus branch id, matching zcash_protocol's `BranchId::Nu6_3`.
     (Nu6_3, ConsensusBranchId(0x37a5165b)),
+    // Matches zcash_protocol's `BranchId::FeaturenetUpgrade1`.
+    (FeaturenetUpgrade1, ConsensusBranchId(0x46545531)),
     // TODO: set below to (Nu7, ConsensusBranchId(0x77190ad8)), once the same value is set in librustzcash
     #[cfg(any(test, feature = "zebra-test"))]
     (Nu7, ConsensusBranchId(0xfffffffe)),
@@ -408,7 +416,8 @@ impl NetworkUpgrade {
     pub fn target_spacing(&self) -> Duration {
         let spacing_seconds = match self {
             Genesis | BeforeOverwinter | Overwinter | Sapling => PRE_BLOSSOM_POW_TARGET_SPACING,
-            Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7 => {
+            Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1
+            | Nu7 => {
                 POST_BLOSSOM_POW_TARGET_SPACING.into()
             }
 
@@ -535,6 +544,9 @@ impl From<zcash_protocol::consensus::NetworkUpgrade> for NetworkUpgrade {
             zcash_protocol::consensus::NetworkUpgrade::Nu6_1 => Self::Nu6_1,
             zcash_protocol::consensus::NetworkUpgrade::Nu6_2 => Self::Nu6_2,
             zcash_protocol::consensus::NetworkUpgrade::Nu6_3 => Self::Nu6_3,
+            zcash_protocol::consensus::NetworkUpgrade::FeaturenetUpgrade1 => {
+                Self::FeaturenetUpgrade1
+            }
             #[cfg(zcash_unstable = "nu7")]
             zcash_protocol::consensus::NetworkUpgrade::Nu7 => Self::Nu7,
             #[cfg(zcash_unstable = "zfuture")]

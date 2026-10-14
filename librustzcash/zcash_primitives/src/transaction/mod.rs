@@ -24,7 +24,7 @@ use corez::io::{self, Read, Write};
 use ::transparent::bundle::{self as transparent, OutPoint, TxIn, TxOut};
 use zcash_encoding::{CompactSize, Vector};
 use zcash_protocol::{
-    consensus::{BlockHeight, BranchId},
+    consensus::{BlockHeight, BranchId, NetworkUpgrade, Parameters},
     value::{BalanceError, ZatBalance, Zatoshis},
 };
 // `valid_in_branch` matches on every branch by bare name.
@@ -224,7 +224,7 @@ impl TxVersion {
             BranchId::Nu6 => TxVersion::V5,
             BranchId::Nu6_1 => TxVersion::V5,
             BranchId::Nu6_2 => TxVersion::V5,
-            BranchId::Nu6_3 => TxVersion::V6,
+            BranchId::Nu6_3 | BranchId::FeaturenetUpgrade1 => TxVersion::V6,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => TxVersion::V6,
         }
@@ -238,25 +238,25 @@ impl TxVersion {
         match self {
             TxVersion::Sprout(_) => consensus_branch_id == Sprout,
             TxVersion::V3 => consensus_branch_id == Overwinter,
-            TxVersion::VCrosslink => matches!(consensus_branch_id, Nu6_3),
+            TxVersion::VCrosslink => matches!(consensus_branch_id, Nu6_3 | FeaturenetUpgrade1),
             TxVersion::V4 => match consensus_branch_id {
                 Sprout | Overwinter => false,
                 Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
-                Nu6_3 => true,
+                Nu6_3 | FeaturenetUpgrade1 => true,
                 #[cfg(zcash_unstable = "nu7")]
                 Nu7 => false, // ZIP 2003
             },
             TxVersion::V5 => match consensus_branch_id {
                 Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy => false,
                 Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
-                Nu6_3 => true,
+                Nu6_3 | FeaturenetUpgrade1 => true,
                 #[cfg(zcash_unstable = "nu7")]
                 Nu7 => true,
             },
             TxVersion::V6 => match consensus_branch_id {
                 Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6
                 | Nu6_1 | Nu6_2 => false,
-                Nu6_3 => true, // Ironwood / NU6.3
+                Nu6_3 | FeaturenetUpgrade1 => true, // Ironwood / NU6.3
                 #[cfg(zcash_unstable = "nu7")]
                 Nu7 => true, // ZIP 230 or ZIP 248, whichever is chosen for activation
             },
@@ -1637,6 +1637,17 @@ pub enum StakingAction {
     },
 }
 
+/// Whether `n` is 1, 10, 100, and so on. Zero is not.
+pub const fn is_power_of_10(mut n: u64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    while n % 10 == 0 {
+        n /= 10;
+    }
+    n == 1
+}
+
 impl StakingAction {
     pub fn kind(&self) -> StakingActionKind {
         match self {
@@ -1683,6 +1694,22 @@ impl StakingAction {
             StakingAction::ConvertFinalizerRewardToDelegationBond { this_finalizer, amount_zats, bond_salt, .. } =>
                 Some((*this_finalizer, *amount_zats, *bond_salt)),
             _ => None,
+        }
+    }
+
+    /// Whether this action's amount is allowed in a block at `height`.
+    ///
+    /// From [`NetworkUpgrade::FeaturenetUpgrade1`] on, a new bond (CreateNewDelegationBond) must carry a
+    /// power of 10 zats. Every other action is exempt: a conversion of a finalizer's reward
+    /// bank takes whatever the bank holds, and a withdrawal must equal the bond's balance,
+    /// which rewards have grown past the amount it was created with.
+    pub fn amount_is_valid_at<P: Parameters>(&self, params: &P, height: u32) -> bool {
+        if !params.is_nu_active(NetworkUpgrade::FeaturenetUpgrade1, BlockHeight::from_u32(height)) {
+            return true;
+        }
+        match self {
+            StakingAction::CreateNewDelegationBond { amount_zats, .. } => is_power_of_10(*amount_zats),
+            _ => true,
         }
     }
 
@@ -2004,7 +2031,7 @@ pub mod testing {
             BranchId::Nu6 => Just(TxVersion::V5).boxed(),
             BranchId::Nu6_1 => Just(TxVersion::V5).boxed(),
             BranchId::Nu6_2 => Just(TxVersion::V5).boxed(),
-            BranchId::Nu6_3 => Just(TxVersion::V6).boxed(),
+            BranchId::Nu6_3 | BranchId::FeaturenetUpgrade1 => Just(TxVersion::V6).boxed(),
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => Just(TxVersion::V6).boxed(),
             #[cfg(zcash_unstable = "zfuture")]

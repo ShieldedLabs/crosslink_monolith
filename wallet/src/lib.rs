@@ -2202,6 +2202,11 @@ impl ManualWallet {
             println!("stake_ironwood_to_finalizer: invalid finalizer address capability");
             return None;
         }
+        // From FeaturenetUpgrade1 consensus only accepts new bonds of a power of 10 zats.
+        if !zcash_primitives::transaction::is_power_of_10(exact_amount_to_send) {
+            println!("stake_ironwood_to_finalizer: bond amount {exact_amount_to_send} zats is not a power of 10");
+            return None;
+        }
         let account = &self.accounts[0];
         let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
         if let Some(ovk) = keys.orchard_ovk {

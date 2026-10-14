@@ -115,6 +115,16 @@ impl InBlockBonds {
             }
         }
 
+        // The transaction verifier checks this too, but against the height the transaction
+        // entered the mempool at. A template built later, past the activation height, relies on
+        // this one to leave the transaction out.
+        if !staking_action.amount_is_valid_at(&non_finalized_chain.network(), height.0) {
+            return Err(ValidateContextError::InvalidDelegationBond(format!(
+                "bond amount {} is not a power of 10 zats: {:?}",
+                staking_action.amount_zats(), bond_key
+            )));
+        }
+
         match staking_action.kind() {
             StakingActionKind::CreateNewDelegationBond => {
                 // Check that bond doesn't already exist
@@ -617,6 +627,51 @@ mod tests {
 
         assert_eq!(invalid_staking_actions(&[retarget], height, &chain, &finalized_state.db), Vec::<usize>::new());
         assert_eq!(invalid_staking_actions(&[unbond, retarget], height, &chain, &finalized_state.db), vec![1]);
+    }
+
+    /// From the rule's activation height on, a new bond must be a power of 10 zats.
+    #[test]
+    fn new_bond_amount_must_be_a_power_of_10_once_active() {
+        use zcash_primitives::{
+            bft::{finalizer_key_from_seed, FinalizerAddress},
+            transaction::{is_power_of_10, StakingAction},
+        };
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+
+        for (n, expected) in [(0, false), (1, true), (10, true), (11, false), (20, false), (1000, true), (10u64.pow(19), true), (u64::MAX, false)] {
+            assert_eq!(is_power_of_10(n), expected, "{n}");
+        }
+
+        let network = Network::new_default_testnet();
+        let ACTIVATION = u32::from(network.activation_height(NetworkUpgrade::FeaturenetUpgrade1).unwrap());
+        let finalized_state = finalized_state();
+        let chain = Chain::new(
+            &network,
+            Height(CREATED),
+            NoteCommitmentTrees::default(),
+            Default::default(),
+            ValueBalance::zero(),
+            [(KEY, bond(), BondStatus::Active)],
+            std::iter::empty(),
+        );
+        let target_finalizer = FinalizerAddress::create(&finalizer_key_from_seed(b"target").1);
+        let create = |amount_zats| StakingAction::CreateNewDelegationBond {
+            amount_zats, unique_pubkey: [2; 32], bond_salt: [0; 32], target_finalizer, signature: [0; 64],
+        };
+        let invalid_at = |height, amount_zats| {
+            invalid_staking_actions(&[create(amount_zats)], Height(height), &chain, &finalized_state.db)
+        };
+
+        assert_eq!(invalid_at(ACTIVATION - 1, 1500), Vec::<usize>::new());
+        assert_eq!(invalid_at(ACTIVATION, 1500), vec![0]);
+        assert_eq!(invalid_at(ACTIVATION, 1000), Vec::<usize>::new());
+
+        // Only a new bond is restricted: a conversion takes whatever the bank holds.
+        let convert = StakingAction::ConvertFinalizerRewardToDelegationBond {
+            unique_pubkey: [3; 32], signature: [0; 64], bond_salt: [0; 32], this_finalizer: [4; 32],
+            amount_zats: 1500, finalizer_signature: [0; 64],
+        };
+        assert!(convert.amount_is_valid_at(&network, ACTIVATION));
     }
 
     /// A second withdrawal of one bond in a block must be rejected here: the commit expects each

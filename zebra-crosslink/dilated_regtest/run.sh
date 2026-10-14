@@ -14,10 +14,15 @@ HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/.." && pwd); OUT=$HERE/out
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) WIN=1; ROOT_TOML=$(cd "$ROOT" && pwd -W);; *) WIN=0; ROOT_TOML=$ROOT;; esac
 ZEBRAD=$ROOT/target/debug/zebrad; [ $WIN = 1 ] && ZEBRAD=$ZEBRAD.exe
 [ -x "$ZEBRAD" ] || { echo "no zebrad at $ZEBRAD"; exit 2; }
-BOND=20000000; STAKING_HEIGHT=150; ROSTER_HEIGHT=300; ACTIVATION_HEIGHT=450
+BOND=10000000; STAKING_HEIGHT=150; ROSTER_HEIGHT=300; ACTIVATION_HEIGHT=450
 PORT=(8232 8242); PID=(); FAIL=0
+# A run gets two minutes of wall clock, pass or fail. The signal is only handled between
+# commands, so no RPC may outlast the deadline.
+TIMEOUT=120; DEADLINE=$(( $(date +%s) + TIMEOUT ))
+trap 'echo "FAILED: timed out after $TIMEOUT s; logs in $OUT"; exit 1' TERM
+( sleep $TIMEOUT; kill -TERM $$ ) >/dev/null 2>&1 & WATCHDOG=$!
 
-rpc() { curl -s -m 300 -X POST "http://127.0.0.1:${PORT[$1]}" -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":${3:-[]}}"; }
+rpc() { curl -s -m $(( DEADLINE - $(date +%s) + 1 )) -X POST "http://127.0.0.1:${PORT[$1]}" -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":${3:-[]}}"; }
 # Never empty: an RPC that times out or answers unparseably reports 0, so a `-lt` against it
 # stays a comparison instead of erroring out and ending the loop that made it.
 tip() { t=$(rpc "$1" getblockchaininfo | jq -r '.result.blocks // 0' 2>/dev/null); case "$t" in ''|*[!0-9]*) t=0;; esac; echo "$t"; }
@@ -35,7 +40,7 @@ stop_nodes() {
     if [ $WIN = 1 ]; then taskkill //PID "$p" //F >/dev/null 2>&1; else kill "$p" 2>/dev/null; fi
   done
 }
-trap stop_nodes EXIT
+trap 'stop_nodes; kill $WATCHDOG 2>/dev/null' EXIT
 
 start_node() {
   n=$1

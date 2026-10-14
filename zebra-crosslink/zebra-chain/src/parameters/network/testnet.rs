@@ -192,6 +192,9 @@ impl From<&BTreeMap<Height, NetworkUpgrade>> for ConfiguredActivationHeights {
                 NetworkUpgrade::Nu6_1 => &mut configured_activation_heights.nu6_1,
                 NetworkUpgrade::Nu6_2 => &mut configured_activation_heights.nu6_2,
                 NetworkUpgrade::Nu6_3 => &mut configured_activation_heights.nu6_3,
+                NetworkUpgrade::FeaturenetUpgrade1 => {
+                    &mut configured_activation_heights.featurenet_upgrade_1
+                }
                 NetworkUpgrade::Nu7 => &mut configured_activation_heights.nu7,
                 #[cfg(zcash_unstable = "zfuture")]
                 NetworkUpgrade::ZFuture => &mut configured_activation_heights.zfuture,
@@ -375,6 +378,9 @@ pub struct ConfiguredActivationHeights {
     /// Activation height for `NU6.3` (Ironwood) network upgrade.
     #[serde(rename = "NU6.3")]
     pub nu6_3: Option<u32>,
+    /// Activation height for the `FeaturenetUpgrade1` network upgrade.
+    #[serde(rename = "FeaturenetUpgrade1")]
+    pub featurenet_upgrade_1: Option<u32>,
     /// Activation height for `NU7` network upgrade.
     #[serde(rename = "NU7")]
     pub nu7: Option<u32>,
@@ -400,6 +406,7 @@ impl ConfiguredActivationHeights {
             nu6_1,
             nu6_2,
             nu6_3,
+            featurenet_upgrade_1,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -431,10 +438,26 @@ impl ConfiguredActivationHeights {
             nu6_1,
             nu6_2,
             nu6_3,
+            featurenet_upgrade_1,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
         }
+        .with_default_featurenet_upgrade()
+    }
+
+    /// Schedules the featurenet upgrade at the height the wallet's hardcoded parameters name,
+    /// unless these heights name one already or leave it no room.
+    ///
+    /// A config file written before the upgrade existed lists every height but this one, and
+    /// without the default its node would never activate the upgrade.
+    pub fn with_default_featurenet_upgrade(mut self) -> Self {
+        let Self { nu6_3, nu7, .. } = self;
+        self.featurenet_upgrade_1 = self.featurenet_upgrade_1.or(
+            Some(zcash_protocol::consensus::TESTNET_FEATURENET_UPGRADE_1_HEIGHT)
+                .filter(|&h| nu6_3.is_some_and(|n| n < h) && nu7.map_or(true, |n| n > h)),
+        );
+        self
     }
 }
 
@@ -625,6 +648,7 @@ impl ParametersBuilder {
             nu6_1,
             nu6_2,
             nu6_3,
+            featurenet_upgrade_1,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -654,6 +678,7 @@ impl ParametersBuilder {
                 .chain(nu6_1.into_iter().map(|h| (h, Nu6_1)))
                 .chain(nu6_2.into_iter().map(|h| (h, Nu6_2)))
                 .chain(nu6_3.into_iter().map(|h| (h, Nu6_3)))
+                .chain(featurenet_upgrade_1.into_iter().map(|h| (h, FeaturenetUpgrade1)))
                 .chain(nu7.into_iter().map(|h| (h, Nu7)));
 
             #[cfg(zcash_unstable = "zfuture")]

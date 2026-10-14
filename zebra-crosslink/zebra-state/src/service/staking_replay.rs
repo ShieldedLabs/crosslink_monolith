@@ -151,7 +151,7 @@ impl StakingReplay {
     /// non-genesis block, after all of its staking actions.
     pub fn apply_block_reward(&mut self, network: &Network, height: Height) {
         let reward = pos_block_reward(height, network);
-        update_bonds_with_pos_issuance(reward, &mut self.delegation_bonds, &mut self.finalizer_rewards);
+        update_bonds_with_pos_issuance(network, height, reward, &mut self.delegation_bonds, &mut self.finalizer_rewards);
     }
 
     /// Whether a hardfork slash activates at `height`, so the caller must read its window.

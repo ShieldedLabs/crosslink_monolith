@@ -79,8 +79,8 @@ default = []
 prost-build = "0.13"
 
 [dependencies.snow]
-git = "https://github.com/ShieldedLabs/snow.git"
-rev = "54369eb3829d6563ef7e5d5f17c09b08a77bca6e"
+package = "shielded_labs_snow"
+version = "0.10.0"
 default-features = false
 features = [
     "use-curve25519",

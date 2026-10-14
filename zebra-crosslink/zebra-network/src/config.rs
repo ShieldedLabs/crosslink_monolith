@@ -1031,7 +1031,7 @@ where
     // Retain default Testnet activation heights unless there's an empty [testnet_parameters.activation_heights] section.
     if let Some(activation_heights) = activation_heights {
         params_builder = params_builder
-            .with_activation_heights(activation_heights)
+            .with_activation_heights(activation_heights.with_default_featurenet_upgrade())
             .map_err(de::Error::custom)?
     }
 

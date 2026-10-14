@@ -901,13 +901,21 @@ pub fn consensus_branch_id(
 
 /// A staking action's amount must be at most `MAX_MONEY`. The amount is read off the wire
 /// unchecked, and value balances, bond records and pool updates all convert it to an [`Amount`].
-pub fn staking_action_amount(tx: &Transaction) -> Result<(), TransactionError> {
+///
+/// Once [`StakingAction::amount_is_valid_at`] activates, a new bond must also carry a power
+/// of 10 zats.
+///
+/// [`StakingAction::amount_is_valid_at`]: zcash_primitives::transaction::StakingAction::amount_is_valid_at
+pub fn staking_action_amount(tx: &Transaction, height: Height, network: &Network) -> Result<(), TransactionError> {
     let Some(staking_action) = tx.staking_action() else {
         return Ok(());
     };
     let amount_zats = staking_action.amount_zats();
     if amount_zats > zebra_chain::amount::MAX_MONEY as u64 {
         return Err(TransactionError::StakingActionAmountInvalid { amount_zats });
+    }
+    if !staking_action.amount_is_valid_at(network, height.0) {
+        return Err(TransactionError::StakingActionAmountNotPowerOf10 { amount_zats });
     }
     Ok(())
 }
