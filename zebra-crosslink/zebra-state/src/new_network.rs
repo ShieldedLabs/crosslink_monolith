@@ -3288,11 +3288,13 @@ pub fn sync(
                         .handle_commit(semantically_verified)
                         .map(|()| hash)
                         .map_err(|err| {
-                            let msg = format!("{err:?}");
-                            if msg.contains("Duplicate") || msg.contains("AlreadyFinalized") {
+                            // Ask the state whether the block is there, not the error's text: the
+                            // only commit errors named Duplicate are double spends
+                            // (DuplicateTransparentSpend, Duplicate*Nullifier), which are rejections.
+                            if known_outcome(&read_state, hash).is_some() {
                                 BlockCommitError::Duplicate
                             } else {
-                                BlockCommitError::Other(msg)
+                                BlockCommitError::Other(format!("{err:?}"))
                             }
                         })
                 }

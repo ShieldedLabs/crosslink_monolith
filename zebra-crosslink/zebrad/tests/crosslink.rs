@@ -1750,12 +1750,10 @@ fn crosslink_mempool_verdict_goes_stale_when_a_block_spends_the_input() {
     let mut double_spend_gen = gen.clone();
     double_spend_gen.utxos.insert(input.0, spent_utxo);
     let double_spend = double_spend_gen.next_block_with_txs(&miner, &[in_mempool.clone()]);
-    // The node does not commit it, which the tip check below pins. But its verdict today is
-    // "already known", not a rejection: new_network takes any commit error whose text contains
-    // "Duplicate" for a duplicate block, and the state's double-spend errors are named
-    // DuplicateTransparentSpend and Duplicate*Nullifier. When that is fixed this load is refused:
-    // make it SHOULD_FAIL and add the reason.
-    tf.push_instr_load_pow(&double_spend, 0);
+    // Refused, and named for what it is. The node once answered it "already known", taking any
+    // commit error whose text contained "Duplicate" for a duplicate block; the state's
+    // double-spend errors are DuplicateTransparentSpend and Duplicate*Nullifier.
+    tf.push_instr_load_pow_rejected(&double_spend, "DuplicateTransparentSpend");
     tf.push_instr_expect_pow_tip(&spends_it_first.hash(), 0);
     tf.push_instr_expect_pow_tip(&double_spend.hash(), SHOULD_FAIL);
     tf.push_instr_submit_tx(&in_mempool, SHOULD_FAIL);
