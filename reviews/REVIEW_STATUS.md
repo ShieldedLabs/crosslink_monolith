@@ -1,10 +1,10 @@
-# Code review status: 28 reported findings and 15 test-format leads
+# Code review status: 29 reported findings and 15 test-format leads
 
 Tracking table. One row per finding. Six sources feed it:
 
 - **Consensus review** (`C` rows): 11 reports in `crosslink-e99404e3de7cc-review/`, validated at `dev` @ `e99404e3de7cc`.
 - **GUI review** (`G` rows): 10 reports in `crosslink-d00b6a44ef594-gui-review/`, validated at `dev` @ `d00b6a44ef594`.
-- **Sync follow-up** (`S` row): 1 report in `crosslink-e56e35f85a98f-sync-review/`, a lead raised while re-checking commit `e56e35f8` and validated at `dev` @ `e56e35f85a98f`.
+- **Sync follow-up** (`S` rows): 1 report in `crosslink-e56e35f85a98f-sync-review/`, a lead raised while re-checking commit `e56e35f8` and validated at `dev` @ `e56e35f85a98f`; and 1 in `crosslink-890036389ac3b-ingest-review/`, found by a scenario and validated at `dev` @ `890036389ac3b`.
 - **Test-format review** (`F` and `T` rows): 15 leads on `test_format.rs` and `zebrad/tests/crosslink.rs`, raised at `dev` @ `8ea4db1f`. They have no report files and no severity. The two sessions that own that code checked them and disputed none; see the section below.
 - **Tenderlink certificate review** (`K` rows): 4 reports in `tenderlink-6705b3ca5e234-certificate-review/`, from an adversarial review of a change to `tenderlink/src/lib.rs` before it was committed, on top of `dev` @ `6705b3ca5e234`. The change landed as `5a6577e2`.
 - **Tenderlink second review** (`K5`, `K6`): 2 reports in `tenderlink-5a6577e2726e5-review/`, from a second, read-only review of the same two commits, validated at `dev` @ `5a6577e2726e5`.
@@ -73,13 +73,14 @@ No finding is covered by any of them today, so every row shows a route not yet t
 | G9 | [Chain view reacts under panes and modals](crosslink-d00b6a44ef594-gui-review/low/chain-view-pans-and-recenters-while-the-pointer-is-over-a-pane-or-modal.md) | low | all | any | CLEAR | none | gui | Fires most often of the three input findings: every touchpad scroll over a pane. Three one-line gates |
 | G10 | [Esc dead after textbox focus; Jump gives no feedback](crosslink-d00b6a44ef594-gui-review/low/esc-cannot-close-a-modal-after-textbox-focus-and-jump-gives-no-feedback.md) | low | all | any | CLEAR | unit | gui | After one Tab, Esc is dead in all eight modals. Half of a two-stage Esc: the clearing handler is commented out |
 
-## Sync follow-up (1)
+## Sync follow-up (2)
 
 Raised by the "crosslink spreadsheet triage" session while reading `e56e35f8`, then validated by tracing the code. The Fires column uses the consensus values.
 
 | # | Finding | Sev | Fires | Gate | Status | Test | Owner | Notes |
 |-|-|-|-|-|-|-|-|-|
 | S1 | [Rejected-block backoff is keyed by hash alone](crosslink-e56e35f85a98f-sync-review/low/rejected-block-backoff-is-keyed-by-hash-alone-so-one-peer-can-delay-an-honest-block-for-every-peer.md) | low | adversary | any | CLEAR | intg | node | Partially confirmed. Each forged copy a peer gets queued under an honest hash stops new requests for that hash to every peer for 1 s doubling to 64 s. One dishonest connection among honest peers normally loses to the honest copy; sustained delay needs most of the node's connections. A regression against `e56e35f8^`, where a forgery cost about one 500 ms pass. The trade-off was weighed in the commit's comments; the existing forged-body test covers one strike only |
+| S2 | [Double-spend block answered already known](crosslink-890036389ac3b-ingest-review/low/a-double-spend-block-is-answered-already-known-because-commit-errors-are-classified-by-their-text.md) | low | adversary | launch | FIXED `1be28cdd` | test-format | node | Commit errors were classified by their text, and the only errors named Duplicate are double spends. Fixed by asking the state whether it has the block. Covered by `crosslink_mempool_verdict_goes_stale_when_a_block_spends_the_input`; a shielded double spend is not covered, the generator cannot build shielded transactions |
 
 ## Tenderlink certificate review (4)
 
@@ -133,34 +134,35 @@ Status of these 15: **6 FIXED**, **2 PARTIAL**, **1 DECIDE**, **6 CLEAR**. Line 
 
 ## Roll-up
 
-The tables in this section count the 28 reported findings. The test-format leads are counted above.
+The tables in this section count the 29 reported findings. The test-format leads are counted above.
 
 | Status | High | Medium | Low | Total |
 |-|-|-|-|-|
-| FIXED | 0 | 2 | 0 | **2** |
+| FIXED | 0 | 2 | 1 | **3** |
 | PARTIAL | 0 | 0 | 0 | 0 |
 | CLEAR (obvious fix, pending) | 3 | 7 | 10 | **20** |
 | DECIDE | 4 | 1 | 0 | **5** |
 | MEASURE | 0 | 0 | 1 | 1 |
-| total | 7 | 10 | 11 | **28** |
+| total | 7 | 10 | 12 | **29** |
 
-By trigger, consensus rows: **6 honest**, **4 adversary**, **1 config**. All 10 GUI rows fire in ordinary use. The sync row needs a dishonest peer. The 6 tenderlink rows need a dishonest proposer, finalizer or peer.
+By trigger, consensus rows: **6 honest**, **4 adversary**, **1 config**. All 10 GUI rows fire in ordinary use. The sync rows need a dishonest peer (S1) or any block that double-spends (S2). The 6 tenderlink rows need a dishonest proposer, finalizer or peer.
 
-By gate: **3 fork** (C2, C7, C11), **11 launch** (C1, C3, C4, C6, C10, G1, G2, G3, K1, K2, K4), **14 any**.
+By gate: **3 fork** (C2, C7, C11), **12 launch** (C1, C3, C4, C6, C10, G1, G2, G3, K1, K2, K4, S2), **14 any**.
 
 By test route, what CI would actually catch on a bad push:
 
 | Route | Findings | Runs in CI? |
 |-|-|-|
-| `test-format`, `dilated` | 0 | n/a |
+| `test-format` (S2) | 1 | not confirmed: the suite is not known to run in CI |
+| `dilated` | 0 | n/a |
 | `cargo` (K1, K2) | 2 | not confirmed: `cargo test` in `tenderlink/` is not known to run in CI |
-| **covered subtotal** | **2** | |
+| **covered subtotal** | **3** | |
 | `unit` (easy, unwritten) | 15 | no |
 | `intg` (easy, unwritten) | 7 | no |
 | `hard` | 3 | no |
 | `none` | 1 | never |
 
-**2 of 28 are covered by a test, and none by something confirmed to run automatically.** 22 of the rest have a cheap route.
+**3 of 29 are covered by a test, and none by something confirmed to run automatically.** 22 of the rest have a cheap route.
 
 ## What the table makes obvious
 
@@ -289,6 +291,8 @@ Numbering follows each report's own Recommendations section, so `C6.3` is item 3
 | S1.1 | Key the backoff by hash and connection: pass the serving peer when recording a strike and the candidate peer when checking | OPEN | The honest peers stay eligible while the peer that served the failed copy waits |
 | S1.2 | Run the merkle check at receipt, before the block takes the queue slot for its hash | OPEN | Stops a merkle-mismatched body from shadowing the honest copy. The code already has an `@Todo` for it. The shadowing predates `e56e35f8` |
 | S1.4 | Tests: six forged `RECV_POW` from one peer, then the honest block from another; a parent-missing variant; a unit test of the two pure functions | OPEN | At `e56e35f85` the sixth strike sets a 32 s wait, longer than the harness's 30 s answer wait. Inferred, not run |
+| S2.1 | Classify a commit error as a duplicate only when the state has the block | DONE `1be28cdd` | `known_outcome` instead of the error's text |
+| S2.3 | Tests: a transparent double spend is refused with its reason; a shielded double spend | PARTIAL | Transparent covered in `1be28cdd`; shielded needs the generator to build shielded transactions |
 
 ## Tenderlink certificate findings
 
