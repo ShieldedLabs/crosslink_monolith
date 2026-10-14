@@ -1477,6 +1477,13 @@ impl BlockGen {
         self.next_block_with_txs(miner_addr, &[])
     }
 
+    /// The network upgrade in effect at the height of the next block, which a transaction for that
+    /// block must be signed for.
+    fn next_upgrade(&self) -> NetworkUpgrade {
+        let height = zebra_chain::block::Height(self.tip.coinbase_height().expect("generated blocks have a height").0 + 1);
+        NetworkUpgrade::current(&self.network, height)
+    }
+
     pub fn next_block_with_txs(
         &mut self,
         miner_addr: &Address,
@@ -1588,7 +1595,7 @@ fn crosslink_mine_from_template() {
     }
 
     // mempool to block the way production does it: the node's own template picks the spend up
-    let spend = transparent_spend(&key, gen.mature_coinbase_for(&key).expect("matured above"));
+    let spend = transparent_spend(gen.next_upgrade(), &key, gen.mature_coinbase_for(&key).expect("matured above"));
     tf.push_instr_submit_tx(&spend, 0);
     tf.push_instr_expect_mempool_contains(&spend, 0);
     tf.push_instr_mine_from_template(0);
@@ -1723,9 +1730,10 @@ fn crosslink_mempool_verdict_goes_stale_when_a_block_spends_the_input() {
     tf.push_instr_load_pow(&gen.tip, 0);
     let input = matured_coinbases(&mut tf, &mut gen, &key, 1).remove(0);
 
-    let in_mempool = transparent_spend(&key, input.clone());
+    let in_mempool = transparent_spend(gen.next_upgrade(), &key, input.clone());
     let fee = mempool_fee(&in_mempool);
     let conflicting = signed_tx(
+        gen.next_upgrade(),
         Some(&key),
         &[input.clone()],
         vec![zebra_chain::transparent::Output::new((input.1.value - fee).expect("the input covers the fee"), other_key.lock_script())],
@@ -1780,7 +1788,7 @@ fn crosslink_tx_mined_on_a_losing_branch_can_be_mined_again() {
     let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
     tf.push_instr_load_pow(&gen.tip, 0);
     let input = matured_coinbases(&mut tf, &mut gen, &key, 1).remove(0);
-    let spend = transparent_spend(&key, input);
+    let spend = transparent_spend(gen.next_upgrade(), &key, input);
 
     tf.push_instr_submit_tx(&spend, 0);
     tf.push_instr_expect_mempool_contains(&spend, 0);
@@ -1825,7 +1833,7 @@ fn crosslink_tx_spending_chain_and_mempool_outputs_in_mixed_order() {
     let mut coinbases = matured_coinbases(&mut tf, &mut gen, &key, 3);
     let (second_chain, first_chain, parent_input) = (coinbases.remove(2), coinbases.remove(1), coinbases.remove(0));
 
-    let parent = transparent_spend(&key, parent_input);
+    let parent = transparent_spend(gen.next_upgrade(), &key, parent_input);
     let from_mempool = (zebra_chain::transparent::OutPoint::from_usize(parent.hash(), 0), parent.outputs()[0].clone());
     let inputs = [first_chain, from_mempool, second_chain];
     // the three inputs hold different amounts, so a signature checked against the wrong one fails
@@ -1838,8 +1846,8 @@ fn crosslink_tx_spending_chain_and_mempool_outputs_in_mixed_order() {
     let outputs = |fee: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>| {
         vec![zebra_chain::transparent::Output::new((total - fee).expect("the inputs cover the fee"), key.lock_script())]
     };
-    let fee = mempool_fee(&signed_tx(Some(&key), &inputs, outputs(zebra_chain::amount::Amount::zero()), None, 0));
-    let mixed = signed_tx(Some(&key), &inputs, outputs(fee), None, 0);
+    let fee = mempool_fee(&signed_tx(gen.next_upgrade(), Some(&key), &inputs, outputs(zebra_chain::amount::Amount::zero()), None, 0));
+    let mixed = signed_tx(gen.next_upgrade(), Some(&key), &inputs, outputs(fee), None, 0);
 
     tf.push_instr_submit_tx(&parent, 0);
     tf.push_instr_expect_mempool_contains(&parent, 0);
@@ -1878,7 +1886,7 @@ fn crosslink_mempool_and_staking_state_instructions() {
 
     // a spend arriving from a peer reaches the mempool and leaves it when mined, and a mined
     // transaction is not a rejected one
-    let spend = transparent_spend(&key, mature(&mut gen, &mut tf));
+    let spend = transparent_spend(gen.next_upgrade(), &key, mature(&mut gen, &mut tf));
     let wire = zebra_network::wire::tx_message_bytes(&network, zebra_chain::transaction::UnminedTx::from(spend.clone()))
         .expect("a transaction frames");
     tf.push_instr_recv_tx_wire(&wire, 0, 0);
@@ -1888,7 +1896,7 @@ fn crosslink_mempool_and_staking_state_instructions() {
     tf.push_instr_expect_mempool_rejected(&spend, SHOULD_FAIL);
 
     // a forged signature is refused and lands in the rejected set
-    let forged = forged_signature(&transparent_spend(&key, mature(&mut gen, &mut tf)));
+    let forged = forged_signature(&transparent_spend(gen.next_upgrade(), &key, mature(&mut gen, &mut tf)));
     tf.push_instr_submit_tx(&forged, SHOULD_FAIL);
     tf.push_instr_expect_mempool_rejected(&forged, 0);
 
@@ -1901,7 +1909,7 @@ fn crosslink_mempool_and_staking_state_instructions() {
     let input = mature(&mut gen, &mut tf);
     tf.push_instr_expect_pool_totals(0, 0, TEST_STAKE_IGNORED, 0);
     tf.push_instr_expect_finalizer_bank(target_pub_key, 0, 0);
-    let bond = staking_tx_create_bond_funded(b"funded-bond", target, 100_000_000, &key, input);
+    let bond = staking_tx_create_bond_funded(gen.next_upgrade(), b"funded-bond", target, 100_000_000, &key, input);
     let bond_key = bond.staking_action().expect("a staking transaction").bond_key();
     tf.push_instr_expect_bond(bond_key, TF_BOND_ABSENT, TEST_STAKE_IGNORED, 0);
     tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &[bond]), 0);
@@ -1966,7 +1974,7 @@ fn crosslink_honest_block_accepted_after_forged_body_with_its_hash() {
             tf.push_instr_load_pow(&gen.next_block(&miner), 0);
             chain_length += 1;
         }
-        let spend = transparent_spend(&key, gen.mature_coinbase_for(&key).expect("matured above"));
+        let spend = transparent_spend(gen.next_upgrade(), &key, gen.mature_coinbase_for(&key).expect("matured above"));
         let honest = gen.next_block_with_txs(&miner, &[spend]);
         let forged = with_forged_signature(&honest);
         assert_eq!(forged.hash(), honest.hash());
@@ -1981,7 +1989,7 @@ fn crosslink_honest_block_accepted_after_forged_body_with_its_hash() {
         tf.push_instr_load_pow(&gen.next_block(&miner), 0);
         chain_length += 1;
     }
-    let spend = transparent_spend(&key, gen.mature_coinbase_for(&key).expect("matured above"));
+    let spend = transparent_spend(gen.next_upgrade(), &key, gen.mature_coinbase_for(&key).expect("matured above"));
     let honest = gen.next_block_with_txs(&miner, &[spend]);
     tf.push_instr_load_pow(&with_forged_signature(&honest), SHOULD_FAIL);
     tf.push_instr_load_pow(&honest, 0);
@@ -2201,13 +2209,14 @@ fn crosslink_invalid_header_kills_peer_and_orphans_answer_at_once() {
 // reason: consensus verifies the action's signature against it (check::staking_action_signature),
 // so `bond_seed` names a key rather than supplying the pubkey bytes directly.
 fn staking_tx_create_bond(
+    upgrade: NetworkUpgrade,
     bond_seed: &[u8],
     target_finalizer: zcash_primitives::bft::FinalizerAddress,
     amount_zats: u64,
 ) -> Arc<Transaction> {
     use zcash_primitives::transaction::StakingAction;
 
-    signed_staking_tx(bond_seed, 0, |unique_pubkey, signature| StakingAction::CreateNewDelegationBond {
+    signed_staking_tx(upgrade, bond_seed, 0, |unique_pubkey, signature| StakingAction::CreateNewDelegationBond {
         amount_zats,
         unique_pubkey,
         bond_salt: [0; 32],
@@ -2221,11 +2230,12 @@ fn staking_tx_create_bond(
 /// signature to find the sighash, then again with the real one. `expiry_height` only tells apart
 /// transactions that would otherwise be identical; 0 means none.
 fn signed_staking_tx(
+    upgrade: NetworkUpgrade,
     bond_seed: &[u8],
     expiry_height: u32,
     action: impl Fn([u8; 32], [u8; 64]) -> zcash_primitives::transaction::StakingAction,
 ) -> Arc<Transaction> {
-    signed_tx(None, &[], Vec::new(), Some((bond_seed, &action)), expiry_height)
+    signed_tx(upgrade, None, &[], Vec::new(), Some((bond_seed, &action)), expiry_height)
 }
 
 /// A transparent key a test holds. BlockGen can mine to its address, so the test can spend what
@@ -2286,7 +2296,12 @@ impl TestKey {
 /// Signing order doesn't matter: the staking action signs the sighash with no input selected,
 /// which commits to the inputs' outpoints and amounts but not their unlock scripts, and each input
 /// signs a sighash that covers the staking action without its signature.
+///
+/// `upgrade` must be the network upgrade at the height of the block the transaction goes in: its
+/// consensus branch id is signed over and checked. `BlockGen::next_upgrade` gives it for the next
+/// block.
 fn signed_tx(
+    upgrade: NetworkUpgrade,
     key: Option<&TestKey>,
     inputs: &[(zebra_chain::transparent::OutPoint, zebra_chain::transparent::Output)],
     outputs: Vec<zebra_chain::transparent::Output>,
@@ -2295,10 +2310,7 @@ fn signed_tx(
 ) -> Arc<Transaction> {
     use zebra_chain::transaction::HashType;
 
-    // must match NetworkUpgrade::current at the block's height: regtest activates every upgrade
-    // at height 1, so this is the last row of REGTEST_NETWORK_UPGRADES and moves with it (NU6
-    // until 57d335cc added NU6.1 through NU6.3).
-    let network_upgrade = NetworkUpgrade::Nu6_3;
+    let network_upgrade = upgrade;
     let build = |unlock_scripts: &[zebra_chain::transparent::Script], staking_signature: [u8; 64]| {
         let inputs = inputs
             .iter()
@@ -2376,6 +2388,7 @@ fn mempool_fee(draft: &Transaction) -> zebra_chain::amount::Amount<zebra_chain::
 
 /// Spends `input` back to `key`, paying `mempool_fee`.
 fn transparent_spend(
+    upgrade: NetworkUpgrade,
     key: &TestKey,
     input: (zebra_chain::transparent::OutPoint, zebra_chain::transparent::Output),
 ) -> Arc<Transaction> {
@@ -2387,15 +2400,16 @@ fn transparent_spend(
         )]
     };
     // The conventional fee depends only on the transaction's shape, not its amounts.
-    let draft = signed_tx(Some(key), &[input.clone()], change(zebra_chain::amount::Amount::zero()), None, 0);
+    let draft = signed_tx(upgrade, Some(key), &[input.clone()], change(zebra_chain::amount::Amount::zero()), None, 0);
     let fee = mempool_fee(&draft);
-    signed_tx(Some(key), &[input], change(fee), None, 0)
+    signed_tx(upgrade, Some(key), &[input], change(fee), None, 0)
 }
 
 /// Bonds `amount_zats` to `target`, funded by `input` (locked to `key`), which also pays
 /// `mempool_fee`; the rest comes back to `key`. Unlike an input-less staking action,
 /// this pays a fee, so the mempool admits it.
 fn staking_tx_create_bond_funded(
+    upgrade: NetworkUpgrade,
     bond_seed: &[u8],
     target_finalizer: zcash_primitives::bft::FinalizerAddress,
     amount_zats: u64,
@@ -2422,24 +2436,24 @@ fn staking_tx_create_bond_funded(
         )]
     };
     // The conventional fee depends only on the transaction's shape, not its amounts.
-    let draft = signed_tx(Some(key), &[input.clone()], change(zebra_chain::amount::Amount::zero()), Some((bond_seed, &create)), 0);
+    let draft = signed_tx(upgrade, Some(key), &[input.clone()], change(zebra_chain::amount::Amount::zero()), Some((bond_seed, &create)), 0);
     let fee = mempool_fee(&draft);
-    signed_tx(Some(key), &[input], change(fee), Some((bond_seed, &create)), 0)
+    signed_tx(upgrade, Some(key), &[input], change(fee), Some((bond_seed, &create)), 0)
 }
 
-fn staking_tx_unbond(bond_seed: &[u8]) -> Arc<Transaction> {
+fn staking_tx_unbond(upgrade: NetworkUpgrade, bond_seed: &[u8]) -> Arc<Transaction> {
     use zcash_primitives::transaction::StakingAction;
 
-    signed_staking_tx(bond_seed, 0, |unique_pubkey, signature| StakingAction::BeginDelegationUnbonding {
+    signed_staking_tx(upgrade, bond_seed, 0, |unique_pubkey, signature| StakingAction::BeginDelegationUnbonding {
         unique_pubkey,
         signature,
     })
 }
 
-fn staking_tx_withdraw(bond_seed: &[u8], amount_zats: u64, expiry_height: u32) -> Arc<Transaction> {
+fn staking_tx_withdraw(upgrade: NetworkUpgrade, bond_seed: &[u8], amount_zats: u64, expiry_height: u32) -> Arc<Transaction> {
     use zcash_primitives::transaction::StakingAction;
 
-    signed_staking_tx(bond_seed, expiry_height, |unique_pubkey, signature| StakingAction::WithdrawDelegationBond {
+    signed_staking_tx(upgrade, bond_seed, expiry_height, |unique_pubkey, signature| StakingAction::WithdrawDelegationBond {
         amount_zats,
         unique_pubkey,
         signature,
@@ -2447,13 +2461,14 @@ fn staking_tx_withdraw(bond_seed: &[u8], amount_zats: u64, expiry_height: u32) -
 }
 
 fn staking_tx_retarget(
+    upgrade: NetworkUpgrade,
     bond_seed: &[u8],
     from_finalizer: zcash_primitives::bft::FinalizerAddress,
     to_finalizer: zcash_primitives::bft::FinalizerAddress,
 ) -> Arc<Transaction> {
     use zcash_primitives::transaction::StakingAction;
 
-    signed_staking_tx(bond_seed, 0, |unique_pubkey, signature| StakingAction::RetargetDelegationBond {
+    signed_staking_tx(upgrade, bond_seed, 0, |unique_pubkey, signature| StakingAction::RetargetDelegationBond {
         unique_pubkey,
         signature,
         from_finalizer,
@@ -2481,7 +2496,7 @@ fn crosslink_pow_block_with_staking_tx() {
     // (height 1 carries the reserved all-zero commitment), so this exercises both the
     // merkle root and the auth-data commitment accounting for the extra transaction
     let block_with_tx =
-        gen.next_block_with_txs(&miner_addr, &[staking_tx_create_bond(b"staking-bond", target, 0)]);
+        gen.next_block_with_txs(&miner_addr, &[staking_tx_create_bond(gen.next_upgrade(), b"staking-bond", target, 0)]);
     assert_eq!(block_with_tx.transactions.len(), 2);
     tf.push_instr_load_pow(&block_with_tx, 0);
 
@@ -2495,7 +2510,7 @@ fn crosslink_pow_block_with_staking_tx() {
     let mut tampered = gen.next_block(&miner_addr).as_ref().clone();
     tampered
         .transactions
-        .push(staking_tx_create_bond(b"staking-bond-tampered", target, 0));
+        .push(staking_tx_create_bond(gen.next_upgrade(), b"staking-bond-tampered", target, 0));
     tf.push_instr_load_pow(&tampered, SHOULD_FAIL);
     tf.push_instr_expect_pow_chain_length(5, 0);
 
@@ -2629,7 +2644,8 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
     // snapshot height 1, and the roster snapshot taken at finalization only sees bonds
     // already in the finalized state. Amount 0 as the bond can't be funded (see
     // staking_tx_create_bond).
-    let staking_tx = staking_tx_create_bond(b"newcomer-bond", target, 0);
+    let height_1_upgrade = NetworkUpgrade::current(&network, zebra_chain::block::Height(1));
+    let staking_tx = staking_tx_create_bond(height_1_upgrade, b"newcomer-bond", target, 0);
     let mut gen = BlockGen::init_at_genesis_plus_1_with_txs(
         network,
         BlockGen::REGTEST_GENESIS_HASH,
@@ -3046,7 +3062,7 @@ fn crosslink_reject_pow_block_with_oversized_staking_amount() {
     let oversized = zebra_chain::amount::MAX_MONEY as u64 + 1;
     let block = gen.next_block_with_txs(
         &miner_addr,
-        &[staking_tx_create_bond(b"oversized-bond", target, oversized)],
+        &[staking_tx_create_bond(gen.next_upgrade(), b"oversized-bond", target, oversized)],
     );
     tf.push_instr_load_pow(&block, SHOULD_FAIL);
 
@@ -3100,39 +3116,39 @@ fn crosslink_reject_action_on_a_bond_after_it_unbonds_or_withdraws_in_the_block(
     let block = gen.next_block_with_txs(
         &miner_addr,
         &[
-            staking_tx_create_bond(b"bond-a", target, 0),
-            staking_tx_create_bond(b"bond-b", target, 0),
-            staking_tx_create_bond(b"bond-c", target, 0),
+            staking_tx_create_bond(gen.next_upgrade(), b"bond-a", target, 0),
+            staking_tx_create_bond(gen.next_upgrade(), b"bond-b", target, 0),
+            staking_tx_create_bond(gen.next_upgrade(), b"bond-c", target, 0),
         ],
     );
     assert_eq!(height(&gen), CREATED);
     tf.push_instr_load_pow(&block, 0);
 
     mine_empty_until(&mut gen, &mut tf, unbond);
-    let block = gen.next_block_with_txs(&miner_addr, &[staking_tx_unbond(b"bond-a"), staking_tx_unbond(b"bond-b")]);
+    let block = gen.next_block_with_txs(&miner_addr, &[staking_tx_unbond(gen.next_upgrade(), b"bond-a"), staking_tx_unbond(gen.next_upgrade(), b"bond-b")]);
     tf.push_instr_load_pow(&block, 0);
 
     // Bond C unbonds, then retargets in the same block. Each is valid on its own here.
     let bad = gen
         .clone()
-        .next_block_with_txs(&miner_addr, &[staking_tx_unbond(b"bond-c"), staking_tx_retarget(b"bond-c", target, other)]);
+        .next_block_with_txs(&miner_addr, &[staking_tx_unbond(gen.next_upgrade(), b"bond-c"), staking_tx_retarget(gen.next_upgrade(), b"bond-c", target, other)]);
     tf.push_instr_load_pow(&bad, SHOULD_FAIL);
     tf.push_instr_expect_pow_chain_length(unbond as usize + 1, 0);
-    let block = gen.next_block_with_txs(&miner_addr, &[staking_tx_retarget(b"bond-c", target, other)]);
+    let block = gen.next_block_with_txs(&miner_addr, &[staking_tx_retarget(gen.next_upgrade(), b"bond-c", target, other)]);
     tf.push_instr_load_pow(&block, 0);
 
     mine_empty_until(&mut gen, &mut tf, withdraw);
-    let block = gen.next_block_with_txs(&miner_addr, &[staking_tx_withdraw(b"bond-b", 0, 0)]);
+    let block = gen.next_block_with_txs(&miner_addr, &[staking_tx_withdraw(gen.next_upgrade(), b"bond-b", 0, 0)]);
     tf.push_instr_load_pow(&block, 0);
 
     // Bond A withdrawn twice in one block: two transactions, told apart by their expiry.
     let bad = gen.clone().next_block_with_txs(
         &miner_addr,
-        &[staking_tx_withdraw(b"bond-a", 0, 0), staking_tx_withdraw(b"bond-a", 0, 10_000)],
+        &[staking_tx_withdraw(gen.next_upgrade(), b"bond-a", 0, 0), staking_tx_withdraw(gen.next_upgrade(), b"bond-a", 0, 10_000)],
     );
     tf.push_instr_load_pow(&bad, SHOULD_FAIL);
     tf.push_instr_expect_pow_chain_length(withdraw as usize + 1, 0);
-    let block = gen.next_block_with_txs(&miner_addr, &[staking_tx_withdraw(b"bond-a", 0, 0)]);
+    let block = gen.next_block_with_txs(&miner_addr, &[staking_tx_withdraw(gen.next_upgrade(), b"bond-a", 0, 0)]);
     tf.push_instr_load_pow(&block, 0);
     tf.push_instr_expect_pow_chain_length(withdraw as usize + 2, 0);
 
@@ -3158,7 +3174,7 @@ fn crosslink_spend_matured_coinbase_with_a_fee() {
         tf.push_instr_load_pow(&gen.next_block(&miner), 0);
     }
 
-    let spend = transparent_spend(&key, gen.mature_coinbase_for(&key).expect("matured above"));
+    let spend = transparent_spend(gen.next_upgrade(), &key, gen.mature_coinbase_for(&key).expect("matured above"));
     tf.push_instr_submit_tx(&spend, 0);
     tf.push_instr_expect_mempool_contains(&spend, 0);
 
@@ -3175,6 +3191,7 @@ fn crosslink_spend_matured_coinbase_with_a_fee() {
     );
     let bond_seed = b"funded-bond";
     let bond = staking_tx_create_bond_funded(
+        gen.next_upgrade(),
         bond_seed,
         target,
         100_000_000,
@@ -3191,6 +3208,271 @@ fn crosslink_spend_matured_coinbase_with_a_fee() {
     // being accepted is what shows the value balanced.
     let bond_key = zebra_crosslink::rng_private_public_key_from_address(bond_seed).2 .0;
     tf.push_instr_expect_bond(bond_key, TF_BOND_ACTIVE, TEST_STAKE_IGNORED, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// A regtest network for `params` with FeaturenetUpgrade1 at `height`, and the node config that
+/// gives the node the same one.
+fn network_with_featurenet_upgrade_at(params: &zcash_primitives::bft::ZcashCrosslinkParameters, height: u32) -> (Network, String) {
+    let heights = zebra_chain::parameters::testnet::ConfiguredActivationHeights {
+        featurenet_upgrade_1: Some(height),
+        ..Default::default()
+    };
+    let node_config = node_config_with_activation_heights(heights);
+    let network = test_network(params, &node_config);
+    assert_eq!(
+        NetworkUpgrade::FeaturenetUpgrade1.activation_height(&network),
+        Some(zebra_chain::block::Height(height)),
+        "the test network schedules the upgrade where the scenario puts it",
+    );
+    (network, node_config)
+}
+
+/// The staking state one block's PoS issuance acts on, and the two payout rules, written from
+/// their descriptions so the scenario below checks the node against something other than itself.
+/// Rounding follows the descriptions too: every share rounds down and the remainder goes to the
+/// biggest staker.
+///
+/// Before FeaturenetUpgrade1 (`pay_per_bond`): each active bond earns its stake-weighted share of
+/// the issuance, a roster finalizer's bank counting as stake; one tenth of a bond's share, rounded
+/// down, goes to its finalizer's bank if that finalizer is in the roster, and the bond keeps the
+/// rest; a bank keeps its whole share. From the upgrade on (`pay_split`): one tenth, rounded down,
+/// is the finalizer pool and the rest the bond pool; the bond pool is shared by active bonds and
+/// roster banks by amount; the finalizer pool by roster finalizers by stake, bonds plus bank.
+#[derive(Clone, Debug, PartialEq)]
+struct PayoutModel {
+    /// (bond key, amount, target finalizer)
+    bonds: Vec<([u8; 32], u64, [u8; 32])>,
+    banks: std::collections::BTreeMap<[u8; 32], u64>,
+}
+
+impl PayoutModel {
+    /// Finalizers with stake, biggest first, ties to the larger key; the first
+    /// ACTIVE_ROSTER_MAX_N are the roster.
+    fn ranked(&self) -> Vec<(u64, [u8; 32])> {
+        let mut stakes = std::collections::BTreeMap::<[u8; 32], u64>::new();
+        for &(_, amount, target) in &self.bonds {
+            *stakes.entry(target).or_insert(0) += amount;
+        }
+        for (&finalizer, &bank) in &self.banks {
+            if bank != 0 {
+                *stakes.entry(finalizer).or_insert(0) += bank;
+            }
+        }
+        let mut ranked: Vec<(u64, [u8; 32])> = stakes.into_iter().map(|(finalizer, stake)| (stake, finalizer)).collect();
+        ranked.sort_by(|a, b| b.cmp(a));
+        ranked
+    }
+
+    fn roster(&self) -> Vec<[u8; 32]> {
+        self.ranked().into_iter().take(zcash_primitives::bft::ACTIVE_ROSTER_MAX_N).map(|(_, finalizer)| finalizer).collect()
+    }
+
+    /// The stakers that share a pool: every bond, then every roster bank with something in it.
+    /// The biggest takes the remainder; ties go to a bond over a bank, then to the smaller key.
+    fn stakers(&self, roster: &[[u8; 32]]) -> (Vec<(bool, [u8; 32], u64)>, usize) {
+        let mut stakers: Vec<(bool, [u8; 32], u64)> = self.bonds.iter().map(|&(key, amount, _)| (false, key, amount)).collect();
+        for (&finalizer, &bank) in &self.banks {
+            if bank != 0 && roster.contains(&finalizer) {
+                stakers.push((true, finalizer, bank));
+            }
+        }
+        let biggest = (0..stakers.len())
+            .max_by(|&a, &b| {
+                let (a_bank, a_key, a_amount) = stakers[a];
+                let (b_bank, b_key, b_amount) = stakers[b];
+                a_amount.cmp(&b_amount).then(b_bank.cmp(&a_bank)).then(b_key.cmp(&a_key))
+            })
+            .expect("the scenario has stake");
+        (stakers, biggest)
+    }
+
+    fn shares(stakers: &[(bool, [u8; 32], u64)], biggest: usize, pool: u64) -> Vec<u64> {
+        let total: u64 = stakers.iter().map(|&(_, _, amount)| amount).sum();
+        let mut shares: Vec<u64> = stakers.iter().map(|&(_, _, amount)| (amount as u128 * pool as u128 / total as u128) as u64).collect();
+        let paid: u64 = shares.iter().sum();
+        shares[biggest] += pool - paid;
+        shares
+    }
+
+    fn pay_per_bond(&mut self, issuance: u64) {
+        let roster = self.roster();
+        let (stakers, biggest) = self.stakers(&roster);
+        let shares = Self::shares(&stakers, biggest, issuance);
+        let mut credits = std::collections::BTreeMap::<[u8; 32], u64>::new();
+        for (index, &(is_bank, key, _)) in stakers.iter().enumerate() {
+            let share = shares[index];
+            if is_bank {
+                *credits.entry(key).or_insert(0) += share;
+                continue;
+            }
+            let bond = self.bonds.iter_mut().find(|bond| bond.0 == key).expect("a staker that is not a bank is a bond");
+            let commission = if roster.contains(&bond.2) { share / 10 } else { 0 };
+            bond.1 += share - commission;
+            *credits.entry(bond.2).or_insert(0) += commission;
+        }
+        for (finalizer, credit) in credits {
+            *self.banks.entry(finalizer).or_insert(0) += credit;
+        }
+    }
+
+    fn pay_split(&mut self, issuance: u64) {
+        let finalizer_pool = issuance / 10;
+        let bond_pool = issuance - finalizer_pool;
+        let ranked: Vec<(u64, [u8; 32])> =
+            self.ranked().into_iter().take(zcash_primitives::bft::ACTIVE_ROSTER_MAX_N).collect();
+        let roster: Vec<[u8; 32]> = ranked.iter().map(|&(_, finalizer)| finalizer).collect();
+
+        let (stakers, biggest) = self.stakers(&roster);
+        let shares = Self::shares(&stakers, biggest, bond_pool);
+        let mut credits = std::collections::BTreeMap::<[u8; 32], u64>::new();
+        for (index, &(is_bank, key, _)) in stakers.iter().enumerate() {
+            if is_bank {
+                *credits.entry(key).or_insert(0) += shares[index];
+            } else {
+                self.bonds.iter_mut().find(|bond| bond.0 == key).expect("a staker that is not a bank is a bond").1 += shares[index];
+            }
+        }
+
+        let roster_stake: u64 = ranked.iter().map(|&(stake, _)| stake).sum();
+        let mut paid = 0;
+        for &(stake, finalizer) in &ranked {
+            let share = (stake as u128 * finalizer_pool as u128 / roster_stake as u128) as u64;
+            paid += share;
+            *credits.entry(finalizer).or_insert(0) += share;
+        }
+        *credits.entry(ranked[0].1).or_insert(0) += finalizer_pool - paid;
+
+        for (finalizer, credit) in credits {
+            *self.banks.entry(finalizer).or_insert(0) += credit;
+        }
+    }
+
+    fn expect(&self, tf: &mut TF) {
+        for &(key, amount, _) in &self.bonds {
+            tf.push_instr_expect_bond(key, TF_BOND_ACTIVE, amount, 0);
+        }
+        for (&finalizer, &bank) in &self.banks {
+            tf.push_instr_expect_finalizer_bank(finalizer, bank, 0);
+        }
+        let bonded: u64 = self.bonds.iter().map(|&(_, amount, _)| amount).sum();
+        let banked: u64 = self.banks.values().sum();
+        tf.push_instr_expect_pool_totals(bonded, 0, banked, 0);
+    }
+}
+
+/// The staking issuance of the block at `height`.
+fn pos_issuance(network: &Network, height: u32) -> u64 {
+    use zebra_chain::parameters::subsidy::{block_subsidy, pos_subsidy};
+
+    let height = zebra_chain::block::Height(height);
+    let subsidy = block_subsidy(height, network).expect("a regtest height has a subsidy");
+    u64::from(pos_subsidy(height, network, subsidy).expect("the staking share is a valid amount"))
+}
+
+/// FeaturenetUpgrade1 changes how a block's staking issuance is paid out. Thirteen finalizers have
+/// a bond each; the smallest is outside the roster of ACTIVE_ROSTER_MAX_N. The bonds are made in
+/// the block before the upgrade, which pays them under the old rule, and the upgrade block pays
+/// under the new one. After each, every bond, every bank and the pool totals are checked.
+///
+/// The roster finalizer outside the roster is what tells the rules apart: before the upgrade its
+/// bond keeps its whole share and the finalizers get less than a tenth; from the upgrade on its bond
+/// gets its share of nine tenths and the roster always gets the full tenth. With every finalizer
+/// in the roster the two rules pay the same, rounding aside.
+#[test]
+fn crosslink_payout_changes_rule_at_featurenet_upgrade_1() {
+    set_test_name(function_name!());
+    const UPGRADE: u32 = 20;
+    const FINALIZERS: usize = zcash_primitives::bft::ACTIVE_ROSTER_MAX_N + 1;
+    let (network, node_config) = network_with_featurenet_upgrade_at(&HARNESS_PARAMETERS, UPGRADE);
+    let mut tf = TF::new_with_node_config(&HARNESS_PARAMETERS, &node_config);
+
+    let key = TestKey::new(b"crosslink test miner");
+    let miner = key.address();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network.clone(), BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    let inputs = matured_coinbases(&mut tf, &mut gen, &key, FINALIZERS);
+    let height = |gen: &BlockGen| gen.tip.coinbase_height().expect("generated blocks have a height").0;
+    assert!(height(&gen) + 1 < UPGRADE - 1, "the coinbases mature before the bond block");
+    while height(&gen) + 1 < UPGRADE - 1 {
+        tf.push_instr_load_pow(&gen.next_block(&miner), 0);
+    }
+
+    // Twelve bonds of 1 ZEC and one of 0.1 ZEC, each to its own finalizer, in the block before the
+    // upgrade. Powers of 10, so the bond rule that starts with the upgrade is not in play.
+    let mut model = PayoutModel { bonds: Vec::new(), banks: Default::default() };
+    let mut bonds = Vec::new();
+    for (index, input) in inputs.into_iter().enumerate() {
+        let finalizer = zcash_primitives::bft::FinalizerAddress::create(
+            &zebra_crosslink::rng_private_public_key_from_address(format!("payout-finalizer-{index}").as_bytes()).1,
+        );
+        let amount = if index + 1 == FINALIZERS { 10_000_000 } else { 100_000_000 };
+        let bond = staking_tx_create_bond_funded(
+            gen.next_upgrade(),
+            format!("payout-bond-{index}").as_bytes(),
+            finalizer,
+            amount,
+            &key,
+            input,
+        );
+        model.bonds.push((bond.staking_action().expect("a staking transaction").bond_key(), amount, finalizer.pub_key.0));
+        bonds.push(bond);
+    }
+    assert_eq!(gen.next_upgrade(), NetworkUpgrade::Nu6_3, "the bond block is before the upgrade");
+    tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &bonds), 0);
+    model.pay_per_bond(pos_issuance(&network, UPGRADE - 1));
+    model.expect(&mut tf);
+
+    // The upgrade block. The two rules must disagree on it, or this scenario shows nothing.
+    assert_eq!(gen.next_upgrade(), NetworkUpgrade::FeaturenetUpgrade1, "the next block is the upgrade's");
+    let issuance = pos_issuance(&network, UPGRADE);
+    let mut old_rule = model.clone();
+    old_rule.pay_per_bond(issuance);
+    model.pay_split(issuance);
+    assert_ne!(old_rule, model, "the two payout rules pay this block the same, so it cannot tell them apart");
+    tf.push_instr_load_pow(&gen.next_block(&miner), 0);
+    model.expect(&mut tf);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// From FeaturenetUpgrade1 on, a new bond must be a power of 10 zats. One that is not is accepted
+/// in the block before the upgrade and refused in the upgrade block, where a power of 10 is
+/// accepted.
+#[test]
+fn crosslink_new_bonds_must_be_a_power_of_10_from_featurenet_upgrade_1() {
+    set_test_name(function_name!());
+    const UPGRADE: u32 = 10;
+    let (network, node_config) = network_with_featurenet_upgrade_at(&HARNESS_PARAMETERS, UPGRADE);
+    let mut tf = TF::new_with_node_config(&HARNESS_PARAMETERS, &node_config);
+
+    let key = TestKey::new(b"crosslink test miner");
+    let miner = key.address();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    let mut inputs = matured_coinbases(&mut tf, &mut gen, &key, 3).into_iter();
+    let height = |gen: &BlockGen| gen.tip.coinbase_height().expect("generated blocks have a height").0;
+    assert!(height(&gen) + 1 < UPGRADE - 1, "the coinbases mature before the last block before the upgrade");
+    while height(&gen) + 1 < UPGRADE - 1 {
+        tf.push_instr_load_pow(&gen.next_block(&miner), 0);
+    }
+    let target = zcash_primitives::bft::FinalizerAddress::create(
+        &zebra_crosslink::rng_private_public_key_from_address(b"power-of-10-target").1,
+    );
+    let mut bond = |gen: &BlockGen, seed: &[u8], amount: u64| {
+        staking_tx_create_bond_funded(gen.next_upgrade(), seed, target, amount, &key, inputs.next().expect("three inputs matured"))
+    };
+
+    assert_eq!(gen.next_upgrade(), NetworkUpgrade::Nu6_3);
+    let before = bond(&gen, b"before-the-upgrade", 150_000_000);
+    tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &[before]), 0);
+
+    assert_eq!(gen.next_upgrade(), NetworkUpgrade::FeaturenetUpgrade1);
+    let refused = bond(&gen, b"after-the-upgrade", 150_000_000);
+    tf.push_instr_load_pow_rejected(&gen.clone().next_block_with_txs(&miner, &[refused]), "power of 10");
+    let accepted = bond(&gen, b"after-the-upgrade-power-of-10", 100_000_000);
+    tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &[accepted]), 0);
 
     test_bytes(tf.write_to_bytes());
 }
