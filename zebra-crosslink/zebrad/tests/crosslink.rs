@@ -2650,6 +2650,88 @@ fn next_pos(
     bft
 }
 
+/// The BFT block a finalizer would propose at `bft_height` on top of `parent`, finalizing the
+/// block just below `tail`: `tail` is the sigma PoW blocks above that snapshot, as the node's own
+/// proposer takes them. Version 2 and `do_not_include_until_bc_height` carried from the parent, as
+/// the node proposes when no hardfork is scheduled at this height.
+fn bft_proposal(
+    params: &zcash_primitives::bft::ZcashCrosslinkParameters,
+    bft_height: u32,
+    parent: FatPointerToBftBlock,
+    parent_do_not_include: u64,
+    tail: &[Arc<Block>],
+) -> BftBlock {
+    let headers = tail.iter().map(|b| zebra_crosslink::bc_hdr_to_lrz(b.header.as_ref())).collect();
+    let mut block = BftBlock::try_from(params, bft_height, parent, headers).expect("a proposal over sigma linked headers");
+    block.version = 2;
+    block.do_not_include_until_bc_height = parent_do_not_include;
+    block
+}
+
+/// The bytes a proposer sends for `block`: what tenderlink carries as the proposal value.
+fn bft_proposal_value(block: &BftBlock) -> Vec<u8> {
+    block.zcash_serialize_to_vec().expect("a BFT block serializes")
+}
+
+/// The fat pointer finalizers make by precommitting `block` at BFT `height` and `round`: one
+/// signature per finalizer, each over the vote (its key, the block's hash, the height, and the
+/// round with the commit bit), with the height's vote namespace appended unless it is nil.
+/// Finalizers are named by the seeds their keys come from, as everywhere in these tests.
+fn signed_fat_pointer(
+    block: &BftBlock,
+    height: u64,
+    round: u32,
+    finalizer_seeds: &[&[u8]],
+    vote_namespace: &[u8; 32],
+) -> FatPointerToBftBlock {
+    let unsigned = FatPointerToBftBlock::from_parts(block.blake3_hash(), height, round, &[]);
+    let signatures: Vec<FatPointerSignature> = finalizer_seeds
+        .iter()
+        .map(|seed| {
+            let (_, key, pub_key) = zebra_crosslink::rng_private_public_key_from_address(seed);
+            let mut signed = pub_key.0.to_vec();
+            signed.extend_from_slice(&unsigned.vote_for_block_without_finalizer_public_key);
+            if *vote_namespace != [0; 32] {
+                signed.extend_from_slice(vote_namespace);
+            }
+            FatPointerSignature { pub_key, vote_signature: <[u8; 64]>::from(key.sign(&signed)) }
+        })
+        .collect();
+    FatPointerToBftBlock::from_parts(block.blake3_hash(), height, round, &signatures)
+}
+
+/// A fat pointer signed by these helpers verifies as the node verifies one, under the namespace it
+/// was signed for and no other. Needs no node.
+#[test]
+fn signed_fat_pointer_verifies_under_its_own_namespace_only() {
+    let (_gen, _miner, pow) = {
+        let network = regtest_network(&HARNESS_PARAMETERS);
+        let miner = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+        let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+        let mut pow = vec![gen.tip.clone()];
+        for _ in 0..HARNESS_PARAMETERS.bc_confirmation_depth_sigma {
+            pow.push(gen.next_block(&miner));
+        }
+        (gen, miner, pow)
+    };
+    let sigma = HARNESS_PARAMETERS.bc_confirmation_depth_sigma as usize;
+    let block = bft_proposal(&HARNESS_PARAMETERS, 0, FatPointerToBftBlock::null(), 0, &pow[1..1 + sigma]);
+    assert_eq!(block.version, 2);
+    let value = bft_proposal_value(&block);
+    assert_eq!(BftBlock::zcash_deserialize(&value[..]).expect("the value parses as a BFT block"), block);
+
+    let seeds: [&[u8]; 3] = [b"finalizer-0", b"finalizer-1", b"finalizer-2"];
+    let namespace = [7u8; 32];
+    for (signed_for, checked_with, verifies) in
+        [([0u8; 32], [0u8; 32], true), (namespace, namespace, true), (namespace, [0u8; 32], false), ([0u8; 32], namespace, false)]
+    {
+        let fat_ptr = signed_fat_pointer(&block, 0, 1, &seeds, &signed_for);
+        assert_eq!(fat_ptr.signatures.len(), seeds.len());
+        assert_eq!(fat_ptr.points_at_block_hash(), block.blake3_hash());
+        assert_eq!(fat_ptr.validate_signatures(&checked_with), verifies, "signed for {signed_for:?}, checked with {checked_with:?}");
+    }
+}
+
 #[test]
 fn crosslink_gen_pow_and_no_signature_no_roster_pos() {
     set_test_name(function_name!());
