@@ -3114,7 +3114,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         }
 
         // @Todo(Phillip): How long should this be?
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // An await, not a thread sleep: this loop is a tokio task, and when no tick is due every
+        // other await in it completes at once, so a thread sleep here never hands its worker back.
+        // A task woken onto that worker's next-task slot, which other workers cannot steal, then
+        // waits forever; that is how a test whose clock stood still hung with nothing blocked.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
