@@ -337,6 +337,11 @@ const MAIN_LOOP_SLEEP_INTERVAL: Duration = Duration::from_millis(125);
 pub fn run_tfl_test(internal_handle: TFLServiceHandle) {
     // EXPECT_BFT_STEP and the BFT instructions read the engine through what it publishes.
     tenderlink::PUBLISH_ENGINE_VIEW.store(true, std::sync::atomic::Ordering::Relaxed);
+    // The test supplies BFT's clock from the start. Taken over only at the first ADVANCE_TIME,
+    // the engine's first round would set its propose timeout on the real clock, at whatever
+    // real moment BFT happened to start, and a loaded machine could see that timeout expire
+    // before the test's proposal arrived.
+    zebra_debug_time::advance_instant(Duration::ZERO);
     // ensure that tests fail on panic/assert(false); otherwise tokio swallows them
     std::panic::set_hook(Box::new(|panic_info| {
         #[allow(clippy::print_stderr)]

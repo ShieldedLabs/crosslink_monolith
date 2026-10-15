@@ -277,10 +277,11 @@ impl TFInstr {
     /// mask of the chunks to send; zero sends all. Whether it counts is the node's call: it only
     /// takes a proposal from that round's proposer.
     pub const BFT_RECV_PROPOSAL: TFInstrKind = 30;
-    /// Moves the clock BFT steps and ticks run on forward by `val[0]` milliseconds. The first
-    /// use stops it following real time. Every synthetic finalizer first sends the node a status
-    /// that needs everything at the engine's height and round, and the instruction returns once
-    /// the engine has acted on the new time and everything it sent is recorded.
+    /// Moves the clock BFT steps and ticks run on forward by `val[0]` milliseconds. In a test
+    /// that clock never follows real time, so nothing else moves it. Every synthetic finalizer
+    /// first sends the node a status that needs everything at the engine's height and round, and
+    /// the instruction returns once the engine has acted on the new time and everything it sent
+    /// is recorded.
     pub const ADVANCE_TIME: TFInstrKind = 31;
     /// The engine is at height `val[0]`, round `val[1] >> 8`, step `val[1] & 0xff` (0 propose,
     /// 1 prevote, 2 precommit, 0xff any).
