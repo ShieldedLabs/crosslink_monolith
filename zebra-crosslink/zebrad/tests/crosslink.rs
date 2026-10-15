@@ -3661,8 +3661,7 @@ const BFT_TICK_MILLIS: u64 = 251;
 /// small multiple of theirs, at most half the total, so no decision is the node's alone),
 /// are picked so that the node proposes at height 1, round 0 exactly when `node_proposes`. Which
 /// member proposes follows from the stakes and keys alone, so it is known before the node runs.
-/// Returns the synthetic finalizers.
-fn bft_rounds_scene(tf: &mut TF, node_proposes: bool) -> [u16; 3] {
+fn bft_rounds_scene(tf: &mut TF, node_proposes: bool) -> BftRoundsScene {
     const STAKE: u64 = 100_000_000;
     let network = regtest_network(&BFT_ROUNDS_PARAMETERS);
     let key = TestKey::new(b"crosslink test miner");
@@ -3703,10 +3702,67 @@ fn bft_rounds_scene(tf: &mut TF, node_proposes: bool) -> [u16; 3] {
     let height = |gen: &BlockGen| gen.tip.coinbase_height().expect("generated blocks have a height").0;
     assert!(height(&gen) < 10, "the bonds land by the roster height");
     tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &bonds), 0);
+    let mut pow = Vec::new();
     while height(&gen) < 111 {
-        tf.push_instr_load_pow(&gen.next_block(&miner), 0);
+        let block = gen.next_block(&miner);
+        tf.push_instr_load_pow(&block, 0);
+        pow.push(block);
     }
-    finalizers
+    let member_pub_keys: Vec<([u8; 32], u64)> = std::iter::once((node.2 .0, node_stake))
+        .chain(finalizers.iter().map(|&k| (pub_keys[usize::from(k)], STAKE)))
+        .collect();
+    BftRoundsScene { finalizers, node_stake, total_stake: node_stake + 3 * STAKE, member_pub_keys, pow, gen, miner }
+}
+
+/// What `bft_rounds_scene` built.
+struct BftRoundsScene {
+    finalizers: [u16; 3],
+    node_stake: u64,
+    total_stake: u64,
+    /// The node first, then `finalizers` in order, as `bft_proposer` takes them.
+    member_pub_keys: Vec<([u8; 32], u64)>,
+    /// The blocks loaded after the bonds, which include every height above the roster height.
+    pow: Vec<Arc<Block>>,
+    /// At the last block loaded, for scenarios that extend the chain.
+    gen: BlockGen,
+    miner: Address,
+}
+
+impl BftRoundsScene {
+    /// The synthetic finalizer that proposes at `height` and `round`, or TF_BFT_THE_NODE.
+    fn proposer(&self, height: u64, round: u32) -> u64 {
+        let proposer = bft_proposer(&self.member_pub_keys, height, round).expect("a roster has a proposer");
+        match self.member_pub_keys.iter().position(|(pub_key, _)| *pub_key == proposer) {
+            Some(0) => TF_BFT_THE_NODE,
+            Some(i) => self.finalizers[i - 1].into(),
+            None => unreachable!("the proposer is a member"),
+        }
+    }
+
+    fn pow_at(&self, height: u32) -> &Arc<Block> {
+        self.pow
+            .iter()
+            .find(|b| b.coinbase_height().map(|h| h.0) == Some(height))
+            .expect("the scene loaded that height")
+    }
+
+    /// The BFT genesis the node decides at activation: version 2, finalizing the roster height.
+    fn genesis(&self) -> BftBlock {
+        let zcash_primitives::bft::BftBootstrap::FromChain { roster_height, .. } = BFT_ROUNDS_PARAMETERS.bootstrap else { unreachable!() };
+        bft_proposal(&BFT_ROUNDS_PARAMETERS, 0, FatPointerToBftBlock::null(), 0, &self.tail_above(roster_height))
+    }
+
+    /// The sigma blocks above `snapshot`: the headers of a BFT block finalizing it.
+    fn tail_above(&self, snapshot: u32) -> Vec<Arc<Block>> {
+        let sigma = BFT_ROUNDS_PARAMETERS.bc_confirmation_depth_sigma as u32;
+        (snapshot + 1..=snapshot + sigma).map(|h| self.pow_at(h).clone()).collect()
+    }
+
+    /// A valid height-1 proposal, on the genesis, finalizing `snapshot`.
+    fn height_1_proposal(&self, snapshot: u32) -> BftBlock {
+        let parent = FatPointerToBftBlock::from_parts(self.genesis().blake3_hash(), 0, 0, &[]);
+        bft_proposal(&BFT_ROUNDS_PARAMETERS, 1, parent, 0, &self.tail_above(snapshot))
+    }
 }
 
 /// The node proposes at height 1, round 0; three synthetic finalizers prevote and precommit its
@@ -3716,7 +3772,7 @@ fn bft_rounds_scene(tf: &mut TF, node_proposes: bool) -> [u16; 3] {
 fn crosslink_bft_round_decides_the_nodes_proposal() {
     set_test_name(function_name!());
     let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
-    let finalizers = bft_rounds_scene(&mut tf, true);
+    let finalizers = bft_rounds_scene(&mut tf, true).finalizers;
 
     tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
     tf.push_instr_expect_bft_proposer(TF_BFT_THE_NODE, 1, 0, 0);
@@ -3749,7 +3805,7 @@ fn crosslink_bft_round_decides_the_nodes_proposal() {
 fn crosslink_bft_votes_under_the_wrong_namespace_do_not_count() {
     set_test_name(function_name!());
     let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
-    let finalizers = bft_rounds_scene(&mut tf, true);
+    let finalizers = bft_rounds_scene(&mut tf, true).finalizers;
 
     tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
     tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
@@ -3761,6 +3817,56 @@ fn crosslink_bft_votes_under_the_wrong_namespace_do_not_count() {
     tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
     tf.push_instr_expect_bft_step(1, 0, Some(TMStep::Precommit), SHOULD_FAIL);
     tf.push_instr_expect_bft_sent(1, 1, 0, None, SHOULD_FAIL);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// The real-node form of tenderlink's line49 split: the round's proposer gives the node one value,
+/// B, and every other finalizer precommits another, A. Those precommits are a quorum without the
+/// node, so A is decided whatever the node holds; the node must give up B, take A when it
+/// arrives, and decide it. Deciding B instead, or nothing, splits the node off the chain.
+#[test]
+fn crosslink_bft_node_given_another_value_decides_what_the_rest_precommitted() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let mut scene = bft_rounds_scene(&mut tf, false);
+    assert!(
+        3 * (scene.total_stake - scene.node_stake) > 2 * scene.total_stake,
+        "the synthetic finalizers are a quorum without the node"
+    );
+    let proposer = scene.proposer(1, 0);
+    let proposer = u16::try_from(proposer).expect("the node does not propose");
+
+    let value_a = bft_proposal_value(&scene.height_1_proposal(20));
+    let value_b = bft_proposal_value(&scene.height_1_proposal(30));
+    let (id_a, id_b) = (bft_value_id(&value_a), bft_value_id(&value_b));
+
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_proposer(proposer.into(), 1, 0, 0);
+    tf.push_instr_bft_recv_proposal(proposer, 1, 0, -1, 0, &value_b, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    // B is a valid proposal, so the node holds it: without this, an invalid B would leave nothing
+    // to give up.
+    tf.push_instr_expect_bft_sent(0, 1, 0, Some(&id_b), 0);
+
+    for k in scene.finalizers {
+        tf.push_instr_bft_recv_vote(k, TF_BFT_PRECOMMIT, 1, 0, &id_a, 0);
+    }
+    tf.push_instr_bft_recv_proposal(proposer, 1, 0, -1, 0, &value_a, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_step(2, 0, None, 0);
+    // Which value was decided shows in fin, which moves only once the best chain's tip cites the
+    // decision. A tip citing A, under the precommits the synthetic finalizers sent, moves fin to
+    // A's snapshot only if the node holds A as decided: a node that decided B has no BFT block
+    // with A's hash for that citation to name.
+    let seeds: Vec<String> = scene.finalizers.iter().map(|&k| synthetic_finalizer_seed(k.into())).collect();
+    let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
+    let decided = signed_fat_pointer(&scene.height_1_proposal(20), 1, 0, &seeds, &[0; 32]);
+    let (miner, gen) = (scene.miner.clone(), &mut scene.gen);
+    gen.next_block(&miner);
+    tf.push_instr_load_pow(&point_tip_at_bft(gen, &decided), 0);
+    tf.push_instr_expect_finalized_tip(Some(&scene.pow_at(20).hash()), 0);
 
     test_bytes(tf.write_to_bytes());
 }
