@@ -6,6 +6,7 @@ use zerocopy::*;
 use zerocopy_derive::*;
 
 use zcash_primitives::bft::*;
+pub use tenderlink::TMStep;
 
 pub struct BftBlockAndFatPointerToItWrap(pub BftBlockAndFatPointerToIt);
 impl ZcashDeserialize for BftBlockAndFatPointerToItWrap {
@@ -77,6 +78,51 @@ pub const TF_BOND_WITHDRAWN: u64 = 2;
 pub const TF_BOND_BURNED: u64 = 3;
 pub const TF_BOND_ABSENT: u64 = 255;
 
+/// BFT_RECV_VOTE bits, above the finalizer index in `val[0]`.
+pub const TF_BFT_PRECOMMIT: u64 = 1 << 32;
+pub const TF_BFT_NIL: u64 = 1 << 33;
+pub const TF_BFT_FOR_NODE_PROPOSAL: u64 = 1 << 34;
+pub const TF_BFT_WRONG_NAMESPACE: u64 = 1 << 35;
+/// EXPECT_BFT_PROPOSER's name for the node itself.
+pub const TF_BFT_THE_NODE: u64 = u64::MAX;
+/// EXPECT_BFT_STEP's step for any step.
+pub const TF_BFT_ANY_STEP: u64 = 0xff;
+/// The node's own finalizer identity seed, unless a test's node config names one.
+pub const TEST_NODE_FINALIZER_SEED: &str = "crosslink test node finalizer";
+
+/// The seed synthetic finalizer `k` derives its key from, with `finalizer_key_from_seed`.
+pub fn synthetic_finalizer_seed(k: u64) -> String {
+    format!("crosslink test finalizer {k}")
+}
+
+/// The id tenderlink gives a proposal of `value`.
+pub fn bft_value_id(value: &[u8]) -> [u8; 32] {
+    tenderlink::value_id_of(&HashKeys::default(), value).0
+}
+
+/// The finalizer that proposes at `height` and `round` when the roster is `members` (finalizer
+/// key, stake), by the node's own roster ordering and proposer choice. For writing a scenario
+/// that has to know who proposes before the node runs.
+pub fn bft_proposer(members: &[([u8; 32], u64)], height: u64, round: u32) -> Option<[u8; 32]> {
+    let members: Vec<zcash_primitives::transaction::RosterMember> = members
+        .iter()
+        .map(|&(pub_key, voting_power)| zcash_primitives::transaction::RosterMember { pub_key, voting_power, ..Default::default() })
+        .collect();
+    let roster = zebra_state::new_network::bft::tenderlink_roster_from_internal(&members, &Default::default());
+    let proposer_i = tenderlink::proposer_index(&HashKeys::default(), &roster, height, round)?;
+    Some(roster[proposer_i].pub_key.0)
+}
+
+/// The public key of synthetic finalizer `k`.
+pub fn synthetic_finalizer_pub_key(k: u64) -> [u8; 32] {
+    finalizer_key_from_seed(synthetic_finalizer_seed(k).as_bytes()).2 .0
+}
+
+/// `height << 32 | round`, as the BFT instructions take them.
+pub const fn bft_height_round(height: u64, round: u32) -> u64 {
+    height << 32 | round as u64
+}
+
 static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     let mut strs = [""; TFInstr::COUNT as usize];
     strs[TFInstr::LOAD_POW as usize] = "LOAD_POW";
@@ -107,8 +153,15 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::SET_TIME as usize] = "SET_TIME";
     strs[TFInstr::CALL_RPC as usize] = "CALL_RPC";
     strs[TFInstr::EXPECT_STAKING_REPLAY_MATCHES as usize] = "EXPECT_STAKING_REPLAY_MATCHES";
+    strs[TFInstr::BFT_RECV_PACKET as usize] = "BFT_RECV_PACKET";
+    strs[TFInstr::BFT_RECV_VOTE as usize] = "BFT_RECV_VOTE";
+    strs[TFInstr::BFT_RECV_PROPOSAL as usize] = "BFT_RECV_PROPOSAL";
+    strs[TFInstr::ADVANCE_TIME as usize] = "ADVANCE_TIME";
+    strs[TFInstr::EXPECT_BFT_STEP as usize] = "EXPECT_BFT_STEP";
+    strs[TFInstr::EXPECT_BFT_SENT as usize] = "EXPECT_BFT_SENT";
+    strs[TFInstr::EXPECT_BFT_PROPOSER as usize] = "EXPECT_BFT_PROPOSER";
 
-    const_assert!(TFInstr::COUNT == 28);
+    const_assert!(TFInstr::COUNT == 35);
     strs
 };
 
@@ -203,7 +256,43 @@ impl TFInstr {
     /// schedule and slash window. Catches state the node accumulated that the chain does not
     /// imply, such as a reward paid twice.
     pub const EXPECT_STAKING_REPLAY_MATCHES: TFInstrKind = 27;
-    pub const COUNT: TFInstrKind = 28;
+
+    // BFT rounds. The node's own BFT engine runs once BFT starts (a FromChain bootstrap in
+    // SET_PARAMS, with the node's finalizer bonded). Synthetic finalizer `k` holds the key from
+    // `synthetic_finalizer_seed(k)` and is connected to the engine on first use, after the
+    // transport. Heights and rounds are packed into one value as `height << 32 | round`.
+    // Signatures use the vote namespace of the engine's height at its last tick.
+
+    /// A tenderlink packet (the data, header first) arriving from synthetic finalizer `val[0]`.
+    /// Fails when the node disconnects the peer for it; any other handling passes.
+    pub const BFT_RECV_PACKET: TFInstrKind = 28;
+    /// A prevote or precommit by synthetic finalizer `val[0] & 0xffff` at `val[1]`, for the
+    /// value id in the data. The `TF_BFT_*` bits of `val[0]` make it a precommit, a nil vote, a
+    /// vote for the proposal the node sent at that height and round, or one signed under the
+    /// wrong namespace. Fails when the finalizer is not on the engine's roster or the node
+    /// disconnects it.
+    pub const BFT_RECV_VOTE: TFInstrKind = 29;
+    /// The proposal in the data, chunked and signed by synthetic finalizer `val[0] & 0xffff` at
+    /// `val[1]`, with valid round `((val[0] >> 16) & 0xffff) - 1`. A non-zero `val[0] >> 32` is a
+    /// mask of the chunks to send; zero sends all. Whether it counts is the node's call: it only
+    /// takes a proposal from that round's proposer.
+    pub const BFT_RECV_PROPOSAL: TFInstrKind = 30;
+    /// Moves the clock BFT steps and ticks run on forward by `val[0]` milliseconds. The first
+    /// use stops it following real time. Every synthetic finalizer first sends the node a status
+    /// that needs everything at the engine's height and round, and the instruction returns once
+    /// the engine has acted on the new time and everything it sent is recorded.
+    pub const ADVANCE_TIME: TFInstrKind = 31;
+    /// The engine is at height `val[0]`, round `val[1] >> 8`, step `val[1] & 0xff` (0 propose,
+    /// 1 prevote, 2 precommit, 0xff any).
+    pub const EXPECT_BFT_STEP: TFInstrKind = 32;
+    /// The node has sent, since the test began, its own vote or proposal of kind `val[0]` (0
+    /// prevote, 1 precommit, 2 proposal) at `val[1]`, for the value id in the data; with no data,
+    /// a nil vote, or a proposal of any value. With SHOULD_FAIL, that it has sent no such thing.
+    pub const EXPECT_BFT_SENT: TFInstrKind = 33;
+    /// The proposer at `val[1]` is synthetic finalizer `val[0]`, or the node when `val[0]` is
+    /// `TF_BFT_THE_NODE`.
+    pub const EXPECT_BFT_PROPOSER: TFInstrKind = 34;
+    pub const COUNT: TFInstrKind = 35;
 
     pub fn str_from_kind(kind: TFInstrKind) -> &'static str {
         let kind = kind as usize;
@@ -289,6 +378,38 @@ impl TFInstr {
             Some(TestInstr::SetTime(unix_time)) => str += &unix_time.to_string(),
             Some(TestInstr::CallRpc { method, params }) => str += &format!("{method} {params}"),
             Some(TestInstr::ExpectStakingReplayMatches) => {}
+            Some(TestInstr::BftRecvPacket { packet, finalizer }) => {
+                str += &format!("{} bytes from finalizer {finalizer}", packet.len())
+            }
+            Some(TestInstr::BftRecvVote { finalizer, bits, height, round, value_id }) => {
+                str += &format!(
+                    "{} by finalizer {finalizer} at {height}.{round} for {}{}",
+                    if bits & TF_BFT_PRECOMMIT != 0 { "precommit" } else { "prevote" },
+                    if bits & TF_BFT_NIL != 0 {
+                        "nil".to_string()
+                    } else if bits & TF_BFT_FOR_NODE_PROPOSAL != 0 {
+                        "the node's proposal".to_string()
+                    } else {
+                        value_id.map_or("nil".to_string(), |v| hex32(&v))
+                    },
+                    if bits & TF_BFT_WRONG_NAMESPACE != 0 { ", wrong namespace" } else { "" },
+                )
+            }
+            Some(TestInstr::BftRecvProposal { finalizer, height, round, valid_round, chunk_mask, value }) => {
+                str += &format!(
+                    "{} by finalizer {finalizer} at {height}.{round}, valid round {valid_round}, chunks {}",
+                    hex32(&bft_value_id(&value)),
+                    if chunk_mask == 0 { "all".to_string() } else { format!("{chunk_mask:#x}") },
+                )
+            }
+            Some(TestInstr::AdvanceTime { millis }) => str += &format!("{millis} ms"),
+            Some(TestInstr::ExpectBftStep { height, round, step }) => str += &format!("{height}.{round} step {step}"),
+            Some(TestInstr::ExpectBftSent { kind, height, round, value_id }) => {
+                str += &format!("kind {kind} at {height}.{round} for {}", value_id.map_or("none".to_string(), |v| hex32(&v)))
+            }
+            Some(TestInstr::ExpectBftProposer { finalizer, height, round }) => {
+                str += &format!("finalizer {finalizer} at {height}.{round}")
+            }
             Some(TestInstr::ExpectPoWTip { hash, slot }) | Some(TestInstr::ExpectFinalizedTip { hash, slot }) => {
                 str += &match hash {
                     Some(hash) => hash.to_string(),
@@ -632,6 +753,49 @@ impl TF {
         self.push_instr_ex(TFInstr::SET_TIME, flags, &[0; 0], [unix_time, 0])
     }
 
+    pub fn push_instr_bft_recv_packet(&mut self, finalizer: u64, packet: &[u8], flags: u32) {
+        self.push_instr_ex(TFInstr::BFT_RECV_PACKET, flags, packet, [finalizer, 0])
+    }
+
+    /// `value_id` is ignored with TF_BFT_NIL or TF_BFT_FOR_NODE_PROPOSAL in `bits`.
+    pub fn push_instr_bft_recv_vote(&mut self, finalizer: u16, bits: u64, height: u64, round: u32, value_id: &[u8; 32], flags: u32) {
+        let data: &[u8] = if bits & (TF_BFT_NIL | TF_BFT_FOR_NODE_PROPOSAL) != 0 { &[] } else { value_id };
+        self.push_instr_ex(TFInstr::BFT_RECV_VOTE, flags, data, [u64::from(finalizer) | bits, bft_height_round(height, round)])
+    }
+
+    /// `chunk_mask` 0 sends every chunk; `valid_round` is -1 for none.
+    pub fn push_instr_bft_recv_proposal(&mut self, finalizer: u16, height: u64, round: u32, valid_round: i64, chunk_mask: u32, value: &[u8], flags: u32) {
+        let valid_round = u64::try_from(valid_round + 1).unwrap_or(0) & 0xffff;
+        let val0 = u64::from(finalizer) | valid_round << 16 | u64::from(chunk_mask) << 32;
+        self.push_instr_ex(TFInstr::BFT_RECV_PROPOSAL, flags, value, [val0, bft_height_round(height, round)])
+    }
+
+    pub fn push_instr_advance_time(&mut self, millis: u64, flags: u32) {
+        self.push_instr_ex(TFInstr::ADVANCE_TIME, flags, &[0; 0], [millis, 0])
+    }
+
+    /// `step` is `None` for any step.
+    pub fn push_instr_expect_bft_step(&mut self, height: u64, round: u32, step: Option<tenderlink::TMStep>, flags: u32) {
+        let step = match step {
+            Some(tenderlink::TMStep::Propose) => 0,
+            Some(tenderlink::TMStep::Prevote) => 1,
+            Some(tenderlink::TMStep::Precommit) => 2,
+            None => TF_BFT_ANY_STEP,
+        };
+        self.push_instr_ex(TFInstr::EXPECT_BFT_STEP, flags, &[0; 0], [height, u64::from(round) << 8 | step])
+    }
+
+    /// `kind` 0 prevote, 1 precommit, 2 proposal. `None` is a nil vote, or a proposal of any value.
+    pub fn push_instr_expect_bft_sent(&mut self, kind: u64, height: u64, round: u32, value_id: Option<&[u8; 32]>, flags: u32) {
+        let data: &[u8] = match value_id { Some(value_id) => value_id, None => &[] };
+        self.push_instr_ex(TFInstr::EXPECT_BFT_SENT, flags, data, [kind, bft_height_round(height, round)])
+    }
+
+    /// `finalizer` is a synthetic finalizer's index, or TF_BFT_THE_NODE.
+    pub fn push_instr_expect_bft_proposer(&mut self, finalizer: u64, height: u64, round: u32, flags: u32) {
+        self.push_instr_ex(TFInstr::EXPECT_BFT_PROPOSER, flags, &[0; 0], [finalizer, bft_height_round(height, round)])
+    }
+
     /// A block the node must reject for `reason`, and must survive rejecting: the load, the
     /// reason check, and the liveness check, as three instructions.
     pub fn push_instr_load_pow_rejected(&mut self, block: &Block, reason: &str) {
@@ -970,7 +1134,7 @@ pub fn crosslink_parameters_for_test(bytes: &[u8]) -> ZcashCrosslinkParameters {
 }
 
 pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> {
-    const_assert!(TFInstr::COUNT == 28);
+    const_assert!(TFInstr::COUNT == 35);
     match instr.kind {
         TFInstr::LOAD_POW => {
             let block = Block::zcash_deserialize(instr.data_slice(bytes)).ok()?;
@@ -1074,6 +1238,45 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
             Some(TestInstr::CallRpc { method: method.to_string(), params: params.to_string() })
         }
         TFInstr::EXPECT_STAKING_REPLAY_MATCHES => Some(TestInstr::ExpectStakingReplayMatches),
+        TFInstr::BFT_RECV_PACKET => Some(TestInstr::BftRecvPacket { packet: instr.data_slice(bytes).to_vec(), finalizer: instr.val[0] }),
+        TFInstr::BFT_RECV_VOTE => {
+            let data = instr.data_slice(bytes);
+            Some(TestInstr::BftRecvVote {
+                finalizer: instr.val[0] & 0xffff,
+                bits: instr.val[0] & !0xffff,
+                height: instr.val[1] >> 32,
+                round: instr.val[1] as u32,
+                value_id: if data.is_empty() { None } else { Some(data.try_into().ok()?) },
+            })
+        }
+        TFInstr::BFT_RECV_PROPOSAL => Some(TestInstr::BftRecvProposal {
+            finalizer: instr.val[0] & 0xffff,
+            height: instr.val[1] >> 32,
+            round: instr.val[1] as u32,
+            valid_round: ((instr.val[0] >> 16) & 0xffff) as i64 - 1,
+            chunk_mask: (instr.val[0] >> 32) as u32,
+            value: instr.data_slice(bytes).to_vec(),
+        }),
+        TFInstr::ADVANCE_TIME => Some(TestInstr::AdvanceTime { millis: instr.val[0] }),
+        TFInstr::EXPECT_BFT_STEP => Some(TestInstr::ExpectBftStep {
+            height: instr.val[0],
+            round: u32::try_from(instr.val[1] >> 8).ok()?,
+            step: instr.val[1] & 0xff,
+        }),
+        TFInstr::EXPECT_BFT_SENT => {
+            let data = instr.data_slice(bytes);
+            Some(TestInstr::ExpectBftSent {
+                kind: instr.val[0],
+                height: instr.val[1] >> 32,
+                round: instr.val[1] as u32,
+                value_id: if data.is_empty() { None } else { Some(data.try_into().ok()?) },
+            })
+        }
+        TFInstr::EXPECT_BFT_PROPOSER => Some(TestInstr::ExpectBftProposer {
+            finalizer: instr.val[0],
+            height: instr.val[1] >> 32,
+            round: instr.val[1] as u32,
+        }),
         TFInstr::EXPECT_POW_TIP | TFInstr::EXPECT_FINALIZED_TIP => {
             let data = instr.data_slice(bytes);
             let hash = if data.is_empty() { None } else { Some(ZebBlockHash(data.try_into().ok()?)) };
@@ -1128,6 +1331,14 @@ pub(crate) enum TestInstr {
     SetTime(u64),
     CallRpc { method: String, params: String },
     ExpectStakingReplayMatches,
+    BftRecvPacket { packet: Vec<u8>, finalizer: u64 },
+    /// `bits` are the TF_BFT_* bits; `value_id` is `None` when the data was empty.
+    BftRecvVote { finalizer: u64, bits: u64, height: u64, round: u32, value_id: Option<[u8; 32]> },
+    BftRecvProposal { finalizer: u64, height: u64, round: u32, valid_round: i64, chunk_mask: u32, value: Vec<u8> },
+    AdvanceTime { millis: u64 },
+    ExpectBftStep { height: u64, round: u32, step: u64 },
+    ExpectBftSent { kind: u64, height: u64, round: u32, value_id: Option<[u8; 32]> },
+    ExpectBftProposer { finalizer: u64, height: u64, round: u32 },
     RosterForceInclude([u8; 32], u64),   // public address
     ExpectRosterIncludes([u8; 32], u64), // public address
 }
@@ -1139,6 +1350,19 @@ pub(crate) async fn handle_instr(
     flags: u32,
     instr_i: usize,
 ) {
+    let is_bft = matches!(
+        instr,
+        TestInstr::BftRecvPacket { .. }
+            | TestInstr::BftRecvVote { .. }
+            | TestInstr::BftRecvProposal { .. }
+            | TestInstr::AdvanceTime { .. }
+            | TestInstr::ExpectBftStep { .. }
+            | TestInstr::ExpectBftSent { .. }
+            | TestInstr::ExpectBftProposer { .. }
+    );
+    if is_bft {
+        bft_await_start(internal_handle).await;
+    }
     match instr {
         TestInstr::LoadPoW(block) => {
             // let path = format!("../crosslink-test-data/test_pow_block_{}.bin", instr_i);
@@ -1242,6 +1466,155 @@ pub(crate) async fn handle_instr(
             };
             test_check(flags, true, &message);
         }
+
+        TestInstr::BftRecvPacket { packet, finalizer } => {
+            let (survived, message) = bft_deliver(finalizer, vec![packet]).await;
+            test_check(flags, survived, &format!("BFT_RECV_PACKET: {message}"));
+        }
+
+        TestInstr::BftRecvVote { finalizer, bits, height, round, value_id } => {
+            let is_precommit = bits & TF_BFT_PRECOMMIT != 0;
+            let packet = bft_engine_view().and_then(|view| {
+                let key = synthetic_finalizer_key(finalizer);
+                let roster_i = roster_index(&view.roster, &key)
+                    .ok_or_else(|| format!("synthetic finalizer {finalizer} is not on the engine's roster"))?;
+                let value_id = if bits & TF_BFT_NIL != 0 {
+                    tenderlink::ValueId::NIL
+                } else if bits & TF_BFT_FOR_NODE_PROPOSAL != 0 {
+                    node_proposal_id(internal_handle, &view, height, round)
+                        .ok_or_else(|| format!("the node has sent no proposal at {height}.{round}"))?
+                } else {
+                    value_id.map_or(tenderlink::ValueId::NIL, tenderlink::ValueId)
+                };
+                let mut namespace = view.vote_namespace;
+                if bits & TF_BFT_WRONG_NAMESPACE != 0 {
+                    namespace[0] ^= 1;
+                }
+                Ok(tenderlink::vote_packet(&key, roster_i as u16, is_precommit, height, round, value_id, &namespace))
+            });
+            match packet {
+                Err(err) => test_check_outcome(false, false, &format!("BFT_RECV_VOTE: {err}")),
+                Ok(packet) => {
+                    let (survived, message) = bft_deliver(finalizer, vec![packet]).await;
+                    test_check(flags, survived, &format!("BFT_RECV_VOTE: {message}"));
+                }
+            }
+        }
+
+        TestInstr::BftRecvProposal { finalizer, height, round, valid_round, chunk_mask, value } => {
+            match bft_engine_view() {
+                Err(err) => test_check_outcome(false, false, &format!("BFT_RECV_PROPOSAL: {err}")),
+                Ok(view) => {
+                    let key = synthetic_finalizer_key(finalizer);
+                    let value_id = tenderlink::value_id_of(&view.hash_keys, &value);
+                    let packets: Vec<Vec<u8>> = tenderlink::proposal_chunk_packets(
+                        &key, &value, value_id, height, round, valid_round, &view.vote_namespace, view.roster.len(),
+                    )
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(chunk_i, _)| chunk_mask == 0 || (*chunk_i < 32 && chunk_mask & (1 << chunk_i) != 0))
+                    .map(|(_, packet)| packet)
+                    .collect();
+                    let (survived, message) = bft_deliver(finalizer, packets).await;
+                    test_check(flags, survived, &format!("BFT_RECV_PROPOSAL: {message}"));
+                }
+            }
+        }
+
+        TestInstr::AdvanceTime { millis } => {
+            // Every synthetic finalizer on the roster is connected, so whatever the node sends a
+            // finalizer reaches the record whether or not the test has used that one yet. The
+            // engine takes the connections and statuses in before the clock moves: a tick that
+            // ran first would answer peers it does not have yet.
+            let mut settled = Ok(());
+            if let Ok(view) = bft_engine_view() {
+                let status = tenderlink::status_packet_needing_everything(view.height, view.round, view.roster.len());
+                {
+                    let mut peers = TEST_BFT_PEERS.lock().unwrap();
+                    for k in 0..SYNTHETIC_FINALIZERS_MAX_N {
+                        if roster_index(&view.roster, &synthetic_finalizer_key(k.into())).is_some() {
+                            bft_peer_index(&mut peers, k);
+                        }
+                    }
+                    for peer in peers.iter() {
+                        let _ = peer.link.inbound.send(status.clone());
+                    }
+                }
+                settled = bft_settle().await;
+            }
+            zebra_debug_time::advance_instant(Duration::from_millis(millis));
+            if !bft_engine_running() {
+                test_check(flags, true, &format!("ADVANCE_TIME: the clock moved {millis} ms; BFT is not running"));
+            } else {
+                match settled.and(bft_settle().await) {
+                    Ok(()) => test_check(flags, true, &format!("ADVANCE_TIME: the clock moved {millis} ms and the engine caught up")),
+                    Err(err) => test_check_outcome(false, false, &format!("ADVANCE_TIME: {err}")),
+                }
+            }
+        }
+
+        TestInstr::ExpectBftStep { height, round, step } => match bft_engine_view() {
+            Err(err) => test_check_outcome(false, false, &format!("BFT step: {err}")),
+            Ok(view) => {
+                let actual_step = match view.step {
+                    tenderlink::TMStep::Propose => 0,
+                    tenderlink::TMStep::Prevote => 1,
+                    tenderlink::TMStep::Precommit => 2,
+                };
+                let holds = view.height == height && view.round == round && (step == TF_BFT_ANY_STEP || step == actual_step);
+                test_check(flags, holds, &format!(
+                    "BFT step: expected {height}.{round} step {step}, the engine is at {}.{} {:?}",
+                    view.height, view.round, view.step,
+                ));
+            }
+        },
+
+        TestInstr::ExpectBftSent { kind, height, round, value_id } => {
+            let settled = if bft_engine_running() { bft_settle().await } else { Ok(()) };
+            match settled.and_then(|()| bft_engine_view()) {
+                Err(err) => test_check_outcome(false, false, &format!("BFT sent: {err}")),
+                Ok(view) => {
+                    let node_i = node_roster_index(internal_handle, &view);
+                    let proposer = view_proposer(&view, height, round);
+                    let wanted = value_id.map_or(tenderlink::ValueId::NIL, tenderlink::ValueId);
+                    let sent = TEST_BFT_SENT.lock().unwrap().iter().any(|sent| match *sent {
+                        tenderlink::SentConsensus::Vote { is_precommit, height: h, round: r, value_id, roster_i } => {
+                            kind == u64::from(is_precommit)
+                                && (h, r) == (height, round)
+                                && value_id == wanted
+                                && node_i == Some(usize::from(roster_i))
+                        }
+                        tenderlink::SentConsensus::ProposalChunk { height: h, round: r, proposal_id, .. } => {
+                            kind == 2
+                                && (h, r) == (height, round)
+                                && (value_id.is_none() || proposal_id == wanted)
+                                && node_i.is_some()
+                                && proposer == node_i
+                        }
+                    });
+                    test_check(flags, sent, &format!(
+                        "BFT sent: the node {} kind {kind} at {height}.{round} for {}",
+                        if sent { "sent" } else { "has not sent" },
+                        value_id.map_or("none".to_string(), |v| hex32(&v)),
+                    ));
+                }
+            }
+        }
+
+        TestInstr::ExpectBftProposer { finalizer, height, round } => match bft_engine_view() {
+            Err(err) => test_check_outcome(false, false, &format!("BFT proposer: {err}")),
+            Ok(view) => {
+                let expected = if finalizer == TF_BFT_THE_NODE {
+                    node_roster_index(internal_handle, &view)
+                } else {
+                    roster_index(&view.roster, &synthetic_finalizer_key(finalizer))
+                };
+                let actual = view_proposer(&view, height, round);
+                test_check(flags, expected.is_some() && expected == actual, &format!(
+                    "BFT proposer at {height}.{round}: roster index {actual:?}, finalizer {finalizer} is at {expected:?}",
+                ));
+            }
+        },
 
         TestInstr::ExpectPoWTip { hash, slot } => match named_block(hash, slot) {
             Err(err) => test_check_outcome(false, false, &format!("PoW tip: {err}")),
@@ -1726,6 +2099,148 @@ fn named_block(hash: Option<ZebBlockHash>, slot: u64) -> Result<Option<ZebBlockH
         Some((_, hash)) => Ok(Some(*hash)),
         None => Err(format!("slot {slot} holds no block; MINE_FROM_TEMPLATE fills slots")),
     }
+}
+
+struct HarnessBftPeer {
+    index: u64,
+    link: tenderlink::SyntheticBftPeer,
+}
+
+static TEST_BFT_PEERS: Mutex<Vec<HarnessBftPeer>> = Mutex::new(Vec::new());
+
+/// The votes and proposal chunks the node has sent any synthetic finalizer during the test, each
+/// once. The node resends what a peer's status asks for on every tick, so most arrive many times.
+static TEST_BFT_SENT: Mutex<Vec<tenderlink::SentConsensus>> = Mutex::new(Vec::new());
+
+fn synthetic_finalizer_key(k: u64) -> ed25519_zebra::SigningKey {
+    finalizer_key_from_seed(synthetic_finalizer_seed(k).as_bytes()).1
+}
+
+fn roster_index(roster: &[tenderlink::SortedRosterMember], key: &ed25519_zebra::SigningKey) -> Option<usize> {
+    let pub_key = PubKeyID(ed25519_zebra::VerificationKeyBytes::from(key).into());
+    roster.iter().position(|member| member.pub_key == pub_key)
+}
+
+fn node_roster_index(internal_handle: &TFLServiceHandle, view: &tenderlink::EngineView) -> Option<usize> {
+    let seed = internal_handle.config.explicit_bft_key_seed.as_deref().unwrap_or(TEST_NODE_FINALIZER_SEED);
+    roster_index(&view.roster, &finalizer_key_from_seed(seed.as_bytes()).1)
+}
+
+fn view_proposer(view: &tenderlink::EngineView, height: u64, round: u32) -> Option<usize> {
+    tenderlink::proposer_index(&view.hash_keys, &view.roster, height, round)
+}
+
+/// The id of the proposal the node sent at `height` and `round`, when it was that round's proposer.
+fn node_proposal_id(internal_handle: &TFLServiceHandle, view: &tenderlink::EngineView, height: u64, round: u32) -> Option<tenderlink::ValueId> {
+    let node_i = node_roster_index(internal_handle, view)?;
+    if view_proposer(view, height, round) != Some(node_i) {
+        return None;
+    }
+    TEST_BFT_SENT.lock().unwrap().iter().find_map(|sent| match *sent {
+        tenderlink::SentConsensus::ProposalChunk { height: h, round: r, proposal_id, .. } if (h, r) == (height, round) => Some(proposal_id),
+        _ => None,
+    })
+}
+
+fn bft_engine_running() -> bool {
+    zebra_state::new_network::bft::bft_chain().read().unwrap().is_activated
+}
+
+/// BFT starts on the sync loop's tick after the activation block commits, so it can trail the
+/// instruction that loaded that block. With a bootstrap configured, waits for it to start; the
+/// bound is for a node that never starts it, which the instruction then reports.
+async fn bft_await_start(internal_handle: &TFLServiceHandle) {
+    if bft_engine_running() || internal_handle.params.bootstrap.activation_height().is_none() {
+        return;
+    }
+    let _ = tokio::time::timeout(NODE_ANSWER_WAIT, async {
+        while !bft_engine_running() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+}
+
+fn bft_engine_view() -> Result<tenderlink::EngineView, String> {
+    if !bft_engine_running() {
+        return Err("BFT is not running (it starts at a FromChain bootstrap's activation height)".to_string());
+    }
+    tenderlink::engine_view().ok_or_else(|| "the BFT engine has not ticked yet; ADVANCE_TIME makes it".to_string())
+}
+
+/// Where synthetic finalizer `k` is in `peers`, connecting it to the engine, with its identity
+/// hello, if it is not there yet.
+fn bft_peer_index(peers: &mut Vec<HarnessBftPeer>, k: u16) -> usize {
+    if let Some(peer_i) = peers.iter().position(|p| p.index == u64::from(k)) {
+        return peer_i;
+    }
+    let link = tenderlink::attach_synthetic_bft_peer(k);
+    let _ = link.inbound.send(tenderlink::id_hello_packet(&synthetic_finalizer_key(k.into()), &link.handshake_hash));
+    peers.push(HarnessBftPeer { index: k.into(), link });
+    peers.len() - 1
+}
+
+/// Synthetic finalizers are looked for on the roster up to this index.
+pub const SYNTHETIC_FINALIZERS_MAX_N: u16 = 64;
+
+/// Hands `packets` to the engine as synthetic finalizer `k` sent them, connecting it first, then
+/// waits for the engine to take them in. Answers whether the peer is still connected, and why not.
+async fn bft_deliver(k: u64, packets: Vec<Vec<u8>>) -> (bool, String) {
+    if !bft_engine_running() {
+        return (false, "BFT is not running (it starts at a FromChain bootstrap's activation height)".to_string());
+    }
+    let Ok(link_index) = u16::try_from(k) else {
+        return (false, format!("synthetic finalizer index {k} does not fit in 16 bits"));
+    };
+    let packets_n = packets.len();
+    {
+        let mut peers = TEST_BFT_PEERS.lock().unwrap();
+        let peer_i = bft_peer_index(&mut peers, link_index);
+        let peer = &peers[peer_i];
+        if !peer.link.alive.load(std::sync::atomic::Ordering::Relaxed) {
+            return (false, format!("the node had already disconnected synthetic finalizer {k}"));
+        }
+        for packet in packets {
+            let _ = peer.link.inbound.send(packet);
+        }
+    }
+    if let Err(err) = bft_settle().await {
+        return (false, err);
+    }
+    let alive = TEST_BFT_PEERS.lock().unwrap().iter().find(|p| p.index == k).is_some_and(|p| p.link.alive.load(std::sync::atomic::Ordering::Relaxed));
+    if alive {
+        (true, format!("{packets_n} packet(s) from synthetic finalizer {k} taken in"))
+    } else {
+        (false, format!("the node disconnected synthetic finalizer {k}"))
+    }
+}
+
+/// Returns once the engine has run the loop passes that take in, read and act on whatever reached
+/// it before the call, then records what the node sent. The bound is for an engine that has
+/// stopped; a running one passes in milliseconds.
+async fn bft_settle() -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    let start = tenderlink::LOOP_PASSES.load(Ordering::Acquire);
+    let waited = tokio::time::timeout(NODE_ANSWER_WAIT, async {
+        while tenderlink::LOOP_PASSES.load(Ordering::Acquire) < start + 3 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    if waited.is_err() {
+        return Err(format!("the BFT engine ran no loop passes within {NODE_ANSWER_WAIT:?}"));
+    }
+    let mut sent = TEST_BFT_SENT.lock().unwrap();
+    for peer in TEST_BFT_PEERS.lock().unwrap().iter() {
+        while let Ok(packet) = peer.link.outbound.try_recv() {
+            for item in tenderlink::sent_consensus(&packet) {
+                if !sent.contains(&item) {
+                    sent.push(item);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn take_stp_peer(index: u64) -> Result<HarnessStpPeer, String> {

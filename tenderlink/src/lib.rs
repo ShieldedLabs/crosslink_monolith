@@ -1799,6 +1799,174 @@ pub fn id_hello_packet(signing_key: &SigningKey, handshake_hash: &[u8; 64]) -> V
     buf[..o].to_vec()
 }
 
+/// What the engine held at the end of its last tick. Only kept once a test sets
+/// [`PUBLISH_ENGINE_VIEW`], so a node pays one load per tick for it.
+#[derive(Debug)]
+pub struct EngineView {
+    pub height: u64,
+    pub round: u32,
+    pub step: TMStep,
+    pub vote_namespace: [u8; 32],
+    pub roster: Vec<SortedRosterMember>,
+    pub hash_keys: HashKeys,
+}
+
+// By hand: HashKeys lives in zcash_primitives and is not Clone, though every field is Copy.
+impl Clone for EngineView {
+    fn clone(&self) -> Self {
+        let hk = &self.hash_keys;
+        EngineView {
+            height: self.height,
+            round: self.round,
+            step: self.step,
+            vote_namespace: self.vote_namespace,
+            roster: self.roster.clone(),
+            hash_keys: HashKeys { proposer: hk.proposer, value_id: hk.value_id, connect_contention: hk.connect_contention, proposal_sig: hk.proposal_sig },
+        }
+    }
+}
+
+pub static PUBLISH_ENGINE_VIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ENGINE_VIEW: Mutex<Option<EngineView>> = Mutex::new(None);
+
+/// Engine-loop passes finished, ticking or not. Three passes after an input arrives, the engine
+/// has taken it in, read it and, if a tick was due, acted on it and handed out what it sent.
+pub static LOOP_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn publish_engine_view(bft_state: &TMState, roster: &[SortedRosterMember]) {
+    if !PUBLISH_ENGINE_VIEW.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let hk = &bft_state.hash_keys;
+    *ENGINE_VIEW.lock().unwrap() = Some(EngineView {
+        height: bft_state.height,
+        round: bft_state.round,
+        step: bft_state.step,
+        vote_namespace: bft_state.vote_namespace,
+        roster: roster.to_vec(),
+        hash_keys: HashKeys { proposer: hk.proposer, value_id: hk.value_id, connect_contention: hk.connect_contention, proposal_sig: hk.proposal_sig },
+    });
+}
+
+/// The engine as of its last tick, once [`PUBLISH_ENGINE_VIEW`] is set and it has ticked.
+pub fn engine_view() -> Option<EngineView> {
+    ENGINE_VIEW.lock().unwrap().clone()
+}
+
+/// The roster index of the proposer for `height` and `round`, as the engine picks it.
+pub fn proposer_index(hash_keys: &HashKeys, roster: &[SortedRosterMember], height: u64, round: u32) -> Option<usize> {
+    TMState::proposer_from_height_round(hash_keys, roster, height, round).0
+}
+
+/// The id a proposal of `value` goes by.
+pub fn value_id_of(hash_keys: &HashKeys, value: &[u8]) -> ValueId {
+    ValueId(hash_keys.value_id.hash(value))
+}
+
+/// An empty packet whose status says the sender is at `height` and `round` and holds none of its
+/// proposal or votes, so the node answers with everything it has for them.
+pub fn status_packet_needing_everything(height: u64, round: u32, roster_n: usize) -> Vec<u8> {
+    let mut buf = [0u8; 256];
+    let mut header = PacketHeader::new::<PACKET_TYPE_EMPTY>();
+    header.tag |= PACKET_TAG_STATUS_FLAG as u64;
+    let mut o = header.write_to(&mut buf);
+    o += needing_everything(height, round, roster_n).write_to(&mut buf[o..]);
+    buf[..o].to_vec()
+}
+
+fn needing_everything(height: u64, round: u32, roster_n: usize) -> PacketStatus {
+    let roster_n = u16::try_from(roster_n).unwrap_or(u16::MAX);
+    PacketStatus {
+        height,
+        round,
+        need_proposal_chunk_rngs: [[0, (PROPOSAL_MAX_SIZE / PROPOSAL_CHUNK_DATA_SIZE + 1) as u32]],
+        need_vote_rngs: [[[0, roster_n]]; 2],
+    }
+}
+
+/// A prevote or precommit packet carrying one vote, by the finalizer holding `signing_key` at
+/// `roster_i`: for `value_id`, or nil when it is `ValueId::NIL`.
+pub fn vote_packet(signing_key: &SigningKey, roster_i: u16, is_precommit: bool, height: u64, round: u32, value_id: ValueId, vote_namespace: &[u8; 32]) -> Vec<u8> {
+    let pub_key = PubKeyID(VerificationKeyBytes::from(signing_key).into());
+    let is_yes = value_id != ValueId::NIL;
+    let sign_data = make_vote_sign_datas(pub_key, is_precommit, height, round, value_id)[is_yes as usize];
+    let mut packet = PacketVotes {
+        no_votes_n: !is_yes as u8,
+        yes_votes_n: is_yes as u8,
+        round,
+        height,
+        value_id,
+        ..Default::default()
+    };
+    packet.votes[0] = PubKeySig { roster_i, sig: TMSig(sign_with_namespace(signing_key, &sign_data, vote_namespace)) };
+    let mut buf = [0u8; 2048];
+    let mut o = PacketHeader::new_(PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit as u8).write_to(&mut buf);
+    o += packet.write_to(&mut buf[o..]);
+    buf[..o].to_vec()
+}
+
+/// The proposal chunk packets for `value`, signed by the proposer holding `signing_key`, each
+/// with a status at `height` and `round` that needs everything. `value_id` is what the chunks
+/// claim to be a part of, normally [`value_id_of`] the value.
+pub fn proposal_chunk_packets(signing_key: &SigningKey, value: &[u8], value_id: ValueId, height: u64, round: u32, valid_round: i64, vote_namespace: &[u8; 32], roster_n: usize) -> Vec<Vec<u8>> {
+    let value = BlockValue(value.to_vec());
+    (0..value.chunks_n()).map(|chunk_i| {
+        let hdr = PacketProposalChunkHeader {
+            chunk_i: chunk_i as u32, proposal_size: value.0.len() as u32, round, valid_round, height, proposal_id: value_id,
+        };
+        let mut buf = vec![0u8; PATH_MTU];
+        let mut header = PacketHeader::new::<PACKET_TYPE_PROPOSAL_CHUNK>();
+        header.tag |= PACKET_TAG_STATUS_FLAG as u64;
+        let mut o = header.write_to(&mut buf);
+        o += needing_everything(height, round, roster_n).write_to(&mut buf[o..]);
+        let signed_o = o;
+        o += hdr.write_to(&mut buf[o..]);
+        let (chunk_o, chunk_size) = value.chunk_o_size(chunk_i);
+        buf[o..o + chunk_size].copy_from_slice(&value.0[chunk_o..chunk_o + chunk_size]);
+        o += chunk_size;
+        let sig = sign_with_namespace(signing_key, &buf[signed_o..o], vote_namespace);
+        buf[o..o + 64].copy_from_slice(&sig);
+        o += 64;
+        buf.truncate(o);
+        buf
+    }).collect()
+}
+
+/// What one packet a node sent carries, as far as consensus goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SentConsensus {
+    /// A vote by the finalizer at `roster_i`; `value_id` is `ValueId::NIL` for nil.
+    Vote { is_precommit: bool, height: u64, round: u32, value_id: ValueId, roster_i: u16 },
+    /// One chunk of a proposal, as the proposer of `height` and `round` signed it.
+    ProposalChunk { height: u64, round: u32, valid_round: i64, proposal_id: ValueId, chunk_i: u32 },
+}
+
+/// The votes and proposal chunks in a packet a node sent; nothing for any other packet.
+pub fn sent_consensus(packet: &[u8]) -> Vec<SentConsensus> {
+    let buf = &mut &packet[..];
+    let Some(header) = PacketHeader::read_from(buf) else { return Vec::new(); };
+    if header.has_status() && PacketStatus::read_from(buf).is_none() {
+        return Vec::new();
+    }
+    let packet_type = header.type_();
+    if packet_type == PACKET_TYPE_PROPOSAL_CHUNK {
+        let Some(hdr) = PacketProposalChunkHeader::read_from(buf) else { return Vec::new(); };
+        return vec![SentConsensus::ProposalChunk { height: hdr.height, round: hdr.round, valid_round: hdr.valid_round, proposal_id: hdr.proposal_id, chunk_i: hdr.chunk_i }];
+    }
+    if packet_type != PACKET_TYPE_PREVOTE_SIGNATURES && packet_type != PACKET_TYPE_PRECOMMIT_SIGNATURES {
+        return Vec::new();
+    }
+    let Some(votes) = PacketVotes::read_from(buf) else { return Vec::new(); };
+    let is_precommit = packet_type == PACKET_TYPE_PRECOMMIT_SIGNATURES;
+    (0..(votes.no_votes_n + votes.yes_votes_n) as usize).map(|vote_i| SentConsensus::Vote {
+        is_precommit,
+        height: votes.height,
+        round: votes.round,
+        value_id: if vote_i < votes.no_votes_n as usize { ValueId::NIL } else { votes.value_id },
+        roster_i: votes.votes[vote_i].roster_i,
+    }).collect()
+}
+
 
 pub async fn entry_point(my_root_private_key: SigningKey,
                          my_stp_keypair: Option<IdentityKeyPair>,
@@ -2022,7 +2190,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         // if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_GRY}PROTOCOL{ANSI_RST}: Connected to {} peers", current_connections.len()); }
 
         let was_now = zebra_debug_time::instant_now();
-        let ticked = was_now > next_tick_time;
+        // At or past, not only past: on a supplied clock the first pass reads exactly the instant
+        // the loop started at, and a tick due then must not wait for the clock to move again.
+        let ticked = was_now >= next_tick_time;
         if ticked {
             {
                 // TICK CODE
@@ -2483,8 +2653,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             messages_received.extend(synthetic.inbound.try_iter().map(|packet| (key, packet)));
         }
         if ticked {
+            publish_engine_view(&bft_state, &roster);
             TICKS_DONE.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
+        LOOP_PASSES.fetch_add(1, std::sync::atomic::Ordering::Release);
 
         // Ensure a Peer entry exists for every active connection
         for &(ref stp_address, handshake_hash) in &current_connections {

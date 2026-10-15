@@ -335,6 +335,8 @@ pub fn rng_private_public_key_from_address(
 
 const MAIN_LOOP_SLEEP_INTERVAL: Duration = Duration::from_millis(125);
 pub fn run_tfl_test(internal_handle: TFLServiceHandle) {
+    // EXPECT_BFT_STEP and the BFT instructions read the engine through what it publishes.
+    tenderlink::PUBLISH_ENGINE_VIEW.store(true, std::sync::atomic::Ordering::Relaxed);
     // ensure that tests fail on panic/assert(false); otherwise tokio swallows them
     std::panic::set_hook(Box::new(|panic_info| {
         #[allow(clippy::print_stderr)]

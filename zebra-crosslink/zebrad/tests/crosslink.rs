@@ -73,6 +73,12 @@ pub fn test_start() {
                 base.crosslink.hardforks = file.crosslink.hardforks;
                 base.crosslink.disable_shipped_hardforks = file.crosslink.disable_shipped_hardforks;
                 base.state.network_checkpoint = file.state.network_checkpoint;
+                base.crosslink.explicit_bft_key_seed = file.crosslink.explicit_bft_key_seed;
+            }
+            // A finalizer identity the test knows, so a scenario can bond to the node and the BFT
+            // instructions can find it on the roster.
+            if base.crosslink.explicit_bft_key_seed.is_none() {
+                base.crosslink.explicit_bft_key_seed = Some(zebra_crosslink::test_format::TEST_NODE_FINALIZER_SEED.to_string());
             }
             base.state.ephemeral = true;
             // getblocktemplate refuses to build a coinbase without one (MINE_FROM_TEMPLATE). The
@@ -3636,6 +3642,125 @@ fn crosslink_new_bonds_must_be_a_power_of_10_from_featurenet_upgrade_1() {
     let accepted = bond(&gen, b"after-the-upgrade-power-of-10", 100_000_000);
     tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &[accepted]), 0);
     tf.push_instr_expect_staking_replay_matches(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// Crosslink parameters whose bootstrap a scenario can reach: the roster is the stakes at height
+/// 10, and BFT starts at height 111, the first more than MAX_BLOCK_REORG_HEIGHT above it.
+const BFT_ROUNDS_PARAMETERS: zcash_primitives::bft::ZcashCrosslinkParameters = zcash_primitives::bft::ZcashCrosslinkParameters {
+    bootstrap: zcash_primitives::bft::BftBootstrap::FromChain { staking_height: 0, roster_height: 10, activation_height: 111 },
+    ..HARNESS_PARAMETERS
+};
+
+/// More than tenderlink's 250 ms send tick, so every ADVANCE_TIME by it runs exactly one tick.
+const BFT_TICK_MILLIS: u64 = 251;
+
+/// Bonds the node and three synthetic finalizers and loads blocks up to BFT activation, so the
+/// node runs BFT from height 1 with those four. The synthetic finalizers, and the node's stake (a
+/// small multiple of theirs, at most half the total, so no decision is the node's alone),
+/// are picked so that the node proposes at height 1, round 0 exactly when `node_proposes`. Which
+/// member proposes follows from the stakes and keys alone, so it is known before the node runs.
+/// Returns the synthetic finalizers.
+fn bft_rounds_scene(tf: &mut TF, node_proposes: bool) -> [u16; 3] {
+    const STAKE: u64 = 100_000_000;
+    let network = regtest_network(&BFT_ROUNDS_PARAMETERS);
+    let key = TestKey::new(b"crosslink test miner");
+    let miner = key.address();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+
+    let node = zebra_crosslink::rng_private_public_key_from_address(TEST_NODE_FINALIZER_SEED.as_bytes());
+    // Within the indices the harness connects by itself.
+    let n = SYNTHETIC_FINALIZERS_MAX_N;
+    let pub_keys: Vec<[u8; 32]> = (0..n).map(|k| synthetic_finalizer_pub_key(k.into())).collect();
+    let (node_stake, finalizers) = [1, 2, 3]
+        .into_iter()
+        .flat_map(|factor| {
+            (0..n).flat_map(move |a| (a + 1..n).flat_map(move |b| (b + 1..n).map(move |c| (factor * STAKE, [a, b, c]))))
+        })
+        .find(|(node_stake, finalizers)| {
+            let members: Vec<([u8; 32], u64)> = std::iter::once((node.2 .0, *node_stake))
+                .chain(finalizers.iter().map(|&k| (pub_keys[usize::from(k)], STAKE)))
+                .collect();
+            (bft_proposer(&members, 1, 0) == Some(node.2 .0)) == node_proposes
+        })
+        .expect("some stakes and three synthetic finalizers put the proposer where asked");
+
+    let members = std::iter::once((node.1, node_stake)).chain(finalizers.iter().map(|&k| {
+        (zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k.into()).as_bytes()).1, STAKE)
+    }));
+    let inputs = matured_coinbases(tf, &mut gen, &key, 4);
+    let bonds: Vec<Arc<Transaction>> = inputs
+        .into_iter()
+        .zip(members)
+        .enumerate()
+        .map(|(i, (input, (signing_key, stake)))| {
+            let finalizer = zcash_primitives::bft::FinalizerAddress::create(&signing_key);
+            staking_tx_create_bond_funded(gen.next_upgrade(), format!("bft-rounds-bond-{i}").as_bytes(), finalizer, stake, &key, input)
+        })
+        .collect();
+    let height = |gen: &BlockGen| gen.tip.coinbase_height().expect("generated blocks have a height").0;
+    assert!(height(&gen) < 10, "the bonds land by the roster height");
+    tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &bonds), 0);
+    while height(&gen) < 111 {
+        tf.push_instr_load_pow(&gen.next_block(&miner), 0);
+    }
+    finalizers
+}
+
+/// The node proposes at height 1, round 0; three synthetic finalizers prevote and precommit its
+/// proposal, and it decides the height: the whole round through the node's own engine, with the
+/// clock moved only by the test.
+#[test]
+fn crosslink_bft_round_decides_the_nodes_proposal() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let finalizers = bft_rounds_scene(&mut tf, true);
+
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_proposer(TF_BFT_THE_NODE, 1, 0, 0);
+    tf.push_instr_expect_bft_step(1, 0, None, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_sent(2, 1, 0, None, 0);
+
+    for k in finalizers {
+        tf.push_instr_bft_recv_vote(k, TF_BFT_FOR_NODE_PROPOSAL, 1, 0, &[0; 32], 0);
+    }
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_step(1, 0, Some(TMStep::Precommit), 0);
+
+    for k in finalizers {
+        tf.push_instr_bft_recv_vote(k, TF_BFT_FOR_NODE_PROPOSAL | TF_BFT_PRECOMMIT, 1, 0, &[0; 32], 0);
+    }
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_step(2, 0, None, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// As crosslink_bft_round_decides_the_nodes_proposal, but the synthetic finalizers sign their
+/// prevotes under the wrong vote namespace. The node must not count them, so it never reaches the
+/// precommit step; without this, a harness signing under the wrong namespace could make every
+/// BFT scenario pass for the wrong reason.
+#[test]
+fn crosslink_bft_votes_under_the_wrong_namespace_do_not_count() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let finalizers = bft_rounds_scene(&mut tf, true);
+
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_sent(2, 1, 0, None, 0);
+    for k in finalizers {
+        tf.push_instr_bft_recv_vote(k, TF_BFT_FOR_NODE_PROPOSAL | TF_BFT_WRONG_NAMESPACE, 1, 0, &[0; 32], 0);
+    }
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_step(1, 0, Some(TMStep::Precommit), SHOULD_FAIL);
+    tf.push_instr_expect_bft_sent(1, 1, 0, None, SHOULD_FAIL);
 
     test_bytes(tf.write_to_bytes());
 }

@@ -9,7 +9,7 @@ zebra-state = { path = "../zebra-state", version = "12.0.1" }
 zebra-node-services = { path = "../zebra-node-services", version = "9.1.2" }
 # The test format calls the block checks directly (CHECK_POW) and supplies the clock (SET_TIME).
 zebra-consensus = { path = "../zebra-consensus", version = "14.0.1" }
-zebra-debug-time = { workspace = true }
+zebra-debug-time = { workspace = true, features = ["timers"] }
 wallet = { path = "../../wallet" }
 
 serde = { workspace = true, features = ["serde_derive"] }
