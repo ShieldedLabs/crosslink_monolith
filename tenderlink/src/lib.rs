@@ -110,6 +110,10 @@ use zcash_primitives::bft::{ HashKey, HashKeys, FatPointerToBftBlock, TMSig, Pub
 // leaves the chain advancing only when a message happens to land inside a step by luck.
 // `PEER_CONNECT_DURATION` stays real: it paces reconnection against a real TCP stack, not against
 // the chain clock.
+//
+// Every read that decides a step timeout, a tick or a gossip goes through
+// `zebra_debug_time::instant_now`, so a test can supply the clock and choose when each fires.
+// Reconnection and the network statistics read the real clock.
 const TICK_DURATION:         std::time::Duration = std::time::Duration::from_millis(250);
 const PEER_GOSSIP_DURATION:  std::time::Duration = std::time::Duration::from_millis(1500);
 const PEER_CONNECT_DURATION: std::time::Duration = std::time::Duration::from_millis(5000);
@@ -1228,7 +1232,7 @@ impl TMState {
     async fn bft_update(&mut self, roster: &mut Vec<SortedRosterMember>) {
         debug_assert!(self.rounds_data.iter().all(|r| r.height >= self.height));
 
-        let now = Instant::now();
+        let now = zebra_debug_time::instant_now();
         let mut total_active_stake = 0;
         for i in 0..active_roster_len(roster) {
             total_active_stake += roster[i].stake;
@@ -1727,6 +1731,74 @@ impl BftAddressMap {
     pub fn all_addrs(&self) -> impl Iterator<Item = (&STPAddress, &PubKeyID)> { self.by_addr.iter() }
 }
 
+/// A finalizer played by a test. What it sends the node arrives as from a connected peer, after
+/// the transport; what the node sends it comes back here instead of going to a socket.
+pub struct SyntheticBftPeer {
+    pub address: STPAddress,
+    /// The STP handshake hash the node holds for this connection; ID_HELLO signs over it.
+    pub handshake_hash: [u8; 64],
+    pub inbound: std::sync::mpsc::Sender<Vec<u8>>,
+    pub outbound: std::sync::mpsc::Receiver<Vec<u8>>,
+    /// Cleared when the node disconnects the peer. It is not reconnected.
+    pub alive: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct SyntheticBftPeerLink {
+    address: STPAddress,
+    handshake_hash: [u8; 64],
+    inbound: std::sync::mpsc::Receiver<Vec<u8>>,
+    outbound: std::sync::mpsc::Sender<Vec<u8>>,
+    alive: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Picked up by the engine loop on its next pass.
+static SYNTHETIC_BFT_PEERS_TO_ATTACH: Mutex<Vec<SyntheticBftPeerLink>> = Mutex::new(Vec::new());
+
+/// Ticks the engine loop has finished: consensus updated, and what it sent handed out. A test that
+/// advances the clock waits for this to move rather than for time to pass.
+pub static TICKS_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Connects synthetic finalizer peer `index` to the running engine. Distinct indices are distinct
+/// peers.
+pub fn attach_synthetic_bft_peer(index: u16) -> SyntheticBftPeer {
+    // 127.3.x.y is loopback nobody listens on (127.2 is the PoW side's), so a gossiped or dialled
+    // address reaches nothing. The key's first two bytes make the ConnectionKey unique per index.
+    let [hi, lo] = index.to_be_bytes();
+    let mut key = vec![0x5f; 32];
+    key[..2].copy_from_slice(&index.to_le_bytes());
+    let address = STPAddress {
+        ip: std::net::Ipv4Addr::new(127, 3, hi, lo).to_ipv6_mapped(),
+        port: 8234,
+        magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s,
+        key,
+    };
+    let mut handshake_hash = [0x5f; 64];
+    handshake_hash[..2].copy_from_slice(&index.to_le_bytes());
+
+    let (inbound_tx, inbound_rx) = std::sync::mpsc::channel();
+    let (outbound_tx, outbound_rx) = std::sync::mpsc::channel();
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    SYNTHETIC_BFT_PEERS_TO_ATTACH.lock().unwrap().push(SyntheticBftPeerLink {
+        address: address.clone(), handshake_hash, inbound: inbound_rx, outbound: outbound_tx, alive: alive.clone(),
+    });
+    SyntheticBftPeer { address, handshake_hash, inbound: inbound_tx, outbound: outbound_rx, alive }
+}
+
+/// The ID_HELLO a finalizer holding `signing_key` sends first on a connection with
+/// `handshake_hash`, header and status included, as the node's own is built.
+pub fn id_hello_packet(signing_key: &SigningKey, handshake_hash: &[u8; 64]) -> Vec<u8> {
+    let hash_key_for_stp_handshake_hash = HashKey(blake3::Hasher::new_derive_key("Tenderlink ID Hello STP Handshake Hash").finalize().into());
+    let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&handshake_hash[..]);
+    let verification = PacketIdVerification {
+        pk: PubKeyID(VerificationKeyBytes::from(signing_key).into()),
+        sig: TMSig(signing_key.sign(&keyed_hash_of_stp_handshake_hash[..]).to_bytes()),
+    };
+    let mut buf = [0u8; 2048];
+    let mut o = PacketHeader::new::<PACKET_TYPE_ID_HELLO>().write_to(&mut buf);
+    o += verification.write_to(&mut buf[o..]);
+    buf[..o].to_vec()
+}
+
 
 pub async fn entry_point(my_root_private_key: SigningKey,
                          my_stp_keypair: Option<IdentityKeyPair>,
@@ -1777,6 +1849,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let mut messages_to_send = Vec::new();
 
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
+    let mut synthetic_bft_peers: Vec<SyntheticBftPeerLink> = Vec::new();
     let mut bft_address_map = BftAddressMap::new();
 
     let mut my_address_attestations = Vec::new();
@@ -1813,13 +1886,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     bft_state.vote_namespace = initial_vote_namespace;
     bft_state.recent_commit_round_cache = ingest_startup_data;
 
-    bft_state.start_round(&roster, Instant::now(), 0).await;
+    bft_state.start_round(&roster, zebra_debug_time::instant_now(), 0).await;
 
     const ONE_SECOND: tokio::time::Duration = tokio::time::Duration::from_secs(1);
     let mut net_stats_window_start = tokio::time::Instant::now();
     let mut net_stats = NetworkStats::default();
 
-    let mut next_peer_gossip  = std::time::Instant::now();
+    let mut next_peer_gossip  = zebra_debug_time::instant_now();
     let mut next_peer_connect = std::time::Instant::now();
     let mut decide_wait_roster_printed: (u64, u32) = (u64::MAX, 0);
 
@@ -1827,7 +1900,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let peer_gossip_duration = zebra_debug_time::real_duration(PEER_GOSSIP_DURATION);
 
     let mut send_buf1 = [0u8; 2048];
-    let mut next_tick_time = tokio::time::Instant::now();
+    let mut next_tick_time = zebra_debug_time::instant_now();
     loop {
         let ctx_str = bft_state.ctx_str(&roster);
 
@@ -1948,8 +2021,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         // if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_GRY}PROTOCOL{ANSI_RST}: Connected to {} peers", current_connections.len()); }
 
-        let was_now = tokio::time::Instant::now();
-        if was_now > next_tick_time {
+        let was_now = zebra_debug_time::instant_now();
+        let ticked = was_now > next_tick_time;
+        if ticked {
             {
                 // TICK CODE
                 peers.retain(|connection_key, peer| {
@@ -2250,7 +2324,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     return true; // keep
                 });
 
-                if std::time::Instant::now() >= next_peer_gossip {
+                if zebra_debug_time::instant_now() >= next_peer_gossip {
                     let mut peer_attestations: Vec<&PeerAttestation> = bft_address_map.by_key.values().flat_map(|a| a.values()).filter_map(|o| o.as_ref()).collect();
                     peer_attestations.shuffle(&mut rand::thread_rng());
                     peer_attestations.truncate(1191 / PEER_ATTESTATION_SERIALIZED_SIZE);
@@ -2269,7 +2343,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         send_stp_msg(&mut messages_to_send, &connection_key, &send_buf1[..o], &mut net_stats);
                     }
 
-                    next_peer_gossip = std::time::Instant::now() + peer_gossip_duration;
+                    next_peer_gossip = zebra_debug_time::instant_now() + peer_gossip_duration;
                 }
 
                 use rand::seq::IteratorRandom;
@@ -2378,7 +2452,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 }
             }
 
-            let now_now = tokio::time::Instant::now();
+            let now_now = zebra_debug_time::instant_now();
             if now_now - next_tick_time > tick_duration {
                 next_tick_time = now_now + tick_duration;
             } else {
@@ -2388,11 +2462,29 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         use rand::seq::SliceRandom;
         messages_to_send.shuffle(&mut rand::thread_rng());
-        let resp = service_connections(&network_thread_handle, NetworkThreadPush { initiate_connections, wanted_connections: current_connections.clone(), send_unreliable: messages_to_send, }).unwrap_or_default();
+
+        // Synthetic peers sit on this side of the transport: their packets bypass it both ways,
+        // and the transport is never asked to keep a connection to them.
+        synthetic_bft_peers.extend(SYNTHETIC_BFT_PEERS_TO_ATTACH.lock().unwrap().drain(..));
+        messages_to_send.retain(|(key, packet)| {
+            let Some(synthetic) = synthetic_bft_peers.iter().find(|p| p.address.connection_key() == *key) else { return true; };
+            let _ = synthetic.outbound.send(packet.clone());
+            false
+        });
+        let wanted_connections = current_connections.iter().filter(|(address, _)| !synthetic_bft_peers.iter().any(|p| p.address == *address)).cloned().collect();
+        let resp = service_connections(&network_thread_handle, NetworkThreadPush { initiate_connections, wanted_connections, send_unreliable: messages_to_send, }).unwrap_or_default();
         current_connections = resp.current_connections;
         initiate_connections = Vec::new();
         let mut messages_received = resp.received_unreliable_messages;
         messages_to_send = Vec::new();
+        for synthetic in synthetic_bft_peers.iter().filter(|p| p.alive.load(std::sync::atomic::Ordering::Relaxed)) {
+            let key = synthetic.address.connection_key();
+            current_connections.push((synthetic.address.clone(), synthetic.handshake_hash));
+            messages_received.extend(synthetic.inbound.try_iter().map(|packet| (key, packet)));
+        }
+        if ticked {
+            TICKS_DONE.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
 
         // Ensure a Peer entry exists for every active connection
         for &(ref stp_address, handshake_hash) in &current_connections {
@@ -2845,6 +2937,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         net_stats.process_time += read_start.elapsed();
 
         current_connections.retain(|(address, _)| !connection_keys_to_disconnect.contains(&address.connection_key()));
+        for synthetic in synthetic_bft_peers.iter().filter(|p| connection_keys_to_disconnect.contains(&p.address.connection_key())) {
+            synthetic.alive.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // @Todo(Phillip): How long should this be?
         std::thread::sleep(std::time::Duration::from_millis(100));

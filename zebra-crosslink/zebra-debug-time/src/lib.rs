@@ -196,3 +196,73 @@ pub fn interval(apparent: std::time::Duration) -> tokio::time::Interval {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval
 }
+
+// # Supplied instants
+//
+// The timers above wait in real time, which is right for a node and wrong for a test that has to
+// decide when a step times out. A test can instead supply the monotonic clock: [`instant_now`]
+// then reads a start instant plus whatever the test has advanced it by, and nothing else moves it.
+// Timeouts compare their deadline against this reading when the owning loop next looks, so they
+// fire on the test's schedule however fast the loop spins.
+//
+// On a node nothing is ever supplied, and the read costs one load on top of
+// `Instant::now()` (an acquire load, so it sees the base its supplied reading was taken from; on
+// x86 that is a plain load).
+
+/// How far the supplied instant has been advanced past [`INSTANT_BASE`], in nanoseconds;
+/// `u64::MAX` is none, and [`instant_now`] reads the real clock.
+#[cfg(feature = "timers")]
+static SUPPLIED_INSTANT_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The real instant the supplied clock started from.
+#[cfg(feature = "timers")]
+static INSTANT_BASE: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new();
+
+/// The current monotonic instant: the real one, or the supplied one once [`advance_instant`] has
+/// been called.
+#[cfg(feature = "timers")]
+pub fn instant_now() -> tokio::time::Instant {
+    let supplied = SUPPLIED_INSTANT_NANOS.load(Ordering::Acquire);
+    if supplied == u64::MAX {
+        return tokio::time::Instant::now();
+    }
+    *INSTANT_BASE.get().expect("set before the first supplied reading") + std::time::Duration::from_nanos(supplied)
+}
+
+/// Moves the supplied instant forward by `by`. The first call stops [`instant_now`] following the
+/// real clock: it reads the real instant of that call, plus `by`, and from then on only what later
+/// calls add.
+#[cfg(feature = "timers")]
+pub fn advance_instant(by: std::time::Duration) {
+    INSTANT_BASE.get_or_init(tokio::time::Instant::now);
+    let by = u64::try_from(by.as_nanos()).unwrap_or(u64::MAX - 1);
+    let _ = SUPPLIED_INSTANT_NANOS.fetch_update(Ordering::Release, Ordering::Relaxed, |nanos| {
+        Some(if nanos == u64::MAX { by } else { nanos.saturating_add(by).min(u64::MAX - 1) })
+    });
+}
+
+/// Whether a test supplies the monotonic clock.
+#[cfg(feature = "timers")]
+pub fn instant_is_supplied() -> bool {
+    SUPPLIED_INSTANT_NANOS.load(Ordering::Relaxed) != u64::MAX
+}
+
+#[cfg(all(test, feature = "timers"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_supplied_instant_moves_only_when_advanced() {
+        let before = instant_now();
+        advance_instant(std::time::Duration::from_secs(5));
+        let first = instant_now();
+        assert!(first >= before + std::time::Duration::from_secs(5));
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(instant_now(), first, "real time passing must not move a supplied instant");
+
+        advance_instant(std::time::Duration::from_millis(250));
+        assert_eq!(instant_now(), first + std::time::Duration::from_millis(250));
+        assert!(instant_is_supplied());
+    }
+}
