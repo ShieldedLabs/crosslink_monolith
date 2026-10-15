@@ -3658,10 +3658,10 @@ const BFT_TICK_MILLIS: u64 = 251;
 
 /// Bonds the node and three synthetic finalizers and loads blocks up to BFT activation, so the
 /// node runs BFT from height 1 with those four. The synthetic finalizers, and the node's stake (a
-/// small multiple of theirs, at most half the total, so no decision is the node's alone),
-/// are picked so that the node proposes at height 1, round 0 exactly when `node_proposes`. Which
+/// small multiple of theirs, at most half the total, so no decision is the node's alone), are
+/// picked so that the node proposes round r of height 1 exactly when `node_proposes[r]`. Which
 /// member proposes follows from the stakes and keys alone, so it is known before the node runs.
-fn bft_rounds_scene(tf: &mut TF, node_proposes: bool) -> BftRoundsScene {
+fn bft_rounds_scene(tf: &mut TF, node_proposes: &[bool]) -> BftRoundsScene {
     const STAKE: u64 = 100_000_000;
     let network = regtest_network(&BFT_ROUNDS_PARAMETERS);
     let key = TestKey::new(b"crosslink test miner");
@@ -3682,7 +3682,7 @@ fn bft_rounds_scene(tf: &mut TF, node_proposes: bool) -> BftRoundsScene {
             let members: Vec<([u8; 32], u64)> = std::iter::once((node.2 .0, *node_stake))
                 .chain(finalizers.iter().map(|&k| (pub_keys[usize::from(k)], STAKE)))
                 .collect();
-            (bft_proposer(&members, 1, 0) == Some(node.2 .0)) == node_proposes
+            node_proposes.iter().enumerate().all(|(round, &is_node)| (bft_proposer(&members, 1, round as u32) == Some(node.2 .0)) == is_node)
         })
         .expect("some stakes and three synthetic finalizers put the proposer where asked");
 
@@ -3772,7 +3772,7 @@ impl BftRoundsScene {
 fn crosslink_bft_round_decides_the_nodes_proposal() {
     set_test_name(function_name!());
     let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
-    let finalizers = bft_rounds_scene(&mut tf, true).finalizers;
+    let finalizers = bft_rounds_scene(&mut tf, &[true]).finalizers;
 
     tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
     tf.push_instr_expect_bft_proposer(TF_BFT_THE_NODE, 1, 0, 0);
@@ -3805,7 +3805,7 @@ fn crosslink_bft_round_decides_the_nodes_proposal() {
 fn crosslink_bft_votes_under_the_wrong_namespace_do_not_count() {
     set_test_name(function_name!());
     let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
-    let finalizers = bft_rounds_scene(&mut tf, true).finalizers;
+    let finalizers = bft_rounds_scene(&mut tf, &[true]).finalizers;
 
     tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
     tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
@@ -3829,7 +3829,7 @@ fn crosslink_bft_votes_under_the_wrong_namespace_do_not_count() {
 fn crosslink_bft_node_given_another_value_decides_what_the_rest_precommitted() {
     set_test_name(function_name!());
     let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
-    let mut scene = bft_rounds_scene(&mut tf, false);
+    let mut scene = bft_rounds_scene(&mut tf, &[false]);
     assert!(
         3 * (scene.total_stake - scene.node_stake) > 2 * scene.total_stake,
         "the synthetic finalizers are a quorum without the node"
@@ -3867,6 +3867,74 @@ fn crosslink_bft_node_given_another_value_decides_what_the_rest_precommitted() {
     gen.next_block(&miner);
     tf.push_instr_load_pow(&point_tip_at_bft(gen, &decided), 0);
     tf.push_instr_expect_finalized_tip(Some(&scene.pow_at(20).hash()), 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// Locks the node on B at height 1, round 0, and moves it to round 1 undecided: the node holds the
+/// proposal B and sees every other finalizer prevote it, so it precommits B; the others then
+/// precommit nil. Returns A, a different valid height-1 value, and B's id.
+fn bft_lock_on_b_then_round_1(tf: &mut TF, scene: &BftRoundsScene) -> (Vec<u8>, [u8; 32]) {
+    let proposer_0 = u16::try_from(scene.proposer(1, 0)).expect("the node does not propose round 0");
+    let value_a = bft_proposal_value(&scene.height_1_proposal(20));
+    let value_b = bft_proposal_value(&scene.height_1_proposal(30));
+    let id_b = bft_value_id(&value_b);
+
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_bft_recv_proposal(proposer_0, 1, 0, -1, 0, &value_b, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_sent(0, 1, 0, Some(&id_b), 0);
+
+    for k in scene.finalizers {
+        tf.push_instr_bft_recv_vote(k, 0, 1, 0, &id_b, 0);
+    }
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_sent(1, 1, 0, Some(&id_b), 0);
+
+    for k in scene.finalizers {
+        tf.push_instr_bft_recv_vote(k, TF_BFT_PRECOMMIT | TF_BFT_NIL, 1, 0, &[0; 32], 0);
+    }
+    // Round 0's precommit timeout is 500 ms.
+    for _ in 0..3 {
+        tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    }
+    tf.push_instr_expect_bft_step(1, 1, None, 0);
+    (value_a, id_b)
+}
+
+/// Tendermint's lock, through the real node: locked on B in round 0, the node must not prevote a
+/// fresh value A in round 1, one whose proposal names no round where A gathered a quorum of
+/// prevotes. It prevotes nil. A node that dropped its lock could precommit A in a later round
+/// after B was decided elsewhere.
+#[test]
+fn crosslink_bft_node_locked_on_a_value_does_not_prevote_a_fresh_one() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene(&mut tf, &[false, false]);
+    let (value_a, _) = bft_lock_on_b_then_round_1(&mut tf, &scene);
+    let id_a = bft_value_id(&value_a);
+    let proposer_1 = u16::try_from(scene.proposer(1, 1)).expect("the node does not propose round 1");
+
+    tf.push_instr_bft_recv_proposal(proposer_1, 1, 1, -1, 0, &value_a, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_sent(0, 1, 1, None, 0);
+    tf.push_instr_expect_bft_sent(0, 1, 1, Some(&id_a), SHOULD_FAIL);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// As crosslink_bft_node_locked_on_a_value_does_not_prevote_a_fresh_one, with the node proposing
+/// round 1: a locked node proposes the value it is locked on, B, not a new block of its own.
+#[test]
+fn crosslink_bft_node_locked_on_a_value_proposes_it_again() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene(&mut tf, &[false, true]);
+    let (_, id_b) = bft_lock_on_b_then_round_1(&mut tf, &scene);
+
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_sent(2, 1, 1, Some(&id_b), 0);
 
     test_bytes(tf.write_to_bytes());
 }
