@@ -403,6 +403,171 @@ fn crosslink_featurenet_upgrade_2_height_set_by_the_test_file() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// The node and the network for a fat pointer binding scenario: FeaturenetUpgrade2 at
+/// `activation`, or unscheduled as by default.
+fn fat_pointer_binding_node(activation: Option<u32>) -> (TF, Network) {
+    use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
+
+    let params = HARNESS_PARAMETERS;
+    let Some(activation) = activation else {
+        let network = regtest_network(&params);
+        assert_eq!(NetworkUpgrade::FeaturenetUpgrade2.activation_height(&network), None);
+        return (TF::new(&params), network);
+    };
+    let node_config = node_config_with_activation_heights(ConfiguredActivationHeights {
+        featurenet_upgrade_2: Some(activation),
+        ..Default::default()
+    });
+    let network = test_network(&params, &node_config);
+    assert_eq!(
+        NetworkUpgrade::FeaturenetUpgrade2.activation_height(&network),
+        Some(zebra_chain::block::Height(activation)),
+        "the test network schedules the upgrade where the scenario puts it",
+    );
+    (TF::new_with_node_config(&params, &node_config), network)
+}
+
+/// Loads six blocks and two BFT blocks over them, bft0 finalizing P1 and bft1 finalizing P2, and
+/// builds P7 citing bft1: the honest block. Then three copies of P7 with the pointer changed and
+/// the commitment left as it was: one height byte flipped, one more signature, and bft0 cited in
+/// place of bft1. Each copy is a valid block apart from the commitment, which is what the two
+/// sides of the upgrade disagree on.
+fn fat_pointer_binding_scene(tf: &mut TF, network: Network) -> (Arc<Block>, Vec<Arc<Block>>) {
+    let miner = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+    let mut pow = vec![gen.tip.clone()];
+    for _ in 2..=6 {
+        pow.push(gen.next_block(&miner));
+    }
+    for block in &pow {
+        tf.push_instr_load_pow(block, 0);
+    }
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+    let bft0 = next_pos(pos_h, fat_ptr, &pow[1..4], &[]);
+    tf.push_instr_load_pos(&bft0, 0);
+    let bft1 = next_pos(pos_h, fat_ptr, &pow[2..5], &[]);
+    tf.push_instr_load_pos(&bft1, 0);
+
+    gen.next_block(&miner);
+    let honest = point_tip_at_bft(&mut gen, &bft1.0.fat_ptr);
+    assert_ne!(honest.header.fat_pointer_to_bft_block, FatPointerToBftBlock::null());
+
+    let with_pointer = |pointer: FatPointerToBftBlock| {
+        Arc::new(Block {
+            header: Arc::new(BlockHeader { fat_pointer_to_bft_block: pointer, ..*honest.header }),
+            ..honest.as_ref().clone()
+        })
+    };
+    let mut height_changed = bft1.0.fat_ptr.clone();
+    height_changed.vote_for_block_without_finalizer_public_key[32] ^= 1;
+    let mut signatures_changed = bft1.0.fat_ptr.clone();
+    signatures_changed.signatures.push(FatPointerSignature { pub_key: PubKeyID([0xcd; 32]), vote_signature: [0xbc; 64] });
+    let tampered = vec![
+        with_pointer(height_changed),
+        with_pointer(signatures_changed),
+        with_pointer(bft0.0.fat_ptr.clone()),
+    ];
+    (honest, tampered)
+}
+
+/// From FeaturenetUpgrade2 the block commitment binds the fat pointer, so a block whose pointer
+/// was changed after its commitment was computed is refused, whichever part changed: the height
+/// bytes, the signature list, or the BFT block it names. Without the binding each of these is a
+/// free re-roll of the block hash after one Equihash solve. The honest block commits, and the
+/// chain neither grows nor moves for any copy.
+#[test]
+fn crosslink_fat_pointer_changed_after_the_commitment_is_refused_from_featurenet_upgrade_2() {
+    set_test_name(function_name!());
+    let (mut tf, network) = fat_pointer_binding_node(Some(4));
+    let (honest, tampered) = fat_pointer_binding_scene(&mut tf, network);
+
+    tf.push_instr_load_pow(&honest, 0);
+    tf.push_instr_expect_pow_chain_length(8, 0);
+    tf.push_instr_expect_pow_tip(&honest.hash(), 0);
+    for block in &tampered {
+        tf.push_instr_load_pow(block, SHOULD_FAIL);
+        tf.push_instr_expect_rejection_reason("InvalidChainHistoryBlockTxAuthCommitment", 0);
+        tf.push_instr_expect_pow_chain_length(8, 0);
+        tf.push_instr_expect_pow_tip(&honest.hash(), 0);
+    }
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// The other side of the upgrade boundary: with FeaturenetUpgrade2 unscheduled the commitment
+/// binds no pointer, so the same three changed copies are valid siblings of the honest block,
+/// accepted as they are today.
+#[test]
+fn crosslink_fat_pointer_changed_after_the_commitment_is_accepted_without_featurenet_upgrade_2() {
+    set_test_name(function_name!());
+    let (mut tf, network) = fat_pointer_binding_node(None);
+    let (honest, tampered) = fat_pointer_binding_scene(&mut tf, network);
+
+    tf.push_instr_load_pow(&honest, 0);
+    tf.push_instr_expect_pow_chain_length(8, 0);
+    for block in &tampered {
+        tf.push_instr_load_pow(block, 0);
+        tf.push_instr_expect_pow_chain_length(8, 0);
+    }
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// With FeaturenetUpgrade2 unscheduled a block's hash is what it was before the pointer was bound:
+/// the regtest genesis, and the ten blocks of finality diagram scene 1, the last four of which
+/// cite BFT blocks. The hashes were recorded from the scene as the node loaded it before the
+/// binding existed (commit 32a059c6). Needs no node.
+#[test]
+fn crosslink_block_hashes_without_featurenet_upgrade_2_are_unchanged() {
+    assert_eq!(
+        NetworkUpgrade::FeaturenetUpgrade2.activation_height(&regtest_network(&HARNESS_PARAMETERS)),
+        None
+    );
+    assert_eq!(zebra_chain::block::genesis::regtest_genesis_block().hash(), BlockGen::REGTEST_GENESIS_HASH);
+    assert_eq!(
+        BlockGen::REGTEST_GENESIS_HASH.to_string(),
+        "029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327"
+    );
+
+    let (_, pow) = diagram_scene_1();
+    let recorded = [
+        "cfb89d521721f3701f91e9694c2af5c771e824151f7c97b43be933fb48edc62f",
+        "fdfad1b116eedb950a10c390c90dadf9a1c51474c309e0c908b8bf950a21d0ba",
+        "e61f66d735a00551dff49bf1655317fdb6fb339e3e213f14a1e0be90f6c14d13",
+        "acddb611e758944eac867a216e35817c1e0dee5ffe59a42b3e94915fe4efe5a6",
+        "c94c501de9865044a242971f41384c239fa37edff2f38497e5b72385188429ec",
+        "8e675045103ad0a3dc0b53ccbe4db4e59f8b435af62f61490a5e5135470ae915",
+        "881a5e9cb5241ff0ded972912cbd82b1d4aeca6ed470a71c844b57774823a782",
+        "af5079db84a11e9e45bba032c2222fd1d6d4e218d1c4d6c1644f4b63097c20cd",
+        "1e144a99639c95a176252edb320aba4d8e951ea4122f9bb8e0b010bc99a1bd22",
+        "d8a09226dbe218be557c69b97badaec15b058cc0c78170fe13f52ac5095ed034",
+    ];
+    assert_eq!(pow.iter().map(|b| b.hash().to_string()).collect::<Vec<_>>(), recorded);
+    assert!(pow[6..].iter().all(|b| b.header.fat_pointer_to_bft_block != FatPointerToBftBlock::null()));
+}
+
+/// From FeaturenetUpgrade2 the node's own template carries a commitment over its pointer: the
+/// template's `blockcommitmentshash` is built with the pointer's digest, so the block mined from
+/// it unchanged commits. Its parent cites a BFT block, so the mined block must too (a pointer
+/// cannot revert to null), and its commitment therefore binds a real digest.
+#[test]
+fn crosslink_template_commits_to_its_fat_pointer_from_featurenet_upgrade_2() {
+    set_test_name(function_name!());
+    let (mut tf, network) = fat_pointer_binding_node(Some(4));
+    let (honest, _) = fat_pointer_binding_scene(&mut tf, network);
+
+    tf.push_instr_load_pow(&honest, 0);
+    tf.push_instr_mine_from_template_into(1, 0);
+    tf.push_instr_expect_pow_tip_slot(1, 0);
+    tf.push_instr_expect_pow_chain_length(9, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 /// Rewrite the checked-in binaries in `crosslink-test-data` from the current block format.
 ///
 /// A tool rather than a test, so it is `#[ignore]`d like `read_from_file` and runs only when
@@ -1531,32 +1696,9 @@ impl BlockGen {
 
         // Both roots must cover *every* transaction in the block, not just the coinbase.
         let merkle_root: merkle::Root = transactions.iter().collect();
-
-        // Mirrors the consensus dispatch (state service
-        // check::block_commitment_is_valid_for_chain_history): the Heartwood activation
-        // block carries the reserved all-zero commitment, Heartwood/Canopy carry the raw
-        // history MMR root, and NU5 onward carries the ZIP-244 hashBlockCommitments,
-        // which also commits to the auth data of every transaction.
-        let commitment_bytes: [u8; 32] =
-            if NetworkUpgrade::Heartwood.activation_height(network) == Some(height) {
-                [0u8; 32]
-            } else {
-                match NetworkUpgrade::current(network, height) {
-                    NetworkUpgrade::Heartwood | NetworkUpgrade::Canopy => {
-                        <[u8; 32]>::from(history_tree.hash().unwrap_or([0u8; 32].into()))
-                    }
-                    _ => {
-                        let auth_data_root: merkle::AuthDataRoot = transactions.iter().collect();
-                        ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
-                            &history_tree
-                                .hash()
-                                .expect("history tree is non-empty after the Heartwood activation block"),
-                            &auth_data_root,
-                        )
-                        .bytes_in_serialized_order()
-                    }
-                }
-            };
+        let fat_pointer_to_bft_block = FatPointerToBftBlock::null();
+        let commitment_bytes =
+            BlockGen::commitment_bytes(network, height, history_tree, &transactions, &fat_pointer_to_bft_block);
 
         Arc::new(Block {
             header: Arc::new(BlockHeader {
@@ -1568,11 +1710,45 @@ impl BlockGen {
                 difficulty_threshold,
                 nonce: HexDebug([0; 32]),
                 solution: work::equihash::Solution::Regtest([0; 36]),
-                fat_pointer_to_bft_block: FatPointerToBftBlock::null(),
+                fat_pointer_to_bft_block,
             }),
 
             transactions,
         })
+    }
+
+    /// The commitment a block at `height` with these transactions and this pointer carries, on a
+    /// chain whose history up to its parent is `history_tree`. Mirrors the consensus dispatch
+    /// (state service check::block_commitment_is_valid_for_chain_history): the Heartwood
+    /// activation block carries the reserved all-zero commitment, Heartwood/Canopy carry the raw
+    /// history MMR root, and NU5 onward carries the ZIP-244 hashBlockCommitments, which also
+    /// commits to the auth data of every transaction and, from FeaturenetUpgrade2, to the pointer.
+    fn commitment_bytes(
+        network: &Network,
+        height: BlockHeight,
+        history_tree: &HistoryTree,
+        transactions: &[Arc<Transaction>],
+        fat_pointer: &FatPointerToBftBlock,
+    ) -> [u8; 32] {
+        if NetworkUpgrade::Heartwood.activation_height(network) == Some(height) {
+            return [0u8; 32];
+        }
+        match NetworkUpgrade::current(network, height) {
+            NetworkUpgrade::Heartwood | NetworkUpgrade::Canopy => {
+                <[u8; 32]>::from(history_tree.hash().unwrap_or([0u8; 32].into()))
+            }
+            _ => {
+                let auth_data_root: merkle::AuthDataRoot = transactions.iter().collect();
+                ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                    &history_tree
+                        .hash()
+                        .expect("history tree is non-empty after the Heartwood activation block"),
+                    &auth_data_root,
+                    &zebra_chain::block::fat_pointer_digest_at(network, height, fat_pointer),
+                )
+                .bytes_in_serialized_order()
+            }
+        }
     }
 
     pub fn next_block(&mut self, miner_addr: &Address) -> Arc<zebra_chain::block::Block> {
@@ -2915,12 +3091,18 @@ fn diagram_scene_path(name: &str) -> PathBuf {
 }
 
 /// Re-stamps the generator's tip with a BFT pointer, giving that block a `context_bft`.
-/// Only the header's fat pointer changes, so the merkle root and the commitment still
-/// match the transaction list. The block hash does change, which is why this has to happen
-/// before the next block is generated from this one.
+/// The merkle root still matches the transaction list; the commitment is recomputed, which
+/// changes it only from FeaturenetUpgrade2, where it binds the pointer. The block hash does
+/// change, which is why this has to happen before the next block is generated from this one.
 fn point_tip_at_bft(gen: &mut BlockGen, fat_ptr: &FatPointerToBftBlock) -> Arc<Block> {
+    let height = gen.tip.coinbase_height().expect("generated blocks have a height");
+    // The generator pushes a block into its history tree only when it builds the next one, so the
+    // tree still ends at the tip's parent, which is what the tip's commitment covers.
+    let commitment_bytes =
+        BlockGen::commitment_bytes(&gen.network, height, &gen.history_tree, &gen.tip.transactions, fat_ptr);
     gen.tip = Arc::new(Block {
         header: Arc::new(BlockHeader {
+            commitment_bytes: HexDebug(commitment_bytes),
             fat_pointer_to_bft_block: fat_ptr.clone(),
             ..*gen.tip.header
         }),

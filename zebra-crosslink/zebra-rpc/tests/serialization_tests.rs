@@ -1101,6 +1101,7 @@ fn test_get_block_template_response() -> Result<(), Box<dyn std::error::Error>> 
         default_roots_chain_history_root.into(),
         default_roots_auth_data_root.into(),
         default_roots_block_commitments_hash.into(),
+        template.default_roots().fat_pointer_digest(),
     );
     let transactions = template
         .transactions()
