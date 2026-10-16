@@ -2880,19 +2880,27 @@ fn signed_fat_pointer(
     vote_namespace: &[u8; 32],
 ) -> FatPointerToBftBlock {
     let unsigned = FatPointerToBftBlock::from_parts(block.blake3_hash(), height, round, &[]);
+    certificate_over(unsigned.vote_for_block_without_finalizer_public_key, finalizer_seeds, vote_namespace)
+}
+
+/// A fat pointer whose vote bytes are `template` (block hash, height, round with the commit bit),
+/// signed by the finalizers with these seeds in the order given, each over its key and the
+/// template, with the namespace appended unless it is nil. For certificates a node would not
+/// make: the template is taken as given.
+fn certificate_over(template: [u8; 44], finalizer_seeds: &[&[u8]], vote_namespace: &[u8; 32]) -> FatPointerToBftBlock {
     let signatures: Vec<FatPointerSignature> = finalizer_seeds
         .iter()
         .map(|seed| {
             let (_, key, pub_key) = zebra_crosslink::rng_private_public_key_from_address(seed);
             let mut signed = pub_key.0.to_vec();
-            signed.extend_from_slice(&unsigned.vote_for_block_without_finalizer_public_key);
+            signed.extend_from_slice(&template);
             if *vote_namespace != [0; 32] {
                 signed.extend_from_slice(vote_namespace);
             }
             FatPointerSignature { pub_key, vote_signature: <[u8; 64]>::from(key.sign(&signed)) }
         })
         .collect();
-    FatPointerToBftBlock::from_parts(block.blake3_hash(), height, round, &signatures)
+    FatPointerToBftBlock { vote_for_block_without_finalizer_public_key: template, signatures }
 }
 
 /// A fat pointer signed by these helpers verifies as the node verifies one, under the namespace it
@@ -4194,6 +4202,354 @@ fn crosslink_bft_node_locked_on_a_value_proposes_it_again() {
 
 #[path = "crosslink/fuzz.rs"]
 mod fuzz;
+
+/// Crosslink parameters for twelve seats, the deployed roster cap: a dozen funded bonds land by
+/// the roster height, 20, and BFT starts at 121, the first height more than
+/// MAX_BLOCK_REORG_HEIGHT above it.
+const TWELVE_SEATS_PARAMETERS: zcash_primitives::bft::ZcashCrosslinkParameters = zcash_primitives::bft::ZcashCrosslinkParameters {
+    bootstrap: zcash_primitives::bft::BftBootstrap::FromChain { staking_height: 0, roster_height: 20, activation_height: 121 },
+    ..HARNESS_PARAMETERS
+};
+
+/// Each seat's stake. Rewards start at the BFT activation height, so every snapshot below it holds
+/// exactly this much per seat.
+const SEAT_STAKE: u64 = 100_000_000;
+
+/// A regtest network with FeaturenetUpgrade2 at `height`, or unscheduled, and the node config
+/// that gives the node the same schedule.
+fn network_with_featurenet_upgrade_2_at(params: &zcash_primitives::bft::ZcashCrosslinkParameters, height: Option<u32>) -> (Network, String) {
+    let Some(height) = height else {
+        return (regtest_network(params), String::new());
+    };
+    let node_config = node_config_with_activation_heights(zebra_chain::parameters::testnet::ConfiguredActivationHeights {
+        featurenet_upgrade_2: Some(height),
+        ..Default::default()
+    });
+    let network = test_network(params, &node_config);
+    assert_eq!(
+        NetworkUpgrade::FeaturenetUpgrade2.activation_height(&network),
+        Some(zebra_chain::block::Height(height)),
+        "the test network schedules the upgrade where the scenario puts it",
+    );
+    (network, node_config)
+}
+
+/// What `twelve_seats_scene` built.
+struct TwelveSeats {
+    /// The eleven synthetic finalizers, in roster order.
+    finalizers: Vec<u16>,
+    /// The node first, then the synthetic finalizers, as `bft_proposer` takes them.
+    member_pub_keys: Vec<([u8; 32], u64)>,
+    /// The blocks loaded after the bonds, which include every height above the roster height.
+    pow: Vec<Arc<Block>>,
+    /// At the last block loaded, for scenarios that extend the chain.
+    gen: BlockGen,
+    miner: Address,
+}
+
+/// Bonds the node and eleven synthetic finalizers at equal stake on `network` and loads blocks up
+/// to BFT activation, so the node runs BFT from height 1 with twelve equal seats: 2f+1 is eight of
+/// them, at these stakes, and the strict quorum nine. The synthetic finalizers are picked so that the node proposes
+/// at each `(height, round)` in `node_proposes` exactly when its flag says so.
+fn twelve_seats_scene(tf: &mut TF, network: Network, node_proposes: &[((u64, u32), bool)]) -> TwelveSeats {
+    let key = TestKey::new(b"crosslink test miner");
+    let miner = key.address();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+
+    let node = zebra_crosslink::rng_private_public_key_from_address(TEST_NODE_FINALIZER_SEED.as_bytes());
+    let members_with = |finalizers: &[u16]| -> Vec<([u8; 32], u64)> {
+        std::iter::once((node.2 .0, SEAT_STAKE))
+            .chain(finalizers.iter().map(|&k| (synthetic_finalizer_pub_key(k.into()), SEAT_STAKE)))
+            .collect()
+    };
+    // A fixed sequence of candidate sets, so the scene is the same on every run.
+    let mut lcg: u64 = 1;
+    let finalizers: Vec<u16> = (0..10_000)
+        .find_map(|_| {
+            let mut picked: Vec<u16> = Vec::new();
+            while picked.len() < 11 {
+                lcg = lcg.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                let k = u16::try_from((lcg >> 33) % u64::from(SYNTHETIC_FINALIZERS_MAX_N)).expect("below the synthetic finalizer count");
+                if !picked.contains(&k) {
+                    picked.push(k);
+                }
+            }
+            let members = members_with(&picked);
+            node_proposes
+                .iter()
+                .all(|&((height, round), is_node)| (bft_proposer(&members, height, round) == Some(node.2 .0)) == is_node)
+                .then_some(picked)
+        })
+        .expect("some eleven synthetic finalizers put the proposer where asked");
+    // Roster order, which is the order a certificate's signatures are in.
+    let roster_order: Vec<[u8; 32]> = bft_roster_order(&members_with(&finalizers));
+    let mut finalizers = finalizers;
+    finalizers.sort_by_key(|&k| roster_order.iter().position(|pub_key| *pub_key == synthetic_finalizer_pub_key(k.into())));
+
+    let signing_keys = std::iter::once(node.1).chain(finalizers.iter().map(|&k| {
+        zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k.into()).as_bytes()).1
+    }));
+    let inputs = matured_coinbases(tf, &mut gen, &key, 12);
+    let bonds: Vec<Arc<Transaction>> = inputs
+        .into_iter()
+        .zip(signing_keys)
+        .enumerate()
+        .map(|(i, (input, signing_key))| {
+            let finalizer = zcash_primitives::bft::FinalizerAddress::create(&signing_key);
+            staking_tx_create_bond_funded(gen.next_upgrade(), format!("twelve-seats-bond-{i}").as_bytes(), finalizer, SEAT_STAKE, &key, input)
+        })
+        .collect();
+    let height = |gen: &BlockGen| gen.tip.coinbase_height().expect("generated blocks have a height").0;
+    assert!(height(&gen) < 20, "the bonds land by the roster height");
+    tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &bonds), 0);
+    let mut pow = Vec::new();
+    while height(&gen) < 121 {
+        let block = gen.next_block(&miner);
+        tf.push_instr_load_pow(&block, 0);
+        pow.push(block);
+    }
+    let member_pub_keys = members_with(&finalizers);
+    TwelveSeats { finalizers, member_pub_keys, pow, gen, miner }
+}
+
+/// The members' keys in the order the node's roster puts them.
+fn bft_roster_order(members: &[([u8; 32], u64)]) -> Vec<[u8; 32]> {
+    let members: Vec<zcash_primitives::transaction::RosterMember> = members
+        .iter()
+        .map(|&(pub_key, voting_power)| zcash_primitives::transaction::RosterMember { pub_key, voting_power, ..Default::default() })
+        .collect();
+    zebra_state::new_network::bft::tenderlink_roster_from_internal(&members, &Default::default())
+        .into_iter()
+        .map(|member| member.pub_key.0)
+        .collect()
+}
+
+impl TwelveSeats {
+    /// The synthetic finalizer that proposes at `height` and `round`, or TF_BFT_THE_NODE.
+    fn proposer(&self, height: u64, round: u32) -> u64 {
+        let proposer = bft_proposer(&self.member_pub_keys, height, round).expect("a roster has a proposer");
+        match self.member_pub_keys.iter().position(|(pub_key, _)| *pub_key == proposer) {
+            Some(0) => TF_BFT_THE_NODE,
+            Some(i) => self.finalizers[i - 1].into(),
+            None => unreachable!("the proposer is a member"),
+        }
+    }
+
+    fn pow_at(&self, height: u32) -> &Arc<Block> {
+        self.pow
+            .iter()
+            .find(|b| b.coinbase_height().map(|h| h.0) == Some(height))
+            .expect("the scene loaded that height")
+    }
+
+    /// The sigma blocks above `snapshot`: the headers of a BFT block finalizing it.
+    fn tail_above(&self, snapshot: u32) -> Vec<Arc<Block>> {
+        let sigma = TWELVE_SEATS_PARAMETERS.bc_confirmation_depth_sigma as u32;
+        (snapshot + 1..=snapshot + sigma).map(|h| self.pow_at(h).clone()).collect()
+    }
+
+    /// The BFT genesis the node decides at activation: version 2, finalizing the roster height.
+    fn genesis(&self) -> BftBlock {
+        bft_proposal(&TWELVE_SEATS_PARAMETERS, 0, FatPointerToBftBlock::null(), 0, &self.tail_above(20))
+    }
+
+    /// A valid height-1 proposal, on the genesis, finalizing `snapshot`.
+    fn height_1_proposal(&self, snapshot: u32) -> BftBlock {
+        let parent = FatPointerToBftBlock::from_parts(self.genesis().blake3_hash(), 0, 0, &[]);
+        bft_proposal(&TWELVE_SEATS_PARAMETERS, 1, parent, 0, &self.tail_above(snapshot))
+    }
+
+    /// The seeds of the first `n` synthetic finalizers in roster order.
+    fn seeds(&self, n: usize) -> Vec<String> {
+        self.finalizers[..n].iter().map(|&k| synthetic_finalizer_seed(k.into())).collect()
+    }
+}
+
+/// Eight precommits decide a height whose roster is the stake below FeaturenetUpgrade2, and do
+/// not decide the first height whose roster is the stake above it, where nine do: the quorum
+/// turns strict where the roster's snapshot crosses the upgrade, through the node's own engine
+/// with twelve equal seats. Without the upgrade eight decide both heights. Synthetic finalizers
+/// propose both heights, so the test knows both blocks.
+///
+/// The quorum is counted in stake. Twelve seats of `SEAT_STAKE` are `n = 12 * SEAT_STAKE`, so
+/// 2f+1 is `8 * SEAT_STAKE - 1` and needs eight seats, one unit short of two thirds; the strict
+/// quorum is `8 * SEAT_STAKE + 1`, nine seats. Seven of twelve is 2f+1 only for unit stakes.
+fn bft_quorum_across_featurenet_upgrade_2(upgrade: Option<u32>) {
+    let (network, node_config) = network_with_featurenet_upgrade_2_at(&TWELVE_SEATS_PARAMETERS, upgrade);
+    let mut tf = TF::new_with_node_config(&TWELVE_SEATS_PARAMETERS, &node_config);
+    let scene = twelve_seats_scene(&mut tf, network, &[((1, 0), false), ((2, 0), false)]);
+    let proposer_1 = u16::try_from(scene.proposer(1, 0)).expect("the node does not propose height 1");
+    let proposer_2 = u16::try_from(scene.proposer(2, 0)).expect("the node does not propose height 2");
+
+    // Height 1's roster is the stake at height 20, below the upgrade. Its block finalizes 60.
+    let block_1 = scene.height_1_proposal(60);
+    let value_1 = bft_proposal_value(&block_1);
+    let id_1 = bft_value_id(&value_1);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_bft_recv_proposal(proposer_1, 1, 0, -1, 0, &value_1, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_sent(0, 1, 0, Some(&id_1), 0);
+    for &k in &scene.finalizers[..8] {
+        tf.push_instr_bft_recv_vote(k, TF_BFT_PRECOMMIT, 1, 0, &id_1, 0);
+    }
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_step(2, 0, None, 0);
+
+    // Height 2's roster is the stake at 60, above the upgrade when it is scheduled. Its proposal
+    // cites height 1 with the eight precommits that decided it.
+    let seeds = scene.seeds(8);
+    let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
+    let decided_1 = signed_fat_pointer(&block_1, 1, 0, &seeds, &[0; 32]);
+    let block_2 = bft_proposal(&TWELVE_SEATS_PARAMETERS, 2, decided_1, 0, &scene.tail_above(80));
+    let value_2 = bft_proposal_value(&block_2);
+    let id_2 = bft_value_id(&value_2);
+    tf.push_instr_bft_recv_proposal(proposer_2, 2, 0, -1, 0, &value_2, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_sent(0, 2, 0, Some(&id_2), 0);
+    for &k in &scene.finalizers[..8] {
+        tf.push_instr_bft_recv_vote(k, TF_BFT_PRECOMMIT, 2, 0, &id_2, 0);
+    }
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    let strict = upgrade.is_some();
+    tf.push_instr_expect_bft_step(3, 0, None, if strict { SHOULD_FAIL } else { 0 });
+    if strict {
+        for &k in &scene.finalizers[8..9] {
+            tf.push_instr_bft_recv_vote(k, TF_BFT_PRECOMMIT, 2, 0, &id_2, 0);
+        }
+        tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+        tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+        tf.push_instr_expect_bft_step(3, 0, None, 0);
+    }
+
+    test_bytes(tf.write_to_bytes());
+}
+
+#[test]
+fn crosslink_bft_quorum_turns_strict_where_the_roster_snapshot_reaches_featurenet_upgrade_2() {
+    set_test_name(function_name!());
+    // Between the roster height, 20, and height 1's snapshot, 60.
+    bft_quorum_across_featurenet_upgrade_2(Some(50));
+}
+
+#[test]
+fn crosslink_bft_quorum_stays_2f_plus_1_with_featurenet_upgrade_2_unscheduled() {
+    set_test_name(function_name!());
+    bft_quorum_across_featurenet_upgrade_2(None);
+}
+
+/// From FeaturenetUpgrade2 a PoW block's fat pointer must be a certificate for the BFT block it
+/// names, and a BFT proposal's previous-block pointer one for its parent. The node decides BFT
+/// height 1 through its own engine on nine of twelve precommits; then one PoW block per malformed
+/// certificate for that block is offered at the same height, each refused with the upgrade below
+/// the scenario and accepted with it unscheduled, beside an honest certificate accepted either
+/// way. A height-2 proposal whose previous-block pointer carries forged signatures is refused and
+/// accepted the same way.
+fn fat_pointer_certificates_across_featurenet_upgrade_2(upgrade: Option<u32>) {
+    let (network, node_config) = network_with_featurenet_upgrade_2_at(&TWELVE_SEATS_PARAMETERS, upgrade);
+    let mut tf = TF::new_with_node_config(&TWELVE_SEATS_PARAMETERS, &node_config);
+    let mut scene = twelve_seats_scene(&mut tf, network, &[((1, 0), false)]);
+    let proposer = u16::try_from(scene.proposer(1, 0)).expect("the node does not propose");
+
+    let block_1 = scene.height_1_proposal(40);
+    let value = bft_proposal_value(&block_1);
+    let id = bft_value_id(&value);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_bft_recv_proposal(proposer, 1, 0, -1, 0, &value, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_sent(0, 1, 0, Some(&id), 0);
+    for &k in &scene.finalizers[..9] {
+        tf.push_instr_bft_recv_vote(k, TF_BFT_PRECOMMIT, 1, 0, &id, 0);
+    }
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_step(2, 0, None, 0);
+
+    // Height 1's roster is the stake at height 20, at or above the upgrade when it is scheduled.
+    let strict = upgrade.is_some();
+    let namespace = zebra_state::new_network::bft::namespace_for_bft_height(&[], 1, strict);
+    let seeds = scene.seeds(11);
+    let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
+    let template = |height: u64, round_bits: u32| -> [u8; 44] {
+        let mut template = [0u8; 44];
+        template[..32].copy_from_slice(&block_1.blake3_hash().0);
+        template[32..40].copy_from_slice(&height.to_le_bytes());
+        template[40..44].copy_from_slice(&round_bits.to_le_bytes());
+        template
+    };
+    let decided = template(1, 0x8000_0000);
+    let honest = certificate_over(decided, &seeds[..9], &namespace);
+
+    let outsider = (0..SYNTHETIC_FINALIZERS_MAX_N)
+        .find(|k| !scene.finalizers.contains(k))
+        .map(|k| synthetic_finalizer_seed(k.into()))
+        .expect("more synthetic finalizers than seats");
+    let mut with_outsider = honest.clone();
+    with_outsider.signatures.push(certificate_over(decided, &[outsider.as_bytes()], &namespace).signatures[0].clone());
+    let mut duplicate = honest.clone();
+    duplicate.signatures.insert(1, honest.signatures[1].clone());
+    let mut out_of_order = honest.clone();
+    out_of_order.signatures.reverse();
+    let mut other_round = honest.clone();
+    other_round.vote_for_block_without_finalizer_public_key[40] = 1;
+    let mut bad_signature = honest.clone();
+    bad_signature.signatures[4].vote_signature[0] ^= 1;
+    let mut forged = honest.clone();
+    for signature in &mut forged.signatures {
+        signature.vote_signature[0] ^= 1;
+    }
+
+    let malformed: [(&str, FatPointerToBftBlock); 10] = [
+        ("no signatures", certificate_over(decided, &[], &namespace)),
+        ("a signer outside the roster", with_outsider),
+        ("a duplicate signer", duplicate),
+        ("signers out of roster order", out_of_order),
+        ("eight of twelve, below the strict quorum", certificate_over(decided, &seeds[..8], &namespace)),
+        ("the wrong height", certificate_over(template(2, 0x8000_0000), &seeds[..9], &namespace)),
+        ("a round other than the one signed", other_round),
+        ("the commit bit clear", certificate_over(template(1, 0), &seeds[..9], &namespace)),
+        ("a bad signature", bad_signature),
+        ("the namespace before the upgrade", certificate_over(decided, &seeds[..9], &[0; 32])),
+    ];
+    let miner = scene.miner.clone();
+    for (_defect, certificate) in &malformed {
+        let mut sibling = scene.gen.clone();
+        sibling.next_block(&miner);
+        tf.push_instr_load_pow(&point_tip_at_bft(&mut sibling, certificate), if strict { SHOULD_FAIL } else { 0 });
+    }
+    scene.gen.next_block(&miner);
+    let honest_block = point_tip_at_bft(&mut scene.gen, &honest);
+    tf.push_instr_load_pow(&honest_block, 0);
+    tf.push_instr_expect_pow_chain_length(123, 0);
+    if strict {
+        tf.push_instr_expect_pow_tip(&honest_block.hash(), 0);
+    }
+
+    // A height-2 proposal citing height 1 by hash, with forged signatures or with a certificate.
+    let height_2 = |previous: FatPointerToBftBlock| {
+        let block = bft_proposal(&TWELVE_SEATS_PARAMETERS, 2, previous, 0, &scene.tail_above(60));
+        BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt::from_parts(block, 2, 0, &[]))
+    };
+    tf.push_instr_check_pos(&height_2(forged), if strict { SHOULD_FAIL } else { 0 });
+    tf.push_instr_check_pos(&height_2(honest), 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+#[test]
+fn crosslink_fat_pointer_certificates_are_checked_from_featurenet_upgrade_2() {
+    set_test_name(function_name!());
+    // Below the roster height, so every BFT height and every PoW block here is past it.
+    fat_pointer_certificates_across_featurenet_upgrade_2(Some(15));
+}
+
+#[test]
+fn crosslink_fat_pointer_certificates_are_hash_only_with_featurenet_upgrade_2_unscheduled() {
+    set_test_name(function_name!());
+    fat_pointer_certificates_across_featurenet_upgrade_2(None);
+}
 
 /// The lock gives way to a later quorum: locked on B in round 0, the node holds a fresh A in round
 /// 1 and prevotes nil, but every other finalizer prevotes A, which is a quorum without the node.
