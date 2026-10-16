@@ -908,7 +908,10 @@ impl Arbitrary for Transaction {
             .boxed(),
 
             // V6 transactions are only valid from NU6.3; v4 and v5 remain valid alongside them.
-            NetworkUpgrade::Nu6_3 | NetworkUpgrade::FeaturenetUpgrade1 | NetworkUpgrade::Nu7 => prop_oneof![
+            NetworkUpgrade::Nu6_3
+            | NetworkUpgrade::FeaturenetUpgrade1
+            | NetworkUpgrade::FeaturenetUpgrade2
+            | NetworkUpgrade::Nu7 => prop_oneof![
                 Self::v4_strategy(ledger_state.clone()),
                 Self::v5_strategy(ledger_state.clone()),
                 Self::v6_strategy(ledger_state)

@@ -195,6 +195,9 @@ impl From<&BTreeMap<Height, NetworkUpgrade>> for ConfiguredActivationHeights {
                 NetworkUpgrade::FeaturenetUpgrade1 => {
                     &mut configured_activation_heights.featurenet_upgrade_1
                 }
+                NetworkUpgrade::FeaturenetUpgrade2 => {
+                    &mut configured_activation_heights.featurenet_upgrade_2
+                }
                 NetworkUpgrade::Nu7 => &mut configured_activation_heights.nu7,
                 #[cfg(zcash_unstable = "zfuture")]
                 NetworkUpgrade::ZFuture => &mut configured_activation_heights.zfuture,
@@ -381,6 +384,9 @@ pub struct ConfiguredActivationHeights {
     /// Activation height for the `FeaturenetUpgrade1` network upgrade.
     #[serde(rename = "FeaturenetUpgrade1")]
     pub featurenet_upgrade_1: Option<u32>,
+    /// Activation height for the `FeaturenetUpgrade2` network upgrade.
+    #[serde(rename = "FeaturenetUpgrade2")]
+    pub featurenet_upgrade_2: Option<u32>,
     /// Activation height for `NU7` network upgrade.
     #[serde(rename = "NU7")]
     pub nu7: Option<u32>,
@@ -407,6 +413,7 @@ impl ConfiguredActivationHeights {
             nu6_2,
             nu6_3,
             featurenet_upgrade_1,
+            featurenet_upgrade_2,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -439,6 +446,7 @@ impl ConfiguredActivationHeights {
             nu6_2,
             nu6_3,
             featurenet_upgrade_1,
+            featurenet_upgrade_2,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -446,17 +454,37 @@ impl ConfiguredActivationHeights {
         .with_default_featurenet_upgrade()
     }
 
-    /// Schedules the featurenet upgrade at the height the wallet's hardcoded parameters name,
+    /// Schedules each featurenet upgrade at the height the wallet's hardcoded parameters name,
     /// unless these heights name one already or leave it no room.
     ///
-    /// A config file written before the upgrade existed lists every height but this one, and
-    /// without the default its node would never activate the upgrade.
+    /// A config file written before an upgrade existed lists every height but its own, and
+    /// without the default its node would never activate the upgrade. `FeaturenetUpgrade2` stays
+    /// unscheduled until `TESTNET_FEATURENET_UPGRADE_2_HEIGHT` names a height.
     pub fn with_default_featurenet_upgrade(mut self) -> Self {
+        use zcash_protocol::consensus::{
+            TESTNET_FEATURENET_UPGRADE_1_HEIGHT, TESTNET_FEATURENET_UPGRADE_2_HEIGHT,
+        };
+        let fits_between = |height: u32, before: Option<u32>, after: Option<u32>| {
+            before.is_some_and(|n| n < height) && after.map_or(true, |n| n > height)
+        };
         let Self { nu6_3, nu7, .. } = self;
-        self.featurenet_upgrade_1 = self.featurenet_upgrade_1.or(
-            Some(zcash_protocol::consensus::TESTNET_FEATURENET_UPGRADE_1_HEIGHT)
-                .filter(|&h| nu6_3.is_some_and(|n| n < h) && nu7.map_or(true, |n| n > h)),
-        );
+
+        if self.featurenet_upgrade_1.is_none()
+            && fits_between(
+                TESTNET_FEATURENET_UPGRADE_1_HEIGHT,
+                nu6_3,
+                self.featurenet_upgrade_2.or(nu7),
+            )
+        {
+            self.featurenet_upgrade_1 = Some(TESTNET_FEATURENET_UPGRADE_1_HEIGHT);
+        }
+        if let Some(height) = TESTNET_FEATURENET_UPGRADE_2_HEIGHT {
+            if self.featurenet_upgrade_2.is_none()
+                && fits_between(height, self.featurenet_upgrade_1.or(nu6_3), nu7)
+            {
+                self.featurenet_upgrade_2 = Some(height);
+            }
+        }
         self
     }
 }
@@ -649,6 +677,7 @@ impl ParametersBuilder {
             nu6_2,
             nu6_3,
             featurenet_upgrade_1,
+            featurenet_upgrade_2,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -679,6 +708,7 @@ impl ParametersBuilder {
                 .chain(nu6_2.into_iter().map(|h| (h, Nu6_2)))
                 .chain(nu6_3.into_iter().map(|h| (h, Nu6_3)))
                 .chain(featurenet_upgrade_1.into_iter().map(|h| (h, FeaturenetUpgrade1)))
+                .chain(featurenet_upgrade_2.into_iter().map(|h| (h, FeaturenetUpgrade2)))
                 .chain(nu7.into_iter().map(|h| (h, Nu7)));
 
             #[cfg(zcash_unstable = "zfuture")]
