@@ -66,6 +66,22 @@ pub fn bank_balance(banks: &[([u8; 32], u64)], pk: &[u8; 32]) -> u64 {
     banks.iter().find(|(k, _)| k == pk).map_or(0, |(_, v)| *v)
 }
 
+/// The mined withdrawal of the bond keyed `bond_key`, matched by key over the whole list so the
+/// answer does not depend on where the asking row sits or how far the history is scrolled.
+pub fn claim_for_bond(txs: &[wallet::WalletTx], bond_key: [u8; 32]) -> Option<(WalletTxPart, BlockHeight)> {
+    for tx in txs {
+        if !(tx.is_on_bc() && tx.h.is_in_block()) {
+            continue;
+        }
+        let Some(staking_action) = tx.staking_action else { continue; };
+        if tx.kind() == WalletTxKind::ClaimUnstake && staking_action.bond_key() == bond_key {
+            // NOTE: ignoring fee
+            return Some((WalletTxPart::from_staking_action(tx.staking_action), tx.h));
+        }
+    }
+    None
+}
+
 /// "1.25" cTAZ -> zats; up to 8 decimal places, no sign, nothing else.
 pub fn parse_ctaz(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -3289,7 +3305,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     if tx_is_in_block {
                                         // NOTE: this assumes that objects maintain bond keys after retargeting
                                         if let Some(staking_action) = tx.staking_action {
-                                            let sent_stake = (tx_kind == WalletTxKind::Stake || tx_kind == WalletTxKind::Retarget);
+                                            let sent_stake = (tx_kind == WalletTxKind::Stake || tx_kind == WalletTxKind::Retarget || tx_kind == WalletTxKind::ConvertReward);
                                             let target_name = shown_finalizer(&finalizer_addresses, &staking_action.target_finalizer_pk(), staking_action.target_finalizer_address());
 
                                             if sent_stake {
@@ -3317,22 +3333,16 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 break 'get_label frame_strf!(data, "{} @ {}", label, tx_h.0);
                                             }
 
-                                            let withdrawal = 'withdrawal: {
-                                                let mut tx_i = index+1;
-                                                while tx_i < txs.len() {
-                                                    if txs[tx_i].is_on_bc() && txs[tx_i].h.is_in_block() {
-                                                        if let (Some(staking_action), WalletTxKind::ClaimUnstake) = (txs[tx_i].staking_action, txs[tx_i].kind()) {
-                                                            // NOTE: ignoring fee
-                                                            let b = WalletTxPart::from_staking_action(txs[tx_i].staking_action);
-                                                            break 'withdrawal Some((b, txs[tx_i].h));
-                                                        }
+                                            if tx_kind == WalletTxKind::BeginUnstake {
+                                                for bond in &staked_roster_unbonded {
+                                                    // u64::MAX is the placeholder for a value the wallet has not learned yet
+                                                    if bond.0 == staking_action.bond_key() && bond.2 != u64::MAX {
+                                                        break 'get_label frame_strf!(data, "{} @ {}, now {} cTAZ", label, tx_h.0, str_from_ctaz(bond.2))
                                                     }
-                                                    tx_i += 1;
                                                 }
-                                                None
-                                            };
+                                            }
 
-                                            if let Some(withdrawal) = withdrawal {
+                                            if let Some(withdrawal) = claim_for_bond(&txs, staking_action.bond_key()) {
                                                 let (b, h) = withdrawal;
                                                 break 'get_label if sent_stake {
                                                     frame_strf!(data, "{} @ {} to {}, claimed @ {} for {} cTAZ", label, tx_h.0, target_name, h, str_from_ctaz(b.spent_zats.into_u64()))
@@ -5529,6 +5539,54 @@ mod paste_tests {
         let capped = pasted_address(&long);
         assert_eq!(capped.chars().count(), PASTED_ADDRESS_MAX_CHARS);
         assert_eq!(capped, "é".repeat(PASTED_ADDRESS_MAX_CHARS));
+    }
+}
+
+#[cfg(test)]
+mod claim_lookup_tests {
+    use super::*;
+    use wallet::{StakingAction, WalletTx};
+
+    fn tx(action: StakingAction, h: u32) -> WalletTx {
+        let mut tx = WalletTx::with_fake_data(WalletTxKind::Stake, 0, 0, false, false, "", h);
+        tx.staking_action = Some(action);
+        tx
+    }
+
+    #[test]
+    fn claim_for_bond_matches_the_bond_key() {
+        let (_, key, _) = wallet::bft::finalizer_key_from_seed(b"gui-claim-lookup");
+        let f = wallet::bft::FinalizerAddress::create(&key);
+        let (a, b) = ([0xaa; 32], [0xbb; 32]);
+        let stake    = |k, amount_zats, h| tx(StakingAction::CreateNewDelegationBond { amount_zats, unique_pubkey: k, bond_salt: [0; 32], target_finalizer: f, signature: [0; 64] }, h);
+        let unstake  = |k, h| tx(StakingAction::BeginDelegationUnbonding { unique_pubkey: k, signature: [0; 64] }, h);
+        let withdraw = |k, amount_zats, h| tx(StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey: k, signature: [0; 64] }, h);
+
+        // Newest first, as the history shows it: bond A's whole life, then bond B's.
+        let mut txs = vec![
+            withdraw(b, 1_030_000_000, 600),
+            unstake(b, 520),
+            stake(b, 1_000_000_000, 400),
+            withdraw(a, 102_000_000, 300),
+            unstake(a, 200),
+            stake(a, 100_000_000, 100),
+        ];
+
+        let (part, h) = claim_for_bond(&txs, b).unwrap();
+        assert_eq!((h, part.spent_zats.into_u64()), (BlockHeight(600), 1_030_000_000));
+        let (part, h) = claim_for_bond(&txs, a).unwrap();
+        assert_eq!((h, part.spent_zats.into_u64()), (BlockHeight(300), 102_000_000));
+
+        // B unstaked but not yet withdrawn must not borrow A's claim.
+        txs.remove(0);
+        assert!(claim_for_bond(&txs, b).is_none());
+        assert_eq!(claim_for_bond(&txs, a).unwrap().0.spent_zats.into_u64(), 102_000_000);
+
+        // A claim that left the chain is not a claim.
+        let mut dropped = withdraw(b, 1_030_000_000, 600);
+        dropped.status = wallet::TxStatus::SoftFail(BlockHeight(600));
+        txs.insert(0, dropped);
+        assert!(claim_for_bond(&txs, b).is_none());
     }
 }
 
