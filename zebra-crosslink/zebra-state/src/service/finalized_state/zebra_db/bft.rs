@@ -65,9 +65,11 @@ impl ZebraDb {
             .expect("column family was created when database was created")
     }
 
-    /// The decided BFT chain, ascending from height 0. Stops at the first gap: a decision is
-    /// written after its snapshot commits, so a crash in between leaves a short chain, which
-    /// resumes by re-deciding that height rather than by loading past the hole.
+    /// The decided BFT chain, ascending from height 0. Stops at the first gap: a crash before
+    /// a row lands leaves a short chain, which resumes by re-deciding that height rather than by
+    /// loading past the hole. A row is written before its snapshot is durable (the snapshot can
+    /// still be only in the non-finalized state), so a loaded row may name a snapshot this state
+    /// does not hold; `restore` resumes BFT below the first such row.
     pub fn bft_chain(&self) -> Vec<StoredDecision> {
         let blocks = self.bft_block_by_height_cf().zs_items_in_range_ordered(..);
         let fat_pointers = self.bft_fat_pointer_by_height_cf().zs_items_in_range_ordered(..);
