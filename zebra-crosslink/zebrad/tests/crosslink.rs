@@ -3941,3 +3941,35 @@ fn crosslink_bft_node_locked_on_a_value_proposes_it_again() {
 
 #[path = "crosslink/fuzz.rs"]
 mod fuzz;
+
+/// The lock gives way to a later quorum: locked on B in round 0, the node holds a fresh A in round
+/// 1 and prevotes nil, but every other finalizer prevotes A, which is a quorum without the node.
+/// The node must then precommit A, locking on it in round 1. A node that held its round-0 lock
+/// against a later quorum could never join a decision the rest had reached.
+#[test]
+fn crosslink_bft_node_locked_on_a_value_precommits_a_later_quorum() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene(&mut tf, &[false, false]);
+    assert!(
+        3 * (scene.total_stake - scene.node_stake) > 2 * scene.total_stake,
+        "the synthetic finalizers are a quorum without the node"
+    );
+    let (value_a, id_b) = bft_lock_on_b_then_round_1(&mut tf, &scene);
+    let id_a = bft_value_id(&value_a);
+    let proposer_1 = u16::try_from(scene.proposer(1, 1)).expect("the node does not propose round 1");
+
+    tf.push_instr_bft_recv_proposal(proposer_1, 1, 1, -1, 0, &value_a, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_sent(0, 1, 1, None, 0);
+
+    for k in scene.finalizers {
+        tf.push_instr_bft_recv_vote(k, 0, 1, 1, &id_a, 0);
+    }
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_sent(1, 1, 1, Some(&id_a), 0);
+    tf.push_instr_expect_bft_sent(1, 1, 1, Some(&id_b), SHOULD_FAIL);
+
+    test_bytes(tf.write_to_bytes());
+}
