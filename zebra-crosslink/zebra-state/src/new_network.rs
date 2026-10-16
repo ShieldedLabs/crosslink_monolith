@@ -3028,7 +3028,8 @@ pub fn sync(
                                     "Finalizers holding at least two thirds of the stake decided a chain containing block {hash} at height {}, which conflicts with the block this node committed at that height.",
                                     height.0,
                                 ),
-                                block_writer.finalized_state.db.path(),
+                                (height, hash),
+                                &block_writer.finalized_state.db,
                             );
                         }
                         drop_block!(hash, "Block at height {} is already finalized", height.0);

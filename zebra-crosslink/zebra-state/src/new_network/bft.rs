@@ -30,6 +30,7 @@ use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize};
 
 use super::ReadState;
 use crate::service::finalized_state::bft::StoredDecision;
+use crate::service::finalized_state::ZebraDb;
 use crate::service::write::WriteBlockWorkerTask;
 use crate::CrosslinkVerdict;
 
@@ -158,11 +159,35 @@ const DROPPED_BFT_REPORT_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// The running tenderlink task. Aborting it ends its network thread, which closes its socket.
 static TENDERLINK_TASK: Mutex<Option<tokio::task::AbortHandle>> = Mutex::new(None);
 
-pub(crate) fn bft_is_dropped() -> bool {
+/// Whether this node has stopped taking part in BFT (see `drop_bft`).
+pub fn bft_is_dropped() -> bool {
     DROPPED_BFT.lock().unwrap().is_some()
 }
 
-pub(crate) fn drop_bft(reason: String, db_path: &std::path::Path) {
+/// Stop BFT on this node because following Π_bft needs `decided`, a block on the decided chain
+/// that this node can no longer hold.
+///
+/// The record is written first, and the depth commit calls this before the commit that leaves
+/// the block behind. A restart without it could not tell this state from a decided snapshot that
+/// was only lost with the non-finalized state, and would resume BFT waiting for a block no peer
+/// can give it.
+pub(crate) fn drop_bft(reason: String, decided: (Height, Hash), db: &ZebraDb) {
+    if bft_is_dropped() {
+        return;
+    }
+    if let Err(err) = db.write_crosslink_bft_dropped(decided.0, decided.1) {
+        // The drop goes ahead: the depth commit is never held back (FINALITY.md §4.3). A restart
+        // without the record resumes BFT below the missing snapshot, fetches the decided chain
+        // again, finds the same conflict, and drops BFT then.
+        tracing::error!(
+            "crosslink: could not record that BFT was dropped over block {} at height {}: {err}",
+            decided.1, decided.0 .0,
+        );
+    }
+    stop_bft(reason, db.path());
+}
+
+fn stop_bft(reason: String, db_path: &std::path::Path) {
     let mut dropped = DROPPED_BFT.lock().unwrap();
     if dropped.is_some() {
         return;
@@ -175,6 +200,7 @@ pub(crate) fn drop_bft(reason: String, db_path: &std::path::Path) {
     );
     tracing::error!("{message}");
     *dropped = Some((message, std::time::Instant::now()));
+    metrics::gauge!("state.crosslink.bft_dropped").set(1.0);
     MISSING_POW_BLOCKS.lock().unwrap().clear();
     DECIDED_MISSING_POW_BLOCKS.lock().unwrap().clear();
     if let Some(task) = TENDERLINK_TASK.lock().unwrap().take() {
@@ -726,7 +752,21 @@ pub(super) struct BftRunner {
     /// moves to the next height, and treats a closed channel as fatal, so they are kept open and
     /// never answered.
     unanswered_decisions: Vec<tokio::sync::oneshot::Sender<(Vec<SortedRosterMember>, [u8; 32])>>,
+    /// A decision whose re-validation came back indeterminate: its snapshot was here when
+    /// tenderlink validated the proposal and has been dropped from the non-finalized state since.
+    /// The decision is final either way, so it is retried at the start of every tick until the
+    /// snapshot is back, and answered only then.
+    parked_decision: Option<ParkedDecision>,
+    /// Set while `tick` retries the parked decision, so only the first park is a warning.
+    retrying_parked_decision: bool,
     next_diagnostic: std::time::Instant,
+}
+
+struct ParkedDecision {
+    block: BftBlock,
+    fat_pointer: FatPointerToBftBlock,
+    proposal_sigs: Vec<TMSig>,
+    reply: DecisionReply,
 }
 
 struct PendingBootstrap {
@@ -755,8 +795,11 @@ impl BftRunner {
             launch,
             pending_bootstrap: None,
             unanswered_decisions: Vec::new(),
+            parked_decision: None,
+            retrying_parked_decision: false,
             next_diagnostic: std::time::Instant::now(),
         };
+        metrics::gauge!("state.crosslink.bft_dropped").set(0.0);
         crate::new_network::fin::load(&block_writer.finalized_state.db);
         if runner.launch.is_some() {
             runner.restore(read_state, block_writer);
@@ -774,6 +817,21 @@ impl BftRunner {
         if let (Some(_), Some(activation_height)) = (self.launch.as_ref(), self.params.bootstrap.activation_height()) {
             if read_state.best_tip().is_some_and(|(tip, _)| tip.0 >= activation_height) {
                 self.bootstrap(read_state, block_writer);
+            }
+        }
+
+        if let Some(ParkedDecision { block, fat_pointer, proposal_sigs, reply }) = self.parked_decision.take() {
+            if bft_is_dropped() {
+                match reply {
+                    DecisionReply::Tenderlink(reply) => self.unanswered_decisions.push(reply),
+                    DecisionReply::ForceFeed(reply) => {
+                        let _ = reply.send(Err("BFT is dropped on this node".to_string()));
+                    }
+                }
+            } else {
+                self.retrying_parked_decision = true;
+                self.decide(block, fat_pointer, proposal_sigs, reply, read_state, block_writer);
+                self.retrying_parked_decision = false;
             }
         }
 
@@ -841,6 +899,16 @@ impl BftRunner {
                 self.decide(block, fat_pointer, proposal_sigs, DecisionReply::Tenderlink(reply), read_state, block_writer);
             }
             BftRequest::ForceFeed { block, fat_pointer, reply } => {
+                if bft_is_dropped() {
+                    let _ = reply.send(Err("BFT is dropped on this node".to_string()));
+                    return;
+                }
+                // A decision at this height is already final and waits only for its snapshot;
+                // storing another one here would fork the chain under it.
+                if self.parked_decision.is_some() {
+                    let _ = reply.send(Err("a decided BFT block is waiting for its snapshot".to_string()));
+                    return;
+                }
                 if fat_pointer.points_at_block_hash() != block.blake3_hash() {
                     let _ = reply.send(Err(format!(
                         "Fat Pointer hash does not match block hash. fp: {} block: {}",
@@ -1207,12 +1275,46 @@ impl BftRunner {
         }
 
         let mut chain = BFT_CHAIN.write().unwrap();
-        assert_eq!(self.validate(&chain, read_state, &new_block), (TMStatus::Pass, TMStatusReason::None));
+        match self.validate(&chain, read_state, &new_block) {
+            (TMStatus::Pass, _) => {}
+            (TMStatus::Indeterminate, reason) => {
+                // Tenderlink decides only on a Pass from this node, so the block this
+                // re-validation lacks was here then and has been dropped from the non-finalized
+                // state since. The decision is final regardless; it is recorded once that block
+                // is back. Recording it now with the last roster would guess the next height's
+                // validator set, which is the stake at a snapshot this node does not hold.
+                drop(chain);
+                if self.retrying_parked_decision {
+                    tracing::debug!("decided BFT block {} at height {} is still parked: {reason:?}", new_block.blake3_hash(), new_block.height);
+                } else {
+                    tracing::warn!(
+                        "parking decided BFT block {} at height {}: {reason:?}",
+                        new_block.blake3_hash(), new_block.height,
+                    );
+                }
+                if let (DecisionReply::Tenderlink(_), TMStatusReason::NeedsBlock { hash }) = (&reply, &reason) {
+                    // The proposal holds a decision's worth of precommits, so the block it needs
+                    // is on the decided chain: fetched whatever height a peer alleges, and BFT is
+                    // dropped if it turns out to conflict with a committed block.
+                    DECIDED_MISSING_POW_BLOCKS.lock().unwrap().insert(Hash(*hash));
+                }
+                self.parked_decision = Some(ParkedDecision { block: new_block, fat_pointer, proposal_sigs, reply });
+                return;
+            }
+            (TMStatus::Fail, reason) => panic!(
+                "decided BFT block {} at height {} failed re-validation after this node validated it: \
+                 an immutable fact changed ({reason:?})",
+                new_block.blake3_hash(), new_block.height,
+            ),
+        }
 
         // The `snapshot`: the parent of the deepest carried header, i.e. the block being
         // finalized. See `BftBlock::snapshot_block_hash`.
         let new_final_hash = Hash(new_block.snapshot_block_hash().0);
-        let new_final_height = read_state.known_block(new_final_hash).unwrap().height;
+        let new_final_height = read_state
+            .known_block(new_final_hash)
+            .expect("validate passed just above, and it requires the snapshot to be known")
+            .height;
         // `height` is the 0-based canonical height, i.e. the chain index directly.
         let insert_i = new_block.height as usize;
 
@@ -1427,6 +1529,20 @@ impl BftRunner {
             fat_pointer_to_tip = fat_pointer;
         }
 
+        // Dropping BFT is permanent for a database, so a recorded drop starts this run dropped
+        // whatever the stored chain looks like. The stored chain is still loaded, because
+        // bc-blocks cite it.
+        if let Some((dropped_height, dropped_hash)) = block_writer.finalized_state.db.crosslink_bft_dropped() {
+            stop_bft(
+                format!(
+                    "It was dropped before this node last stopped: following Π_bft needed block \
+                     {dropped_hash} at height {}, which conflicts with this node's committed chain.",
+                    dropped_height.0,
+                ),
+                block_writer.finalized_state.db.path(),
+            );
+        }
+
         let mut new_final_hash = Hash([0; 32]);
         let mut new_final_height = Height(0);
         if let Some(new_block) = blocks.last() {
@@ -1434,10 +1550,8 @@ impl BftRunner {
             match read_state.known_block(new_final_hash) {
                 Some(known) => new_final_height = known.height,
                 None => {
-                    // The node committed past a fork from this block before it stopped, or the
-                    // database is damaged. Either way the decided chain cannot be followed from
-                    // here. The stored chain is still loaded, because bc-blocks cite it.
-                    drop_bft(
+                    // The decided chain cannot be followed from here.
+                    stop_bft(
                         format!("The decided BFT chain finalizes block {new_final_hash}, which this database does not hold."),
                         block_writer.finalized_state.db.path(),
                     );
@@ -1531,6 +1645,10 @@ impl BftRunner {
         // against the chain, and a genesis already at index 0 fails that assert -- which under
         // `panic = abort` takes the node down.
         if BFT_CHAIN.read().unwrap().blocks.first().is_some_and(|b| !b.headers.is_empty()) {
+            return;
+        }
+        // A parked genesis is decided already and waits only for its snapshot.
+        if self.parked_decision.is_some() {
             return;
         }
         let Some((genesis, fat_pointer)) = self.build_bootstrap_genesis(read_state) else {
@@ -1642,10 +1760,17 @@ impl BftRunner {
                 Box::pin(async move {
                     let block = BftBlock::zcash_deserialize(&block.0[..]).unwrap();
                     let (reply, rx) = tokio::sync::oneshot::channel();
+                    // Both failures mean the sync thread will never answer: it has shut down, or
+                    // this node dropped BFT and is aborting this task. Either way this height
+                    // never completes here, and waiting forever lets the abort or the runtime's
+                    // shutdown end the task instead of the process.
                     if !send_request(BftRequest::Decided { block, fat_pointer, proposal_sigs, reply }) {
-                        panic!("new_network is not running; cannot store a decided BFT block");
+                        return std::future::pending().await;
                     }
-                    rx.await.expect("new_network dropped a decided BFT block")
+                    let Ok(answer) = rx.await else {
+                        return std::future::pending().await;
+                    };
+                    answer
                 })
             })),
             tenderlink::ClosureToUpdatePeers(Arc::new(move |all_peers| {

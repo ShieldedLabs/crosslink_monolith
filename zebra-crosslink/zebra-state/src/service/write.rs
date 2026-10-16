@@ -246,7 +246,8 @@ impl WriteBlockWorkerTask {
                     "This node's best chain forks below the block decided at height {} ({decided_hash}) and has reached the reorg depth, so committing {root_hash} leaves that block behind.",
                     decided_height.0,
                 ),
-                self.finalized_state.db.path(),
+                (decided_height, decided_hash),
+                &self.finalized_state.db,
             );
         }
     }
