@@ -2170,4 +2170,49 @@ mod tests {
         let early = header(block_id(1, 1_000), early_time, required(&context, snapshot_height, early_time));
         assert!(check(&[&early]).is_err());
     }
+
+    /// A carried header declaring PoWLimit more than six spacings after the snapshot, above the
+    /// minimum-difficulty start height: a legitimate minimum-difficulty header on stock Testnet
+    /// parameters, refused on parameters that switch the exemption off and once
+    /// FeaturenetUpgrade2 is active.
+    #[test]
+    fn a_minimum_difficulty_carried_header_passes_only_where_the_exemption_holds() {
+        use zebra_chain::parameters::testnet::{self, ConfiguredActivationHeights};
+        use zebra_chain::work::difficulty::ParameterDifficulty as _;
+
+        let stock = Network::new_default_testnet();
+        let Network::Testnet(stock_params) = &stock else {
+            unreachable!("the default testnet is a Testnet");
+        };
+        let mut heights = ConfiguredActivationHeights::from(stock_params.activation_heights());
+        let last_scheduled = stock_params.activation_heights().keys().last().expect("Testnet has upgrades").0;
+        let snapshot_height = Height(last_scheduled.max(400_000));
+        heights.featurenet_upgrade_2 = Some(snapshot_height.0);
+        let upgraded = testnet::Parameters::build()
+            .with_activation_heights(heights)
+            .expect("valid activation heights")
+            .to_network()
+            .expect("valid parameters");
+        let featurenet = testnet::Parameters::build()
+            .with_minimum_difficulty_start_height(None)
+            .to_network()
+            .expect("valid parameters");
+
+        let check = |network: &Network| {
+            let spacing = zebra_chain::parameters::NetworkUpgrade::target_spacing_for_height(network, snapshot_height).num_seconds();
+            let history_bits = (network.target_difficulty_limit() / 1_000u64).to_compact();
+            let snapshot_time = 2_000_000_000;
+            let context: VecDeque<_> = (0..POW_ADJUSTMENT_BLOCK_SPAN)
+                .map(|depth| (history_bits, time(snapshot_time - spacing * i64::try_from(depth).expect("depth is below 28"))))
+                .collect();
+            let gapped = header(block_id(1, snapshot_height.0), snapshot_time + spacing * 6 + 1, network.target_difficulty_limit().to_compact());
+            headers_meet_required_difficulty(network, snapshot_height, context, &[bc_hdr_to_lrz(&gapped)])
+        };
+
+        assert_eq!(check(&stock), Ok(()));
+        for network in [&featurenet, &upgraded] {
+            let err = check(network).expect_err("no minimum-difficulty exemption applies");
+            assert!(err.contains("is not equal to the expected difficulty"), "{err}");
+        }
+    }
 }
