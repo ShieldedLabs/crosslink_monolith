@@ -487,6 +487,16 @@ const POISON_INSTR: usize = 4;
 /// block 5 is valid (see the control). Everything built on block 5 then waits for a parent that
 /// never commits: a refused body leaves something behind, keyed by the hash it shares with the
 /// real block, that decides the next block's verdict.
+///
+/// Cause (confirmed 2026-10-16): `WriteBlockWorkerTask::handle_commit` (zebra-state
+/// service/write.rs, from upstream Zebra) stores a failed block's error in `parent_error_map`
+/// under its hash, so that its children are refused without being validated. The copy's error is
+/// stored under block 4's hash. The real block 4 still commits, since only its parent's hash is
+/// looked up, but block 5's parent is block 4's hash, so block 5 gets the copy's error. A hash
+/// commits only to the header, and the copy failed for its body, so the error says nothing about
+/// block 4's children. Removing the hash from the map when a block with it commits makes this
+/// pass with the suite otherwise unchanged; not storing errors that only show a body does not
+/// match its header would also work.
 #[test]
 #[ignore = "open finding: a refused block body poisons the next block's commit; ingest code, needs a human look before a fix"]
 fn crosslink_fuzz_finding_refused_body_poisons_the_next_block() {
