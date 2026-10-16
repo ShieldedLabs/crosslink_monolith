@@ -122,6 +122,8 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "bft_proposal_sigs_by_height",
     // The node-local finalized marker.
     "crosslink_fin",
+    // The decided-chain block this node could not follow when it dropped BFT.
+    "crosslink_bft_dropped",
     // Legacy slash-index column families, empty and unused since Retarget actions
     // began carrying their `from` finalizer (burn sets are computed lazily at
     // activation now); still registered so existing databases open.

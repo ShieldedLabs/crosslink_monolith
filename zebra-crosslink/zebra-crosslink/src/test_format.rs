@@ -160,8 +160,9 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::EXPECT_BFT_STEP as usize] = "EXPECT_BFT_STEP";
     strs[TFInstr::EXPECT_BFT_SENT as usize] = "EXPECT_BFT_SENT";
     strs[TFInstr::EXPECT_BFT_PROPOSER as usize] = "EXPECT_BFT_PROPOSER";
+    strs[TFInstr::EXPECT_BFT_DROPPED as usize] = "EXPECT_BFT_DROPPED";
 
-    const_assert!(TFInstr::COUNT == 35);
+    const_assert!(TFInstr::COUNT == 36);
     strs
 };
 
@@ -281,7 +282,8 @@ impl TFInstr {
     /// that clock never follows real time, so nothing else moves it. Every synthetic finalizer
     /// first sends the node a status that needs everything at the engine's height and round, and
     /// the instruction returns once the engine has acted on the new time and everything it sent
-    /// is recorded.
+    /// is recorded. With SHOULD_FAIL, that the engine does not catch up: it is waiting on the
+    /// node, as it does on a decision the node has not answered.
     pub const ADVANCE_TIME: TFInstrKind = 31;
     /// The engine is at height `val[0]`, round `val[1] >> 8`, step `val[1] & 0xff` (0 propose,
     /// 1 prevote, 2 precommit, 0xff any).
@@ -293,7 +295,10 @@ impl TFInstr {
     /// The proposer at `val[1]` is synthetic finalizer `val[0]`, or the node when `val[0]` is
     /// `TF_BFT_THE_NODE`.
     pub const EXPECT_BFT_PROPOSER: TFInstrKind = 34;
-    pub const COUNT: TFInstrKind = 35;
+    /// The node has stopped taking part in BFT (`val[0]` 1) or has not (0), and its database
+    /// records it the same way: with the data a block hash, the record names that block.
+    pub const EXPECT_BFT_DROPPED: TFInstrKind = 35;
+    pub const COUNT: TFInstrKind = 36;
 
     pub fn str_from_kind(kind: TFInstrKind) -> &'static str {
         let kind = kind as usize;
@@ -420,6 +425,12 @@ impl TFInstr {
             }
             Some(TestInstr::RecvStpPacket { packet, peer }) => {
                 str += &format!("type {:?}, {} bytes from peer {peer}", packet.first(), packet.len())
+            }
+            Some(TestInstr::ExpectBftDropped { dropped, hash }) => {
+                str += &format!("{dropped}");
+                if let Some(hash) = hash {
+                    str += &format!(" over {hash}");
+                }
             }
             None => {}
         }
@@ -804,6 +815,12 @@ impl TF {
         self.push_instr_ex(TFInstr::EXPECT_BFT_PROPOSER, flags, &[0; 0], [finalizer, bft_height_round(height, round)])
     }
 
+    /// `hash`, when given, is the block the dropped-BFT record must name.
+    pub fn push_instr_expect_bft_dropped(&mut self, dropped: bool, hash: Option<&ZebBlockHash>, flags: u32) {
+        let data = hash.map_or(&[][..], |hash| &hash.0[..]);
+        self.push_instr_ex(TFInstr::EXPECT_BFT_DROPPED, flags, data, [u64::from(dropped), 0])
+    }
+
     /// A block the node must reject for `reason`, and must survive rejecting: the load, the
     /// reason check, and the liveness check, as three instructions.
     pub fn push_instr_load_pow_rejected(&mut self, block: &Block, reason: &str) {
@@ -1144,7 +1161,7 @@ pub fn crosslink_parameters_for_test(bytes: &[u8]) -> ZcashCrosslinkParameters {
 }
 
 pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> {
-    const_assert!(TFInstr::COUNT == 35);
+    const_assert!(TFInstr::COUNT == 36);
     match instr.kind {
         TFInstr::LOAD_POW => {
             let block = Block::zcash_deserialize(instr.data_slice(bytes)).ok()?;
@@ -1301,6 +1318,11 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
             packet: instr.data_slice(bytes).to_vec(),
             peer: instr.val[0],
         }),
+        TFInstr::EXPECT_BFT_DROPPED => {
+            let data = instr.data_slice(bytes);
+            let hash = if data.is_empty() { None } else { Some(ZebBlockHash(data.try_into().ok()?)) };
+            Some(TestInstr::ExpectBftDropped { dropped: instr.val[0] != 0, hash })
+        }
 
         // An instruction this build doesn't know. The caller decides whether that is fatal
         // (a test) or skippable (the fuzzer, the GUI viewer).
@@ -1349,6 +1371,7 @@ pub(crate) enum TestInstr {
     ExpectBftStep { height: u64, round: u32, step: u64 },
     ExpectBftSent { kind: u64, height: u64, round: u32, value_id: Option<[u8; 32]> },
     ExpectBftProposer { finalizer: u64, height: u64, round: u32 },
+    ExpectBftDropped { dropped: bool, hash: Option<ZebBlockHash> },
     RosterForceInclude([u8; 32], u64),   // public address
     ExpectRosterIncludes([u8; 32], u64), // public address
 }
@@ -1558,7 +1581,7 @@ pub(crate) async fn handle_instr(
             } else {
                 match settled.and(bft_settle().await) {
                     Ok(()) => test_check(flags, true, &format!("ADVANCE_TIME: the clock moved {millis} ms and the engine caught up")),
-                    Err(err) => test_check_outcome(false, false, &format!("ADVANCE_TIME: {err}")),
+                    Err(err) => test_check(flags, false, &format!("ADVANCE_TIME: {err}")),
                 }
             }
         }
@@ -1739,6 +1762,34 @@ pub(crate) async fn handle_instr(
         TestInstr::ExpectNodeAlive => {
             let (alive, message) = node_alive(internal_handle).await;
             test_check(flags, alive, &message);
+        }
+
+        TestInstr::ExpectBftDropped { dropped, hash } => {
+            let in_memory = zebra_state::new_network::bft::bft_is_dropped();
+            let answer = tokio::time::timeout(
+                NODE_ANSWER_WAIT,
+                (internal_handle.call.read_state)(zebra_state::ReadRequest::CrosslinkBftDropped),
+            )
+            .await;
+            let record = match answer {
+                Ok(Ok(zebra_state::ReadResponse::CrosslinkBftDropped(record))) => record,
+                other => {
+                    test_check_outcome(false, false, &format!("EXPECT_BFT_DROPPED: no verdict, the record request answered {other:?}"));
+                    return;
+                }
+            };
+            let record_matches = match (dropped, hash, record) {
+                (false, _, None) => true,
+                (true, None, Some(_)) => true,
+                (true, Some(hash), Some((_, recorded))) => recorded == hash,
+                _ => false,
+            };
+            let holds = in_memory == dropped && record_matches;
+            test_check(
+                flags,
+                holds,
+                &format!("EXPECT_BFT_DROPPED: BFT dropped in memory: {in_memory}; database record: {record:?}"),
+            );
         }
 
         TestInstr::RecvTx { wire, peer } => {

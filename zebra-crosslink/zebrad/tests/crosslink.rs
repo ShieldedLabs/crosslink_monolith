@@ -1267,6 +1267,147 @@ fn crosslink_pow_follows_the_heaviest_chain_until_fin_moves_to_the_decided_branc
     test_bytes(tf.write_to_bytes());
 }
 
+/// The depth commit runs past a fork from the decided snapshot: the node drops BFT, records why in
+/// its database before that commit, and keeps running as proof of work. Afterwards it asks for no
+/// block on the dropped branch, decides nothing more, and still mines and commits on its own chain.
+#[test]
+fn crosslink_dropping_bft_at_the_reorg_depth_records_it_and_keeps_pow_running() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+    let network = regtest_network(&HARNESS_PARAMETERS);
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let miner_addr2 = zcash_keys::address::Address::Transparent(
+        zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
+    );
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut pow = vec![gen.tip.clone()];
+    tf.push_instr_load_pow(&gen.tip, 0);
+
+    // Heights 1..9, common to both branches.
+    for _ in 2..10 {
+        pow.push(gen.next_block(&miner_addr));
+        tf.push_instr_load_pow(&gen.tip, 0);
+    }
+    for i in 0..3 {
+        let bft = next_pos(pos_h, fat_ptr, &pow[i..i + 3], &[]);
+        tf.push_instr_load_pos(&bft, 0);
+    }
+
+    // Branch B, heights 10..14: pow[9..14], a side chain holding the snapshot that gets decided.
+    let mut genb = gen.clone();
+    for _ in 10..15 {
+        pow.push(genb.next_block(&miner_addr2));
+        tf.push_instr_load_pow(&genb.tip, 0);
+    }
+    // Branch A, heights 10..20: the best chain.
+    for _ in 10..21 {
+        tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
+    }
+
+    // Decided: snapshot pow[9], branch B's height 10.
+    let decided = next_pos(pos_h, fat_ptr, &pow[10..13], &[]);
+    tf.push_instr_load_pos(&decided, 0);
+    let decided_snapshot = pow[9].hash();
+    // The next height on it, snapshot pow[10]. Checked, never stored.
+    let next = create_pos_and_ptr_to_finalize_pow(*pos_h, fat_ptr.clone(), &pow[11..14], &[]);
+
+    // Branch A runs on. Height 109 is the first whose commit takes branch A's height 10 into the
+    // finalized state, which leaves branch B on no chain this node holds.
+    for _ in 21..109 {
+        tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
+    }
+    tf.push_instr_expect_bft_dropped(false, None, 0);
+    tf.push_instr_check_pos(&next, 0);
+
+    tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
+    tf.push_instr_expect_bft_dropped(true, Some(&decided_snapshot), 0);
+
+    // Indeterminate, and with no block named: nothing on the dropped branch can arrive.
+    tf.push_instr_check_pos(&next, SHOULD_DEFER);
+    tf.push_instr_expect_rejection_reason("pending: None", 0);
+    tf.push_instr_load_pos(&next, SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("BFT is dropped", 0);
+    tf.push_instr_expect_node_alive(0);
+
+    // Proof of work goes on, from loaded blocks and from the node's own templates.
+    tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
+    tf.push_instr_expect_pow_chain_length(111, 0);
+    tf.push_instr_mine_from_template(0);
+    tf.push_instr_expect_pow_chain_length(112, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// A height-0 BFT block whose headers are `tail`'s, relinked onto a snapshot named by `snapshot`
+/// that no chain holds, with every header's difficulty set to `bits`.
+fn pos_on_a_snapshot_nobody_holds(tail: &[Arc<Block>], snapshot: [u8; 32], bits: Option<u32>) -> BftBlockAndFatPointerToItWrap {
+    use zcash_primitives::block::BlockHash as BcBlockHash;
+    let mut headers: Vec<_> = tail.iter().map(|b| zebra_crosslink::bc_hdr_to_lrz(b.header.as_ref())).collect();
+    for i in 0..headers.len() {
+        if let Some(bits) = bits {
+            headers[i].bits = bits;
+        }
+        headers[i].prev_block = if i == 0 { BcBlockHash(snapshot) } else { BcBlockHash::from_header_data(&headers[i - 1]) };
+    }
+    let mut block = BftBlock::try_from(&HARNESS_PARAMETERS, 0, FatPointerToBftBlock::null(), headers).expect("sigma linked headers");
+    block.version = 2;
+    BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt::from_parts(block, 0, 0, &[]))
+}
+
+/// Proposals naming snapshots that do not exist cannot stall PoW sync. Each one this node
+/// validates asks peers for its snapshot by hash; more of them than one peer has download slots
+/// used to take every slot, so the next real block was never requested. The wanted set is capped
+/// and by-hash requests hold only a share of the budget, so the real block still arrives. A tail
+/// whose own headers fail is refused before anything is asked for.
+#[test]
+fn crosslink_bogus_bft_snapshots_do_not_stall_pow_sync() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let (mut gen, miner, pow) = pow_chain_for(&mut tf, 10);
+
+    let mut over_the_limit = [0xeeu8; 32];
+    over_the_limit[0] = 0;
+    tf.push_instr_check_pos(&pos_on_a_snapshot_nobody_holds(&pow[2..5], over_the_limit, Some(0x217f_ffff)), SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("rejected", 0);
+
+    for n in 0..40u8 {
+        let mut snapshot = [n; 32];
+        snapshot[31] = 0xa5;
+        tf.push_instr_check_pos(&pos_on_a_snapshot_nobody_holds(&pow[2..5], snapshot, None), SHOULD_DEFER);
+    }
+    tf.push_instr_recv_pow(&gen.next_block(&miner), 0, 0);
+    tf.push_instr_expect_pow_chain_length(pow.len() + 2, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// The bound on wanted snapshots still lets a real one through: a proposal whose snapshot this
+/// node lacks asks for it by hash, a peer serves it, and the proposal then validates.
+#[test]
+fn crosslink_missing_bft_snapshot_is_fetched_by_hash() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let (gen, _, pow) = pow_chain_for(&mut tf, 10);
+    let miner2 = zcash_keys::address::Address::Transparent(
+        zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
+    );
+    // A side branch off the tip that the node has not seen.
+    let mut genb = gen.clone();
+    let side: Vec<Arc<Block>> = (0..4).map(|_| genb.next_block(&miner2)).collect();
+    let proposal = create_pos_and_ptr_to_finalize_pow(0, FatPointerToBftBlock::null(), &side[1..4], &[]);
+    assert_eq!(pow.len(), 10);
+
+    tf.push_instr_check_pos(&proposal, SHOULD_DEFER);
+    tf.push_instr_expect_rejection_reason("NeedsBlock", 0);
+    tf.push_instr_recv_pow(&side[0], 0, 0);
+    tf.push_instr_check_pos(&proposal, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 // Last Final Snapshot (FINALITY.md §3.1, §6.2): a bc-block may cite a bft-block only if its own
 // ancestry contains that bft-block's snapshot. The test needs the decided snapshot to sit on a
 // branch the citing block is not on, which is possible only now that deciding does not commit.
@@ -3915,6 +4056,70 @@ fn crosslink_bft_node_given_another_value_decides_what_the_rest_precommitted() {
     gen.next_block(&miner);
     tf.push_instr_load_pow(&point_tip_at_bft(gen, &decided), 0);
     tf.push_instr_expect_finalized_tip(Some(&scene.pow_at(20).hash()), 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// The decide race: the node validates a proposal as Pass, then a depth commit drops the side
+/// chain holding its snapshot, then the rest of the roster precommits it. Tenderlink decides on the
+/// Pass it cached, and the node's re-validation is now indeterminate. The decision is parked, not
+/// asserted on, so the node stays up; fetching the snapshot then shows it conflicts with the
+/// committed chain, and BFT is dropped with the record naming that block.
+#[test]
+fn crosslink_bft_decision_whose_snapshot_was_dropped_is_parked_not_aborted() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let mut scene = bft_rounds_scene(&mut tf, &[false]);
+    assert!(
+        3 * (scene.total_stake - scene.node_stake) > 2 * scene.total_stake,
+        "the synthetic finalizers are a quorum without the node"
+    );
+    let proposer = u16::try_from(scene.proposer(1, 0)).expect("the node does not propose");
+
+    // A side chain at heights 112..115 off the scene's tip; its first block is the snapshot.
+    let miner2 = zcash_keys::address::Address::Transparent(
+        zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
+    );
+    let mut genb = scene.gen.clone();
+    let side: Vec<Arc<Block>> = (0..4).map(|_| genb.next_block(&miner2)).collect();
+    for block in &side {
+        tf.push_instr_load_pow(block, 0);
+    }
+    let parent = FatPointerToBftBlock::from_parts(scene.genesis().blake3_hash(), 0, 0, &[]);
+    let value = bft_proposal_value(&bft_proposal(&BFT_ROUNDS_PARAMETERS, 1, parent, 0, &side[1..4]));
+    let id = bft_value_id(&value);
+
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_bft_recv_proposal(proposer, 1, 0, -1, 0, &value, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    // A prevote for it: the node validated it as Pass, and tenderlink has cached that.
+    tf.push_instr_expect_bft_sent(0, 1, 0, Some(&id), 0);
+
+    // The main chain runs on until committing its height 112 drops the side chain. One block
+    // more publishes the chains as they are after that commit.
+    let miner = scene.miner.clone();
+    for _ in 112..=212 {
+        tf.push_instr_load_pow(&scene.gen.next_block(&miner), 0);
+    }
+    tf.push_instr_expect_pow_chain_length(213, 0);
+
+    // The rest of the roster precommits it, which decides it on the engine's next tick. The
+    // engine then waits on the node's answer, so from there it never settles.
+    for k in scene.finalizers {
+        tf.push_instr_bft_recv_vote(k, TF_BFT_PRECOMMIT, 1, 0, &id, 0);
+    }
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, SHOULD_FAIL);
+    tf.push_instr_expect_node_alive(0);
+    tf.push_instr_expect_bft_dropped(false, None, 0);
+
+    // The parked decision put its snapshot on the decided chain, so the node asks for it by hash.
+    // It sits below the finalized tip on a chain the node did not commit.
+    tf.push_instr_recv_pow(&side[0], 0, SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("already finalized", 0);
+    tf.push_instr_expect_bft_dropped(true, Some(&side[0].hash()), 0);
+    tf.push_instr_expect_node_alive(0);
+    tf.push_instr_load_pow(&scene.gen.next_block(&miner), 0);
+    tf.push_instr_expect_pow_chain_length(214, 0);
 
     test_bytes(tf.write_to_bytes());
 }
