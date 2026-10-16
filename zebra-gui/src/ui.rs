@@ -80,6 +80,34 @@ pub fn parse_ctaz(s: &str) -> Option<u64> {
     whole.checked_mul(ONE_cTAZ)?.checked_add(frac)
 }
 
+/// "[first edge..last edge]" counted in characters, never bytes: the input is whatever the
+/// clipboard held, and a byte cut inside a character panics, which aborts the node.
+pub fn abbreviate_ends(s: &str, edge: usize) -> String {
+    let count = s.chars().count();
+    if count < 2 * edge {
+        return format!("[{s}]");
+    }
+    let mut head_end = s.len();
+    let mut tail_start = s.len();
+    for (i, (byte_o, _)) in s.char_indices().enumerate() {
+        if i == edge { head_end = byte_o; }
+        if i == count - edge { tail_start = byte_o; }
+    }
+    format!("[{}..{}]", &s[..head_end], &s[tail_start..])
+}
+
+/// Comfortably above a finalizer address (134 characters) and a unified address with three receivers.
+const PASTED_ADDRESS_MAX_CHARS: usize = 512;
+
+/// The clipboard text a paste button stores: trimmed, bounded, and filtered like the Ctrl+V path in lib.rs.
+pub fn pasted_address(raw: &str) -> String {
+    let mut out = String::new();
+    for c in raw.trim().chars().take(PASTED_ADDRESS_MAX_CHARS) {
+        if c >= ' ' && c != '\u{7f}' { out.push(c); }
+    }
+    out
+}
+
 
 #[macro_export]
 macro_rules! frame_strf {
@@ -1981,15 +2009,14 @@ pub fn ui_left_pane(ui: &mut Context,
                         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
                         if true {
-                            let mut send_address = "0000000000000000";
-                            if data.send_address.len() >= 16 {
-                                send_address = &data.send_address;
+                            if data.send_address.is_empty() {
+                                ui.text("No address pasted", TextDecl { h: ui.scale(20.0), colour: WHITE.mul(0.6), align: AlignX::Center, ..TextDecl });
+                            } else {
+                                ui.text(frame_strf!(data, "{}", abbreviate_ends(&data.send_address, 8)), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                             }
-
-                            ui.text(frame_strf!(data, "[{}..{}]", &send_address[..8], &send_address[send_address.len() - 8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                             if button(ui, "Paste Address", true) {
                                 if let Some(text) = ui.input().get_from_clipboard() {
-                                    data.send_address = text.trim().to_string();
+                                    data.send_address = pasted_address(&text);
                                 }
                             }
 
@@ -2020,7 +2047,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
                             if button(ui, "Paste Address", true) {
                                 if let Some(text) = ui.input().get_from_clipboard() {
-                                    data.send_address = text.trim().to_string();
+                                    data.send_address = pasted_address(&text);
                                     let send_address_buf: Vec<char> = data.send_address.chars().collect();
                                     let textbox_state = data.textboxes.entry(send_address_id.id).or_default();
                                     textbox_state.text_buf = send_address_buf;
@@ -2250,15 +2277,14 @@ pub fn ui_left_pane(ui: &mut Context,
                     title_bar(ui, true, "Stake", id("Stake Title Bar"));
 
                     if true {
-                        let mut stake_address = "0000000000000000";
-                        if data.stake_address.len() >= 16 {
-                            stake_address = &data.stake_address;
+                        if data.stake_address.is_empty() {
+                            ui.text("No identity pasted", TextDecl { h: ui.scale(20.0), colour: WHITE.mul(0.6), align: AlignX::Center, ..TextDecl });
+                        } else {
+                            ui.text(frame_strf!(data, "{}", abbreviate_ends(&data.stake_address, 8)), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                         }
-
-                        ui.text(frame_strf!(data, "[{}..{}]", &stake_address[0..8], &stake_address[stake_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                         if button(ui, "Paste Identity", true) {
                             if let Some(text) = ui.input().get_from_clipboard() {
-                                data.stake_address = text.trim().to_string();
+                                data.stake_address = pasted_address(&text);
                             }
                         }
 
@@ -2289,7 +2315,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         }
                         if button(ui, "Paste Identity", true) {
                             if let Some(text) = ui.input().get_from_clipboard() {
-                                data.stake_address = text.trim().to_string();
+                                data.stake_address = pasted_address(&text);
                                 let stake_address_buf: Vec<char> = data.stake_address.chars().collect();
                                 let textbox_state = data.textboxes.entry(stake_address_id.id).or_default();
                                 textbox_state.text_buf = stake_address_buf;
@@ -2406,15 +2432,14 @@ pub fn ui_left_pane(ui: &mut Context,
                 Modal::Retarget => {
                     title_bar(ui, true, "Retarget Delegation Bond", id("Retarget Title Bar"));
 
-                    let mut stake_address = "0000000000000000";
-                    if data.stake_address.len() >= 16 {
-                        stake_address = &data.stake_address;
+                    if data.stake_address.is_empty() {
+                        ui.text("No identity pasted", TextDecl { h: ui.scale(20.0), colour: WHITE.mul(0.6), align: AlignX::Center, ..TextDecl });
+                    } else {
+                        ui.text(frame_strf!(data, "{}", abbreviate_ends(&data.stake_address, 8)), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                     }
-
-                    ui.text(frame_strf!(data, "[{}..{}]", &stake_address[0..8], &stake_address[stake_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                     if button(ui, "Paste Identity", true) {
                         if let Some(text) = ui.input().get_from_clipboard() {
-                            data.stake_address = text.trim().to_string();
+                            data.stake_address = pasted_address(&text);
                         }
                     }
 
@@ -5461,5 +5486,44 @@ mod roster_identity_tests {
 
         member.finalizer_address = Some(wallet::bft::FinalizerAddress { pub_key: pk, sig: wallet::bft::TMSig([0; 64]) });
         assert_eq!(roster_member_identity(&member).2, raw_pk);
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::*;
+
+    #[test]
+    fn abbreviate_ends_counts_characters_not_bytes() {
+        assert_eq!(abbreviate_ends("0123456789abcdefXYZ", 8), "[01234567..bcdefXYZ]");
+        assert_eq!(abbreviate_ends("0123456789abcdef", 8), "[01234567..89abcdef]");
+
+        // Three bytes each: byte 8 falls inside the third character, the old crash.
+        assert_eq!(abbreviate_ends("你好世界你好", 8), "[你好世界你好]");
+        assert_eq!(abbreviate_ends("一二三四五六七八九十甲乙丙丁戊己庚辛", 8), "[一二三四五六七八..甲乙丙丁戊己庚辛]");
+
+        // Two bytes each.
+        assert_eq!(abbreviate_ends("абвгдежзийклмнопрст", 8), "[абвгдежз..лмнопрст]");
+
+        // One multi-byte character straddling byte 8 and one straddling len - 8.
+        assert_eq!(abbreviate_ends("1234567é90123456é8901234", 8), "[1234567é..é8901234]");
+        assert_eq!(abbreviate_ends("ab😀cdefghijklmnopq€rs", 8), "[ab😀cdefg..mnopq€rs]");
+
+        assert_eq!(abbreviate_ends("short", 8), "[short]");
+        assert_eq!(abbreviate_ends("fifteen chars!!", 8), "[fifteen chars!!]");
+        assert_eq!(abbreviate_ends("", 8), "[]");
+    }
+
+    #[test]
+    fn pasted_address_is_trimmed_printable_and_capped() {
+        assert_eq!(pasted_address("  \t utest1abc \r\n"), "utest1abc");
+        assert_eq!(pasted_address("ut\u{0}est\u{7}1\u{1b}[31m\u{7f}abc"), "utest1[31mabc");
+        assert_eq!(pasted_address("ut est"), "ut est");
+        assert_eq!(pasted_address("\n\n"), "");
+
+        let long: String = "é".repeat(600);
+        let capped = pasted_address(&long);
+        assert_eq!(capped.chars().count(), PASTED_ADDRESS_MAX_CHARS);
+        assert_eq!(capped, "é".repeat(PASTED_ADDRESS_MAX_CHARS));
     }
 }
