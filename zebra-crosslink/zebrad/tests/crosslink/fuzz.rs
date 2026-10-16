@@ -63,6 +63,9 @@ impl Choices {
 /// disconnected, so each such delivery gets its own.
 const FRESH_PEERS_FROM: u64 = 100;
 
+/// The deepest a fork reaches below `main`'s tip.
+const FORK_DEPTH_MAX: usize = 6;
+
 /// What the generator builds and what it believes the node holds.
 pub(crate) struct FuzzGen {
     pub tf: TF,
@@ -83,6 +86,60 @@ pub(crate) struct FuzzGen {
     pub next_fresh_peer: u64,
     /// For distinct forks: each one mines to its own address.
     pub forks_made: u64,
+
+    /// The parameters the node runs, for the staking calendar.
+    pub params: zcash_primitives::bft::ZcashCrosslinkParameters,
+    /// Spends submitted to the mempool and not yet mined.
+    pub pending: Vec<FuzzPending>,
+    /// Spends mined on `main`, for double spends of them.
+    pub mined_spends: Vec<FuzzMinedSpend>,
+    /// Coins whose spend was mined on a block a reorg dropped: the node may have put that spend
+    /// back in its mempool, so what it does with another spend of the coin is not known.
+    pub unsure_coins: std::collections::HashSet<zebra_chain::transparent::OutPoint>,
+    /// Every bond the generator has tried to create, whether or not the node took it.
+    pub bonds: Vec<FuzzBond>,
+    /// For distinct transactions: conflicting spends and bond seeds are numbered by this.
+    pub txs_made: u64,
+    /// `rival_height` and `main`'s tip when the transaction model was last brought up to date: a
+    /// change in either since means the node may have switched chains, which resets its mempool.
+    pub model_rival_height: u32,
+    pub model_tip: (u32, BlockHash),
+}
+
+/// A spend the node took into its mempool.
+#[derive(Clone)]
+pub(crate) struct FuzzPending {
+    pub tx: Arc<Transaction>,
+    pub coin: (zebra_chain::transparent::OutPoint, zebra_chain::transparent::Utxo),
+    /// Whether the node is known to hold it still.
+    pub known: bool,
+}
+
+/// A spend mined on `main` at `height`, in the block with hash `block`.
+#[derive(Clone)]
+pub(crate) struct FuzzMinedSpend {
+    pub coin: (zebra_chain::transparent::OutPoint, zebra_chain::transparent::Utxo),
+    pub height: u32,
+    pub block: BlockHash,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FuzzBondState {
+    Absent,
+    Active,
+    Unbonding,
+    Withdrawn,
+}
+
+/// A bond and what the generator believes the node holds for it: `state`, entered at `at`
+/// (height and block hash on `main`).
+#[derive(Clone)]
+pub(crate) struct FuzzBond {
+    pub seed: Vec<u8>,
+    pub key: [u8; 32],
+    pub state: FuzzBondState,
+    pub at: (u32, BlockHash),
+    pub known: bool,
 }
 
 impl FuzzGen {
@@ -93,7 +150,12 @@ impl FuzzGen {
         let gen = BlockGen::init_at_genesis_plus_1(network.clone(), BlockGen::REGTEST_GENESIS_HASH, &miner);
         let mut tf = TF::new(params);
         tf.push_instr_load_pow(&gen.tip, 0);
-        FuzzGen { tf, network, key, miner, main: vec![gen], tip_known: true, rival_height: 0, next_fresh_peer: FRESH_PEERS_FROM, forks_made: 0 }
+        let model_tip = (1, gen.tip.hash());
+        FuzzGen {
+            tf, network, key, miner, main: vec![gen], tip_known: true, rival_height: 0, next_fresh_peer: FRESH_PEERS_FROM, forks_made: 0,
+            params: params.clone(), pending: Vec::new(), mined_spends: Vec::new(), unsure_coins: Default::default(), bonds: Vec::new(),
+            txs_made: 0, model_rival_height: 0, model_tip,
+        }
     }
 
     pub(crate) fn tip(&self) -> &BlockGen {
@@ -145,7 +207,7 @@ fn move_extend(g: &mut FuzzGen, c: &mut Choices) {
 
 /// A branch from `depth` blocks below the tip, `len` blocks long, mined to its own address.
 fn move_fork(g: &mut FuzzGen, c: &mut Choices) {
-    let max_depth = (g.height() as usize - 1).min(6);
+    let max_depth = (g.height() as usize - 1).min(FORK_DEPTH_MAX);
     if max_depth == 0 {
         return move_extend(g, c);
     }
@@ -237,15 +299,378 @@ fn move_mangled_block(g: &mut FuzzGen, c: &mut Choices) {
     g.rival_height = g.rival_height.max(g.height() + 1);
 }
 
+// ---- Transaction and staking moves ----
+// Spends use only coinbase outputs deeper than any fork the moves make, so a reorg never removes
+// the coin itself, only (perhaps) a spend of it.
+
+/// How deep a coinbase must be before a move spends it: mature, and below any fork.
+const SPENDABLE_DEPTH: u32 = {
+    let below_forks = FORK_DEPTH_MAX as u32 + 1;
+    let maturity = zebra_chain::transparent::MIN_TRANSPARENT_COINBASE_MATURITY;
+    if maturity > below_forks { maturity } else { below_forks }
+};
+
+/// Whether `main` holds the block `hash` at `height`.
+fn on_main(g: &FuzzGen, (height, hash): (u32, BlockHash)) -> bool {
+    height >= 1 && g.main.get(height as usize - 1).is_some_and(|gen| gen.tip.hash() == hash)
+}
+
+/// Marks unknown whatever a chain switch since the last transaction move may have changed. A
+/// switch resets the node's mempool, and a reorg below a mined action undoes it.
+fn refresh_model(g: &mut FuzzGen) {
+    let switched = !g.tip_known || g.rival_height != g.model_rival_height || !on_main(g, g.model_tip);
+    if switched {
+        for p in &mut g.pending {
+            p.known = false;
+        }
+    }
+    let (kept, dropped): (Vec<FuzzMinedSpend>, Vec<FuzzMinedSpend>) =
+        std::mem::take(&mut g.mined_spends).into_iter().partition(|s| on_main(g, (s.height, s.block)));
+    g.mined_spends = kept;
+    g.unsure_coins.extend(dropped.into_iter().map(|s| s.coin.0));
+    for i in 0..g.bonds.len() {
+        let bond = &g.bonds[i];
+        if bond.at.0 != 0 && !on_main(g, bond.at) {
+            g.bonds[i].known = false;
+        }
+    }
+    g.model_rival_height = g.rival_height;
+    g.model_tip = (g.height(), g.tip().tip.hash());
+}
+
+/// Coinbase outputs at SPENDABLE_DEPTH paying the generator's key that nothing it made spends, oldest first.
+/// For the mempool, also none whose earlier spend a reorg may have put back there.
+fn free_coins(g: &FuzzGen, for_mempool: bool) -> Vec<(zebra_chain::transparent::OutPoint, zebra_chain::transparent::Utxo)> {
+    let next_height = g.height() + 1;
+    let lock_script = g.key.lock_script();
+    let mut coins: Vec<_> = g
+        .tip()
+        .utxos
+        .iter()
+        .filter(|(outpoint, utxo)| {
+            utxo.from_coinbase
+                && utxo.output.lock_script == lock_script
+                && next_height >= utxo.height.0 + SPENDABLE_DEPTH
+                && !g.pending.iter().any(|p| p.coin.0 == **outpoint)
+                && !(for_mempool && g.unsure_coins.contains(*outpoint))
+        })
+        .map(|(outpoint, utxo)| (*outpoint, utxo.clone()))
+        .collect();
+    coins.sort_by_key(|(outpoint, utxo)| (utxo.height, outpoint.hash.0, outpoint.index));
+    coins
+}
+
+/// Extends `main` until a coinbase is at SPENDABLE_DEPTH.
+fn fund(g: &mut FuzzGen) {
+    while free_coins(g, false).is_empty() {
+        let mut next = g.tip().clone();
+        let block = next.next_block(&g.miner.clone());
+        g.main.push(next);
+        g.tf.push_instr_load_pow(&block, if g.tip_known { 0 } else { ANY_OUTCOME });
+        g.after_main_grew();
+    }
+    g.expect_tip();
+}
+
+/// Mines `txs` in the next block of `main` and delivers it. Returns whether the node is known
+/// to have taken it as its tip.
+fn mine(g: &mut FuzzGen, c: &mut Choices, txs: &[Arc<Transaction>]) -> bool {
+    let known = g.tip_known;
+    let mut next = g.tip().clone();
+    let block = next.next_block_with_txs(&g.miner.clone(), txs);
+    g.main.push(next);
+    g.deliver(c, &block, if known { 0 } else { ANY_OUTCOME });
+    g.after_main_grew();
+    g.expect_tip();
+    known && g.tip_known
+}
+
+/// Delivers a block on `main`'s tip that the node must refuse when the tip is known. When it
+/// is not, the node may hold a chain on which the block is valid, and then holds it as a rival.
+fn refuse(g: &mut FuzzGen, c: &mut Choices, block: &Block) {
+    if g.tip_known {
+        if c.unusual(64) {
+            let peer = g.next_fresh_peer;
+            g.next_fresh_peer += 1;
+            g.tf.push_instr_recv_pow(block, peer, SHOULD_FAIL);
+        } else {
+            g.tf.push_instr_load_pow(block, SHOULD_FAIL);
+        }
+    } else {
+        g.tf.push_instr_load_pow(block, ANY_OUTCOME);
+        g.rival_height = g.rival_height.max(g.height() + 1);
+    }
+    g.tf.push_instr_expect_node_alive(0);
+    g.expect_tip();
+}
+
+/// Hands the node a transaction it must take, through SUBMIT_TX or a peer's relay.
+fn offer_tx(g: &mut FuzzGen, c: &mut Choices, tx: &Arc<Transaction>) {
+    if c.unusual(96) {
+        let wire = zebra_network::wire::tx_message_bytes(&g.network, zebra_chain::transaction::UnminedTx::from(tx.clone()))
+            .expect("a transaction frames");
+        g.tf.push_instr_recv_tx_wire(&wire, 0, 0);
+    } else {
+        g.tf.push_instr_submit_tx(tx, 0);
+    }
+}
+
+/// A spend of `coin` paying another key, so it conflicts with `transparent_spend` of the same
+/// coin. `salt` picks the key, so each conflict is a distinct transaction.
+fn conflicting_spend(
+    upgrade: NetworkUpgrade,
+    key: &TestKey,
+    coin: &(zebra_chain::transparent::OutPoint, zebra_chain::transparent::Utxo),
+    salt: u64,
+) -> Arc<Transaction> {
+    let other = TestKey::new(format!("crosslink fuzz conflict {salt}").as_bytes());
+    let input = (coin.0, coin.1.output.clone());
+    let input_value = input.1.value;
+    let pay = |fee: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>| {
+        vec![zebra_chain::transparent::Output::new((input_value - fee).expect("the input covers the fee"), other.lock_script())]
+    };
+    let draft = signed_tx(upgrade, Some(key), &[input.clone()], pay(zebra_chain::amount::Amount::zero()), None, 0);
+    let fee = mempool_fee(&draft);
+    signed_tx(upgrade, Some(key), &[input], pay(fee), None, 0)
+}
+
+/// A spend into the mempool, through SUBMIT_TX or a peer's relay.
+fn move_spend(g: &mut FuzzGen, c: &mut Choices) {
+    refresh_model(g);
+    let coins = free_coins(g, true);
+    if coins.is_empty() {
+        return fund(g);
+    }
+    let coin = coins[c.below(coins.len())].clone();
+    let tx = transparent_spend(g.tip().next_upgrade(), &g.key, (coin.0, coin.1.output.clone()));
+    offer_tx(g, c, &tx);
+    g.tf.push_instr_expect_mempool_contains(&tx, 0);
+    g.pending.push(FuzzPending { tx, coin, known: true });
+}
+
+/// Mines every pending spend, and sometimes a spend straight into the block too. A mined spend
+/// leaves the mempool.
+fn move_mine_pending(g: &mut FuzzGen, c: &mut Choices) {
+    refresh_model(g);
+    let mut spends: Vec<(Arc<Transaction>, (zebra_chain::transparent::OutPoint, zebra_chain::transparent::Utxo))> =
+        g.pending.iter().map(|p| (p.tx.clone(), p.coin.clone())).collect();
+    if spends.is_empty() || c.unusual(64) {
+        if let Some(coin) = free_coins(g, false).first().cloned() {
+            spends.push((transparent_spend(g.tip().next_upgrade(), &g.key, (coin.0, coin.1.output.clone())), coin));
+        }
+    }
+    if spends.is_empty() {
+        return fund(g);
+    }
+    let txs: Vec<Arc<Transaction>> = spends.iter().map(|(tx, _)| tx.clone()).collect();
+    let known = mine(g, c, &txs);
+    if known {
+        for tx in &txs {
+            g.tf.push_instr_expect_mempool_absent(tx, 0);
+        }
+    }
+    let (height, block) = (g.height(), g.tip().tip.hash());
+    g.mined_spends.extend(spends.into_iter().map(|(_, coin)| FuzzMinedSpend { coin, height, block }));
+    g.pending.clear();
+    if c.unusual(64) {
+        g.tf.push_instr_expect_staking_replay_matches(0);
+    }
+}
+
+/// A second spend of a coin already spent, in the mempool or on `main`, offered to the mempool
+/// or mined; or two spends of one coin in one block.
+fn move_double_spend(g: &mut FuzzGen, c: &mut Choices) {
+    refresh_model(g);
+    let (pending_n, mined_n) = (g.pending.len(), g.mined_spends.len());
+    if pending_n + mined_n == 0 || c.unusual(32) {
+        // Both spends in one block, which must be refused.
+        let Some(coin) = free_coins(g, false).first().cloned() else { return fund(g) };
+        g.txs_made += 1;
+        let upgrade = g.tip().next_upgrade();
+        let first = transparent_spend(upgrade, &g.key, (coin.0, coin.1.output.clone()));
+        let second = conflicting_spend(upgrade, &g.key, &coin, g.txs_made);
+        let block = g.tip().clone().next_block_with_txs(&g.miner.clone(), &[first, second]);
+        return refuse(g, c, &block);
+    }
+    g.txs_made += 1;
+    let upgrade = g.tip().next_upgrade();
+    let i = c.below(pending_n + mined_n);
+    let into_block = c.unusual(128);
+    if i < pending_n {
+        let original = g.pending[i].clone();
+        let conflict = conflicting_spend(upgrade, &g.key, &original.coin, g.txs_made);
+        if into_block {
+            // The block takes the conflict, and the mempool drops the spend it held.
+            g.pending.remove(i);
+            let known = mine(g, c, &[conflict]);
+            if known && original.known {
+                g.tf.push_instr_expect_mempool_absent(&original.tx, 0);
+            }
+            let (height, block) = (g.height(), g.tip().tip.hash());
+            g.mined_spends.push(FuzzMinedSpend { coin: original.coin, height, block });
+        } else if original.known {
+            g.tf.push_instr_submit_tx(&conflict, SHOULD_FAIL);
+            g.tf.push_instr_expect_mempool_contains(&original.tx, 0);
+        } else {
+            // Without the original, the node may take the conflict instead; whatever it holds
+            // for this coin is then unknown.
+            g.tf.push_instr_submit_tx(&conflict, ANY_OUTCOME);
+            g.unsure_coins.insert(original.coin.0);
+            g.pending.remove(i);
+        }
+    } else {
+        let spent = g.mined_spends[i - pending_n].clone();
+        let conflict = conflicting_spend(upgrade, &g.key, &spent.coin, g.txs_made);
+        // Offered to the mempool, a new transaction spending an output the chain no longer has is
+        // held while the verifier waits for that output to appear, and refused when the wait
+        // (17 s) runs out: slow, so rarely chosen. Only a transaction the mempool held when a
+        // block spent its inputs is refused at once ("inputs were spent").
+        if into_block || !c.unusual(64) {
+            // The generator is told the coin is unspent, so the block is well formed (its
+            // coinbase claims the fee) and wrong only in spending it twice.
+            let mut scratch = g.tip().clone();
+            scratch.utxos.insert(spent.coin.0, spent.coin.1.clone());
+            let block = scratch.next_block_with_txs(&g.miner.clone(), &[conflict]);
+            refuse(g, c, &block);
+        } else if g.tip_known {
+            g.tf.push_instr_submit_tx(&conflict, SHOULD_FAIL);
+            g.tf.push_instr_expect_mempool_absent(&conflict, 0);
+        } else {
+            g.tf.push_instr_submit_tx(&conflict, ANY_OUTCOME);
+            g.unsure_coins.insert(spent.coin.0);
+        }
+    }
+}
+
+/// The finalizers bonds are made to: a few, so retargets and shared targets happen.
+fn fuzz_finalizer(i: usize) -> zcash_primitives::bft::FinalizerAddress {
+    zcash_primitives::bft::FinalizerAddress::create(
+        &zebra_crosslink::rng_private_public_key_from_address(format!("crosslink fuzz finalizer {i}").as_bytes()).1,
+    )
+}
+
+/// A bond action in the next block: create, unbond or withdraw, on a new bond or one made
+/// before, valid or not. Whether it is valid follows from the bond's state and the staking
+/// calendar, the rules the node applies: actions only on staking days, and each action at least
+/// `action_delay` after the bond's last one. Sometimes first mines up to the next height where
+/// that action could be valid, so valid actions are common rather than rare.
+fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
+    refresh_model(g);
+    let staking = g.params.staking;
+    // Mostly an action on a bond in the state it needs, so bonds move through their whole life;
+    // sometimes a bond in any state, or one never created, for the refusals.
+    let needs = |action: usize| [FuzzBondState::Absent, FuzzBondState::Active, FuzzBondState::Unbonding][action];
+    let fitting = |g: &FuzzGen, action: usize| -> Vec<usize> {
+        (0..g.bonds.len()).filter(|&i| g.bonds[i].known && g.bonds[i].state == needs(action)).collect()
+    };
+    // Advancing a bond that exists is the ordinary choice: a whole life takes three actions, and
+    // staking is one move in eight.
+    let mut action = if !fitting(g, 2).is_empty() && !c.unusual(128) {
+        2
+    } else if !fitting(g, 1).is_empty() && !c.unusual(128) {
+        1
+    } else {
+        c.below(3)
+    };
+    if action != 0 && fitting(g, action).is_empty() && !c.unusual(64) {
+        action = 0;
+    }
+    let fits = fitting(g, action);
+    let bond_i = if !fits.is_empty() && (action != 0 || c.unusual(32)) && !c.unusual(48) {
+        fits[c.below(fits.len())]
+    } else if !g.bonds.is_empty() && action != 0 && !c.unusual(64) {
+        c.below(g.bonds.len())
+    } else {
+        g.txs_made += 1;
+        let seed = format!("crosslink fuzz bond {}", g.txs_made).into_bytes();
+        let key = staking_tx_create_bond(g.tip().next_upgrade(), &seed, fuzz_finalizer(0), 0)
+            .staking_action()
+            .expect("a staking transaction")
+            .bond_key();
+        g.bonds.push(FuzzBond { seed, key, state: FuzzBondState::Absent, at: (0, BlockHash([0; 32])), known: true });
+        g.bonds.len() - 1
+    };
+
+    let is_staking_day = |h: u32| h % staking.period < staking.day_window;
+    let bond = g.bonds[bond_i].clone();
+    if !c.unusual(96) {
+        let earliest = if bond.at.0 == 0 { 0 } else { bond.at.0 + staking.action_delay };
+        while g.height() + 1 < earliest || !is_staking_day(g.height() + 1) {
+            mine(g, c, &[]);
+        }
+    }
+
+    let h = g.height() + 1;
+    let upgrade = g.tip().next_upgrade();
+    let wrong_amount = action == 2 && c.unusual(32);
+    let (tx, valid, after) = match action {
+        0 => (
+            staking_tx_create_bond(upgrade, &bond.seed, fuzz_finalizer(c.below(3)), 0),
+            bond.state == FuzzBondState::Absent,
+            FuzzBondState::Active,
+        ),
+        1 => (staking_tx_unbond(upgrade, &bond.seed), bond.state == FuzzBondState::Active, FuzzBondState::Unbonding),
+        _ => (
+            staking_tx_withdraw(upgrade, &bond.seed, u64::from(wrong_amount), 0),
+            bond.state == FuzzBondState::Unbonding && !wrong_amount,
+            FuzzBondState::Withdrawn,
+        ),
+    };
+    let delay_met = bond.at.0 == 0 || h >= bond.at.0 + staking.action_delay;
+    let valid = valid && delay_met && is_staking_day(h);
+
+    if !bond.known {
+        // The node may hold this bond in another state: the action may or may not apply. If it
+        // does, the node holds a block `main` does not have, a rival at the next height.
+        let block = g.tip().clone().next_block_with_txs(&g.miner.clone(), &[tx]);
+        g.tf.push_instr_load_pow(&block, ANY_OUTCOME);
+        g.tf.push_instr_expect_node_alive(0);
+        g.tip_known = false;
+        g.rival_height = g.rival_height.max(h);
+        return;
+    }
+    if valid {
+        let known = mine(g, c, &[tx]);
+        let bond = &mut g.bonds[bond_i];
+        bond.state = after;
+        bond.at = (h, g.main[h as usize - 1].tip.hash());
+        bond.known = known;
+    } else {
+        let block = g.tip().clone().next_block_with_txs(&g.miner.clone(), &[tx]);
+        refuse(g, c, &block);
+        if !g.tip_known {
+            g.bonds[bond_i].known = false;
+        }
+    }
+
+    let bond = &g.bonds[bond_i];
+    if bond.known && g.tip_known {
+        let status = match bond.state {
+            FuzzBondState::Absent => TF_BOND_ABSENT,
+            FuzzBondState::Active => TF_BOND_ACTIVE,
+            FuzzBondState::Unbonding => TF_BOND_UNBONDING,
+            FuzzBondState::Withdrawn => TF_BOND_WITHDRAWN,
+        };
+        let key = bond.key;
+        g.tf.push_instr_expect_bond(key, status, TEST_STAKE_IGNORED, 0);
+    }
+    if c.unusual(64) {
+        g.tf.push_instr_expect_staking_replay_matches(0);
+    }
+}
+// ---- End of transaction and staking moves ----
+
 type Move = fn(&mut FuzzGen, &mut Choices);
 
 /// The moves, most ordinary first: choice 0 picks extend.
-const MOVES: &[Move] = &[move_extend, move_fork, move_invalid_block, move_mangled_block];
+const MOVES: &[Move] = &[move_extend, move_fork, move_invalid_block, move_mangled_block, move_spend, move_mine_pending, move_double_spend, move_staking];
 
 /// The test file for `c`. Each input enables a subset of the moves, so rare combinations are not
 /// drowned out by common ones.
 pub(crate) fn generate(c: &mut Choices) -> Vec<u8> {
-    let mut g = FuzzGen::new(&HARNESS_PARAMETERS);
+    // The short staking calendar, so bonds can unbond and withdraw within one input.
+    let params = zcash_primitives::bft::ZcashCrosslinkParameters { staking: short_staking(&HARNESS_PARAMETERS), ..HARNESS_PARAMETERS };
+    let mut g = FuzzGen::new(&params);
     let enabled: Vec<Move> = MOVES.iter().enumerate().filter(|(i, _)| *i == 0 || !c.unusual(64)).map(|(_, m)| *m).collect();
     let moves_n = 4 + c.below(28);
     for _ in 0..moves_n {
@@ -561,4 +986,41 @@ fn crosslink_fuzz_directed_repeated_coinbase_does_not_condemn_the_real_block() {
         let coinbase = b.transactions[0].clone();
         b.transactions.push(coinbase);
     }));
+}
+
+/// How often the generator emits each kind of instruction, with which outcome flag, over
+/// CROSSLINK_FUZZ_SEEDS (default 0..200), and how often a bond is expected in each status. Runs
+/// no node: it shows whether a move's paths come up at all, and whether its hard expectations are
+/// drowned out by ANY_OUTCOME.
+#[test]
+#[ignore]
+fn crosslink_fuzz_census() {
+    let seeds = std::env::var("CROSSLINK_FUZZ_SEEDS").unwrap_or_else(|_| "0..200".to_string());
+    let (a, b) = seeds.split_once("..").expect("CROSSLINK_FUZZ_SEEDS is a..b");
+    let (a, b): (u64, u64) = (a.parse().expect("seed range start"), b.parse().expect("seed range end"));
+    let mut counts: std::collections::BTreeMap<(u8, &str), usize> = Default::default();
+    let mut bonds: std::collections::BTreeMap<u64, usize> = Default::default();
+    let mut instrs_n = 0;
+    for seed in a..b {
+        let tf = TF::read_from_bytes(&generate(&mut Choices::from_seed(seed, 4096))).expect("a generated file reads");
+        instrs_n += tf.instrs.len();
+        for instr in &tf.instrs {
+            let outcome = if instr.flags & ANY_OUTCOME != 0 {
+                "any"
+            } else if instr.flags & SHOULD_FAIL != 0 {
+                "fail"
+            } else {
+                "pass"
+            };
+            *counts.entry((instr.kind as u8, outcome)).or_default() += 1;
+            if instr.kind == TFInstr::EXPECT_BOND {
+                *bonds.entry(instr.val[1]).or_default() += 1;
+            }
+        }
+    }
+    eprintln!("census over seeds {a}..{b}: {instrs_n} instructions");
+    for ((kind, outcome), n) in &counts {
+        eprintln!("  kind {kind:>3} {outcome:<4} {n}");
+    }
+    eprintln!("  EXPECT_BOND by status (0 active, 1 unbonding, 2 withdrawn, 255 absent): {bonds:?}");
 }
