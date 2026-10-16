@@ -96,6 +96,19 @@ pub fn abbreviate_ends(s: &str, edge: usize) -> String {
     format!("[{}..{}]", &s[..head_end], &s[tail_start..])
 }
 
+/// ui.textbox creates a missing entry empty, and empty parses as "no time filter", so the
+/// entry must already hold the stored filter before the first call or opening the popup clears it.
+pub fn seed_seconds_textbox(textboxes: &mut HashMap<u32, TextboxState>, id: u32, seconds: u32) {
+    if textboxes.contains_key(&id) {
+        return;
+    }
+    let mut text_buf = Vec::new();
+    if seconds != 0 {
+        text_buf.extend(seconds.to_string().chars());
+    }
+    textboxes.insert(id, TextboxState { text_buf, ..Default::default() });
+}
+
 /// Comfortably above a finalizer address (134 characters) and a unified address with three receivers.
 const PASTED_ADDRESS_MAX_CHARS: usize = 512;
 
@@ -3670,13 +3683,14 @@ pub fn ui_right_pane(ui: &mut Context,
                         ui.text("Connected less than:", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl });
 
                         let textbox_id = ui::id("Seconds since connected Textbox");
+                        seed_seconds_textbox(&mut data.textboxes, textbox_id.id, filters.filter_seconds_since_connected);
                         let secs_string = ui.textbox(
                             data,
                             textbox_id,
                             "∞",
                             TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
                         );
-                        let textbox_state = data.textboxes.entry(textbox_id.id).or_insert_with(|| TextboxState { text_buf: vec!['1', '5'], ..Default::default() });
+                        let textbox_state = data.textboxes.entry(textbox_id.id).or_default();
                         textbox_state.text_buf.retain(|c| (*c >= '0' && *c <= '9') || *c == '∞');
                         let len = textbox_state.text_buf.len();
                         textbox_state.selection.0 = textbox_state.selection.0.min(len); // @Todo: this is very likely not the best thing to do here
@@ -5515,5 +5529,32 @@ mod paste_tests {
         let capped = pasted_address(&long);
         assert_eq!(capped.chars().count(), PASTED_ADDRESS_MAX_CHARS);
         assert_eq!(capped, "é".repeat(PASTED_ADDRESS_MAX_CHARS));
+    }
+}
+
+#[cfg(test)]
+mod finalizer_filter_tests {
+    use super::*;
+
+    #[test]
+    fn seconds_textbox_seed_survives_the_textbox() {
+        // id() needs a live Clay context; any key exercises the map the same way.
+        let id = 0x5ec0_0d5;
+        let mut textboxes: HashMap<u32, TextboxState> = HashMap::new();
+
+        seed_seconds_textbox(&mut textboxes, id, FinalizerFilters::default().filter_seconds_since_connected);
+        // What ui.textbox does with the entry on its first call.
+        let state = textboxes.entry(id).or_default();
+        assert_eq!(state.text_buf, vec!['1', '5']);
+
+        // Later passes must not overwrite what the user typed.
+        state.text_buf = vec!['3'];
+        seed_seconds_textbox(&mut textboxes, id, 15);
+        assert_eq!(textboxes[&id].text_buf, vec!['3']);
+
+        // A stored "no time filter" opens as the empty box, which parses back to 0.
+        let mut textboxes: HashMap<u32, TextboxState> = HashMap::new();
+        seed_seconds_textbox(&mut textboxes, id, 0);
+        assert!(textboxes[&id].text_buf.is_empty());
     }
 }
