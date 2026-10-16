@@ -7634,6 +7634,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-build",
+ "zcash_address",
  "zcash_client_backend",
  "zcash_client_sqlite",
  "zcash_keys",

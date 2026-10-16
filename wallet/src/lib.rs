@@ -87,8 +87,8 @@ use rustls::crypto::CryptoProvider;
 use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::CertificateError;
 use tokio::runtime::Builder;
+pub use zcash_client_backend::address::UnifiedAddress;
 use zcash_client_backend::{
-    address::UnifiedAddress,
     data_api::{
         self,
         chain::{error::Error as ChainError, scan_cached_blocks, ChainState},
@@ -1056,6 +1056,8 @@ pub struct WalletState {
     pub waiting_for_faucet: bool,
     pub waiting_for_stake_to_finalizer: bool,
     pub waiting_for_send: bool,
+    /// Why the last GUI send could not be built; cleared by the next send.
+    pub send_error: String,
 
     pub wallets_sync_h: u64,
     pub wallets_tip_h: u64,
@@ -1138,11 +1140,9 @@ impl WalletState {
         self.actions_in_flight.push_back(WalletAction::ClaimBond(txid));
     }
 
-    pub fn send_to_address(&mut self, address: String, amount: u64) {
-        let Ok(address) = UnifiedAddress::decode(&TEST_NETWORK /* @todo */, &address) else {
-            println!("Invalid address for send: {}", address);
-            return;
-        };
+    /// `address` comes from `decode_send_address`, so the wallet loop only has to build the spend.
+    pub fn send_to_address(&mut self, address: UnifiedAddress, amount: u64) {
+        self.send_error.clear();
 
         if self.actions_in_flight.iter().filter(|a| match a {
             WalletAction::SendToAddress(addr, amt) if amt.into_u64() == amount && addr.eq(&address) => true,
@@ -1152,7 +1152,55 @@ impl WalletState {
         }
 
         self.waiting_for_send = true;
-        self.actions_in_flight.push_back(WalletAction::SendToAddress(address, Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_finalizer")));
+        self.actions_in_flight.push_back(WalletAction::SendToAddress(address, Zatoshis::from_u64(amount).expect("send amounts are the GUI's fixed buttons, all far below MAX_MONEY")));
+    }
+}
+
+/// The one rule for "an address this wallet can send to", shared by the GUI and the RPC send:
+/// a unified address for the wallet's network that carries an Ironwood (Orchard) receiver.
+/// Each way of failing gets its own reason, because the GUI shows it under the pasted address.
+pub fn decode_send_address(address: &str) -> Result<UnifiedAddress, String> {
+    use zcash_address::{ConversionError, ZcashAddress};
+    use zcash_client_backend::address::Address;
+    use zcash_protocol::consensus::NetworkConstants;
+
+    let network = TEST_NETWORK.network_type(); // @todo: the wallet loop is hard-wired to TEST_NETWORK too
+
+    let zaddr = match ZcashAddress::try_from_encoded(address) {
+        Ok(zaddr) => zaddr,
+        Err(_) => {
+            if bft::FinalizerAddress::decode(address).is_some() {
+                return Err("This is a finalizer identity, not a payment address".to_string());
+            }
+            for net in [NetworkType::Main, NetworkType::Test, NetworkType::Regtest] {
+                if address.starts_with(&format!("{}1", net.hrp_unified_address())) {
+                    return Err("Unified address is damaged or incomplete, copy it again".to_string());
+                }
+            }
+            return Err("Not a Zcash address".to_string());
+        }
+    };
+
+    match zaddr.convert_if_network::<Address>(network) {
+        Ok(Address::Unified(ua)) => {
+            if ua.orchard().is_none() {
+                return Err("Unified address has no Ironwood receiver".to_string());
+            }
+            Ok(ua)
+        }
+        Ok(Address::Transparent(_)) => Err("Transparent addresses are not supported, use a unified address".to_string()),
+        Ok(Address::Sapling(_)) => Err("Sapling addresses are not supported, use a unified address".to_string()),
+        Ok(Address::Tex(_)) => Err("TEX addresses are not supported, use a unified address".to_string()),
+        Err(ConversionError::IncorrectNetwork { actual, .. }) => {
+            let actual = match actual {
+                NetworkType::Main => "mainnet",
+                NetworkType::Test => "testnet",
+                NetworkType::Regtest => "regtest",
+            };
+            Err(format!("This is a {actual} address, this wallet is on testnet"))
+        }
+        Err(ConversionError::Unsupported(_)) => Err("This address type is not supported, use a unified address".to_string()),
+        Err(ConversionError::User(err)) => Err(format!("Invalid unified address: {err}")),
     }
 }
 
@@ -4949,26 +4997,24 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         if rpc_send.is_none() {
             let staged_send = BASIC_SEND_STAGE.lock().unwrap().take();
             if let Some((value_zats, address, sender)) = staged_send {
-                // The address arrives as a string and is decoded here rather than at the RPC
-                // boundary because this loop is what knows the network the wallet was built for.
-                let ua  = UnifiedAddress::decode(network, &address);
-                let dst = if let Ok(ua) = &ua { ua.orchard().copied() } else { None };
-
-                if let Some(dst) = dst {
-                    let mut tx = ProposedTx::EMPTY;
-                    let ok = user_wallet.send_ironwood_to_ironwood_zats(network, &mut tx, &mut client, &user_usk,
-                                                                       value_zats, &orchard_tree, dst, MemoBytes::empty()).is_some();
-                    if ok {
-                        println!("prepared notes for RPC-requested send of {value_zats} zats");
-                        just_init_new_tx = true;
-                        rpc_send = Some((tx, sender));
-                    } else {
-                        let _ = sender.send(Err("failed to create send transaction from notes".to_string()));
+                // The same rule as the GUI's Send modal, so both refuse the same addresses for the same reasons.
+                match decode_send_address(&address) {
+                    Err(reason) => {
+                        let _ = sender.send(Err(format!("{reason}: {address}")));
                     }
-                } else if ua.is_err() {
-                    let _ = sender.send(Err(format!("invalid unified address: {address}")));
-                } else {
-                    let _ = sender.send(Err(format!("unified address has no Ironwood receiver: {address}")));
+                    Ok(ua) => {
+                        let dst = *ua.orchard().expect("decode_send_address only accepts addresses with an Orchard receiver");
+                        let mut tx = ProposedTx::EMPTY;
+                        let ok = user_wallet.send_ironwood_to_ironwood_zats(network, &mut tx, &mut client, &user_usk,
+                                                                           value_zats, &orchard_tree, dst, MemoBytes::empty()).is_some();
+                        if ok {
+                            println!("prepared notes for RPC-requested send of {value_zats} zats");
+                            just_init_new_tx = true;
+                            rpc_send = Some((tx, sender));
+                        } else {
+                            let _ = sender.send(Err("failed to create send transaction from notes".to_string()));
+                        }
+                    }
                 }
             }
         }
@@ -5042,6 +5088,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         let ok = user_wallet.send_ironwood_to_ironwood_zats(network, &mut proposed_send, &mut client, &user_usk, amount.into_u64(), &orchard_tree, *orchard_address, memo).is_some();
                         just_init_new_tx |= ok;
                         if DUMP_ACTIONS { println!("Try user send: {ok:?}"); }
+                        if !ok {
+                            // The modal closed on the click, so the wallet tab is the only place left to say so.
+                            wallet_state.lock().unwrap().send_error = "Could not build the send. Check that funds are confirmed and cover the fee.".to_string();
+                        }
                         true // ALT ok
                     } else {
                         false
@@ -5395,5 +5445,51 @@ mod tests {
         assert_eq!(str_from_ctaz(150_000_000), "1.500");
         assert_eq!(str_from_ctaz(500_000_000), "5.000");
         assert_eq!(str_from_ctaz(100_012_345), "1.00012");
+    }
+
+    #[test]
+    fn decode_send_address_accepts_only_testnet_unified_addresses_with_orchard() {
+        use zcash_client_backend::address::Address;
+
+        let account = zip32::AccountId::try_from(0).unwrap();
+        let usk = UnifiedSpendingKey::from_seed(&TEST_NETWORK, &[7u8; 32], account).unwrap();
+        let (full_ua, _) = usk.to_unified_full_viewing_key().default_address(UnifiedAddressRequest::ALLOW_ALL).unwrap();
+        assert!(full_ua.orchard().is_some());
+        // This wallet's keys derive Orchard receivers only, so the other kinds are built directly.
+        let (_, sapling) = sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32]).default_address();
+        let transparent = TransparentAddress::PublicKeyHash([1; 20]);
+
+        let orchard_ua = full_ua.encode(&TEST_NETWORK);
+        let ok = decode_send_address(&orchard_ua).unwrap();
+        assert_eq!(ok, full_ua);
+
+        let reason = |s: &str| decode_send_address(s).unwrap_err();
+        let mut reasons = vec![
+            reason(&Address::Transparent(transparent).encode(&TEST_NETWORK)),
+            reason(&Address::Sapling(sapling).encode(&TEST_NETWORK)),
+            reason(&Address::Tex([3; 20]).encode(&TEST_NETWORK)),
+            reason(&full_ua.encode(&MAIN_NETWORK)),
+            reason(&full_ua.to_zcash_address(NetworkType::Regtest).to_string()),
+            reason(&bft::FinalizerAddress::create(&bft::finalizer_key_from_seed(b"send-address").1).encode()),
+            reason(&orchard_ua[..orchard_ua.len() - 1]),
+            reason("send it to my friend please"),
+            reason(&UnifiedAddress::from_receivers(None, Some(sapling), Some(transparent)).unwrap().encode(&TEST_NETWORK)),
+        ];
+        println!("{reasons:#?}");
+        assert!(reasons[0].starts_with("Transparent"));
+        assert!(reasons[1].starts_with("Sapling"));
+        assert!(reasons[2].starts_with("TEX"));
+        assert!(reasons[3].contains("mainnet"));
+        assert!(reasons[4].contains("regtest"));
+        assert!(reasons[5].contains("finalizer identity"));
+        assert!(reasons[6].contains("damaged"));
+        assert_eq!(reasons[7], "Not a Zcash address");
+        assert!(reasons[8].contains("no Ironwood receiver"));
+        assert_eq!(reason(""), "Not a Zcash address");
+
+        let n = reasons.len();
+        reasons.sort();
+        reasons.dedup();
+        assert_eq!(reasons.len(), n, "each kind of wrong address gets its own reason");
     }
 }

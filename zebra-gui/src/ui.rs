@@ -36,6 +36,10 @@ pub struct UiData {
     pub per_frame_strs: Vec<String>,
 
     pub send_address:  String,
+    // wallet::decode_send_address of the pasted address, cached so it doesn't rerun every frame
+    pub send_address_checked: String,
+    pub send_address_ua: Option<wallet::UnifiedAddress>,
+    pub send_address_err: String,
     pub send_amount_index: usize,
     pub stake_address: String,
     // ed25519-verify of the pasted address, cached so it doesn't rerun every frame
@@ -2079,6 +2083,23 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
                         }
 
+                        if data.send_address != data.send_address_checked {
+                            data.send_address_checked = data.send_address.clone();
+                            match wallet::decode_send_address(&data.send_address) {
+                                Ok(ua) => {
+                                    data.send_address_ua = Some(ua);
+                                    data.send_address_err.clear();
+                                }
+                                Err(err) => {
+                                    data.send_address_ua = None;
+                                    data.send_address_err = err;
+                                }
+                            }
+                        }
+                        if !data.send_address.is_empty() && !data.send_address_err.is_empty() {
+                            ui.text(frame_strf!(data, "{}", data.send_address_err), TextDecl { h: ui.scale(16.0), colour: (0xff, 0xaf, 0x0e, 0xff), align: AlignX::Center, ..TextDecl });
+                        }
+
                         // spacer
                         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
 
@@ -2108,7 +2129,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 )
                             };
 
-                            let can = !waiting_for_send && data.send_address.len() != 0;
+                            let can = !waiting_for_send && data.send_address_ua.is_some();
                             let sends = [
                                 ("0.1", ONE_cTAZ/10),
                                 // ("0.2", 2*(ONE_cTAZ/10)),
@@ -2126,7 +2147,10 @@ pub fn ui_left_pane(ui: &mut Context,
                             if true {
                                 for send in sends {
                                     if button(ui, send.0, can && (balance as u64) >= send.1) {
-                                        wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), send.1);
+                                        let ua = data.send_address_ua.clone().expect("the button is disabled until the address decodes");
+                                        wallet_state.lock().unwrap().send_to_address(ua, send.1);
+                                        // The pending row in the history confirms it; a build failure shows on the wallet tab.
+                                        ui.modal = Modal::None;
                                     }
                                 }
 
@@ -2167,7 +2191,9 @@ pub fn ui_left_pane(ui: &mut Context,
                                     frame_strf!(data, "Send {}", selected.0),
                                     can && (balance as u64) >= selected.1,
                                 ) {
-                                    wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), selected.1);
+                                    let ua = data.send_address_ua.clone().expect("the button is disabled until the address decodes");
+                                    wallet_state.lock().unwrap().send_to_address(ua, selected.1);
+                                    ui.modal = Modal::None;
                                 }
                             }
                         }
@@ -3049,6 +3075,13 @@ pub fn ui_left_pane(ui: &mut Context,
             if button(ui, can, ICON_LINK_1, "Stake")      { ui.modal = Modal::Stake;   }
             if button(ui, can, ICON_UNLINK, "Edit Stake") { ui.modal = Modal::Unstake; }
             if button(ui, can, ICON_COG_1,  "User")       { ui.modal = Modal::User;    } // TODO: person icon
+        }
+
+        if can {
+            let send_error = wallet_state.lock().unwrap().send_error.clone();
+            if !send_error.is_empty() {
+                ui.text(frame_strf!(data, "{}", send_error), TextDecl { h: ui.scale(16.0), colour: (0xff, 0xaf, 0x0e, 0xff), align: AlignX::Center, ..TextDecl });
+            }
         }
 
         // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
