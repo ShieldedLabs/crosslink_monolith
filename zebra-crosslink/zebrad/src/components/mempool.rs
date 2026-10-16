@@ -100,6 +100,7 @@ fn adjusted_mempool_misbehavior_score(
         && [
             (NetworkUpgrade::Nu6_2, NetworkUpgrade::Nu6_3),
             (NetworkUpgrade::Nu6_3, NetworkUpgrade::FeaturenetUpgrade1),
+            (NetworkUpgrade::FeaturenetUpgrade1, NetworkUpgrade::FeaturenetUpgrade2),
         ]
         .into_iter()
         .any(|(old, new)| {

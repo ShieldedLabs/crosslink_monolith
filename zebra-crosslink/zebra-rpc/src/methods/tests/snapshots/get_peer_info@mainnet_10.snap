@@ -10,7 +10,7 @@ expression: get_peer_info
     "inbound": false,
     "banscore": 0,
     "subver": "/Zebra:2.1.0/",
-    "version": 170165,
+    "version": 170166,
     "connection_state": "connected"
   }
 ]
