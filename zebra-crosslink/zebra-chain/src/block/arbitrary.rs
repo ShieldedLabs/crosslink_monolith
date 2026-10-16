@@ -522,6 +522,7 @@ impl Block {
                                     ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
                                         &history_tree_root,
                                         &auth_data_root,
+                                        &[0; 32],
                                     );
                                 let block_header = Arc::make_mut(&mut block.header);
                                 block_header.commitment_bytes =

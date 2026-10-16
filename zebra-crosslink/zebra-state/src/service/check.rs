@@ -140,7 +140,24 @@ pub(crate) fn block_commitment_is_valid_for_chain_history(
     network: &Network,
     history_tree: &HistoryTree,
 ) -> Result<(), ValidateContextError> {
-    match block.commitment(network)? {
+    let commitment = block.commitment(network)?;
+
+    // Only `hashBlockCommitments` can bind a fat pointer, so a block with any other commitment
+    // must carry none. On Crosslink networks that is genesis and the Heartwood activation block,
+    // where BFT bootstrapped from the chain already forces null but supplied BFT does not.
+    let pointer_cannot_be_bound = !matches!(
+        commitment,
+        block::Commitment::ChainHistoryBlockTxAuthCommitment(_)
+    );
+    if pointer_cannot_be_bound
+        && block.header.fat_pointer_to_bft_block != block::FatPointerToBftBlock::null()
+    {
+        return Err(ValidateContextError::InvalidBlockCommitment(
+            CommitmentError::FatPointerWithoutCommitment,
+        ));
+    }
+
+    match commitment {
         block::Commitment::PreSaplingReserved(_)
         | block::Commitment::FinalSaplingRoot(_)
         | block::Commitment::ChainHistoryActivationReserved => {
@@ -202,10 +219,18 @@ pub(crate) fn block_commitment_is_valid_for_chain_history(
                  since the current block has a ChainHistoryBlockTxAuthCommitment",
                 );
             let auth_data_root = block.auth_data_root();
+            let height = block
+                .coinbase_height()
+                .expect("Block::commitment above refuses a block without a height");
 
             let hash_block_commitments = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
                 &history_tree_root,
                 &auth_data_root,
+                &block::fat_pointer_digest_at(
+                    network,
+                    height,
+                    &block.header.fat_pointer_to_bft_block,
+                ),
             );
 
             if actual_hash_block_commitments == hash_block_commitments {

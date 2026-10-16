@@ -11,7 +11,8 @@
         "merkleroot": "c9a6321293a3955b9970750b0fee21e89bc6f8938e51391410c3577ad9d03405",
         "chainhistoryroot": "e1c60e427c655cf06400239bc0a42532a993995e7601ef8848c53fd6ea426055",
         "authdataroot": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        "blockcommitmentshash": "c78325bc39115ce5bfdd75215e0104aacb674e2dc19d06a8fca4f963b52c462c"
+        "blockcommitmentshash": "c78325bc39115ce5bfdd75215e0104aacb674e2dc19d06a8fca4f963b52c462c",
+        "fatpointerdigest": "0000000000000000000000000000000000000000000000000000000000000000"
     },
     "transactions": [],
     "coinbasetxn": {

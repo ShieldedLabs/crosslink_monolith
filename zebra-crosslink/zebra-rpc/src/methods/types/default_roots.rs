@@ -9,7 +9,8 @@ use zebra_chain::{
     block::{
         self,
         merkle::{self, AuthDataRoot, AUTH_DIGEST_PLACEHOLDER},
-        ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Height,
+        ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, FatPointerToBftBlock,
+        Height,
     },
     parameters::{Network, NetworkUpgrade},
     transaction::VerifiedUnminedTx,
@@ -44,13 +45,22 @@ pub struct DefaultRoots {
     pub(crate) auth_data_root: AuthDataRoot,
 
     /// The block commitment for the new block's header.
-    /// This hash covers `chain_history_root` and `auth_data_root`.
+    /// This hash covers `chain_history_root`, `auth_data_root` and `fat_pointer_digest`.
     ///
     /// `merkle_root` has its own field in the block header.
     #[serde(rename = "blockcommitmentshash")]
     #[serde(with = "hex")]
     #[getter(copy)]
     pub(crate) block_commitments_hash: ChainHistoryBlockTxAuthCommitmentHash,
+
+    /// The digest of the template's fat pointer that `block_commitments_hash` covers in place of
+    /// ZIP 244's zero terminator: all zeroes before `FeaturenetUpgrade2` or for a null pointer.
+    /// In display order, like the other roots. A pool that recomputes `block_commitments_hash`
+    /// after changing the transactions needs it to build a valid block.
+    #[serde(rename = "fatpointerdigest")]
+    #[serde(with = "hex")]
+    #[getter(copy)]
+    pub(crate) fat_pointer_digest: [u8; 32],
 }
 
 impl DefaultRoots {
@@ -61,6 +71,7 @@ impl DefaultRoots {
         coinbase: &TransactionTemplate<NegativeOrZero>,
         chain_history_root: Option<ChainHistoryMmrRootHash>,
         mempool_txs: &[VerifiedUnminedTx],
+        fat_pointer: &FatPointerToBftBlock,
     ) -> Self {
         let chain_history_root = chain_history_root
             .or_else(|| {
@@ -81,6 +92,8 @@ impl DefaultRoots {
                     .unwrap_or(AUTH_DIGEST_PLACEHOLDER)
             }))
             .collect();
+
+        let fat_pointer_digest = block::fat_pointer_digest_at(net, height, fat_pointer);
 
         Self {
             merkle_root: iter::once(coinbase.hash)
@@ -105,7 +118,13 @@ impl DefaultRoots {
                 ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
                     &chain_history_root,
                     &auth_data_root,
+                    &fat_pointer_digest,
                 )
+            },
+            fat_pointer_digest: {
+                let mut display_order = fat_pointer_digest;
+                display_order.reverse();
+                display_order
             },
         }
     }

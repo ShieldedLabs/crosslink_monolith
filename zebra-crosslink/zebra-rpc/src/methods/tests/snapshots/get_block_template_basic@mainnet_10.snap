@@ -15,7 +15,8 @@ expression: block_template
     "merkleroot": "0dd4c87d6aba52431fef01079578826b547a22e444af986368c507918f893e8a",
     "chainhistoryroot": "94470fa66ebd1a5fdb109a5aa3f3204f14de3a42135e71aa7f4c44055847e0b5",
     "authdataroot": "c1b58477fa048262b10f726bf451dc8476e55fc56d82a5792a0ba63d0e2f645d",
-    "blockcommitmentshash": "9fe0f2f50842e3d0d5c4b78554ead8bfaa3314241f6f899d2373b96a3aaecccd"
+    "blockcommitmentshash": "9fe0f2f50842e3d0d5c4b78554ead8bfaa3314241f6f899d2373b96a3aaecccd",
+    "fatpointerdigest": "0000000000000000000000000000000000000000000000000000000000000000"
   },
   "transactions": [],
   "coinbasetxn": {

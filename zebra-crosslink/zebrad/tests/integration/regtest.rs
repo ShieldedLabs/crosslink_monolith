@@ -641,6 +641,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         &coinbase_txn,
         chain_history_root,
         &[],
+        block_template.fat_pointer_to_bft_block(),
     );
 
     let block_template = BlockTemplateResponse::new(
@@ -707,6 +708,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         &coinbase_txn,
         chain_history_root,
         &[],
+        block_template.fat_pointer_to_bft_block(),
     );
 
     let block_template = BlockTemplateResponse::new(
