@@ -97,20 +97,59 @@ pub fn bft_chain() -> &'static RwLock<BftChain> {
     &BFT_CHAIN
 }
 
-/// PoW blocks needed to validate a received BFT proposal: its snapshot, or its parent's.
+/// PoW blocks needed to validate a received BFT proposal: its snapshot, or its parent's, each with
+/// when a validation last asked for it.
 ///
 /// Tenderlink can deliver a proposal before the PoW synchronizer sees its snapshot. Keep the exact
 /// missing hashes here so the sync loop can request them directly instead of waiting for them to
 /// happen to appear in a peer's moving near-tip window.
-static MISSING_POW_BLOCKS: LazyLock<Mutex<HashSet<Hash>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+///
+/// Any proposer names any hash here, so the set is bounded: an entry expires unless a validation
+/// asks for it again within `MISSING_POW_BLOCK_FRESHNESS`, and it never holds more than
+/// `MAX_MISSING_POW_BLOCKS`. Tenderlink re-validates an indeterminate proposal on every tick while
+/// the network is still voting on it, so a hash stays wanted exactly as long as that. Blocks on
+/// the decided chain are kept in `DECIDED_MISSING_POW_BLOCKS` instead, which neither expires nor
+/// evicts.
+static MISSING_POW_BLOCKS: LazyLock<Mutex<HashMap<Hash, std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Thirty seconds is many BFT ticks and a few rounds; not measured against a live network.
+const MISSING_POW_BLOCK_FRESHNESS: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Honest validation needs a handful of hashes at once: the snapshot of each proposal in play and
+/// the parent's snapshot. Not measured; it only has to sit above that and well below the download
+/// budget.
+const MAX_MISSING_POW_BLOCKS: usize = 16;
 
 fn needs_pow_block(hash: Hash) -> (TMStatus, TMStatusReason) {
     if bft_is_dropped() {
         return (TMStatus::Indeterminate, TMStatusReason::None);
     }
-    MISSING_POW_BLOCKS.lock().unwrap().insert(hash);
+    note_missing_pow_block(&mut MISSING_POW_BLOCKS.lock().unwrap(), hash, std::time::Instant::now());
     (TMStatus::Indeterminate, TMStatusReason::NeedsBlock { hash: hash.0 })
+}
+
+/// Ask for `hash` as of `now`, evicting the least recently asked-for other hash past the cap.
+fn note_missing_pow_block(missing: &mut HashMap<Hash, std::time::Instant>, hash: Hash, now: std::time::Instant) {
+    missing.insert(hash, now);
+    if missing.len() > MAX_MISSING_POW_BLOCKS {
+        let stalest = missing
+            .iter()
+            .filter(|(other, _)| **other != hash)
+            .min_by_key(|(_, asked)| **asked)
+            .map(|(other, _)| *other)
+            .expect("the map holds more than the cap, so more than the hash just asked for");
+        missing.remove(&stalest);
+    }
+}
+
+/// Drop the hashes that are known now, or that no validation has asked for within the window.
+fn retain_missing_pow_blocks(
+    missing: &mut HashMap<Hash, std::time::Instant>,
+    now: std::time::Instant,
+    is_known: impl Fn(Hash) -> bool,
+) {
+    missing.retain(|hash, asked| now.saturating_duration_since(*asked) < MISSING_POW_BLOCK_FRESHNESS && !is_known(*hash));
 }
 
 pub(super) fn missing_pow_blocks(read_state: &ReadState) -> Vec<Hash> {
@@ -119,10 +158,10 @@ pub(super) fn missing_pow_blocks(read_state: &ReadState) -> Vec<Hash> {
         return Vec::new();
     }
     let mut missing = MISSING_POW_BLOCKS.lock().unwrap();
-    missing.retain(|hash| read_state.known_block(*hash).is_none());
+    retain_missing_pow_blocks(&mut missing, std::time::Instant::now(), |hash| read_state.known_block(hash).is_some());
     let mut decided = DECIDED_MISSING_POW_BLOCKS.lock().unwrap();
     decided.retain(|hash| read_state.known_block(*hash).is_none());
-    missing.iter().chain(decided.iter().filter(|hash| !missing.contains(*hash))).copied().collect()
+    missing.keys().chain(decided.iter().filter(|hash| !missing.contains_key(*hash))).copied().collect()
 }
 
 /// PoW blocks this node lacks that are a decided snapshot or one of its ancestors.
@@ -238,7 +277,7 @@ fn note_decided_missing_pow_blocks(bft_state: &TMState) {
         }
         let f = (total_stake - 1) / 3;
         let threshold = if f == 0 { total_stake } else { 2 * f + 1 };
-        if round.counts.yes_precommits >= threshold && MISSING_POW_BLOCKS.lock().unwrap().contains(&Hash(hash)) {
+        if round.counts.yes_precommits >= threshold && MISSING_POW_BLOCKS.lock().unwrap().contains_key(&Hash(hash)) {
             DECIDED_MISSING_POW_BLOCKS.lock().unwrap().insert(Hash(hash));
         }
     }
@@ -1203,13 +1242,6 @@ impl BftRunner {
                 return fail;
             }
         }
-        // The `snapshot` this proposal finalizes: the parent of the deepest carried header.
-        let new_final_hash = Hash(new_block.snapshot_block_hash().0);
-        if read_state.known_block(new_final_hash).is_none() {
-            tracing::warn!("Didn't have hash available for confirmation: {}", new_final_hash);
-            return needs_pow_block(new_final_hash);
-        }
-
         // The tail itself is checked from the headers alone: each extends the one below it
         // (above), the deepest extends the snapshot (by definition of the snapshot), and each
         // carries its own proof of work. The blocks behind the headers are never required. A
@@ -1217,12 +1249,22 @@ impl BftRunner {
         // nodes retain and serve only the blocks on their chains, so a node catching up on a
         // decided bft-block could never download an orphaned tail, and every bc-block whose fat
         // pointer names that bft-block would stay deferred.
+        //
+        // This runs before the snapshot lookup, which may ask peers for the snapshot: a tail
+        // that fails on its own headers is refused without asking for anything.
         let network = read_state.network();
         for (i, header) in new_block.headers.iter().enumerate() {
             if let Err(reason) = header_pow_is_valid(header, network) {
                 tracing::warn!("BFT block header {i} fails proof of work: {reason}");
                 return fail;
             }
+        }
+
+        // The `snapshot` this proposal finalizes: the parent of the deepest carried header.
+        let new_final_hash = Hash(new_block.snapshot_block_hash().0);
+        if read_state.known_block(new_final_hash).is_none() {
+            tracing::warn!("Didn't have hash available for confirmation: {}", new_final_hash);
+            return needs_pow_block(new_final_hash);
         }
 
         // Linearity (FINALITY.md §3.4): `snapshot(parent(B)) ⪯bc snapshot(B)`. With BFT Final
@@ -1867,5 +1909,46 @@ fn recency_status_from(bft_state: &TMState, bft_key_address_map: &BftAddressMap)
         my_locked_round: bft_state.locked_value_round.1,
         my_valid_round: bft_state.valid_value_round.1,
         finalizer_statuses,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hash(n: u8) -> Hash {
+        Hash([n; 32])
+    }
+
+    #[test]
+    fn missing_pow_blocks_expire_unless_asked_for_again_and_stay_under_the_cap() {
+        let start = std::time::Instant::now();
+        let mut missing = HashMap::new();
+        note_missing_pow_block(&mut missing, hash(1), start);
+        note_missing_pow_block(&mut missing, hash(2), start);
+
+        // Hash 1 is asked for again just before the window closes; hash 2 is not.
+        let refreshed = start + MISSING_POW_BLOCK_FRESHNESS - std::time::Duration::from_millis(1);
+        note_missing_pow_block(&mut missing, hash(1), refreshed);
+        retain_missing_pow_blocks(&mut missing, start + MISSING_POW_BLOCK_FRESHNESS, |_| false);
+        assert_eq!(missing.keys().copied().collect::<Vec<_>>(), vec![hash(1)]);
+
+        // A known block leaves at once, fresh or not.
+        retain_missing_pow_blocks(&mut missing, refreshed, |known| known == hash(1));
+        assert!(missing.is_empty());
+
+        // Past the cap the least recently asked-for goes, never the hash just asked for, even
+        // when every entry was asked for at the same instant.
+        for n in 0..=u8::try_from(MAX_MISSING_POW_BLOCKS).expect("the cap fits in a byte") {
+            note_missing_pow_block(&mut missing, hash(n), start + std::time::Duration::from_secs(u64::from(n)));
+        }
+        assert_eq!(missing.len(), MAX_MISSING_POW_BLOCKS);
+        assert!(!missing.contains_key(&hash(0)));
+        let mut same_instant = HashMap::new();
+        for n in 0..100 {
+            note_missing_pow_block(&mut same_instant, hash(n), start);
+            assert!(same_instant.contains_key(&hash(n)));
+            assert!(same_instant.len() <= MAX_MISSING_POW_BLOCKS);
+        }
     }
 }

@@ -1293,6 +1293,73 @@ fn crosslink_dropping_bft_at_the_reorg_depth_records_it_and_keeps_pow_running() 
     test_bytes(tf.write_to_bytes());
 }
 
+/// A height-0 BFT block whose headers are `tail`'s, relinked onto a snapshot named by `snapshot`
+/// that no chain holds, with every header's difficulty set to `bits`.
+fn pos_on_a_snapshot_nobody_holds(tail: &[Arc<Block>], snapshot: [u8; 32], bits: Option<u32>) -> BftBlockAndFatPointerToItWrap {
+    use zcash_primitives::block::BlockHash as BcBlockHash;
+    let mut headers: Vec<_> = tail.iter().map(|b| zebra_crosslink::bc_hdr_to_lrz(b.header.as_ref())).collect();
+    for i in 0..headers.len() {
+        if let Some(bits) = bits {
+            headers[i].bits = bits;
+        }
+        headers[i].prev_block = if i == 0 { BcBlockHash(snapshot) } else { BcBlockHash::from_header_data(&headers[i - 1]) };
+    }
+    let mut block = BftBlock::try_from(&HARNESS_PARAMETERS, 0, FatPointerToBftBlock::null(), headers).expect("sigma linked headers");
+    block.version = 2;
+    BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt::from_parts(block, 0, 0, &[]))
+}
+
+/// Proposals naming snapshots that do not exist cannot stall PoW sync. Each one this node
+/// validates asks peers for its snapshot by hash; more of them than one peer has download slots
+/// used to take every slot, so the next real block was never requested. The wanted set is capped
+/// and by-hash requests hold only a share of the budget, so the real block still arrives. A tail
+/// whose own headers fail is refused before anything is asked for.
+#[test]
+fn crosslink_bogus_bft_snapshots_do_not_stall_pow_sync() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let (mut gen, miner, pow) = pow_chain_for(&mut tf, 10);
+
+    let mut over_the_limit = [0xeeu8; 32];
+    over_the_limit[0] = 0;
+    tf.push_instr_check_pos(&pos_on_a_snapshot_nobody_holds(&pow[2..5], over_the_limit, Some(0x217f_ffff)), SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("rejected", 0);
+
+    for n in 0..40u8 {
+        let mut snapshot = [n; 32];
+        snapshot[31] = 0xa5;
+        tf.push_instr_check_pos(&pos_on_a_snapshot_nobody_holds(&pow[2..5], snapshot, None), SHOULD_DEFER);
+    }
+    tf.push_instr_recv_pow(&gen.next_block(&miner), 0, 0);
+    tf.push_instr_expect_pow_chain_length(pow.len() + 2, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// The bound on wanted snapshots still lets a real one through: a proposal whose snapshot this
+/// node lacks asks for it by hash, a peer serves it, and the proposal then validates.
+#[test]
+fn crosslink_missing_bft_snapshot_is_fetched_by_hash() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let (gen, _, pow) = pow_chain_for(&mut tf, 10);
+    let miner2 = zcash_keys::address::Address::Transparent(
+        zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
+    );
+    // A side branch off the tip that the node has not seen.
+    let mut genb = gen.clone();
+    let side: Vec<Arc<Block>> = (0..4).map(|_| genb.next_block(&miner2)).collect();
+    let proposal = create_pos_and_ptr_to_finalize_pow(0, FatPointerToBftBlock::null(), &side[1..4], &[]);
+    assert_eq!(pow.len(), 10);
+
+    tf.push_instr_check_pos(&proposal, SHOULD_DEFER);
+    tf.push_instr_expect_rejection_reason("NeedsBlock", 0);
+    tf.push_instr_recv_pow(&side[0], 0, 0);
+    tf.push_instr_check_pos(&proposal, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 // Last Final Snapshot (FINALITY.md §3.1, §6.2): a bc-block may cite a bft-block only if its own
 // ancestry contains that bft-block's snapshot. The test needs the decided snapshot to sit on a
 // branch the citing block is not on, which is possible only now that deciding does not commit.
