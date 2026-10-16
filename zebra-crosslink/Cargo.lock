@@ -6285,8 +6285,8 @@ dependencies = [
 
 [[package]]
 name = "softer_gui"
-version = "5.0.0"
-source = "git+https://github.com/ShieldedLabs/softer_gui?rev=9f6789d9a3a354951d497ffa060df361ae68fbf1#9f6789d9a3a354951d497ffa060df361ae68fbf1"
+version = "5.0.1"
+source = "git+https://github.com/ShieldedLabs/softer_gui?rev=de63f083ea670b4e453710863c83e3d9a03d9906#de63f083ea670b4e453710863c83e3d9a03d9906"
 
 [[package]]
 name = "soketto"
