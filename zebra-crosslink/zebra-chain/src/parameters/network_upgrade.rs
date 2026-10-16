@@ -285,10 +285,11 @@ pub const POW_AVERAGING_WINDOW: usize = 17;
 /// Based on <https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network>
 const TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER: i32 = 6;
 
-/// The start height for the testnet minimum difficulty consensus rule.
+/// The default start height for the testnet minimum difficulty consensus rule; a configured
+/// testnet can move it or switch the rule off (`testnet::Parameters::minimum_difficulty_start_height`).
 ///
 /// Based on <https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network>
-const TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT: block::Height = block::Height(299_188);
+pub(crate) const TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT: block::Height = block::Height(299_188);
 
 /// The activation height for the block maximum time rule on Testnet.
 ///
@@ -476,19 +477,22 @@ impl NetworkUpgrade {
         network: &Network,
         height: block::Height,
     ) -> Option<Duration> {
-        match (network, height) {
-            // TODO: Move `TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT` to a field on testnet::Parameters (#8364)
-            (Network::Testnet(_params), height)
-                if height < TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT =>
-            {
-                None
-            }
-            (Network::Mainnet, _) => None,
-            (Network::Testnet(_params), _) => {
-                let network_upgrade = NetworkUpgrade::current(network, height);
-                Some(network_upgrade.target_spacing() * TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER)
-            }
+        use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade as LrzNetworkUpgrade, Parameters as _};
+
+        let Network::Testnet(params) = network else {
+            return None;
+        };
+        if height < params.minimum_difficulty_start_height()? {
+            return None;
         }
+        // Crosslink's Tail Confirmation checks carried headers against ThresholdBits from
+        // FeaturenetUpgrade2. An exemption earned by spacing timestamps would let a proposer
+        // forge every carried header at PoWLimit, so no block is exempt from then on.
+        if network.is_nu_active(LrzNetworkUpgrade::FeaturenetUpgrade2, BlockHeight::from(height.0)) {
+            return None;
+        }
+        let network_upgrade = NetworkUpgrade::current(network, height);
+        Some(network_upgrade.target_spacing() * TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER)
     }
 
     /// Returns true if the gap between `block_time` and `previous_block_time` is
