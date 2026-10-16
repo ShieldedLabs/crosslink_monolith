@@ -1428,7 +1428,10 @@ impl BftRunner {
             &fat_pointer,
             &proposal_sigs,
         ) {
-            tracing::error!("could not store BFT decision at height {}: {err}", block.height);
+            tracing::error!(
+                "could not store BFT decision at height {}: {err}; that height is decided again on the next start",
+                block.height,
+            );
         }
 
         match reply {
@@ -1445,8 +1448,10 @@ impl BftRunner {
     }
 
     /// Replay the persisted chain into the store, and start tenderlink at its next height if it
-    /// holds anything. An empty store means this node has not bootstrapped yet: BFT genesis is
-    /// built once the PoW chain reaches the activation height (see `tick`).
+    /// holds anything. An empty store means no genesis is stored: BFT genesis is built once the
+    /// PoW chain is at or above the activation height (see `tick`), which may already be the
+    /// case. Replay stops below the first decision whose snapshot this state does not hold, and
+    /// BFT resumes there.
     ///
     /// Rosters are recomputed from the bonds at each height's snapshot, never read back as
     /// stored bytes: a roster that disagreed with the stored votes would re-index every one of
@@ -1456,23 +1461,23 @@ impl BftRunner {
         let hardforks = hardforks.rules();
         let stored = block_writer.finalized_state.db.bft_chain();
 
-        // A node that has mined past the activation height has decided BFT genesis, so an empty
-        // BFT chain there is a database written before the chain was stored. It is not migrated
-        // and not re-bootstrapped: re-deriving genesis over a chain that already ran BFT would
-        // put this node on a different decided chain than its peers.
+        // A tip past the activation height does not mean genesis was stored. Genesis is decided
+        // at the start of a tick and the same tick's commit loop can carry the tip past
+        // activation, so a node stopped before the next tick has neither; so does one whose
+        // genesis row failed to write, or lacks row 0, which hides every later row. Genesis is a
+        // pure function of the headers above h1 (`build_bootstrap_genesis`), so the first tick's
+        // `bootstrap` derives the same block this node would have stored, and rows above it are
+        // rewritten as catch-up decides them again.
         if stored.is_empty() {
             if let (Some(activation_height), Some((tip, _))) =
                 (self.params.bootstrap.activation_height(), read_state.best_tip())
             {
-                if tip.0 > activation_height && self.launch.is_some() {
-                    tracing::error!(
-                        "this database is past the BFT activation height ({}) but holds no decided \
-                         BFT chain, so it predates BFT storage in the finalized database. Delete \
-                         {} and resync.",
-                        activation_height,
-                        block_writer.finalized_state.db.path().display(),
+                if tip.0 >= activation_height {
+                    tracing::info!(
+                        "crosslink restore: tip {} is at or above the BFT activation height {} and no \
+                         BFT chain is stored; BFT genesis will be derived from the chain on the first tick",
+                        tip.0, activation_height,
                     );
-                    std::process::exit(1);
                 }
             }
         }
