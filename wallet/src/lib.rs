@@ -5384,4 +5384,16 @@ mod tests {
         bytes[last - 64] = 2;
         assert!(decode_roster_bytes(&bytes).is_err());
     }
+
+    #[test]
+    fn str_from_ctaz_pads_the_fraction() {
+        assert_eq!(str_from_ctaz(0), "0.000");
+        assert_eq!(str_from_ctaz(100_000), "0.001");
+        assert_eq!(str_from_ctaz(1_000_000), "0.010");
+        assert_eq!(str_from_ctaz(10_000_000), "0.100");
+        assert_eq!(str_from_ctaz(105_000_000), "1.050");
+        assert_eq!(str_from_ctaz(150_000_000), "1.500");
+        assert_eq!(str_from_ctaz(500_000_000), "5.000");
+        assert_eq!(str_from_ctaz(100_012_345), "1.00012");
+    }
 }

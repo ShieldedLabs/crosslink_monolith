@@ -1249,14 +1249,6 @@ fn display_str(chunks: &[u64; 4]) -> String {
     display_str_with_edge_bytes(chunks, 4)
 }
 
-fn format_stake_amount(stake_amount: i64) -> String {
-    let full = stake_amount / 100_000_000;
-    let part = stake_amount % 100_000_000;
-    let part_str = format!("{part}00");
-    let trim_part = part_str.trim_end_matches("0");
-    format!("{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)])
-}
-
 fn chunkify(bytes: &[u8; 32]) -> [u64; 4] {
     let mut chunks = [0u64; 4];
     for i in 0..4 {
@@ -2529,7 +2521,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 }
 
                                 if ui.openable(data, id, activated, true) {
-                                    for &(bond_key, finalizer, initial) in &staked_roster_unbonded {
+                                    for &(bond_key, finalizer, latest) in &staked_roster_unbonded {
                                         let index: u32 = {
                                             use std::hash::{Hash, Hasher};
                                             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2538,7 +2530,6 @@ pub fn ui_left_pane(ui: &mut Context,
                                             h.finish() as u32
                                         };
 
-                                        let stake_amount = initial as i64;
                                         if index > 0 { // separator
                                             let colour = {
                                                 let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
@@ -2603,10 +2594,10 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 let mut colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
                                                 // a bond discovered out of order carries a u64::MAX
                                                 // placeholder until the wallet learns the real value
-                                                let str = if initial == u64::MAX {
+                                                let str = if latest == u64::MAX {
                                                     frame_strf!(data, "...")
                                                 } else {
-                                                    frame_strf!(data, "{}", format_stake_amount(stake_amount))
+                                                    frame_strf!(data, "{} cTAZ", str_from_ctaz(latest))
                                                 };
                                                 if ui.hovered(id) {
                                                     colour = WHITE;
@@ -2674,7 +2665,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 if ui.openable(data, id, activated, true) {
                                     let mut prev_finalizer:   Option<[u8; 32]> = None;
                                     let mut open_finalizer:   bool = false;
-                                    for (bond_i, &(bond_key, finalizer, initial)) in staked_roster_bonded.iter().enumerate() {
+                                    for (bond_i, &(bond_key, finalizer, latest)) in staked_roster_bonded.iter().enumerate() {
                                         let index: u32 = {
                                             use std::hash::{Hash, Hasher};
                                             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2786,7 +2777,6 @@ pub fn ui_left_pane(ui: &mut Context,
                                             continue;
                                         }
 
-                                        let stake_amount = initial as i64;
                                         if index > 0 { // separator
                                             let colour = {
                                                 let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
@@ -2867,10 +2857,10 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 let mut colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
                                                 // a bond discovered out of order carries a u64::MAX
                                                 // placeholder until the wallet learns the real value
-                                                let str = if initial == u64::MAX {
+                                                let str = if latest == u64::MAX {
                                                     frame_strf!(data, "...")
                                                 } else {
-                                                    frame_strf!(data, "{}", format_stake_amount(stake_amount))
+                                                    frame_strf!(data, "{} cTAZ", str_from_ctaz(latest))
                                                 };
                                                 if ui.hovered(id) {
                                                     colour = WHITE;
