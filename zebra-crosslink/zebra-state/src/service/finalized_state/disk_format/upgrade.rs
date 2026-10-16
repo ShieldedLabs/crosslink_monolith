@@ -118,7 +118,11 @@ fn format_upgrades(
         // Backfills the finalizer public key -> verified finalizer address index from the
         // staking actions of already-finalized blocks.
         Box::new(add_finalizer_addresses::Upgrade),
-    ] as [Box<dyn DiskFormatUpgrade>; 8])
+        Box::new(no_migration::NoMigration::new(
+            "add crosslink_bft_dropped column family",
+            Version::new(31, 4, 0),
+        )),
+    ] as [Box<dyn DiskFormatUpgrade>; 9])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }

@@ -6,10 +6,15 @@
 #
 #   dilated_regtest/run.sh [TARGET=650]
 #
+# LOSE_BACKUP=<n> deletes node n's non-finalized backup between the stop and the restart, so that
+# node restarts holding BFT decisions whose snapshots it no longer has. It must resume BFT below
+# them and catch up rather than exit.
+#
 # Mining never pauses once stake is placed: an idle tip makes every BFT proposal empty and the
 # round timeouts grow with the round number, so a pause of minutes costs minutes more to recover.
 set -u
 TARGET=${1:-650}
+LOSE_BACKUP=${LOSE_BACKUP:-}
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/.." && pwd); OUT=$HERE/out
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) WIN=1; ROOT_TOML=$(cd "$ROOT" && pwd -W);; *) WIN=0; ROOT_TOML=$ROOT;; esac
 ZEBRAD=$ROOT/target/debug/zebrad; [ $WIN = 1 ] && ZEBRAD=$ZEBRAD.exe
@@ -103,6 +108,10 @@ restart_nodes() {
   # The new process truncates node$n.log, so the pre-restart logs move aside; `logs` globs both,
   # while the bare .log is what the post-restart checks read.
   for k in 0 1; do mv "$OUT/node$k.log" "$OUT/node$k.log.1"; mv "$OUT/node$k.err" "$OUT/node$k.err.1"; done
+  if [ -n "$LOSE_BACKUP" ]; then
+    echo "$(date +%T) restart: deleting node$LOSE_BACKUP's non-finalized backup"
+    rm -rf "$OUT/state$LOSE_BACKUP/non_finalized_state"
+  fi
   PID=()
   for k in 0 1; do start_node $k; done
   # The tip is not expected back at $BEFORE here: a hard kill drops whatever the non-finalized
@@ -139,8 +148,13 @@ for k in 0 1; do
   [ -n "$h" ] || fail "node$k did not resume BFT from its database after the restart"
   echo "$P" | grep -q "crosslink bootstrap: PoW reached height" && fail "node$k re-bootstrapped BFT after the restart"
   # One decision may have committed without its row being written, so the resumed height is
-  # allowed to be one short of what the pre-restart log counted.
-  [ -z "$h" ] || [ "$h" -ge $(( ${DEC_BEFORE[$k]} - 1 )) ] || fail "node$k resumed BFT at height $h, behind the ${DEC_BEFORE[$k]} blocks it had decided"
+  # allowed to be one short of what the pre-restart log counted. A node that lost its backup
+  # resumes below the first decision whose snapshot went with it, and catches up from there.
+  if [ "$k" = "$LOSE_BACKUP" ]; then
+    echo "$P" | grep -o "BFT height [0-9]* finalizes [0-9a-f]*, which this state does not hold" | head -1
+  else
+    [ -z "$h" ] || [ "$h" -ge $(( ${DEC_BEFORE[$k]} - 1 )) ] || fail "node$k resumed BFT at height $h, behind the ${DEC_BEFORE[$k]} blocks it had decided"
+  fi
   after=$(echo "$P" | grep -c "Successfully decided BFT block")
   [ "$after" -ge 1 ] || fail "node$k decided no BFT blocks after the restart"
 done
