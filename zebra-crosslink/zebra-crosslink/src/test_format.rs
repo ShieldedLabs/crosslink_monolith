@@ -434,6 +434,9 @@ impl TFInstr {
             if (instr.flags & SHOULD_DEFER) != 0 {
                 str += " SHOULD_DEFER";
             }
+            if (instr.flags & ANY_OUTCOME) != 0 {
+                str += " ANY_OUTCOME";
+            }
             str += " ]";
         }
 
@@ -450,6 +453,10 @@ pub const SHOULD_FAIL: u32 = 1 << 0;
 /// The block is held pending (an unknown parent, or a wait on BFT) rather than accepted or
 /// rejected. Overrides SHOULD_FAIL.
 pub const SHOULD_DEFER: u32 = 1 << 1;
+/// Any verdict passes: for an action whose outcome the writer cannot know, such as a fuzzed
+/// block. What it does not cover is the node giving no verdict at all, which still fails, as do
+/// the expectations that follow. Overrides SHOULD_FAIL and SHOULD_DEFER.
+pub const ANY_OUTCOME: u32 = 1 << 2;
 
 pub struct TF {
     pub instrs: Vec<TFInstr>,
@@ -919,7 +926,8 @@ impl TF {
 
 // TODO: macro for a stringified condition
 fn test_check(flags: u32, condition: bool, message: &str) {
-    test_check_outcome(condition, condition == ((flags & SHOULD_FAIL) == 0), message);
+    let holds = flags & ANY_OUTCOME != 0 || condition == ((flags & SHOULD_FAIL) == 0);
+    test_check_outcome(condition, holds, message);
 }
 
 /// Records an instruction's outcome. `accepted` is what EXPECT_REJECTION_REASON reads back;
@@ -944,9 +952,10 @@ fn test_check_outcome(accepted: bool, holds: bool, message: &str) {
 /// them, so a node that stopped answering cannot pass for one that rejected.
 fn check_ingest(flags: u32, label: &str, outcome: Result<zebra_state::new_network::IngestOutcome, String>) {
     use zebra_state::new_network::IngestOutcome;
-    let expect_pending = flags & SHOULD_DEFER != 0;
-    let expect_rejected = !expect_pending && flags & SHOULD_FAIL != 0;
-    let expect_accepted = !expect_pending && !expect_rejected;
+    let any = flags & ANY_OUTCOME != 0;
+    let expect_pending = any || flags & SHOULD_DEFER != 0;
+    let expect_rejected = any || (!expect_pending && flags & SHOULD_FAIL != 0);
+    let expect_accepted = any || (!expect_pending && !expect_rejected);
     let (accepted, holds, message) = match outcome {
         Ok(IngestOutcome::Committed(_)) => (true, expect_accepted, format!("{label}accepted: PoW ingest ok")),
         Ok(IngestOutcome::Known { .. }) => (true, expect_accepted, format!("{label}accepted: PoW already known")),

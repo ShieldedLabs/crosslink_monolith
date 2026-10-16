@@ -3938,3 +3938,6 @@ fn crosslink_bft_node_locked_on_a_value_proposes_it_again() {
 
     test_bytes(tf.write_to_bytes());
 }
+
+#[path = "crosslink/fuzz.rs"]
+mod fuzz;
