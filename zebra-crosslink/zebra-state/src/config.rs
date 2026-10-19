@@ -173,8 +173,6 @@ pub struct Config {
     #[cfg(feature = "elasticsearch")]
     /// The elasticsearch database password.
     pub elasticsearch_password: RedactedString,
-    /// The elasticsearch database password.
-    pub elasticsearch_password: String,
 
     /// New Networking
     /// Seed string the node derives its network identity from. `None` means generate one.
@@ -318,7 +316,6 @@ impl Default for Config {
             elasticsearch_username: "elastic".to_string(),
             #[cfg(feature = "elasticsearch")]
             elasticsearch_password: RedactedString::default(),
-            elasticsearch_password: "".to_string(),
             network_identity_seed_string: None,
             network_local_port: 0,
             network_initial_peers: Vec::new(),
