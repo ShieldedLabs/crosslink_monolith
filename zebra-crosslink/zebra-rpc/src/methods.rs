@@ -224,8 +224,8 @@ pub trait Rpc {
     ///
     /// # Notes
     ///
-    /// As in zcashd, the `end_of_service` object is only present on Mainnet, where end of
-    /// support is enforced. Zebra reports the estimated last height this release supports in
+    /// The `end_of_service` object is present on every network except Regtest, where end of
+    /// support is not enforced. Zebra reports the estimated last height this release supports in
     /// `end_of_service.block_height`; the node halts when the tip goes past it.
     ///
     /// Some fields from the zcashd reference are missing from Zebra's response: `version` and
@@ -1530,9 +1530,9 @@ where
     async fn get_deprecation_info(&self) -> Result<GetDeprecationInfoResponse> {
         let end_of_service = self
             .end_of_support_height
-            // End of support is only enforced on Mainnet, and the zcashd-compatible response
-            // omits `end_of_service` on other networks, even if a height was configured.
-            .filter(|_| self.network == Network::Mainnet)
+            // End of support is not enforced on Regtest, so the response omits `end_of_service`
+            // there, even if a height was configured.
+            .filter(|_| !self.network.is_regtest())
             .map(|end_of_support_height| {
                 // Estimate the halt time from the current tip and target block spacing. If the
                 // tip is not available yet, fall back to the highest compiled-in checkpoint,
