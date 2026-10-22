@@ -4,7 +4,11 @@ use std::time::Duration;
 
 use color_eyre::Report;
 
-use zebra_chain::{block::Height, chain_tip::ChainTip, parameters::Network};
+use zebra_chain::{
+    block::Height,
+    chain_tip::ChainTip,
+    parameters::{Network, POST_BLOSSOM_POW_TARGET_SPACING},
+};
 
 use crate::application::release_version;
 
@@ -12,7 +16,7 @@ use crate::application::release_version;
 pub const ESTIMATED_RELEASE_HEIGHT: u32 = 93_545;
 
 /// The number of blocks per day on the featurenet, with its 25-second block time.
-pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / 25;
+pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET_SPACING;
 
 /// The maximum number of days after `ESTIMATED_RELEASE_HEIGHT` where a Zebra server will run
 /// without halting.
