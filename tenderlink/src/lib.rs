@@ -87,7 +87,8 @@ const PATH_MTU: usize = max_single_datagram_message_size(CRYPTO_MAGIC).unwrap();
 const MAX_BANDWIDTH_BYTES_PER_SECOND: usize = 1_000_000;
 
 
-pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+// STP 1.0 (wire profile 6) dropped BLAKE2s; peers on the 0.x selector fail closed.
+pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
 // pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
 
@@ -1496,7 +1497,7 @@ pub use crate::stp::fmt_prefixed_byte_str_rev;
 pub use crate::stp::CONNECT_MAGIC1_PLAIN_TEXT;
 pub use crate::stp::{total_packet_payload_overhead_from_connect_magic1_inside_udp_payload, max_single_datagram_message_size};
 pub use crate::stp::new_keypair_from_connect_magic1_with_seed;
-pub use crate::stp::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+pub use crate::stp::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
 
 
 pub const MAX_P2P_DISCOVERY_PUBKEY_SIZE: usize = 32;
@@ -1768,10 +1769,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     use crate::stp::*;
     use crate::native_sockets::*;
+    use crate::transport::{new_network_thread, service_connections, NetworkThreadPush};
 
     let my_port = my_endpoint.map(|e| e.port).unwrap_or(23485); // @Dev: .unwrap_or(0); // @Todo! Get local port after sock creation! @@@
     // small min keeps the send buffer rate-adaptive (clamp(1s * rate, 512KiB, 256MiB)) instead of a flat 256MiB/conn
-    let network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
+    let mut network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
     let mut initiate_connections = Vec::<STPAddress>::new();
     let mut messages_to_send = Vec::new();
@@ -2388,7 +2390,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         use rand::seq::SliceRandom;
         messages_to_send.shuffle(&mut rand::thread_rng());
-        let resp = service_connections(&network_thread_handle, NetworkThreadPush { initiate_connections, wanted_connections: current_connections.clone(), send_unreliable: messages_to_send, }).unwrap_or_default();
+        let resp = service_connections(&mut network_thread_handle, NetworkThreadPush { initiate_connections, wanted_connections: current_connections.clone(), send_unreliable: messages_to_send, ..Default::default() }).unwrap_or_default();
         current_connections = resp.current_connections;
         initiate_connections = Vec::new();
         let mut messages_received = resp.received_unreliable_messages;
@@ -3387,7 +3389,8 @@ pub fn run_instances(i: usize) {
 }
 
 pub mod p2p_test;
-pub use shielded_transport_pigeon::{stp, native_sockets, nym_sockets};
+pub use shielded_transport_pigeon::{stp, native_sockets};
+pub mod transport;
 pub mod helpers;
 
 use helpers::*;

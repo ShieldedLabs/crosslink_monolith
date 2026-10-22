@@ -1,5 +1,3 @@
-use tenderlink::*;
-
 fn main() {
     std::panic::set_hook(Box::new(|info| {
         eprintln!("panic: {info}");
@@ -7,37 +5,8 @@ fn main() {
         // #[cfg(all(unix, debug_assertions))]    unsafe { libc::raise(libc::SIGTRAP); }
     }));
 
-    let args: Vec<String> = std::env::args().collect();
-    // println!("Command line: {:?}", args);
-
-    if args.len() > 2 {
-        let seed = [7, 11, 99, 220, 101, 143, 113,   4, 242, 136,  58, 150, 223, 186, 106, 203,
-                   67, 18, 48,  96, 176,  69, 152, 173, 224,  46, 206, 156, 217,  31, 170, 165];
-    
-        let seeder_keypair = stp::new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, seed).unwrap();
-        
-    
-        use crate::stp::*;
-        if args[1] == "reflector" {
-            let port : u16 = args[2].parse().unwrap();
-            println!("running reflector on port: {}", port);
-            do_the_test_program3(port, seeder_keypair, None, None, (1_000_000, 256 * 1024 * 1024, 256 * 1024 * 1024));
-            return;
-        }
-        if args[1] == "beamer" {
-            let max_pps = if args.len() > 5 {
-                Some(args[5].parse().unwrap())
-            } else { None };
-            
-            let port : u16 = args[2].parse().unwrap();
-            let other_addr : std::net::Ipv6Addr = args[3].parse().unwrap();
-            let other_port : u16 = args[4].parse().unwrap();
-            println!("running beamer on port: {}", port);
-            println!("connecting to {} port {}", other_addr, other_port);
-            do_the_test_program3(port, new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap(), Some(STPAddress { ip: other_addr, port: other_port, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: seeder_keypair.public, }), max_pps, (500_000, 512*1024, 256*1024*1024));
-            return;
-        }
-    }
+    // The 0.x reflector/beamer modes lived in the STP crate and were removed in 1.0;
+    // STP's own examples (lockfree_thread, lockfree_flood) cover that ground now.
 
     let args: Vec<String> = std::env::args().collect();
     let mut i: usize = usize::MAX;

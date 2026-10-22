@@ -18,6 +18,7 @@ use zebra_chain::serialization::ZcashSerialize;
 
 use tenderlink::stp::*;
 use tenderlink::native_sockets::*;
+use tenderlink::transport::{new_network_thread, service_connections, Channel, NetworkThreadPush};
 use tenderlink::{SliceWrite, SliceRead};
 use tenderlink::{dbg_panic, dbg_verify};
 
@@ -32,7 +33,9 @@ use checkpoint::Checkpoint;
 
 const JUMBO_FRAG_SIZE: usize = max_single_datagram_message_size(CRYPTO_MAGIC).unwrap();
 
-const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+// STP 1.0 (wire profile 6) dropped BLAKE2s, so 0.x peer addresses (selector 1fgEw5Nx) are
+// refused at config parse below and by the handshake; this one prints as 11Q8bpGo.
+const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
 //const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
 // @Todo: more of these, merge with Tenderlink, etc.
@@ -957,17 +960,21 @@ impl SliceWrite for PeerPowBlockRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PeerPowBlockDownload {
     height_hash: HeightAndHashOr0,
-    reassembly: ReassemblySlot, // accumulates block fragments across (re)requests
+    reassembly: BlockReassembly, // accumulates block fragments across (re)requests
     last_modified: std::time::Instant,
     timeout_strikes: u8, // quiet periods survived; fragments reset it (see dl-init timeout)
+    last_requested: Option<std::time::Instant>, // when the last BLOCK_REQ for this slot went out
+    request_attempts: u8, // BLOCK_REQs since the last fragment arrived; sets the retry backoff
 }
 impl Default for PeerPowBlockDownload {
     fn default() -> Self {
         Self {
             height_hash: HeightAndHashOr0::default(),
-            reassembly: ReassemblySlot::new(),
+            reassembly: BlockReassembly::default(),
             last_modified: std::time::Instant::now(),
             timeout_strikes: 0,
+            last_requested: None,
+            request_attempts: 0,
         }
     }
 }
@@ -1002,6 +1009,101 @@ impl SliceWrite for PeerPowBlockResponseChunkHdr {
 
 const BLOCK_DOWNLOADS_N: usize = 32;
 
+/// Largest block payload one BLOCK_CHUNK message carries. It is a whole consensus-max block,
+/// so a block answers a request in one STP message; the offset/size header and reassembly
+/// stay so a request can still resume from a prefix.
+const BLOCK_RESPONSE_MAX_PAYLOAD: usize = zebra_chain::block::MAX_BLOCK_BYTES as usize;
+/// Largest BLOCK_CHUNK message: payload plus type byte and chunk header.
+const BLOCK_RESPONSE_MAX_MESSAGE: usize = BLOCK_RESPONSE_MAX_PAYLOAD + 1 + 4 + 4 + 4 + 32;
+const_assert!(BLOCK_RESPONSE_MAX_MESSAGE <= tenderlink::transport::MAX_MESSAGE_SIZE);
+
+/// First BLOCK_REQ retry for a slot that has seen no data, doubling per attempt up to the cap.
+/// STP is best-effort: a whole-block message can be lost, and only a retry recovers it. The
+/// backoff keeps a slow link from being sent the same block again every request tick.
+const BLOCK_REQUEST_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(1000);
+const BLOCK_REQUEST_RETRY_MAX:  std::time::Duration = std::time::Duration::from_millis(4000);
+
+fn block_request_retry_delay(attempts: u8) -> std::time::Duration {
+    BLOCK_REQUEST_RETRY_BASE
+        .saturating_mul(1u32 << attempts.saturating_sub(1).min(8))
+        .min(BLOCK_REQUEST_RETRY_MAX)
+}
+
+/// Reassembles one block from BLOCK_CHUNK fragments. The buffer never grows past the
+/// fragment ends the caller admits, and the caller bounds those by the declared size, which
+/// is itself bounded by `MAX_BLOCK_BYTES`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BlockReassembly {
+    pub buf: Vec<u8>,
+    pub total_len: Option<u32>,
+    pub received: Vec<(u32, u32)>, // sorted non-overlapping non-adjacent ranges: [start, end)
+}
+
+impl BlockReassembly {
+    /// returns (success, is_complete)
+    pub fn insert(&mut self, offset: usize, data: &[u8], is_fin: bool) -> (bool, bool) {
+        let start = offset as u32;
+        let end = (offset + data.len()) as u32;
+
+        // If this is the final fragment, derive total_len from offset + data.len()
+        if is_fin {
+            if let Some(existing) = self.total_len {
+                if existing != end { return (false, false); }
+            } else {
+                if let Some(&(_, last_end)) = self.received.last() {
+                    if last_end > end { return (false, false); }
+                }
+                self.total_len = Some(end);
+                self.buf.resize(end as usize, 0);
+            }
+        }
+
+        // Empty fragment: no data to insert, bounds check offset then check completion
+        if data.is_empty() {
+            if let Some(tl) = self.total_len {
+                if start > tl { return (false, false); }
+            }
+            return (true, self.is_complete());
+        }
+
+        if let Some(tl) = self.total_len {
+            if start >= tl || end > tl { return (false, false); }
+        }
+
+        if end as usize > self.buf.len() {
+            self.buf.resize(end as usize, 0);
+        }
+
+        // Find all ranges that overlap or are adjacent to [start, end)
+        let first = self.received.partition_point(|&(_, e)| e < start);
+        let last = self.received.partition_point(|&(s, _)| s <= end);
+
+        // Verify overlapping bytes match
+        for &(rs, re) in &self.received[first..last] {
+            let ov_start = start.max(rs) as usize;
+            let ov_end = end.min(re) as usize;
+            if ov_start < ov_end {
+                let data_off = ov_start - offset;
+                if self.buf[ov_start..ov_end] != data[data_off..data_off + (ov_end - ov_start)] {
+                    return (false, false);
+                }
+            }
+        }
+
+        self.buf[offset..offset + data.len()].copy_from_slice(data);
+
+        let merged_start = if first < last { self.received[first].0.min(start) } else { start };
+        let merged_end = if first < last { self.received[last - 1].1.max(end) } else { end };
+        self.received.splice(first..last, std::iter::once((merged_start, merged_end)));
+
+        (true, self.is_complete())
+    }
+
+    fn is_complete(&self) -> bool {
+        self.total_len.is_some_and(|tl| self.received.len() == 1 && self.received[0] == (0, tl))
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BlockDownloads {
     slots: [PeerPowBlockDownload; BLOCK_DOWNLOADS_N],
@@ -1012,9 +1114,11 @@ impl BlockDownloads {
         if dl_i < self.slots.len() {
             self.slots[dl_i] = PeerPowBlockDownload {
                 height_hash,
-                reassembly: ReassemblySlot::new(),
+                reassembly: BlockReassembly::default(),
                 last_modified: std::time::Instant::now(),
                 timeout_strikes: 0,
+                last_requested: None,
+                request_attempts: 0,
             };
             self.used_flags |= 1 << dl_i;
             Some(dl_i)
@@ -1354,37 +1458,30 @@ pub fn status_packet(queued: &[Hash], chains: &NearTipChains, tip_height_overrid
 }
 
 /// The BLOCK_CHUNK packets that answer a request for `serialized` from `offset` on.
+///
+/// With STP 1.0 carrying messages up to [`tenderlink::transport::MAX_MESSAGE_SIZE`], every
+/// block fits in one packet: the remainder from `offset` goes out whole. STP delivery is still
+/// best-effort, so the requester keeps the slot, its retry backoff and timeout, and resumes
+/// from its highest contiguous prefix if a (legacy, partial) fragment ever arrives.
 pub fn block_chunk_packets(serialized: &[u8], height: u32, hash: Hash, offset: usize) -> Vec<Vec<u8>> {
     let total_size: u32 = serialized.len().try_into().unwrap();
     let height_hash = HeightAndHashOr0 { height: block::Height(height), hash_or_0: hash };
 
-    // Poor-man's fragmentation: split the block into single-packet chunks, each an
-    // independently deliverable & re-requestable message. STP delivery is unreliable,
-    // so the receiver reassembles and re-requests from its highest contiguous prefix.
-    let mut pkt_buf = [0u8; JUMBO_FRAG_SIZE];
-
-    // payload bytes available per packet after the chunk header
-    let chunk_size = JUMBO_FRAG_SIZE - {
-        let hdr = PeerPowBlockResponseChunkHdr { offset: 0, size: total_size, height_hash };
-        let mut o = 0;
-        o += PACKET_TYPE_BLOCK_CHUNK.write_to(&mut pkt_buf[o..]);
-        o += hdr.write_to(&mut pkt_buf[o..]);
-        o
-    };
-
     let mut packets = Vec::new();
-    for (chunk_i, chunk) in serialized[offset..].chunks(chunk_size).enumerate() {
+    for (chunk_i, chunk) in serialized[offset..].chunks(BLOCK_RESPONSE_MAX_PAYLOAD).enumerate() {
         let hdr = PeerPowBlockResponseChunkHdr {
-            offset: offset as u32 + (chunk_i * chunk_size) as u32,
+            offset: (offset + chunk_i * BLOCK_RESPONSE_MAX_PAYLOAD) as u32,
             size: total_size,
             height_hash,
         };
-
+        let mut hdr_buf = [0u8; BLOCK_RESPONSE_MAX_MESSAGE - BLOCK_RESPONSE_MAX_PAYLOAD];
         let mut o = 0;
-        o += PACKET_TYPE_BLOCK_CHUNK.write_to(&mut pkt_buf[o..]);
-        o += hdr.write_to(&mut pkt_buf[o..]);
-        o += chunk.write_to(&mut pkt_buf[o..]);
-        packets.push(Vec::from(&pkt_buf[..o]));
+        o += PACKET_TYPE_BLOCK_CHUNK.write_to(&mut hdr_buf[o..]);
+        o += hdr.write_to(&mut hdr_buf[o..]);
+        let mut packet = Vec::with_capacity(o + chunk.len());
+        packet.extend_from_slice(&hdr_buf[..o]);
+        packet.extend_from_slice(chunk);
+        packets.push(packet);
     }
     packets
 }
@@ -1620,12 +1717,18 @@ pub fn sync(
 
     let my_keypairs = vec![network_keypair.clone()];
     // small min keeps the send buffer rate-adaptive (clamp(1s * rate, 512KiB, 256MiB)) instead of a flat 256MiB/conn
-    let network_thread_handle = new_network_thread(my_keypairs.clone(), actual_network_local_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
+    let mut network_thread_handle = new_network_thread(my_keypairs.clone(), actual_network_local_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
     tracing::info!("NewNet: Bound to port {}", actual_network_local_port);
+    // A fresh peer string for other nodes' network_initial_peers (replace the IP with this
+    // node's reachable one). STP 1.0 addresses cannot be reused from 0.x configs.
+    tracing::info!("NewNet: PEER ADDRESS: {:?}", STPAddress::from(std::net::Ipv6Addr::LOCALHOST, actual_network_local_port, &network_keypair));
 
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
     let mut initiate_connections = Vec::<STPAddress>::new();
     let mut packets_to_send: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
+    // Whole-block responses travel on the transport's bulk channel, so this node's status and
+    // requests to the same peer are not queued behind them.
+    let mut bulk_packets_to_send: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
     let mut synthetic_peers: Vec<SyntheticPeerLink> = Vec::new();
 
     // Parse and connect to initial peers
@@ -1980,7 +2083,12 @@ pub fn sync(
         // TODO: replace with a later block_packets_to_send, which should be sorted by (in-block offset, height)
         blocks_to_send.sort_by_key(|(_, _, height, _)| *height);
 
-        // TODO: rate limit production!
+        // Backpressure before work: a response is built only when the peer's untransmitted
+        // backlog (our outbox plus STP's queue, see `send_budget`) leaves room for it, counting
+        // what this tick already queued. A skipped request is not lost: the requester's slot
+        // retries with backoff and times out as before.
+        let mut reserved_send_bytes: HashMap<ConnectionKey, u64> = HashMap::new();
+        let mut deferred_block_responses = 0usize;
         for (connection_key, hash, height, offset) in &blocks_to_send {
             let hash = *hash;
             if !current_connections.iter().any(|(addr, _)| addr.connection_key() == *connection_key) {
@@ -1991,6 +2099,19 @@ pub fn sync(
                 if TRACE { tracing::info!("Can't send block that was queued for sending: Peer does not exist for connection: {connection_key:?}"); }
                 continue;
             };
+
+            let reserved = reserved_send_bytes.get(connection_key).copied().unwrap_or(0);
+            let needed = match serialized_blocks.get(&hash) {
+                Some(serialized) => (serialized.len().saturating_sub(*offset) + BLOCK_RESPONSE_MAX_MESSAGE - BLOCK_RESPONSE_MAX_PAYLOAD) as u64,
+                None => BLOCK_RESPONSE_MAX_MESSAGE as u64, // unknown until serialized: assume the max
+            };
+            // Synthetic peers are served around the network thread (see the outbound
+            // interception before service_connections), so STP's backlog does not apply.
+            let is_synthetic = synthetic_peers.iter().any(|p| p.address.connection_key() == *connection_key);
+            if !is_synthetic && network_thread_handle.send_budget(*connection_key, Channel::Bulk) < reserved + needed {
+                deferred_block_responses += 1;
+                continue;
+            }
 
             if !serialized_blocks.contains_key(&hash) {
                 match read_state.block_from_any_chain(hash.into()) {
@@ -2016,8 +2137,12 @@ pub fn sync(
             if TRACE { tracing::info!("Sending BLOCK (Height: {height}, Hash: {hash}, {offset}-{})", serialized_block.len()); }
 
             for packet in block_chunk_packets(serialized_block, *height, hash, *offset) {
-                packets_to_send.push((*connection_key, packet));
+                *reserved_send_bytes.entry(*connection_key).or_insert(0) += packet.len() as u64;
+                bulk_packets_to_send.push((*connection_key, packet));
             }
+        }
+        if deferred_block_responses > 0 {
+            tracing::debug!("NewNet: deferred {deferred_block_responses} block responses: peer send backlog full");
         }
         blocks_to_send.clear();
 
@@ -2543,6 +2668,16 @@ pub fn sync(
                             continue 'downloads;
                         }
 
+                        let dl = &mut peer.block_downloads.slots[dl_i];
+
+                        // Retry with backoff: a block now answers in one message, so re-asking
+                        // every request tick would only resend it while it is still in flight.
+                        let now = std::time::Instant::now();
+                        if dl.last_requested.is_some_and(|at| now.saturating_duration_since(at) < block_request_retry_delay(dl.request_attempts)) {
+                            continue 'downloads;
+                        }
+                        dl.last_requested = Some(now);
+                        dl.request_attempts = dl.request_attempts.saturating_add(1);
                         let dl = &peer.block_downloads.slots[dl_i];
 
                         // resume from the highest contiguous prefix we've already reassembled
@@ -2580,22 +2715,25 @@ pub fn sync(
         // them: their packets leave and arrive around it, and they are re-added to the connection
         // list it hands back each tick until the node kills them.
         synthetic_peers.extend(SYNTHETIC_PEERS_TO_ATTACH.lock().unwrap().drain(..));
-        packets_to_send.retain(|(key, packet)| {
-            let Some(synthetic) = synthetic_peers.iter().find(|p| p.address.connection_key() == *key) else {
-                return true;
-            };
-            let _ = synthetic.outbound.send(packet.clone());
-            false
-        });
+        for queue in [&mut packets_to_send, &mut bulk_packets_to_send] {
+            queue.retain(|(key, packet)| {
+                let Some(synthetic) = synthetic_peers.iter().find(|p| p.address.connection_key() == *key) else {
+                    return true;
+                };
+                let _ = synthetic.outbound.send(packet.clone());
+                false
+            });
+        }
 
         // Service STP connections (send/recv). `None` means the network thread
         // did not answer in time because it died or wedged: keep our connection
         // list as it was instead of replacing it with an empty answer, so this
         // tick loop -- and with it Zebra's shutdown -- can continue.
-        let mut packets_received = match service_connections(&network_thread_handle, NetworkThreadPush {
+        let mut packets_received = match service_connections(&mut network_thread_handle, NetworkThreadPush {
             initiate_connections,
             wanted_connections: current_connections.iter().filter(|(addr, _)| !synthetic_peers.iter().any(|p| p.address == *addr)).cloned().collect(),
             send_unreliable: packets_to_send,
+            send_bulk: std::mem::take(&mut bulk_packets_to_send),
         }) {
             Some(resp) => {
                 current_connections = resp.current_connections;
@@ -2947,6 +3085,9 @@ pub fn sync(
                 }
                 peer.block_downloads.slots[dl_i].last_modified = std::time::Instant::now();
                 peer.block_downloads.slots[dl_i].timeout_strikes = 0;
+                // progress: the next retry (for a remaining suffix) starts from the base delay
+                peer.block_downloads.slots[dl_i].request_attempts = 0;
+                peer.block_downloads.slots[dl_i].last_requested = None;
 
                 if !complete {
                     if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: fragment at offset {} ({} bytes); awaiting more", hdr.offset, msg.len()); }
@@ -3405,6 +3546,67 @@ pub fn sync(
 mod tests {
     #[allow(unused_imports)]
     use super::*;
+
+    #[cfg(test)]
+    fn parse_chunk(packet: &[u8]) -> (PeerPowBlockResponseChunkHdr, &[u8]) {
+        assert_eq!(packet[0], PACKET_TYPE_BLOCK_CHUNK);
+        let mut msg = &packet[1..];
+        let hdr = PeerPowBlockResponseChunkHdr::read_from(&mut msg).unwrap();
+        (hdr, msg)
+    }
+
+    #[test]
+    fn max_size_block_is_answered_in_one_bounded_message() {
+        let block: Vec<u8> = (0..BLOCK_RESPONSE_MAX_PAYLOAD).map(|i| (i * 7) as u8).collect();
+        let hash = Hash([9; 32]);
+        let packets = block_chunk_packets(&block, 5, hash, 0);
+        assert_eq!(packets.len(), 1);
+        assert!(packets[0].len() <= BLOCK_RESPONSE_MAX_MESSAGE);
+        let (hdr, payload) = parse_chunk(&packets[0]);
+        assert_eq!((hdr.offset, hdr.size, hdr.height_hash.height.0), (0, block.len() as u32, 5));
+        let mut r = BlockReassembly::default();
+        assert_eq!(r.insert(hdr.offset as usize, payload, true), (true, true));
+        assert_eq!(r.buf, block);
+
+        // A request that resumes from a prefix gets exactly the remainder, again in one message.
+        let packets = block_chunk_packets(&block, 5, hash, 1000);
+        assert_eq!(packets.len(), 1);
+        let (hdr, payload) = parse_chunk(&packets[0]);
+        assert_eq!(hdr.offset, 1000);
+        assert_eq!(payload, &block[1000..]);
+    }
+
+    #[test]
+    fn block_reassembly_resumes_and_rejects_inconsistent_fragments() {
+        let block: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+        let mut r = BlockReassembly::default();
+        assert_eq!(r.insert(0, &block[..3000], false), (true, false));
+        // a lost middle fragment leaves a gap; the prefix is what a retry resumes from
+        assert_eq!(r.insert(6000, &block[6000..], true), (true, false));
+        assert_eq!(r.received.first().map(|r| r.1), Some(3000));
+        // overlapping retransmission with the same bytes is accepted and completes it
+        assert_eq!(r.insert(2000, &block[2000..7000], false), (true, true));
+        assert_eq!(r.buf, block);
+
+        let mut r = BlockReassembly::default();
+        assert_eq!(r.insert(0, &block[..100], false), (true, false));
+        let mut forged = block[50..150].to_vec();
+        forged[0] ^= 1;
+        assert_eq!(r.insert(50, &forged, false).0, false, "conflicting overlap");
+        assert_eq!(r.insert(100, &block[100..200], true), (true, true));
+        assert_eq!(r.insert(150, &block[150..300], false).0, false, "past the declared end");
+        assert_eq!(r.buf.len(), 200, "buffer never grows past the declared end");
+    }
+
+    #[test]
+    fn block_request_retry_backs_off_to_a_cap() {
+        let secs: Vec<u64> = (1..=6).map(|a| block_request_retry_delay(a).as_millis() as u64).collect();
+        assert_eq!(secs, vec![1000, 2000, 4000, 4000, 4000, 4000]);
+        assert_eq!(block_request_retry_delay(u8::MAX), BLOCK_REQUEST_RETRY_MAX);
+        // every retry lands before the slot's unmodified timeout and its one strike expire
+        let total: std::time::Duration = (1..=4).map(block_request_retry_delay).sum();
+        assert!(total < DOWNLOAD_UNMODIFIED_TIMEOUT_DUR * 2);
+    }
 
     #[test]
     fn cpu_verification_shutdown_does_not_wait_for_worker() {
