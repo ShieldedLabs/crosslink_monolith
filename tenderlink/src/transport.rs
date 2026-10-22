@@ -36,14 +36,14 @@
 //! response protocols on top keep their own timeouts and retries.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use shielded_transport_pigeon::pump::{Event, LockfreeEndpoint, RingConfig};
 use shielded_transport_pigeon::stp::{
-    new_pump_with_options, ConnectionKey, Dscp, IdentityKeyPair, NetworkThreadOptions, Pump,
-    STPAddress,
+    ConnectionKey, Dscp, IdentityKeyPair, NetworkThreadOptions, Pump, STPAddress,
+    new_pump_with_options,
 };
 
 /// Which STP send queue of a connection a message travels on.
@@ -586,7 +586,7 @@ impl NetworkThreadHandle {
 mod tests {
     use super::*;
     use shielded_transport_pigeon::stp::{
-        new_keypair_from_connect_magic1, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b,
+        CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b, new_keypair_from_connect_magic1,
     };
     use std::net::Ipv6Addr;
 
@@ -807,10 +807,11 @@ mod tests {
                 initiate_connections: peers.clone(),
                 ..Default::default()
             });
-            assert!(a
-                .connecting
-                .keys()
-                .all(|k| peers.iter().all(|p| p.connection_key() != *k)));
+            assert!(
+                a.connecting
+                    .keys()
+                    .all(|k| peers.iter().all(|p| p.connection_key() != *k))
+            );
         }
         // Space returns: each pump pass takes the queued control, every teardown is delivered
         // in turn, and only then do the queued connects go out.
@@ -1064,18 +1065,24 @@ mod tests {
     #[test]
     fn fresh_addresses_round_trip_and_the_0x_selector_fails_closed() {
         use shielded_transport_pigeon::stp::{
-            build_magic2_client_block, crypto_string_from_connect_magic1, negotiate_magic2,
-            validate_magic2, CONNECT_MAGIC1_PLAIN_TEXT, MAGIC2_APP_CROSSLINK,
+            CONNECT_MAGIC1_PLAIN_TEXT, MAGIC2_APP_CROSSLINK, build_magic2_client_block,
+            crypto_string_from_connect_magic1, negotiate_magic2, validate_magic2,
         };
         // STP 2.0 selectors; every peer upgrades together.
-        assert_eq!(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b, 0xa91a_aca6_f0f9);
+        assert_eq!(
+            CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b,
+            0xa91a_aca6_f0f9
+        );
         assert_eq!(CONNECT_MAGIC1_PLAIN_TEXT, 0x1f34_a6ae_39ab);
         assert_eq!(MAGIC2_APP_CROSSLINK, 0x8944_4182_b302_528e);
 
         // Crosslink's application magic2 is what the transitive negotiator offers and accepts.
         let block = build_magic2_client_block();
         assert_eq!(block[0], 1);
-        assert_eq!(block[1..9], [0x8e, 0x52, 0x02, 0xb3, 0x82, 0x41, 0x44, 0x89]);
+        assert_eq!(
+            block[1..9],
+            [0x8e, 0x52, 0x02, 0xb3, 0x82, 0x41, 0x44, 0x89]
+        );
         assert_eq!(negotiate_magic2(&block), Some(MAGIC2_APP_CROSSLINK));
         assert!(validate_magic2(MAGIC2_APP_CROSSLINK));
         // The STP 1.0 Crosslink magic2 is neither offered nor accepted.
@@ -1108,6 +1115,39 @@ mod tests {
         for old in [0xa891_6e3c_54d7, 0x6d43_b2f8_091b, 0x7193_c304_f8d5] {
             assert!(crypto_string_from_connect_magic1(old).is_none(), "{old:#x}");
             assert!(new_keypair_from_connect_magic1(old).is_none(), "{old:#x}");
+        }
+    }
+
+    #[test]
+    fn built_in_peer_configs_use_current_stp_selector() {
+        for (source, count) in [
+            (
+                include_str!("../../zebra-crosslink/zebrad/src/config.rs"),
+                3,
+            ),
+            (
+                include_str!("../../zebra-crosslink/dilated_regtest/node0.toml.in"),
+                1,
+            ),
+            (
+                include_str!("../../zebra-crosslink/dilated_regtest/node1.toml.in"),
+                1,
+            ),
+        ] {
+            let peers: Vec<_> = source
+                .lines()
+                .filter(|line| line.contains("]:12001:") || line.contains("]:12002:"))
+                .map(|line| line.split('"').nth(1).expect("quoted peer address"))
+                .collect();
+            assert_eq!(peers.len(), count);
+            for peer in peers {
+                let address = STPAddress::parse(peer).expect("built-in peer must parse");
+                assert_eq!(
+                    address.magic1, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b,
+                    "{peer}"
+                );
+                assert_eq!(format!("{address:?}"), peer);
+            }
         }
     }
 
