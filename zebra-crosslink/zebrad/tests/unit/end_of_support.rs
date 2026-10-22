@@ -93,7 +93,7 @@ fn end_of_support_function() {
     // Panic is tested in `end_of_support_panic`
 }
 
-/// Test that the end of support height is reported on Mainnet and not on test networks.
+/// Test that the end of support height is reported on every network except Regtest.
 #[test]
 fn end_of_support_height_per_network() {
     // The reported height is the last supported height: `check()` runs at it without panicking
@@ -105,6 +105,11 @@ fn end_of_support_height_per_network() {
         Some(last_supported_height)
     );
     end_of_support::check(last_supported_height, &Network::Mainnet);
+
+    assert_eq!(
+        end_of_support::end_of_support_height(&Network::new_default_testnet()),
+        Some(last_supported_height)
+    );
 
     // End of support is not enforced on Regtest, so no height is reported.
     assert_eq!(
