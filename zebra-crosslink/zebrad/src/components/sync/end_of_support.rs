@@ -89,16 +89,16 @@ pub fn check(tip_height: Height, _network: &Network) {
         panic!(
             "{EOS_PANIC_MESSAGE_HEADER} if the release date is older than {EOS_PANIC_AFTER} days. \
             \nRelease name: {}, Estimated release height: {ESTIMATED_RELEASE_HEIGHT} \
-            \nHint: Download and install the latest Zebra release from: https://github.com/ZcashFoundation/zebra/releases/latest",
+            \nHint: Download and install the latest release from: https://github.com/ShieldedLabs/crosslink_monolith/releases/latest",
             release_version()
         );
     } else if tip_height > warn_height {
         warn!(
             "{EOS_WARN_MESSAGE_HEADER} at block {}. \
             \nRelease name: {}, Estimated release height: {ESTIMATED_RELEASE_HEIGHT} \
-            \nHint: Download and install the latest Zebra release from: https://github.com/ZcashFoundation/zebra/releases/latest", panic_height.0, release_version()
+            \nHint: Download and install the latest release from: https://github.com/ShieldedLabs/crosslink_monolith/releases/latest", panic_height.0, release_version()
         );
     } else {
-        info!("Zebra release is supported until block {}, please report bugs at https://github.com/ZcashFoundation/zebra/issues", panic_height.0);
+        info!("Zebra release is supported until block {}, please report bugs at https://github.com/ShieldedLabs/crosslink_monolith/issues", panic_height.0);
     }
 }
