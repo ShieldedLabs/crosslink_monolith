@@ -33,8 +33,8 @@ use checkpoint::Checkpoint;
 
 const JUMBO_FRAG_SIZE: usize = max_single_datagram_message_size(CRYPTO_MAGIC).unwrap();
 
-// STP 1.0 (wire profile 6) dropped BLAKE2s, so 0.x peer addresses (selector 1fgEw5Nx) are
-// refused at config parse below and by the handshake; this one prints as 11Q8bpGo.
+// STP 2.0 replaced the magic1 selectors, so 1.x (11Q8bpGo) and 0.x (1fgEw5Nx) peer addresses
+// are refused at config parse below and by the handshake; this one prints as -fCmrBqp.
 const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
 //const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
@@ -1881,7 +1881,7 @@ pub fn sync(
     let block_response_deadline = block_response_deadline(network_thread_handle.limits().peer_outbox_bytes as u64);
     tracing::info!("NewNet: Bound to port {}", actual_network_local_port);
     // A fresh peer string for other nodes' network_initial_peers (replace the IP with this
-    // node's reachable one). STP 1.0 addresses cannot be reused from 0.x configs.
+    // node's reachable one). STP 2.0 addresses cannot be reused from 1.x or 0.x configs.
     tracing::info!("NewNet: PEER ADDRESS: {:?}", STPAddress::from(std::net::Ipv6Addr::LOCALHOST, actual_network_local_port, &network_keypair));
 
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();

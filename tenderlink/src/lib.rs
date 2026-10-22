@@ -92,7 +92,8 @@ const_assert!(PROPOSAL_PACKET_SIZE <= max_single_datagram_message_size(CRYPTO_MA
 const MAX_BANDWIDTH_BYTES_PER_SECOND: usize = 1_000_000;
 
 
-// STP 1.0 (wire profile 6) dropped BLAKE2s; peers on the 0.x selector fail closed.
+// STP 2.0 replaced the magic1 selectors (and the Crosslink magic2); peers on the 1.x or
+// 0.x selectors fail closed, so every peer upgrades together.
 pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
 // pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 

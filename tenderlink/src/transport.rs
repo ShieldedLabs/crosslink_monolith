@@ -1063,24 +1063,52 @@ mod tests {
 
     #[test]
     fn fresh_addresses_round_trip_and_the_0x_selector_fails_closed() {
-        let key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b)
-            .unwrap();
-        let address = STPAddress::from(Ipv6Addr::LOCALHOST, 39_210, &key);
-        let text = format!("{address:?}");
-        assert!(text.contains(":11Q8bpGo:"), "{text}");
-        let back = STPAddress::parse(&text).expect("printed address parses");
-        assert_eq!(
-            (back.ip, back.port, back.magic1, &back.key),
-            (address.ip, address.port, address.magic1, &address.key)
-        );
-        // The same peer written with the 0.x BLAKE2s selector is not a usable 1.0 address.
-        let old = text.replace("11Q8bpGo", "1fgEw5Nx");
-        assert!(STPAddress::parse(&old)
-            .is_none_or(|a| a.magic1 != CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b));
-        assert!(
-            shielded_transport_pigeon::stp::crypto_string_from_connect_magic1(0x7193_c304_f8d5)
-                .is_none()
-        );
+        use shielded_transport_pigeon::stp::{
+            build_magic2_client_block, crypto_string_from_connect_magic1, negotiate_magic2,
+            validate_magic2, CONNECT_MAGIC1_PLAIN_TEXT, MAGIC2_APP_CROSSLINK,
+        };
+        // STP 2.0 selectors; every peer upgrades together.
+        assert_eq!(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b, 0xa91a_aca6_f0f9);
+        assert_eq!(CONNECT_MAGIC1_PLAIN_TEXT, 0x1f34_a6ae_39ab);
+        assert_eq!(MAGIC2_APP_CROSSLINK, 0x8944_4182_b302_528e);
+
+        // Crosslink's application magic2 is what the transitive negotiator offers and accepts.
+        let block = build_magic2_client_block();
+        assert_eq!(block[0], 1);
+        assert_eq!(block[1..9], [0x8e, 0x52, 0x02, 0xb3, 0x82, 0x41, 0x44, 0x89]);
+        assert_eq!(negotiate_magic2(&block), Some(MAGIC2_APP_CROSSLINK));
+        assert!(validate_magic2(MAGIC2_APP_CROSSLINK));
+        // The STP 1.0 Crosslink magic2 is neither offered nor accepted.
+        assert!(!validate_magic2(0x5d74_7212_5631_44d9));
+        let mut old_block = block;
+        old_block[1..9].copy_from_slice(&0x5d74_7212_5631_44d9_u64.to_le_bytes());
+        assert_eq!(negotiate_magic2(&old_block), None);
+
+        for (magic1, selector) in [
+            (CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b, "-fCmrBqp"),
+            (CONNECT_MAGIC1_PLAIN_TEXT, "qzmupjQf"),
+        ] {
+            let key = new_keypair_from_connect_magic1(magic1).unwrap();
+            let address = STPAddress::from(Ipv6Addr::LOCALHOST, 39_210, &key);
+            assert_eq!(address.magic1, magic1);
+            let text = format!("{address:?}");
+            assert!(text.contains(&format!(":{selector}:")), "{text}");
+            let back = STPAddress::parse(&text).expect("printed address parses");
+            assert_eq!(
+                (back.ip, back.port, back.magic1, &back.key),
+                (address.ip, address.port, address.magic1, &address.key)
+            );
+            // The same peer written with the 1.0 or 0.x selector is not a usable 2.0 address.
+            for old_selector in ["11Q8bpGo", "1fgEw5Nx", "Gwn4skNt"] {
+                let old = text.replace(selector, old_selector);
+                assert!(STPAddress::parse(&old).is_none_or(|a| a.magic1 != magic1));
+            }
+        }
+        // Old selectors: 1.0 encrypted, 1.0 plaintext, 0.x encrypted.
+        for old in [0xa891_6e3c_54d7, 0x6d43_b2f8_091b, 0x7193_c304_f8d5] {
+            assert!(crypto_string_from_connect_magic1(old).is_none(), "{old:#x}");
+            assert!(new_keypair_from_connect_magic1(old).is_none(), "{old:#x}");
+        }
     }
 
     #[test]
