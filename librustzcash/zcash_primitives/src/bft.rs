@@ -1099,6 +1099,11 @@ impl FatPointerToBftBlock {
     }
 
     pub fn validate_signatures(&self, vote_namespace: &[u8; 32]) -> bool {
+        // Only precommits certify a block. Prevotes for it sign the same bytes with the
+        // precommit bit of the round clear, and would otherwise pass as a certificate.
+        if !self.get_vote_template().typ {
+            return false;
+        }
         let mut batch = ed25519_zebra::batch::Verifier::new();
         for (vote, signature) in self.inflate() {
             let vk_bytes = ed25519_zebra::VerificationKeyBytes::from(vote.validator_address.0);
@@ -1313,6 +1318,43 @@ pub struct ScanInfo {
     pub max_height_seen: u32,
     /// `coinbases_value + bonds_value`; burned bonds are not included.
     pub total_value: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signed_fat_pointer(typ: bool) -> FatPointerToBftBlock {
+        let template = Vote {
+            validator_address: PubKeyID([0; 32]),
+            value: Blake3Hash([5; 32]),
+            height: 7,
+            typ,
+            round: 2,
+        };
+        let signatures: Vec<FatPointerSignature> = (1..=3u8)
+            .map(|i| {
+                let key = SigningKey::from([i; 32]);
+                let pub_key = PubKeyID(<[u8; 32]>::from(VerificationKeyBytes::from(&key)));
+                let vote = Vote { validator_address: pub_key, ..template.clone() };
+                FatPointerSignature { pub_key, vote_signature: key.sign(&vote.to_bytes()).to_bytes() }
+            })
+            .collect();
+        let mut fat_pointer = FatPointerToBftBlock::from_parts(template.value, template.height, template.round as u32, &signatures);
+        fat_pointer.vote_for_block_without_finalizer_public_key.copy_from_slice(&template.to_bytes()[32..]);
+        fat_pointer
+    }
+
+    #[test]
+    fn prevotes_do_not_certify_a_block() {
+        let precommits = signed_fat_pointer(true);
+        assert_eq!(precommits, FatPointerToBftBlock::from_parts(Blake3Hash([5; 32]), 7, 2, &precommits.signatures));
+        assert!(precommits.validate_signatures(&[0; 32]));
+
+        let prevotes = signed_fat_pointer(false);
+        assert_eq!(prevotes.inflate().len(), 3);
+        assert!(!prevotes.validate_signatures(&[0; 32]));
+    }
 }
 
 

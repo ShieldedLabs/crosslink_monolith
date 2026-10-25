@@ -208,7 +208,7 @@ fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMembe
         let mut sign_data = [0; 76 - 32];
         round_data.proposal_id.0.write_to(&mut sign_data[0..32]);
         round_data.height.write_to(&mut sign_data[32..]);
-        (round_data.round + 0x8000_0000).write_to(&mut sign_data[40..]);
+        (round_data.round | PRECOMMIT_ROUND_BIT).write_to(&mut sign_data[40..]);
         vote_for_block_without_finalizer_public_key = sign_data;
     }
 
@@ -857,6 +857,12 @@ impl TMState {
             // let ctx_str  = self.ctx_str(roster);
             // let pkt_str = format!("{:20} {}.{}.{}", packet_name_from_tag(packet_type), height, round, chunk_i);
             // eprintln!("{ctx_str} {ANSI_GRY}BFT{ANSI_RST}: received [{}] when we're at height {}", pkt_str, self.height);
+            return TMStatus::Fail;
+        }
+
+        // No honest node ever reaches a round with this bit set, and a vote signed for one would
+        // count as a vote of the other kind in another round (see `PRECOMMIT_ROUND_BIT`).
+        if round & PRECOMMIT_ROUND_BIT != 0 {
             return TMStatus::Fail;
         }
 
@@ -1569,11 +1575,20 @@ fn sign_with_namespace(key: &SigningKey, data: &[u8], namespace: &[u8; 32]) -> [
     }
 }
 
+// The signed bytes of a vote carry its round with this bit set for a precommit and clear for a
+// prevote. So a round that already has the bit set signs the same bytes as some vote of another
+// round: a precommit in round 0x8000_0000 + r is a precommit in round r, and, if the bit were
+// added rather than or-ed in, a prevote in round r would be a precommit in round 0x8000_0000 + r.
+// Rounds that high are refused on receipt (`check_and_incorporate_msg`); otherwise anyone holding
+// honest votes could replay them as votes of another kind and round, and the round-catchup rule
+// would move every finalizer to a round whose timeouts last decades.
+const PRECOMMIT_ROUND_BIT: u32 = 0x8000_0000;
+
 fn make_vote_sign_datas(pub_key: PubKeyID, is_precommit: bool, height: u64, round: u32, value_id: ValueId) -> [[u8; 76]; 2] {
     let mut sign_data_no = [0; 76];
     sign_data_no[0..32].copy_from_slice(&pub_key.0[..]);
     height.write_to(&mut sign_data_no[64..]);
-    (round + 0x8000_0000 * (is_precommit as u32)).write_to(&mut sign_data_no[72..]);
+    (round | if is_precommit { PRECOMMIT_ROUND_BIT } else { 0 }).write_to(&mut sign_data_no[72..]);
     let mut sign_data_yes = sign_data_no;
     value_id.0.write_to(&mut sign_data_yes[32..64]);
     [sign_data_no, sign_data_yes]
@@ -3528,6 +3543,43 @@ mod tests {
         );
         state.insert_round(0, 0, &roster);
         (state, roster)
+    }
+
+    #[test]
+    fn vote_packet_with_more_votes_than_slots_is_refused() {
+        let read = |no_votes_n: u8, yes_votes_n: u8| {
+            let mut buf = vec![no_votes_n, yes_votes_n];
+            buf.resize(2 + 4 + 8 + 32 + 510 * (2 + 64), 0);
+            PacketVotes::read_from(&mut &buf[..])
+        };
+        assert!(read(18, 0).is_some());
+        assert!(read(9, 9).is_some());
+        assert!(read(0, 19).is_none());
+        assert!(read(10, 10).is_none());
+        assert!(read(255, 255).is_none());
+    }
+
+    #[test]
+    fn votes_in_a_round_with_the_precommit_bit_are_refused() {
+        let (mut state, roster) = dup_state();
+        let value_id = ValueId([1; 32]);
+        let replay_round = PRECOMMIT_ROUND_BIT;
+
+        let precommit = make_vote_sign_datas(roster[0].pub_key, true, 0, 0, value_id)[1];
+        let replayed  = make_vote_sign_datas(roster[0].pub_key, true, 0, replay_round, value_id)[1];
+        assert_eq!(precommit, replayed, "the replay this guards against: same signed bytes, other round");
+        let sig = TMSig(sign_with_namespace(&state.my_signing_key, &precommit, &state.vote_namespace));
+        assert_eq!(state.check_and_incorporate_msg(0, replay_round, 0, value_id, -2, &roster, 0,
+            PACKET_TYPE_PRECOMMIT_SIGNATURES, &replayed, sig), TMStatus::Fail);
+
+        let prevote = make_vote_sign_datas(roster[0].pub_key, false, 0, replay_round | 5, value_id)[1];
+        let prevote_sig = TMSig(sign_with_namespace(&state.my_signing_key, &prevote, &state.vote_namespace));
+        assert_eq!(state.check_and_incorporate_msg(0, replay_round | 5, 0, value_id, -2, &roster, 0,
+            PACKET_TYPE_PREVOTE_SIGNATURES, &prevote, prevote_sig), TMStatus::Fail);
+
+        assert!(state.rounds_data.iter().all(|r| r.round & PRECOMMIT_ROUND_BIT == 0));
+        assert_eq!(state.check_and_incorporate_msg(0, 0, 0, value_id, -2, &roster, 0,
+            PACKET_TYPE_PRECOMMIT_SIGNATURES, &precommit, sig), TMStatus::Indeterminate);
     }
 
     #[test]
