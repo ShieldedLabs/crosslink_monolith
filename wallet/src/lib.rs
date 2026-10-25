@@ -2005,6 +2005,11 @@ impl ManualWallet {
 
                         for &note in &shuffled_notes {
                             if note.recv_h.confirmations(self.confirmations_tip()) < SPENDABLE_CONFIRMATIONS { continue; }
+                            // A witness error below fails the whole build, not just this note.
+                            if note.position == unknown_tree_position() {
+                                println!("tx build: skipping orchard note with no known tree position ({note:?})");
+                                continue;
+                            }
 
                             let witness = match tree.witness_at_checkpoint_id(note.position, &orchard_anchor_h) {
                                 // NOTE: presumably can fail from too-recent note
@@ -5397,5 +5402,104 @@ mod tests {
         assert!(decode_roster_bytes(&bytes).is_err());
         bytes[last - 64] = 2;
         assert!(decode_roster_bytes(&bytes).is_err());
+    }
+
+    fn note_fixture() -> (ManualWallet, PreparedKeys, orchard::Note, orchard::Address) {
+        let usk = UnifiedSpendingKey::from_seed(&TEST_NETWORK, &[7; 32], zip32::AccountId::ZERO).unwrap();
+        let ufvk = usk.to_unified_full_viewing_key();
+        let keys = PreparedKeys::from_ufvk_all(&ufvk);
+        let recipient = keys.orchard_fvk.as_ref().unwrap().address_at(0u32, orchard::keys::Scope::External);
+        let rho = orchard::note::Rho::from_bytes(&[1; 32]).unwrap();
+        let rseed = (0u8..=255).find_map(|b| orchard::note::RandomSeed::from_bytes([b; 32], &rho).into_option()).unwrap();
+        let note = orchard::Note::from_parts(recipient, orchard::value::NoteValue::from_raw(1_000_000_000), rho, rseed, orchard::note::NoteVersion::V3).unwrap();
+        let account = ManualAccount {
+            ufvk, birthday: BlockHeight(0), balance_changes: vec![],
+            fully_decoded_h: BlockHeight(0), fully_detected_h: BlockHeight(0),
+            recv_txos: vec![], utxos: vec![], stxos: vec![],
+            recv_orchard_notes: vec![], unspent_orchard_notes: vec![], spent_orchard_notes: vec![],
+        };
+        let wallet = ManualWallet {
+            name: "note-position-test", accounts: vec![account], strms: vec![],
+            chain_tip_h: BlockHeight(100), sync_h: BlockHeight(100), branch_mismatch: None,
+            txs: vec![], tx_h_map: HashMap::new(), seen_bond_values: HashMap::new(), care_about_bonds: vec![],
+        };
+        (wallet, keys, note, recipient)
+    }
+
+    fn record_note_action(wallet: &mut ManualWallet, txid: TxId, h: BlockHeight, part: WalletTxPart, position: incrementalmerkletree::Position) {
+        // The full-tx reader passes the unknown position; the compact reader passes the tree position.
+        let part_flags = if position == unknown_tree_position() { TxParts::FULL_TX } else { TxParts::SHIELDED_RECV };
+        let tx = WalletTx { txid, h, status: TxStatus::OnBc, part_flags, parts: [WalletTxPart::ZERO, part], ..WalletTx::EMPTY };
+        let mut insert_i = 0;
+        update_insert_i(&wallet.txs, &mut insert_i, h);
+        update_with_tx(wallet, tx, &mut insert_i);
+    }
+
+    fn receive_note(wallet: &mut ManualWallet, keys: &PreparedKeys, note: orchard::Note, addr: orchard::Address, h: BlockHeight, position: incrementalmerkletree::Position) {
+        let txid = TxId::from_bytes([9; 32]);
+        let unrelated_nf = orchard::note::Nullifier::from_bytes(&[2; 32]).unwrap();
+        let part = handle_orchard_action(wallet, 0, keys, position, h, &txid, &unrelated_nf, Some((note, addr)), None).unwrap();
+        record_note_action(wallet, txid, h, part, position);
+    }
+
+    fn spend_note(wallet: &mut ManualWallet, keys: &PreparedKeys, note: orchard::Note, position: incrementalmerkletree::Position) {
+        let nf = note.nullifier(keys.orchard_fvk.as_ref().unwrap());
+        let txid = TxId::from_bytes([8; 32]);
+        let h = BlockHeight(11);
+        let part = handle_orchard_action(wallet, 0, keys, position, h, &txid, &nf, None, None).unwrap();
+        record_note_action(wallet, txid, h, part, position);
+    }
+
+    #[test]
+    fn mempool_resighting_keeps_the_compact_position() {
+        let (mut wallet, keys, note, addr) = note_fixture();
+        receive_note(&mut wallet, &keys, note, addr, BlockHeight::MEMPOOL, unknown_tree_position());
+        receive_note(&mut wallet, &keys, note, addr, BlockHeight(10), 0.into());
+        receive_note(&mut wallet, &keys, note, addr, BlockHeight::MEMPOOL, unknown_tree_position());
+        assert_eq!(wallet.tx_h_map[&TxId::from_bytes([9; 32])], BlockHeight(10));
+        assert_eq!(wallet.accounts[0].unspent_orchard_notes.len(), 1);
+        assert_eq!(wallet.accounts[0].unspent_orchard_notes[0].recv_h, BlockHeight(10));
+        assert_eq!(wallet.accounts[0].unspent_orchard_notes[0].position, 0.into());
+    }
+
+    #[test]
+    fn compact_receive_fills_in_the_position_of_a_spent_copy() {
+        let (mut wallet, keys, note, addr) = note_fixture();
+        receive_note(&mut wallet, &keys, note, addr, BlockHeight(10), unknown_tree_position());
+        spend_note(&mut wallet, &keys, note, unknown_tree_position());
+        receive_note(&mut wallet, &keys, note, addr, BlockHeight(10), 0.into());
+        let account = &wallet.accounts[0];
+        assert_eq!(account.recv_orchard_notes[0].position, 0.into());
+        // A rewind of the spending block restores this copy as unspent.
+        assert_eq!(account.spent_orchard_notes[0].position, 0.into());
+    }
+
+    #[test]
+    fn spent_copy_stays_witnessable_after_the_compact_scan_sees_the_spend() {
+        let (mut wallet, keys, note, addr) = note_fixture();
+        receive_note(&mut wallet, &keys, note, addr, BlockHeight(10), unknown_tree_position());
+        spend_note(&mut wallet, &keys, note, unknown_tree_position());
+        receive_note(&mut wallet, &keys, note, addr, BlockHeight(10), 0.into());
+        spend_note(&mut wallet, &keys, note, 1.into());
+
+        let mut tree = OrchardShardTree::new(shardtree::store::memory::MemoryShardStore::empty(), 100);
+        let cmx = orchard::note::ExtractedNoteCommitment::from(note.commitment());
+        tree.append(orchard::tree::MerkleHashOrchard::from_cmx(&cmx), incrementalmerkletree::Retention::Marked).unwrap();
+        tree.checkpoint(BlockHeight(10)).unwrap();
+        let saved = wallet.accounts[0].spent_orchard_notes[0];
+        assert_eq!(saved.recv_h, BlockHeight(10));
+        assert_eq!(saved.spent_h, BlockHeight(11));
+        let witness = tree.witness_at_checkpoint_id(saved.position, &BlockHeight(10));
+        assert!(matches!(witness, Ok(Some(_))), "{:?}", witness.as_ref().err());
+    }
+
+    #[test]
+    fn spend_after_the_compact_receive_keeps_the_position() {
+        let (mut wallet, keys, note, addr) = note_fixture();
+        receive_note(&mut wallet, &keys, note, addr, BlockHeight(10), 0.into());
+        receive_note(&mut wallet, &keys, note, addr, BlockHeight(10), unknown_tree_position());
+        spend_note(&mut wallet, &keys, note, unknown_tree_position());
+        assert_eq!(wallet.accounts[0].spent_orchard_notes.len(), 1);
+        assert_eq!(wallet.accounts[0].spent_orchard_notes[0].position, 0.into());
     }
 }
