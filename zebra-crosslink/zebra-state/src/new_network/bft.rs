@@ -1625,10 +1625,15 @@ impl BftRunner {
                 })
             })),
             tenderlink::ClosureToValidateProposedBlock(Arc::new(move |block| {
-                let parsed = BftBlock::zcash_deserialize(&block.0[..]);
+                // Tenderlink certifies a hash of the raw bytes, but `decide` checks the hash of the
+                // re-serialized block. A payload that parses but isn't canonical (e.g. trailing
+                // bytes) would be certified and then abort every node in `decide`.
+                let parsed = BftBlock::zcash_deserialize(&block.0[..]).ok().filter(|parsed| {
+                    parsed.zcash_serialize_to_vec().is_ok_and(|bytes| bytes == block.0)
+                });
                 Box::pin(async move {
-                    let Ok(block) = parsed else {
-                        tracing::error!("Failed to deserialize Tenderlink payload.");
+                    let Some(block) = parsed else {
+                        tracing::error!("Tenderlink payload is not a canonically encoded BFT block.");
                         return (TMStatus::Fail, TMStatusReason::None);
                     };
                     let (reply, rx) = tokio::sync::oneshot::channel();
