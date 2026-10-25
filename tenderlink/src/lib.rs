@@ -3075,7 +3075,11 @@ impl PacketVotes {
             value_id:    ValueId(SliceRead::read_from(buf)?),
             ..Default::default()
         };
-        for i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
+        let votes_n = packet.no_votes_n as usize + packet.yes_votes_n as usize;
+        if votes_n > packet.votes.len() {
+            return None;
+        }
+        for i in 0..votes_n {
             packet.votes[i].roster_i = u16::read_from(buf)?;
             packet.votes[i].sig.0    = SliceRead::read_from(buf)?;
         }
