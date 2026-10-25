@@ -2815,6 +2815,20 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
         } else if !have_seen {
             orchard_recv_h_insert(&mut account.unspent_orchard_notes, orchard_note);
         }
+
+        // A full-tx replay can spend this note before its compact receive supplies the position,
+        // leaving the spent copy at the unknown position. A rewind would then restore it as
+        // unspent with no position, and every spend that picks it fails. Duplicate records can
+        // leave more than one spent copy, so update every match.
+        if orchard_note.position < unknown_tree_position() {
+            for saved in account.spent_orchard_notes.iter_mut().filter(|saved| saved.nf == orchard_note.nf) {
+                if saved.position == unknown_tree_position() {
+                    saved.position = orchard_note.position;
+                } else if saved.position != orchard_note.position {
+                    println!("ERROR: spent orchard note has 2 different valid positions: {:?} vs {:?}", saved.position, orchard_note.position);
+                }
+            }
+        }
     }
 
     Some(s)
