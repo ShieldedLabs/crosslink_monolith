@@ -1301,6 +1301,11 @@ impl ZcashDeserialize for Transaction {
                 // Convert it to a NetworkUpgrade
                 let network_upgrade =
                     NetworkUpgrade::try_from(limited_reader.read_u32::<LittleEndian>()?)?;
+                if network_upgrade < NetworkUpgrade::Nu6_3 {
+                    return Err(SerializationError::Parse(
+                        "VCrosslink transaction must have a NU6.3 or later consensus branch ID",
+                    ));
+                }
 
                 // Denoted as `lock_time` in the spec.
                 let lock_time = LockTime::zcash_deserialize(&mut limited_reader)?;
@@ -1342,7 +1347,7 @@ impl ZcashDeserialize for Transaction {
                 let staking_action =
                     zcash_primitives::transaction::StakingAction::read(&mut limited_reader)?;
 
-                Ok(Transaction::VCrosslink {
+                let tx = Transaction::VCrosslink {
                     network_upgrade,
                     lock_time,
                     expiry_height,
@@ -1352,7 +1357,13 @@ impl ZcashDeserialize for Transaction {
                     orchard_shielded_data,
                     ironwood_shielded_data,
                     staking_action,
-                })
+                };
+
+                // The same round-trip guard as the v6 arm, so a non-canonical bundle can't reach
+                // the `expect(...)` in `Hash::from`.
+                tx.to_librustzcash(network_upgrade)?;
+
+                Ok(tx)
             }
             (_, _) => Err(SerializationError::Parse("bad tx header")),
         }
