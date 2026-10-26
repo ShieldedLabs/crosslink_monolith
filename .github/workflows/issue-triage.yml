@@ -24,7 +24,6 @@ permissions: {}
 # project-timeframe-done.yml uses.
 env:
   ISSUE: ${{ github.event.issue.number || inputs.issue }}
-  PROJECT_NUMBER: 12
   PROJECT_ID: PVT_kwDOB2JXZM4Bl0RE
 
 concurrency:
@@ -272,22 +271,36 @@ jobs:
           GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
         run: |
           set -euo pipefail
-          fields=$(gh project field-list "$PROJECT_NUMBER" --owner "$GITHUB_REPOSITORY_OWNER" --format json)
-          fid() { jq -r --arg n "$1" '.fields[] | select(.name == $n) | .id' <<<"$fields"; }
-          oid() { jq -r --arg n "$1" --arg o "$2" '.fields[] | select(.name == $n) | .options[]? | select(.name == $o) | .id' <<<"$fields" | head -1; }
-          item=$(gh project item-add "$PROJECT_NUMBER" --owner "$GITHUB_REPOSITORY_OWNER" --url "https://github.com/$GITHUB_REPOSITORY/issues/$ISSUE" --format json --jq .id)
+          # Plain GraphQL, like project-timeframe-done.yml: `gh project` fails with this token ("unknown owner type").
+          info=$(gh api graphql -F number="$ISSUE" -f owner="$GITHUB_REPOSITORY_OWNER" -f name="${GITHUB_REPOSITORY#*/}" \
+            -f query='query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { id projectItems(first: 20) { nodes { id project { id } } } } } }' \
+            --jq '.data.repository.issue')
+          item=$(jq -r '[.projectItems.nodes[] | select(.project.id == env.PROJECT_ID) | .id][0] // empty' <<<"$info")
+          fields=$(gh api graphql -f project="$PROJECT_ID" \
+            -f query='query($project: ID!) { node(id: $project) { ... on ProjectV2 { fields(first: 50) { nodes { ... on ProjectV2FieldCommon { id name } ... on ProjectV2SingleSelectField { options { id name } } } } } } }' \
+            --jq '.data.node.fields.nodes')
+          fid() { jq -r --arg n "$1" '[.[] | select(.name == $n) | .id][0] // empty' <<<"$fields"; }
+          oid() { jq -r --arg n "$1" --arg o "$2" '[.[] | select(.name == $n) | .options[]? | select(.name == $o) | .id][0] // empty' <<<"$fields"; }
           set_option() {
             local o
             o=$(oid "$1" "$2")
             if [ -n "$o" ]; then
-              gh project item-edit --id "$item" --project-id "$PROJECT_ID" --field-id "$(fid "$1")" --single-select-option-id "$o" > /dev/null
+              gh api graphql --silent -f project="$PROJECT_ID" -f item="$item" -f field="$(fid "$1")" -f option="$o" \
+                -f query='mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) { updateProjectV2ItemFieldValue(input: { projectId: $project, itemId: $item, fieldId: $field, value: { singleSelectOptionId: $option } }) { clientMutationId } }'
             fi
           }
-          set_option Status "new uncategorized"
+          # An issue already on the board keeps its Status, so a rerun can't undo a maintainer's move.
+          if [ -z "$item" ]; then
+            item=$(gh api graphql -f project="$PROJECT_ID" -f content="$(jq -r .id <<<"$info")" \
+              -f query='mutation($project: ID!, $content: ID!) { addProjectV2ItemById(input: { projectId: $project, contentId: $content }) { item { id } } }' \
+              --jq '.data.addProjectV2ItemById.item.id')
+            set_option Status "new uncategorized"
+          fi
           if [ -z "$OUT" ]; then exit 0; fi
           set_option Area "$(jq -r .area <<<"$OUT")"
-          urgency="$(jq -r .severity <<<"$OUT"): $(jq -r .reason <<<"$OUT" | tr -s '\r\n' '  ' | head -c 200)"
-          gh project item-edit --id "$item" --project-id "$PROJECT_ID" --field-id "$(fid Urgency)" --text "$urgency" > /dev/null
+          urgency=$(jq -r '.severity + ": " + (.reason | gsub("\\s+"; " ") | .[:200])' <<<"$OUT")
+          gh api graphql --silent -f project="$PROJECT_ID" -f item="$item" -f field="$(fid Urgency)" -f text="$urgency" \
+            -f query='mutation($project: ID!, $item: ID!, $field: ID!, $text: String!) { updateProjectV2ItemFieldValue(input: { projectId: $project, itemId: $item, fieldId: $field, value: { text: $text } }) { clientMutationId } }'
 
       - name: Label and comment
         if: ${{ !cancelled() }}
