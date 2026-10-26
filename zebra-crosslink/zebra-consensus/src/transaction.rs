@@ -1474,7 +1474,8 @@ fn verify_v4_transaction_network_upgrade(
         | NetworkUpgrade::Nu6_1
         | NetworkUpgrade::Nu6_2
         | NetworkUpgrade::Nu6_3
-        | NetworkUpgrade::FeaturenetUpgrade1 => Ok(()),
+        | NetworkUpgrade::FeaturenetUpgrade1
+        | NetworkUpgrade::FeaturenetUpgrade2 => Ok(()),
 
         #[cfg(zcash_unstable = "zfuture")]
         NetworkUpgrade::ZFuture => Ok(()),
@@ -1514,6 +1515,7 @@ fn verify_v5_transaction_network_upgrade(
         | NetworkUpgrade::Nu6_2
         | NetworkUpgrade::Nu6_3
         | NetworkUpgrade::FeaturenetUpgrade1
+        | NetworkUpgrade::FeaturenetUpgrade2
         | NetworkUpgrade::Nu7 => Ok(()),
 
         #[cfg(zcash_unstable = "zfuture")]
@@ -1541,7 +1543,10 @@ fn verify_v6_transaction_network_upgrade(
     network_upgrade: NetworkUpgrade,
 ) -> Result<(), TransactionError> {
     match network_upgrade {
-        NetworkUpgrade::Nu6_3 | NetworkUpgrade::FeaturenetUpgrade1 | NetworkUpgrade::Nu7 => Ok(()),
+        NetworkUpgrade::Nu6_3
+        | NetworkUpgrade::FeaturenetUpgrade1
+        | NetworkUpgrade::FeaturenetUpgrade2
+        | NetworkUpgrade::Nu7 => Ok(()),
 
         #[cfg(zcash_unstable = "zfuture")]
         NetworkUpgrade::ZFuture => Ok(()),

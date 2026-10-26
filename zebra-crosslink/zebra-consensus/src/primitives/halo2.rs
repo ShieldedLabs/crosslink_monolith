@@ -326,7 +326,7 @@ pub fn orchard_v5_verifier_for(network_upgrade: NetworkUpgrade) -> &'static Veri
         // restriction applies "regardless of transaction version ... so that it cannot be bypassed
         // by using a version 5 transaction". Verifying these under the NU6.2 fixed key would both
         // reject honest proofs (different key) and fail to enforce the restriction.
-        Nu6_3 | FeaturenetUpgrade1 | Nu7 => &VERIFIER_NU6_3_ONWARD,
+        Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | Nu7 => &VERIFIER_NU6_3_ONWARD,
 
         // `ZFuture` only exists under the `zcash_unstable = "zfuture"` cfg. It is a post-NU6.3
         // upgrade, so it inherits the NU6.3 circuit and is bound to the NU6.3-onward key here on
@@ -355,7 +355,7 @@ pub fn orchard_verifying_key_for(network_upgrade: NetworkUpgrade) -> &'static It
         Genesis | BeforeOverwinter | Overwinter | Sapling | Blossom | Heartwood | Canopy | Nu5
         | Nu6 | Nu6_1 => &VERIFYING_KEY_PRE_NU6_2,
         Nu6_2 => &VERIFYING_KEY_NU6_2,
-        Nu6_3 | FeaturenetUpgrade1 | Nu7 => &VERIFYING_KEY_NU6_3_ONWARD,
+        Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | Nu7 => &VERIFYING_KEY_NU6_3_ONWARD,
         #[cfg(zcash_unstable = "zfuture")]
         ZFuture => &VERIFYING_KEY_NU6_3_ONWARD,
     }

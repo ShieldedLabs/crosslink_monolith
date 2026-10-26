@@ -278,6 +278,8 @@ const NETWORK_UPGRADES_IN_ORDER: &[NetworkUpgrade] = &[
     #[cfg(any(test, feature = "zebra-test"))]
     FeaturenetUpgrade1,
     #[cfg(any(test, feature = "zebra-test"))]
+    FeaturenetUpgrade2,
+    #[cfg(any(test, feature = "zebra-test"))]
     Nu7,
 ];
 
@@ -294,7 +296,44 @@ fn full_activation_list_contains_all_upgrades() {
     let network = Network::Mainnet;
     let full_list = network.full_activation_list();
 
-    // FeaturenetUpgrade1 and NU7 are unscheduled on Mainnet (no activation height committed), so
-    // they are absent from the full activation list even though they are always present in the iter.
-    assert_eq!(full_list.len(), NetworkUpgrade::iter().count() - 2);
+    // The featurenet upgrades and NU7 are unscheduled on Mainnet (no activation height committed),
+    // so they are absent from the full activation list even though they are always present in the
+    // iter.
+    assert_eq!(full_list.len(), NetworkUpgrade::iter().count() - 3);
 }
+
+/// FeaturenetUpgrade2's branch ID is the bytes `FTU2`, and Zebra and zcash_protocol both map it
+/// back to the upgrade, so a transaction signed under it is read as FeaturenetUpgrade2's.
+#[test]
+fn featurenet_upgrade_2_branch_id_round_trips() {
+    let _init_guard = zebra_test::init();
+
+    let branch_id = FeaturenetUpgrade2
+        .branch_id()
+        .expect("FeaturenetUpgrade2 has a consensus branch ID");
+    assert_eq!(u32::from(branch_id).to_be_bytes(), *b"FTU2");
+
+    let upgrade = NetworkUpgrade::try_from(u32::from(branch_id))
+        .expect("Zebra knows the FeaturenetUpgrade2 branch ID");
+    assert_eq!(upgrade, FeaturenetUpgrade2);
+
+    let lrz_branch_id = zcash_protocol::consensus::BranchId::try_from(branch_id)
+        .expect("zcash_protocol knows the FeaturenetUpgrade2 branch ID");
+    assert_eq!(
+        lrz_branch_id,
+        zcash_protocol::consensus::BranchId::FeaturenetUpgrade2
+    );
+    assert_eq!(u32::from(lrz_branch_id), u32::from(branch_id));
+    let lrz_upgrade = lrz_branch_id
+        .network_upgrade()
+        .expect("a featurenet branch ID has a network upgrade");
+    assert_eq!(NetworkUpgrade::from(lrz_upgrade), FeaturenetUpgrade2);
+    assert_eq!(lrz_upgrade.branch_id(), lrz_branch_id);
+
+    let hex_branch_id: String = branch_id.encode_hex();
+    assert_eq!(
+        ConsensusBranchId::from_hex(hex_branch_id).expect("hex branch ID parses"),
+        branch_id
+    );
+}
+
