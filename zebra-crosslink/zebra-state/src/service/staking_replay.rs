@@ -3,7 +3,7 @@
 //! Anything that reconstructs bonds from blocks instead of reading them from a `Chain`
 //! uses this: the aggregated-stakes repair (`stake_fixup`) and the wallet issuance scan in
 //! zebra-crosslink. The live path applies the same three steps in the same order: at a
-//! rule's activation height the hardfork slash burns come first, then
+//! rule's activation height the slashfork slash burns come first, then
 //! `Chain::update_chain_tip_with_block_except_trees` applies each transaction's staking
 //! action and then the block reward if the block pays one. A replay that pays the reward per
 //! transaction or skips the burns drifts from the stored stakes from the first
@@ -23,7 +23,7 @@ use zcash_primitives::transaction::StakingAction;
 use zebra_chain::{
     amount::{Amount, NonNegative, MAX_MONEY},
     block::{Block, Height},
-    parameters::{HardForkSchedule, Network},
+    parameters::{SlashForkSchedule, Network},
     transaction,
     value_balance::ValueBalance,
 };
@@ -42,7 +42,7 @@ use crate::{
 };
 
 /// Bonds and finalizer reward banks advanced one block at a time from genesis, with the
-/// hardfork slash rules they are subject to.
+/// slashfork slash rules they are subject to.
 // No `Default`: a defaulted `slash_analysis_window` of 0 would silently empty every slash window.
 #[derive(Clone, Debug)]
 pub struct StakingReplay {
@@ -50,26 +50,26 @@ pub struct StakingReplay {
     pub delegation_bonds: HashMap<BondKey, (DelegationBond, BondStatusInChain)>,
     /// Each finalizer's commission bank, a virtual bond on that finalizer.
     pub finalizer_rewards: HashMap<[u8; 32], u64>,
-    /// `(activation, terminated finalizers)` for every hardfork rule that slashes.
+    /// `(activation, terminated finalizers)` for every slashfork rule that slashes.
     slash_rules: Vec<(Height, BTreeSet<[u8; 32]>)>,
     /// The network's slash analysis window, in blocks.
     slash_analysis_window: u32,
 }
 
-/// A hardfork slash applied by the replay.
+/// A slashfork slash applied by the replay.
 #[derive(Clone, Debug, Default)]
 pub struct SlashBurns {
-    /// The finalizers the hardfork terminated.
+    /// The finalizers the slashfork terminated.
     pub finalizers: BTreeSet<[u8; 32]>,
     /// The bonds burned for delegating to one of them inside the slash window.
     pub burned: BTreeSet<BondKey>,
 }
 
 impl StakingReplay {
-    /// An empty replay subject to the slash rules of `hardfork_schedule`, which must be the
+    /// An empty replay subject to the slash rules of `slashfork_schedule`, which must be the
     /// node's canonical schedule, and the network's `slash_analysis_window`.
-    pub fn new(hardfork_schedule: &HardForkSchedule, slash_analysis_window: u32) -> Self {
-        let slash_rules = hardfork_schedule
+    pub fn new(slashfork_schedule: &SlashForkSchedule, slash_analysis_window: u32) -> Self {
+        let slash_rules = slashfork_schedule
             .rules()
             .iter()
             .filter(|rule| !rule.terminated_finalizers.is_empty())
@@ -81,7 +81,7 @@ impl StakingReplay {
         Self { delegation_bonds: HashMap::new(), finalizer_rewards: HashMap::new(), slash_rules, slash_analysis_window }
     }
 
-    /// Applies one block: any hardfork slash burns activating at `height`, then its staking
+    /// Applies one block: any slashfork slash burns activating at `height`, then its staking
     /// actions in transaction order, then the block reward if `pays_reward`. `block_at` must
     /// return the block at any height in [`slash_window`]`(height)`.
     ///
@@ -154,12 +154,12 @@ impl StakingReplay {
         update_bonds_with_pos_issuance(network, height, reward, &mut self.delegation_bonds, &mut self.finalizer_rewards);
     }
 
-    /// Whether a hardfork slash activates at `height`, so the caller must read its window.
+    /// Whether a slashfork slash activates at `height`, so the caller must read its window.
     pub fn slash_activates_at(&self, height: Height) -> bool {
         self.slash_rules.iter().any(|(activation, _)| *activation == height)
     }
 
-    /// Burns the bonds of every hardfork activating exactly at `height`. `window_blocks`
+    /// Burns the bonds of every slashfork activating exactly at `height`. `window_blocks`
     /// must yield the blocks at [`slash_window`]`(height)`, in any order. Call before the
     /// block's staking actions, so the bonds are those at the end of the previous block.
     pub fn apply_slash_burns(

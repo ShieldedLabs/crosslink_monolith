@@ -1,12 +1,12 @@
-//! User-led hardfork rules.
+//! User-led slashfork rules.
 //!
-//! Crosslink supports user-led hardforks: rules, supplied in the node config,
+//! Crosslink supports user-led slashforks: rules, supplied in the node config,
 //! that activate at a given PoW block height (and BFT certificate height) and
-//! terminate a set of finalizers. Over time, user-led hardforks become assumed
+//! terminate a set of finalizers. Over time, user-led slashforks become assumed
 //! by the software, so the config rules are merged with a set of rules shipped
-//! in the executable (see [`shipped_hardforks`]).
+//! in the executable (see [`shipped_slashforks`]).
 //!
-//! The canonical, merged-and-validated set is represented by [`HardForkSchedule`],
+//! The canonical, merged-and-validated set is represented by [`SlashForkSchedule`],
 //! which is built once at config load and then shared (read-only) with everything
 //! that needs it — zebra-state, zebra-consensus and zebra-crosslink.
 
@@ -17,13 +17,13 @@
 // validation (staking-aligned heights, unique and non-empty finalizers) lives on
 // the type in `bft.rs` via serde `deserialize_with`. The scheduling and merge
 // logic below stays here, where node config lives.
-pub use zcash_primitives::bft::HardForkConfig;
+pub use zcash_primitives::bft::SlashForkConfig;
 
-/// Hardfork rules shipped in the executable.
+/// Slashfork rules shipped in the executable.
 ///
-/// User-led hardforks (from the config file) are merged with these, since over
-/// time user-led hardforks become assumed by the software.
-pub fn shipped_hardforks() -> Vec<HardForkConfig> {
+/// User-led slashforks (from the config file) are merged with these, since over
+/// time user-led slashforks become assumed by the software.
+pub fn shipped_slashforks() -> Vec<SlashForkConfig> {
     // flip hex from config toml order to PubKeyID correct order
     let finalizer_from_hex = |hex_str: &str| {
         let mut bytes = [0u8; 32];
@@ -32,7 +32,7 @@ pub fn shipped_hardforks() -> Vec<HardForkConfig> {
         zcash_primitives::bft::PubKeyID(bytes)
     };
 
-    vec![HardForkConfig {
+    vec![SlashForkConfig {
         // Slash activations must start a staking day; this is 22 prototype staking periods.
         pow_activation_height: 228_096,
         bft_certificate_height: 2158,
@@ -40,25 +40,25 @@ pub fn shipped_hardforks() -> Vec<HardForkConfig> {
     }]
 }
 
-/// The canonical, ordered set of hardfork rules in effect for a node.
+/// The canonical, ordered set of slashfork rules in effect for a node.
 ///
-/// Built once via [`HardForkSchedule::new`] from the user-configured rules merged
-/// with [`shipped_hardforks`]. The contained rules are sorted by
+/// Built once via [`SlashForkSchedule::new`] from the user-configured rules merged
+/// with [`shipped_slashforks`]. The contained rules are sorted by
 /// `pow_activation_height` and each rule's `terminated_finalizers` list is sorted,
 /// so the schedule is canonical and ready to be committed to by hash. Because the
 /// rules are height-sorted, lookups binary-search.
 ///
-/// Share a single `Arc<HardForkSchedule>` with everything that needs it rather
+/// Share a single `Arc<SlashForkSchedule>` with everything that needs it rather
 /// than copying the `Vec` around.
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
-pub struct HardForkSchedule {
-    /// Hardfork rules, sorted ascending by `pow_activation_height`.
-    rules: Vec<HardForkConfig>,
+pub struct SlashForkSchedule {
+    /// Slashfork rules, sorted ascending by `pow_activation_height`.
+    rules: Vec<SlashForkConfig>,
 }
 
-/// A merged hardfork rule, tagged with the source list(s) it came from.
-struct TaggedHardFork {
-    rule: HardForkConfig,
+/// A merged slashfork rule, tagged with the source list(s) it came from.
+struct TaggedSlashFork {
+    rule: SlashForkConfig,
     from_user: bool,
     from_shipped: bool,
 }
@@ -68,7 +68,7 @@ struct TaggedHardFork {
 /// User and shipped rules may only overlap as a shared, exactly-matching block;
 /// if one source's rules were interleaved with the other's, that source's rules
 /// would not form a contiguous run, which we reject.
-fn assert_contiguous(tagged: &[TaggedHardFork], pred: impl Fn(&TaggedHardFork) -> bool, name: &str) {
+fn assert_contiguous(tagged: &[TaggedSlashFork], pred: impl Fn(&TaggedSlashFork) -> bool, name: &str) {
     let indices: Vec<usize> = tagged
         .iter()
         .enumerate()
@@ -78,16 +78,16 @@ fn assert_contiguous(tagged: &[TaggedHardFork], pred: impl Fn(&TaggedHardFork) -
     if let (Some(&first), Some(&last)) = (indices.first(), indices.last()) {
         assert!(
             last - first + 1 == indices.len(),
-            "{name} hardfork rules interleave with the other source's rules; \
-             user-led and shipped hardforks may only overlap as an exactly-matching block",
+            "{name} slashfork rules interleave with the other source's rules; \
+             user-led and shipped slashforks may only overlap as an exactly-matching block",
         );
     }
 }
 
-impl HardForkSchedule {
-    /// Build the canonical schedule by merging `user_hardforks` (typically from
-    /// the node config) with the hardfork rules shipped in the executable
-    /// ([`shipped_hardforks`]), then canonicalizing ordering: each
+impl SlashForkSchedule {
+    /// Build the canonical schedule by merging `user_slashforks` (typically from
+    /// the node config) with the slashfork rules shipped in the executable
+    /// ([`shipped_slashforks`]), then canonicalizing ordering: each
     /// `terminated_finalizers` list is sorted, and the combined list is sorted by
     /// `pow_activation_height`.
     ///
@@ -102,34 +102,34 @@ impl HardForkSchedule {
     /// - The two sources interleaving by height. They may only overlap as a
     ///   shared, exactly-matching block (the shipped rules are the assumed past,
     ///   which the user rules may restate exactly and then extend).
-    pub fn new(user_hardforks: Vec<HardForkConfig>) -> Self {
-        Self::merge(user_hardforks, shipped_hardforks())
+    pub fn new(user_slashforks: Vec<SlashForkConfig>) -> Self {
+        Self::merge(user_slashforks, shipped_slashforks())
     }
 
-    /// Like [`HardForkSchedule::new`], but ignores the rules shipped in the
-    /// executable: the schedule is built from `user_hardforks` alone. Lets a
+    /// Like [`SlashForkSchedule::new`], but ignores the rules shipped in the
+    /// executable: the schedule is built from `user_slashforks` alone. Lets a
     /// testnet operator specify the entire schedule manually rather than
-    /// inheriting the built-in assumed past (see the `disable_shipped_hardforks`
+    /// inheriting the built-in assumed past (see the `disable_shipped_slashforks`
     /// config flag). The same ordering/duplicate validation still applies.
-    pub fn new_without_shipped(user_hardforks: Vec<HardForkConfig>) -> Self {
-        Self::merge(user_hardforks, Vec::new())
+    pub fn new_without_shipped(user_slashforks: Vec<SlashForkConfig>) -> Self {
+        Self::merge(user_slashforks, Vec::new())
     }
 
-    fn merge(user_hardforks: Vec<HardForkConfig>, shipped: Vec<HardForkConfig>) -> Self {
-        let mut user_hardforks = user_hardforks;
+    fn merge(user_slashforks: Vec<SlashForkConfig>, shipped: Vec<SlashForkConfig>) -> Self {
+        let mut user_slashforks = user_slashforks;
         let mut shipped = shipped;
 
         // Canonicalize each rule's finalizer list so that equality (and thus
         // exact-duplicate detection) is independent of the order finalizers were
         // listed in.
-        for hardfork in user_hardforks.iter_mut().chain(shipped.iter_mut()) {
-            hardfork.terminated_finalizers.sort();
+        for slashfork in user_slashforks.iter_mut().chain(shipped.iter_mut()) {
+            slashfork.terminated_finalizers.sort();
         }
 
         // Tag every rule with the source(s) it came from, merging exact
         // duplicates (within a list or across the two lists) as we go.
-        let mut tagged: Vec<TaggedHardFork> = Vec::new();
-        for (rule, from_user) in user_hardforks
+        let mut tagged: Vec<TaggedSlashFork> = Vec::new();
+        for (rule, from_user) in user_slashforks
             .iter()
             .map(|rule| (rule, true))
             .chain(shipped.iter().map(|rule| (rule, false)))
@@ -139,7 +139,7 @@ impl HardForkSchedule {
                     existing.from_user |= from_user;
                     existing.from_shipped |= !from_user;
                 }
-                None => tagged.push(TaggedHardFork {
+                None => tagged.push(TaggedSlashFork {
                     rule: rule.clone(),
                     from_user,
                     from_shipped: !from_user,
@@ -158,14 +158,14 @@ impl HardForkSchedule {
         for pair in tagged.windows(2) {
             assert!(
                 pair[0].rule.pow_activation_height != pair[1].rule.pow_activation_height,
-                "conflicting hardfork rules at pow_activation_height {}: {:?} vs {:?}",
+                "conflicting slashfork rules at pow_activation_height {}: {:?} vs {:?}",
                 pair[0].rule.pow_activation_height,
                 pair[0].rule,
                 pair[1].rule,
             );
             assert!(
                 pair[0].rule.bft_certificate_height <= pair[1].rule.bft_certificate_height,
-                "incoherently ordered hardfork rules: the rule at pow_activation_height {} \
+                "incoherently ordered slashfork rules: the rule at pow_activation_height {} \
                  has bft_certificate_height {}, but the next rule (pow_activation_height {}) \
                  has bft_certificate_height {}; bft_certificate_height must be non-decreasing \
                  with pow_activation_height",
@@ -185,8 +185,8 @@ impl HardForkSchedule {
         }
     }
 
-    /// wrap a list that is already canonical; no merging with [`shipped_hardforks`] and no validation
-    pub fn from_canonical(rules: Vec<HardForkConfig>) -> Self {
+    /// wrap a list that is already canonical; no merging with [`shipped_slashforks`] and no validation
+    pub fn from_canonical(rules: Vec<SlashForkConfig>) -> Self {
         debug_assert!(rules.windows(2).all(|pair| {
             pair[0].pow_activation_height < pair[1].pow_activation_height
                 && pair[0].bft_certificate_height <= pair[1].bft_certificate_height
@@ -194,15 +194,15 @@ impl HardForkSchedule {
         Self { rules }
     }
 
-    /// The hardfork rules, sorted ascending by `pow_activation_height`.
-    pub fn rules(&self) -> &[HardForkConfig] {
+    /// The slashfork rules, sorted ascending by `pow_activation_height`.
+    pub fn rules(&self) -> &[SlashForkConfig] {
         &self.rules
     }
 
-    /// The most recent hardfork rule active at `pow_height`, i.e. the rule with
+    /// The most recent slashfork rule active at `pow_height`, i.e. the rule with
     /// the greatest `pow_activation_height` that is `<= pow_height`, or `None` if
-    /// no hardfork has activated by that height.
-    pub fn rule_active_at(&self, pow_height: u64) -> Option<&HardForkConfig> {
+    /// no slashfork has activated by that height.
+    pub fn rule_active_at(&self, pow_height: u64) -> Option<&SlashForkConfig> {
         // partition_point gives the count of rules with activation <= pow_height.
         let idx = self
             .rules
@@ -216,8 +216,8 @@ mod tests {
     use super::*;
     use zcash_primitives::bft::PubKeyID;
 
-    fn rule(pow: u64, bft: u64, finalizer: u8) -> HardForkConfig {
-        HardForkConfig {
+    fn rule(pow: u64, bft: u64, finalizer: u8) -> SlashForkConfig {
+        SlashForkConfig {
             pow_activation_height: pow,
             bft_certificate_height: bft,
             terminated_finalizers: vec![PubKeyID([finalizer; 32])],
@@ -225,16 +225,16 @@ mod tests {
     }
 
     #[test]
-    fn shipped_hardforks_build_a_valid_schedule() {
+    fn shipped_slashforks_build_a_valid_schedule() {
         // `merge` validates ordering/duplicates, so this panics if the shipped
         // rules are ever incoherent.
-        let schedule = HardForkSchedule::new(Vec::new());
-        assert_eq!(schedule.rules(), shipped_hardforks());
+        let schedule = SlashForkSchedule::new(Vec::new());
+        assert_eq!(schedule.rules(), shipped_slashforks());
     }
 
     #[test]
     fn bft_heights_strictly_increasing_is_accepted() {
-        let schedule = HardForkSchedule::new_without_shipped(vec![rule(300, 20, 2), rule(150, 10, 1)]);
+        let schedule = SlashForkSchedule::new_without_shipped(vec![rule(300, 20, 2), rule(150, 10, 1)]);
         // Sorted by pow_activation_height; bft_certificate_height increases with it.
         let bfts: Vec<u64> = schedule.rules().iter().map(|r| r.bft_certificate_height).collect();
         assert_eq!(bfts, vec![10, 20]);
@@ -244,7 +244,7 @@ mod tests {
     fn duplicate_bft_height_is_accepted() {
         // Two rules certified at the same BFT height, distinct pow activations:
         // both survive, in pow order.
-        let schedule = HardForkSchedule::new_without_shipped(vec![rule(300, 10, 2), rule(150, 10, 1)]);
+        let schedule = SlashForkSchedule::new_without_shipped(vec![rule(300, 10, 2), rule(150, 10, 1)]);
         let heights: Vec<(u64, u64)> = schedule
             .rules()
             .iter()
@@ -257,6 +257,6 @@ mod tests {
     #[should_panic(expected = "bft_certificate_height must be non-decreasing")]
     fn inverted_bft_height_is_rejected() {
         // pow_activation_height increases but bft_certificate_height decreases.
-        HardForkSchedule::new_without_shipped(vec![rule(150, 20, 1), rule(300, 10, 2)]);
+        SlashForkSchedule::new_without_shipped(vec![rule(150, 20, 1), rule(300, 10, 2)]);
     }
 }

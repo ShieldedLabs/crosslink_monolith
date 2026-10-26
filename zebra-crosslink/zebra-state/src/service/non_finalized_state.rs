@@ -67,7 +67,7 @@ pub struct NonFinalizedState {
     pub network: Network,
 
     /// drives slash burns; set at init
-    pub(crate) hardfork_schedule: std::sync::Arc<zebra_chain::parameters::hardfork::HardForkSchedule>,
+    pub(crate) slashfork_schedule: std::sync::Arc<zebra_chain::parameters::slashfork::SlashForkSchedule>,
 
     // Diagnostics
     //
@@ -109,7 +109,7 @@ impl Clone for NonFinalizedState {
         Self {
             chain_set: self.chain_set.clone(),
             network: self.network.clone(),
-            hardfork_schedule: self.hardfork_schedule.clone(),
+            slashfork_schedule: self.slashfork_schedule.clone(),
             should_count_metrics: self.should_count_metrics,
             // Don't track progress in clones.
             #[cfg(feature = "progress-bar")]
@@ -122,17 +122,17 @@ impl Clone for NonFinalizedState {
 
 impl NonFinalizedState {
     /// Returns a new non-finalized state for `network`.
-    // @Todo: move hardfork_schedule into Network?
-    pub fn new(network: &Network, hardfork_schedule: std::sync::Arc<zebra_chain::parameters::hardfork::HardForkSchedule>) -> NonFinalizedState {
+    // @Todo: move slashfork_schedule into Network?
+    pub fn new(network: &Network, slashfork_schedule: std::sync::Arc<zebra_chain::parameters::slashfork::SlashForkSchedule>) -> NonFinalizedState {
         // A slash's guarantee that no burned bond was already withdrawn needs its activation at
         // the start of one of this network's staking days (see `slash_burn_set`). Config parsing
         // only checks that against the prototype calendar, so a network with its own calendar is
         // checked here, before any slash can meet a withdrawn bond.
         let period = u64::from(network.crosslink_parameters().staking.period);
-        for rule in hardfork_schedule.rules() {
+        for rule in slashfork_schedule.rules() {
             assert!(
                 rule.terminated_finalizers.is_empty() || rule.pow_activation_height % period == 0,
-                "the slashing hardfork at height {} does not start a staking day on this network (staking period {period})",
+                "the slashing slashfork at height {} does not start a staking day on this network (staking period {period})",
                 rule.pow_activation_height,
             );
         }
@@ -140,7 +140,7 @@ impl NonFinalizedState {
         NonFinalizedState {
             chain_set: Default::default(),
             network: network.clone(),
-            hardfork_schedule,
+            slashfork_schedule,
             should_count_metrics: true,
             #[cfg(feature = "progress-bar")]
             chain_count_bar: None,
@@ -513,18 +513,18 @@ impl NonFinalizedState {
             finalized_state,
         )?;
 
-        // At a hardfork's PoW activation height A, burn every bond delegated to a slashed
+        // At a slashfork's PoW activation height A, burn every bond delegated to a slashed
         // finalizer at the end of any block in [A - W, A). The burn is part of the state at
         // the end of A - 1, so it comes before A's own staking actions are validated: none of
         // them may withdraw, unbond or retarget a burned bond. This lives here, not in
         // commit_block, so that a block starting a new chain (parent == finalized tip, via
         // commit_new_chain) burns too.
-        let slash_burns = match self.hardfork_schedule.rule_active_at(height.0 as u64) {
+        let slash_burns = match self.slashfork_schedule.rule_active_at(height.0 as u64) {
             Some(rule) if rule.pow_activation_height == height.0 as u64 => {
                 let finalizers: Vec<[u8; 32]> = rule.terminated_finalizers.iter().map(|f| f.0).collect();
                 let burns = Arc::make_mut(&mut new_chain).apply_slash_burns(finalized_state, &finalizers, height);
                 tracing::info!(
-                    "hardfork slash burns at height {}: burned {} bond(s) for {} terminated finalizer(s): {:?}",
+                    "slashfork slash burns at height {}: burned {} bond(s) for {} terminated finalizer(s): {:?}",
                     height.0,
                     burns.len(),
                     finalizers.len(),

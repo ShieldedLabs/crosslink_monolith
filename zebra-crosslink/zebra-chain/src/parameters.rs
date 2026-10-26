@@ -15,7 +15,7 @@
 pub mod checkpoint;
 pub mod constants;
 mod genesis;
-pub mod hardfork;
+pub mod slashfork;
 mod network;
 mod network_upgrade;
 mod transaction;
@@ -24,7 +24,7 @@ mod transaction;
 pub mod arbitrary;
 
 pub use genesis::*;
-pub use hardfork::{shipped_hardforks, HardForkConfig, HardForkSchedule};
+pub use slashfork::{shipped_slashforks, SlashForkConfig, SlashForkSchedule};
 pub use network::{is_crosslink_testnet, magic::Magic, subsidy, testnet, Network, NetworkKind};
 pub use network_upgrade::*;
 pub use transaction::*;

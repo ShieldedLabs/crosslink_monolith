@@ -6,7 +6,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use abscissa_core::{Application, Command, Runnable};
 use clap::Parser;
-use zebra_chain::parameters::HardForkSchedule;
+use zebra_chain::parameters::SlashForkSchedule;
 
 use crate::prelude::APPLICATION;
 
@@ -39,8 +39,8 @@ impl Runnable for FixupDbStakeCmd {
 
         // The state config's schedule defaults to empty; every command that needs
         // it builds it from the canonical merged rules, as `start` does.
-        state_config.hardfork_schedule = Arc::new(HardForkSchedule::from_canonical(
-            config.crosslink.hardforks.clone(),
+        state_config.slashfork_schedule = Arc::new(SlashForkSchedule::from_canonical(
+            config.crosslink.slashforks.clone(),
         ));
 
         if let Err(error) = zebra_state::fixup_aggregated_stakes(

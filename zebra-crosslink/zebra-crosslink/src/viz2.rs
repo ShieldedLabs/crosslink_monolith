@@ -124,7 +124,7 @@ fn bft_inspection(b: &wallet::bft::BftBlock) -> BlockInspection {
         previous_hash: Hash32::from_bytes(b.previous_block_hash().0),
         finalization_candidate_height: 0,
         do_not_include_until_bc_height: b.do_not_include_until_bc_height,
-        hardforks: b.hardforks.iter().map(|hf| zebra_gui::HardforkInspection {
+        slashforks: b.slashforks.iter().map(|hf| zebra_gui::SlashForkInspection {
             pow_activation_height: hf.pow_activation_height,
             bft_certificate_height: hf.bft_certificate_height,
             terminated_finalizers: hf.terminated_finalizers.iter().map(|id| Hash32::from_bytes(id.0)).collect(),
@@ -282,9 +282,9 @@ impl VizScene {
             }
         }
 
-        let hardfork_activation_heights: HashSet<u64> = bft
+        let slashfork_activation_heights: HashSet<u64> = bft
             .iter()
-            .flat_map(|b| b.hardforks.iter().map(|hf| hf.pow_activation_height))
+            .flat_map(|b| b.slashforks.iter().map(|hf| hf.pow_activation_height))
             .collect();
 
         let mut bc_blocks: Vec<zebra_gui::BcBlock> = Vec::new();
@@ -309,13 +309,13 @@ impl VizScene {
                 work: work_from_difficulty(b.header.difficulty_threshold),
                 utc: b.header.time.timestamp(),
                 serialized_size: b.zcash_serialized_size(),
-                is_hardfork_activation: hardfork_activation_heights.contains(&this_height),
+                is_slashfork_activation: slashfork_activation_heights.contains(&this_height),
             });
         }
 
-        let hardfork_bft_heights: HashSet<u64> = bft
+        let slashfork_bft_heights: HashSet<u64> = bft
             .iter()
-            .filter(|b| !b.hardforks.is_empty())
+            .filter(|b| !b.slashforks.is_empty())
             .map(|b| b.height as u64)
             .collect();
         let mut bft_blocks: Vec<zebra_gui::BftBlock> = Vec::new();
@@ -347,7 +347,7 @@ impl VizScene {
                         ),
                     })
                     .collect(),
-                next_block_is_hardfork: hardfork_bft_heights.contains(&(b.height as u64 + 1)),
+                next_block_is_slashfork: slashfork_bft_heights.contains(&(b.height as u64 + 1)),
             });
         }
 
@@ -836,13 +836,13 @@ pub async fn service_viz_requests(
                     response.bft_recency = zebra_state::new_network::bft::bft_recency_status(); // TODO: do we want a better way of communicating singleton data
                     {
                         // Terminated finalizers, derived the same way tenderlink filters its roster:
-                        // a pure function of the hardfork schedule at the current working height (the
+                        // a pure function of the slashfork schedule at the current working height (the
                         // next block to decide) and the current finalized BC height. Identical source
                         // means the viz display and the actual consensus roster always agree.
                         let working_bft_height = internal.blocks.len() as u64;
                         let finalized_bc_height = internal.bft_final_snapshot.map(|(h, _)| h.0 as u64).unwrap_or(0);
                         response.blacklisted_finalizers = zebra_state::new_network::bft::terminated_finalizers_at(
-                            &tfl_handle.config.hardforks, working_bft_height, finalized_bc_height,
+                            &tfl_handle.config.slashforks, working_bft_height, finalized_bc_height,
                         )
                         .iter()
                         .map(|pk| Hash32::from_bytes(pk.0))
@@ -910,9 +910,9 @@ pub async fn service_viz_requests(
                                 .unwrap_or(0xdeadbeef),
                             utc: bc.header.time.timestamp(),
                             serialized_size: bc.zcash_serialized_size(),
-                            // Flag this block when it sits at a hardfork's PoW activation height.
+                            // Flag this block when it sits at a slashfork's PoW activation height.
                             // Many forks may share that height; each is flagged independently.
-                            is_hardfork_activation: tfl_handle.config.hardforks.iter()
+                            is_slashfork_activation: tfl_handle.config.slashforks.iter()
                                 .any(|hf| hf.pow_activation_height == height.0 as u64),
                         });
                     };
@@ -1025,10 +1025,10 @@ pub async fn service_viz_requests(
                                 utc: x.time as i64,
                                 work: work_from_difficulty(zebra_chain::work::difficulty::CompactDifficulty(x.bits)),
                             }).collect(),
-                            // Foreknowledge from the hardfork schedule (known at startup, not from
-                            // the next block): flag this block when a hardfork activates at the next
-                            // BFT height, so the GUI can warn before the hardfork block exists.
-                            next_block_is_hardfork: tfl_handle.config.hardforks.iter()
+                            // Foreknowledge from the slashfork schedule (known at startup, not from
+                            // the next block): flag this block when a slashfork activates at the next
+                            // BFT height, so the GUI can warn before the slashfork block exists.
+                            next_block_is_slashfork: tfl_handle.config.slashforks.iter()
                                 .any(|hf| hf.bft_certificate_height == i as u64 + 1),
                         });
 

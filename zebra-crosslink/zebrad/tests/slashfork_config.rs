@@ -3,17 +3,17 @@ use std::path::Path;
 use zebrad::config::ZebradConfig;
 
 fn fixtures_dir() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/common/hardfork_configs")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/common/slashfork_configs")
 }
 
 #[test]
-fn hardfork_valid_config_loads() {
+fn slashfork_valid_config_loads() {
     ZebradConfig::load(Some(fixtures_dir().join("valid.toml")))
-        .expect("valid hardfork config should load");
+        .expect("valid slashfork config should load");
 }
 
 #[test]
-fn hardfork_invalid_configs_rejected() {
+fn slashfork_invalid_configs_rejected() {
     let cases = [
         ("misaligned-height.toml", "must be a multiple of the staking period"),
         ("zero-height.toml", "must be greater than zero"),

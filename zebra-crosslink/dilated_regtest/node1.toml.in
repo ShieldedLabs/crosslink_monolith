@@ -10,7 +10,7 @@ checkpoint_sync = true
 public_address = "127.0.0.1:12302"
 explicit_bft_key_seed = "127.0.0.1:12302"
 bft_peers = ["127.0.0.1:12301", "127.0.0.1:12302"]
-disable_shipped_hardforks = true
+disable_shipped_slashforks = true
 
 [mempool]
 eviction_memory_time = "1h"

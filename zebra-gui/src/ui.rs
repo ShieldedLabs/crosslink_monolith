@@ -3873,7 +3873,7 @@ pub fn ui_right_pane(ui: &mut Context,
                         };
 
                         let (text_colour, icon) = if is_terminated {
-                            // Terminated by a hardfork: show a cancel (X) icon instead of wifi.
+                            // Terminated by a slashfork: show a cancel (X) icon instead of wifi.
                             (WHITE.mul(0.5), ICON_CANCEL)
                         } else if is_online {
                             (WHITE, ICON_WIFI)

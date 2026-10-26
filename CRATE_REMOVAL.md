@@ -112,7 +112,7 @@ in Part 1 are written against it rather than against the sync loop.
   `zebrad/src/lightwalletd.rs`, which call the `wallet` crate directly. The wallet's copy of the
   payout rule, `block_pays_pos_issuance`, travels with them and reads the bft-chain through a
   read request; it stays identical to the other two copies (FINALITY.md §5.4).
-- `zebra_crosslink::config::Config` moves to the node configuration. The hardfork types it
+- `zebra_crosslink::config::Config` moves to the node configuration. The slashfork types it
   re-exports already live in `zebra-chain`, where `zebra-state` can reach them.
 
 Deletes: `TFLServiceInternal`, `TFLServiceHandle`, `TFLServiceCalls`, `spawn_new_tfl_service`,

@@ -16,7 +16,7 @@ use crate::block::{ BlockHeaderData as BcBlockHeader, BlockHeader as BcBlockHead
 //     ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
 // };
 
-/// A single user-led hardfork rule.
+/// A single user-led slashfork rule.
 ///
 /// This is the canonical per-rule type, shared by node config (in `zebra-chain`,
 /// which re-exports it) and by [`BftBlock`], which embeds an optional entry from
@@ -27,16 +27,16 @@ use crate::block::{ BlockHeaderData as BcBlockHeader, BlockHeader as BcBlockHead
 /// finalizer signatures (see [`BftBlock`] docs). Do not change the layout without
 /// bumping the [`BftBlock`] version.
 ///
-/// [`zcash_serialize`]: HardForkConfig::zcash_serialize
+/// [`zcash_serialize`]: SlashForkConfig::zcash_serialize
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HardForkConfig {
-    /// The PoW block height at which this hardfork activates.
+pub struct SlashForkConfig {
+    /// The PoW block height at which this slashfork activates.
     #[serde(deserialize_with = "deserialize_staking_aligned")]
     pub pow_activation_height: u64,
-    /// The BFT certificate height at which this hardfork activates.
+    /// The BFT certificate height at which this slashfork activates.
     pub bft_certificate_height: u64,
-    /// Finalizers terminated by this hardfork; must list at least one. Committed
+    /// Finalizers terminated by this slashfork; must list at least one. Committed
     /// to by hash later, so this list is sorted into a canonical order when the
     /// schedule is built.
     #[serde(deserialize_with = "deserialize_unique_finalizers")]
@@ -70,11 +70,11 @@ fn deserialize_unique_finalizers<'de, D>(d: D) -> Result<Vec<PubKeyID>, D::Error
     Ok(finalizers)
 }
 
-impl HardForkConfig {
+impl SlashForkConfig {
     /// Upper bound on `terminated_finalizers` accepted by [`zcash_deserialize`],
     /// to bound allocation from untrusted input.
     ///
-    /// [`zcash_deserialize`]: HardForkConfig::zcash_deserialize
+    /// [`zcash_deserialize`]: SlashForkConfig::zcash_deserialize
     const MAX_TERMINATED_FINALIZERS: u32 = 4096;
 
     #[allow(clippy::unwrap_in_result)]
@@ -104,7 +104,7 @@ impl HardForkConfig {
             reader.read_exact(&mut bytes)?;
             terminated_finalizers.push(PubKeyID(bytes));
         }
-        Ok(HardForkConfig {
+        Ok(SlashForkConfig {
             pow_activation_height,
             bft_certificate_height,
             terminated_finalizers,
@@ -145,12 +145,12 @@ impl HardForkConfig {
 ///
 /// The serialized form is consensus-critical (it is blake3-hashed, and that hash
 /// is the value finalizers sign — see [Blake3Hash] and [Vote]). New fields are
-/// therefore gated on [version]: `version >= 2` blocks serialize the [hardforks]
+/// therefore gated on [version]: `version >= 2` blocks serialize the [slashforks]
 /// and [do_not_include_until_bc_height] tail, while earlier versions serialize
 /// byte-for-byte as before, leaving their hashes and signatures unchanged.
 ///
 /// [version]: BftBlock::version
-/// [hardforks]: BftBlock::hardforks
+/// [slashforks]: BftBlock::slashforks
 /// [do_not_include_until_bc_height]: BftBlock::do_not_include_until_bc_height
 ///
 /// ## Design Notes
@@ -182,14 +182,14 @@ pub struct BftBlock {
     /// them; it is `headers[0]`'s parent, named by hash.
     // @Zooko: PoPoW?
     pub headers: Vec<BcBlockHeader>,
-    /// The user-led hardfork rules activated by this block, in canonical schedule
+    /// The user-led slashfork rules activated by this block, in canonical schedule
     /// order (ascending `pow_activation_height`). Usually empty; multiple rules may
     /// share one BFT certificate height, so this is a list rather than an option.
     ///
     /// Serialized only in `version >= 2` blocks. For earlier versions this must
     /// be empty: it is not serialized and so not covered by the block hash or
     /// finalizer signatures.
-    pub hardforks: Vec<HardForkConfig>,
+    pub slashforks: Vec<SlashForkConfig>,
     /// BC height before which this BFT block must not be included.
     ///
     /// Serialized only in `version >= 2` blocks. For earlier versions this must
@@ -223,13 +223,13 @@ impl BftBlock {
         // Version 2 tail. Earlier versions end here, so their serialization (and
         // hence hash and signatures) is unchanged.
         if self.version >= 2 {
-            writer.write_u8(u8::try_from(self.hardforks.len()).expect("at most 255 hardforks per BFT block"))?;
-            for hardfork in &self.hardforks {
-                hardfork.zcash_serialize(&mut writer)?;
+            writer.write_u8(u8::try_from(self.slashforks.len()).expect("at most 255 slashforks per BFT block"))?;
+            for slashfork in &self.slashforks {
+                slashfork.zcash_serialize(&mut writer)?;
             }
             writer.write_u64::<LittleEndian>(self.do_not_include_until_bc_height)?;
         } else {
-            assert!(self.hardforks.is_empty());
+            assert!(self.slashforks.is_empty());
             assert!(self.do_not_include_until_bc_height == 0);
         }
         Ok(())
@@ -273,14 +273,14 @@ impl BftBlock {
         }
 
         // Version 2 tail; see zcash_serialize. Earlier versions default to NIL.
-        let (hardforks, do_not_include_until_bc_height) = if version >= 2 {
-            let hardfork_count = reader.read_u8()?;
-            let mut hardforks = Vec::with_capacity(hardfork_count as usize);
-            for _ in 0..hardfork_count {
-                hardforks.push(HardForkConfig::zcash_deserialize(&mut reader)?);
+        let (slashforks, do_not_include_until_bc_height) = if version >= 2 {
+            let slashfork_count = reader.read_u8()?;
+            let mut slashforks = Vec::with_capacity(slashfork_count as usize);
+            for _ in 0..slashfork_count {
+                slashforks.push(SlashForkConfig::zcash_deserialize(&mut reader)?);
             }
             let do_not_include_until_bc_height = reader.read_u64::<LittleEndian>()?;
-            (hardforks, do_not_include_until_bc_height)
+            (slashforks, do_not_include_until_bc_height)
         } else {
             (Vec::new(), 0)
         };
@@ -290,7 +290,7 @@ impl BftBlock {
             height,
             previous_block_fat_ptr,
             headers: array,
-            hardforks,
+            slashforks,
             do_not_include_until_bc_height,
         })
     }
@@ -335,7 +335,7 @@ impl BftBlock {
             height,
             previous_block_fat_ptr,
             headers,
-            hardforks: Vec::new(),
+            slashforks: Vec::new(),
             do_not_include_until_bc_height: 0,
         })
     }
@@ -486,7 +486,7 @@ pub struct StakingParameters {
 }
 
 impl StakingParameters {
-    /// Blocks before a slashing hardfork's activation whose staking actions decide its burns.
+    /// Blocks before a slashing slashfork's activation whose staking actions decide its burns.
     ///
     /// Derived rather than set, because the slash's guarantee that no burned bond was already
     /// withdrawn depends on this exact size; see `SLASH_ANALYSIS_WINDOW`.
@@ -746,7 +746,7 @@ impl TMSig {
     }
 
     /// Like [`TMSig::verify`], but for vote namespacing: the 32-byte `namespace`
-    /// (a cumulative hash of the hardforks in effect) is appended to `signed_data`
+    /// (a cumulative hash of the slashforks in effect) is appended to `signed_data`
     /// before verifying. A nil namespace (`[0; 32]`) appends nothing, so signatures
     /// made without namespacing verify byte-for-byte as before — backwards compatible.
     pub fn verify_with_namespace(&self, pub_key: PubKeyID, signed_data: &[u8], namespace: &[u8; 32]) -> Result<(), (ed25519_zebra::Error, &str)> {
@@ -1304,7 +1304,7 @@ pub struct ScanInfo {
     pub bonds: Vec<ScanBond>,
     pub bonds_value: u64,
 
-    /// Bonds burned by a hardfork slash, kept out of `bonds`, `bonds_value` and `total_value`
+    /// Bonds burned by a slashfork slash, kept out of `bonds`, `bonds_value` and `total_value`
     /// until it is decided how burned stake counts toward issuance.
     #[serde(default)]
     pub burned_bonds: Vec<ScanBond>,

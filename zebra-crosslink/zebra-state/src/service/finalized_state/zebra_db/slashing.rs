@@ -1,4 +1,4 @@
-//! Hardfork slash burns.
+//! Slashfork slash burns.
 //!
 //! To burn the bonds of a finalizer `T` slashed at activation height `A`, we must
 //! find every bond delegated to `T` at the end of any block in the window `[A - W, A)`. This
@@ -43,7 +43,7 @@ fn slash_window_heights(activation: Height, slash_analysis_window: u32) -> std::
     activation.0.saturating_sub(slash_analysis_window) + 1..activation.0
 }
 
-/// The burn set for a hardfork activating at `activation`: every bond delegated
+/// The burn set for a slashfork activating at `activation`: every bond delegated
 /// to a finalizer in `slashed` at the end of any block in `[activation - W, activation)`.
 ///
 /// `bonds` is the bond state at the end of block `activation - 1`, before any of the
