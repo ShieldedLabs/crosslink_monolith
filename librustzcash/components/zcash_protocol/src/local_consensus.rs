@@ -73,6 +73,7 @@ impl Parameters for LocalNetwork {
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => self.nu7,
             NetworkUpgrade::FeaturenetUpgrade1 => None,
+            NetworkUpgrade::FeaturenetUpgrade2 => None,
         }
     }
 }

@@ -360,6 +360,7 @@ impl BlockTemplateResponse {
             &coinbase_txn,
             chain_info.chain_history_root,
             &mempool_txs,
+            &fat_pointer_to_bft_block,
         );
 
         // Convert difficulty
