@@ -3535,7 +3535,7 @@ pub fn sync(
                             // re-check next tick rather than dropping and re-downloading it.
                             None => Err(("crosslink", BlockVerifyError { msg: defer_msg, misbehavior_score: 0 }, true)),
                             // Permanent, per the gate's own documentation. Drop it.
-                            Some(crate::CrosslinkVerdict::Reject) => Err(("crosslink", BlockVerifyError { msg: "fat pointer regressed or is too early".to_string(), misbehavior_score: 0 }, false)),
+                            Some(crate::CrosslinkVerdict::Reject) => Err(("crosslink", BlockVerifyError { msg: "fat pointer regressed, is too early, or does not carry a valid certificate".to_string(), misbehavior_score: 0 }, false)),
                             // `pos_payout` travels with the block to `Chain::push`: the gate is the
                             // only place that resolves the certificate and what it finalizes.
                             Some(crate::CrosslinkVerdict::Accept { pos_payout }) => {
