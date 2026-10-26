@@ -392,6 +392,24 @@ impl RoundData {
         self.proposal_is_faulty        = false;
     }
 
+    /// A conflicting chunk that arrives before the certificate flags a whole proposal faulty without
+    /// touching its bytes, and once those are the real ones every honest chunk is a repeat, so the
+    /// chunk path never revisits the flag. Once certified, the bytes are whatever hashes to the id:
+    /// keep them if they do and fetch them again if they do not.
+    fn settle_faulty_if_certified(&mut self, roster: &[SortedRosterMember], hash_keys: &HashKeys, ctx_str: &str) {
+        if !self.proposal_is_faulty || !self.has_full_proposal() || !self.proposal_is_certified(roster) {
+            return;
+        }
+        if self.proposal.id_from_value(hash_keys) == self.proposal_id {
+            self.proposal_is_faulty        = false;
+            self.proposal_checked_validity = (TMStatus::Indeterminate, TMStatusReason::None);
+        } else {
+            eprintln!("{ctx_str} {ANSI_YLW}BFT{ANSI_RST} at {}.{}: what we hold of the decided value {} does not hash to it. Starting it again...",
+                self.height, self.round, self.proposal_id);
+            self.restart_proposal_assembly();
+        }
+    }
+
     /// Called when a precommit for `value_id` has just been stored. If `value_id` is not the proposal
     /// we hold and now has 2f+1 precommits, it is decided, so it replaces ours: the votes stay, the
     /// bytes of ours go, and its bytes are taken as they arrive. Only one value can get there with
@@ -1268,6 +1286,7 @@ impl TMState {
 
         for i in current_height_start_i..self.rounds_data.len() {
             let on_roster = roster_i_from_pub_key(&roster[..active_roster_len(roster)], self.my_pub_key).is_some();
+            self.rounds_data[i].settle_faulty_if_certified(roster, &self.hash_keys, &ctx_str);
             let counts = self.rounds_data[i].counts.clone();
             let has_enough_info_to_determine_validity = self.rounds_data[i].has_enough_info_to_determine_validity();
 
@@ -4581,6 +4600,30 @@ mod tests {
         }
     }
 
+    // The other order: the real bytes are whole and stored, then the conflicting chunk flags them, then
+    // the precommits come. Every real chunk after that is a repeat, so nothing on the chunk path can
+    // clear the flag; the node still decides the value it holds.
+    #[test]
+    fn line49_wrong_bytes_before_the_certificate_do_not_condemn_correct_bytes() {
+        let (keys, roster, proposer, others) = split_finalizers();
+        let me = others[2];
+        let value   = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let garbage = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| (i as u8).wrapping_mul(3)).collect());
+
+        let mut node = split_engine(&keys, &roster, me, None);
+        node.insert_round(0, 0, &roster);
+        let id = value.id_from_value(&node.hash_keys);
+
+        split_chunks(&mut node, &keys, &roster, proposer, &value, id, None);
+        split_chunks(&mut node, &keys, &roster, proposer, &garbage, id, Some(1));
+        assert!(node.rounds_data[0].has_full_proposal() && node.rounds_data[0].proposal_is_faulty);
+        for i in [proposer, others[0], others[1]] { split_vote(&mut node, &keys, &roster, i, true, id); }
+
+        split_chunks(&mut node, &keys, &roster, proposer, &value, id, None);
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(node.bft_update(&mut roster.clone()));
+        assert_eq!(node.height, 1);
+    }
+
     // A chunk's header says how big the value is and which chunk this is. Neither is believed past the
     // limit: the size is allocated on sight.
     #[test]
@@ -4599,6 +4642,29 @@ mod tests {
             assert_eq!(node.check_and_incorporate_msg(0, 0, chunk_i as usize, id, -1, &roster, proposer,
                 PACKET_TYPE_PROPOSAL_CHUNK, &data, sig), TMStatus::Fail, "size {proposal_size}, chunk {chunk_i}");
             assert!(node.rounds_data[0].proposal.0.is_empty(), "size {proposal_size}, chunk {chunk_i}");
+        }
+    }
+
+    // The signed bytes of a vote are the ones `zcash_primitives::bft::Vote` lays out, the round's top
+    // bit marking a precommit, for any round a peer can write.
+    #[test]
+    fn vote_sign_data_matches_the_canonical_vote_encoding() {
+        let pub_key  = PubKeyID([4; 32]);
+        let value_id = ValueId([6; 32]);
+        for round in [0u32, 7, 0x7fff_ffff, 0x8000_0007, u32::MAX] {
+            let canonical = zcash_primitives::bft::Vote {
+                validator_address: pub_key,
+                value:             zcash_primitives::bft::Blake3Hash(value_id.0),
+                height:            11,
+                typ:               true,
+                // Same 32 bits; `to_bytes` keeps the low 31 and sets the top one for a precommit.
+                round:             round as i32,
+            };
+            assert_eq!(make_vote_sign_datas(pub_key, true, 11, round, value_id)[1], canonical.to_bytes(), "precommit round {round:#x}");
+            if round < 0x8000_0000 {
+                let canonical = zcash_primitives::bft::Vote { typ: false, ..canonical };
+                assert_eq!(make_vote_sign_datas(pub_key, false, 11, round, value_id)[1], canonical.to_bytes(), "prevote round {round:#x}");
+            }
         }
     }
 
