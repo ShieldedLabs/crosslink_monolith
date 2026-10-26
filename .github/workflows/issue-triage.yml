@@ -81,10 +81,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           mkdir triage_input
-          gh issue view "$ISSUE" -R "$GITHUB_REPOSITORY" --json number,title,author,createdAt,body,comments > triage_input/issue.json
-          gh issue list -R "$GITHUB_REPOSITORY" --state all --limit 5000 --json number,state,title,body \
-            --jq '.[] | "#\(.number) [\(.state)] \(.title)\n\(.body[:300])\n"' > triage_input/issues.txt
+          # The issue list is a heavy query, and GitHub answers 502 or 504 to it under load.
+          fetch() {
+            local out=$1; shift
+            for i in 1 2 3; do
+              if "$@" > "$out"; then return 0; fi
+              echo "GitHub API call failed (attempt $i)."; sleep $((20 * i))
+            done
+            return 1
+          }
+          fetch triage_input/issue.json gh issue view "$ISSUE" -R "$GITHUB_REPOSITORY" --json number,title,author,createdAt,body,comments
+          fetch triage_input/issues.txt gh issue list -R "$GITHUB_REPOSITORY" --state all --limit 5000 --json number,state,title,body \
+            --jq '.[] | "#\(.number) [\(.state)] \(.title)\n\(.body[:300])\n"'
 
       - name: No model secret
         if: env.HAS_CLAUDE != 'true' && env.HAS_GROK != 'true'
@@ -107,7 +117,7 @@ jobs:
 
       - name: Triage with Grok
         id: grok
-        if: ${{ !cancelled() && env.HAS_GROK == 'true' && (env.HAS_CLAUDE != 'true' || steps.claude.outcome == 'failure') }}
+        if: env.HAS_GROK == 'true' && (env.HAS_CLAUDE != 'true' || steps.claude.outcome == 'failure')
         env:
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
           XAI_MODEL: ${{ vars.XAI_MODEL || 'grok-4.3' }}
