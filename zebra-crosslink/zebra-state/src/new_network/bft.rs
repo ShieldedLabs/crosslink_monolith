@@ -8,10 +8,11 @@
 //! read lock on [`bft_chain`].
 #![allow(missing_docs)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasherDefault;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 
+use chrono::{DateTime, Utc};
 use tenderlink::{
     addr_string_to_stuff, BftAddressMap, BlockValue, ConsensusCounts, FinalizerPeerAddress,
     RoundData, SortedRosterMember, TMState, TMStatus, TMStatusReason, TMStep, ValueId,
@@ -26,9 +27,12 @@ use zcash_primitives::block::{
 };
 use zcash_primitives::transaction::RosterMember;
 use zebra_chain::block::{Hash, Header, Height};
+use zebra_chain::parameters::Network;
 use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize};
+use zebra_chain::work::difficulty::CompactDifficulty;
 
 use super::ReadState;
+use crate::service::check::{self, difficulty::POW_ADJUSTMENT_BLOCK_SPAN, AdjustedDifficulty};
 use crate::service::finalized_state::bft::StoredDecision;
 use crate::service::finalized_state::ZebraDb;
 use crate::service::write::WriteBlockWorkerTask;
@@ -380,9 +384,7 @@ pub fn bc_hdr_to_lrz(header: &Header) -> BcBlockHeader {
 /// only the threshold, so a header here must not have to meet more than its block did.
 fn header_pow_is_valid(header: &BcBlockHeader, network: &zebra_chain::parameters::Network) -> Result<(), String> {
     use zebra_chain::work::difficulty::ParameterDifficulty as _;
-    let mut bytes = Vec::new();
-    BcBlockHeaderWrap::write_data(header, &mut bytes).map_err(|e| e.to_string())?;
-    let header = Header::zcash_deserialize(&*bytes).map_err(|e| e.to_string())?;
+    let header = header_from_lrz(header)?;
     let hash = header.hash();
     let threshold = header
         .difficulty_threshold
@@ -398,6 +400,80 @@ fn header_pow_is_valid(header: &BcBlockHeader, network: &zebra_chain::parameters
         return Err(format!("hash {hash} does not meet difficulty threshold {threshold:?}"));
     }
     header.solution.check(&header).map_err(|e| e.to_string())
+}
+
+fn header_from_lrz(header: &BcBlockHeader) -> Result<Header, String> {
+    let mut bytes = Vec::new();
+    BcBlockHeaderWrap::write_data(header, &mut bytes).map_err(|e| e.to_string())?;
+    Header::zcash_deserialize(&*bytes).map_err(|e| e.to_string())
+}
+
+/// The `(nBits, time)` pairs the difficulty adjustment reads for the block above `snapshot`: the
+/// snapshot and its ancestors, nearest first, up to `POW_ADJUSTMENT_BLOCK_SPAN` of them or back to
+/// genesis. The walk follows each header's own parent hash, so it reads the snapshot's chain
+/// wherever that chain forks from the best one.
+fn difficulty_context_above(
+    snapshot_hash: Hash,
+    snapshot_height: Height,
+    mut header_of: impl FnMut(Hash) -> Option<Arc<Header>>,
+) -> VecDeque<(CompactDifficulty, DateTime<Utc>)> {
+    let mut context = VecDeque::with_capacity(POW_ADJUSTMENT_BLOCK_SPAN + 1);
+    let mut cursor = snapshot_hash;
+    let mut height = snapshot_height;
+    loop {
+        let header = header_of(cursor).expect(
+            "a held block's ancestors are held: each non-finalized chain carries its history above \
+             the finalized tip, and the finalized state holds the rest",
+        );
+        context.push_back((header.difficulty_threshold, header.time));
+        if context.len() == POW_ADJUSTMENT_BLOCK_SPAN || height == Height(0) {
+            return context;
+        }
+        cursor = header.previous_block_hash;
+        height = Height(height.0 - 1);
+    }
+}
+
+/// Whether each carried header could head a block at its position: its `nBits` equals the
+/// `ThresholdBits` the chain requires there, and its time is within the median-time-past bounds.
+/// `context` is [`difficulty_context_above`] the snapshot, and each accepted header becomes the
+/// nearest entry of the next one's context. Without this a header only has to meet the `nBits` it
+/// declares for itself, which can be as easy as PoWLimit.
+fn headers_meet_required_difficulty(
+    network: &Network,
+    snapshot_height: Height,
+    mut context: VecDeque<(CompactDifficulty, DateTime<Utc>)>,
+    headers: &[BcBlockHeader],
+) -> Result<(), String> {
+    let mut previous_height = snapshot_height;
+    for (i, header) in headers.iter().enumerate() {
+        let header = header_from_lrz(header)?;
+        let Some(height) = previous_height + 1 else {
+            return Err(format!("carried header {i} would be above the maximum block height"));
+        };
+        let adjustment =
+            AdjustedDifficulty::new_from_header_time(header.time, previous_height, network, context.iter().copied());
+        if let Err(error) = check::difficulty_threshold_and_time_are_valid(header.difficulty_threshold, adjustment) {
+            return Err(format!("carried header {i} at height {}: {error}", height.0));
+        }
+        context.push_front((header.difficulty_threshold, header.time));
+        context.truncate(POW_ADJUSTMENT_BLOCK_SPAN);
+        previous_height = height;
+    }
+    Ok(())
+}
+
+/// [`headers_meet_required_difficulty`] for headers carried above a block this state holds.
+fn carried_headers_meet_required_difficulty(
+    read_state: &ReadState,
+    snapshot_hash: Hash,
+    snapshot_height: Height,
+    headers: &[BcBlockHeader],
+) -> Result<(), String> {
+    let context = difficulty_context_above(snapshot_hash, snapshot_height, |hash| {
+        read_state.any_chain_block_header(crate::HashOrHeight::Hash(hash))
+    });
+    headers_meet_required_difficulty(read_state.network(), snapshot_height, context, headers)
 }
 
 /// The set of finalizers terminated (blacklisted) by user-led hardforks at a given point, as a
@@ -1088,6 +1164,18 @@ impl BftRunner {
             tracing::info!("not proposing: the headers above the candidate do not form a chain");
             return None;
         }
+        {
+            use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters as _};
+            let network = read_state.network();
+            if network.is_nu_active(NetworkUpgrade::FeaturenetUpgrade2, BlockHeight::from(finality_candidate_height.0)) {
+                if let Err(reason) =
+                    carried_headers_meet_required_difficulty(read_state, candidate_hash, finality_candidate_height, &headers)
+                {
+                    tracing::info!("not proposing: the headers above the candidate fail Tail Confirmation: {reason}");
+                    return None;
+                }
+            }
+        }
 
         // The user-led hardforks scheduled at this BFT height (several rules may share one
         // certificate height). The schedule is canonical, so this filter preserves canonical
@@ -1273,9 +1361,23 @@ impl BftRunner {
 
         // The `snapshot` this proposal finalizes: the parent of the deepest carried header.
         let new_final_hash = Hash(new_block.snapshot_block_hash().0);
-        if read_state.known_block(new_final_hash).is_none() {
+        let Some(snapshot) = read_state.known_block(new_final_hash) else {
             tracing::warn!("Didn't have hash available for confirmation: {}", new_final_hash);
             return needs_pow_block(new_final_hash);
+        };
+
+        // From FeaturenetUpgrade2 each header must also carry the difficulty its position
+        // requires, read from the snapshot's own ancestry, so the check stays objective.
+        {
+            use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters as _};
+            if network.is_nu_active(NetworkUpgrade::FeaturenetUpgrade2, BlockHeight::from(snapshot.height.0)) {
+                if let Err(reason) =
+                    carried_headers_meet_required_difficulty(read_state, new_final_hash, snapshot.height, &new_block.headers)
+                {
+                    tracing::warn!("BFT block fails Tail Confirmation: {reason}");
+                    return fail;
+                }
+            }
         }
 
         // Linearity (FINALITY.md §3.4): `snapshot(parent(B)) ⪯bc snapshot(B)`. With BFT Final
@@ -1998,6 +2100,168 @@ mod tests {
             note_missing_pow_block(&mut same_instant, hash(n), start);
             assert!(same_instant.contains_key(&hash(n)));
             assert!(same_instant.len() <= MAX_MISSING_POW_BLOCKS);
+        }
+    }
+
+    fn time(seconds: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(seconds, 0).expect("test times are in range")
+    }
+
+    fn header(previous_block_hash: Hash, seconds: i64, difficulty_threshold: CompactDifficulty) -> Header {
+        Header {
+            version: 5,
+            previous_block_hash,
+            merkle_root: zebra_chain::block::merkle::Root([0; 32]),
+            commitment_bytes: zebra_chain::fmt::HexDebug([0; 32]),
+            time: time(seconds),
+            difficulty_threshold,
+            nonce: zebra_chain::fmt::HexDebug([0; 32]),
+            solution: zebra_chain::work::equihash::Solution::for_proposal(),
+            fat_pointer_to_bft_block: FatPointerToBftBlock::null(),
+        }
+    }
+
+    /// A block id that names its branch and height, so a context can be read back as positions.
+    fn block_id(branch: u8, height: u32) -> Hash {
+        let mut bytes = [0; 32];
+        bytes[0] = branch;
+        bytes[1..5].copy_from_slice(&height.to_le_bytes());
+        Hash(bytes)
+    }
+
+    /// Each block's time encodes its branch and height, and its nBits its height alone.
+    fn branch_time(branch: u8, height: u32) -> i64 {
+        1_000_000 + i64::from(height) * 1_000 + i64::from(branch)
+    }
+
+    #[test]
+    fn difficulty_context_follows_the_snapshot_across_a_side_chain() {
+        // Branch 1 is the finalized prefix and best chain, heights 0 to 40. Branch 2 is a side
+        // chain forking above height 30, heights 31 to 35.
+        let mut held: HashMap<Hash, Arc<Header>> = HashMap::new();
+        let mut add = |branch: u8, height: u32, parent: Hash| {
+            let bits = CompactDifficulty(0x1f00_0000 + height);
+            held.insert(block_id(branch, height), Arc::new(header(parent, branch_time(branch, height), bits)));
+        };
+        add(1, 0, zebra_chain::parameters::GENESIS_PREVIOUS_BLOCK_HASH);
+        for height in 1..=40 {
+            add(1, height, block_id(1, height - 1));
+        }
+        add(2, 31, block_id(1, 30));
+        for height in 32..=35 {
+            add(2, height, block_id(2, height - 1));
+        }
+        let entry = |branch: u8, height: u32| (CompactDifficulty(0x1f00_0000 + height), time(branch_time(branch, height)));
+
+        // A full node validating the block above side-chain block 35 reads that block and its 27
+        // ancestors on its own chain: 35 to 31 on the side chain, then 30 down to 8 below the fork.
+        let context = difficulty_context_above(block_id(2, 35), Height(35), |hash| held.get(&hash).cloned());
+        let expected: Vec<_> = (31..=35).rev().map(|h| entry(2, h)).chain((8..=30).rev().map(|h| entry(1, h))).collect();
+        assert_eq!(context.len(), POW_ADJUSTMENT_BLOCK_SPAN);
+        assert_eq!(context.into_iter().collect::<Vec<_>>(), expected);
+
+        // Near genesis the context is shorter and ends at genesis, without asking for its parent.
+        let mut asked = Vec::new();
+        let context = difficulty_context_above(block_id(1, 5), Height(5), |hash| {
+            asked.push(hash);
+            held.get(&hash).cloned()
+        });
+        assert_eq!(context.into_iter().collect::<Vec<_>>(), (0..=5).rev().map(|h| entry(1, h)).collect::<Vec<_>>());
+        assert_eq!(asked.last(), Some(&block_id(1, 0)));
+    }
+
+    #[test]
+    fn carried_headers_must_carry_the_difficulty_their_position_requires() {
+        use zebra_chain::work::difficulty::ParameterDifficulty as _;
+
+        // Default Testnet far below its minimum-difficulty start height, so ThresholdBits
+        // applies with no exemption. The history runs at the target spacing with nBits well
+        // below PoWLimit.
+        let network = Network::new_default_testnet();
+        let snapshot_height = Height(1_000);
+        let spacing = zebra_chain::parameters::NetworkUpgrade::target_spacing_for_height(&network, snapshot_height).num_seconds();
+        let pow_limit = network.target_difficulty_limit().to_compact();
+        let history_bits = (network.target_difficulty_limit() / 1_000u64).to_compact();
+        let snapshot_time = 2_000_000_000;
+        let context: VecDeque<_> = (0..POW_ADJUSTMENT_BLOCK_SPAN)
+            .map(|depth| (history_bits, time(snapshot_time - spacing * i64::try_from(depth).expect("depth is below 28"))))
+            .collect();
+
+        let required = |context: &VecDeque<(CompactDifficulty, DateTime<Utc>)>, previous: Height, seconds: i64| {
+            AdjustedDifficulty::new_from_header_time(time(seconds), previous, &network, context.iter().copied())
+                .expected_difficulty_threshold()
+        };
+        let first_time = snapshot_time + spacing;
+        let first_bits = required(&context, snapshot_height, first_time);
+        assert_ne!(first_bits, pow_limit, "the scenario needs a required difficulty above PoWLimit");
+        let first = header(block_id(1, 1_000), first_time, first_bits);
+        let mut after_first = context.clone();
+        after_first.push_front((first_bits, first.time));
+        let second_time = first_time + spacing;
+        let second_bits = required(&after_first, Height(1_001), second_time);
+        let second = header(first.hash(), second_time, second_bits);
+
+        let tail = |headers: &[&Header]| headers.iter().map(|h| bc_hdr_to_lrz(h)).collect::<Vec<_>>();
+        let check = |headers: &[&Header]| headers_meet_required_difficulty(&network, snapshot_height, context.clone(), &tail(headers));
+
+        assert_eq!(check(&[&first, &second]), Ok(()));
+
+        // The same positions declaring PoWLimit, as a forged tail does.
+        let forged_first = header(block_id(1, 1_000), first_time, pow_limit);
+        let err = check(&[&forged_first]).expect_err("a PoWLimit header where the chain requires more is refused");
+        assert!(err.starts_with("carried header 0 at height 1001"), "{err}");
+        let forged_second = header(first.hash(), second_time, pow_limit);
+        let err = check(&[&first, &forged_second]).expect_err("the second header is checked against a context holding the first");
+        assert!(err.starts_with("carried header 1 at height 1002"), "{err}");
+
+        // A time at or below the median-time-past is refused whatever it declares.
+        let early_time = snapshot_time - spacing * 20;
+        let early = header(block_id(1, 1_000), early_time, required(&context, snapshot_height, early_time));
+        assert!(check(&[&early]).is_err());
+    }
+
+    /// A carried header declaring PoWLimit more than six spacings after the snapshot, above the
+    /// minimum-difficulty start height: a legitimate minimum-difficulty header on stock Testnet
+    /// parameters, refused on parameters that switch the exemption off and once
+    /// FeaturenetUpgrade2 is active.
+    #[test]
+    fn a_minimum_difficulty_carried_header_passes_only_where_the_exemption_holds() {
+        use zebra_chain::parameters::testnet::{self, ConfiguredActivationHeights};
+        use zebra_chain::work::difficulty::ParameterDifficulty as _;
+
+        let stock = Network::new_default_testnet();
+        let Network::Testnet(stock_params) = &stock else {
+            unreachable!("the default testnet is a Testnet");
+        };
+        let mut heights = ConfiguredActivationHeights::from(stock_params.activation_heights());
+        let last_scheduled = stock_params.activation_heights().keys().last().expect("Testnet has upgrades").0;
+        let snapshot_height = Height(last_scheduled.max(400_000));
+        heights.featurenet_upgrade_2 = Some(snapshot_height.0);
+        let upgraded = testnet::Parameters::build()
+            .with_activation_heights(heights)
+            .expect("valid activation heights")
+            .to_network()
+            .expect("valid parameters");
+        let featurenet = testnet::Parameters::build()
+            .with_minimum_difficulty_start_height(None)
+            .to_network()
+            .expect("valid parameters");
+
+        let check = |network: &Network| {
+            let spacing = zebra_chain::parameters::NetworkUpgrade::target_spacing_for_height(network, snapshot_height).num_seconds();
+            let history_bits = (network.target_difficulty_limit() / 1_000u64).to_compact();
+            let snapshot_time = 2_000_000_000;
+            let context: VecDeque<_> = (0..POW_ADJUSTMENT_BLOCK_SPAN)
+                .map(|depth| (history_bits, time(snapshot_time - spacing * i64::try_from(depth).expect("depth is below 28"))))
+                .collect();
+            let gapped = header(block_id(1, snapshot_height.0), snapshot_time + spacing * 6 + 1, network.target_difficulty_limit().to_compact());
+            headers_meet_required_difficulty(network, snapshot_height, context, &[bc_hdr_to_lrz(&gapped)])
+        };
+
+        assert_eq!(check(&stock), Ok(()));
+        for network in [&featurenet, &upgraded] {
+            let err = check(network).expect_err("no minimum-difficulty exemption applies");
+            assert!(err.contains("is not equal to the expected difficulty"), "{err}");
         }
     }
 }

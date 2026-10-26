@@ -180,6 +180,37 @@ fn regtest_should_allow_unshielded_coinbase_spends_serialization_roundtrip() {
     assert!(!params.should_allow_unshielded_coinbase_spends());
 }
 
+/// Checks that a configured Testnet's minimum-difficulty start height survives a serialization
+/// round-trip, both moved and switched off, and that a word other than "never" is refused.
+#[test]
+fn minimum_difficulty_start_height_serialization_roundtrip() {
+    let _init_guard = zebra_test::init();
+
+    for start_height in [Some(Height(400_000)), None] {
+        let config = Config {
+            network: testnet::Parameters::build()
+                .with_minimum_difficulty_start_height(start_height)
+                .to_network()
+                .expect("failed to build configured network"),
+            initial_testnet_peers: [].into(),
+            ..Config::default()
+        };
+
+        let serialized = toml::to_string(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(config, deserialized);
+        let Network::Testnet(params) = &deserialized.network else {
+            panic!("deserialized network must be a Testnet");
+        };
+        assert_eq!(params.minimum_difficulty_start_height(), start_height);
+    }
+
+    let toml = "network = 'Testnet'\ninitial_testnet_peers = []\n\n[testnet_parameters]\nminimum_difficulty_start_height = 'later'\n";
+    let err = toml::from_str::<Config>(toml).expect_err("only a height or \"never\" is accepted");
+    assert!(err.to_string().contains("minimum_difficulty_start_height"), "unexpected error: {err}");
+}
+
 /// Checks that the Regtest-only `should_allow_unshielded_coinbase_spends` knob is rejected
 /// on a configured Testnet rather than silently ignored.
 #[test]
