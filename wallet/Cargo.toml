@@ -19,6 +19,7 @@ zcash_primitives = { path = "../librustzcash/zcash_primitives" }
 zcash_client_backend = { path = "../librustzcash/zcash_client_backend", features = ["lightwalletd-tonic", "sync"] }
 zcash_client_sqlite = { path = "../librustzcash/zcash_client_sqlite", features = ["orchard", "transparent-inputs"] }
 zcash_keys = { path = "../librustzcash/zcash_keys", features = ["transparent-inputs"] }
+zcash_address = { path = "../librustzcash/components/zcash_address" }
 zcash_protocol = { path = "../librustzcash/components/zcash_protocol" }
 zcash_transparent = { path = "../librustzcash/zcash_transparent" }
 zcash_note_encryption = "0.4.1"

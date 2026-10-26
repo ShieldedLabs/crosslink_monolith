@@ -36,6 +36,10 @@ pub struct UiData {
     pub per_frame_strs: Vec<String>,
 
     pub send_address:  String,
+    // wallet::decode_send_address of the pasted address, cached so it doesn't rerun every frame
+    pub send_address_checked: String,
+    pub send_address_ua: Option<wallet::UnifiedAddress>,
+    pub send_address_err: String,
     pub send_amount_index: usize,
     pub stake_address: String,
     // ed25519-verify of the pasted address, cached so it doesn't rerun every frame
@@ -66,6 +70,22 @@ pub fn bank_balance(banks: &[([u8; 32], u64)], pk: &[u8; 32]) -> u64 {
     banks.iter().find(|(k, _)| k == pk).map_or(0, |(_, v)| *v)
 }
 
+/// The mined withdrawal of the bond keyed `bond_key`, matched by key over the whole list so the
+/// answer does not depend on where the asking row sits or how far the history is scrolled.
+pub fn claim_for_bond(txs: &[wallet::WalletTx], bond_key: [u8; 32]) -> Option<(WalletTxPart, BlockHeight)> {
+    for tx in txs {
+        if !(tx.is_on_bc() && tx.h.is_in_block()) {
+            continue;
+        }
+        let Some(staking_action) = tx.staking_action else { continue; };
+        if tx.kind() == WalletTxKind::ClaimUnstake && staking_action.bond_key() == bond_key {
+            // NOTE: ignoring fee
+            return Some((WalletTxPart::from_staking_action(tx.staking_action), tx.h));
+        }
+    }
+    None
+}
+
 /// "1.25" cTAZ -> zats; up to 8 decimal places, no sign, nothing else.
 pub fn parse_ctaz(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -78,6 +98,47 @@ pub fn parse_ctaz(s: &str) -> Option<u64> {
     let whole: u64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
     let frac: u64 = if frac.is_empty() { 0 } else { format!("{frac:0<8}").parse().ok()? };
     whole.checked_mul(ONE_cTAZ)?.checked_add(frac)
+}
+
+/// "[first edge..last edge]" counted in characters, never bytes: the input is whatever the
+/// clipboard held, and a byte cut inside a character panics, which aborts the node.
+pub fn abbreviate_ends(s: &str, edge: usize) -> String {
+    let count = s.chars().count();
+    if count < 2 * edge {
+        return format!("[{s}]");
+    }
+    let mut head_end = s.len();
+    let mut tail_start = s.len();
+    for (i, (byte_o, _)) in s.char_indices().enumerate() {
+        if i == edge { head_end = byte_o; }
+        if i == count - edge { tail_start = byte_o; }
+    }
+    format!("[{}..{}]", &s[..head_end], &s[tail_start..])
+}
+
+/// ui.textbox creates a missing entry empty, and empty parses as "no time filter", so the
+/// entry must already hold the stored filter before the first call or opening the popup clears it.
+pub fn seed_seconds_textbox(textboxes: &mut HashMap<u32, TextboxState>, id: u32, seconds: u32) {
+    if textboxes.contains_key(&id) {
+        return;
+    }
+    let mut text_buf = Vec::new();
+    if seconds != 0 {
+        text_buf.extend(seconds.to_string().chars());
+    }
+    textboxes.insert(id, TextboxState { text_buf, ..Default::default() });
+}
+
+/// Comfortably above a finalizer address (134 characters) and a unified address with three receivers.
+const PASTED_ADDRESS_MAX_CHARS: usize = 512;
+
+/// The clipboard text a paste button stores: trimmed, bounded, and filtered like the Ctrl+V path in lib.rs.
+pub fn pasted_address(raw: &str) -> String {
+    let mut out = String::new();
+    for c in raw.trim().chars().take(PASTED_ADDRESS_MAX_CHARS) {
+        if c >= ' ' && c != '\u{7f}' { out.push(c); }
+    }
+    out
 }
 
 
@@ -1981,15 +2042,14 @@ pub fn ui_left_pane(ui: &mut Context,
                         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
                         if true {
-                            let mut send_address = "0000000000000000";
-                            if data.send_address.len() >= 16 {
-                                send_address = &data.send_address;
+                            if data.send_address.is_empty() {
+                                ui.text("No address pasted", TextDecl { h: ui.scale(20.0), colour: WHITE.mul(0.6), align: AlignX::Center, ..TextDecl });
+                            } else {
+                                ui.text(frame_strf!(data, "{}", abbreviate_ends(&data.send_address, 8)), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                             }
-
-                            ui.text(frame_strf!(data, "[{}..{}]", &send_address[..8], &send_address[send_address.len() - 8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                             if button(ui, "Paste Address", true) {
                                 if let Some(text) = ui.input().get_from_clipboard() {
-                                    data.send_address = text.trim().to_string();
+                                    data.send_address = pasted_address(&text);
                                 }
                             }
 
@@ -2020,7 +2080,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
                             if button(ui, "Paste Address", true) {
                                 if let Some(text) = ui.input().get_from_clipboard() {
-                                    data.send_address = text.trim().to_string();
+                                    data.send_address = pasted_address(&text);
                                     let send_address_buf: Vec<char> = data.send_address.chars().collect();
                                     let textbox_state = data.textboxes.entry(send_address_id.id).or_default();
                                     textbox_state.text_buf = send_address_buf;
@@ -2029,6 +2089,23 @@ pub fn ui_left_pane(ui: &mut Context,
                                     textbox_state.selection.1 = len;
                                 }
                             }
+                        }
+
+                        if data.send_address != data.send_address_checked {
+                            data.send_address_checked = data.send_address.clone();
+                            match wallet::decode_send_address(&data.send_address) {
+                                Ok(ua) => {
+                                    data.send_address_ua = Some(ua);
+                                    data.send_address_err.clear();
+                                }
+                                Err(err) => {
+                                    data.send_address_ua = None;
+                                    data.send_address_err = err;
+                                }
+                            }
+                        }
+                        if !data.send_address.is_empty() && !data.send_address_err.is_empty() {
+                            ui.text(frame_strf!(data, "{}", data.send_address_err), TextDecl { h: ui.scale(16.0), colour: (0xff, 0xaf, 0x0e, 0xff), align: AlignX::Center, ..TextDecl });
                         }
 
                         // spacer
@@ -2060,7 +2137,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 )
                             };
 
-                            let can = !waiting_for_send && data.send_address.len() != 0;
+                            let can = !waiting_for_send && data.send_address_ua.is_some();
                             let sends = [
                                 ("0.1", ONE_cTAZ/10),
                                 // ("0.2", 2*(ONE_cTAZ/10)),
@@ -2078,7 +2155,10 @@ pub fn ui_left_pane(ui: &mut Context,
                             if true {
                                 for send in sends {
                                     if button(ui, send.0, can && (balance as u64) >= send.1) {
-                                        wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), send.1);
+                                        let ua = data.send_address_ua.clone().expect("the button is disabled until the address decodes");
+                                        wallet_state.lock().unwrap().send_to_address(ua, send.1);
+                                        // The pending row in the history confirms it; a build failure shows on the wallet tab.
+                                        ui.modal = Modal::None;
                                     }
                                 }
 
@@ -2119,7 +2199,9 @@ pub fn ui_left_pane(ui: &mut Context,
                                     frame_strf!(data, "Send {}", selected.0),
                                     can && (balance as u64) >= selected.1,
                                 ) {
-                                    wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), selected.1);
+                                    let ua = data.send_address_ua.clone().expect("the button is disabled until the address decodes");
+                                    wallet_state.lock().unwrap().send_to_address(ua, selected.1);
+                                    ui.modal = Modal::None;
                                 }
                             }
                         }
@@ -2250,15 +2332,14 @@ pub fn ui_left_pane(ui: &mut Context,
                     title_bar(ui, true, "Stake", id("Stake Title Bar"));
 
                     if true {
-                        let mut stake_address = "0000000000000000";
-                        if data.stake_address.len() >= 16 {
-                            stake_address = &data.stake_address;
+                        if data.stake_address.is_empty() {
+                            ui.text("No identity pasted", TextDecl { h: ui.scale(20.0), colour: WHITE.mul(0.6), align: AlignX::Center, ..TextDecl });
+                        } else {
+                            ui.text(frame_strf!(data, "{}", abbreviate_ends(&data.stake_address, 8)), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                         }
-
-                        ui.text(frame_strf!(data, "[{}..{}]", &stake_address[0..8], &stake_address[stake_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                         if button(ui, "Paste Identity", true) {
                             if let Some(text) = ui.input().get_from_clipboard() {
-                                data.stake_address = text.trim().to_string();
+                                data.stake_address = pasted_address(&text);
                             }
                         }
 
@@ -2289,7 +2370,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         }
                         if button(ui, "Paste Identity", true) {
                             if let Some(text) = ui.input().get_from_clipboard() {
-                                data.stake_address = text.trim().to_string();
+                                data.stake_address = pasted_address(&text);
                                 let stake_address_buf: Vec<char> = data.stake_address.chars().collect();
                                 let textbox_state = data.textboxes.entry(stake_address_id.id).or_default();
                                 textbox_state.text_buf = stake_address_buf;
@@ -2406,15 +2487,14 @@ pub fn ui_left_pane(ui: &mut Context,
                 Modal::Retarget => {
                     title_bar(ui, true, "Retarget Delegation Bond", id("Retarget Title Bar"));
 
-                    let mut stake_address = "0000000000000000";
-                    if data.stake_address.len() >= 16 {
-                        stake_address = &data.stake_address;
+                    if data.stake_address.is_empty() {
+                        ui.text("No identity pasted", TextDecl { h: ui.scale(20.0), colour: WHITE.mul(0.6), align: AlignX::Center, ..TextDecl });
+                    } else {
+                        ui.text(frame_strf!(data, "{}", abbreviate_ends(&data.stake_address, 8)), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                     }
-
-                    ui.text(frame_strf!(data, "[{}..{}]", &stake_address[0..8], &stake_address[stake_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                     if button(ui, "Paste Identity", true) {
                         if let Some(text) = ui.input().get_from_clipboard() {
-                            data.stake_address = text.trim().to_string();
+                            data.stake_address = pasted_address(&text);
                         }
                     }
 
@@ -3005,6 +3085,13 @@ pub fn ui_left_pane(ui: &mut Context,
             if button(ui, can, ICON_COG_1,  "User")       { ui.modal = Modal::User;    } // TODO: person icon
         }
 
+        if can {
+            let send_error = wallet_state.lock().unwrap().send_error.clone();
+            if !send_error.is_empty() {
+                ui.text(frame_strf!(data, "{}", send_error), TextDecl { h: ui.scale(16.0), colour: (0xff, 0xaf, 0x0e, 0xff), align: AlignX::Center, ..TextDecl });
+            }
+        }
+
         // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
         let txs = {
@@ -3259,7 +3346,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     if tx_is_in_block {
                                         // NOTE: this assumes that objects maintain bond keys after retargeting
                                         if let Some(staking_action) = tx.staking_action {
-                                            let sent_stake = (tx_kind == WalletTxKind::Stake || tx_kind == WalletTxKind::Retarget);
+                                            let sent_stake = (tx_kind == WalletTxKind::Stake || tx_kind == WalletTxKind::Retarget || tx_kind == WalletTxKind::ConvertReward);
                                             let target_name = shown_finalizer(&finalizer_addresses, &staking_action.target_finalizer_pk(), staking_action.target_finalizer_address());
 
                                             if sent_stake {
@@ -3287,22 +3374,16 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 break 'get_label frame_strf!(data, "{} @ {}", label, tx_h.0);
                                             }
 
-                                            let withdrawal = 'withdrawal: {
-                                                let mut tx_i = index+1;
-                                                while tx_i < txs.len() {
-                                                    if txs[tx_i].is_on_bc() && txs[tx_i].h.is_in_block() {
-                                                        if let (Some(staking_action), WalletTxKind::ClaimUnstake) = (txs[tx_i].staking_action, txs[tx_i].kind()) {
-                                                            // NOTE: ignoring fee
-                                                            let b = WalletTxPart::from_staking_action(txs[tx_i].staking_action);
-                                                            break 'withdrawal Some((b, txs[tx_i].h));
-                                                        }
+                                            if tx_kind == WalletTxKind::BeginUnstake {
+                                                for bond in &staked_roster_unbonded {
+                                                    // u64::MAX is the placeholder for a value the wallet has not learned yet
+                                                    if bond.0 == staking_action.bond_key() && bond.2 != u64::MAX {
+                                                        break 'get_label frame_strf!(data, "{} @ {}, now {} cTAZ", label, tx_h.0, str_from_ctaz(bond.2))
                                                     }
-                                                    tx_i += 1;
                                                 }
-                                                None
-                                            };
+                                            }
 
-                                            if let Some(withdrawal) = withdrawal {
+                                            if let Some(withdrawal) = claim_for_bond(&txs, staking_action.bond_key()) {
                                                 let (b, h) = withdrawal;
                                                 break 'get_label if sent_stake {
                                                     frame_strf!(data, "{} @ {} to {}, claimed @ {} for {} cTAZ", label, tx_h.0, target_name, h, str_from_ctaz(b.spent_zats.into_u64()))
@@ -3653,13 +3734,14 @@ pub fn ui_right_pane(ui: &mut Context,
                         ui.text("Connected less than:", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl });
 
                         let textbox_id = ui::id("Seconds since connected Textbox");
+                        seed_seconds_textbox(&mut data.textboxes, textbox_id.id, filters.filter_seconds_since_connected);
                         let secs_string = ui.textbox(
                             data,
                             textbox_id,
                             "∞",
                             TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
                         );
-                        let textbox_state = data.textboxes.entry(textbox_id.id).or_insert_with(|| TextboxState { text_buf: vec!['1', '5'], ..Default::default() });
+                        let textbox_state = data.textboxes.entry(textbox_id.id).or_default();
                         textbox_state.text_buf.retain(|c| (*c >= '0' && *c <= '9') || *c == '∞');
                         let len = textbox_state.text_buf.len();
                         textbox_state.selection.0 = textbox_state.selection.0.min(len); // @Todo: this is very likely not the best thing to do here
@@ -5486,5 +5568,119 @@ mod stake_amount_tests {
             assert_eq!(format_stake_amount(zats), shown, "{zats} zats");
             assert_eq!(format_stake_amount(zats), format!("{} cTAZ", str_from_ctaz(zats)));
         }
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::*;
+
+    #[test]
+    fn abbreviate_ends_counts_characters_not_bytes() {
+        assert_eq!(abbreviate_ends("0123456789abcdefXYZ", 8), "[01234567..bcdefXYZ]");
+        assert_eq!(abbreviate_ends("0123456789abcdef", 8), "[01234567..89abcdef]");
+
+        // Three bytes each: byte 8 falls inside the third character, the old crash.
+        assert_eq!(abbreviate_ends("你好世界你好", 8), "[你好世界你好]");
+        assert_eq!(abbreviate_ends("一二三四五六七八九十甲乙丙丁戊己庚辛", 8), "[一二三四五六七八..甲乙丙丁戊己庚辛]");
+
+        // Two bytes each.
+        assert_eq!(abbreviate_ends("абвгдежзийклмнопрст", 8), "[абвгдежз..лмнопрст]");
+
+        // One multi-byte character straddling byte 8 and one straddling len - 8.
+        assert_eq!(abbreviate_ends("1234567é90123456é8901234", 8), "[1234567é..é8901234]");
+        assert_eq!(abbreviate_ends("ab😀cdefghijklmnopq€rs", 8), "[ab😀cdefg..mnopq€rs]");
+
+        assert_eq!(abbreviate_ends("short", 8), "[short]");
+        assert_eq!(abbreviate_ends("fifteen chars!!", 8), "[fifteen chars!!]");
+        assert_eq!(abbreviate_ends("", 8), "[]");
+    }
+
+    #[test]
+    fn pasted_address_is_trimmed_printable_and_capped() {
+        assert_eq!(pasted_address("  \t utest1abc \r\n"), "utest1abc");
+        assert_eq!(pasted_address("ut\u{0}est\u{7}1\u{1b}[31m\u{7f}abc"), "utest1[31mabc");
+        assert_eq!(pasted_address("ut est"), "ut est");
+        assert_eq!(pasted_address("\n\n"), "");
+
+        let long: String = "é".repeat(600);
+        let capped = pasted_address(&long);
+        assert_eq!(capped.chars().count(), PASTED_ADDRESS_MAX_CHARS);
+        assert_eq!(capped, "é".repeat(PASTED_ADDRESS_MAX_CHARS));
+    }
+}
+
+#[cfg(test)]
+mod claim_lookup_tests {
+    use super::*;
+    use wallet::{StakingAction, WalletTx};
+
+    fn tx(action: StakingAction, h: u32) -> WalletTx {
+        let mut tx = WalletTx::with_fake_data(WalletTxKind::Stake, 0, 0, false, false, "", h);
+        tx.staking_action = Some(action);
+        tx
+    }
+
+    #[test]
+    fn claim_for_bond_matches_the_bond_key() {
+        let (_, key, _) = wallet::bft::finalizer_key_from_seed(b"gui-claim-lookup");
+        let f = wallet::bft::FinalizerAddress::create(&key);
+        let (a, b) = ([0xaa; 32], [0xbb; 32]);
+        let stake    = |k, amount_zats, h| tx(StakingAction::CreateNewDelegationBond { amount_zats, unique_pubkey: k, bond_salt: [0; 32], target_finalizer: f, signature: [0; 64] }, h);
+        let unstake  = |k, h| tx(StakingAction::BeginDelegationUnbonding { unique_pubkey: k, signature: [0; 64] }, h);
+        let withdraw = |k, amount_zats, h| tx(StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey: k, signature: [0; 64] }, h);
+
+        // Newest first, as the history shows it: bond A's whole life, then bond B's.
+        let mut txs = vec![
+            withdraw(b, 1_030_000_000, 600),
+            unstake(b, 520),
+            stake(b, 1_000_000_000, 400),
+            withdraw(a, 102_000_000, 300),
+            unstake(a, 200),
+            stake(a, 100_000_000, 100),
+        ];
+
+        let (part, h) = claim_for_bond(&txs, b).unwrap();
+        assert_eq!((h, part.spent_zats.into_u64()), (BlockHeight(600), 1_030_000_000));
+        let (part, h) = claim_for_bond(&txs, a).unwrap();
+        assert_eq!((h, part.spent_zats.into_u64()), (BlockHeight(300), 102_000_000));
+
+        // B unstaked but not yet withdrawn must not borrow A's claim.
+        txs.remove(0);
+        assert!(claim_for_bond(&txs, b).is_none());
+        assert_eq!(claim_for_bond(&txs, a).unwrap().0.spent_zats.into_u64(), 102_000_000);
+
+        // A claim that left the chain is not a claim.
+        let mut dropped = withdraw(b, 1_030_000_000, 600);
+        dropped.status = wallet::TxStatus::SoftFail(BlockHeight(600));
+        txs.insert(0, dropped);
+        assert!(claim_for_bond(&txs, b).is_none());
+    }
+}
+
+#[cfg(test)]
+mod finalizer_filter_tests {
+    use super::*;
+
+    #[test]
+    fn seconds_textbox_seed_survives_the_textbox() {
+        // id() needs a live Clay context; any key exercises the map the same way.
+        let id = 0x5ec0_0d5;
+        let mut textboxes: HashMap<u32, TextboxState> = HashMap::new();
+
+        seed_seconds_textbox(&mut textboxes, id, FinalizerFilters::default().filter_seconds_since_connected);
+        // What ui.textbox does with the entry on its first call.
+        let state = textboxes.entry(id).or_default();
+        assert_eq!(state.text_buf, vec!['1', '5']);
+
+        // Later passes must not overwrite what the user typed.
+        state.text_buf = vec!['3'];
+        seed_seconds_textbox(&mut textboxes, id, 15);
+        assert_eq!(textboxes[&id].text_buf, vec!['3']);
+
+        // A stored "no time filter" opens as the empty box, which parses back to 0.
+        let mut textboxes: HashMap<u32, TextboxState> = HashMap::new();
+        seed_seconds_textbox(&mut textboxes, id, 0);
+        assert!(textboxes[&id].text_buf.is_empty());
     }
 }
