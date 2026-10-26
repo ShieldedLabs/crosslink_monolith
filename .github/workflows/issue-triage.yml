@@ -48,11 +48,12 @@ jobs:
         1. Check the issue's main claims against the code.
         2. Look for a duplicate in triage_input/issues.txt, and in reviews/, the security review findings indexed by reviews/REVIEW_STATUS.md.
         3. Look for a fix already on dev: start with the git log for commits whose message mentions the issue number, then the code the issue names.
-        4. Rate the bug as reported, even if it is fixed on dev:
+        4. Rate the issue as reported, even if it is fixed on dev. Severity measures the harm a defect does, so a planned task, missing feature, design question or chore gets none rather than a guess:
            - sev:critical: exploitable now on the live featurenet to halt finality, split consensus, or lose or steal funds.
            - sev:high: anyone, or ordinary use, can crash a node, corrupt its state, or block staking or sending with no workaround; or a security flaw that must be fixed before mainnet.
            - sev:medium: a broken feature with a workaround, a misleading UI or error, or a weakness nobody can exploit.
            - sev:low: cosmetic, docs or minor UX.
+           - none: not a defect.
         5. Give the reason in one or two plain sentences, with no links and no @-mentions.
 
         Leave duplicate_issue at 0, duplicate_review empty and fixed_by empty when there is none. duplicate_review is a review finding ID such as K5 or C7.1; fixed_by holds commit hashes.
@@ -60,7 +61,7 @@ jobs:
         {"type": "object", "additionalProperties": false,
         "required": ["severity", "area", "reason", "duplicate_issue", "duplicate_review", "fixed_by"],
         "properties": {
-        "severity": {"type": "string", "enum": ["sev:critical", "sev:high", "sev:medium", "sev:low"]},
+        "severity": {"type": "string", "enum": ["sev:critical", "sev:high", "sev:medium", "sev:low", "none"]},
         "area": {"type": "string", "enum": ["App", "BFT", "BFT/networking", "Bonds", "Database", "Featurenet", "Fees", "Finalizer UX", "Infra", "Mining", "Networking", "PoW sync", "RPC", "Reward", "Slashing", "Staking", "Staking TX", "Sync", "Testing", "UI", "Visualization", "Wallet", "Wallet CLI"]},
         "reason": {"type": "string", "maxLength": 400},
         "duplicate_issue": {"type": "integer", "minimum": 0},
@@ -267,15 +268,17 @@ jobs:
       ENGINE: ${{ needs.triage.outputs.engine }}
     steps:
       - name: File on the Crosslink board
+        id: board
         env:
           GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
         run: |
           set -euo pipefail
           # Plain GraphQL, like project-timeframe-done.yml: `gh project` fails with this token ("unknown owner type").
           info=$(gh api graphql -F number="$ISSUE" -f owner="$GITHUB_REPOSITORY_OWNER" -f name="${GITHUB_REPOSITORY#*/}" \
-            -f query='query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { id projectItems(first: 20) { nodes { id project { id } } } } } }' \
+            -f query='query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { id projectItems(first: 20) { nodes { id project { id } area: fieldValueByName(name: "Area") { ... on ProjectV2ItemFieldSingleSelectValue { name } } urgency: fieldValueByName(name: "Urgency") { ... on ProjectV2ItemFieldTextValue { text } } } } } } }' \
             --jq '.data.repository.issue')
-          item=$(jq -r '[.projectItems.nodes[] | select(.project.id == env.PROJECT_ID) | .id][0] // empty' <<<"$info")
+          node=$(jq -c '[.projectItems.nodes[] | select(.project.id == env.PROJECT_ID)][0] // {}' <<<"$info")
+          item=$(jq -r '.id // empty' <<<"$node")
           fields=$(gh api graphql -f project="$PROJECT_ID" \
             -f query='query($project: ID!) { node(id: $project) { ... on ProjectV2 { fields(first: 50) { nodes { ... on ProjectV2FieldCommon { id name } ... on ProjectV2SingleSelectField { options { id name } } } } } } }' \
             --jq '.data.node.fields.nodes')
@@ -297,22 +300,30 @@ jobs:
             set_option Status "new uncategorized"
           fi
           if [ -z "$OUT" ]; then exit 0; fi
-          set_option Area "$(jq -r .area <<<"$OUT")"
-          urgency=$(jq -r '.severity + ": " + (.reason | gsub("\\s+"; " ") | .[:200])' <<<"$OUT")
-          gh api graphql --silent -f project="$PROJECT_ID" -f item="$item" -f field="$(fid Urgency)" -f text="$urgency" \
-            -f query='mutation($project: ID!, $item: ID!, $field: ID!, $text: String!) { updateProjectV2ItemFieldValue(input: { projectId: $project, itemId: $item, fieldId: $field, value: { text: $text } }) { clientMutationId } }'
+          # Triage only fills in an empty Area or Urgency, so it never overwrites what people set.
+          if [ -n "$(jq -r '.area.name // empty' <<<"$node")" ]; then
+            echo "kept_area=true" >> "$GITHUB_OUTPUT"
+          else
+            set_option Area "$(jq -r .area <<<"$OUT")"
+          fi
+          if [ -z "$(jq -r '.urgency.text // empty' <<<"$node")" ] && [ "$(jq -r .severity <<<"$OUT")" != none ]; then
+            urgency=$(jq -r '.severity + ": " + (.reason | gsub("\\s+"; " ") | .[:200])' <<<"$OUT")
+            gh api graphql --silent -f project="$PROJECT_ID" -f item="$item" -f field="$(fid Urgency)" -f text="$urgency" \
+              -f query='mutation($project: ID!, $item: ID!, $field: ID!, $text: String!) { updateProjectV2ItemFieldValue(input: { projectId: $project, itemId: $item, fieldId: $field, value: { text: $text } }) { clientMutationId } }'
+          fi
 
       - name: Label and comment
         if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          KEPT_AREA: ${{ steps.board.outputs.kept_area }}
         run: |
           set -euo pipefail
           if [ -z "$OUT" ]; then echo "Triage returned nothing."; exit 0; fi
 
           sev=$(jq -r .severity <<<"$OUT")
-          case "$sev" in sev:critical|sev:high|sev:medium|sev:low) ;; *) echo "Unexpected severity."; exit 1 ;; esac
+          case "$sev" in sev:critical|sev:high|sev:medium|sev:low|none) ;; *) echo "Unexpected severity."; exit 1 ;; esac
           area=$(jq -r .area <<<"$OUT")
           [[ "$area" =~ ^[A-Za-z/\ ]{1,30}$ ]] || area="unknown"
           [[ "$ENGINE" =~ ^[A-Za-z0-9.\ -]{1,40}$ ]] || ENGINE="a model"
@@ -332,17 +343,23 @@ jobs:
           done
 
           declare -A color=([sev:critical]=b60205 [sev:high]=d93f0b [sev:medium]=fbca04 [sev:low]=0e8a16 [duplicate]=cfd3d7)
-          labels=("$sev")
+          labels=()
+          if [ "$sev" != none ]; then labels+=("$sev"); fi
           if [ "$dup" != 0 ]; then labels+=(duplicate); fi
           args=()
           for l in "${labels[@]}"; do
             gh label create "$l" --color "${color[$l]}" > /dev/null 2>&1 || true
             args+=(--add-label "$l")
           done
-          gh issue edit "$ISSUE" "${args[@]}"
+          for l in $(gh issue view "$ISSUE" --json labels --jq '.labels[].name | select(startswith("sev:"))'); do
+            if [ "$l" != "$sev" ]; then args+=(--remove-label "$l"); fi
+          done
+          if [ ${#args[@]} -gt 0 ]; then gh issue edit "$ISSUE" "${args[@]}"; fi
 
+          if [ "$sev" = none ]; then rating="**no severity**"; else rating="**$sev**"; fi
+          if [ -z "$KEPT_AREA" ]; then rating="$rating, area **$area**"; fi
           {
-            echo "Automated triage by $ENGINE: **$sev**, area **$area**. $reason"
+            echo "Automated triage by $ENGINE: $rating. $reason"
             if [ "$dup" != 0 ]; then echo; echo "Possible duplicate of #$dup."; fi
             if [ -n "$review" ]; then echo; echo "Matches review finding $review in [reviews/REVIEW_STATUS.md](https://github.com/$GH_REPO/blob/dev/reviews/REVIEW_STATUS.md)."; fi
             if [ -n "$fixes" ]; then echo; echo "Commits on \`dev\` that may already fix this:$fixes."; fi
