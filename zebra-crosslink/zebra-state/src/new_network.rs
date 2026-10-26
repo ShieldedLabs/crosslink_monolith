@@ -743,6 +743,9 @@ const MAX_BANDWIDTH_BYTES_PER_RES: usize = MAX_BANDWIDTH_BYTES_PER_MS * PEER_RES
 // x2: the budget sizes every in-flight block at MAX_BLOCK_BYTES, but real blocks are a small
 // fraction of that, so the unscaled count leaves most of the bandwidth budget unused.
 const MAX_BANDWIDTH_BLOCKS_PER_RES: usize = 2 * (MAX_BANDWIDTH_BYTES_PER_RES / zebra_chain::block::MAX_BLOCK_BYTES as usize);
+/// The share of that budget by-hash requests for BFT may hold. Honest validation needs a handful
+/// of hashes, so this binds only when proposals name blocks that do not exist.
+const MAX_BFT_BLOCKS_PER_RES: usize = MAX_BANDWIDTH_BLOCKS_PER_RES / 4;
 
 
 // use crate::crosslink::TFLServiceRequest;
@@ -2484,6 +2487,9 @@ pub fn sync(
             }
 
             let mut active_block_dls = 0;
+            // By-hash requests for BFT, counted apart: they are capped at a share of the budget,
+            // so hashes named in proposals can never crowd out near-tip sync.
+            let mut bft_block_dls = 0;
             let mut requests_by_hash: HashMap<Hash, usize> = HashMap::new();
             let mut requests_by_height: HashMap<u32, usize> = HashMap::new();
             const MAX_REQUEST_DUPLICATES_N: usize = 2; // TODO: reconsider @Prod
@@ -2503,6 +2509,9 @@ pub fn sync(
 
                         } else if hash_or_0 != block::Hash([0; 32]) {
                             requests_by_hash.entry(hash_or_0).and_modify(|c| *c += 1).or_insert(1);
+                            if height == u32::MAX {
+                                bft_block_dls += 1;
+                            }
                             let is_probe = !checkpoint_committed_locally && checkpoint.is_some_and(|cp| cp.height == height && cp.hash == hash_or_0);
                             if !is_probe { active_block_dls += 1; }
 
@@ -2571,7 +2580,7 @@ pub fn sync(
                 // peers directly; waiting for a hash to reappear in a moving STATUS window can
                 // deadlock BFT validation and every PoW block whose fat pointer names it.
                 for &hash in &missing_bft_pow_blocks {
-                    if active_block_dls >= MAX_BANDWIDTH_BLOCKS_PER_RES {
+                    if active_block_dls >= MAX_BANDWIDTH_BLOCKS_PER_RES || bft_block_dls >= MAX_BFT_BLOCKS_PER_RES {
                         break;
                     }
                     let dups = requests_by_hash.entry(hash).or_insert(0);
@@ -2589,6 +2598,7 @@ pub fn sync(
                     {
                         tracing::debug!("Requesting PoW block {hash} needed by BFT validation from peer {connection_key:?}");
                         active_block_dls += 1;
+                        bft_block_dls += 1;
                         *dups += 1;
                     }
                 }
@@ -3328,7 +3338,8 @@ pub fn sync(
                                     "Finalizers holding at least two thirds of the stake decided a chain containing block {hash} at height {}, which conflicts with the block this node committed at that height.",
                                     height.0,
                                 ),
-                                block_writer.finalized_state.db.path(),
+                                (height, hash),
+                                &block_writer.finalized_state.db,
                             );
                         }
                         drop_block!(hash, "Block at height {} is already finalized", height.0);

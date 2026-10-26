@@ -1198,6 +1198,8 @@ impl Service<ReadRequest> for ReadStateService {
                 crate::new_network::bft::bft_chain().read().unwrap().is_activated,
             )),
 
+            ReadRequest::CrosslinkBftDropped => Ok(ReadResponse::CrosslinkBftDropped(state.db.crosslink_bft_dropped())),
+
             // Used by the StateService.
             ReadRequest::Depth(hash) => Ok(ReadResponse::Depth(read::depth(
                 state.latest_best_chain(),
