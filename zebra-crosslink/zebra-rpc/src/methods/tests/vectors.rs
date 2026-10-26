@@ -227,7 +227,7 @@ async fn rpc_getdeprecationinfo_estimates_time_from_tip_with_safety_margin() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn rpc_getdeprecationinfo_omits_end_of_service_off_mainnet() {
+async fn rpc_getdeprecationinfo_omits_end_of_service_on_regtest() {
     let _init_guard = zebra_test::init();
 
     let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
@@ -237,7 +237,7 @@ async fn rpc_getdeprecationinfo_omits_end_of_service_off_mainnet() {
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, _rpc_tx_queue) = RpcImpl::new(
-        Network::new_default_testnet(),
+        Network::new_regtest(Default::default()),
         Default::default(),
         Default::default(),
         "0.0.1",
@@ -254,8 +254,8 @@ async fn rpc_getdeprecationinfo_omits_end_of_service_off_mainnet() {
         None,
     );
 
-    // Even if an end of support height is configured, `end_of_service` is only reported on
-    // Mainnet, matching zcashd and the RPC documentation.
+    // Even if an end of support height is configured, `end_of_service` is not reported on
+    // Regtest, where end of support is not enforced.
     let rpc = rpc.with_end_of_support_height(Some(Height(100)));
     let deprecation_info = rpc
         .get_deprecation_info()

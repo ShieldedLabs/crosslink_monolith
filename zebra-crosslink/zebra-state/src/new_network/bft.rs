@@ -283,6 +283,17 @@ pub async fn validate_bft_block(block: BftBlock) -> Result<(TMStatus, TMStatusRe
     rx.await.map_err(|_| "new_network dropped the validate reply".to_string())
 }
 
+/// The BFT block `bytes` encode, if they are that block's one canonical encoding.
+///
+/// Tenderlink certifies a hash of a proposal's raw bytes, but `decide` checks the hash of the
+/// block re-serialized. A proposal that parses but is not canonical (trailing bytes, for one)
+/// would be certified and then abort every node that reaches `decide`, so validation refuses it.
+fn bft_block_from_canonical_bytes(bytes: &[u8]) -> Option<BftBlock> {
+    let block = BftBlock::zcash_deserialize(bytes).ok()?;
+    let canonical = block.zcash_serialize_to_vec().ok()?;
+    (canonical == bytes).then_some(block)
+}
+
 /// Everything BFT needs from outside the state: the node's finalizer identity, where it listens,
 /// and who to connect to. The decided chain is persisted in the finalized database.
 pub struct BftLaunch {
@@ -1625,10 +1636,10 @@ impl BftRunner {
                 })
             })),
             tenderlink::ClosureToValidateProposedBlock(Arc::new(move |block| {
-                let parsed = BftBlock::zcash_deserialize(&block.0[..]);
+                let parsed = bft_block_from_canonical_bytes(&block.0);
                 Box::pin(async move {
-                    let Ok(block) = parsed else {
-                        tracing::error!("Failed to deserialize Tenderlink payload.");
+                    let Some(block) = parsed else {
+                        tracing::error!("Tenderlink payload is not a canonically encoded BFT block.");
                         return (TMStatus::Fail, TMStatusReason::None);
                     };
                     let (reply, rx) = tokio::sync::oneshot::channel();
@@ -1724,5 +1735,48 @@ fn recency_status_from(bft_state: &TMState, bft_key_address_map: &BftAddressMap)
         my_locked_round: bft_state.locked_value_round.1,
         my_valid_round: bft_state.valid_value_round.1,
         finalizer_statuses,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_block(version: u32) -> BftBlock {
+        let header = BcBlockHeader {
+            version: 4,
+            prev_block: BlockHash([1; 32]),
+            merkle_root: [2; 32],
+            final_sapling_root: [3; 32],
+            time: 4,
+            bits: 5,
+            nonce: [6; 32],
+            solution: vec![7; 1344],
+            fat_pointer_to_bft_block: FatPointerToBftBlock::null(),
+        };
+        BftBlock {
+            version,
+            height: 9,
+            previous_block_fat_ptr: FatPointerToBftBlock::null(),
+            headers: vec![header; 3],
+            hardforks: Vec::new(),
+            do_not_include_until_bc_height: if version >= 2 { 11 } else { 0 },
+        }
+    }
+
+    #[test]
+    fn only_the_canonical_encoding_of_a_bft_block_is_accepted() {
+        for version in [1, 2] {
+            let block = test_block(version);
+            let bytes = block.zcash_serialize_to_vec().unwrap();
+            assert_eq!(bft_block_from_canonical_bytes(&bytes), Some(block.clone()));
+
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert_eq!(BftBlock::zcash_deserialize(&trailing[..]).unwrap(), block);
+            assert_eq!(bft_block_from_canonical_bytes(&trailing), None);
+
+            assert_eq!(bft_block_from_canonical_bytes(&bytes[..bytes.len() - 1]), None);
+        }
     }
 }

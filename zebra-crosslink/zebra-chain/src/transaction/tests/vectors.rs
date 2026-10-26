@@ -1176,6 +1176,63 @@ fn v6_orchard_bundle_rejects_cross_address_flag_on_the_wire() {
     assert_eq!(tx, tx2);
 }
 
+/// A VCrosslink transaction round-trips and has a txid, while one whose bundle Zebra's lenient
+/// codec parses but librustzcash refuses, or one with a pre-NU6.3 branch id, MUST be rejected at
+/// deserialization: either would otherwise abort the node in the txid-path `expect(...)`.
+#[test]
+fn vcrosslink_transaction_is_rejected_unless_librustzcash_parses_it() {
+    use crate::ironwood;
+    use crate::orchard::{self, Flags, ShieldedDataV6};
+
+    let _init_guard = zebra_test::init();
+    let zero = Amount::try_from(0).expect("zero is a valid amount");
+
+    let vcrosslink = |network_upgrade: NetworkUpgrade, bundle: orchard::ShieldedData| {
+        Transaction::VCrosslink {
+            network_upgrade,
+            lock_time: LockTime::unlocked(),
+            expiry_height: block::Height(0),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: Some(ironwood::ShieldedData::new(ShieldedDataV6::new(bundle))),
+            staking_action: None,
+        }
+    };
+    let bundle = arbitrary::fake_v6_orchard_shielded_data(Flags::ENABLE_SPENDS, zero, 1);
+
+    let tx = vcrosslink(NetworkUpgrade::Nu6_3, bundle.clone());
+    let bytes = tx
+        .zcash_serialize_to_vec()
+        .expect("VCrosslink transaction serializes");
+    let tx2: Transaction = bytes
+        .zcash_deserialize_into()
+        .expect("VCrosslink transaction deserializes");
+    assert_eq!(tx, tx2);
+    assert_eq!(tx2.hash(), tx.hash());
+
+    let mut padded = bundle.clone();
+    padded.proof.0.push(0);
+    let bytes = vcrosslink(NetworkUpgrade::Nu6_3, padded)
+        .zcash_serialize_to_vec()
+        .expect("VCrosslink transaction serializes");
+    let result: Result<Transaction, _> = bytes.zcash_deserialize_into();
+    assert!(
+        result.is_err(),
+        "a VCrosslink bundle that librustzcash refuses must be rejected on the wire",
+    );
+
+    let bytes = vcrosslink(NetworkUpgrade::Nu6, bundle)
+        .zcash_serialize_to_vec()
+        .expect("VCrosslink transaction serializes");
+    let result: Result<Transaction, _> = bytes.zcash_deserialize_into();
+    assert!(
+        result.is_err(),
+        "a pre-NU6.3 VCrosslink transaction must be rejected on the wire",
+    );
+}
+
 #[test]
 fn test_coinbase_script() -> Result<()> {
     let _init_guard = zebra_test::init();

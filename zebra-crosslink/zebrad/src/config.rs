@@ -291,9 +291,9 @@ impl ZebradConfig {
 
             state: zebra_state::config::Config {
                 network_initial_peers: vec![
-                    "[::ffff:45.63.75.9]:12001:1fgEw5Nx:-w4ArAa4esTUBjgig6xIQJ4N8DlwL5aufGMcDPGzPE4".to_owned(),
-                    "[::ffff:70.34.220.94]:12001:1fgEw5Nx:CgjQzIjxFknQOJfxKP4H5adl3uzGfAN1D0219Q3JSyw".to_owned(),
-                    "[::ffff:64.177.44.176]:12001:1fgEw5Nx:jY7963HX-GzMkOhi1c7kxmeKXC4juGhwY2l4NlQheBs".to_owned(),
+                    "[::ffff:45.63.75.9]:12001:-fCmrBqp:-w4ArAa4esTUBjgig6xIQJ4N8DlwL5aufGMcDPGzPE4".to_owned(),
+                    "[::ffff:70.34.220.94]:12001:-fCmrBqp:CgjQzIjxFknQOJfxKP4H5adl3uzGfAN1D0219Q3JSyw".to_owned(),
+                    "[::ffff:64.177.44.176]:12001:-fCmrBqp:jY7963HX-GzMkOhi1c7kxmeKXC4juGhwY2l4NlQheBs".to_owned(),
                 ],
                 ..Default::default()
             },

@@ -81,13 +81,20 @@ const ANSI_YLW: &'static str = "\x1b[93m";
 const ANSI_BLU: &'static str = "\x1b[34m";
 const ANSI_RST: &'static str = "\x1b[0m";
 
-const PATH_MTU: usize = max_single_datagram_message_size(CRYPTO_MAGIC).unwrap();
+// Signed application format, also persisted with proposal signatures: STP 0.2 used
+// 1184 UDP bytes - 22 crypto bytes - 8 framing bytes = 1154 application bytes.
+// Do not derive this from the transport MTU: STP 1.0 fits 1179 application bytes,
+// but changing these chunk boundaries invalidates signatures in existing history.
+const PROPOSAL_PACKET_SIZE: usize = 1154;
+const_assert!(PROPOSAL_PACKET_SIZE <= max_single_datagram_message_size(CRYPTO_MAGIC).unwrap());
 
 // Tweak this!
 const MAX_BANDWIDTH_BYTES_PER_SECOND: usize = 1_000_000;
 
 
-pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+// STP 2.0 replaced the magic1 selectors (and the Crosslink magic2); peers on the 1.x or
+// 0.x selectors fail closed, so every peer upgrades together.
+pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
 // pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
 
@@ -205,7 +212,7 @@ fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMembe
         let mut sign_data = [0; 76 - 32];
         round_data.proposal_id.0.write_to(&mut sign_data[0..32]);
         round_data.height.write_to(&mut sign_data[32..]);
-        (round_data.round + 0x8000_0000).write_to(&mut sign_data[40..]);
+        (round_data.round | PRECOMMIT_ROUND_BIT).write_to(&mut sign_data[40..]);
         vote_for_block_without_finalizer_public_key = sign_data;
     }
 
@@ -857,6 +864,12 @@ impl TMState {
             return TMStatus::Fail;
         }
 
+        // No honest node ever reaches a round with this bit set, and a vote signed for one would
+        // count as a vote of the other kind in another round (see `PRECOMMIT_ROUND_BIT`).
+        if round & PRECOMMIT_ROUND_BIT != 0 {
+            return TMStatus::Fail;
+        }
+
         // check if in (active) roster
         if roster_i >= active_roster_len(roster) {
             let ctx_str  = self.ctx_str(roster);
@@ -1500,7 +1513,7 @@ pub use crate::stp::fmt_prefixed_byte_str_rev;
 pub use crate::stp::CONNECT_MAGIC1_PLAIN_TEXT;
 pub use crate::stp::{total_packet_payload_overhead_from_connect_magic1_inside_udp_payload, max_single_datagram_message_size};
 pub use crate::stp::new_keypair_from_connect_magic1_with_seed;
-pub use crate::stp::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+pub use crate::stp::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
 
 
 pub const MAX_P2P_DISCOVERY_PUBKEY_SIZE: usize = 32;
@@ -1566,11 +1579,20 @@ fn sign_with_namespace(key: &SigningKey, data: &[u8], namespace: &[u8; 32]) -> [
     }
 }
 
+// The signed bytes of a vote carry its round with this bit set for a precommit and clear for a
+// prevote. So a round that already has the bit set signs the same bytes as some vote of another
+// round: a precommit in round 0x8000_0000 + r is a precommit in round r, and, if the bit were
+// added rather than or-ed in, a prevote in round r would be a precommit in round 0x8000_0000 + r.
+// Rounds that high are refused on receipt (`check_and_incorporate_msg`); otherwise anyone holding
+// honest votes could replay them as votes of another kind and round, and the round-catchup rule
+// would move every finalizer to a round whose timeouts last decades.
+const PRECOMMIT_ROUND_BIT: u32 = 0x8000_0000;
+
 fn make_vote_sign_datas(pub_key: PubKeyID, is_precommit: bool, height: u64, round: u32, value_id: ValueId) -> [[u8; 76]; 2] {
     let mut sign_data_no = [0; 76];
     sign_data_no[0..32].copy_from_slice(&pub_key.0[..]);
     height.write_to(&mut sign_data_no[64..]);
-    (round + 0x8000_0000 * (is_precommit as u32)).write_to(&mut sign_data_no[72..]);
+    (round | if is_precommit { PRECOMMIT_ROUND_BIT } else { 0 }).write_to(&mut sign_data_no[72..]);
     let mut sign_data_yes = sign_data_no;
     value_id.0.write_to(&mut sign_data_yes[32..64]);
     [sign_data_no, sign_data_yes]
@@ -1769,7 +1791,7 @@ pub fn attach_synthetic_bft_peer(index: u16) -> SyntheticBftPeer {
     let address = STPAddress {
         ip: std::net::Ipv4Addr::new(127, 3, hi, lo).to_ipv6_mapped(),
         port: 8234,
-        magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s,
+        magic1: CRYPTO_MAGIC,
         key,
     };
     let mut handshake_hash = [0x5f; 64];
@@ -1914,7 +1936,9 @@ pub fn proposal_chunk_packets(signing_key: &SigningKey, value: &[u8], value_id: 
         let hdr = PacketProposalChunkHeader {
             chunk_i: chunk_i as u32, proposal_size: value.0.len() as u32, round, valid_round, height, proposal_id: value_id,
         };
-        let mut buf = vec![0u8; PATH_MTU];
+        // Header, status, chunk header, chunk and signature fit the signed packet size by
+        // construction: a chunk holds at most PROPOSAL_CHUNK_DATA_SIZE bytes.
+        let mut buf = vec![0u8; PROPOSAL_PACKET_SIZE];
         let mut header = PacketHeader::new::<PACKET_TYPE_PROPOSAL_CHUNK>();
         header.tag |= PACKET_TAG_STATUS_FLAG as u64;
         let mut o = header.write_to(&mut buf);
@@ -1968,6 +1992,36 @@ pub fn sent_consensus(packet: &[u8]) -> Vec<SentConsensus> {
 }
 
 
+/// Serialize the signed application chunk, including restored proposal signatures. The outer
+/// packet header/status are not signed and are written by the caller.
+fn write_signed_proposal_chunk(round_data: &RoundData, chunk_i: usize,
+                               proposer_pub_key: PubKeyID, ctx_str: &str, buf: &mut [u8]) -> Option<usize> {
+    let chunk_hdr = PacketProposalChunkHeader {
+        height: round_data.height, round: round_data.round,
+        chunk_i: chunk_i.try_into().unwrap(),
+        proposal_size: round_data.proposal.0.len().try_into().unwrap(),
+        proposal_id: round_data.proposal_id,
+        valid_round: round_data.proposal_valid_round,
+    };
+    let mut o = chunk_hdr.write_to(buf);
+    let (chunk_o, chunk_size) = round_data.proposal.chunk_o_size(chunk_i);
+    o += round_data.proposal.0[chunk_o..chunk_o + chunk_size].write_to(&mut buf[o..]);
+    let sig_o = o;
+    o += round_data.proposal_sigs[chunk_i].0.write_to(&mut buf[o..]);
+
+    #[cfg(debug_assertions)] // self-check signatures as sanity check
+    match round_data.proposal_sigs[chunk_i].verify_with_namespace(proposer_pub_key, &buf[..sig_o], &round_data.vote_namespace) {
+        Ok(_) => {}
+        Err((err, str)) => {
+            if PRINT_BFT_SIG_FAULT {
+                eprintln!("{ctx_str}: {ANSI_RED}BFT FAULT{ANSI_RST}: {str} [..{}): for proposal from {proposer_pub_key:?} {}.{}.{chunk_i}: {} {err}", sig_o-1, round_data.height, round_data.round, chunk_hdr.proposal_id);
+            }
+            return None;
+        }
+    }
+    Some(o)
+}
+
 pub async fn entry_point(my_root_private_key: SigningKey,
                          my_stp_keypair: Option<IdentityKeyPair>,
                          my_endpoint: Option<STPAddress>,
@@ -2008,10 +2062,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     use crate::stp::*;
     use crate::native_sockets::*;
+    use crate::transport::{new_network_thread, service_connections, NetworkThreadPush};
 
     let my_port = my_endpoint.map(|e| e.port).unwrap_or(23485); // @Dev: .unwrap_or(0); // @Todo! Get local port after sock creation! @@@
     // small min keeps the send buffer rate-adaptive (clamp(1s * rate, 512KiB, 256MiB)) instead of a flat 256MiB/conn
-    let network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
+    let mut network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
     let mut initiate_connections = Vec::<STPAddress>::new();
     let mut messages_to_send = Vec::new();
@@ -2238,12 +2293,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         send_stp_msg(messages_to_send, connection_key, &send_buf1[..o], stats);
                     }
 
-                    let mut chunk_hdr = PacketProposalChunkHeader {
-                        height, round, chunk_i: 0,
-                        proposal_size: round_data.proposal.0.len().try_into().unwrap(),
-                        proposal_id: round_data.proposal_id,
-                        valid_round: round_data.proposal_valid_round,
-                    };
                     let (_, proposer_pub_key) = TMState::proposer_from_height_round(&bft_state.hash_keys, &round_data.roster, height, round);
 
                     let mut sent_chunk_cs = 0;
@@ -2253,33 +2302,16 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         for chunk_i in 0..round_data.proposal_sigs.len() {
                             // send all of the proposal chunks we've seen
                             if round_data.proposal_sigs[chunk_i] != TMSig::NIL {
-                                chunk_hdr.chunk_i = chunk_i as u32;
-
                                 let mut o = 0;
 
                                 let header = PacketHeader::new::<PACKET_TYPE_PROPOSAL_CHUNK>();
                                 // @Todo @Speed: We should build the header once and save it for all chunks. Peers only obey the latest status anyway.
                                 o += write_header_and_maybe_status(header, true, bft_state, roster, &mut send_buf1[o..], peer.index_counter); peer.index_counter += 1;
-                                let signed_data_start = o; // past header+status
 
-                                o += chunk_hdr.write_to(&mut send_buf1[o..]);
-
-                                let (chunk_o, chunk_size) = round_data.proposal.chunk_o_size(chunk_i);
-                                o += round_data.proposal.0[chunk_o..chunk_o + chunk_size].write_to(&mut send_buf1[o..]);
-                                let sig_o = o;
-                                o += round_data.proposal_sigs[chunk_i].0.write_to(&mut send_buf1[o..]);
-
-                                #[cfg(debug_assertions)] // self-check signatures as sanity check
-                                match round_data.proposal_sigs[chunk_i].verify_with_namespace(proposer_pub_key, &send_buf1[signed_data_start..sig_o], &round_data.vote_namespace) {
-                                    Ok(_) => {}
-                                    Err((err, str)) => {
-                                        if PRINT_BFT_SIG_FAULT {
-                                            eprintln!("{ctx_str}: {ANSI_RED}BFT FAULT{ANSI_RST}: {str} [..{}): for proposal from {proposer_pub_key:?} {height}.{round}.{chunk_i}: {} {err}", sig_o-1, chunk_hdr.proposal_id);
-                                        }
-                                        continue;
-                                    }
-                                }
-
+                                let Some(written) = write_signed_proposal_chunk(round_data, chunk_i, proposer_pub_key, ctx_str, &mut send_buf1[o..]) else {
+                                    continue;
+                                };
+                                o += written;
                                 if PRINT_SENDS { println!("{ctx_str} {ANSI_GRY}SENDS{ANSI_RST}: sending proposal chunk {} to {:?}", chunk_i, peer_bft_key); }
                                 sent_chunk_cs += 1;
                                 print_packet_tag_send(header);
@@ -2642,7 +2674,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             false
         });
         let wanted_connections = current_connections.iter().filter(|(address, _)| !synthetic_bft_peers.iter().any(|p| p.address == *address)).cloned().collect();
-        let resp = service_connections(&network_thread_handle, NetworkThreadPush { initiate_connections, wanted_connections, send_unreliable: messages_to_send, }).unwrap_or_default();
+        let resp = service_connections(&mut network_thread_handle, NetworkThreadPush { initiate_connections, wanted_connections, send_unreliable: messages_to_send, ..Default::default() }).unwrap_or_default();
         current_connections = resp.current_connections;
         initiate_connections = Vec::new();
         let mut messages_received = resp.received_unreliable_messages;
@@ -3331,7 +3363,11 @@ impl PacketVotes {
             value_id:    ValueId(SliceRead::read_from(buf)?),
             ..Default::default()
         };
-        for i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
+        let votes_n = packet.no_votes_n as usize + packet.yes_votes_n as usize;
+        if votes_n > packet.votes.len() {
+            return None;
+        }
+        for i in 0..votes_n {
             packet.votes[i].roster_i = u16::read_from(buf)?;
             packet.votes[i].sig.0    = SliceRead::read_from(buf)?;
         }
@@ -3438,7 +3474,7 @@ pub const PEER_ATTESTATION_SERIALIZED_SIZE: usize = // @Volatile.
 
 
 pub const PROPOSAL_PACKET_EXTRA:    usize = (PACKET_HEADER_SIZE + PACKET_STATUS_SIZE + 56 + 64);
-pub const PROPOSAL_CHUNK_DATA_SIZE: usize = PATH_MTU - PROPOSAL_PACKET_EXTRA;
+pub const PROPOSAL_CHUNK_DATA_SIZE: usize = PROPOSAL_PACKET_SIZE - PROPOSAL_PACKET_EXTRA;
 /// The largest value a proposer may propose. A node allocates the size the first chunk's header
 /// names before it has any of the bytes, so the header must not be able to name an arbitrary one.
 pub const PROPOSAL_MAX_SIZE:        usize = 1 << 20;
@@ -3658,7 +3694,8 @@ pub fn run_instances(i: usize) {
 }
 
 pub mod p2p_test;
-pub use shielded_transport_pigeon::{stp, native_sockets, nym_sockets};
+pub use shielded_transport_pigeon::{stp, native_sockets};
+pub mod transport;
 pub mod helpers;
 
 use helpers::*;
@@ -3666,6 +3703,104 @@ use helpers::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Restored signatures are over the legacy application format, not the active STP MTU.
+    /// Exercise the production sender serializer and receiver authentication through real Pumps.
+    #[test]
+    fn restored_legacy_proposal_chunks_cross_stp1_and_authenticate() {
+        use crate::transport::{NetworkThreadHandle, NetworkThreadPush, TransportLimits};
+        use crate::stp::new_keypair_from_connect_magic1;
+        let (mut receiver, roster) = dup_state();
+        let namespace = [0x42; 32];
+        receiver.vote_namespace = namespace;
+        let bytes: Vec<u8> = (0..6 * 990 + 400).map(|i| (i % 251) as u8).collect();
+        let value_id = BlockValue(bytes.clone()).id_from_value(&receiver.hash_keys);
+        let mut stored_sigs = Vec::new();
+        // Intentionally independent of PROPOSAL_CHUNK_DATA_SIZE and chunk_o_size: this
+        // is the persisted 0.2 format (1154-byte packets, 990 signed data bytes per chunk).
+        for (chunk_i, chunk) in bytes.chunks(990).enumerate() {
+            let hdr = PacketProposalChunkHeader {
+                height: 0, round: 0, chunk_i: chunk_i.try_into().unwrap(),
+                proposal_size: bytes.len().try_into().unwrap(), proposal_id: value_id, valid_round: -1,
+            };
+            let mut signed = [0; 2048];
+            let mut o = hdr.write_to(&mut signed);
+            o += chunk.write_to(&mut signed[o..]);
+            stored_sigs.push(TMSig(sign_with_namespace(&receiver.my_signing_key, &signed[..o], &namespace)));
+        }
+        // Restore the same fields as new_network::bft::decided_round_data, without re-signing.
+        let mut restored = RoundData::EMPTY;
+        restored.proposal = BlockValue(bytes.clone());
+        restored.proposal_id = value_id;
+        restored.proposal_valid_round = -1;
+        restored.proposal_sigs_n = stored_sigs.len();
+        restored.proposal_sigs = stored_sigs;
+        restored.vote_namespace = namespace;
+
+        let free_port = || {
+            let socket = std::net::UdpSocket::bind("[::1]:0").unwrap();
+            socket.local_addr().unwrap().port()
+        };
+        let a_key = new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+        let b_key = new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+        let (a_port, b_port) = (free_port(), free_port());
+        let b_addr = STPAddress::from(Ipv6Addr::LOCALHOST, b_port, &b_key);
+        let mut a = NetworkThreadHandle::new(vec![a_key], a_port, None,
+            (1_000_000, 512 * 1024, 32 << 20), TransportLimits::default());
+        let mut b = NetworkThreadHandle::new(vec![b_key], b_port, None,
+            (1_000_000, 512 * 1024, 32 << 20), TransportLimits::default());
+        let to_b = b_addr.connection_key();
+        let mut push = NetworkThreadPush { initiate_connections: vec![b_addr], ..Default::default() };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !a.is_connected(to_b) {
+            let pull = a.service(std::mem::take(&mut push));
+            push.wanted_connections = pull.current_connections;
+            b.service(NetworkThreadPush::default());
+            assert!(std::time::Instant::now() < deadline, "connect timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        for chunk_i in 0..restored.proposal_sigs.len() {
+            let mut packet = [0; 2048];
+            let mut header = PacketHeader::new::<PACKET_TYPE_PROPOSAL_CHUNK>();
+            header.tag |= PACKET_TAG_STATUS_FLAG as u64;
+            let mut o = header.write_to(&mut packet);
+            o += PacketStatus::default().write_to(&mut packet[o..]);
+            if let Some(n) = write_signed_proposal_chunk(&restored, chunk_i, roster[0].pub_key, "restored regression", &mut packet[o..]) {
+                o += n;
+                push.send_unreliable.push((to_b, packet[..o].to_vec()));
+            }
+        }
+        let sent = push.send_unreliable.len();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut received = 0;
+        while received < 7 && std::time::Instant::now() < deadline {
+            let pull = a.service(std::mem::take(&mut push));
+            push.wanted_connections = pull.current_connections;
+            for (_, packet) in b.service(NetworkThreadPush::default()).received_unreliable_messages {
+                let mut input = &packet[..];
+                let header = PacketHeader::read_from(&mut input).unwrap();
+                assert_eq!(header.type_(), PACKET_TYPE_PROPOSAL_CHUNK);
+                assert!(header.has_status());
+                PacketStatus::read_from(&mut input).unwrap();
+                let signed_data = input;
+                let hdr = PacketProposalChunkHeader::read_from(&mut input).unwrap();
+                let chunk_size = input.len() - 64;
+                let sig = TMSig(input[chunk_size..].try_into().unwrap());
+                // Authenticate exactly the serialized header+chunk, as the receive path does.
+                assert_eq!(receiver.check_and_incorporate_msg(hdr.height, hdr.round,
+                    hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round, &roster, 0,
+                    PACKET_TYPE_PROPOSAL_CHUNK, &signed_data[..signed_data.len() - 64], sig), TMStatus::Pass);
+                received += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!((sent, received), (7, 7), "restored signatures must not be silently skipped");
+        assert_eq!(receiver.rounds_data[0].proposal_sigs_n, 7);
+        assert_eq!(receiver.rounds_data[0].proposal.0, bytes);
+        assert_eq!(PROPOSAL_CHUNK_DATA_SIZE, 990);
+        assert!(PROPOSAL_PACKET_SIZE <= max_single_datagram_message_size(CRYPTO_MAGIC).unwrap());
+        assert_eq!(a.stats().outbox_dropped_messages, 0);
+    }
 
     fn dup_state() -> (TMState, [SortedRosterMember; 1]) {
         let key = SigningKey::from([7u8; 32]);
@@ -3681,6 +3816,43 @@ mod tests {
         );
         state.insert_round(0, 0, &roster);
         (state, roster)
+    }
+
+    #[test]
+    fn vote_packet_with_more_votes_than_slots_is_refused() {
+        let read = |no_votes_n: u8, yes_votes_n: u8| {
+            let mut buf = vec![no_votes_n, yes_votes_n];
+            buf.resize(2 + 4 + 8 + 32 + 510 * (2 + 64), 0);
+            PacketVotes::read_from(&mut &buf[..])
+        };
+        assert!(read(18, 0).is_some());
+        assert!(read(9, 9).is_some());
+        assert!(read(0, 19).is_none());
+        assert!(read(10, 10).is_none());
+        assert!(read(255, 255).is_none());
+    }
+
+    #[test]
+    fn votes_in_a_round_with_the_precommit_bit_are_refused() {
+        let (mut state, roster) = dup_state();
+        let value_id = ValueId([1; 32]);
+        let replay_round = PRECOMMIT_ROUND_BIT;
+
+        let precommit = make_vote_sign_datas(roster[0].pub_key, true, 0, 0, value_id)[1];
+        let replayed  = make_vote_sign_datas(roster[0].pub_key, true, 0, replay_round, value_id)[1];
+        assert_eq!(precommit, replayed, "the replay this guards against: same signed bytes, other round");
+        let sig = TMSig(sign_with_namespace(&state.my_signing_key, &precommit, &state.vote_namespace));
+        assert_eq!(state.check_and_incorporate_msg(0, replay_round, 0, value_id, -2, &roster, 0,
+            PACKET_TYPE_PRECOMMIT_SIGNATURES, &replayed, sig), TMStatus::Fail);
+
+        let prevote = make_vote_sign_datas(roster[0].pub_key, false, 0, replay_round | 5, value_id)[1];
+        let prevote_sig = TMSig(sign_with_namespace(&state.my_signing_key, &prevote, &state.vote_namespace));
+        assert_eq!(state.check_and_incorporate_msg(0, replay_round | 5, 0, value_id, -2, &roster, 0,
+            PACKET_TYPE_PREVOTE_SIGNATURES, &prevote, prevote_sig), TMStatus::Fail);
+
+        assert!(state.rounds_data.iter().all(|r| r.round & PRECOMMIT_ROUND_BIT == 0));
+        assert_eq!(state.check_and_incorporate_msg(0, 0, 0, value_id, -2, &roster, 0,
+            PACKET_TYPE_PRECOMMIT_SIGNATURES, &precommit, sig), TMStatus::Indeterminate);
     }
 
     #[test]

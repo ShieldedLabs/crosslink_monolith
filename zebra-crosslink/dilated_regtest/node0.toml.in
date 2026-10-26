@@ -49,7 +49,7 @@ delete_old_database = true
 ephemeral = false
 network_identity_seed_string = "This is node one."
 network_local_port = 12001
-network_initial_peers = ["[::ffff:127.0.0.1]:12002:1fgEw5Nx:kadD12IIrFqeXeftIyVA3mgLY4WovpjYK7dgWlVjR0g"]
+network_initial_peers = ["[::ffff:127.0.0.1]:12002:-fCmrBqp:kadD12IIrFqeXeftIyVA3mgLY4WovpjYK7dgWlVjR0g"]
 
 [state.network_checkpoint]
 height = 0

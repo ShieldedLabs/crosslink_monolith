@@ -28,11 +28,11 @@ impl<const N: usize> SliceRead for [u8; N] {
     fn read_from(buf: &mut &[u8]) -> Option<Self> { if buf.len() < N { return None; } let (b, rest) = buf.split_at(N); *buf = rest; Some(b.try_into().unwrap()) }
 }
 
-// Byte helpers, rate type and the Noise RNG resolver come from the transport crate.
+// Byte helpers and the rate type come from the transport crate.
 pub use shielded_transport_pigeon::helpers::{
     store_u64, load_u64, store_u48, load_u48, store_u32, load_u32,
     store_u24, load_u24, store_u16, load_u16,
-    BytesPerSecond, RustIsBadRngWrapper, SnowRngResolver,
+    BytesPerSecond,
 };
 
 use shielded_transport_pigeon::stp::ConnectionKey;

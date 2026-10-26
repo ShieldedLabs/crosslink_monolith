@@ -93,7 +93,7 @@ fn end_of_support_function() {
     // Panic is tested in `end_of_support_panic`
 }
 
-/// Test that the end of support height is reported on Mainnet and not on test networks.
+/// Test that the end of support height is reported on every network except Regtest.
 #[test]
 fn end_of_support_height_per_network() {
     // The reported height is the last supported height: `check()` runs at it without panicking
@@ -106,9 +106,14 @@ fn end_of_support_height_per_network() {
     );
     end_of_support::check(last_supported_height, &Network::Mainnet);
 
-    // End of support is not enforced on test networks, so no height is reported.
     assert_eq!(
         end_of_support::end_of_support_height(&Network::new_default_testnet()),
+        Some(last_supported_height)
+    );
+
+    // End of support is not enforced on Regtest, so no height is reported.
+    assert_eq!(
+        end_of_support::end_of_support_height(&Network::new_regtest(Default::default())),
         None
     );
 }
@@ -117,13 +122,8 @@ fn end_of_support_height_per_network() {
 #[test]
 #[tracing_test::traced_test]
 fn end_of_support_date() {
-    // Get the list of checkpoints.
-    let list = Network::Mainnet.checkpoint_list();
-
-    // Get the last one we have and use it as tip.
-    let higher_checkpoint = list.max_height();
-
-    end_of_support::check(higher_checkpoint, &Network::Mainnet);
+    // A tip at the release height is always inside the support range.
+    end_of_support::check(Height(ESTIMATED_RELEASE_HEIGHT), &Network::Mainnet);
     assert!(logs_contain(
         "Checking if Zebra release is inside support range ..."
     ));

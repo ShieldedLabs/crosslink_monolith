@@ -14,7 +14,7 @@ split-debuginfo = "unpacked"  # produce separate .pdb files
 lto = false
 
 [dependencies]
-shielded_transport_pigeon = "0.2.0"
+shielded_transport_pigeon = "2.0.0"
 blake3 = "1.8.2"
 byteorder = "1.5.0"
 ed25519-zebra = "4.1.0"

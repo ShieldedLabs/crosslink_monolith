@@ -18,6 +18,7 @@ use zebra_chain::serialization::ZcashSerialize;
 
 use tenderlink::stp::*;
 use tenderlink::native_sockets::*;
+use tenderlink::transport::{new_network_thread, service_connections, Channel, NetworkThreadPush};
 use tenderlink::{SliceWrite, SliceRead};
 use tenderlink::{dbg_panic, dbg_verify};
 
@@ -32,7 +33,9 @@ use checkpoint::Checkpoint;
 
 const JUMBO_FRAG_SIZE: usize = max_single_datagram_message_size(CRYPTO_MAGIC).unwrap();
 
-const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+// STP 2.0 replaced the magic1 selectors, so 1.x (11Q8bpGo) and 0.x (1fgEw5Nx) peer addresses
+// are refused at config parse below and by the handshake; this one prints as -fCmrBqp.
+const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
 //const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
 // @Todo: more of these, merge with Tenderlink, etc.
@@ -957,17 +960,26 @@ impl SliceWrite for PeerPowBlockRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PeerPowBlockDownload {
     height_hash: HeightAndHashOr0,
-    reassembly: ReassemblySlot, // accumulates block fragments across (re)requests
+    reassembly: BlockReassembly, // accumulates block fragments across (re)requests
     last_modified: std::time::Instant,
     timeout_strikes: u8, // quiet periods survived; fragments reset it (see dl-init timeout)
+    last_requested: Option<std::time::Instant>, // when the last BLOCK_REQ for this slot went out
+    request_attempts: u8, // BLOCK_REQs sent for this slot; sets the retry backoff
+    // When the slot's FIRST BLOCK_REQ went out. Anchors the response deadline (see
+    // `block_download_expired`); set once per slot generation and never moved by a retry, a
+    // fragment or any other traffic from the peer.
+    first_requested: Option<std::time::Instant>,
 }
 impl Default for PeerPowBlockDownload {
     fn default() -> Self {
         Self {
             height_hash: HeightAndHashOr0::default(),
-            reassembly: ReassemblySlot::new(),
+            reassembly: BlockReassembly::default(),
             last_modified: std::time::Instant::now(),
             timeout_strikes: 0,
+            last_requested: None,
+            request_attempts: 0,
+            first_requested: None,
         }
     }
 }
@@ -1002,6 +1014,242 @@ impl SliceWrite for PeerPowBlockResponseChunkHdr {
 
 const BLOCK_DOWNLOADS_N: usize = 32;
 
+/// Largest block payload one BLOCK_CHUNK message carries. It is a whole consensus-max block,
+/// so a block answers a request in one STP message; the offset/size header and reassembly
+/// stay so a request can still resume from a prefix.
+const BLOCK_RESPONSE_MAX_PAYLOAD: usize = zebra_chain::block::MAX_BLOCK_BYTES as usize;
+/// Largest BLOCK_CHUNK message: payload plus type byte and chunk header.
+const BLOCK_RESPONSE_MAX_MESSAGE: usize = BLOCK_RESPONSE_MAX_PAYLOAD + 1 + 4 + 4 + 4 + 32;
+const_assert!(BLOCK_RESPONSE_MAX_MESSAGE <= tenderlink::transport::MAX_MESSAGE_SIZE);
+
+/// First BLOCK_REQ retry for a slot that has seen no data, doubling per attempt up to the cap.
+/// STP is best-effort: a whole-block message can be lost, and only a retry recovers it. The
+/// backoff keeps a slow link from being sent the same block again every request tick.
+const BLOCK_REQUEST_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(1000);
+const BLOCK_REQUEST_RETRY_MAX:  std::time::Duration = std::time::Duration::from_millis(4000);
+
+fn block_request_retry_delay(attempts: u8) -> std::time::Duration {
+    BLOCK_REQUEST_RETRY_BASE
+        .saturating_mul(1u32 << attempts.saturating_sub(1).min(8))
+        .min(BLOCK_REQUEST_RETRY_MAX)
+}
+
+/// ASSUMED floor on the useful payload rate of one peer's Bulk flow to us. It is a design
+/// assumption that sizes the response deadline, NOT a network guarantee: a link slower than
+/// this can still lose a slot that was making progress.
+const BLOCK_MIN_GOODPUT_BYTES_PER_SEC: u64 = 64 * 1024;
+/// Added to the drain time for round trips, the request/respond/dl-init tick cadences and
+/// decoding on both ends.
+const BLOCK_RESPONSE_DEADLINE_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// How long a requested download slot waits for its whole block, counted from the slot's
+/// first BLOCK_REQ.
+///
+/// STP delivers only complete messages and reports no per-message receive progress, so a
+/// block that is still arriving looks exactly like one that is lost. The responder admits a
+/// response only while its Bulk backlog to us (outbox, send ring and STP queue: everything
+/// not yet transmitted, including checkpoint-probe and stale responses queued earlier) plus
+/// the response fits `peer_bulk_cap_bytes` (see `send_budget` and `admit_block_response`), so
+/// at most that many bytes are ahead of and including our block. At the assumed floor rate
+/// they drain in `cap / BLOCK_MIN_GOODPUT_BYTES_PER_SEC`. With the default 8 MiB cap this is
+/// 128s + 8s = 136s.
+///
+/// Limit: the bound assumes the response is admitted at our first request. A response the
+/// responder deferred (backlog full) and admitted on a later retry starts its drain later.
+fn block_response_deadline(peer_bulk_cap_bytes: u64) -> std::time::Duration {
+    let drain_ms = peer_bulk_cap_bytes.saturating_mul(1000) / BLOCK_MIN_GOODPUT_BYTES_PER_SEC;
+    std::time::Duration::from_millis(drain_ms) + BLOCK_RESPONSE_DEADLINE_ALLOWANCE
+}
+
+/// Whether the download in `dl` should be cancelled at `now`.
+///
+/// - A slot whose BLOCK_REQ never went out keeps the old rule: `DOWNLOAD_UNMODIFIED_TIMEOUT_DUR`
+///   without change, one strike, then the same again (16s).
+/// - A requested slot lives until `first_requested + deadline` (inclusive) and is cancelled
+///   after it. Nothing renews it: retries, STATUS or other packets from the peer, and partial
+///   fragments all leave `first_requested` alone, so a resumed download cannot extend forever.
+///   A slot is re-anchored only when it is refilled (`BlockDownloads::fill_slot`).
+fn block_download_expired(dl: &mut PeerPowBlockDownload, now: std::time::Instant, deadline: std::time::Duration) -> bool {
+    if let Some(first_requested) = dl.first_requested {
+        return now.saturating_duration_since(first_requested) > deadline;
+    }
+    if now.saturating_duration_since(dl.last_modified) > DOWNLOAD_UNMODIFIED_TIMEOUT_DUR {
+        if dl.timeout_strikes == 0 {
+            // one grace period before cancelling: cancelling throws away the partial
+            // reassembly, and a slow tick can strand already-arrived fragments in the network
+            // thread until *after* this pass runs. any fragment resets the strike (see
+            // BLOCK_CHUNK), so only a genuinely dead download gets cancelled.
+            dl.timeout_strikes = 1;
+            dl.last_modified = now;
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+/// Bookkeeping for a fragment that landed in `dl`. It resets only the never-requested rule's
+/// quiet timer and strike. It moves neither the deadline anchor (`first_requested`) nor the
+/// retry schedule: a suffix still missing is asked for at the next scheduled retry, so a peer
+/// feeding partial fragments can neither extend the slot nor make us re-ask faster than the
+/// 1/2/4/4s backoff.
+fn note_block_fragment(dl: &mut PeerPowBlockDownload, now: std::time::Instant) {
+    dl.last_modified = now;
+    dl.timeout_strikes = 0;
+}
+
+/// Whether a BLOCK_REQ for `dl` goes out at `now`; if so, records it. Retries back off
+/// 1/2/4/4...s (`block_request_retry_delay`) and stop once the slot is past its deadline,
+/// so one slot sends at most about deadline/4s + 4 requests (36 for the default 136s).
+fn block_request_due(dl: &mut PeerPowBlockDownload, now: std::time::Instant, deadline: std::time::Duration) -> bool {
+    if dl.first_requested.is_some_and(|first| now.saturating_duration_since(first) > deadline) {
+        return false;
+    }
+    // Retry with backoff: a block answers in one message, so re-asking every request tick
+    // would only resend it while it is still in flight.
+    if dl.last_requested.is_some_and(|at| now.saturating_duration_since(at) < block_request_retry_delay(dl.request_attempts)) {
+        return false;
+    }
+    dl.first_requested.get_or_insert(now);
+    dl.last_requested = Some(now);
+    dl.request_attempts = dl.request_attempts.saturating_add(1);
+    true
+}
+
+/// Most distinct (hash, offset) responses remembered per peer while its Bulk backlog is
+/// undrained. Past it, new responses to that peer wait (the requester retries).
+/// A requester may have up to `MAX_BANDWIDTH_BLOCKS_PER_RES` downloads active, so a burst
+/// beyond the cap waits a drain: bounded batching, traded for a fixed-size record.
+const MAX_QUEUED_BLOCK_RESPONSES_PER_PEER: usize = 32;
+
+/// Responder side: block responses queued to one peer on the Bulk channel since its Bulk
+/// backlog was last seen empty. A request for one of them is a retry of a response still in
+/// flight; answering it again would queue a second copy (up to `BLOCK_RESPONSE_MAX_MESSAGE`)
+/// behind the first. The record is forgotten once the backlog drains, so a response that was
+/// lost on the wire can be sent again on the next retry. Lives in `Peer`, so it is freed with the peer.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct QueuedBlockResponses {
+    queued: Vec<(Hash, u32)>, // at most MAX_QUEUED_BLOCK_RESPONSES_PER_PEER
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseAdmission {
+    Admit,
+    /// already queued and not yet known transmitted
+    Duplicate,
+    /// the per-peer record is full until the backlog drains
+    RecordFull,
+    /// the peer's Bulk budget cannot take `reserved + needed` more bytes
+    NoBudget,
+}
+
+impl QueuedBlockResponses {
+    /// Call once per tick, before any response is reserved this tick and after the previous
+    /// tick's responses reached the transport (`service`), with that peer's Bulk backlog.
+    /// `None` (a synthetic peer, whose packets are handed over at once) also counts as drained.
+    fn forget_if_drained(&mut self, bulk_backlog_bytes: Option<u64>) {
+        if bulk_backlog_bytes.is_none_or(|bytes| bytes == 0) {
+            self.queued.clear();
+        }
+    }
+
+    fn record(&mut self, hash: Hash, offset: u32) {
+        debug_assert!(self.queued.len() < MAX_QUEUED_BLOCK_RESPONSES_PER_PEER);
+        self.queued.push((hash, offset));
+    }
+}
+
+/// Whether to answer a request for `(hash, offset)` with `needed` bytes, given what this tick
+/// already reserved for the same peer. `budget` is the peer's `send_budget(Bulk)`, or `None`
+/// for a synthetic peer, which is served around STP and so has no budget.
+fn admit_block_response(queued: &QueuedBlockResponses, hash: Hash, offset: u32, budget: Option<u64>, reserved: u64, needed: u64) -> ResponseAdmission {
+    if queued.queued.contains(&(hash, offset)) {
+        return ResponseAdmission::Duplicate;
+    }
+    if queued.queued.len() >= MAX_QUEUED_BLOCK_RESPONSES_PER_PEER {
+        return ResponseAdmission::RecordFull;
+    }
+    if budget.is_some_and(|budget| budget < reserved.saturating_add(needed)) {
+        return ResponseAdmission::NoBudget;
+    }
+    ResponseAdmission::Admit
+}
+
+/// Reassembles one block from BLOCK_CHUNK fragments. The buffer never grows past the
+/// fragment ends the caller admits, and the caller bounds those by the declared size, which
+/// is itself bounded by `MAX_BLOCK_BYTES`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BlockReassembly {
+    pub buf: Vec<u8>,
+    pub total_len: Option<u32>,
+    pub received: Vec<(u32, u32)>, // sorted non-overlapping non-adjacent ranges: [start, end)
+}
+
+impl BlockReassembly {
+    /// returns (success, is_complete)
+    pub fn insert(&mut self, offset: usize, data: &[u8], is_fin: bool) -> (bool, bool) {
+        let start = offset as u32;
+        let end = (offset + data.len()) as u32;
+
+        // If this is the final fragment, derive total_len from offset + data.len()
+        if is_fin {
+            if let Some(existing) = self.total_len {
+                if existing != end { return (false, false); }
+            } else {
+                if let Some(&(_, last_end)) = self.received.last() {
+                    if last_end > end { return (false, false); }
+                }
+                self.total_len = Some(end);
+                self.buf.resize(end as usize, 0);
+            }
+        }
+
+        // Empty fragment: no data to insert, bounds check offset then check completion
+        if data.is_empty() {
+            if let Some(tl) = self.total_len {
+                if start > tl { return (false, false); }
+            }
+            return (true, self.is_complete());
+        }
+
+        if let Some(tl) = self.total_len {
+            if start >= tl || end > tl { return (false, false); }
+        }
+
+        if end as usize > self.buf.len() {
+            self.buf.resize(end as usize, 0);
+        }
+
+        // Find all ranges that overlap or are adjacent to [start, end)
+        let first = self.received.partition_point(|&(_, e)| e < start);
+        let last = self.received.partition_point(|&(s, _)| s <= end);
+
+        // Verify overlapping bytes match
+        for &(rs, re) in &self.received[first..last] {
+            let ov_start = start.max(rs) as usize;
+            let ov_end = end.min(re) as usize;
+            if ov_start < ov_end {
+                let data_off = ov_start - offset;
+                if self.buf[ov_start..ov_end] != data[data_off..data_off + (ov_end - ov_start)] {
+                    return (false, false);
+                }
+            }
+        }
+
+        self.buf[offset..offset + data.len()].copy_from_slice(data);
+
+        let merged_start = if first < last { self.received[first].0.min(start) } else { start };
+        let merged_end = if first < last { self.received[last - 1].1.max(end) } else { end };
+        self.received.splice(first..last, std::iter::once((merged_start, merged_end)));
+
+        (true, self.is_complete())
+    }
+
+    fn is_complete(&self) -> bool {
+        self.total_len.is_some_and(|tl| self.received.len() == 1 && self.received[0] == (0, tl))
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BlockDownloads {
     slots: [PeerPowBlockDownload; BLOCK_DOWNLOADS_N],
@@ -1012,9 +1260,12 @@ impl BlockDownloads {
         if dl_i < self.slots.len() {
             self.slots[dl_i] = PeerPowBlockDownload {
                 height_hash,
-                reassembly: ReassemblySlot::new(),
+                reassembly: BlockReassembly::default(),
                 last_modified: std::time::Instant::now(),
                 timeout_strikes: 0,
+                last_requested: None,
+                request_attempts: 0,
+                first_requested: None,
             };
             self.used_flags |= 1 << dl_i;
             Some(dl_i)
@@ -1093,6 +1344,9 @@ pub struct Peer {
 
     // has served us the checkpoint block (see the checkpoint gate in dl-init)
     has_checkpoint_block: bool,
+
+    // block responses queued to this peer and not yet known transmitted (duplicate guard)
+    queued_block_responses: QueuedBlockResponses,
 }
 
 #[derive(Debug)]
@@ -1354,42 +1608,43 @@ pub fn status_packet(queued: &[Hash], chains: &NearTipChains, tip_height_overrid
 }
 
 /// The BLOCK_CHUNK packets that answer a request for `serialized` from `offset` on.
+///
+/// With STP 1.0 carrying messages up to [`tenderlink::transport::MAX_MESSAGE_SIZE`], every
+/// block fits in one packet: the remainder from `offset` goes out whole. STP delivery is still
+/// best-effort, so the requester keeps the slot, its retry backoff and timeout, and resumes
+/// from its highest contiguous prefix if a (legacy, partial) fragment ever arrives.
 pub fn block_chunk_packets(serialized: &[u8], height: u32, hash: Hash, offset: usize) -> Vec<Vec<u8>> {
     let total_size: u32 = serialized.len().try_into().unwrap();
     let height_hash = HeightAndHashOr0 { height: block::Height(height), hash_or_0: hash };
 
-    // Poor-man's fragmentation: split the block into single-packet chunks, each an
-    // independently deliverable & re-requestable message. STP delivery is unreliable,
-    // so the receiver reassembles and re-requests from its highest contiguous prefix.
-    let mut pkt_buf = [0u8; JUMBO_FRAG_SIZE];
-
-    // payload bytes available per packet after the chunk header
-    let chunk_size = JUMBO_FRAG_SIZE - {
-        let hdr = PeerPowBlockResponseChunkHdr { offset: 0, size: total_size, height_hash };
-        let mut o = 0;
-        o += PACKET_TYPE_BLOCK_CHUNK.write_to(&mut pkt_buf[o..]);
-        o += hdr.write_to(&mut pkt_buf[o..]);
-        o
-    };
-
     let mut packets = Vec::new();
-    for (chunk_i, chunk) in serialized[offset..].chunks(chunk_size).enumerate() {
+    for (chunk_i, chunk) in serialized[offset..].chunks(BLOCK_RESPONSE_MAX_PAYLOAD).enumerate() {
         let hdr = PeerPowBlockResponseChunkHdr {
-            offset: offset as u32 + (chunk_i * chunk_size) as u32,
+            offset: (offset + chunk_i * BLOCK_RESPONSE_MAX_PAYLOAD) as u32,
             size: total_size,
             height_hash,
         };
-
+        let mut hdr_buf = [0u8; BLOCK_RESPONSE_MAX_MESSAGE - BLOCK_RESPONSE_MAX_PAYLOAD];
         let mut o = 0;
-        o += PACKET_TYPE_BLOCK_CHUNK.write_to(&mut pkt_buf[o..]);
-        o += hdr.write_to(&mut pkt_buf[o..]);
-        o += chunk.write_to(&mut pkt_buf[o..]);
-        packets.push(Vec::from(&pkt_buf[..o]));
+        o += PACKET_TYPE_BLOCK_CHUNK.write_to(&mut hdr_buf[o..]);
+        o += hdr.write_to(&mut hdr_buf[o..]);
+        let mut packet = Vec::with_capacity(o + chunk.len());
+        packet.extend_from_slice(&hdr_buf[..o]);
+        packet.extend_from_slice(chunk);
+        packets.push(packet);
     }
     packets
 }
 
 /// `(height, hash, offset)` if `packet` is a BLOCK_REQ. A zero hash asks by height alone.
+fn block_request_packet(height_hash: HeightAndHashOr0, offset: u32) -> Vec<u8> {
+    let mut buf = [0u8; JUMBO_FRAG_SIZE];
+    let mut o = 0;
+    o += PACKET_TYPE_BLOCK_REQ.write_to(&mut buf[o..]);
+    o += PeerPowBlockRequest { height_hash, offset }.write_to(&mut buf[o..]);
+    Vec::from(&buf[..o])
+}
+
 pub fn parse_block_request(packet: &[u8]) -> Option<(u32, Hash, u32)> {
     let mut msg = packet;
     if u8::read_from(&mut msg)? != PACKET_TYPE_BLOCK_REQ {
@@ -1620,12 +1875,21 @@ pub fn sync(
 
     let my_keypairs = vec![network_keypair.clone()];
     // small min keeps the send buffer rate-adaptive (clamp(1s * rate, 512KiB, 256MiB)) instead of a flat 256MiB/conn
-    let network_thread_handle = new_network_thread(my_keypairs.clone(), actual_network_local_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
+    let mut network_thread_handle = new_network_thread(my_keypairs.clone(), actual_network_local_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
+    // Sized from the per-(peer, channel) byte cap the transport actually enforces, which is
+    // what bounds the responder's Bulk backlog ahead of our block (see `block_response_deadline`).
+    let block_response_deadline = block_response_deadline(network_thread_handle.limits().peer_outbox_bytes as u64);
     tracing::info!("NewNet: Bound to port {}", actual_network_local_port);
+    // A fresh peer string for other nodes' network_initial_peers (replace the IP with this
+    // node's reachable one). STP 2.0 addresses cannot be reused from 1.x or 0.x configs.
+    tracing::info!("NewNet: PEER ADDRESS: {:?}", STPAddress::from(std::net::Ipv6Addr::LOCALHOST, actual_network_local_port, &network_keypair));
 
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
     let mut initiate_connections = Vec::<STPAddress>::new();
     let mut packets_to_send: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
+    // Whole-block responses travel on the transport's bulk channel, so this node's status and
+    // requests to the same peer are not queued behind them.
+    let mut bulk_packets_to_send: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
     let mut synthetic_peers: Vec<SyntheticPeerLink> = Vec::new();
 
     // Parse and connect to initial peers
@@ -1980,17 +2244,50 @@ pub fn sync(
         // TODO: replace with a later block_packets_to_send, which should be sorted by (in-block offset, height)
         blocks_to_send.sort_by_key(|(_, _, height, _)| *height);
 
-        // TODO: rate limit production!
+        // Backpressure before work: a response is built only when the peer's untransmitted
+        // backlog (our outbox plus STP's queue, see `send_budget`) leaves room for it, counting
+        // what this tick already queued. A skipped request is not lost: the requester's slot
+        // retries with backoff until its response deadline (`block_response_deadline`), counted
+        // from its first request. A request for a response still queued to that peer is
+        // skipped as a duplicate (`QueuedBlockResponses`).
+        let mut reserved_send_bytes: HashMap<ConnectionKey, u64> = HashMap::new();
+        let mut deferred_block_responses = 0usize;
+        let mut duplicate_block_responses = 0usize;
+        // The one point per tick where the duplicate guard may forget: last tick's responses
+        // have been handed to the transport (and so counted in its backlog), and nothing has
+        // been reserved yet this tick. Clearing anywhere after a reservation below and before
+        // `service` would forget a response that is queued but not yet submitted.
+        for (connection_key, peer) in peers.iter_mut() {
+            let is_synthetic = synthetic_peers.iter().any(|p| p.address.connection_key() == *connection_key);
+            let backlog = if is_synthetic { None } else { Some(network_thread_handle.send_backlog_bytes(*connection_key, Channel::Bulk).unwrap_or(0)) };
+            peer.queued_block_responses.forget_if_drained(backlog);
+        }
         for (connection_key, hash, height, offset) in &blocks_to_send {
             let hash = *hash;
             if !current_connections.iter().any(|(addr, _)| addr.connection_key() == *connection_key) {
                 if TRACE { tracing::info!("Can't send block that was queued for sending: Peer was disconnected: {connection_key:?}"); }
                 continue;
             }
-            let Some(_peer) = peers.get_mut(connection_key) else {
+            let Some(peer) = peers.get_mut(connection_key) else {
                 if TRACE { tracing::info!("Can't send block that was queued for sending: Peer does not exist for connection: {connection_key:?}"); }
                 continue;
             };
+            let Ok(offset_u32) = u32::try_from(*offset) else { continue };
+
+            let reserved = reserved_send_bytes.get(connection_key).copied().unwrap_or(0);
+            let needed = match serialized_blocks.get(&hash) {
+                Some(serialized) => (serialized.len().saturating_sub(*offset) + BLOCK_RESPONSE_MAX_MESSAGE - BLOCK_RESPONSE_MAX_PAYLOAD) as u64,
+                None => BLOCK_RESPONSE_MAX_MESSAGE as u64, // unknown until serialized: assume the max
+            };
+            // Synthetic peers are served around the network thread (see the outbound
+            // interception before service_connections), so STP's backlog does not apply.
+            let is_synthetic = synthetic_peers.iter().any(|p| p.address.connection_key() == *connection_key);
+            let budget = if is_synthetic { None } else { Some(network_thread_handle.send_budget(*connection_key, Channel::Bulk)) };
+            match admit_block_response(&peer.queued_block_responses, hash, offset_u32, budget, reserved, needed) {
+                ResponseAdmission::Admit => {}
+                ResponseAdmission::Duplicate => { duplicate_block_responses += 1; continue; }
+                ResponseAdmission::RecordFull | ResponseAdmission::NoBudget => { deferred_block_responses += 1; continue; }
+            }
 
             if !serialized_blocks.contains_key(&hash) {
                 match read_state.block_from_any_chain(hash.into()) {
@@ -2015,9 +2312,26 @@ pub fn sync(
 
             if TRACE { tracing::info!("Sending BLOCK (Height: {height}, Hash: {hash}, {offset}-{})", serialized_block.len()); }
 
-            for packet in block_chunk_packets(serialized_block, *height, hash, *offset) {
-                packets_to_send.push((*connection_key, packet));
+            // Reserve the exact bytes before building, so a later request this tick for the
+            // same peer is checked against them.
+            let exact = (serialized_block.len() - *offset + BLOCK_RESPONSE_MAX_MESSAGE - BLOCK_RESPONSE_MAX_PAYLOAD) as u64;
+            if budget.is_some_and(|budget| budget < reserved.saturating_add(exact)) {
+                deferred_block_responses += 1;
+                continue;
             }
+            *reserved_send_bytes.entry(*connection_key).or_insert(0) += exact;
+            peer.queued_block_responses.record(hash, offset_u32);
+            let packets = block_chunk_packets(serialized_block, *height, hash, *offset);
+            debug_assert_eq!(packets.iter().map(|p| p.len() as u64).sum::<u64>(), exact);
+            for packet in packets {
+                bulk_packets_to_send.push((*connection_key, packet));
+            }
+        }
+        if deferred_block_responses > 0 {
+            tracing::debug!("NewNet: deferred {deferred_block_responses} block responses: peer send backlog full");
+        }
+        if duplicate_block_responses > 0 {
+            tracing::debug!("NewNet: skipped {duplicate_block_responses} block requests already answered and still queued");
         }
         blocks_to_send.clear();
 
@@ -2182,21 +2496,10 @@ pub fn sync(
                             if TRACE { tracing::info!("Cancelling download request for block @ {}, {} - <= finalized @ {}", height, hash_or_0, near_tip_chains.finalized_height); }
                             peer.block_downloads.remove(dl_i);
 
-                        } else if peer.block_downloads.slots[dl_i].last_modified.elapsed() > DOWNLOAD_UNMODIFIED_TIMEOUT_DUR {
-                            let dl = &mut peer.block_downloads.slots[dl_i];
-                            if dl.timeout_strikes == 0 {
-                                // one grace period before cancelling: cancelling throws away the
-                                // partial reassembly, and a slow tick can strand already-arrived
-                                // fragments in the network thread until *after* this pass runs.
-                                // any fragment resets the strike (see BLOCK_CHUNK), so only a
-                                // genuinely dead download gets cancelled.
-                                dl.timeout_strikes = 1;
-                                dl.last_modified = std::time::Instant::now();
-                            } else {
-                                if TRACE { tracing::info!("Cancelling download request for block @ {}, {} - timed out", height, hash_or_0); }
-                                peer.block_downloads.remove(dl_i);
-                                // TODO: lower weighting on this peer?
-                            }
+                        } else if block_download_expired(&mut peer.block_downloads.slots[dl_i], std::time::Instant::now(), block_response_deadline) {
+                            if TRACE { tracing::info!("Cancelling download request for block @ {}, {} - timed out", height, hash_or_0); }
+                            peer.block_downloads.remove(dl_i);
+                            // TODO: lower weighting on this peer?
 
                         } else if hash_or_0 != block::Hash([0; 32]) {
                             requests_by_hash.entry(hash_or_0).and_modify(|c| *c += 1).or_insert(1);
@@ -2543,6 +2846,9 @@ pub fn sync(
                             continue 'downloads;
                         }
 
+                        if !block_request_due(&mut peer.block_downloads.slots[dl_i], std::time::Instant::now(), block_response_deadline) {
+                            continue 'downloads;
+                        }
                         let dl = &peer.block_downloads.slots[dl_i];
 
                         // resume from the highest contiguous prefix we've already reassembled
@@ -2551,17 +2857,9 @@ pub fn sync(
                             _ => 0,
                         };
 
-                        let mut buf = [0u8; JUMBO_FRAG_SIZE];
-                        let mut o = 0;
-                        o += PACKET_TYPE_BLOCK_REQ.write_to(&mut buf[o..]);
-                        o += PeerPowBlockRequest {
-                            height_hash: dl.height_hash,
-                            offset,
-                        }.write_to(&mut buf[o..]);
-
                         tracing::debug!("Requesting height {} hash {} offset {offset} from peer {connection_key:?}", dl.height_hash.height.0, dl.height_hash.hash_or_0);
 
-                        packets_to_send.push((*connection_key, Vec::from(&buf[..o])));
+                        packets_to_send.push((*connection_key, block_request_packet(dl.height_hash, offset)));
                     }
                 }
             }
@@ -2580,22 +2878,25 @@ pub fn sync(
         // them: their packets leave and arrive around it, and they are re-added to the connection
         // list it hands back each tick until the node kills them.
         synthetic_peers.extend(SYNTHETIC_PEERS_TO_ATTACH.lock().unwrap().drain(..));
-        packets_to_send.retain(|(key, packet)| {
-            let Some(synthetic) = synthetic_peers.iter().find(|p| p.address.connection_key() == *key) else {
-                return true;
-            };
-            let _ = synthetic.outbound.send(packet.clone());
-            false
-        });
+        for queue in [&mut packets_to_send, &mut bulk_packets_to_send] {
+            queue.retain(|(key, packet)| {
+                let Some(synthetic) = synthetic_peers.iter().find(|p| p.address.connection_key() == *key) else {
+                    return true;
+                };
+                let _ = synthetic.outbound.send(packet.clone());
+                false
+            });
+        }
 
         // Service STP connections (send/recv). `None` means the network thread
         // did not answer in time because it died or wedged: keep our connection
         // list as it was instead of replacing it with an empty answer, so this
         // tick loop -- and with it Zebra's shutdown -- can continue.
-        let mut packets_received = match service_connections(&network_thread_handle, NetworkThreadPush {
+        let mut packets_received = match service_connections(&mut network_thread_handle, NetworkThreadPush {
             initiate_connections,
             wanted_connections: current_connections.iter().filter(|(addr, _)| !synthetic_peers.iter().any(|p| p.address == *addr)).cloned().collect(),
             send_unreliable: packets_to_send,
+            send_bulk: std::mem::take(&mut bulk_packets_to_send),
         }) {
             Some(resp) => {
                 current_connections = resp.current_connections;
@@ -2945,8 +3246,7 @@ pub fn sync(
                     kill!("overlapping/out-of-bounds block fragment");
                     continue 'process_packets;
                 }
-                peer.block_downloads.slots[dl_i].last_modified = std::time::Instant::now();
-                peer.block_downloads.slots[dl_i].timeout_strikes = 0;
+                note_block_fragment(&mut peer.block_downloads.slots[dl_i], std::time::Instant::now());
 
                 if !complete {
                     if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: fragment at offset {} ({} bytes); awaiting more", hdr.offset, msg.len()); }
@@ -3405,6 +3705,381 @@ pub fn sync(
 mod tests {
     #[allow(unused_imports)]
     use super::*;
+
+    #[cfg(test)]
+    fn parse_chunk(packet: &[u8]) -> (PeerPowBlockResponseChunkHdr, &[u8]) {
+        assert_eq!(packet[0], PACKET_TYPE_BLOCK_CHUNK);
+        let mut msg = &packet[1..];
+        let hdr = PeerPowBlockResponseChunkHdr::read_from(&mut msg).unwrap();
+        (hdr, msg)
+    }
+
+    #[test]
+    fn max_size_block_is_answered_in_one_bounded_message() {
+        let block: Vec<u8> = (0..BLOCK_RESPONSE_MAX_PAYLOAD).map(|i| (i * 7) as u8).collect();
+        let hash = Hash([9; 32]);
+        let packets = block_chunk_packets(&block, 5, hash, 0);
+        assert_eq!(packets.len(), 1);
+        assert!(packets[0].len() <= BLOCK_RESPONSE_MAX_MESSAGE);
+        let (hdr, payload) = parse_chunk(&packets[0]);
+        assert_eq!((hdr.offset, hdr.size, hdr.height_hash.height.0), (0, block.len() as u32, 5));
+        let mut r = BlockReassembly::default();
+        assert_eq!(r.insert(hdr.offset as usize, payload, true), (true, true));
+        assert_eq!(r.buf, block);
+
+        // A request that resumes from a prefix gets exactly the remainder, again in one message.
+        let packets = block_chunk_packets(&block, 5, hash, 1000);
+        assert_eq!(packets.len(), 1);
+        let (hdr, payload) = parse_chunk(&packets[0]);
+        assert_eq!(hdr.offset, 1000);
+        assert_eq!(payload, &block[1000..]);
+    }
+
+    #[test]
+    fn block_reassembly_resumes_and_rejects_inconsistent_fragments() {
+        let block: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+        let mut r = BlockReassembly::default();
+        assert_eq!(r.insert(0, &block[..3000], false), (true, false));
+        // a lost middle fragment leaves a gap; the prefix is what a retry resumes from
+        assert_eq!(r.insert(6000, &block[6000..], true), (true, false));
+        assert_eq!(r.received.first().map(|r| r.1), Some(3000));
+        // overlapping retransmission with the same bytes is accepted and completes it
+        assert_eq!(r.insert(2000, &block[2000..7000], false), (true, true));
+        assert_eq!(r.buf, block);
+
+        let mut r = BlockReassembly::default();
+        assert_eq!(r.insert(0, &block[..100], false), (true, false));
+        let mut forged = block[50..150].to_vec();
+        forged[0] ^= 1;
+        assert_eq!(r.insert(50, &forged, false).0, false, "conflicting overlap");
+        assert_eq!(r.insert(100, &block[100..200], true), (true, true));
+        assert_eq!(r.insert(150, &block[150..300], false).0, false, "past the declared end");
+        assert_eq!(r.buf.len(), 200, "buffer never grows past the declared end");
+    }
+
+    #[test]
+    fn block_request_retry_backs_off_to_a_cap() {
+        let secs: Vec<u64> = (1..=6).map(|a| block_request_retry_delay(a).as_millis() as u64).collect();
+        assert_eq!(secs, vec![1000, 2000, 4000, 4000, 4000, 4000]);
+        assert_eq!(block_request_retry_delay(u8::MAX), BLOCK_REQUEST_RETRY_MAX);
+        // the capped backoff leaves a requested slot many retries before its response deadline
+        assert!(BLOCK_REQUEST_RETRY_MAX * 30 < default_block_response_deadline());
+    }
+
+    #[cfg(test)]
+    fn default_block_response_deadline() -> std::time::Duration {
+        block_response_deadline(tenderlink::transport::TransportLimits::default().peer_outbox_bytes as u64)
+    }
+
+    #[test]
+    fn block_response_deadline_drains_the_whole_default_bulk_cap_at_the_floor_rate() {
+        // 8 MiB / 64 KiB/s = 128s, + 8s allowance
+        assert_eq!(default_block_response_deadline(), std::time::Duration::from_secs(136));
+        assert_eq!(block_response_deadline(1 << 20), std::time::Duration::from_secs(16 + 8));
+    }
+
+    #[test]
+    fn never_requested_slot_still_expires_after_16s() {
+        let deadline = default_block_response_deadline();
+        let t0 = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        let mut dl = PeerPowBlockDownload { last_modified: t0, ..Default::default() };
+        assert!(!block_download_expired(&mut dl, t0 + ms(8000), deadline));
+        assert!(!block_download_expired(&mut dl, t0 + ms(8001), deadline), "first quiet period is a strike");
+        assert_eq!(dl.timeout_strikes, 1);
+        assert!(!block_download_expired(&mut dl, t0 + ms(16001), deadline));
+        assert!(block_download_expired(&mut dl, t0 + ms(16002), deadline));
+        assert!(dl.first_requested.is_none());
+    }
+
+    #[test]
+    fn requested_slot_lives_until_its_original_deadline_and_nothing_renews_it() {
+        let deadline = default_block_response_deadline();
+        let t0 = std::time::Instant::now();
+        let s = std::time::Duration::from_secs;
+        let mut dl = PeerPowBlockDownload { last_modified: t0, ..Default::default() };
+        assert!(block_request_due(&mut dl, t0, deadline));
+        assert_eq!(dl.first_requested, Some(t0));
+        // well past the old 8s + strike, with no fragment at all
+        for at in [s(9), s(17), s(40), s(100)] {
+            assert!(!block_download_expired(&mut dl, t0 + at, deadline), "{at:?}");
+        }
+        // retries, a partial fragment and a refreshed quiet timer leave the anchor alone
+        assert!(block_request_due(&mut dl, t0 + s(101), deadline));
+        note_block_fragment(&mut dl, t0 + s(120));
+        dl.reassembly.insert(0, &[1, 2, 3], false);
+        assert!(block_request_due(&mut dl, t0 + s(125), deadline));
+        assert_eq!(dl.first_requested, Some(t0));
+        // exact boundary: alive at the deadline, gone just after it
+        assert!(!block_download_expired(&mut dl, t0 + deadline, deadline));
+        assert!(block_download_expired(&mut dl, t0 + deadline + std::time::Duration::from_nanos(1), deadline));
+        // and no request goes out past it
+        assert!(!block_request_due(&mut dl, t0 + deadline + s(5), deadline));
+        // a refilled slot (new generation) starts unanchored
+        let mut downloads = BlockDownloads::default();
+        let hh = HeightAndHashOr0 { height: Height(1), hash_or_0: Hash([1; 32]) };
+        let i = downloads.insert(hh).unwrap();
+        downloads.slots[i] = dl;
+        downloads.remove(i);
+        assert_eq!(downloads.insert(hh), Some(i));
+        assert_eq!(downloads.slots[i].first_requested, None);
+    }
+
+    #[test]
+    fn missing_peer_slot_expires_on_time_after_a_bounded_number_of_requests() {
+        // Production cadence on a virtual clock: dl-init (expiry) every 500ms, requests every
+        // 300ms; simulated on a 100ms grid. The peer never answers anything.
+        let deadline = default_block_response_deadline();
+        let t0 = std::time::Instant::now();
+        let mut dl = PeerPowBlockDownload { last_modified: t0, ..Default::default() };
+        let (mut requests, mut request_times, mut expired_at) = (0, Vec::new(), None);
+        for tick in 0..2000u64 {
+            let ms = tick * 100;
+            let now = t0 + std::time::Duration::from_millis(ms);
+            if ms % 500 == 0 && block_download_expired(&mut dl, now, deadline) {
+                expired_at = Some(ms);
+                break;
+            }
+            if ms % 300 == 0 && block_request_due(&mut dl, now, deadline) {
+                requests += 1;
+                request_times.push(ms);
+            }
+        }
+        assert_eq!(expired_at, Some(136_500), "first dl-init pass after the deadline");
+        assert!(requests <= 36, "{requests} requests: {request_times:?}");
+        assert!(requests >= 30, "{requests} requests: {request_times:?}");
+        assert!(request_times.windows(2).all(|w| w[1] - w[0] >= 1000));
+        assert!(*request_times.last().unwrap() <= 136_000);
+    }
+
+    #[test]
+    fn queued_block_responses_skip_duplicates_until_the_bulk_backlog_drains() {
+        let mut q = QueuedBlockResponses::default();
+        let (a, b) = (Hash([1; 32]), Hash([2; 32]));
+        assert_eq!(admit_block_response(&q, a, 0, Some(10_000), 0, 2_000), ResponseAdmission::Admit);
+        q.record(a, 0);
+        // retries of the queued response, any budget: skipped
+        assert_eq!(admit_block_response(&q, a, 0, Some(u64::MAX), 0, 1), ResponseAdmission::Duplicate);
+        assert_eq!(admit_block_response(&q, a, 0, None, 0, 1), ResponseAdmission::Duplicate);
+        // a second, different block or suffix is not a duplicate
+        assert_eq!(admit_block_response(&q, b, 0, Some(10_000), 2_000, 2_000), ResponseAdmission::Admit);
+        assert_eq!(admit_block_response(&q, a, 100, Some(10_000), 2_000, 2_000), ResponseAdmission::Admit);
+        // same-tick reservation counts against the budget
+        assert_eq!(admit_block_response(&q, b, 0, Some(10_000), 8_001, 2_000), ResponseAdmission::NoBudget);
+        assert_eq!(admit_block_response(&q, b, 0, Some(10_000), 8_000, 2_000), ResponseAdmission::Admit);
+        // synthetic peers have no STP budget
+        assert_eq!(admit_block_response(&q, b, 0, None, u64::MAX, u64::MAX), ResponseAdmission::Admit);
+        // not drained: kept; drained: forgotten, so a lost response can be retried
+        q.forget_if_drained(Some(1));
+        assert_eq!(admit_block_response(&q, a, 0, Some(10_000), 0, 2_000), ResponseAdmission::Duplicate);
+        q.forget_if_drained(Some(0));
+        assert_eq!(admit_block_response(&q, a, 0, Some(10_000), 0, 2_000), ResponseAdmission::Admit);
+        // the record is capped; full means wait for the drain, never evict
+        for i in 0..MAX_QUEUED_BLOCK_RESPONSES_PER_PEER as u32 {
+            q.record(a, i);
+        }
+        assert_eq!(admit_block_response(&q, b, 0, None, 0, 1), ResponseAdmission::RecordFull);
+        assert_eq!(admit_block_response(&q, a, 3, None, 0, 1), ResponseAdmission::Duplicate);
+        // a synthetic peer (no backlog) is drained every tick, never stuck
+        q.forget_if_drained(None);
+        assert_eq!(admit_block_response(&q, b, 0, None, 0, 1), ResponseAdmission::Admit);
+        assert!(q.queued.is_empty());
+    }
+
+    /// Two real STP pumps on loopback. The responder's Bulk flow is rate-capped and already
+    /// holds 24 other block responses for us (stale or probe-like: we have no slot for them),
+    /// so our max-size block, one whole STP message, lands only after the old 8s + strike
+    /// timeout (16s) with no fragment before it. The requester runs the production slot,
+    /// expiry, request and fragment helpers; the responder the production duplicate guard and
+    /// Bulk budget. The block must complete into the SAME slot with its original anchor, with
+    /// no second copy queued while the first is untransmitted, while Control pings stay fast.
+    #[test]
+    fn slow_whole_block_completes_in_its_original_slot() {
+        use tenderlink::transport::{NetworkThreadHandle, TransportLimits};
+        use std::time::{Duration, Instant};
+        fn free_port() -> u16 {
+            std::net::UdpSocket::bind("[::1]:0").unwrap().local_addr().unwrap().port()
+        }
+        fn node(max_pps: Option<u64>) -> (NetworkThreadHandle, STPAddress) {
+            let key = new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+            let port = free_port();
+            let address = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, port, &key);
+            let h = NetworkThreadHandle::new(vec![key], port, max_pps, (1_000_000, 512 * 1024, 32 << 20), TransportLimits::default());
+            (h, address)
+        }
+        fn pseudo_random(len: usize, mut x: u64) -> Vec<u8> {
+            (0..len).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u8 }).collect()
+        }
+        const PING: u8 = 0xF0;
+        const PONG: u8 = 0xF1;
+        const BLOCK_LEN: usize = BLOCK_RESPONSE_MAX_PAYLOAD;
+        const AHEAD: usize = 24;
+        // Measured on loopback: STP moves ~5 KB of payload per unit of `max_pps`, so 20 gives
+        // ~100 KB/s and the 25 max-size responses take ~20-30s.
+        let pps = 20;
+
+        let (mut req, req_addr) = node(None);
+        let (mut resp, resp_addr) = node(Some(pps));
+        let deadline = block_response_deadline(resp.limits().peer_outbox_bytes as u64);
+
+        let mut push = NetworkThreadPush { initiate_connections: vec![resp_addr.clone()], ..Default::default() };
+        let connect_by = Instant::now() + Duration::from_secs(10);
+        let (to_resp, to_req) = loop {
+            let pr = req.service(std::mem::take(&mut push));
+            let ps = resp.service(NetworkThreadPush::default());
+            if let (Some(a), Some(b)) = (pr.current_connections.first(), ps.current_connections.first()) {
+                break (a.0.connection_key(), b.0.connection_key());
+            }
+            assert!(Instant::now() < connect_by, "connect timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        let block = pseudo_random(BLOCK_LEN, 0x9E37_79B9_7F4A_7C15);
+        let hash = Hash([0x5A; 32]);
+        let hh = HeightAndHashOr0 { height: Height(1234), hash_or_0: hash };
+        let one_copy = (BLOCK_LEN + BLOCK_RESPONSE_MAX_MESSAGE - BLOCK_RESPONSE_MAX_PAYLOAD) as u64;
+
+        // the responder's Bulk backlog to us, queued through the same guard and budget
+        let mut queued = QueuedBlockResponses::default();
+        let mut push_resp = NetworkThreadPush::default();
+        let mut reserved = 0u64;
+        for i in 0..AHEAD {
+            let other = Hash([i as u8; 32]);
+            assert_eq!(admit_block_response(&queued, other, 0, Some(resp.send_budget(to_req, Channel::Bulk)), reserved, one_copy), ResponseAdmission::Admit);
+            reserved += one_copy;
+            queued.record(other, 0);
+            push_resp.send_bulk.extend(block_chunk_packets(&pseudo_random(BLOCK_LEN, i as u64 + 1), 1000 + i as u32, other, 0).into_iter().map(|p| (to_req, p)));
+        }
+        resp.service(push_resp);
+        assert_eq!(resp.send_backlog_bytes(to_req, Channel::Bulk), Some(AHEAD as u64 * one_copy));
+
+        let mut downloads = BlockDownloads::default();
+        let slot = downloads.insert(hh).unwrap();
+        // the old rule, for the counterexample: same slot, never anchored
+        let mut old_rule = PeerPowBlockDownload { last_modified: Instant::now(), ..Default::default() };
+        let mut old_rule_cancelled_at = None;
+
+        let (mut admitted, mut duplicates, mut requests, mut stale_chunks) = (0u32, 0u32, 0u32, 0u32);
+        let mut pings: HashMap<u32, Instant> = HashMap::new();
+        let (mut ping_seq, mut max_rtt, mut pongs) = (0u32, Duration::ZERO, 0u32);
+        let (mut next_request, mut next_init, mut next_ping) = (Instant::now(), Instant::now(), Instant::now());
+        let mut req_inbox: Vec<Vec<u8>> = Vec::new();
+        let mut first_requested = None;
+        let mut ours_queued_since: Option<Instant> = None;
+        let mut completed = None;
+        let started = Instant::now();
+
+        while completed.is_none() {
+            let now = Instant::now();
+            assert!(now < started + Duration::from_secs(90), "transfer did not complete");
+            let mut push_req = NetworkThreadPush::default();
+            if now >= next_init {
+                next_init = now + Duration::from_millis(500);
+                assert!(downloads.slot_is_used(slot));
+                assert!(!block_download_expired(&mut downloads.slots[slot], now, deadline), "slot expired after {:?}", now - started);
+                if old_rule_cancelled_at.is_none() && block_download_expired(&mut old_rule, now, deadline) {
+                    old_rule_cancelled_at = Some(now - started);
+                }
+            }
+            if now >= next_request {
+                next_request = now + Duration::from_millis(300);
+                if block_request_due(&mut downloads.slots[slot], now, deadline) {
+                    requests += 1;
+                    push_req.send_unreliable.push((to_resp, block_request_packet(downloads.slots[slot].height_hash, 0)));
+                }
+                first_requested = first_requested.or(downloads.slots[slot].first_requested);
+                assert_eq!(downloads.slots[slot].first_requested, first_requested, "anchor moved");
+            }
+            if now >= next_ping {
+                next_ping = now + Duration::from_millis(500);
+                pings.insert(ping_seq, now);
+                let mut p = vec![PING];
+                p.extend_from_slice(&ping_seq.to_le_bytes());
+                push_req.send_unreliable.push((to_resp, p));
+                ping_seq += 1;
+            }
+            push_req.wanted_connections = vec![(resp_addr.clone(), [0; 64])];
+            let pr = req.service(push_req);
+            assert!(req.is_connected(to_resp));
+            for (_, msg) in pr.received_unreliable_messages {
+                match msg[0] {
+                    PONG => {
+                        let seq = u32::from_le_bytes(msg[1..5].try_into().unwrap());
+                        max_rtt = max_rtt.max(pings.remove(&seq).unwrap().elapsed());
+                        pongs += 1;
+                    }
+                    PACKET_TYPE_BLOCK_CHUNK => {
+                        let (hdr, payload) = parse_chunk(&msg);
+                        // like production: a response with no slot is discarded
+                        let Some(dl_i) = downloads.position(hdr.height_hash) else {
+                            assert_ne!(hdr.height_hash, hh);
+                            stale_chunks += 1;
+                            continue;
+                        };
+                        assert_eq!(dl_i, slot, "the response must find its original slot");
+                        let is_fin = hdr.offset as usize + payload.len() == hdr.size as usize;
+                        let dl = &mut downloads.slots[slot];
+                        let (ok, complete) = dl.reassembly.insert(hdr.offset as usize, payload, is_fin);
+                        assert!(ok && complete, "a block is one whole message");
+                        note_block_fragment(dl, Instant::now());
+                        let first = dl.first_requested.unwrap();
+                        completed = Some((first.elapsed(), downloads.remove(slot).reassembly.buf));
+                    }
+                    other => panic!("unexpected packet {other}"),
+                }
+            }
+
+            // responder tick: the forget point first, then answer what arrived last tick
+            let backlog = resp.send_backlog_bytes(to_req, Channel::Bulk).unwrap_or(0);
+            queued.forget_if_drained(Some(backlog));
+            let mut push_resp = NetworkThreadPush::default();
+            let mut reserved = 0u64;
+            for msg in req_inbox.drain(..) {
+                if msg[0] == PING {
+                    push_resp.send_unreliable.push((to_req, [&[PONG][..], &msg[1..]].concat()));
+                    continue;
+                }
+                let (height, hash, offset) = parse_block_request(&msg).unwrap();
+                let needed = (BLOCK_LEN - offset as usize + BLOCK_RESPONSE_MAX_MESSAGE - BLOCK_RESPONSE_MAX_PAYLOAD) as u64;
+                match admit_block_response(&queued, hash, offset, Some(resp.send_budget(to_req, Channel::Bulk)), reserved, needed) {
+                    ResponseAdmission::Admit => {
+                        // a second copy only once the first has left the responder entirely
+                        assert!(ours_queued_since.is_none() || backlog == 0, "second copy queued behind an untransmitted first");
+                        ours_queued_since = Some(Instant::now());
+                        admitted += 1;
+                        reserved += needed;
+                        queued.record(hash, offset);
+                        for packet in block_chunk_packets(&block, height, hash, offset as usize) {
+                            push_resp.send_bulk.push((to_req, packet));
+                        }
+                    }
+                    ResponseAdmission::Duplicate => duplicates += 1,
+                    other => panic!("unexpected admission {other:?}"),
+                }
+            }
+            push_resp.wanted_connections = vec![(req_addr.clone(), [0; 64])];
+            let ps = resp.service(push_resp);
+            req_inbox.extend(ps.received_unreliable_messages.into_iter().map(|(_, m)| m));
+            let backlog = resp.send_backlog_bytes(to_req, Channel::Bulk).unwrap_or(0);
+            assert!(backlog <= (AHEAD as u64 + 1) * one_copy, "Bulk backlog {backlog}: more than one copy of ours");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let (since_first_request, buf) = completed.unwrap();
+        assert!(buf == block, "payload corrupted");
+        assert!(since_first_request > 2 * DOWNLOAD_UNMODIFIED_TIMEOUT_DUR, "transfer too fast to test anything: {since_first_request:?}");
+        assert!(since_first_request < deadline);
+        assert!(old_rule_cancelled_at.is_some(), "the old 8s + strike rule would have cancelled this slot");
+        assert_eq!(stale_chunks, AHEAD as u32, "every stale response arrived first and was discarded");
+        // A retry landing after our copy left the responder but before the requester decoded
+        // it may legitimately be answered again; the assertion above rules out a copy queued
+        // behind an untransmitted one.
+        assert!((1..=2).contains(&admitted), "{admitted} copies admitted");
+        assert!(duplicates >= 3 && requests >= 4, "retries happened and were deduplicated: {requests} requests, {duplicates} duplicates");
+        assert!(pongs >= 20, "{pongs} pongs");
+        assert!(max_rtt < Duration::from_secs(1), "Control ping took {max_rtt:?} behind the Bulk backlog");
+        eprintln!("slow block: {since_first_request:?}, {admitted} copies, {requests} requests, {duplicates} duplicates, max ping rtt {max_rtt:?}, pps {pps}, old rule cancelled at {old_rule_cancelled_at:?}");
+    }
 
     #[test]
     fn cpu_verification_shutdown_does_not_wait_for_worker() {

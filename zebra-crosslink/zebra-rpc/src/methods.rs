@@ -224,8 +224,8 @@ pub trait Rpc {
     ///
     /// # Notes
     ///
-    /// As in zcashd, the `end_of_service` object is only present on Mainnet, where end of
-    /// support is enforced. Zebra reports the estimated last height this release supports in
+    /// The `end_of_service` object is present on every network except Regtest, where end of
+    /// support is not enforced. Zebra reports the estimated last height this release supports in
     /// `end_of_service.block_height`; the node halts when the tip goes past it.
     ///
     /// Some fields from the zcashd reference are missing from Zebra's response: `version` and
@@ -408,6 +408,13 @@ pub trait Rpc {
     /// *(The `address:port` matches the value in `zebrad.toml > [rpc] > listen_addr`)*
     #[method(name = "get_tfl_roster_zats")]
     async fn get_tfl_roster_zats(&self) -> Option<Vec<RosterMember>>;
+
+    /// BFT roster with each member's verified finalizer address, when the chain has revealed one.
+    ///
+    /// Same stake data as `get_tfl_roster_zats`. `finalizer_address` is the `zfinv1` string
+    /// instead of null. Keys the chain has not revealed stay null.
+    #[method(name = "get_tfl_roster_with_addresses")]
+    async fn get_tfl_roster_with_addresses(&self) -> Option<Vec<RosterMember>>;
 
     /// Get the fat pointer to the BFT Chain tip. TODO: Example
     #[method(name = "get_tfl_fat_pointer_to_bft_chain_tip")]
@@ -1523,9 +1530,9 @@ where
     async fn get_deprecation_info(&self) -> Result<GetDeprecationInfoResponse> {
         let end_of_service = self
             .end_of_support_height
-            // End of support is only enforced on Mainnet, and the zcashd-compatible response
-            // omits `end_of_service` on other networks, even if a height was configured.
-            .filter(|_| self.network == Network::Mainnet)
+            // End of support is not enforced on Regtest, so the response omits `end_of_service`
+            // there, even if a height was configured.
+            .filter(|_| !self.network.is_regtest())
             .map(|end_of_support_height| {
                 // Estimate the halt time from the current tip and target block spacing. If the
                 // tip is not available yet, fall back to the highest compiled-in checkpoint,
@@ -2177,6 +2184,27 @@ where
             .oneshot(ReadRequest::CrosslinkRoster)
             .await;
         if let Ok(ReadResponse::CrosslinkRoster(roster)) = ret {
+            Some(roster)
+        } else {
+            tracing::error!(?ret, "Bad tfl service return.");
+            None
+        }
+    }
+
+    async fn get_tfl_roster_with_addresses(&self) -> Option<Vec<RosterMember>> {
+        let ret = self
+            .read_state
+            .clone()
+            .oneshot(ReadRequest::CrosslinkRosterWithAddresses)
+            .await;
+        if let Ok(ReadResponse::CrosslinkRosterWithAddresses(pairs)) = ret {
+            let roster = pairs
+                .into_iter()
+                .map(|(mut member, address)| {
+                    member.finalizer_address = address;
+                    member
+                })
+                .collect();
             Some(roster)
         } else {
             tracing::error!(?ret, "Bad tfl service return.");
