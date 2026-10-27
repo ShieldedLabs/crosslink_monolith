@@ -8,7 +8,7 @@
 
 use std::{collections::HashMap, fmt, str::FromStr, sync::Arc};
 
-use zcash_primitives::bft::{BftBlock, FatPointerToBftBlock, TMSig};
+use zcash_primitives::bft::{BftBlock, FatPointerToBftBlock, SlashForkConfig, TMSig};
 use zebra_chain::block::{self, Block, Height};
 
 use crate::service::finalized_state::zebra_db::bft::StoredDecision;
@@ -65,17 +65,71 @@ pub struct BftDecision {
     pub block: BftBlock,
     /// The fat pointer to it: the precommit signatures that decided it.
     pub fat_pointer: FatPointerToBftBlock,
-    /// The proposer's signature on each chunk of the proposal, empty if none were stored.
+    /// The proposer's signature on each chunk of the proposal, empty if the round had no proposer.
     pub proposal_sigs: Vec<TMSig>,
+    /// The valid round the proposal was sent in, which `proposal_sigs` cover; -1 for none.
+    pub valid_round: i64,
 }
 
 impl From<StoredDecision> for BftDecision {
+    /// The database does not store the valid round, so this is -1 until
+    /// [`BftDecision::recover_valid_round`] finds the one the signatures were made in.
     fn from(stored: StoredDecision) -> Self {
         BftDecision {
             block: stored.block,
             fat_pointer: stored.fat_pointer,
             proposal_sigs: stored.proposal_sigs,
+            valid_round: -1,
         }
+    }
+}
+
+impl BftDecision {
+    /// The valid round the proposal signatures were made in, read back from the signatures.
+    ///
+    /// The database keeps the signatures but not the valid round they cover, and a decision
+    /// loaded with the wrong one is refused. The signatures settle it: they verify under only the
+    /// proposer's key, the height's vote namespace and the round they were sent in. The proposer is
+    /// almost always among the certificate's signers, the namespace is one of the two this height
+    /// can have (with or without FeaturenetUpgrade2's strict quorum), and a valid round is below
+    /// the decided round, so the search is small, and at round 0 there is nothing to search.
+    ///
+    /// `None` when no combination verifies, which leaves a decision whose proposer did not sign the
+    /// certificate, decided after round 0, unresolved.
+    pub fn recover_valid_round(&self, slashforks: &[SlashForkConfig]) -> Option<i64> {
+        use crate::new_network::bft::namespace_for_bft_height;
+
+        let round = self.fat_pointer.get_vote_template().round;
+        if self.proposal_sigs.is_empty() || round <= 0 {
+            return Some(-1);
+        }
+        let value = self.block.zcash_serialize_to_vec().ok()?;
+        if self.proposal_sigs.len() != tenderlink::proposal_chunks_n(value.len()) {
+            return None;
+        }
+        let height = u64::from(self.block.height);
+        let value_id = tenderlink::ValueId(self.fat_pointer.points_at_block_hash().0);
+        let namespaces =
+            [false, true].map(|strict| namespace_for_bft_height(slashforks, height, strict));
+        // A non-negative i32 round fits u32.
+        let round_u32 = round as u32;
+        (-1..i64::from(round)).find(|&valid_round| {
+            namespaces.iter().any(|namespace| {
+                self.fat_pointer.signatures.iter().any(|signer| {
+                    tenderlink::first_bad_proposal_chunk_sig(
+                        signer.pub_key,
+                        &value,
+                        value_id,
+                        height,
+                        round_u32,
+                        valid_round,
+                        namespace,
+                        &self.proposal_sigs,
+                    )
+                    .is_none()
+                })
+            })
+        })
     }
 }
 
@@ -248,7 +302,8 @@ impl crate::ReadStateService {
     /// the node moves on while they are read.
     pub fn chain_prefix(&self, max_height: Option<Height>) -> Result<ChainPrefix, String> {
         let best_chain = self.latest_best_chain();
-        let tip = super::read::best_tip(&self.latest_non_finalized_state(), &self.db)
+        let non_finalized = self.latest_non_finalized_state();
+        let tip = super::read::best_tip(&non_finalized, &self.db)
             .ok_or_else(|| "the state holds no blocks".to_string())?;
         let height = max_height.unwrap_or(tip.0);
         if height > tip.0 {
@@ -265,11 +320,24 @@ impl crate::ReadStateService {
                 .ok_or_else(|| format!("no block at height {h}, below the best tip"))?;
             blocks.push(block);
         }
+        let slashforks = non_finalized.slashfork_schedule.rules();
         let decisions = self
             .db
             .bft_chain()
             .into_iter()
-            .map(BftDecision::from)
+            .map(|stored| {
+                let mut decision = BftDecision::from(stored);
+                match decision.recover_valid_round(slashforks) {
+                    Some(valid_round) => decision.valid_round = valid_round,
+                    None => tracing::warn!(
+                        "chain prefix: BFT height {}'s proposal signatures verify under no valid round \
+                         with any certificate signer as proposer; writing -1, which a node loading the \
+                         file will refuse if it is wrong",
+                        decision.block.height,
+                    ),
+                }
+                decision
+            })
             .collect();
         ChainPrefix::new(blocks, decisions)
     }
@@ -278,6 +346,103 @@ impl crate::ReadStateService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zcash_primitives::bft::{
+        finalizer_key_from_seed, BftBlockAndFatPointerToIt, FatPointerSignature,
+    };
+
+    /// A decision at BFT height 3, decided in `round`, its certificate signed by `signer`.
+    fn decision_signed_by(signer: zcash_primitives::bft::PubKeyID, round: u32) -> BftDecision {
+        let block = BftBlock {
+            version: 1,
+            height: 3,
+            previous_block_fat_ptr: FatPointerToBftBlock::null(),
+            headers: Vec::new(),
+            slashforks: Vec::new(),
+            do_not_include_until_bc_height: 0,
+        };
+        let signature = FatPointerSignature {
+            pub_key: signer,
+            vote_signature: [0; 64],
+        };
+        let decided = BftBlockAndFatPointerToIt::from_parts(block, 3, round, &[signature]);
+        BftDecision {
+            block: decided.block,
+            fat_pointer: decided.fat_ptr,
+            proposal_sigs: Vec::new(),
+            valid_round: -1,
+        }
+    }
+
+    fn sign(
+        decision: &mut BftDecision,
+        key: &ed25519_zebra::SigningKey,
+        round: u32,
+        valid_round: i64,
+        namespace: &[u8; 32],
+    ) {
+        let value = decision.block.zcash_serialize_to_vec().unwrap();
+        let value_id = tenderlink::ValueId(decision.block.blake3_hash().0);
+        decision.proposal_sigs = tenderlink::proposal_chunk_sigs(
+            key,
+            &value,
+            value_id,
+            3,
+            round,
+            valid_round,
+            namespace,
+        );
+    }
+
+    #[test]
+    fn the_valid_round_is_read_back_from_the_proposal_signatures() {
+        use crate::new_network::bft::namespace_for_bft_height;
+        let (_, key, pub_key) = finalizer_key_from_seed(b"chain prefix proposer");
+        let (_, other_key, other_pub_key) = finalizer_key_from_seed(b"chain prefix bystander");
+
+        // Re-proposed in round 2 from a value locked in round 1, under either namespace.
+        for strict in [false, true] {
+            let namespace = namespace_for_bft_height(&[], 3, strict);
+            let mut decision = decision_signed_by(pub_key, 2);
+            sign(&mut decision, &key, 2, 1, &namespace);
+            assert_eq!(
+                decision.recover_valid_round(&[]),
+                Some(1),
+                "strict quorum {strict}"
+            );
+
+            // Proposed fresh in round 2.
+            sign(&mut decision, &key, 2, -1, &namespace);
+            assert_eq!(
+                decision.recover_valid_round(&[]),
+                Some(-1),
+                "strict quorum {strict}"
+            );
+        }
+
+        // A proposer who did not sign the certificate cannot be found among its signers.
+        let mut decision = decision_signed_by(other_pub_key, 2);
+        sign(
+            &mut decision,
+            &key,
+            2,
+            1,
+            &namespace_for_bft_height(&[], 3, false),
+        );
+        assert_eq!(decision.recover_valid_round(&[]), None);
+
+        // Round 0 has no earlier round to have locked a value in, and no proposer means no search.
+        let mut decision = decision_signed_by(pub_key, 0);
+        sign(
+            &mut decision,
+            &other_key,
+            0,
+            -1,
+            &namespace_for_bft_height(&[], 3, false),
+        );
+        assert_eq!(decision.recover_valid_round(&[]), Some(-1));
+        decision.proposal_sigs.clear();
+        assert_eq!(decision.recover_valid_round(&[]), Some(-1));
+    }
 
     #[test]
     fn cutoff_parses_what_it_prints() {

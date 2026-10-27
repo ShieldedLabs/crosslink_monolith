@@ -3590,12 +3590,12 @@ fn diagram_scene_2_chain_prefix() -> zebra_state::ChainPrefix {
         .expect("the scene reads back")
         .instrs
         .iter()
-        .filter(|instr| instr.kind == TFInstr::LOAD_POS)
-        .map(|instr| {
-            let decided = BftBlockAndFatPointerToItWrap::zcash_deserialize(instr.data_slice(&bytes))
-                .expect("the scene's BFT blocks parse")
-                .0;
-            zebra_state::BftDecision { block: decided.block, fat_pointer: decided.fat_ptr, proposal_sigs: Vec::new() }
+        .filter_map(|instr| read_load_pos(&bytes, instr))
+        .map(|(block, fat_pointer, proposal_sigs, valid_round)| zebra_state::BftDecision {
+            block,
+            fat_pointer,
+            proposal_sigs,
+            valid_round,
         })
         .collect();
     let best_chain = std::iter::once(zebra_chain::block::genesis::regtest_genesis_block())

@@ -4,8 +4,9 @@
 //! The finalized database commits blocks and cannot take them back. A prefix file is the way
 //! back: export the chain up to the height to return to, start a node on an empty state, and
 //! import the file. The file is ordinary test format -- `SET_PARAMS`, then `LOAD_POW` for every
-//! PoW block from genesis and `LOAD_POS` for each decided BFT block, placed directly after the PoW
-//! block it was decided on -- so it is readable without a node, can be converted to another
+//! PoW block from genesis and `LOAD_POS` for each decided BFT block, with its proposal signatures,
+//! placed directly after the PoW block it was decided on -- so it is readable without a node, can
+//! be converted to another
 //! node's storage, and can have scenario instructions appended to replay something that
 //! happened on the network from the state the network was in.
 //!
@@ -39,17 +40,17 @@ pub fn prefix_tf(params: &ZcashCrosslinkParameters, prefix: &ChainPrefix, cutoff
     tf
 }
 
-/// The one place a decided BFT block enters a prefix file.
-///
-/// `LOAD_POS` drops the proposal signatures, which a node rebuilt from the file then cannot use
-/// to re-serve the decided proposal to lagging peers. TF_PROPOSAL_SIGS.md proposes an
-/// instruction that keeps them; this switches to it when it exists.
+/// The one place a decided BFT block enters a prefix file: with the proposer's chunk signatures
+/// and the valid round they cover, which a node loading it checks against the round's proposer,
+/// as it would a tenderlink decision.
 fn push_decision(tf: &mut TF, decision: BftDecision) {
-    tf.push_instr_load_pos(
+    tf.push_instr_load_pos_signed(
         &BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt {
             block: decision.block,
             fat_ptr: decision.fat_pointer,
         }),
+        &decision.proposal_sigs,
+        decision.valid_round,
         0,
     );
 }
@@ -245,7 +246,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use test_format::{tf_read_instr, TestInstr, HARNESS_PARAMETERS};
+    use test_format::{read_load_pos, tf_read_instr, TestInstr, HARNESS_PARAMETERS};
     use zebra_chain::block::Block;
 
     /// The PoW blocks and decided BFT blocks in a stored scene, in file order.
@@ -256,14 +257,17 @@ mod tests {
         let (bytes, tf) = TF::read_from_file(&path).expect("the stored scene reads");
         let (mut blocks, mut decisions) = (Vec::new(), Vec::new());
         for instr in &tf.instrs {
-            match tf_read_instr(&bytes, instr) {
-                Some(TestInstr::LoadPoW(block)) => blocks.push(Arc::new(block)),
-                Some(TestInstr::LoadPoS((block, fat_pointer))) => decisions.push(BftDecision {
+            if let Some((block, fat_pointer, proposal_sigs, valid_round)) =
+                read_load_pos(&bytes, instr)
+            {
+                decisions.push(BftDecision {
                     block,
                     fat_pointer,
-                    proposal_sigs: Vec::new(),
-                }),
-                _ => {}
+                    proposal_sigs,
+                    valid_round,
+                });
+            } else if let Some(TestInstr::LoadPoW(block)) = tf_read_instr(&bytes, instr) {
+                blocks.push(Arc::new(block));
             }
         }
         (blocks, decisions)
@@ -397,21 +401,33 @@ mod tests {
 
     #[test]
     fn a_prefix_file_reads_back_as_the_same_chain() {
-        let prefix = scene_prefix(BFT_SCENES[0]);
+        let mut prefix = scene_prefix(BFT_SCENES[0]);
+        // The scenes' rosters have no proposer, so they carry no proposal signatures; give one
+        // decision a full set, re-proposed in round 2, so the round trip covers them.
+        let decision = &mut prefix.decisions[1];
+        let chunks_n =
+            tenderlink::proposal_chunks_n(decision.block.zcash_serialize_to_vec().unwrap().len());
+        decision.proposal_sigs = vec![zcash_primitives::bft::TMSig([7; 64]); chunks_n];
+        decision.valid_round = 2;
+
         let bytes = prefix_tf(&HARNESS_PARAMETERS, &prefix, BftCutoff::Cited).write_to_bytes();
         let tf = TF::read_from_bytes(&bytes).expect("a written prefix reads");
 
         let mut read = Vec::new();
         for instr in &tf.instrs[1..] {
+            if let Some((block, fat_pointer, proposal_sigs, valid_round)) =
+                read_load_pos(&bytes, instr)
+            {
+                read.push(ChainPrefixItem::Bft(BftDecision {
+                    block,
+                    fat_pointer,
+                    proposal_sigs,
+                    valid_round,
+                }));
+                continue;
+            }
             match tf_read_instr(&bytes, instr) {
                 Some(TestInstr::LoadPoW(block)) => read.push(ChainPrefixItem::Pow(Arc::new(block))),
-                Some(TestInstr::LoadPoS((block, fat_pointer))) => {
-                    read.push(ChainPrefixItem::Bft(BftDecision {
-                        block,
-                        fat_pointer,
-                        proposal_sigs: Vec::new(),
-                    }))
-                }
                 other => panic!(
                     "a prefix file holds only loads after SET_PARAMS, not {}",
                     other.is_some()
@@ -427,7 +443,7 @@ mod tests {
 
     #[test]
     fn a_prefix_rejects_blocks_that_are_not_one_chain() {
-        let prefix = scene_prefix("blocks.zeccltf");
+        let prefix = scene_prefix(BFT_SCENES[0]);
         let mut skipped = prefix.blocks.clone();
         skipped.remove(1);
         assert!(ChainPrefix::new(skipped, Vec::new()).is_err());

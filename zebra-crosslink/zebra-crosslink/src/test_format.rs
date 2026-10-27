@@ -1195,6 +1195,15 @@ pub fn crosslink_parameters_for_test(bytes: &[u8]) -> ZcashCrosslinkParameters {
     }
 }
 
+/// A `LOAD_POS` instruction's decided block, fat pointer, proposal signatures and valid round, or
+/// `None` for any other instruction or one that does not parse.
+pub fn read_load_pos(bytes: &[u8], instr: &TFInstr) -> Option<(BftBlock, FatPointerToBftBlock, Vec<TMSig>, i64)> {
+    match tf_read_instr(bytes, instr)? {
+        TestInstr::LoadPoS { block, fat_ptr, proposal_sigs, valid_round } => Some((block, fat_ptr, proposal_sigs, valid_round)),
+        _ => None,
+    }
+}
+
 pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> {
     const_assert!(TFInstr::COUNT == 36);
     match instr.kind {

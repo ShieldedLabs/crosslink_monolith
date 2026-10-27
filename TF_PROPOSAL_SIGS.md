@@ -1,7 +1,8 @@
 # Proposal: decided BFT blocks with their proposal signatures in the test format
 
-Status: proposal. Written for #241 (chain prefix export/import); meant to be implemented
-by whoever owns `test_format.rs`, in a way that also serves ordinary tests.
+Status: implemented in ef17e7ea ("test_format: LOAD_POS carries the proposer's chunk
+signatures"), except that the database still does not store `valid_round` (below). Chain
+prefix exports use it; see `CHAIN_PREFIX.md`. Kept as the record of the requirements.
 
 ## The gap
 

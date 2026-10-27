@@ -10,7 +10,9 @@ The file is ordinary `.zeccltf` test format (`zebra-crosslink/src/test_format.rs
 
 - `SET_PARAMS` with the network's Crosslink parameters;
 - `LOAD_POW` for every PoW block from genesis to the height, in the Zcash wire encoding;
-- `LOAD_POS` for each decided BFT block: the block and the fat pointer that decided it.
+- `LOAD_POS` for each decided BFT block: the block, the fat pointer that decided it, and the
+  proposer's chunk signatures with the valid round they cover. These are what a node needs to
+  re-serve the decided proposal to a lagging finalizer, and what it checks when it loads one.
 
 Because the file is plain test format, it can be:
 
@@ -58,6 +60,18 @@ Each BFT block is placed as early as a live node could have decided it. That is 
 the PoW block that is its newest carried header, or after its snapshot when those headers lie on
 a branch the prefix does not hold. In every case it comes before the first PoW block that cites
 it.
+
+That rule puts BFT genesis on a chain-bootstrapped network ahead of the activation height, at
+which a live node derives it. A node importing the file therefore stores the file's genesis
+before it would derive the same block itself, and the two cannot race.
+
+The database stores each decision's proposal signatures but not the valid round they were made
+in, which is part of what they sign. The exporter reads it back from the signatures. It tries the
+certificate's signers as the proposer, under the one or two vote namespaces the height can have,
+for each round below the decided round, and keeps the valid round that verifies. At round 0
+there is nothing to try. If nothing verifies, the decision is written with -1 and the export
+logs a warning; a node loading it refuses it if -1 is wrong. That can only happen when the
+proposer of a decision made after round 0 did not sign its certificate.
 
 ## Importing
 
@@ -111,11 +125,10 @@ the node's own rules for their heights.
 
 - **Only the canonical chain.** The database holds one best chain, so side branches, arrival
   order and timing are not in the file. Append them as scenario instructions when they matter.
-- **Proposal signatures are dropped.** `LOAD_POS` does not carry the proposer's per-chunk
-  proposal signatures that the database stores. A node rebuilt from a file cannot re-serve
-  those decided proposals to lagging finalizers. Everything else replays identically.
-  `TF_PROPOSAL_SIGS.md` proposes the instruction that keeps them, and notes a related gap in the
-  database itself: the signed `valid_round` is not stored either.
+- **A rebuilt node does not keep valid rounds.** The file carries them and loading checks them,
+  but the database has no place for them, so a restart rebuilds every decided round with -1. A
+  restarted node re-serves the chunks of a re-proposed value with signatures that do not match.
+  This holds for any node, not just an imported one (see `TF_PROPOSAL_SIGS.md`).
 - **`supported` and `N` can include BFT blocks no PoW block in the prefix cites.** A node
   importing them holds decisions that the PoW chain has not yet acknowledged. That is the
   intent, but it is a different state from a node stopped at height `H` under `cited`.
