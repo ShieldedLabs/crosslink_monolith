@@ -149,6 +149,24 @@ pub fn equihash_solution_is_valid(header: &Header) -> Result<(), equihash::Error
     header.solution.check(header)
 }
 
+/// Returns `Ok(())` if the fat pointer `header` carries has no more signatures than `network`'s
+/// active roster has seats. Parsing bounds the count only by `FAT_POINTER_SIGNATURES_MAX`, having
+/// no network to read the roster cap from, so this is where the network's own cap applies, at
+/// every height.
+pub fn fat_pointer_fits_active_roster(header: &Header, network: &Network, hash: &Hash) -> Result<(), BlockError> {
+    let params = network.crosslink_parameters();
+    let fat_pointer = &header.fat_pointer_to_bft_block;
+    if fat_pointer.fits_active_roster(&params) {
+        Ok(())
+    } else {
+        Err(BlockError::FatPointerExceedsActiveRoster {
+            hash: *hash,
+            signatures: fat_pointer.signatures.len(),
+            cap: params.active_roster_max_n,
+        })
+    }
+}
+
 /// Returns `Ok()` with the deferred pool balance change of the coinbase transaction if the block
 /// subsidy in `block` is valid for `network`
 ///

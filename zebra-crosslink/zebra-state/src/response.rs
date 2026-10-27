@@ -485,6 +485,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::CrosslinkIsActivated`].
     CrosslinkIsActivated(bool),
 
+    /// Response to [`ReadRequest::CrosslinkBftDropped`].
+    CrosslinkBftDropped(Option<(block::Height, block::Hash)>),
+
     /// Response to [`ReadRequest::Depth`] with the depth of the specified block.
     Depth(Option<u32>),
 
@@ -793,6 +796,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::CrosslinkBlockFinality(_)
             | ReadResponse::CrosslinkTxFinality(_)
             | ReadResponse::CrosslinkIsActivated(_)
+            | ReadResponse::CrosslinkBftDropped(_)
             | ReadResponse::ForkPoint(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }

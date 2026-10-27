@@ -87,6 +87,13 @@ pub const TF_BFT_WRONG_NAMESPACE: u64 = 1 << 35;
 pub const TF_BFT_THE_NODE: u64 = u64::MAX;
 /// EXPECT_BFT_STEP's step for any step.
 pub const TF_BFT_ANY_STEP: u64 = 0xff;
+/// The proposer's signature on each chunk of `block` decided at `round`, made with `signing_key`
+/// in `valid_round` under `vote_namespace`: what LOAD_POS carries for a decided height.
+pub fn bft_proposal_sigs(signing_key: &ed25519_zebra::SigningKey, block: &BftBlock, round: u32, valid_round: i64, vote_namespace: &[u8; 32]) -> Vec<TMSig> {
+    let value = block.zcash_serialize_to_vec().expect("a BFT block serializes");
+    let value_id = tenderlink::ValueId(block.blake3_hash().0);
+    tenderlink::proposal_chunk_sigs(signing_key, &value, value_id, u64::from(block.height), round, valid_round, vote_namespace)
+}
 /// The node's own finalizer identity seed, unless a test's node config names one.
 pub const TEST_NODE_FINALIZER_SEED: &str = "crosslink test node finalizer";
 
@@ -103,13 +110,13 @@ pub fn bft_value_id(value: &[u8]) -> [u8; 32] {
 /// The finalizer that proposes at `height` and `round` when the roster is `members` (finalizer
 /// key, stake), by the node's own roster ordering and proposer choice. For writing a scenario
 /// that has to know who proposes before the node runs.
-pub fn bft_proposer(members: &[([u8; 32], u64)], height: u64, round: u32) -> Option<[u8; 32]> {
+pub fn bft_proposer(members: &[([u8; 32], u64)], active_roster_max_n: usize, height: u64, round: u32) -> Option<[u8; 32]> {
     let members: Vec<zcash_primitives::transaction::RosterMember> = members
         .iter()
         .map(|&(pub_key, voting_power)| zcash_primitives::transaction::RosterMember { pub_key, voting_power, ..Default::default() })
         .collect();
     let roster = zebra_state::new_network::bft::tenderlink_roster_from_internal(&members, &Default::default());
-    let proposer_i = tenderlink::proposer_index(&HashKeys::default(), &roster, height, round)?;
+    let proposer_i = tenderlink::proposer_index(&HashKeys::default(), &roster, active_roster_max_n, height, round)?;
     Some(roster[proposer_i].pub_key.0)
 }
 
@@ -160,8 +167,9 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::EXPECT_BFT_STEP as usize] = "EXPECT_BFT_STEP";
     strs[TFInstr::EXPECT_BFT_SENT as usize] = "EXPECT_BFT_SENT";
     strs[TFInstr::EXPECT_BFT_PROPOSER as usize] = "EXPECT_BFT_PROPOSER";
+    strs[TFInstr::EXPECT_BFT_DROPPED as usize] = "EXPECT_BFT_DROPPED";
 
-    const_assert!(TFInstr::COUNT == 35);
+    const_assert!(TFInstr::COUNT == 36);
     strs
 };
 
@@ -170,6 +178,12 @@ impl TFInstr {
     // (de)serialization layer.
     // TODO: there may be a crate that makes an enum feasible here
     pub const LOAD_POW: TFInstrKind = 0;
+    /// A decided BFT height, force-fed as tenderlink would have decided it. The data is the
+    /// block and its fat pointer, then the proposer's chunk signatures, 64 bytes each in chunk
+    /// order. `val[0]` is the proposal's valid round plus one (0 for none), which the signatures
+    /// cover. The node refuses the block unless the signatures are the round's proposer's, one
+    /// per chunk; a round with no proposer (the genesis, a roster with no stake) has none. A
+    /// count that is neither none nor one per chunk does not parse.
     pub const LOAD_POS: TFInstrKind = 1;
     pub const SET_PARAMS: TFInstrKind = 2;
     pub const EXPECT_POW_CHAIN_LENGTH: TFInstrKind = 3;
@@ -281,7 +295,8 @@ impl TFInstr {
     /// that clock never follows real time, so nothing else moves it. Every synthetic finalizer
     /// first sends the node a status that needs everything at the engine's height and round, and
     /// the instruction returns once the engine has acted on the new time and everything it sent
-    /// is recorded.
+    /// is recorded. With SHOULD_FAIL, that the engine does not catch up: it is waiting on the
+    /// node, as it does on a decision the node has not answered.
     pub const ADVANCE_TIME: TFInstrKind = 31;
     /// The engine is at height `val[0]`, round `val[1] >> 8`, step `val[1] & 0xff` (0 propose,
     /// 1 prevote, 2 precommit, 0xff any).
@@ -293,7 +308,10 @@ impl TFInstr {
     /// The proposer at `val[1]` is synthetic finalizer `val[0]`, or the node when `val[0]` is
     /// `TF_BFT_THE_NODE`.
     pub const EXPECT_BFT_PROPOSER: TFInstrKind = 34;
-    pub const COUNT: TFInstrKind = 35;
+    /// The node has stopped taking part in BFT (`val[0]` 1) or has not (0), and its database
+    /// records it the same way: with the data a block hash, the record names that block.
+    pub const EXPECT_BFT_DROPPED: TFInstrKind = 35;
+    pub const COUNT: TFInstrKind = 36;
 
     pub fn str_from_kind(kind: TFInstrKind) -> &'static str {
         let kind = kind as usize;
@@ -318,22 +336,25 @@ impl TFInstr {
                 };
                 str += &format!("{} - {}, parent: {}", height, block.hash(), block.header.previous_block_hash)
             }
-            Some(TestInstr::LoadPoS((block, fat_ptr))) => match (block.headers.first(), block.headers.last()) {
-                (Some(first), Some(last)) => {
-                    str += &format!(
-                        "{}, snapshot: {}, hdrs: [{} .. {}]",
-                        block.blake3_hash(),
-                        block.snapshot_block_hash(),
-                        BlockHash::from_header_data(first),
-                        BlockHash::from_header_data(last)
-                    )
+            Some(TestInstr::LoadPoS { block, proposal_sigs, valid_round, .. }) => {
+                match (block.headers.first(), block.headers.last()) {
+                    (Some(first), Some(last)) => {
+                        str += &format!(
+                            "{}, snapshot: {}, hdrs: [{} .. {}]",
+                            block.blake3_hash(),
+                            block.snapshot_block_hash(),
+                            BlockHash::from_header_data(first),
+                            BlockHash::from_header_data(last)
+                        )
+                    }
+                    _ => str += &format!("{}, no headers", block.blake3_hash()),
                 }
-                _ => str += &format!("{}, no headers", block.blake3_hash()),
-            },
+                str += &format!(", {} proposal signature(s), valid round {valid_round}", proposal_sigs.len());
+            }
             Some(TestInstr::SetParams(params)) => {
                 str += &format!(
-                    "{} {:?}",
-                    params.bc_confirmation_depth_sigma, params.bootstrap
+                    "{} {:?}, roster {}",
+                    params.bc_confirmation_depth_sigma, params.bootstrap, params.active_roster_max_n
                 )
             }
             Some(TestInstr::ExpectPoWChainLength(h)) => str += &h.to_string(),
@@ -420,6 +441,12 @@ impl TFInstr {
             }
             Some(TestInstr::RecvStpPacket { packet, peer }) => {
                 str += &format!("type {:?}, {} bytes from peer {peer}", packet.first(), packet.len())
+            }
+            Some(TestInstr::ExpectBftDropped { dropped, hash }) => {
+                str += &format!("{dropped}");
+                if let Some(hash) = hash {
+                    str += &format!(" over {hash}");
+                }
             }
             None => {}
         }
@@ -527,12 +554,13 @@ impl TF {
             bc_confirmation_depth_sigma,
             bootstrap,
             staking,
+            active_roster_max_n,
         } = *params;
         tf.push_instr_ex(
             TFInstr::SET_PARAMS,
             0,
             &params_to_bytes(bootstrap, staking, node_config),
-            [bc_confirmation_depth_sigma, 0],
+            [bc_confirmation_depth_sigma, u64::try_from(active_roster_max_n).expect("a roster cap fits in a u64")],
         );
 
         tf
@@ -603,11 +631,22 @@ impl TF {
         self.push_instr_ex(TFInstr::LOAD_POW, flags, data, [0; 2])
     }
 
+    /// A decision with no proposal signatures, for a round with no proposer. See `push_instr_load_pos_signed`.
     pub fn push_instr_load_pos(&mut self, data: &BftBlockAndFatPointerToItWrap, flags: u32) {
-        self.push_instr_serialize_ex(TFInstr::LOAD_POS, flags, data, [0; 2])
+        self.push_instr_load_pos_signed(data, &[], -1, flags)
     }
     pub fn push_instr_load_pos_bytes(&mut self, data: &[u8], flags: u32) {
         self.push_instr_ex(TFInstr::LOAD_POS, flags, data, [0; 2])
+    }
+
+    /// `proposal_sigs` one per chunk (see [`bft_proposal_sigs`]), `valid_round` -1 for none.
+    pub fn push_instr_load_pos_signed(&mut self, data: &BftBlockAndFatPointerToItWrap, proposal_sigs: &[TMSig], valid_round: i64, flags: u32) {
+        let mut bytes = data.zcash_serialize_to_vec().expect("a BFT block and fat pointer serialize");
+        for sig in proposal_sigs {
+            bytes.extend_from_slice(&sig.0);
+        }
+        let valid_round = u64::try_from(valid_round + 1).expect("a valid round of -1 or more");
+        self.push_instr_ex(TFInstr::LOAD_POS, flags, &bytes, [valid_round, 0])
     }
 
     pub fn push_instr_expect_pow_chain_length(&mut self, length: usize, flags: u32) {
@@ -809,6 +848,12 @@ impl TF {
         self.push_instr_ex(TFInstr::EXPECT_BFT_PROPOSER, flags, &[0; 0], [finalizer, bft_height_round(height, round)])
     }
 
+    /// `hash`, when given, is the block the dropped-BFT record must name.
+    pub fn push_instr_expect_bft_dropped(&mut self, dropped: bool, hash: Option<&ZebBlockHash>, flags: u32) {
+        let data = hash.map_or(&[][..], |hash| &hash.0[..]);
+        self.push_instr_ex(TFInstr::EXPECT_BFT_DROPPED, flags, data, [u64::from(dropped), 0])
+    }
+
     /// A block the node must reject for `reason`, and must survive rejecting: the load, the
     /// reason check, and the liveness check, as three instructions.
     pub fn push_instr_load_pow_rejected(&mut self, block: &Block, reason: &str) {
@@ -974,8 +1019,8 @@ fn check_ingest(flags: u32, label: &str, outcome: Result<zebra_state::new_networ
 use crate::*;
 
 /// Parameters for scenarios that feed BFT blocks in directly, which is every scenario that is not
-/// testing the bootstrap itself. A file with no `SET_PARAMS` is read as these: every scenario was
-/// written that way before the bootstrap became a parameter.
+/// testing the bootstrap itself: the prototype's, with the fields those scenes are built around
+/// set here. A file with no `SET_PARAMS` is read as `PROTOTYPE_PARAMETERS`, not these.
 pub const HARNESS_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParameters {
     bootstrap: BftBootstrap::Supplied,
     // Sigma is pinned here rather than inherited from `PROTOTYPE_PARAMETERS`. The
@@ -989,6 +1034,7 @@ pub const HARNESS_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParameter
     // Pinned for the same reason as sigma: the staking scenes are built at heights chosen for
     // this calendar. A scenario that wants a short one uses `short_staking`.
     staking: PROTOTYPE_STAKING,
+    ..PROTOTYPE_PARAMETERS
 };
 
 /// The shortest staking calendar a scenario on `params` can use and still mean what it would on
@@ -1041,8 +1087,9 @@ fn short_calendar(params: &ZcashCrosslinkParameters) -> StakingParameters {
 // only when it isn't the prototype's, and data that ends after the bootstrap is read as the
 // prototype calendar, so files from before the calendar was a parameter, and every file that
 // keeps the prototype calendar, stay byte-identical.
-// `val[1]` is written as zero and never read: it used to carry the Book's `L`, which Zebra
-// Crosslink does not have.
+// `val[1]` is the active roster cap, always written. Files from before the cap was a parameter
+// hold 0 there, read as the prototype's cap. Long before that it carried the Book's `L`, which
+// Zebra Crosslink does not have; no file in the test data still does.
 const TF_BOOTSTRAP_SUPPLIED: u8 = 0;
 const TF_BOOTSTRAP_FROM_CHAIN: u8 = 1;
 
@@ -1128,28 +1175,28 @@ pub fn node_config_for_test(bytes: &[u8]) -> String {
 }
 
 /// The Crosslink parameters a test file's node must run with: its leading `SET_PARAMS`, or
-/// [`HARNESS_PARAMETERS`] if it has none. They are consensus parameters, so the harness builds the
+/// [`PROTOTYPE_PARAMETERS`] if it has none. They are consensus parameters, so the harness builds the
 /// network with them before the node boots instead of applying them when the instruction runs.
 pub fn crosslink_parameters_for_test(bytes: &[u8]) -> ZcashCrosslinkParameters {
     let Ok(tf) = TF::read_from_bytes(bytes) else {
-        return HARNESS_PARAMETERS;
+        return PROTOTYPE_PARAMETERS;
     };
     let Some(first) = tf.instrs.first() else {
-        return HARNESS_PARAMETERS;
+        return PROTOTYPE_PARAMETERS;
     };
     if first.kind != TFInstr::SET_PARAMS {
-        return HARNESS_PARAMETERS;
+        return PROTOTYPE_PARAMETERS;
     }
     // A malformed SET_PARAMS falls back here, then fails loudly when the instruction is read.
     if let Some(TestInstr::SetParams(params)) = tf_read_instr(bytes, first) {
         params
     } else {
-        HARNESS_PARAMETERS
+        PROTOTYPE_PARAMETERS
     }
 }
 
 pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> {
-    const_assert!(TFInstr::COUNT == 35);
+    const_assert!(TFInstr::COUNT == 36);
     match instr.kind {
         TFInstr::LOAD_POW => {
             let block = Block::zcash_deserialize(instr.data_slice(bytes)).ok()?;
@@ -1157,20 +1204,34 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
         }
 
         TFInstr::LOAD_POS => {
-            let block_and_fat_ptr =
-                BftBlockAndFatPointerToItWrap::zcash_deserialize(instr.data_slice(bytes)).ok()?;
-            Some(TestInstr::LoadPoS((
-                block_and_fat_ptr.0.block,
-                block_and_fat_ptr.0.fat_ptr,
-            )))
+            let mut rest = instr.data_slice(bytes);
+            let block_and_fat_ptr = BftBlockAndFatPointerToItWrap::zcash_deserialize(&mut rest).ok()?;
+            // The count comes from the block, never from the file: the chunk count, or none.
+            // Whether none is allowed at this height is the node's call.
+            let chunks_n = tenderlink::proposal_chunks_n(block_and_fat_ptr.0.block.zcash_serialize_to_vec().ok()?.len());
+            if !rest.is_empty() && rest.len() != 64 * chunks_n {
+                return None;
+            }
+            let proposal_sigs = rest.chunks_exact(64).map(|sig| TMSig(sig.try_into().expect("64 bytes"))).collect();
+            Some(TestInstr::LoadPoS {
+                block: block_and_fat_ptr.0.block,
+                fat_ptr: block_and_fat_ptr.0.fat_ptr,
+                proposal_sigs,
+                valid_round: i64::try_from(instr.val[0]).ok()? - 1,
+            })
         }
 
         TFInstr::SET_PARAMS => {
             let (bootstrap, staking, _node_config) = params_from_bytes(instr.data_slice(bytes), file_version(bytes))?;
+            let active_roster_max_n = match instr.val[1] {
+                0 => PROTOTYPE_PARAMETERS.active_roster_max_n,
+                n => usize::try_from(n).ok()?,
+            };
             Some(TestInstr::SetParams(ZcashCrosslinkParameters {
                 bc_confirmation_depth_sigma: instr.val[0],
                 bootstrap,
                 staking,
+                active_roster_max_n,
             }))
         }
 
@@ -1306,6 +1367,11 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
             packet: instr.data_slice(bytes).to_vec(),
             peer: instr.val[0],
         }),
+        TFInstr::EXPECT_BFT_DROPPED => {
+            let data = instr.data_slice(bytes);
+            let hash = if data.is_empty() { None } else { Some(ZebBlockHash(data.try_into().ok()?)) };
+            Some(TestInstr::ExpectBftDropped { dropped: instr.val[0] != 0, hash })
+        }
 
         // An instruction this build doesn't know. The caller decides whether that is fatal
         // (a test) or skippable (the fuzzer, the GUI viewer).
@@ -1316,7 +1382,8 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
 #[derive(Clone)]
 pub(crate) enum TestInstr {
     LoadPoW(Block),
-    LoadPoS((BftBlock, FatPointerToBftBlock)),
+    /// A decided BFT height, with the proposer's chunk signatures and the valid round they cover.
+    LoadPoS { block: BftBlock, fat_ptr: FatPointerToBftBlock, proposal_sigs: Vec<TMSig>, valid_round: i64 },
     SetParams(ZcashCrosslinkParameters),
     ExpectPoWChainLength(u32),
     ExpectPoSChainLength(u64),
@@ -1354,6 +1421,7 @@ pub(crate) enum TestInstr {
     ExpectBftStep { height: u64, round: u32, step: u64 },
     ExpectBftSent { kind: u64, height: u64, round: u32, value_id: Option<[u8; 32]> },
     ExpectBftProposer { finalizer: u64, height: u64, round: u32 },
+    ExpectBftDropped { dropped: bool, hash: Option<ZebBlockHash> },
     RosterForceInclude([u8; 32], u64),   // public address
     ExpectRosterIncludes([u8; 32], u64), // public address
 }
@@ -1567,7 +1635,7 @@ pub(crate) async fn handle_instr(
             } else {
                 match settled.and(bft_settle().await) {
                     Ok(()) => test_check(flags, true, &format!("ADVANCE_TIME: the clock moved {millis} ms and the engine caught up")),
-                    Err(err) => test_check_outcome(false, false, &format!("ADVANCE_TIME: {err}")),
+                    Err(err) => test_check(flags, false, &format!("ADVANCE_TIME: {err}")),
                 }
             }
         }
@@ -1667,7 +1735,7 @@ pub(crate) async fn handle_instr(
             }
         },
 
-        TestInstr::LoadPoS((block, fat_ptr)) => {
+        TestInstr::LoadPoS { block, fat_ptr, proposal_sigs, valid_round } => {
             // let path = format!("../crosslink-test-data/test_pos_block_{}.bin", instr_i);
             // info!("writing binary at {}", path);
             // let mut file = std::fs::File::create(&path).expect("valid file");
@@ -1679,7 +1747,7 @@ pub(crate) async fn handle_instr(
             let expect_accepted = flags & SHOULD_DEFER == 0 && !expect_rejected;
             let answer = tokio::time::timeout(
                 NODE_ANSWER_WAIT,
-                zebra_state::new_network::bft::force_feed_bft_block(Arc::new(block), fat_ptr),
+                zebra_state::new_network::bft::force_feed_bft_block(Arc::new(block), fat_ptr, proposal_sigs, valid_round),
             )
             .await;
             match answer {
@@ -1748,6 +1816,34 @@ pub(crate) async fn handle_instr(
         TestInstr::ExpectNodeAlive => {
             let (alive, message) = node_alive(internal_handle).await;
             test_check(flags, alive, &message);
+        }
+
+        TestInstr::ExpectBftDropped { dropped, hash } => {
+            let in_memory = zebra_state::new_network::bft::bft_is_dropped();
+            let answer = tokio::time::timeout(
+                NODE_ANSWER_WAIT,
+                (internal_handle.call.read_state)(zebra_state::ReadRequest::CrosslinkBftDropped),
+            )
+            .await;
+            let record = match answer {
+                Ok(Ok(zebra_state::ReadResponse::CrosslinkBftDropped(record))) => record,
+                other => {
+                    test_check_outcome(false, false, &format!("EXPECT_BFT_DROPPED: no verdict, the record request answered {other:?}"));
+                    return;
+                }
+            };
+            let record_matches = match (dropped, hash, record) {
+                (false, _, None) => true,
+                (true, None, Some(_)) => true,
+                (true, Some(hash), Some((_, recorded))) => recorded == hash,
+                _ => false,
+            };
+            let holds = in_memory == dropped && record_matches;
+            test_check(
+                flags,
+                holds,
+                &format!("EXPECT_BFT_DROPPED: BFT dropped in memory: {in_memory}; database record: {record:?}"),
+            );
         }
 
         TestInstr::RecvTx { wire, peer } => {
@@ -2146,7 +2242,7 @@ fn node_roster_index(internal_handle: &TFLServiceHandle, view: &tenderlink::Engi
 }
 
 fn view_proposer(view: &tenderlink::EngineView, height: u64, round: u32) -> Option<usize> {
-    tenderlink::proposer_index(&view.hash_keys, &view.roster, height, round)
+    tenderlink::proposer_index(&view.hash_keys, &view.roster, view.active_roster_max_n, height, round)
 }
 
 /// The id of the proposal the node sent at `height` and `round`, when it was that round's proposer.
@@ -2645,6 +2741,44 @@ mod tests {
 
     const SHORT: StakingParameters = StakingParameters { period: 10, day_window: 5, action_delay: 6 };
 
+    /// The signature count is the block's chunk count or nothing, whatever the file says: a
+    /// fuzzed file reaches this parser, and the node indexes signatures by chunk.
+    #[test]
+    fn load_pos_takes_no_signatures_or_one_per_chunk() {
+        let block = BftBlock {
+            version: 0,
+            height: 1,
+            previous_block_fat_ptr: FatPointerToBftBlock::null(),
+            headers: Vec::new(),
+            slashforks: Vec::new(),
+            do_not_include_until_bc_height: 0,
+        };
+        let chunks_n = tenderlink::proposal_chunks_n(block.zcash_serialize_to_vec().unwrap().len());
+        let data = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr: FatPointerToBftBlock::null() });
+        let read = |sigs_n: usize, extra: &[u8]| {
+            let mut tf = TF::new(&HARNESS_PARAMETERS);
+            tf.push_instr_load_pos_signed(&data, &vec![TMSig([7; 64]); sigs_n], 2, 0);
+            let mut bytes = tf.write_to_bytes();
+            if !extra.is_empty() {
+                // Lengthen the last instruction's data in place: it is the last thing in the data.
+                let tf = TF::read_from_bytes(&bytes).unwrap();
+                let mut out = TF { instrs: tf.instrs.clone(), data: tf.data.clone() };
+                out.data.extend_from_slice(extra);
+                out.instrs.last_mut().unwrap().data.size += extra.len() as u64;
+                bytes = out.write_to_bytes();
+            }
+            let tf = TF::read_from_bytes(&bytes).unwrap();
+            match tf_read_instr(&bytes, tf.instrs.last().unwrap()) {
+                Some(TestInstr::LoadPoS { proposal_sigs, valid_round, .. }) => Some((proposal_sigs.len(), valid_round)),
+                _ => None,
+            }
+        };
+        assert_eq!(read(0, &[]), Some((0, 2)));
+        assert_eq!(read(chunks_n, &[]), Some((chunks_n, 2)));
+        assert_eq!(read(chunks_n + 1, &[]), None);
+        assert_eq!(read(chunks_n, &[0; 3]), None, "a partial signature");
+    }
+
     #[test]
     fn set_params_round_trips_the_staking_calendar_and_node_config() {
         for bootstrap in [BftBootstrap::Supplied, BftBootstrap::FromChain { staking_height: 0, roster_height: 5, activation_height: 300 }] {
@@ -2666,6 +2800,53 @@ mod tests {
         assert_eq!(params_from_bytes(&[TF_BOOTSTRAP_SUPPLIED], 0), Some((BftBootstrap::Supplied, PROTOTYPE_STAKING, String::new())));
         assert_eq!(params_from_bytes(&[TF_BOOTSTRAP_SUPPLIED], 1), None);
         assert_eq!(params_to_bytes(BftBootstrap::Supplied, PROTOTYPE_STAKING, "").len(), 1 + 12);
+    }
+
+    /// The roster cap rides in SET_PARAMS `val[1]`; a file from before it did holds 0 there, read
+    /// as the prototype's cap.
+    #[test]
+    fn set_params_carries_the_roster_cap() {
+        let read = |params: &ZcashCrosslinkParameters| {
+            let bytes = TF::new(params).write_to_bytes();
+            let tf = TF::read_from_bytes(&bytes).expect("a written file reads");
+            (tf.instrs[0].val[1], crosslink_parameters_for_test(&bytes))
+        };
+        let prototype_cap = u64::try_from(PROTOTYPE_PARAMETERS.active_roster_max_n).expect("a roster cap fits in a u64");
+        assert_eq!(read(&HARNESS_PARAMETERS), (prototype_cap, HARNESS_PARAMETERS));
+        let four = ZcashCrosslinkParameters { active_roster_max_n: 4, ..HARNESS_PARAMETERS };
+        assert_eq!(read(&four), (4, four));
+
+        let mut legacy = TF::new(&four);
+        legacy.instrs[0].val[1] = 0;
+        assert_eq!(crosslink_parameters_for_test(&legacy.write_to_bytes()).active_roster_max_n, PROTOTYPE_PARAMETERS.active_roster_max_n);
+    }
+
+    /// Every committed test file names its parameters with a leading SET_PARAMS. A file without
+    /// one runs under the prototype's, which a file made for any other set would not mean.
+    #[test]
+    fn committed_test_files_name_their_parameters() {
+        fn files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("the test data directory reads") {
+                let path = entry.expect("a directory entry reads").path();
+                if path.is_dir() {
+                    files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "zeccltf") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        files(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../crosslink-test-data"), &mut paths);
+        assert!(!paths.is_empty(), "found the committed test files");
+        let mut problems = Vec::new();
+        for path in paths {
+            let bytes = std::fs::read(&path).expect("a test file reads");
+            let Ok(tf) = TF::read_from_bytes(&bytes) else { continue };
+            if tf.instrs.first().map_or(true, |first| first.kind != TFInstr::SET_PARAMS) {
+                problems.push(format!("{}: no leading SET_PARAMS", path.display()));
+            }
+        }
+        assert!(problems.is_empty(), "{problems:#?}");
     }
 
     #[test]

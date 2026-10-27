@@ -1582,6 +1582,10 @@ pub enum ReadRequest {
     /// Whether the Crosslink BFT chain has bootstrapped.
     CrosslinkIsActivated,
 
+    /// The block this node's database records it could not follow when it dropped BFT, or
+    /// `None` when it never has (FINALITY.md §4.3).
+    CrosslinkBftDropped,
+
     /// Performs contextual validation of the given block, but does not commit it to the state.
     ///
     /// It is the caller's responsibility to perform semantic validation.
@@ -1708,6 +1712,7 @@ impl ReadRequest {
             ReadRequest::CrosslinkBlockFinality(_) => "crosslink_block_finality",
             ReadRequest::CrosslinkTxFinality(_) => "crosslink_tx_finality",
             ReadRequest::CrosslinkIsActivated => "crosslink_is_activated",
+            ReadRequest::CrosslinkBftDropped => "crosslink_bft_dropped",
             ReadRequest::Depth(_) => "depth",
             ReadRequest::Block(_) => "block",
             ReadRequest::AnyChainBlock(_) => "any_chain_block",

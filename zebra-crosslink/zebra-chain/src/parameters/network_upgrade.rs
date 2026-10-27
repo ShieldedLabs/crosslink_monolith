@@ -66,6 +66,8 @@ pub enum NetworkUpgrade {
     Nu6_3,
     /// The Zcash protocol after the first Crosslink featurenet upgrade.
     FeaturenetUpgrade1,
+    /// The Zcash protocol after the second Crosslink featurenet upgrade.
+    FeaturenetUpgrade2,
     /// The Zcash protocol after the NU7 upgrade.
     #[serde(rename = "NU7")]
     Nu7,
@@ -140,14 +142,24 @@ pub(super) const MAINNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] 
 /// `zcash_protocol::consensus` must name the same upgrade, or every wallet transaction
 /// carries a branch ID the node rejects.
 #[allow(unused)]
-pub(super) const TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] = &[
-    (block::Height(0), Genesis),
-    (block::Height(1), Nu6_3),
-    (
-        block::Height(zcash_protocol::consensus::TESTNET_FEATURENET_UPGRADE_1_HEIGHT),
-        FeaturenetUpgrade1,
-    ),
-];
+pub(super) const TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] = {
+    use zcash_protocol::consensus::{
+        TESTNET_FEATURENET_UPGRADE_1_HEIGHT, TESTNET_FEATURENET_UPGRADE_2_HEIGHT,
+    };
+    match TESTNET_FEATURENET_UPGRADE_2_HEIGHT {
+        None => &[
+            (block::Height(0), Genesis),
+            (block::Height(1), Nu6_3),
+            (block::Height(TESTNET_FEATURENET_UPGRADE_1_HEIGHT), FeaturenetUpgrade1),
+        ],
+        Some(featurenet_upgrade_2) => &[
+            (block::Height(0), Genesis),
+            (block::Height(1), Nu6_3),
+            (block::Height(TESTNET_FEATURENET_UPGRADE_1_HEIGHT), FeaturenetUpgrade1),
+            (block::Height(featurenet_upgrade_2), FeaturenetUpgrade2),
+        ],
+    }
+};
 
 /// The Consensus Branch Id, used to bind transactions and blocks to a
 /// particular network upgrade.
@@ -244,6 +256,8 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (Nu6_3, ConsensusBranchId(0x37a5165b)),
     // Matches zcash_protocol's `BranchId::FeaturenetUpgrade1`.
     (FeaturenetUpgrade1, ConsensusBranchId(0x46545531)),
+    // Matches zcash_protocol's `BranchId::FeaturenetUpgrade2`.
+    (FeaturenetUpgrade2, ConsensusBranchId(0x46545532)),
     // TODO: set below to (Nu7, ConsensusBranchId(0x77190ad8)), once the same value is set in librustzcash
     #[cfg(any(test, feature = "zebra-test"))]
     (Nu7, ConsensusBranchId(0xfffffffe)),
@@ -271,10 +285,11 @@ pub const POW_AVERAGING_WINDOW: usize = 17;
 /// Based on <https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network>
 const TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER: i32 = 6;
 
-/// The start height for the testnet minimum difficulty consensus rule.
+/// The default start height for the testnet minimum difficulty consensus rule; a configured
+/// testnet can move it or switch the rule off (`testnet::Parameters::minimum_difficulty_start_height`).
 ///
 /// Based on <https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network>
-const TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT: block::Height = block::Height(299_188);
+pub(crate) const TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT: block::Height = block::Height(299_188);
 
 /// The activation height for the block maximum time rule on Testnet.
 ///
@@ -417,7 +432,7 @@ impl NetworkUpgrade {
         let spacing_seconds = match self {
             Genesis | BeforeOverwinter | Overwinter | Sapling => PRE_BLOSSOM_POW_TARGET_SPACING,
             Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1
-            | Nu7 => {
+            | FeaturenetUpgrade2 | Nu7 => {
                 POST_BLOSSOM_POW_TARGET_SPACING.into()
             }
 
@@ -462,19 +477,22 @@ impl NetworkUpgrade {
         network: &Network,
         height: block::Height,
     ) -> Option<Duration> {
-        match (network, height) {
-            // TODO: Move `TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT` to a field on testnet::Parameters (#8364)
-            (Network::Testnet(_params), height)
-                if height < TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT =>
-            {
-                None
-            }
-            (Network::Mainnet, _) => None,
-            (Network::Testnet(_params), _) => {
-                let network_upgrade = NetworkUpgrade::current(network, height);
-                Some(network_upgrade.target_spacing() * TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER)
-            }
+        use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade as LrzNetworkUpgrade, Parameters as _};
+
+        let Network::Testnet(params) = network else {
+            return None;
+        };
+        if height < params.minimum_difficulty_start_height()? {
+            return None;
         }
+        // Crosslink's Tail Confirmation checks carried headers against ThresholdBits from
+        // FeaturenetUpgrade2. An exemption earned by spacing timestamps would let a proposer
+        // forge every carried header at PoWLimit, so no block is exempt from then on.
+        if network.is_nu_active(LrzNetworkUpgrade::FeaturenetUpgrade2, BlockHeight::from(height.0)) {
+            return None;
+        }
+        let network_upgrade = NetworkUpgrade::current(network, height);
+        Some(network_upgrade.target_spacing() * TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER)
     }
 
     /// Returns true if the gap between `block_time` and `previous_block_time` is
@@ -546,6 +564,9 @@ impl From<zcash_protocol::consensus::NetworkUpgrade> for NetworkUpgrade {
             zcash_protocol::consensus::NetworkUpgrade::Nu6_3 => Self::Nu6_3,
             zcash_protocol::consensus::NetworkUpgrade::FeaturenetUpgrade1 => {
                 Self::FeaturenetUpgrade1
+            }
+            zcash_protocol::consensus::NetworkUpgrade::FeaturenetUpgrade2 => {
+                Self::FeaturenetUpgrade2
             }
             #[cfg(zcash_unstable = "nu7")]
             zcash_protocol::consensus::NetworkUpgrade::Nu7 => Self::Nu7,

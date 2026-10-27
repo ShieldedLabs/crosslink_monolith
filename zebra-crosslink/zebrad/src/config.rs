@@ -321,6 +321,9 @@ impl ZebradConfig {
                     .with_network_magic(Magic([b'C', b'l', b'T', b'1']))
                     .expect("Crosslink testnet magic is not a reserved value")
                     .with_slow_start_interval(Height(0))
+                    // Tail Confirmation checks carried headers against ThresholdBits, which a
+                    // minimum-difficulty exemption would let a proposer meet at PoWLimit.
+                    .with_minimum_difficulty_start_height(None)
                     .with_genesis_hash("05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38")
                     .expect("Crosslink testnet genesis hash is well-formed")
                     .clear_checkpoints()

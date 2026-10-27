@@ -555,3 +555,100 @@ fn time_check_fixed() {
         node_time_check(now, block_header_time).expect("the inverse comparison should be valid");
     }
 }
+
+/// A pointer with one signature, for the fat pointer digest tests.
+fn sample_fat_pointer() -> crate::block::FatPointerToBftBlock {
+    let mut vote_for_block_without_finalizer_public_key = [0; 44];
+    vote_for_block_without_finalizer_public_key[..32].copy_from_slice(&[7; 32]);
+    vote_for_block_without_finalizer_public_key[32..40].copy_from_slice(&3u64.to_le_bytes());
+    vote_for_block_without_finalizer_public_key[40..].copy_from_slice(&0x8000_0000u32.to_le_bytes());
+    crate::block::FatPointerToBftBlock {
+        vote_for_block_without_finalizer_public_key,
+        signatures: vec![crate::block::FatPointerSignature {
+            pub_key: crate::block::PubKeyID([1; 32]),
+            vote_signature: [2; 64],
+        }],
+    }
+}
+
+/// The null pointer contributes ZIP 244's zero terminator, and with it `from_commitments` is the
+/// upstream `hashBlockCommitments`: BLAKE2b-256, personalized "ZcashBlockCommit", over the history
+/// root, the auth data root and 32 zero bytes. Any other pointer contributes the BLAKE2b-256 of
+/// its serialization, so changing any of its bytes changes the commitment.
+#[test]
+fn fat_pointer_digest_of_null_reproduces_the_zip_244_commitment() {
+    use crate::block::{
+        fat_pointer_digest, merkle::AuthDataRoot, ChainHistoryBlockTxAuthCommitmentHash,
+        ChainHistoryMmrRootHash, FatPointerToBftBlock,
+    };
+
+    let _init_guard = zebra_test::init();
+
+    assert_eq!(fat_pointer_digest(&FatPointerToBftBlock::null()), [0; 32]);
+
+    let history_root = ChainHistoryMmrRootHash::from([0x11; 32]);
+    let auth_data_root = AuthDataRoot::from([0x22; 32]);
+    let mut zip_244_input = Vec::new();
+    zip_244_input.extend_from_slice(&[0x11; 32]);
+    zip_244_input.extend_from_slice(&[0x22; 32]);
+    zip_244_input.extend_from_slice(&[0; 32]);
+    let zip_244: [u8; 32] = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"ZcashBlockCommit")
+        .hash(&zip_244_input)
+        .as_bytes()
+        .try_into()
+        .expect("32 byte array");
+    assert_eq!(
+        ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+            &history_root,
+            &auth_data_root,
+            &fat_pointer_digest(&FatPointerToBftBlock::null()),
+        ),
+        ChainHistoryBlockTxAuthCommitmentHash::from(zip_244),
+    );
+
+    let pointer = sample_fat_pointer();
+    let expected: [u8; 32] = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"ZcashCLFatPtrHsh")
+        .hash(&pointer.to_bytes())
+        .as_bytes()
+        .try_into()
+        .expect("32 byte array");
+    assert_eq!(fat_pointer_digest(&pointer), expected);
+    assert_ne!(fat_pointer_digest(&pointer), [0; 32]);
+
+    let mut height_changed = pointer.clone();
+    height_changed.vote_for_block_without_finalizer_public_key[32] ^= 1;
+    let mut signatures_changed = pointer.clone();
+    signatures_changed.signatures.clear();
+    for changed in [height_changed, signatures_changed] {
+        assert_ne!(fat_pointer_digest(&changed), fat_pointer_digest(&pointer));
+    }
+}
+
+/// The digest a block binds is zero below FeaturenetUpgrade2 and on a network that does not
+/// schedule it, whatever the pointer, and the pointer's digest from its activation height on.
+#[test]
+fn fat_pointer_digest_at_switches_on_at_featurenet_upgrade_2() {
+    use crate::{
+        block::{fat_pointer_digest, fat_pointer_digest_at},
+        parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
+    };
+
+    let _init_guard = zebra_test::init();
+
+    let pointer = sample_fat_pointer();
+    let unscheduled = Network::new_regtest(RegtestParameters::default());
+    let scheduled = Network::new_regtest(RegtestParameters::from(ConfiguredActivationHeights {
+        nu5: Some(1),
+        featurenet_upgrade_2: Some(10),
+        ..Default::default()
+    }));
+    assert_eq!(fat_pointer_digest_at(&unscheduled, Height(10), &pointer), [0; 32]);
+    assert_eq!(fat_pointer_digest_at(&unscheduled, Height::MAX, &pointer), [0; 32]);
+    assert_eq!(fat_pointer_digest_at(&scheduled, Height(9), &pointer), [0; 32]);
+    assert_eq!(fat_pointer_digest_at(&scheduled, Height(10), &pointer), fat_pointer_digest(&pointer));
+    assert_eq!(fat_pointer_digest_at(&scheduled, Height(11), &pointer), fat_pointer_digest(&pointer));
+}

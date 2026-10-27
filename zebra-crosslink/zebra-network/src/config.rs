@@ -615,10 +615,23 @@ struct DTestnetParameters {
     /// If unset, the default activation height for the network is used; the soft fork
     /// cannot be disabled via configuration.
     temporary_orchard_disabling_soft_fork_height: Option<u32>,
+    /// Height from which a block may declare the minimum difficulty after a long enough time
+    /// gap, or `"never"`. If unset, the default Testnet height is used.
+    minimum_difficulty_start_height: Option<DMinimumDifficultyStartHeight>,
     /// Regtest only: whether to allow coinbase spends to have transparent outputs.
     should_allow_unshielded_coinbase_spends: Option<bool>,
     /// Crosslink consensus parameters. Unset values keep the prototype's.
     crosslink: Option<DCrosslinkParameters>,
+}
+
+/// A minimum-difficulty start height as written in a config file: a height, or `"never"`. A
+/// plain optional height could not say "never", and a network that sets it would come back from
+/// its own written config with the default height, forking at that height from nodes that kept it.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum DMinimumDifficultyStartHeight {
+    Height(u32),
+    Never(String),
 }
 
 /// Crosslink consensus parameters as written in a config file.
@@ -636,6 +649,7 @@ struct DCrosslinkParameters {
     staking_period: Option<u32>,
     staking_day_window: Option<u32>,
     staking_action_delay: Option<u32>,
+    active_roster_max_n: Option<usize>,
 }
 
 impl DCrosslinkParameters {
@@ -663,6 +677,7 @@ impl DCrosslinkParameters {
                 day_window: self.staking_day_window.unwrap_or(prototype.staking.day_window),
                 action_delay: self.staking_action_delay.unwrap_or(prototype.staking.action_delay),
             },
+            active_roster_max_n: self.active_roster_max_n.unwrap_or(prototype.active_roster_max_n),
         }
     }
 }
@@ -680,6 +695,9 @@ impl From<ZcashCrosslinkParameters> for DCrosslinkParameters {
             staking_period: staking.map(|s| s.period),
             staking_day_window: staking.map(|s| s.day_window),
             staking_action_delay: staking.map(|s| s.action_delay),
+            // Likewise written only when it differs from the prototype's.
+            active_roster_max_n: (params.active_roster_max_n != PROTOTYPE_PARAMETERS.active_roster_max_n)
+                .then_some(params.active_roster_max_n),
         }
     }
 }
@@ -777,6 +795,16 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             temporary_orchard_disabling_soft_fork_height: params
                 .temporary_orchard_disabling_soft_fork_height()
                 .map(|height| height.0),
+            minimum_difficulty_start_height: if params.minimum_difficulty_start_height()
+                == testnet::Parameters::default().minimum_difficulty_start_height()
+            {
+                None
+            } else {
+                match params.minimum_difficulty_start_height() {
+                    Some(height) => Some(DMinimumDifficultyStartHeight::Height(height.0)),
+                    None => Some(DMinimumDifficultyStartHeight::Never("never".to_string())),
+                }
+            },
             should_allow_unshielded_coinbase_spends: params
                 .is_regtest()
                 .then(|| params.should_allow_unshielded_coinbase_spends()),
@@ -978,6 +1006,7 @@ where
         checkpoints,
         extend_funding_stream_addresses_as_required,
         temporary_orchard_disabling_soft_fork_height,
+        minimum_difficulty_start_height,
         should_allow_unshielded_coinbase_spends,
         crosslink,
     } = params;
@@ -1079,6 +1108,23 @@ where
         params_builder = params_builder.with_temporary_orchard_disabling_soft_fork_height(
             height.try_into().map_err(de::Error::custom)?,
         );
+    }
+
+    match minimum_difficulty_start_height {
+        None => {}
+        Some(DMinimumDifficultyStartHeight::Height(height)) => {
+            params_builder = params_builder.with_minimum_difficulty_start_height(Some(
+                height.try_into().map_err(de::Error::custom)?,
+            ));
+        }
+        Some(DMinimumDifficultyStartHeight::Never(word)) if word == "never" => {
+            params_builder = params_builder.with_minimum_difficulty_start_height(None);
+        }
+        Some(DMinimumDifficultyStartHeight::Never(word)) => {
+            return Err(de::Error::custom(format!(
+                "minimum_difficulty_start_height must be a height or \"never\", not {word:?}"
+            )));
+        }
     }
 
     // Return an error if the initial testnet peers includes any of the default initial Mainnet or Testnet

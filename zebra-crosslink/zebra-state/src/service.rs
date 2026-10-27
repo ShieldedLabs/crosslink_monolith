@@ -1204,6 +1204,8 @@ impl Service<ReadRequest> for ReadStateService {
                 crate::new_network::bft::bft_chain().read().unwrap().is_activated,
             )),
 
+            ReadRequest::CrosslinkBftDropped => Ok(ReadResponse::CrosslinkBftDropped(state.db.crosslink_bft_dropped())),
+
             // Used by the StateService.
             ReadRequest::Depth(hash) => Ok(ReadResponse::Depth(read::depth(
                 state.latest_best_chain(),
@@ -2089,7 +2091,7 @@ pub fn pos_block_reward(height: block::Height, network: &Network) -> u64 {
 /// credited its whole share.
 ///
 /// Only finalizers in the active roster are paid into their banks. The roster is
-/// the top [`ACTIVE_ROSTER_MAX_N`] finalizers by total stake (bonds plus bank, ties
+/// the top `active_roster_max_n` (a network parameter) finalizers by total stake (bonds plus bank, ties
 /// to the larger key) as of this block's bond state, the same ordering tenderlink
 /// applies to the aggregated-stakes snapshot. A bond pointed at a finalizer outside
 /// the roster keeps its whole reward, and such a finalizer's bank (if it has one from
@@ -2100,6 +2102,7 @@ pub fn pos_block_reward(height: block::Height, network: &Network) -> u64 {
 /// undo exactly what was done without recomputing. Both are empty when nothing is
 /// at stake.
 fn update_bonds_with_pos_issuance_legacy(
+    active_roster_max_n: usize,
     bond_reward_total: u64,
     delegation_bonds: &mut HashMap<finalized_state::disk_format::BondKey, (finalized_state::disk_format::DelegationBond, non_finalized_state::BondStatusInChain)>,
     finalizer_rewards: &mut HashMap<[u8; 32], u64>,
@@ -2107,7 +2110,6 @@ fn update_bonds_with_pos_issuance_legacy(
 {
     use zebra_chain::amount::Amount;
     use crate::constants::FINALIZER_COMMISSION_DIVISOR;
-    use zcash_primitives::bft::ACTIVE_ROSTER_MAX_N;
 
     // The active roster: rank every finalizer by what it would show in the
     // aggregated-stakes snapshot (active bonds targeting it plus its bank).
@@ -2125,7 +2127,7 @@ fn update_bonds_with_pos_issuance_legacy(
         }
         let mut ranked: Vec<(u64, [u8; 32])> = stakes.into_iter().map(|(k, v)| (v, k)).collect();
         ranked.sort_by_key(|&(stake, key)| std::cmp::Reverse((stake, key)));
-        ranked.iter().take(ACTIVE_ROSTER_MAX_N).map(|&(_, key)| key).collect()
+        ranked.iter().take(active_roster_max_n).map(|&(_, key)| key).collect()
     };
 
     /*
@@ -2242,7 +2244,7 @@ fn update_bonds_with_pos_issuance_legacy(
 ///   whether a bond's target finalizer is in the active roster. A bank's share is credited to
 ///   the bank. The rounding remainder goes to the biggest of them.
 /// * The finalizer pool is shared by the finalizers in the active roster (top
-///   [`ACTIVE_ROSTER_MAX_N`] by active bonds plus bank) in proportion to that same stake, and
+///   the network's `active_roster_max_n` by active bonds plus bank) in proportion to that same stake, and
 ///   credited to their banks. The rounding remainder goes to the biggest roster finalizer.
 ///
 /// A pool with nobody to pay is left unpaid (burned). Returns the amounts actually paid, per
@@ -2257,11 +2259,11 @@ pub fn update_bonds_with_pos_issuance(
 {
     use zebra_chain::amount::Amount;
     use crate::constants::FINALIZER_COMMISSION_DIVISOR;
-    use zcash_primitives::bft::ACTIVE_ROSTER_MAX_N;
+    let active_roster_max_n = network.crosslink_parameters().active_roster_max_n;
 
     use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
     if !network.is_nu_active(NetworkUpgrade::FeaturenetUpgrade1, height.0.into()) {
-        return update_bonds_with_pos_issuance_legacy(bond_reward_total, delegation_bonds, finalizer_rewards);
+        return update_bonds_with_pos_issuance_legacy(active_roster_max_n, bond_reward_total, delegation_bonds, finalizer_rewards);
     }
 
     let finalizer_pool = bond_reward_total / FINALIZER_COMMISSION_DIVISOR;
@@ -2282,7 +2284,7 @@ pub fn update_bonds_with_pos_issuance(
     }
     let mut ranked: Vec<(u64, [u8; 32])> = stakes.into_iter().map(|(k, v)| (v, k)).collect();
     ranked.sort_by_key(|&(stake, key)| std::cmp::Reverse((stake, key)));
-    let roster: Vec<(u64, [u8; 32])> = ranked.into_iter().take(ACTIVE_ROSTER_MAX_N).collect();
+    let roster: Vec<(u64, [u8; 32])> = ranked.into_iter().take(active_roster_max_n).collect();
 
     // Bond pool: every active bond plus every non-empty roster bank (a bank is a virtual
     // bond), stake-weighted. The remainder goes to the biggest staker (ties: bonds before

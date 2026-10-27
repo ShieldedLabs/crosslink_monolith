@@ -9,7 +9,7 @@ use crate::{
         checkpoint::list::{CheckpointList, TESTNET_CHECKPOINT_LIST},
         constants::{magics, SLOW_START_INTERVAL, SLOW_START_SHIFT},
         network::error::ParametersBuilderError,
-        network_upgrade::TESTNET_ACTIVATION_HEIGHTS,
+        network_upgrade::{TESTNET_ACTIVATION_HEIGHTS, TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT},
         subsidy::{
             constants::mainnet,
             constants::testnet,
@@ -194,6 +194,9 @@ impl From<&BTreeMap<Height, NetworkUpgrade>> for ConfiguredActivationHeights {
                 NetworkUpgrade::Nu6_3 => &mut configured_activation_heights.nu6_3,
                 NetworkUpgrade::FeaturenetUpgrade1 => {
                     &mut configured_activation_heights.featurenet_upgrade_1
+                }
+                NetworkUpgrade::FeaturenetUpgrade2 => {
+                    &mut configured_activation_heights.featurenet_upgrade_2
                 }
                 NetworkUpgrade::Nu7 => &mut configured_activation_heights.nu7,
                 #[cfg(zcash_unstable = "zfuture")]
@@ -381,6 +384,9 @@ pub struct ConfiguredActivationHeights {
     /// Activation height for the `FeaturenetUpgrade1` network upgrade.
     #[serde(rename = "FeaturenetUpgrade1")]
     pub featurenet_upgrade_1: Option<u32>,
+    /// Activation height for the `FeaturenetUpgrade2` network upgrade.
+    #[serde(rename = "FeaturenetUpgrade2")]
+    pub featurenet_upgrade_2: Option<u32>,
     /// Activation height for `NU7` network upgrade.
     #[serde(rename = "NU7")]
     pub nu7: Option<u32>,
@@ -407,6 +413,7 @@ impl ConfiguredActivationHeights {
             nu6_2,
             nu6_3,
             featurenet_upgrade_1,
+            featurenet_upgrade_2,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -439,6 +446,7 @@ impl ConfiguredActivationHeights {
             nu6_2,
             nu6_3,
             featurenet_upgrade_1,
+            featurenet_upgrade_2,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -446,17 +454,37 @@ impl ConfiguredActivationHeights {
         .with_default_featurenet_upgrade()
     }
 
-    /// Schedules the featurenet upgrade at the height the wallet's hardcoded parameters name,
+    /// Schedules each featurenet upgrade at the height the wallet's hardcoded parameters name,
     /// unless these heights name one already or leave it no room.
     ///
-    /// A config file written before the upgrade existed lists every height but this one, and
-    /// without the default its node would never activate the upgrade.
+    /// A config file written before an upgrade existed lists every height but its own, and
+    /// without the default its node would never activate the upgrade. `FeaturenetUpgrade2` stays
+    /// unscheduled until `TESTNET_FEATURENET_UPGRADE_2_HEIGHT` names a height.
     pub fn with_default_featurenet_upgrade(mut self) -> Self {
+        use zcash_protocol::consensus::{
+            TESTNET_FEATURENET_UPGRADE_1_HEIGHT, TESTNET_FEATURENET_UPGRADE_2_HEIGHT,
+        };
+        let fits_between = |height: u32, before: Option<u32>, after: Option<u32>| {
+            before.is_some_and(|n| n < height) && after.map_or(true, |n| n > height)
+        };
         let Self { nu6_3, nu7, .. } = self;
-        self.featurenet_upgrade_1 = self.featurenet_upgrade_1.or(
-            Some(zcash_protocol::consensus::TESTNET_FEATURENET_UPGRADE_1_HEIGHT)
-                .filter(|&h| nu6_3.is_some_and(|n| n < h) && nu7.map_or(true, |n| n > h)),
-        );
+
+        if self.featurenet_upgrade_1.is_none()
+            && fits_between(
+                TESTNET_FEATURENET_UPGRADE_1_HEIGHT,
+                nu6_3,
+                self.featurenet_upgrade_2.or(nu7),
+            )
+        {
+            self.featurenet_upgrade_1 = Some(TESTNET_FEATURENET_UPGRADE_1_HEIGHT);
+        }
+        if let Some(height) = TESTNET_FEATURENET_UPGRADE_2_HEIGHT {
+            if self.featurenet_upgrade_2.is_none()
+                && fits_between(height, self.featurenet_upgrade_1.or(nu6_3), nu7)
+            {
+                self.featurenet_upgrade_2 = Some(height);
+            }
+        }
         self
     }
 }
@@ -527,6 +555,9 @@ pub struct ParametersBuilder {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+    /// Height from which a block may declare the minimum difficulty after a long enough time gap
+    /// (ZIPs 205 and 208), or `None` if no block ever may
+    minimum_difficulty_start_height: Option<Height>,
     /// Crosslink consensus parameters for this network
     crosslink: ZcashCrosslinkParameters,
 }
@@ -565,6 +596,7 @@ impl Default for ParametersBuilder {
             temporary_orchard_disabling_soft_fork_height: Some(
                 super::TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT,
             ),
+            minimum_difficulty_start_height: Some(TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT),
             crosslink: PROTOTYPE_PARAMETERS,
         }
     }
@@ -649,6 +681,7 @@ impl ParametersBuilder {
             nu6_2,
             nu6_3,
             featurenet_upgrade_1,
+            featurenet_upgrade_2,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -679,6 +712,7 @@ impl ParametersBuilder {
                 .chain(nu6_2.into_iter().map(|h| (h, Nu6_2)))
                 .chain(nu6_3.into_iter().map(|h| (h, Nu6_3)))
                 .chain(featurenet_upgrade_1.into_iter().map(|h| (h, FeaturenetUpgrade1)))
+                .chain(featurenet_upgrade_2.into_iter().map(|h| (h, FeaturenetUpgrade2)))
                 .chain(nu7.into_iter().map(|h| (h, Nu7)));
 
             #[cfg(zcash_unstable = "zfuture")]
@@ -883,6 +917,13 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets the height from which a block may declare the minimum difficulty after a long enough
+    /// time gap, or `None` so that no block ever may.
+    pub fn with_minimum_difficulty_start_height(mut self, height: Option<Height>) -> Self {
+        self.minimum_difficulty_start_height = height;
+        self
+    }
+
     /// Sets the Crosslink consensus parameters to be used in the [`Parameters`] being built.
     pub fn with_crosslink_parameters(
         mut self,
@@ -893,6 +934,9 @@ impl ParametersBuilder {
         }
         if !crosslink.staking.is_valid() {
             return Err(ParametersBuilderError::InvalidStakingParameters);
+        }
+        if !crosslink.active_roster_is_valid() {
+            return Err(ParametersBuilderError::InvalidActiveRoster);
         }
         self.crosslink = crosslink;
         Ok(self)
@@ -916,6 +960,7 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
+            minimum_difficulty_start_height,
             crosslink,
         } = self;
         Parameters {
@@ -934,6 +979,7 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
+            minimum_difficulty_start_height,
             crosslink,
         }
     }
@@ -982,6 +1028,7 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
+            minimum_difficulty_start_height,
             crosslink,
         } = Self::default();
 
@@ -997,6 +1044,7 @@ impl ParametersBuilder {
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
             && self.post_blossom_halving_interval == post_blossom_halving_interval
             && self.lockbox_disbursements == lockbox_disbursements
+            && self.minimum_difficulty_start_height == minimum_difficulty_start_height
             && self.crosslink == crosslink
     }
 }
@@ -1064,6 +1112,9 @@ pub struct Parameters {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+    /// Height from which a block may declare the minimum difficulty after a long enough time gap
+    /// (ZIPs 205 and 208), or `None` if no block ever may
+    minimum_difficulty_start_height: Option<Height>,
     /// Crosslink consensus parameters for this network
     crosslink: ZcashCrosslinkParameters,
 }
@@ -1160,6 +1211,7 @@ impl Parameters {
             lockbox_disbursements: _,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
+            minimum_difficulty_start_height,
             // Configurable on Regtest: the test-format harness supplies BFT instead of bootstrapping it
             crosslink: _,
         } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
@@ -1172,6 +1224,7 @@ impl Parameters {
             && self.disable_pow == disable_pow
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
             && self.post_blossom_halving_interval == post_blossom_halving_interval
+            && self.minimum_difficulty_start_height == minimum_difficulty_start_height
     }
 
     /// Returns the network name
@@ -1217,6 +1270,12 @@ impl Parameters {
     /// Returns true if proof-of-work validation should be disabled for this network
     pub fn disable_pow(&self) -> bool {
         self.disable_pow
+    }
+
+    /// Returns the height from which a block may declare the minimum difficulty after a long
+    /// enough time gap, or `None` if no block ever may
+    pub fn minimum_difficulty_start_height(&self) -> Option<Height> {
+        self.minimum_difficulty_start_height
     }
 
     /// Returns the Crosslink consensus parameters for this network

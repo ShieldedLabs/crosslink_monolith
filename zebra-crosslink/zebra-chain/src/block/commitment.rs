@@ -6,7 +6,7 @@ use hex::{FromHex, ToHex};
 use thiserror::Error;
 
 use crate::{
-    block::{self, merkle::AuthDataRoot},
+    block::{self, merkle::AuthDataRoot, FatPointerToBftBlock},
     parameters::{
         Network,
         NetworkUpgrade::{self, *},
@@ -137,7 +137,7 @@ impl Commitment {
             // block. Match every post-Heartwood upgrade *at the Heartwood activation height* instead.
             //
             // See <https://zips.z.cash/zip-0221> and the [protocol specification §7.6](https://zips.z.cash/protocol/protocol.pdf).
-            (Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1 | Nu7, activation_height)
+            (Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | Nu7, activation_height)
                 if height == activation_height
                     && Some(height) == Heartwood.activation_height(network) =>
             {
@@ -148,7 +148,7 @@ impl Commitment {
                 }
             }
             (Heartwood | Canopy, _) => Ok(ChainHistoryRoot(ChainHistoryMmrRootHash(bytes))),
-            (Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1 | Nu7, _) => Ok(ChainHistoryBlockTxAuthCommitment(
+            (Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | Nu7, _) => Ok(ChainHistoryBlockTxAuthCommitment(
                 ChainHistoryBlockTxAuthCommitmentHash(bytes),
             )),
 
@@ -309,11 +309,15 @@ impl ChainHistoryBlockTxAuthCommitmentHash {
     /// the *previous* block.
     /// `auth_data_root` is the root of the Merkle tree of authorizing data
     /// commmitments of each transaction in the *current* block.
+    /// `fat_pointer_digest` takes the place of ZIP 244's zero terminator; it is
+    /// [`fat_pointer_digest_at`] for this block, which is all zeroes wherever
+    /// upstream's rule applies.
     ///
     ///  [ZIP-244]: https://zips.z.cash/zip-0244#block-header-changes
     pub fn from_commitments(
         history_tree_root: &ChainHistoryMmrRootHash,
         auth_data_root: &AuthDataRoot,
+        fat_pointer_digest: &[u8; 32],
     ) -> Self {
         // > The value of this hash [hashBlockCommitments] is the BLAKE2b-256 hash personalized
         // > by the string "ZcashBlockCommit" of the following elements:
@@ -326,12 +330,57 @@ impl ChainHistoryBlockTxAuthCommitmentHash {
             .to_state()
             .update(&<[u8; 32]>::from(*history_tree_root)[..])
             .update(&<[u8; 32]>::from(*auth_data_root))
-            .update(&[0u8; 32])
+            .update(fat_pointer_digest)
             .finalize()
             .as_bytes()
             .try_into()
             .expect("32 byte array");
         Self(hash_block_commitments)
+    }
+}
+
+/// BLAKE2b-256 of the serialized fat pointer, or all zeroes for the null pointer.
+///
+/// The pointer is serialized after the Equihash solution, so outside the Equihash input but
+/// inside the block hash the difficulty filter compares: unbound, a miner could vary it after a
+/// single solve and grind the block hash with `sha256d` alone. Feeding this digest into
+/// `hashBlockCommitments`, which is inside the Equihash input, makes every pointer change cost a
+/// new solution. The null pointer maps to ZIP 244's terminator so that a block without a pointer
+/// keeps upstream's commitment.
+pub fn fat_pointer_digest(fat_pointer: &FatPointerToBftBlock) -> [u8; 32] {
+    if *fat_pointer == FatPointerToBftBlock::null() {
+        return [0; 32];
+    }
+    let mut bytes = Vec::new();
+    fat_pointer
+        .zcash_serialize(&mut bytes)
+        .expect("serialization into a vec can't fail");
+    blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"ZcashCLFatPtrHsh")
+        .hash(&bytes)
+        .as_bytes()
+        .try_into()
+        .expect("32 byte array")
+}
+
+/// The digest of `fat_pointer` that a block at `height` binds into `hashBlockCommitments`: from
+/// `FeaturenetUpgrade2` on, [`fat_pointer_digest`]; before it, ZIP 244's zero terminator whatever
+/// the pointer, so every earlier block keeps its commitment and its hash.
+pub fn fat_pointer_digest_at(
+    network: &Network,
+    height: block::Height,
+    fat_pointer: &FatPointerToBftBlock,
+) -> [u8; 32] {
+    use zcash_protocol::consensus::Parameters;
+
+    if network.is_nu_active(
+        zcash_protocol::consensus::NetworkUpgrade::FeaturenetUpgrade2,
+        height.0.into(),
+    ) {
+        fat_pointer_digest(fat_pointer)
+    } else {
+        [0; 32]
     }
 }
 
@@ -415,4 +464,7 @@ pub enum CommitmentError {
 
     #[error("provided bytes are not a valid sapling root")]
     InvalidSapingRootBytes,
+
+    #[error("a block whose commitment cannot bind a fat pointer carries a non-null one")]
+    FatPointerWithoutCommitment,
 }

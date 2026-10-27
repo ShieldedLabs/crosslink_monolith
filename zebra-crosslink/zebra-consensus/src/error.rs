@@ -575,6 +575,13 @@ pub enum BlockError {
         source: amount::Error,
     },
 
+    #[error("block {hash:?} carries a fat pointer with {signatures} signatures, more than the {cap} seats of the active roster")]
+    FatPointerExceedsActiveRoster {
+        hash: zebra_chain::block::Hash,
+        signatures: usize,
+        cap: usize,
+    },
+
     #[error("unexpected error occurred: {0}")]
     Other(String),
 }
@@ -611,7 +618,8 @@ impl BlockError {
             | NoTransactions
             | BadMerkleRoot { .. }
             | WrongTransactionConsensusBranchId
-            | TooManyTransparentSignatureOperations { .. } => 100,
+            | TooManyTransparentSignatureOperations { .. }
+            | FatPointerExceedsActiveRoster { .. } => 100,
             Transaction(err) => err.mempool_misbehavior_score(),
             _other => 0,
         }
