@@ -78,7 +78,9 @@ were not, and the best tip.
 
 `--trusted` skips only the proof, signature and script checks (`verify_expensive`) for the
 file's PoW blocks. Everything else above still runs. Use it for files from a node you trust,
-typically your own export.
+typically your own export. The saving grows with the shielded transactions a chain holds. A
+600-block regtest chain of mostly coinbase blocks loaded in 75 s fully verified and in 67 s
+trusted, in a debug build, with identical results: same tip, `fin` and roster.
 
 Import into an empty state directory. Blocks the state already holds load as known. Blocks on
 another chain are treated as any competing branch would be: the node's fork choice and `fin`
