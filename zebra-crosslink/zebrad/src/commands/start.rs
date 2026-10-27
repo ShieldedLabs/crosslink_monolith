@@ -88,7 +88,7 @@ use tower::{builder::ServiceBuilder, util::BoxService, ServiceExt};
 use tracing_futures::Instrument;
 
 use zebra_chain::block::genesis::regtest_genesis_block;
-use zebra_chain::parameters::{is_crosslink_testnet, HardForkSchedule};
+use zebra_chain::parameters::{is_crosslink_testnet, SlashForkSchedule};
 use zebra_consensus::router::BackgroundTaskHandles;
 use zebra_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
 
@@ -433,8 +433,8 @@ impl StartCmd {
         info!("opening database, this may take a few minutes");
 
         let mut state_config = config.state.clone();
-        // config.crosslink.hardforks is already canonical and merged (see ZebradConfig::load)
-        state_config.hardfork_schedule = Arc::new(HardForkSchedule::from_canonical(config.crosslink.hardforks.clone()));
+        // config.crosslink.slashforks is already canonical and merged (see ZebradConfig::load)
+        state_config.slashfork_schedule = Arc::new(SlashForkSchedule::from_canonical(config.crosslink.slashforks.clone()));
 
         let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change, block_writer) =
             zebra_state::spawn_init(

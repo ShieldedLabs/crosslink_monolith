@@ -266,7 +266,7 @@ impl TFInstr {
     /// error, such as a method that no longer exists.
     pub const CALL_RPC: TFInstrKind = 26;
     /// Every bond and finalizer bank the node holds at its best tip is what replaying the best
-    /// chain's staking actions and rewards from genesis gives, with the node's own hardfork
+    /// chain's staking actions and rewards from genesis gives, with the node's own slashfork
     /// schedule and slash window. Catches state the node accumulated that the chain does not
     /// imply, such as a reward paid twice.
     pub const EXPECT_STAKING_REPLAY_MATCHES: TFInstrKind = 27;
@@ -537,7 +537,7 @@ impl TF {
 
     /// Also sets parts of the node's config: `node_config` is a zebrad.toml fragment, of which
     /// the harness takes the `[network]` parameters (on regtest, under the Crosslink parameters
-    /// given here), the `[crosslink]` hardfork schedule, and `[state] network_checkpoint`.
+    /// given here), the `[crosslink]` slashfork schedule, and `[state] network_checkpoint`.
     pub fn new_with_node_config(params: &ZcashCrosslinkParameters, node_config: &str) -> TF {
         let mut tf = TF {
             instrs: Vec::new(),
@@ -2132,8 +2132,8 @@ async fn staking_replay_matches(internal_handle: &TFLServiceHandle) -> (bool, St
         }
     }
 
-    let hardfork_schedule = zebra_chain::parameters::HardForkSchedule::from_canonical(internal_handle.config.hardforks.clone());
-    let mut replay = StakingReplay::new(&hardfork_schedule, internal_handle.params.staking.slash_analysis_window());
+    let slashfork_schedule = zebra_chain::parameters::SlashForkSchedule::from_canonical(internal_handle.config.slashforks.clone());
+    let mut replay = StakingReplay::new(&slashfork_schedule, internal_handle.params.staking.slash_analysis_window());
     for (height, block) in blocks.iter().enumerate() {
         // Every block pays issuance: variable reward is disabled in Chain::push, and the stake
         // repair tool (stake_fixup.rs) replays with the same rule. If that changes, so must this.
@@ -2741,7 +2741,7 @@ mod tests {
             height: 1,
             previous_block_fat_ptr: FatPointerToBftBlock::null(),
             headers: Vec::new(),
-            hardforks: Vec::new(),
+            slashforks: Vec::new(),
             do_not_include_until_bc_height: 0,
         };
         let chunks_n = tenderlink::proposal_chunks_n(block.zcash_serialize_to_vec().unwrap().len());

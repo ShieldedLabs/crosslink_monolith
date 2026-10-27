@@ -19,7 +19,7 @@ use tenderlink::{
 };
 use zcash_primitives::bft::{
     BftBlock, BftBootstrap, Blake3Hash, FatPointerToBftBlock, FinalizerRecencyStatus,
-    HardForkConfig, HashKeys, PubKeyID, TFLRecencyStatus, TMSig, ZcashCrosslinkParameters,
+    SlashForkConfig, HashKeys, PubKeyID, TFLRecencyStatus, TMSig, ZcashCrosslinkParameters,
     // FINALITY_LIVENESS_ALLOWANCE, // only used by the disabled variable-reward gate
 };
 use zcash_primitives::block::{
@@ -524,24 +524,24 @@ fn carried_headers_meet_required_difficulty(
     headers_meet_required_difficulty(read_state.network(), snapshot_height, context, headers)
 }
 
-/// The set of finalizers terminated (blacklisted) by user-led hardforks at a given point, as a
+/// The set of finalizers terminated (blacklisted) by user-led slashforks at a given point, as a
 /// pure function of `(schedule, bft_height, finalized_bc_height)`.
 ///
-/// A finalizer is terminated at BFT height `bft_height` when some scheduled hardfork:
+/// A finalizer is terminated at BFT height `bft_height` when some scheduled slashfork:
 /// - has `bft_certificate_height <= bft_height` -- in effect at this height, **inclusive**, so the
-///   finalizers a hardfork terminates are already excluded from the roster that votes on the very
-///   block carrying that hardfork (this matches the vote-namespacing inclusiveness); and
+///   finalizers a slashfork terminates are already excluded from the roster that votes on the very
+///   block carrying that slashfork (this matches the vote-namespacing inclusiveness); and
 /// - has `pow_activation_height > finalized_bc_height` -- the activation has not yet been
 ///   finalized. Once it is, the bonds are terminated at the source (so the finalizer is gone from
 ///   the roster anyway) and the key is free to be restaked to, so it must no longer be suppressed
 ///   here.
 pub fn terminated_finalizers_at(
-    hardforks: &[HardForkConfig],
+    slashforks: &[SlashForkConfig],
     bft_height: u64,
     finalized_bc_height: u64,
 ) -> HashSet<PubKeyID> {
     let mut set = HashSet::new();
-    for hf in hardforks.iter().filter(|hf| {
+    for hf in slashforks.iter().filter(|hf| {
         hf.bft_certificate_height <= bft_height && hf.pow_activation_height > finalized_bc_height
     }) {
         for &finalizer in &hf.terminated_finalizers {
@@ -552,20 +552,20 @@ pub fn terminated_finalizers_at(
 }
 
 /// Vote-namespacing domain separator for a BFT height: a flat blake3 hash of the prefix of
-/// scheduled hardforks whose `bft_certificate_height <= bft_height` (inclusive of a hardfork at
+/// scheduled slashforks whose `bft_certificate_height <= bft_height` (inclusive of a slashfork at
 /// `bft_height` itself), concatenated in canonical schedule order. An empty prefix yields
-/// `[0; 32]` (nil), so the no-hardfork case is a backwards-compatible no-op in tenderlink's
+/// `[0; 32]` (nil), so the no-slashfork case is a backwards-compatible no-op in tenderlink's
 /// signing. The schedule is sorted with non-decreasing `bft_certificate_height` (several rules
 /// may share one certificate height), so the filtered set is exactly the prefix.
 ///
 /// At a height that decides by the strict quorum (`strict_quorum_at`) the FeaturenetUpgrade2
-/// branch ID follows the hardforks. A finalizer still deciding on `2f+1` and one deciding on the
+/// branch ID follows the slashforks. A finalizer still deciding on `2f+1` and one deciding on the
 /// strict quorum then sign under different namespaces and neither counts the other's votes, so
 /// the switch is a clean fork rather than a network whose halves decide on different quorums.
-pub fn namespace_for_bft_height(hardforks: &[HardForkConfig], bft_height: u64, strict_quorum: bool) -> [u8; 32] {
+pub fn namespace_for_bft_height(slashforks: &[SlashForkConfig], bft_height: u64, strict_quorum: bool) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     let mut any = false;
-    for hf in hardforks.iter().filter(|hf| hf.bft_certificate_height <= bft_height) {
+    for hf in slashforks.iter().filter(|hf| hf.bft_certificate_height <= bft_height) {
         let mut bytes = Vec::new();
         hf.zcash_serialize(&mut bytes).expect("serializing to a Vec is infallible");
         hasher.update(&bytes);
@@ -592,22 +592,22 @@ pub fn strict_quorum_at(network: &Network, roster_snapshot_height: Option<Height
 /// What votes at `bft_height`: tenderlink's roster built from `stakes`, the stake at the snapshot
 /// of the block below, which sits at `roster_snapshot_height` (`None` for genesis); and the
 /// voting roster, with the height's namespace and quorum rule, that its certificates are checked
-/// against. The snapshot height is also the finalized watermark the hardfork terminations use.
+/// against. The snapshot height is also the finalized watermark the slashfork terminations use.
 pub fn roster_for_bft_height(
     network: &Network,
-    hardforks: &[HardForkConfig],
+    slashforks: &[SlashForkConfig],
     stakes: &[RosterMember],
     bft_height: u64,
     roster_snapshot_height: Option<Height>,
 ) -> (Vec<SortedRosterMember>, VotingRoster) {
     // u32 to u64 is lossless.
     let watermark = roster_snapshot_height.map_or(0, |height| u64::from(height.0));
-    let terminated = terminated_finalizers_at(hardforks, bft_height, watermark);
+    let terminated = terminated_finalizers_at(slashforks, bft_height, watermark);
     let roster = tenderlink_roster_from_internal(stakes, &terminated);
     let strict_quorum = strict_quorum_at(network, roster_snapshot_height);
     let voting = VotingRoster {
         roster: roster[..roster.len().min(network.crosslink_parameters().active_roster_max_n)].to_vec(),
-        vote_namespace: namespace_for_bft_height(hardforks, bft_height, strict_quorum),
+        vote_namespace: namespace_for_bft_height(slashforks, bft_height, strict_quorum),
         strict_quorum,
     };
     (roster, voting)
@@ -653,7 +653,7 @@ pub fn certificate_is_valid(fat_pointer: &FatPointerToBftBlock, bft_height: u64,
 }
 
 /// Build the tenderlink consensus roster from the stored roster, excluding any finalizer in
-/// `terminated` (terminated by a user-led hardfork; see [`terminated_finalizers_at`]). Pass an
+/// `terminated` (terminated by a user-led slashfork; see [`terminated_finalizers_at`]). Pass an
 /// empty set to build the roster unfiltered.
 pub fn tenderlink_roster_from_internal(
     vals: &[RosterMember],
@@ -1028,7 +1028,7 @@ pub(super) struct BftRunner {
     rt: tokio::runtime::Handle,
     network: Network,
     params: ZcashCrosslinkParameters,
-    hardforks: Arc<zebra_chain::parameters::HardForkSchedule>,
+    slashforks: Arc<zebra_chain::parameters::SlashForkSchedule>,
     /// Held until BFT starts (a loaded chain, or the bootstrap genesis); `None` once tenderlink
     /// is spawned, or when this node runs no BFT at all.
     launch: Option<BftLaunch>,
@@ -1080,7 +1080,7 @@ impl BftRunner {
             rt,
             network: read_state.network().clone(),
             params: read_state.network().crosslink_parameters(),
-            hardforks: config.hardfork_schedule.clone(),
+            slashforks: config.slashfork_schedule.clone(),
             launch,
             pending_bootstrap: None,
             unanswered_decisions: Vec::new(),
@@ -1281,7 +1281,7 @@ impl BftRunner {
         // usize to u64 is lossless on every supported target.
         let next_bft_height = chain.blocks.len() as u64;
         let roster_snapshot_height = chain.bft_final_snapshot.map(|(height, _)| height);
-        roster_for_bft_height(&self.network, self.hardforks.rules(), &chain.roster, next_bft_height, roster_snapshot_height).1
+        roster_for_bft_height(&self.network, self.slashforks.rules(), &chain.roster, next_bft_height, roster_snapshot_height).1
     }
 
     fn propose(&self, read_state: &ReadState) -> Option<BftBlock> {
@@ -1405,12 +1405,12 @@ impl BftRunner {
             }
         }
 
-        // The user-led hardforks scheduled at this BFT height (several rules may share one
+        // The user-led slashforks scheduled at this BFT height (several rules may share one
         // certificate height). The schedule is canonical, so this filter preserves canonical
         // (ascending pow_activation_height) order -- the same order `validate` requires
         // byte-for-byte.
-        let scheduled_hardforks: Vec<HardForkConfig> = self
-            .hardforks
+        let scheduled_slashforks: Vec<SlashForkConfig> = self
+            .slashforks
             .rules()
             .iter()
             .filter(|hf| hf.bft_certificate_height == bft_height)
@@ -1423,13 +1423,13 @@ impl BftRunner {
                 // signatures are untouched), and v2 >= any parent's version satisfies the
                 // monotonic-version check.
                 block.version = 2;
-                // A hardfork block sets do_not_include to the greatest activation height it
+                // A slashfork block sets do_not_include to the greatest activation height it
                 // carries (pointing at this block commits to every certificate in it, so the
                 // strictest one governs); otherwise the parent's carries forward so it never
                 // regresses (both as `validate` requires).
-                if let Some(last) = scheduled_hardforks.last() {
+                if let Some(last) = scheduled_slashforks.last() {
                     block.do_not_include_until_bc_height = last.pow_activation_height;
-                    block.hardforks = scheduled_hardforks;
+                    block.slashforks = scheduled_slashforks;
                 } else {
                     block.do_not_include_until_bc_height = parent_do_not_include;
                 }
@@ -1499,56 +1499,56 @@ impl BftRunner {
             return fail;
         }
 
-        // The proposal must carry exactly the hardforks this node has scheduled at this BFT
+        // The proposal must carry exactly the slashforks this node has scheduled at this BFT
         // height -- byte-for-byte, in canonical (ascending pow_activation_height) order, and
         // none at all when none are scheduled -- and set its do_not_include_until_bc_height to
         // the greatest activation height among them (pointing at this block commits to every
         // certificate in it, so the strictest one governs).
         //
         // This runs before the generic do_not_include_until_bc_height monotonicity check below
-        // so that a regression *caused by the hardfork activation* is reported as its own
+        // so that a regression *caused by the slashfork activation* is reported as its own
         // distinct error rather than the generic one.
-        let scheduled_hardforks: Vec<&HardForkConfig> = self
-            .hardforks
+        let scheduled_slashforks: Vec<&SlashForkConfig> = self
+            .slashforks
             .rules()
             .iter()
             .filter(|hf| hf.bft_certificate_height == bft_height)
             .collect();
         {
-            let serialize = |hf: &HardForkConfig| {
+            let serialize = |hf: &SlashForkConfig| {
                 let mut bytes = Vec::new();
                 hf.zcash_serialize(&mut bytes).expect("serializing to a Vec is infallible");
                 bytes
             };
-            let proposal_matches = new_block.hardforks.len() == scheduled_hardforks.len()
+            let proposal_matches = new_block.slashforks.len() == scheduled_slashforks.len()
                 && new_block
-                    .hardforks
+                    .slashforks
                     .iter()
-                    .zip(scheduled_hardforks.iter())
+                    .zip(scheduled_slashforks.iter())
                     .all(|(carried, scheduled)| serialize(carried) == serialize(scheduled));
             if !proposal_matches {
                 tracing::warn!(
-                    "BFT block at height {} must carry exactly the {} scheduled hardfork(s) byte-for-byte in schedule order, but does not",
-                    bft_height, scheduled_hardforks.len(),
+                    "BFT block at height {} must carry exactly the {} scheduled slashfork(s) byte-for-byte in schedule order, but does not",
+                    bft_height, scheduled_slashforks.len(),
                 );
                 return fail;
             }
         }
 
         // Rules are pow-sorted, so the last scheduled rule has the greatest activation.
-        if let Some(last_scheduled) = scheduled_hardforks.last() {
+        if let Some(last_scheduled) = scheduled_slashforks.last() {
             if new_block.do_not_include_until_bc_height != last_scheduled.pow_activation_height {
                 tracing::warn!(
-                    "BFT hardfork block at height {} must set do_not_include_until_bc_height to the greatest carried pow_activation_height {}, but it is {}",
+                    "BFT slashfork block at height {} must set do_not_include_until_bc_height to the greatest carried pow_activation_height {}, but it is {}",
                     bft_height, last_scheduled.pow_activation_height, new_block.do_not_include_until_bc_height,
                 );
                 return fail;
             }
-            // Separate error: the hardfork's PoW activation height must not regress the
+            // Separate error: the slashfork's PoW activation height must not regress the
             // monotonic do_not_include_until_bc_height relative to the parent.
             if last_scheduled.pow_activation_height < parent_do_not_include {
                 tracing::warn!(
-                    "Hardfork pow_activation_height {} at BFT height {} is below the parent's do_not_include_until_bc_height {}; the hardfork activation regresses do_not_include_until_bc_height",
+                    "Slashfork pow_activation_height {} at BFT height {} is below the parent's do_not_include_until_bc_height {}; the slashfork activation regresses do_not_include_until_bc_height",
                     last_scheduled.pow_activation_height, bft_height, parent_do_not_include,
                 );
                 return fail;
@@ -1556,7 +1556,7 @@ impl BftRunner {
         }
 
         // do_not_include_until_bc_height must be monotonic non-decreasing. (v1 blocks use the
-        // implicit value 0, so this holds for existing history.) In the hardfork case the checks
+        // implicit value 0, so this holds for existing history.) In the slashfork case the checks
         // above already guarantee this passes.
         if new_block.do_not_include_until_bc_height < parent_do_not_include {
             tracing::warn!(
@@ -1738,7 +1738,7 @@ impl BftRunner {
                     signatures: Vec::new(),
                 },
                 headers: Vec::new(),
-                hardforks: Vec::new(),
+                slashforks: Vec::new(),
                 do_not_include_until_bc_height: 0,
             });
         }
@@ -1770,7 +1770,7 @@ impl BftRunner {
 
     fn finish_decision(&mut self, decision: DecidedBlock, block_writer: &mut WriteBlockWorkerTask) {
         let DecidedBlock { new_final_hash, new_final_height, block, fat_pointer, proposal_sigs, reply } = decision;
-        let hardforks = self.hardforks.rules();
+        let slashforks = self.slashforks.rules();
 
         // The roster the next height votes with is the stake at this block's snapshot, read from
         // the chain (FINALITY.md §7): from the non-finalized state that holds it, or from the
@@ -1816,11 +1816,11 @@ impl BftRunner {
 
         // The returned roster is for the NEXT height (tenderlink advances to it after this
         // decision): its index is the new chain length. Exclude finalizers terminated at that
-        // height, inclusive, so they are already out of the roster that will vote on a hardfork
+        // height, inclusive, so they are already out of the roster that will vote on a slashfork
         // block scheduled there.
         let next_bft_height = chain.blocks.len() as u64;
         let (roster, voting) =
-            roster_for_bft_height(&self.network, hardforks, &chain.roster, next_bft_height, Some(new_final_height));
+            roster_for_bft_height(&self.network, slashforks, &chain.roster, next_bft_height, Some(new_final_height));
         drop(chain);
 
         tracing::info!(
@@ -1847,8 +1847,8 @@ impl BftRunner {
 
         match reply {
             DecisionReply::Tenderlink(reply) => {
-                // Vote namespacing: the next height's namespace is the cumulative hardfork hash
-                // inclusive of any hardfork scheduled at that next height.
+                // Vote namespacing: the next height's namespace is the cumulative slashfork hash
+                // inclusive of any slashfork scheduled at that next height.
                 let _ = reply.send((roster, voting.vote_namespace, voting.strict_quorum));
             }
             DecisionReply::ForceFeed(reply) => {
@@ -1867,8 +1867,8 @@ impl BftRunner {
     /// stored bytes: a roster that disagreed with the stored votes would re-index every one of
     /// them through seats that never voted (FINALITY.md §8.1).
     fn restore(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
-        let hardforks = self.hardforks.clone();
-        let hardforks = hardforks.rules();
+        let slashforks = self.slashforks.clone();
+        let slashforks = slashforks.rules();
         let stored = block_writer.finalized_state.db.bft_chain();
 
         // A tip past the activation height does not mean genesis was stored. Genesis is decided
@@ -1902,7 +1902,7 @@ impl BftRunner {
         let mut voting_rosters: Vec<Arc<VotingRoster>> = Vec::new();
         // BC height finalized by the previous replayed block's cert; the roster voting on block
         // N was formed at N-1's decision, so N's replayed roster must use this. Using this
-        // block's own height jailed and unjailed finalizers one cert early at a hardfork
+        // block's own height jailed and unjailed finalizers one cert early at a slashfork
         // activation boundary. It also picks N's quorum rule and namespace.
         let mut prev_finalized_bc_height: Option<Height> = None;
         // The snapshot of the last replayed block, when this state holds it.
@@ -1920,7 +1920,7 @@ impl BftRunner {
             // height, so it matches the roster that actually voted on this decided block.
             let this_bft_height = ingest.len() as u64;
             let (roster, voting) =
-                roster_for_bft_height(&self.network, hardforks, &unsorted_roster, this_bft_height, prev_finalized_bc_height);
+                roster_for_bft_height(&self.network, slashforks, &unsorted_roster, this_bft_height, prev_finalized_bc_height);
 
             // The roster the next height votes with, and the watermark that filters it, both
             // come from this block's snapshot -- the same two reads `finish_decision` makes
@@ -1993,7 +1993,7 @@ impl BftRunner {
         let startup_bft_height = blocks.len() as u64;
         let finalized_watermark = last_final.map_or(0, |(height, _)| u64::from(height.0));
         let (roster, startup_voting) = roster_for_bft_height(
-            &self.network, hardforks, &unsorted_roster, startup_bft_height, last_final.map(|(height, _)| height),
+            &self.network, slashforks, &unsorted_roster, startup_bft_height, last_final.map(|(height, _)| height),
         );
 
         let loaded_any = !blocks.is_empty();
@@ -2023,7 +2023,7 @@ impl BftRunner {
     /// receiving.
     ///
     /// It is shaped exactly as a proposer would shape it -- v2, the sigma confirmation headers
-    /// above h1, any hardforks scheduled at BFT height 0 -- so `validate` accepts it unchanged.
+    /// above h1, any slashforks scheduled at BFT height 0 -- so `validate` accepts it unchanged.
     /// Its fat pointer names the block at height 0, round 0, and carries no signatures: the
     /// validator set for genesis is nil and the decision is valid by construction. BFT height 1
     /// is the first real decision, and its previous-block pointer is this one.
@@ -2051,16 +2051,16 @@ impl BftRunner {
             }
         };
         block.version = 2;
-        let scheduled_hardforks: Vec<HardForkConfig> = self
-            .hardforks
+        let scheduled_slashforks: Vec<SlashForkConfig> = self
+            .slashforks
             .rules()
             .iter()
             .filter(|hf| hf.bft_certificate_height == 0)
             .cloned()
             .collect();
-        if let Some(last) = scheduled_hardforks.last() {
+        if let Some(last) = scheduled_slashforks.last() {
             block.do_not_include_until_bc_height = last.pow_activation_height;
-            block.hardforks = scheduled_hardforks;
+            block.slashforks = scheduled_slashforks;
         }
         let fat_pointer = FatPointerToBftBlock::from_parts(block.blake3_hash(), 0, 0, &[]);
         Some((block, fat_pointer))
@@ -2110,7 +2110,7 @@ impl BftRunner {
             }
         };
         let PendingBootstrap { genesis, fat_pointer, .. } = self.pending_bootstrap.take().unwrap();
-        let (genesis_roster, genesis_voting) = roster_for_bft_height(&self.network, self.hardforks.rules(), &[], 0, None);
+        let (genesis_roster, genesis_voting) = roster_for_bft_height(&self.network, self.slashforks.rules(), &[], 0, None);
         let genesis_round = decided_round_data(&genesis, &fat_pointer, genesis_roster, &genesis_voting, Vec::new(), 0, self.params.active_roster_max_n);
         self.spawn_tenderlink(roster, vec![genesis_round], vote_namespace, strict_quorum);
     }
@@ -2295,7 +2295,7 @@ mod tests {
             height: 9,
             previous_block_fat_ptr: FatPointerToBftBlock::null(),
             headers: vec![header; 3],
-            hardforks: Vec::new(),
+            slashforks: Vec::new(),
             do_not_include_until_bc_height: if version >= 2 { 11 } else { 0 },
         }
     }
@@ -2438,8 +2438,8 @@ mod tests {
     }
 
     /// The rule switches on the height of the roster's snapshot, and with it the namespace: nil
-    /// below activation with no hardforks, the branch ID's from it on, and different from the
-    /// hardforks' own namespace when there are some.
+    /// below activation with no slashforks, the branch ID's from it on, and different from the
+    /// slashforks' own namespace when there are some.
     #[test]
     fn strict_quorum_and_its_namespace_start_at_the_roster_snapshot_on_featurenet_upgrade_2() {
         let network = Network::new_regtest(zebra_chain::parameters::testnet::RegtestParameters::from(

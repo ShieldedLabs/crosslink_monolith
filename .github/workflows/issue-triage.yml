@@ -48,11 +48,11 @@ jobs:
         1. Check the issue's main claims against the code.
         2. Look for a duplicate in triage_input/issues.txt, and in reviews/, the security review findings indexed by reviews/REVIEW_STATUS.md.
         3. Look for a fix already on dev: start with the git log for commits whose message mentions the issue number, then the code the issue names.
-        4. Rate the bug as reported, even if it is fixed on dev:
-           - sev:critical: exploitable now on the live featurenet to halt finality, split consensus, or lose or steal funds.
-           - sev:high: anyone, or ordinary use, can crash a node, corrupt its state, or block staking or sending with no workaround; or a security flaw that must be fixed before mainnet.
-           - sev:medium: a broken feature with a workaround, a misleading UI or error, or a weakness nobody can exploit.
-           - sev:low: cosmetic, docs or minor UX.
+        4. Rate every issue, even if it is fixed on dev. A defect, including one a doc, TODO, review or issue title already treats as known or planned work (a stall, crash, fork, wrong result, or missing validation or security check in the code that runs now), is rated by the harm it does. Any other issue (a task, feature, design question or chore) is rated by how soon it must be done:
+           - sev:critical: a defect exploitable now on the live featurenet to halt finality, split consensus, or lose or steal funds; or work that the current featurenet or work in progress is stuck on.
+           - sev:high: a defect that lets anyone, or ordinary use, crash a node, corrupt its state, or block staking or sending with no workaround; a security flaw that must be fixed before mainnet; or work mainnet cannot launch without.
+           - sev:medium: a broken feature with a workaround, a misleading UI or error, or a weakness nobody can exploit; or work that clearly helps node operators, testers or developers and belongs in an upcoming release.
+           - sev:low: a cosmetic, docs or minor UX defect; or a nice-to-have, long-term idea, or open question that nothing is waiting on.
         5. Give the reason in one or two plain sentences, with no links and no @-mentions.
 
         Leave duplicate_issue at 0, duplicate_review empty and fixed_by empty when there is none. duplicate_review is a review finding ID such as K5 or C7.1; fixed_by holds commit hashes.
@@ -80,10 +80,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           mkdir triage_input
-          gh issue view "$ISSUE" -R "$GITHUB_REPOSITORY" --json number,title,author,createdAt,body,comments > triage_input/issue.json
-          gh issue list -R "$GITHUB_REPOSITORY" --state all --limit 5000 --json number,state,title,body \
-            --jq '.[] | "#\(.number) [\(.state)] \(.title)\n\(.body[:300])\n"' > triage_input/issues.txt
+          # The issue list is a heavy query, and GitHub answers 502 or 504 to it under load.
+          fetch() {
+            local out=$1; shift
+            for i in 1 2 3; do
+              if "$@" > "$out"; then return 0; fi
+              echo "GitHub API call failed (attempt $i)."; sleep $((20 * i))
+            done
+            return 1
+          }
+          fetch triage_input/issue.json gh issue view "$ISSUE" -R "$GITHUB_REPOSITORY" --json number,title,author,createdAt,body,comments
+          fetch triage_input/issues.txt gh issue list -R "$GITHUB_REPOSITORY" --state all --limit 5000 --json number,state,title,body \
+            --jq '.[] | "#\(.number) [\(.state)] \(.title)\n\(.body[:300])\n"'
 
       - name: No model secret
         if: env.HAS_CLAUDE != 'true' && env.HAS_GROK != 'true'
@@ -106,7 +116,7 @@ jobs:
 
       - name: Triage with Grok
         id: grok
-        if: ${{ !cancelled() && env.HAS_GROK == 'true' && (env.HAS_CLAUDE != 'true' || steps.claude.outcome == 'failure') }}
+        if: env.HAS_GROK == 'true' && (env.HAS_CLAUDE != 'true' || steps.claude.outcome == 'failure')
         env:
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
           XAI_MODEL: ${{ vars.XAI_MODEL || 'grok-4.3' }}
@@ -267,15 +277,17 @@ jobs:
       ENGINE: ${{ needs.triage.outputs.engine }}
     steps:
       - name: File on the Crosslink board
+        id: board
         env:
           GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
         run: |
           set -euo pipefail
           # Plain GraphQL, like project-timeframe-done.yml: `gh project` fails with this token ("unknown owner type").
           info=$(gh api graphql -F number="$ISSUE" -f owner="$GITHUB_REPOSITORY_OWNER" -f name="${GITHUB_REPOSITORY#*/}" \
-            -f query='query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { id projectItems(first: 20) { nodes { id project { id } } } } } }' \
+            -f query='query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { id projectItems(first: 20) { nodes { id project { id } area: fieldValueByName(name: "Area") { ... on ProjectV2ItemFieldSingleSelectValue { name } } urgency: fieldValueByName(name: "Urgency") { ... on ProjectV2ItemFieldTextValue { text } } } } } } }' \
             --jq '.data.repository.issue')
-          item=$(jq -r '[.projectItems.nodes[] | select(.project.id == env.PROJECT_ID) | .id][0] // empty' <<<"$info")
+          node=$(jq -c '[.projectItems.nodes[] | select(.project.id == env.PROJECT_ID)][0] // {}' <<<"$info")
+          item=$(jq -r '.id // empty' <<<"$node")
           fields=$(gh api graphql -f project="$PROJECT_ID" \
             -f query='query($project: ID!) { node(id: $project) { ... on ProjectV2 { fields(first: 50) { nodes { ... on ProjectV2FieldCommon { id name } ... on ProjectV2SingleSelectField { options { id name } } } } } } }' \
             --jq '.data.node.fields.nodes')
@@ -297,16 +309,24 @@ jobs:
             set_option Status "new uncategorized"
           fi
           if [ -z "$OUT" ]; then exit 0; fi
-          set_option Area "$(jq -r .area <<<"$OUT")"
-          urgency=$(jq -r '.severity + ": " + (.reason | gsub("\\s+"; " ") | .[:200])' <<<"$OUT")
-          gh api graphql --silent -f project="$PROJECT_ID" -f item="$item" -f field="$(fid Urgency)" -f text="$urgency" \
-            -f query='mutation($project: ID!, $item: ID!, $field: ID!, $text: String!) { updateProjectV2ItemFieldValue(input: { projectId: $project, itemId: $item, fieldId: $field, value: { text: $text } }) { clientMutationId } }'
+          # Triage only fills in an empty Area or Urgency, so it never overwrites what people set.
+          if [ -n "$(jq -r '.area.name // empty' <<<"$node")" ]; then
+            echo "kept_area=true" >> "$GITHUB_OUTPUT"
+          else
+            set_option Area "$(jq -r .area <<<"$OUT")"
+          fi
+          if [ -z "$(jq -r '.urgency.text // empty' <<<"$node")" ]; then
+            urgency=$(jq -r '.severity + ": " + (.reason | gsub("\\s+"; " ") | .[:200])' <<<"$OUT")
+            gh api graphql --silent -f project="$PROJECT_ID" -f item="$item" -f field="$(fid Urgency)" -f text="$urgency" \
+              -f query='mutation($project: ID!, $item: ID!, $field: ID!, $text: String!) { updateProjectV2ItemFieldValue(input: { projectId: $project, itemId: $item, fieldId: $field, value: { text: $text } }) { clientMutationId } }'
+          fi
 
       - name: Label and comment
         if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          KEPT_AREA: ${{ steps.board.outputs.kept_area }}
         run: |
           set -euo pipefail
           if [ -z "$OUT" ]; then echo "Triage returned nothing."; exit 0; fi
@@ -339,14 +359,26 @@ jobs:
             gh label create "$l" --color "${color[$l]}" > /dev/null 2>&1 || true
             args+=(--add-label "$l")
           done
-          gh issue edit "$ISSUE" "${args[@]}"
+          for l in $(gh issue view "$ISSUE" --json labels --jq '.labels[].name | select(startswith("sev:"))'); do
+            if [ "$l" != "$sev" ]; then args+=(--remove-label "$l"); fi
+          done
+          if [ ${#args[@]} -gt 0 ]; then gh issue edit "$ISSUE" "${args[@]}"; fi
 
+          rating="**$sev**"
+          if [ -z "$KEPT_AREA" ]; then rating="$rating, area **$area**"; fi
           {
-            echo "Automated triage by $ENGINE: **$sev**, area **$area**. $reason"
+            echo "Automated triage by $ENGINE: $rating. $reason"
             if [ "$dup" != 0 ]; then echo; echo "Possible duplicate of #$dup."; fi
             if [ -n "$review" ]; then echo; echo "Matches review finding $review in [reviews/REVIEW_STATUS.md](https://github.com/$GH_REPO/blob/dev/reviews/REVIEW_STATUS.md)."; fi
             if [ -n "$fixes" ]; then echo; echo "Commits on \`dev\` that may already fix this:$fixes."; fi
             echo
             echo "A maintainer will review this."
           } > "$RUNNER_TEMP/comment.md"
-          gh issue comment "$ISSUE" --body-file "$RUNNER_TEMP/comment.md"
+          # A rerun replaces its earlier verdict rather than stacking a second comment.
+          old=$(gh api "repos/$GH_REPO/issues/$ISSUE/comments" --paginate \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("Automated triage by"))) | .id' | tail -1)
+          if [ -n "$old" ]; then
+            gh api --method PATCH "repos/$GH_REPO/issues/comments/$old" -F body=@"$RUNNER_TEMP/comment.md" --silent
+          else
+            gh issue comment "$ISSUE" --body-file "$RUNNER_TEMP/comment.md"
+          fi

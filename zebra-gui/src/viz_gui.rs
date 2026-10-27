@@ -76,12 +76,12 @@ pub struct BftBlockInspection {
     pub previous_hash: Hash32,
     pub finalization_candidate_height: u32,
     pub do_not_include_until_bc_height: u64,
-    pub hardforks: Vec<HardforkInspection>,
+    pub slashforks: Vec<SlashForkInspection>,
     pub pow_headers: Vec<BftPowHeaderInspection>,
 }
 
 #[derive(Clone, Debug)]
-pub struct HardforkInspection {
+pub struct SlashForkInspection {
     pub pow_activation_height: u64,
     pub bft_certificate_height: u64,
     pub terminated_finalizers: Vec<Hash32>,
@@ -135,8 +135,8 @@ impl BlockInspection {
                 if bft.do_not_include_until_bc_height > 0 {
                     s.push_str(&format!("  Do not include until BC height: {}\n", bft.do_not_include_until_bc_height));
                 }
-                for hf in &bft.hardforks {
-                    s.push_str("  Hardfork:\n");
+                for hf in &bft.slashforks {
+                    s.push_str("  Slashfork:\n");
                     s.push_str(&format!("    PoW activation height: {}\n", hf.pow_activation_height));
                     s.push_str(&format!("    BFT certificate height: {}\n", hf.bft_certificate_height));
                     s.push_str(&format!("    Terminated finalizers ({}):\n", hf.terminated_finalizers.len()));
@@ -194,7 +194,7 @@ pub struct ResponseFromZebra {
 
     pub bft_recency: wallet::TFLRecencyStatus,
 
-    /// 32-byte ids of finalizers terminated by a user-led hardfork (the rolling
+    /// 32-byte ids of finalizers terminated by a user-led slashfork (the rolling
     /// blacklist). The right-hand pane excludes these from the normal list and
     /// shows them at the bottom with a cancel (X) icon.
     pub blacklisted_finalizers: Vec<Hash32>,
@@ -268,10 +268,10 @@ pub struct BcBlock {
     pub work: u64,
     pub utc: i64,
     pub serialized_size: usize,
-    /// This block is at a user-led hardfork's PoW activation height. Many forked
+    /// This block is at a user-led slashfork's PoW activation height. Many forked
     /// blocks may share that height, so each one carries the flag and gets the
-    /// hardfork-activation marker drawn below it.
-    pub is_hardfork_activation: bool,
+    /// slashfork-activation marker drawn below it.
+    pub is_slashfork_activation: bool,
 }
 impl Default for BcBlock {
     fn default() -> Self {
@@ -289,7 +289,7 @@ impl Default for BcBlock {
             work: 0,
             utc: 0,
             serialized_size: 0,
-            is_hardfork_activation: false,
+            is_slashfork_activation: false,
         }
     }
 }
@@ -356,9 +356,9 @@ pub struct BftBlock {
     pub points_at_bc_height: u64, // the snapshot's BC height (0 = unknown): positions the BFT block even before its PoW block arrives
     pub proving_blocks: Vec<ProvingHeader>,
     /// The *next* BFT block (this block's successor) activates a user-led
-    /// hardfork. We mark this block so the GUI can signal that a hardfork is
+    /// slashfork. We mark this block so the GUI can signal that a slashfork is
     /// imminent — i.e. that the block about to be built is special.
-    pub next_block_is_hardfork: bool,
+    pub next_block_is_slashfork: bool,
 }
 impl Default for BftBlock {
     fn default() -> Self {
@@ -369,7 +369,7 @@ impl Default for BftBlock {
             points_at_bc_block: Hash32::from_u64(0),
             points_at_bc_height: 0,
             proving_blocks: Vec::with_capacity(0),
-            next_block_is_hardfork: false,
+            next_block_is_slashfork: false,
         }
     }
 }
@@ -796,7 +796,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
 
             *seq += 1;
             let this_hash = Hash32::from_u64(*seq);
-            let block = OnScreenBc { block: BcBlock { this_hash, parent_hash, this_height, txs_n, is_best_chain, is_finalized, knowledge: BcKnowledge::FullBlock, points_at_bft_block, pointed_at_by_bft_height: u64::MAX, work:1234, utc:0, serialized_size: 0, is_hardfork_activation: false }, ..Default::default() };
+            let block = OnScreenBc { block: BcBlock { this_hash, parent_hash, this_height, txs_n, is_best_chain, is_finalized, knowledge: BcKnowledge::FullBlock, points_at_bft_block, pointed_at_by_bft_height: u64::MAX, work:1234, utc:0, serialized_size: 0, is_slashfork_activation: false }, ..Default::default() };
             viz_state.on_screen_bcs.insert(block.block.this_hash, block);
             this_hash
         };
@@ -808,7 +808,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
             viz_state.bft_tip_height = this_height;
 
             let this_hash = Hash32::from_u64(*seq);
-            let block = OnScreenBft { block: BftBlock { this_hash, parent_hash: bft_parent_hash, this_height, points_at_bc_block, points_at_bc_height: 0, proving_blocks: vec![], next_block_is_hardfork: false }, ..Default::default() };
+            let block = OnScreenBft { block: BftBlock { this_hash, parent_hash: bft_parent_hash, this_height, points_at_bc_block, points_at_bc_height: 0, proving_blocks: vec![], next_block_is_slashfork: false }, ..Default::default() };
             viz_state.on_screen_bfts.insert(block.block.this_hash, block);
 
             bft_parent_hash = this_hash;
@@ -985,7 +985,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                     BcBlock {
                         is_best_chain:          r.block.is_best_chain          || bc.is_best_chain,
                         is_finalized:           r.block.is_finalized           || bc.is_finalized,
-                        is_hardfork_activation: r.block.is_hardfork_activation || bc.is_hardfork_activation,
+                        is_slashfork_activation: r.block.is_slashfork_activation || bc.is_slashfork_activation,
                         pointed_at_by_bft_height: if bc.pointed_at_by_bft_height != u64::MAX {
                             bc.pointed_at_by_bft_height
                         } else {
@@ -1004,7 +1004,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                         // OR-merging
                         is_best_chain:          r.block.is_best_chain          || bc.is_best_chain,
                         is_finalized:           r.block.is_finalized           || bc.is_finalized,
-                        is_hardfork_activation: r.block.is_hardfork_activation || bc.is_hardfork_activation,
+                        is_slashfork_activation: r.block.is_slashfork_activation || bc.is_slashfork_activation,
 
                         // max-merging (mostly avoiding 0s)
                         this_height:     bc.this_height.max(r.block.this_height),
@@ -1070,7 +1070,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                 work: 0,
                 utc: 0,
                 serialized_size: 0,
-                is_hardfork_activation: false,
+                is_slashfork_activation: false,
             }, ..Default::default() });
         }
 
@@ -1102,7 +1102,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                         work: ph.work,
                         utc: ph.utc,
                         serialized_size: 0,
-                        is_hardfork_activation: false,
+                        is_slashfork_activation: false,
                     };
                     match viz_state.on_screen_bcs.get_mut(&ph.hash) {
                         Some(existing) if existing.block.knowledge < BcKnowledge::HeaderSeen => {
@@ -2161,10 +2161,10 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                 draw_ctx.circle_square(pt_x, pt_y, rad * 0.65, rad * on_screen_bc.roundness * 0.65, 0xFF080808);
             }
 
-            // Hardfork activation marker: a small orange badge just below this block,
-            // which sits at a user-led hardfork's PoW activation height. Several forked
+            // Slashfork activation marker: a small orange badge just below this block,
+            // which sits at a user-led slashfork's PoW activation height. Several forked
             // blocks may share that height; each one is marked independently.
-            if on_screen_bc.block.is_hardfork_activation {
+            if on_screen_bc.block.is_slashfork_activation {
                 let orange = (((on_screen_bc.alpha*255.0) as u32) << 24) | 0xFF8C00;
                 let marker_rad = 0.6 * screen_unit;
                 draw_ctx.circle_square(pt_x, pt_y + 1.2*screen_unit, marker_rad, marker_rad * on_screen_bc.roundness, orange);
@@ -2296,10 +2296,10 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bft.roundness, color);
         }
 
-        // Hardfork warning marker: a small orange badge a little above and to the
+        // Slashfork warning marker: a small orange badge a little above and to the
         // right of this block, signalling that the *next* BFT block will activate
-        // a user-led hardfork.
-        if on_screen_bft.block.next_block_is_hardfork {
+        // a user-led slashfork.
+        if on_screen_bft.block.next_block_is_slashfork {
             let orange = (((on_screen_bft.alpha*255.0) as u32) << 24) | 0xFF8C00;
             let rad = 0.6 * screen_unit;
             draw_ctx.circle_square(origin_x + (x + 1.2)*screen_unit, origin_y + (y - 1.2)*screen_unit, rad, rad*on_screen_bft.roundness, orange);

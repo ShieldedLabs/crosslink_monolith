@@ -34,7 +34,7 @@ use tower::buffer::Buffer;
 use zebra_chain::{
     block::{self, CountedHeader, HeightDiff},
     diagnostic::CodeTimer,
-    parameters::{HardForkSchedule, Network, NetworkUpgrade},
+    parameters::{SlashForkSchedule, Network, NetworkUpgrade},
     serialization::ZcashSerialize,
     subtree::NoteCommitmentSubtreeIndex,
 };
@@ -179,8 +179,8 @@ pub(crate) struct StateService {
     /// Set to `f64::NAN` if `finalized_state_queued_blocks` is empty, because grafana shows NaNs
     /// as a break in the graph.
 
-    /// the slash index blocks verification at hardfork activations; set at init
-    hardfork_schedule: Arc<HardForkSchedule>,
+    /// the slash index blocks verification at slashfork activations; set at init
+    slashfork_schedule: Arc<SlashForkSchedule>,
 }
 
 /// What the crosslink fat-pointer gate ([`new_network::bft::admit_fat_pointer`](crate::new_network::bft::admit_fat_pointer)) decided about a block.
@@ -380,7 +380,7 @@ impl StateService {
         }
         let _skip_backup_task = config.debug_skip_non_finalized_state_backup_task;
         let (non_finalized_state, non_finalized_state_sender, non_finalized_state_receiver, backup_task) =
-            NonFinalizedState::new(network, config.hardfork_schedule.clone())
+            NonFinalizedState::new(network, config.slashfork_schedule.clone())
                 .with_backup(
                     backup_dir_path.clone(),
                     &finalized_state.db,
@@ -427,7 +427,7 @@ impl StateService {
             pending_utxos,
             last_prune: Instant::now(),
             read_service: read_service.clone(),
-            hardfork_schedule: config.hardfork_schedule.clone(),
+            slashfork_schedule: config.slashfork_schedule.clone(),
         };
         timer.finish_desc("initializing state service");
 
@@ -771,8 +771,8 @@ impl ReadStateService {
     /// Built afresh on every call and never cached: the burn set depends on the chain below
     /// `height`, which changes with every new block and reorg.
     fn chain_for_block_at(&self, height: block::Height) -> Option<Arc<Chain>> {
-        let (best_chain, hardfork_schedule) = self.non_finalized_state_receiver.with_watch_data(|non_finalized_state| {
-            (non_finalized_state.best_chain().cloned(), non_finalized_state.hardfork_schedule.clone())
+        let (best_chain, slashfork_schedule) = self.non_finalized_state_receiver.with_watch_data(|non_finalized_state| {
+            (non_finalized_state.best_chain().cloned(), non_finalized_state.slashfork_schedule.clone())
         });
         let (mut chain, tip_height) = match best_chain {
             Some(chain) => {
@@ -794,7 +794,7 @@ impl ReadStateService {
             }
         };
 
-        let activating_rule = hardfork_schedule
+        let activating_rule = slashfork_schedule
             .rule_active_at(height.0 as u64)
             .filter(|rule| rule.pow_activation_height == height.0 as u64);
         if let Some(rule) = activating_rule {

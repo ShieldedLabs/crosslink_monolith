@@ -147,16 +147,16 @@ Also benchmark release builds only.  `[profile.dev] opt-level = 0` applies to
 every workspace crate, and a debug node is roughly ten times slower at this.
 
 
-WORKED EXAMPLE — the hardfork bond-burn test on a short calendar
+WORKED EXAMPLE — the slashfork bond-burn test on a short calendar
 ----------------------------------------------------------------
 
-The user-led hardfork burns every bond that was delegated to a terminated
+The user-led slashfork burns every bond that was delegated to a terminated
 finalizer at any point in the 240-block window before activation. Testing that
 means reaching an activation height with bonds of several shapes in place.
 
 Setup: both nodes carry a short test calendar, rather than the real-network
-three-day calendar, and the same hardfork rule. The hardfork height remains a
-multiple of the real-network period because `HardForkConfig` validates it while
+three-day calendar, and the same slashfork rule. The slashfork height remains a
+multiple of the real-network period because `SlashForkConfig` validates it while
 deserializing, before the node's shortened calendar is available:
 
     [network.testnet_parameters.crosslink]
@@ -167,7 +167,7 @@ deserializing, before the node's shortened calendar is available:
     staking_day_window = 48
     staking_action_delay = 49
 
-    [[crosslink.hardforks]]
+    [[crosslink.slashforks]]
     pow_activation_height  = 20736
     bft_certificate_height = 30
     terminated_finalizers  = ["12db8198060e969700d35e6a7bfacfb76cab2e5fe1423245241d799bd1f85221"]
@@ -185,11 +185,11 @@ The run, at 50x with PoW off and one node mining, ~0.5 s/block:
     height   320  bond B created, staked to F
     height   330  bond C created, staked to node one's finalizer
     height 20600  bond B retargeted to node one — inside the window [20497, 20736)
-    height 20736  hardfork activates
+    height 20736  slashfork activates
 
 Result, logged identically by both nodes:
 
-    hardfork slash burns at height 20736: burned 2 bond(s) for 1 terminated
+    slashfork slash burns at height 20736: burned 2 bond(s) for 1 terminated
     finalizer(s): ["8144cfcd...", "8151258a..."]
 
 which are bonds A and B. A was a sitting duck; B fled inside the window and was

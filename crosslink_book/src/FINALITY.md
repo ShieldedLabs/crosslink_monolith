@@ -1195,7 +1195,7 @@ default for "confirmed" presentation. Each consumer needs a contract:
 | canonical state activation | `fin` | sticky fork choice floor (§4.3) |
 | physical database status | database finalized tip | higher of `fin` and the reorg-depth commit; never reported as Crosslink finality |
 | staking rewards | objective per-block source | never use node-local `fin`; see §9.1 |
-| validator roster and hardfork membership | bonds at `snapshot(B_{H−1})` | objective; see below |
+| validator roster and slashfork membership | bonds at `snapshot(B_{H−1})` | objective; see below |
 | block-template BFT context | newest qualifying decided bft-block | the σ-confirmation and Last Final Snapshot tests are the ones bc-block admission runs, so a template never carries a certificate its own chain would refuse (§6.2) |
 | BFT round diagnostics | `tenderlink` round state | display only; a published snapshot, never an input to consensus |
 | visualization feed | `bc_best_tip`, `local_finalized_tip`, the decided bft-chain, round diagnostics | a view: it holds no state and decides nothing |
@@ -1211,9 +1211,9 @@ request, except the GUI's, which still reaches `fin` as a crate-level import (§
 finality RPCs return no value while `fin` is unset. `TFLBlockFinality` carries no confirmation
 count with its middle state, because the count would change the test format.
 
-### 7.3 Consensus-sensitive roster and hardfork inputs
+### 7.3 Consensus-sensitive roster and slashfork inputs
 
-The validator roster, voting power, and hardfork-driven membership changes are
+The validator roster, voting power, and slashfork-driven membership changes are
 consensus-sensitive. They must not read node-local `fin` unless there is a proof that every
 validator derives the same value at the same BFT height. Prefix compatibility between honest
 `fin` values is insufficient.
@@ -1221,7 +1221,7 @@ validator derives the same value at the same BFT height. Prefix compatibility be
 The two quantities are separate:
 
 - **Canonical ledger state** is selected by sticky fork choice with floor `fin` (§4.3).
-- **The validator set for BFT height `H`** (roster, voting power, and hardfork-driven
+- **The validator set for BFT height `H`** (roster, voting power, and slashfork-driven
   membership) is read from the bonds at `snapshot(B_{H−1})`, where `B_{H−1}` is the decided
   bft-block at height `H − 1`. `Π_bft` agreement fixes `B_{H−1}`, its snapshot is a function of
   its `headers_bc`, and the bonds at a bc-block are a function of that block's ancestry, so every

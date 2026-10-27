@@ -1060,7 +1060,7 @@ pub enum Request {
     BondInfo([u8; 32]),
 
     /// Looks up a delegation bond as a block at `height` on the best chain would see it. That
-    /// differs from [`Request::BondInfo`] only at a hardfork's activation height, whose slash
+    /// differs from [`Request::BondInfo`] only at a slashfork's activation height, whose slash
     /// burns land before the block's staking actions.
     ///
     /// Returns [`Response::BondInfo`], like [`Request::BondInfo`].
@@ -1619,7 +1619,7 @@ pub enum ReadRequest {
     BondInfo([u8; 32]),
 
     /// Looks up a delegation bond as a block at `height` on the best chain would see it. That
-    /// differs from [`ReadRequest::BondInfo`] only at a hardfork's activation height, whose slash
+    /// differs from [`ReadRequest::BondInfo`] only at a slashfork's activation height, whose slash
     /// burns land before the block's staking actions.
     ///
     /// Returns [`ReadResponse::BondInfo`], like [`ReadRequest::BondInfo`].

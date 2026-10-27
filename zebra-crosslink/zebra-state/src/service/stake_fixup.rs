@@ -4,7 +4,7 @@
 //! death between the two writes left a finalized block with no stakes row, and
 //! every later BFT decision naming that block aborts the node. This module
 //! rebuilds the missing rows by replaying every block's staking actions,
-//! rewards, and hardfork slash burns from genesis with the same functions the
+//! rewards, and slashfork slash burns from genesis with the same functions the
 //! live commit path uses, and refuses to write unless the replay reproduces
 //! every row already on disk. Run it via `zebrad --fixup-db-stake`.
 
@@ -32,12 +32,12 @@ use crate::{
 /// findings print to stdout. The state cache must not be open in a node.
 ///
 /// The replayed rows are trustworthy because the replay uses the same staking
-/// transition functions as the live commit path — including hardfork slash
+/// transition functions as the live commit path — including slashfork slash
 /// burns at each rule's activation height — and nothing is written unless the
 /// replay also reproduces, exactly, every stakes row already in the database.
 /// Existing rows are never modified.
 ///
-/// `config.hardfork_schedule` must hold the same canonical schedule the node
+/// `config.slashfork_schedule` must hold the same canonical schedule the node
 /// runs with, or the replay diverges at the first missing rule's activation.
 ///
 /// `verify` runs the replay cross-check of every stored row even when no rows
@@ -110,7 +110,7 @@ pub fn fixup_aggregated_stakes(
     }
 
     let activations: Vec<String> = config
-        .hardfork_schedule
+        .slashfork_schedule
         .rules()
         .iter()
         .filter(|rule| {
@@ -121,7 +121,7 @@ pub fn fixup_aggregated_stakes(
         .collect();
     if !activations.is_empty() {
         println!(
-            "replaying hardfork slash burns activating at height(s) {}",
+            "replaying slashfork slash burns activating at height(s) {}",
             activations.join(", "),
         );
     }
@@ -131,7 +131,7 @@ pub fn fixup_aggregated_stakes(
         tip_height.0,
     );
     let mut replay = StakingReplay::new(
-        &config.hardfork_schedule,
+        &config.slashfork_schedule,
         network.crosslink_parameters().staking.slash_analysis_window(),
     );
     // The previous block's certificate, to decide whether the next block advances it. Genesis
@@ -175,7 +175,7 @@ pub fn fixup_aggregated_stakes(
             };
             if let Some(slash) = replay.apply_block(network, height, &block, cert_advanced, block_at)? {
                 println!(
-                    "applied hardfork slash burns at height {h}: {} bond(s) burned for {} \
+                    "applied slashfork slash burns at height {h}: {} bond(s) burned for {} \
                      terminated finalizer(s)",
                     slash.burned.len(),
                     slash.finalizers.len(),

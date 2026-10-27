@@ -1,4 +1,4 @@
-[[crosslink.hardforks]]
+[[crosslink.slashforks]]
 pow_activation_height = 20736
 bft_certificate_height = 10
 terminated_finalizers = [

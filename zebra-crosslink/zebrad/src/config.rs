@@ -196,6 +196,15 @@ impl ZebradConfig {
         // Deserialize into our struct, which will use defaults for any missing fields
         let mut config: Self = raw_config.clone().try_deserialize()?;
 
+        for (old, new) in [
+            ("crosslink.hardforks", "crosslink.slashforks"),
+            ("crosslink.disable_shipped_hardforks", "crosslink.disable_shipped_slashforks"),
+        ] {
+            if raw_config.get::<config::Value>(old).is_ok() {
+                eprintln!("warning: config key `{old}` was renamed to `{new}`; the old name will stop working in a future release");
+            }
+        }
+
         // set crosslink testnet defaults based on whether they were *specified*, which is slightly
         // more precise than whether they are currently Some/None
         {
@@ -242,18 +251,18 @@ impl ZebradConfig {
             .cache_dir
             .push("crosslink_featurenet_20260929_staking3d");
 
-        // Merge user-led hardforks with the ones shipped in the executable, validate
+        // Merge user-led slashforks with the ones shipped in the executable, validate
         // them, and store the canonical (sorted, deduplicated) list back. Building
         // the schedule panics on conflicting/interleaving rules, so a bad config is
-        // rejected at load time. `disable_shipped_hardforks` skips the built-in rules
+        // rejected at load time. `disable_shipped_slashforks` skips the built-in rules
         // so a testnet operator can specify the whole schedule manually.
-        let user_hardforks = config.crosslink.hardforks.clone();
-        let schedule = if config.crosslink.disable_shipped_hardforks {
-            zebra_chain::parameters::HardForkSchedule::new_without_shipped(user_hardforks)
+        let user_slashforks = config.crosslink.slashforks.clone();
+        let schedule = if config.crosslink.disable_shipped_slashforks {
+            zebra_chain::parameters::SlashForkSchedule::new_without_shipped(user_slashforks)
         } else {
-            zebra_chain::parameters::HardForkSchedule::new(user_hardforks)
+            zebra_chain::parameters::SlashForkSchedule::new(user_slashforks)
         };
-        config.crosslink.hardforks = schedule.rules().to_vec();
+        config.crosslink.slashforks = schedule.rules().to_vec();
 
         // Install the debug clock before anything reads it. Every command loads its
         // config through here, so this is the one place it can be done once.

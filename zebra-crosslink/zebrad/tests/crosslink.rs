@@ -70,8 +70,8 @@ pub fn test_start() {
             base.network.network = test_network(&crosslink, &node_config);
             if !node_config.is_empty() {
                 let file: ZebradConfig = toml::from_str(&node_config).expect("a test file's node config parses as zebrad.toml");
-                base.crosslink.hardforks = file.crosslink.hardforks;
-                base.crosslink.disable_shipped_hardforks = file.crosslink.disable_shipped_hardforks;
+                base.crosslink.slashforks = file.crosslink.slashforks;
+                base.crosslink.disable_shipped_slashforks = file.crosslink.disable_shipped_slashforks;
                 base.state.network_checkpoint = file.state.network_checkpoint;
                 base.crosslink.explicit_bft_key_seed = file.crosslink.explicit_bft_key_seed;
             }
@@ -1044,7 +1044,7 @@ fn pos_from_headers(
             .iter()
             .map(|b| zebra_crosslink::bc_hdr_to_lrz(b.header.as_ref()))
             .collect(),
-        hardforks: Vec::new(),
+        slashforks: Vec::new(),
         do_not_include_until_bc_height: 0,
     };
     BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt::from_parts(
@@ -3046,7 +3046,7 @@ fn next_pos_at_round(
 /// The BFT block a finalizer would propose at `bft_height` on top of `parent`, finalizing the
 /// block just below `tail`: `tail` is the sigma PoW blocks above that snapshot, as the node's own
 /// proposer takes them. Version 2 and `do_not_include_until_bc_height` carried from the parent, as
-/// the node proposes when no hardfork is scheduled at this height.
+/// the node proposes when no slashfork is scheduled at this height.
 fn bft_proposal(
     params: &zcash_primitives::bft::ZcashCrosslinkParameters,
     bft_height: u32,

@@ -20,7 +20,7 @@ use crate::{
     service::finalized_state::restorable_db_versions,
     state_database_format_version_in_code, BoxError,
 };
-use zebra_chain::parameters::HardForkSchedule;
+use zebra_chain::parameters::SlashForkSchedule;
 
 use std::sync::Arc;
 
@@ -189,9 +189,9 @@ pub struct Config {
     #[serde(with = "network_checkpoint_toml")]
     pub network_checkpoint: Option<NetworkCheckpoint>,
 
-    /// Hard-fork rules for this network. Not read from the config file; filled in by the caller.
+    /// Slashfork rules for this network. Not read from the config file; filled in by the caller.
     #[serde(skip)]
-    pub hardfork_schedule: Arc<HardForkSchedule>,
+    pub slashfork_schedule: Arc<SlashForkSchedule>,
 }
 
 /// Lite checkpoint pin: `(height, hash)`. `None` means disabled.
@@ -320,7 +320,7 @@ impl Default for Config {
             network_local_port: 0,
             network_initial_peers: Vec::new(),
             network_checkpoint: None,
-            hardfork_schedule: Default::default(),
+            slashfork_schedule: Default::default(),
         }
     }
 }

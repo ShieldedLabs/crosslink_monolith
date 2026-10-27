@@ -165,11 +165,11 @@ pub mod service;
 pub mod config {
     use serde::{Deserialize, Serialize};
 
-    // The canonical hardfork types live in `zebra-chain` so that zebra-state and
+    // The canonical slashfork types live in `zebra-chain` so that zebra-state and
     // zebra-consensus — which cannot depend on zebra-crosslink — can share them.
     // Re-exported here for ergonomic access via `zebra_crosslink::config::*`.
-    pub use zebra_chain::parameters::hardfork::{
-        shipped_hardforks, HardForkConfig, HardForkSchedule,
+    pub use zebra_chain::parameters::slashfork::{
+        shipped_slashforks, SlashForkConfig, SlashForkSchedule,
     };
 
     /// Configuration for the state service.
@@ -187,16 +187,18 @@ pub mod config {
         pub disable_the_headless_wallet: bool,
         /// Disable lightwallet_server.
         pub disable_zaino: bool,
-        /// User-led hardfork rules, as supplied in the config file. These are
-        /// merged with [`shipped_hardforks`] and validated by building a
-        /// [`HardForkSchedule`]; after loading, this holds the canonical, merged
+        /// User-led slashfork rules, as supplied in the config file. These are
+        /// merged with [`shipped_slashforks`] and validated by building a
+        /// [`SlashForkSchedule`]; after loading, this holds the canonical, merged
         /// list (see `ZebradConfig::load`).
-        pub hardforks: Vec<HardForkConfig>,
-        /// Ignore the hardfork rules shipped in the executable
-        /// ([`shipped_hardforks`]) and use only `hardforks`. Lets a testnet
-        /// operator specify the entire hardfork schedule manually instead of
+        #[serde(alias = "hardforks")]
+        pub slashforks: Vec<SlashForkConfig>,
+        /// Ignore the slashfork rules shipped in the executable
+        /// ([`shipped_slashforks`]) and use only `slashforks`. Lets a testnet
+        /// operator specify the entire slashfork schedule manually instead of
         /// inheriting the built-in (mainnet) assumed past. Defaults to `false`.
-        pub disable_shipped_hardforks: bool,
+        #[serde(alias = "disable_shipped_hardforks")]
+        pub disable_shipped_slashforks: bool,
     }
     impl Default for Config {
         fn default() -> Self {
@@ -206,8 +208,8 @@ pub mod config {
                 explicit_bft_key_seed: None,
                 disable_the_headless_wallet: false,
                 disable_zaino: false,
-                hardforks: Vec::new(),
-                disable_shipped_hardforks: false,
+                slashforks: Vec::new(),
+                disable_shipped_slashforks: false,
             }
         }
     }
@@ -472,9 +474,9 @@ async fn total_issuance_from_key(
     let t_wall = std::time::Instant::now();
     PROF.reset();
 
-    let hardfork_schedule = zebra_chain::parameters::HardForkSchedule::from_canonical(internal_handle.config.hardforks.clone());
+    let slashfork_schedule = zebra_chain::parameters::SlashForkSchedule::from_canonical(internal_handle.config.slashforks.clone());
     let slash_analysis_window = internal_handle.params.staking.slash_analysis_window();
-    let mut staking = zebra_state::StakingReplay::new(&hardfork_schedule, slash_analysis_window);
+    let mut staking = zebra_state::StakingReplay::new(&slashfork_schedule, slash_analysis_window);
     // The certificate carried by the previously scanned block, to tell whether the next one
     // advances it. `None` until the first block of the range, whose parent is outside it.
     // let mut prev_fat_pointer: Option<FatPointerToBftBlock> = None; // variable reward disabled
@@ -539,7 +541,7 @@ async fn total_issuance_from_key(
                 }
             }
             if let Some(slash) = timed(&PROF.replay_ns, || staking.apply_slash_burns(ZebBlockHeight(height), window_blocks)) {
-                println!("applied hardfork slash burns at height {height}: {} bond(s) burned for {} terminated finalizer(s)", slash.burned.len(), slash.finalizers.len());
+                println!("applied slashfork slash burns at height {height}: {} bond(s) burned for {} terminated finalizer(s)", slash.burned.len(), slash.finalizers.len());
             }
         }
 

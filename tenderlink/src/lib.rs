@@ -30,7 +30,7 @@ const PRINT_BFT_UPDATE:     bool = 1 == 1;
 const PRINT_BFT_STATE:      bool = 0 == 1;
 const PRINT_BFT_CONDITIONS: bool = 1 == 1;
 // Invalid-signature BFT FAULT prints. Off by default: with vote namespacing these are common and
-// expected (e.g. peers signing under a different hardfork namespace), so they're just noise.
+// expected (e.g. peers signing under a different slashfork namespace), so they're just noise.
 const PRINT_BFT_SIG_FAULT:  bool = 0 == 1;
 const PRINT_BFT_TIMEOUTS:   bool = 0 == 1;
 
@@ -190,7 +190,7 @@ impl std::fmt::Debug for ClosureToValidateProposedBlock {
 }
 #[derive(Clone)]
 // Returns the roster for the next height together with that height's 32-byte vote-namespacing
-// domain separator (the cumulative hash of hardforks in effect; `[0; 32]` when there are none)
+// domain separator (the cumulative hash of slashforks in effect; `[0; 32]` when there are none)
 // and whether it decides by the strict quorum (see `decision_threshold`).
 pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock, Vec<TMSig>)-> core::pin::Pin<Box<dyn Future<Output = (Vec<SortedRosterMember>, [u8; 32], bool)> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToPushDecidedBlock {
@@ -293,7 +293,7 @@ pub struct RoundData {
     pub timeout_triggered: [bool; 2],
 
     /// Vote-namespacing domain separator for this round's height: a cumulative hash of the
-    /// hardforks in effect (nil `[0; 32]` when there are none → no-op, backwards compatible).
+    /// slashforks in effect (nil `[0; 32]` when there are none → no-op, backwards compatible).
     /// Mixed into all signed payloads at this height. Set from the per-height value supplied
     /// externally (copied from [`TMState::vote_namespace`] at creation, or from ingest data).
     pub vote_namespace: [u8; 32],
@@ -700,7 +700,7 @@ pub struct TMState {
     /// basically the chain of agreed blocks
     pub height: u64,
     /// Vote-namespacing domain separator for the current [`height`](Self::height): a cumulative
-    /// hash of the hardforks in effect (nil `[0; 32]` when none → backwards compatible). Supplied
+    /// hash of the slashforks in effect (nil `[0; 32]` when none → backwards compatible). Supplied
     /// externally per height (initial value at startup; updated from the decided-block closure's
     /// return when the height advances), and copied into each [`RoundData`] as rounds are created.
     pub vote_namespace: [u8; 32],
@@ -1626,8 +1626,8 @@ pub struct FinalizerPeerAddress {
 }
 
 /// Sign `data` for vote namespacing: the 32-byte `namespace` (a cumulative hash of the
-/// hardforks in effect at this height) is appended before signing. A nil namespace
-/// (`[0; 32]`) appends nothing, so the no-hardfork case signs byte-for-byte as before —
+/// slashforks in effect at this height) is appended before signing. A nil namespace
+/// (`[0; 32]`) appends nothing, so the no-slashfork case signs byte-for-byte as before —
 /// backwards compatible. Mirrored by [`TMSig::verify_with_namespace`].
 fn sign_with_namespace(key: &SigningKey, data: &[u8], namespace: &[u8; 32]) -> [u8; 64] {
     if *namespace == [0u8; 32] {
@@ -1740,7 +1740,7 @@ async fn instance(
                 decisions.lock().unwrap().push((block, fat_pointer));
                 let mut ret = roster2.clone();
                 ret.truncate(3 + decisions.lock().unwrap().len() % 2);
-                // Sim/test has no hardforks → nil namespace (backwards-compatible no-op).
+                // Sim/test has no slashforks → nil namespace (backwards-compatible no-op).
                 (ret, [0u8; 32], false)
             })
         })),
@@ -1751,7 +1751,7 @@ async fn instance(
         })})),
 
         Vec::new(),
-        [0u8; 32], // initial_vote_namespace: no hardforks in the sim
+        [0u8; 32], // initial_vote_namespace: no slashforks in the sim
         false,     // initial_strict_quorum
     ).await
 }
@@ -2136,7 +2136,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          bft_access_closure: ClosureToAccessBft,
                          ingest_startup_data: Vec<RoundData>,
                          // Vote-namespacing domain separator for the startup height
-                         // (`ingest_startup_data.len()`); `[0; 32]` when no hardforks are in effect.
+                         // (`ingest_startup_data.len()`); `[0; 32]` when no slashforks are in effect.
                          initial_vote_namespace: [u8; 32],
                          // Whether the startup height decides by the strict quorum.
                          initial_strict_quorum: bool,
