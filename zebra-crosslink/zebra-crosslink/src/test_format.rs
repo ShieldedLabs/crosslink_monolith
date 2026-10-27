@@ -87,6 +87,13 @@ pub const TF_BFT_WRONG_NAMESPACE: u64 = 1 << 35;
 pub const TF_BFT_THE_NODE: u64 = u64::MAX;
 /// EXPECT_BFT_STEP's step for any step.
 pub const TF_BFT_ANY_STEP: u64 = 0xff;
+/// The proposer's signature on each chunk of `block` decided at `round`, made with `signing_key`
+/// in `valid_round` under `vote_namespace`: what LOAD_POS carries for a decided height.
+pub fn bft_proposal_sigs(signing_key: &ed25519_zebra::SigningKey, block: &BftBlock, round: u32, valid_round: i64, vote_namespace: &[u8; 32]) -> Vec<TMSig> {
+    let value = block.zcash_serialize_to_vec().expect("a BFT block serializes");
+    let value_id = tenderlink::ValueId(block.blake3_hash().0);
+    tenderlink::proposal_chunk_sigs(signing_key, &value, value_id, u64::from(block.height), round, valid_round, vote_namespace)
+}
 /// The node's own finalizer identity seed, unless a test's node config names one.
 pub const TEST_NODE_FINALIZER_SEED: &str = "crosslink test node finalizer";
 
@@ -171,6 +178,12 @@ impl TFInstr {
     // (de)serialization layer.
     // TODO: there may be a crate that makes an enum feasible here
     pub const LOAD_POW: TFInstrKind = 0;
+    /// A decided BFT height, force-fed as tenderlink would have decided it. The data is the
+    /// block and its fat pointer, then the proposer's chunk signatures, 64 bytes each in chunk
+    /// order. `val[0]` is the proposal's valid round plus one (0 for none), which the signatures
+    /// cover. The node refuses the block unless the signatures are the round's proposer's, one
+    /// per chunk; a round with no proposer (the genesis, a roster with no stake) has none. A
+    /// count that is neither none nor one per chunk does not parse.
     pub const LOAD_POS: TFInstrKind = 1;
     pub const SET_PARAMS: TFInstrKind = 2;
     pub const EXPECT_POW_CHAIN_LENGTH: TFInstrKind = 3;
@@ -323,18 +336,21 @@ impl TFInstr {
                 };
                 str += &format!("{} - {}, parent: {}", height, block.hash(), block.header.previous_block_hash)
             }
-            Some(TestInstr::LoadPoS((block, fat_ptr))) => match (block.headers.first(), block.headers.last()) {
-                (Some(first), Some(last)) => {
-                    str += &format!(
-                        "{}, snapshot: {}, hdrs: [{} .. {}]",
-                        block.blake3_hash(),
-                        block.snapshot_block_hash(),
-                        BlockHash::from_header_data(first),
-                        BlockHash::from_header_data(last)
-                    )
+            Some(TestInstr::LoadPoS { block, proposal_sigs, valid_round, .. }) => {
+                match (block.headers.first(), block.headers.last()) {
+                    (Some(first), Some(last)) => {
+                        str += &format!(
+                            "{}, snapshot: {}, hdrs: [{} .. {}]",
+                            block.blake3_hash(),
+                            block.snapshot_block_hash(),
+                            BlockHash::from_header_data(first),
+                            BlockHash::from_header_data(last)
+                        )
+                    }
+                    _ => str += &format!("{}, no headers", block.blake3_hash()),
                 }
-                _ => str += &format!("{}, no headers", block.blake3_hash()),
-            },
+                str += &format!(", {} proposal signature(s), valid round {valid_round}", proposal_sigs.len());
+            }
             Some(TestInstr::SetParams(params)) => {
                 str += &format!(
                     "{} {:?}, roster {}",
@@ -610,11 +626,22 @@ impl TF {
         self.push_instr_ex(TFInstr::LOAD_POW, flags, data, [0; 2])
     }
 
+    /// A decision with no proposal signatures, for a round with no proposer. See `push_instr_load_pos_signed`.
     pub fn push_instr_load_pos(&mut self, data: &BftBlockAndFatPointerToItWrap, flags: u32) {
-        self.push_instr_serialize_ex(TFInstr::LOAD_POS, flags, data, [0; 2])
+        self.push_instr_load_pos_signed(data, &[], -1, flags)
     }
     pub fn push_instr_load_pos_bytes(&mut self, data: &[u8], flags: u32) {
         self.push_instr_ex(TFInstr::LOAD_POS, flags, data, [0; 2])
+    }
+
+    /// `proposal_sigs` one per chunk (see [`bft_proposal_sigs`]), `valid_round` -1 for none.
+    pub fn push_instr_load_pos_signed(&mut self, data: &BftBlockAndFatPointerToItWrap, proposal_sigs: &[TMSig], valid_round: i64, flags: u32) {
+        let mut bytes = data.zcash_serialize_to_vec().expect("a BFT block and fat pointer serialize");
+        for sig in proposal_sigs {
+            bytes.extend_from_slice(&sig.0);
+        }
+        let valid_round = u64::try_from(valid_round + 1).expect("a valid round of -1 or more");
+        self.push_instr_ex(TFInstr::LOAD_POS, flags, &bytes, [valid_round, 0])
     }
 
     pub fn push_instr_expect_pow_chain_length(&mut self, length: usize, flags: u32) {
@@ -1172,12 +1199,21 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
         }
 
         TFInstr::LOAD_POS => {
-            let block_and_fat_ptr =
-                BftBlockAndFatPointerToItWrap::zcash_deserialize(instr.data_slice(bytes)).ok()?;
-            Some(TestInstr::LoadPoS((
-                block_and_fat_ptr.0.block,
-                block_and_fat_ptr.0.fat_ptr,
-            )))
+            let mut rest = instr.data_slice(bytes);
+            let block_and_fat_ptr = BftBlockAndFatPointerToItWrap::zcash_deserialize(&mut rest).ok()?;
+            // The count comes from the block, never from the file: the chunk count, or none.
+            // Whether none is allowed at this height is the node's call.
+            let chunks_n = tenderlink::proposal_chunks_n(block_and_fat_ptr.0.block.zcash_serialize_to_vec().ok()?.len());
+            if !rest.is_empty() && rest.len() != 64 * chunks_n {
+                return None;
+            }
+            let proposal_sigs = rest.chunks_exact(64).map(|sig| TMSig(sig.try_into().expect("64 bytes"))).collect();
+            Some(TestInstr::LoadPoS {
+                block: block_and_fat_ptr.0.block,
+                fat_ptr: block_and_fat_ptr.0.fat_ptr,
+                proposal_sigs,
+                valid_round: i64::try_from(instr.val[0]).ok()? - 1,
+            })
         }
 
         TFInstr::SET_PARAMS => {
@@ -1341,7 +1377,8 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
 #[derive(Clone)]
 pub(crate) enum TestInstr {
     LoadPoW(Block),
-    LoadPoS((BftBlock, FatPointerToBftBlock)),
+    /// A decided BFT height, with the proposer's chunk signatures and the valid round they cover.
+    LoadPoS { block: BftBlock, fat_ptr: FatPointerToBftBlock, proposal_sigs: Vec<TMSig>, valid_round: i64 },
     SetParams(ZcashCrosslinkParameters),
     ExpectPoWChainLength(u32),
     ExpectPoSChainLength(u64),
@@ -1689,7 +1726,7 @@ pub(crate) async fn handle_instr(
             }
         },
 
-        TestInstr::LoadPoS((block, fat_ptr)) => {
+        TestInstr::LoadPoS { block, fat_ptr, proposal_sigs, valid_round } => {
             // let path = format!("../crosslink-test-data/test_pos_block_{}.bin", instr_i);
             // info!("writing binary at {}", path);
             // let mut file = std::fs::File::create(&path).expect("valid file");
@@ -1701,7 +1738,7 @@ pub(crate) async fn handle_instr(
             let expect_accepted = flags & SHOULD_DEFER == 0 && !expect_rejected;
             let answer = tokio::time::timeout(
                 NODE_ANSWER_WAIT,
-                zebra_state::new_network::bft::force_feed_bft_block(Arc::new(block), fat_ptr),
+                zebra_state::new_network::bft::force_feed_bft_block(Arc::new(block), fat_ptr, proposal_sigs, valid_round),
             )
             .await;
             match answer {
@@ -2694,6 +2731,44 @@ mod tests {
     use super::*;
 
     const SHORT: StakingParameters = StakingParameters { period: 10, day_window: 5, action_delay: 6 };
+
+    /// The signature count is the block's chunk count or nothing, whatever the file says: a
+    /// fuzzed file reaches this parser, and the node indexes signatures by chunk.
+    #[test]
+    fn load_pos_takes_no_signatures_or_one_per_chunk() {
+        let block = BftBlock {
+            version: 0,
+            height: 1,
+            previous_block_fat_ptr: FatPointerToBftBlock::null(),
+            headers: Vec::new(),
+            hardforks: Vec::new(),
+            do_not_include_until_bc_height: 0,
+        };
+        let chunks_n = tenderlink::proposal_chunks_n(block.zcash_serialize_to_vec().unwrap().len());
+        let data = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr: FatPointerToBftBlock::null() });
+        let read = |sigs_n: usize, extra: &[u8]| {
+            let mut tf = TF::new(&HARNESS_PARAMETERS);
+            tf.push_instr_load_pos_signed(&data, &vec![TMSig([7; 64]); sigs_n], 2, 0);
+            let mut bytes = tf.write_to_bytes();
+            if !extra.is_empty() {
+                // Lengthen the last instruction's data in place: it is the last thing in the data.
+                let tf = TF::read_from_bytes(&bytes).unwrap();
+                let mut out = TF { instrs: tf.instrs.clone(), data: tf.data.clone() };
+                out.data.extend_from_slice(extra);
+                out.instrs.last_mut().unwrap().data.size += extra.len() as u64;
+                bytes = out.write_to_bytes();
+            }
+            let tf = TF::read_from_bytes(&bytes).unwrap();
+            match tf_read_instr(&bytes, tf.instrs.last().unwrap()) {
+                Some(TestInstr::LoadPoS { proposal_sigs, valid_round, .. }) => Some((proposal_sigs.len(), valid_round)),
+                _ => None,
+            }
+        };
+        assert_eq!(read(0, &[]), Some((0, 2)));
+        assert_eq!(read(chunks_n, &[]), Some((chunks_n, 2)));
+        assert_eq!(read(chunks_n + 1, &[]), None);
+        assert_eq!(read(chunks_n, &[0; 3]), None, "a partial signature");
+    }
 
     #[test]
     fn set_params_round_trips_the_staking_calendar_and_node_config() {

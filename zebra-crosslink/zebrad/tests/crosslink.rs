@@ -4880,3 +4880,78 @@ fn crosslink_bft_node_locked_on_a_value_precommits_a_later_quorum() {
 
     test_bytes(tf.write_to_bytes());
 }
+
+/// Height 1 decided by the three synthetic finalizers, its proposal signed by `signer`'s key in
+/// `signed_valid_round` and loaded as made in `valid_round`. The proposer at 1.0 is a synthetic
+/// finalizer.
+fn signed_decision_scene(signer: Option<SignerOf>, signed_valid_round: i64, valid_round: i64, flags: u32) -> TF {
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene(&mut tf, &[false]);
+    let proposer = scene.proposer(1, 0);
+    assert_ne!(proposer, TF_BFT_THE_NODE, "the scene puts a synthetic finalizer at 1.0");
+    // Waits for BFT to have started, so height 1 is the one being decided.
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+
+    let block = scene.height_1_proposal(20);
+    let seeds: Vec<String> = scene.finalizers.iter().map(|&k| synthetic_finalizer_seed(k.into())).collect();
+    let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
+    let fat_ptr = signed_fat_pointer(&block, 1, 0, &seeds, &[0; 32]);
+    let sigs = match signer {
+        None => Vec::new(),
+        Some(signer) => {
+            let k = match signer {
+                SignerOf::Proposer => proposer,
+                SignerOf::Another => scene.finalizers.iter().map(|&k| u64::from(k)).find(|&k| k != proposer).unwrap(),
+            };
+            let key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k).as_bytes()).1;
+            bft_proposal_sigs(&key, &block, 0, signed_valid_round, &[0; 32])
+        }
+    };
+    let data = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr });
+    tf.push_instr_load_pos_signed(&data, &sigs, valid_round, flags);
+    tf
+}
+
+#[derive(Clone, Copy)]
+enum SignerOf {
+    Proposer,
+    Another,
+}
+
+/// A decided height whose proposal signatures are the round's proposer's is taken.
+#[test]
+fn crosslink_load_pos_with_the_proposers_signatures() {
+    set_test_name(function_name!());
+    let mut tf = signed_decision_scene(Some(SignerOf::Proposer), -1, -1, 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+    test_bytes(tf.write_to_bytes());
+}
+
+/// Signatures by a finalizer that is not the round's proposer are refused...
+#[test]
+fn crosslink_load_pos_refuses_another_finalizers_signatures() {
+    set_test_name(function_name!());
+    let mut tf = signed_decision_scene(Some(SignerOf::Another), -1, -1, SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("is not signed by", 0);
+    tf.push_instr_expect_pos_chain_length(1, 0);
+    test_bytes(tf.write_to_bytes());
+}
+
+/// ...as are the proposer's own, made in another valid round than the one the load names: the
+/// valid round is part of what each chunk signature covers...
+#[test]
+fn crosslink_load_pos_refuses_signatures_from_another_valid_round() {
+    set_test_name(function_name!());
+    let mut tf = signed_decision_scene(Some(SignerOf::Proposer), 0, -1, SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("is not signed by", 0);
+    test_bytes(tf.write_to_bytes());
+}
+
+/// ...and none at all: above the genesis height, a decision has a proposer who signed it.
+#[test]
+fn crosslink_load_pos_refuses_a_decision_with_no_signatures() {
+    set_test_name(function_name!());
+    let mut tf = signed_decision_scene(None, -1, -1, SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("0 proposal signatures", 0);
+    test_bytes(tf.write_to_bytes());
+}

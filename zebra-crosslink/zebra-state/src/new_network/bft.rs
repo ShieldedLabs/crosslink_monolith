@@ -19,7 +19,7 @@ use tenderlink::{
 };
 use zcash_primitives::bft::{
     BftBlock, BftBootstrap, Blake3Hash, FatPointerToBftBlock, FinalizerRecencyStatus,
-    HardForkConfig, PubKeyID, TFLRecencyStatus, TMSig, ZcashCrosslinkParameters,
+    HardForkConfig, HashKeys, PubKeyID, TFLRecencyStatus, TMSig, ZcashCrosslinkParameters,
     // FINALITY_LIVENESS_ALLOWANCE, // only used by the disabled variable-reward gate
 };
 use zcash_primitives::block::{
@@ -347,10 +347,17 @@ pub enum BftRequest {
         reply: tokio::sync::oneshot::Sender<(Vec<SortedRosterMember>, [u8; 32], bool)>,
     },
     /// A decided block supplied from outside (the test format's `LoadPoS`): validated and stored
-    /// exactly as a tenderlink decision, with no proposal signatures.
+    /// exactly as a tenderlink decision, with the proposer's chunk signatures, or none for a round
+    /// that has no proposer.
     ForceFeed {
         block: Arc<BftBlock>,
         fat_pointer: FatPointerToBftBlock,
+        proposal_sigs: Vec<TMSig>,
+        /// The proposal's valid round, which its chunk signatures cover; -1 for none. Checked,
+        /// not stored: the database has no place for it yet, so `restore` rebuilds every decided
+        /// round with -1, and chunks of a re-proposed value re-served after a restart carry the
+        /// wrong valid round for their signatures.
+        valid_round: i64,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
 }
@@ -366,13 +373,18 @@ fn send_request(request: BftRequest) -> bool {
     }
 }
 
-/// Store a decided block supplied from outside, as if tenderlink had decided it.
+/// Store a decided block supplied from outside, as if tenderlink had decided it, with the
+/// proposer's chunk signatures and the valid round they were made in: one per chunk, the round's
+/// proposer's, or none when the round has no proposer.
 pub async fn force_feed_bft_block(
     block: Arc<BftBlock>,
     fat_pointer: FatPointerToBftBlock,
+    proposal_sigs: Vec<TMSig>,
+    valid_round: i64,
 ) -> Result<(), String> {
     let (reply, rx) = tokio::sync::oneshot::channel();
-    if !send_request(BftRequest::ForceFeed { block, fat_pointer, reply }) {
+    let request = BftRequest::ForceFeed { block, fat_pointer, proposal_sigs, valid_round, reply };
+    if !send_request(request) {
         return Err("new_network is not running".to_string());
     }
     rx.await.map_err(|_| "new_network dropped the force-feed reply".to_string())?
@@ -1175,7 +1187,7 @@ impl BftRunner {
                 }
                 self.decide(block, fat_pointer, proposal_sigs, DecisionReply::Tenderlink(reply), read_state, block_writer);
             }
-            BftRequest::ForceFeed { block, fat_pointer, reply } => {
+            BftRequest::ForceFeed { block, fat_pointer, proposal_sigs, valid_round, reply } => {
                 if bft_is_dropped() {
                     let _ = reply.send(Err("BFT is dropped on this node".to_string()));
                     return;
@@ -1221,9 +1233,43 @@ impl BftRunner {
                         return;
                     }
                 }
+                if let Err(why) = self.check_proposal_sigs(&block, &fat_pointer, &proposal_sigs, valid_round) {
+                    let _ = reply.send(Err(why));
+                    return;
+                }
                 let block = Arc::unwrap_or_clone(block);
-                self.decide(block, fat_pointer, Vec::new(), DecisionReply::ForceFeed(reply), read_state, block_writer);
+                self.decide(block, fat_pointer, proposal_sigs, DecisionReply::ForceFeed(reply), read_state, block_writer);
             }
+        }
+    }
+
+    /// A force-fed decision's proposal signatures, as a tenderlink decision has them: the round's
+    /// proposer's, one per chunk, over each chunk as it was sent in `valid_round`. Whether there
+    /// is a proposer is tenderlink's choice on the roster the certificate is checked against, not
+    /// a rule of this path: a round with none (the bootstrap genesis, a roster with no stake) has
+    /// no signatures.
+    fn check_proposal_sigs(&self, block: &BftBlock, fat_pointer: &FatPointerToBftBlock, sigs: &[TMSig], valid_round: i64) -> Result<(), String> {
+        let (height, round) = (u64::from(block.height), fat_pointer.get_vote_template().round);
+        let Ok(round) = u32::try_from(round) else {
+            return Err(format!("the fat pointer's round {round} is negative"));
+        };
+        let voting = self.next_voting_roster(&BFT_CHAIN.read().unwrap());
+        let Some(proposer_i) = tenderlink::proposer_index(&HashKeys::default(), &voting.roster, self.params.active_roster_max_n, height, round) else {
+            return match sigs.is_empty() {
+                true => Ok(()),
+                false => Err(format!("{} proposal signatures for {height}.{round}, which has no proposer", sigs.len())),
+            };
+        };
+        let value = block.zcash_serialize_to_vec().expect("a BFT block serializes");
+        let chunks_n = tenderlink::proposal_chunks_n(value.len());
+        if sigs.len() != chunks_n {
+            return Err(format!("{} proposal signatures for a proposal of {chunks_n} chunks", sigs.len()));
+        }
+        let proposer = voting.roster[proposer_i].pub_key;
+        let value_id = tenderlink::ValueId(fat_pointer.points_at_block_hash().0);
+        match tenderlink::first_bad_proposal_chunk_sig(proposer, &value, value_id, height, round, valid_round, &voting.vote_namespace, sigs) {
+            Some(chunk_i) => Err(format!("proposal chunk {chunk_i} is not signed by {proposer:?}, the proposer of {height}.{round}")),
+            None => Ok(()),
         }
     }
 

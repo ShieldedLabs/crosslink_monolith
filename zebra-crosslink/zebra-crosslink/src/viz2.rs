@@ -182,7 +182,7 @@ impl VizScene {
             instr_strings.push(test_format::TFInstr::string_from_instr(bytes, instr));
             match test_format::tf_read_instr(bytes, instr) {
                 Some(test_format::TestInstr::LoadPoW(block)) => pow.push(Arc::new(block)),
-                Some(test_format::TestInstr::LoadPoS((block, _fat_ptr))) => bft.push(block),
+                Some(test_format::TestInstr::LoadPoS { block, .. }) => bft.push(block),
                 _ => {}
             }
         }

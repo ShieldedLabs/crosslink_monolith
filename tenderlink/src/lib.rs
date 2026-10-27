@@ -1992,15 +1992,52 @@ pub fn vote_packet(signing_key: &SigningKey, roster_i: u16, is_precommit: bool, 
     buf[..o].to_vec()
 }
 
+/// How many chunks a proposal of `value_len` bytes is sent in, so how many signatures it has.
+pub fn proposal_chunks_n(value_len: usize) -> usize {
+    value_len.div_ceil(PROPOSAL_CHUNK_DATA_SIZE)
+}
+
+/// What the proposer signs for chunk `chunk_i` of `value`: the chunk header, then the chunk.
+/// `write_signed_proposal_chunk` and the receive path check signatures over these same bytes.
+fn proposal_chunk_signed_bytes(value: &BlockValue, value_id: ValueId, height: u64, round: u32, valid_round: i64, chunk_i: usize) -> Vec<u8> {
+    let hdr = PacketProposalChunkHeader {
+        chunk_i: chunk_i as u32, proposal_size: value.0.len() as u32, round, valid_round, height, proposal_id: value_id,
+    };
+    let (chunk_o, chunk_size) = value.chunk_o_size(chunk_i);
+    let mut bytes = vec![0u8; PacketProposalChunkHeader::SERIALIZED_SIZE];
+    hdr.write_to(&mut bytes);
+    bytes.extend_from_slice(&value.0[chunk_o..chunk_o + chunk_size]);
+    bytes
+}
+
+/// The proposer's signature on each chunk of `value`, in chunk order: what a decided height
+/// stores as its proposal signatures.
+pub fn proposal_chunk_sigs(signing_key: &SigningKey, value: &[u8], value_id: ValueId, height: u64, round: u32, valid_round: i64, vote_namespace: &[u8; 32]) -> Vec<TMSig> {
+    let value = BlockValue(value.to_vec());
+    (0..value.chunks_n()).map(|chunk_i| {
+        let signed = proposal_chunk_signed_bytes(&value, value_id, height, round, valid_round, chunk_i);
+        TMSig(sign_with_namespace(signing_key, &signed, vote_namespace))
+    }).collect()
+}
+
+/// The first chunk of `value` whose signature in `sigs` was not made by `proposer`, or `None`
+/// when all were. `sigs` must hold one per chunk.
+pub fn first_bad_proposal_chunk_sig(proposer: PubKeyID, value: &[u8], value_id: ValueId, height: u64, round: u32, valid_round: i64, vote_namespace: &[u8; 32], sigs: &[TMSig]) -> Option<usize> {
+    let value = BlockValue(value.to_vec());
+    debug_assert_eq!(sigs.len(), value.chunks_n());
+    (0..value.chunks_n()).find(|&chunk_i| {
+        let signed = proposal_chunk_signed_bytes(&value, value_id, height, round, valid_round, chunk_i);
+        sigs.get(chunk_i).is_none_or(|sig| sig.verify_with_namespace(proposer, &signed, vote_namespace).is_err())
+    })
+}
+
 /// The proposal chunk packets for `value`, signed by the proposer holding `signing_key`, each
 /// with a status at `height` and `round` that needs everything. `value_id` is what the chunks
 /// claim to be a part of, normally [`value_id_of`] the value.
 pub fn proposal_chunk_packets(signing_key: &SigningKey, value: &[u8], value_id: ValueId, height: u64, round: u32, valid_round: i64, vote_namespace: &[u8; 32], roster_n: usize) -> Vec<Vec<u8>> {
+    let sigs = proposal_chunk_sigs(signing_key, value, value_id, height, round, valid_round, vote_namespace);
     let value = BlockValue(value.to_vec());
     (0..value.chunks_n()).map(|chunk_i| {
-        let hdr = PacketProposalChunkHeader {
-            chunk_i: chunk_i as u32, proposal_size: value.0.len() as u32, round, valid_round, height, proposal_id: value_id,
-        };
         // Header, status, chunk header, chunk and signature fit the signed packet size by
         // construction: a chunk holds at most PROPOSAL_CHUNK_DATA_SIZE bytes.
         let mut buf = vec![0u8; PROPOSAL_PACKET_SIZE];
@@ -2008,13 +2045,10 @@ pub fn proposal_chunk_packets(signing_key: &SigningKey, value: &[u8], value_id: 
         header.tag |= PACKET_TAG_STATUS_FLAG as u64;
         let mut o = header.write_to(&mut buf);
         o += needing_everything(height, round, roster_n).write_to(&mut buf[o..]);
-        let signed_o = o;
-        o += hdr.write_to(&mut buf[o..]);
-        let (chunk_o, chunk_size) = value.chunk_o_size(chunk_i);
-        buf[o..o + chunk_size].copy_from_slice(&value.0[chunk_o..chunk_o + chunk_size]);
-        o += chunk_size;
-        let sig = sign_with_namespace(signing_key, &buf[signed_o..o], vote_namespace);
-        buf[o..o + 64].copy_from_slice(&sig);
+        let signed = proposal_chunk_signed_bytes(&value, value_id, height, round, valid_round, chunk_i);
+        buf[o..o + signed.len()].copy_from_slice(&signed);
+        o += signed.len();
+        buf[o..o + 64].copy_from_slice(&sigs[chunk_i].0);
         o += 64;
         buf.truncate(o);
         buf
