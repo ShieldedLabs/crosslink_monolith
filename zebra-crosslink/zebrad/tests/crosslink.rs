@@ -724,7 +724,7 @@ fn crosslink_expect_pos_height_after_push() {
 
     let nw = regtest_network(&HARNESS_PARAMETERS);
     let miner_addr = Address::decode(&nw, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
-    let mut gen = BlockGen::init_at_genesis_plus_1(nw, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut gen = bonded_start(&mut tf, nw);
 
     let mut pow_common = vec![gen.tip.clone()];
     for _ in 2..8 {
@@ -733,12 +733,12 @@ fn crosslink_expect_pos_height_after_push() {
     for pow in &pow_common {
         tf.push_instr_load_pow(pow, 0);
     }
-    tf.push_instr_expect_pow_chain_length(8, 0);
+    tf.push_instr_expect_pow_chain_length(8 + BONDED_SHIFT, 0);
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     for i in 1..5 {
-        let bft = next_pos(pos_h, fat_ptr, &pow_common[i..i+3], &[]);
-        tf.push_instr_load_pos(&bft, 0);
+        let bft = next_signed_pos(pos_h, fat_ptr, &pow_common[i..i+3]);
+        push_decided_pos(&mut tf, &bft, 0);
         tf.push_instr_expect_pos_chain_length((*pos_h).try_into().unwrap(), 0);
     }
 
@@ -755,7 +755,7 @@ fn crosslink_expect_pos_out_of_order() {
 
     let nw = regtest_network(&HARNESS_PARAMETERS);
     let miner_addr = Address::decode(&nw, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
-    let mut gen = BlockGen::init_at_genesis_plus_1(nw, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut gen = bonded_start(&mut tf, nw);
 
     let mut pow_common = vec![gen.tip.clone()];
     for _ in 2..6 {
@@ -764,18 +764,18 @@ fn crosslink_expect_pos_out_of_order() {
     for pow in &pow_common {
         tf.push_instr_load_pow(pow, 0);
     }
-    tf.push_instr_expect_pow_chain_length(6, 0);
+    tf.push_instr_expect_pow_chain_length(6 + BONDED_SHIFT, 0);
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let pos = [
-        next_pos(pos_h, fat_ptr, &pow_common[0..=2], &[]),
-        next_pos(pos_h, fat_ptr, &pow_common[1..=3], &[]),
-        next_pos(pos_h, fat_ptr, &pow_common[2..=4], &[]),
+        next_signed_pos(pos_h, fat_ptr, &pow_common[0..=2]),
+        next_signed_pos(pos_h, fat_ptr, &pow_common[1..=3]),
+        next_signed_pos(pos_h, fat_ptr, &pow_common[2..=4]),
     ];
 
-    tf.push_instr_load_pos(&pos[0], 0);
-    tf.push_instr_load_pos(&pos[2], SHOULD_FAIL);
-    tf.push_instr_load_pos(&pos[1], 0);
+    push_decided_pos(&mut tf, &pos[0], 0);
+    push_decided_pos(&mut tf, &pos[2], SHOULD_FAIL);
+    push_decided_pos(&mut tf, &pos[1], 0);
     tf.push_instr_expect_pos_chain_length(2, 0);
 
     test_bytes(tf.write_to_bytes());
@@ -788,7 +788,7 @@ fn crosslink_expect_pos_push_same_block_twice_only_accepted_once() {
 
     let nw = regtest_network(&HARNESS_PARAMETERS);
     let miner_addr = Address::decode(&nw, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
-    let mut gen = BlockGen::init_at_genesis_plus_1(nw, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut gen = bonded_start(&mut tf, nw);
 
     let mut pow_common = vec![gen.tip.clone()];
     for _ in 2..4 {
@@ -797,13 +797,13 @@ fn crosslink_expect_pos_push_same_block_twice_only_accepted_once() {
     for pow in &pow_common {
         tf.push_instr_load_pow(pow, 0);
     }
-    tf.push_instr_expect_pow_chain_length(4, 0);
+    tf.push_instr_expect_pow_chain_length(4 + BONDED_SHIFT, 0);
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
-    let pos = next_pos(pos_h, fat_ptr, &pow_common[0..=2], &[]);
+    let pos = next_signed_pos(pos_h, fat_ptr, &pow_common[0..=2]);
 
-    tf.push_instr_load_pos(&pos, 0);
-    tf.push_instr_load_pos(&pos, SHOULD_FAIL);
+    push_decided_pos(&mut tf, &pos, 0);
+    push_decided_pos(&mut tf, &pos, SHOULD_FAIL);
     tf.push_instr_expect_pos_chain_length(1, 0);
 
     test_bytes(tf.write_to_bytes());
@@ -854,8 +854,7 @@ fn crosslink_finality_reads_before_and_after_the_first_decision() {
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = regtest_network(&HARNESS_PARAMETERS);
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
-    let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut gen = bonded_start(&mut tf, network);
 
     // A hash no block has: the absent case of the block-status row.
     let unknown = zebra_chain::block::Hash([0x11u8; 32]);
@@ -888,8 +887,8 @@ fn crosslink_finality_reads_before_and_after_the_first_decision() {
     );
 
     // Decide over pow[4..7], whose snapshot is pow[3], and cite it: `fin` reaches pow[3].
-    let bft = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
-    tf.push_instr_load_pos(&bft, 0);
+    let bft = next_signed_pos(pos_h, fat_ptr, &pow[4..7]);
+    push_decided_pos(&mut tf, &bft, 0);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
@@ -919,8 +918,7 @@ fn crosslink_test_basic_finality() {
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = regtest_network(&HARNESS_PARAMETERS);
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
-    let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut gen = bonded_start(&mut tf, network);
 
     // A second, distinct, valid transparent P2PKH miner (a different coinbase => different
     // block hashes, so the fork actually competes). Tex addresses are rejected by the
@@ -956,14 +954,12 @@ fn crosslink_test_basic_finality() {
         pow[2] = side_gen.clone().expect("pow[2] is the side block").next_block(&side_miner);
     }
 
-    // Nothing is loaded yet, so every one of these is a block this node does not hold, which
-    // the FINALITY.md §7.2 table answers the same way as a block off the best chain.
+    // Nothing above `pow[0]` (which `bonded_start` loaded) is loaded yet, so every one of these
+    // is a block this node does not hold, which the FINALITY.md §7.2 table answers the same way
+    // as a block off the best chain.
     for i2 in 0..n {
-        tf.push_instr_expect_pow_block_finality(
-            &pow[i2].hash(),
-            Some(TFLBlockFinality::CantBeFinalized),
-            0,
-        );
+        let finality = if i2 == 0 { TFLBlockFinality::NotYetFinalized } else { TFLBlockFinality::CantBeFinalized };
+        tf.push_instr_expect_pow_block_finality(&pow[i2].hash(), Some(finality), 0);
     }
 
     for i in 0..n {
@@ -999,8 +995,8 @@ fn crosslink_test_basic_finality() {
         } else {
             pow[LINKS[i]..LINKS[i] + 3].to_vec()
         };
-        let bft = next_pos(pos_h, fat_ptr, &window, &[]);
-        tf.push_instr_load_pos(&bft, 0);
+        let bft = next_signed_pos(pos_h, fat_ptr, &window);
+        push_decided_pos(&mut tf, &bft, 0);
 
         // A decision alone moves nothing (FINALITY.md §4.3): `fin` follows `candidate(bc_best)`,
         // so the chain has to cite the decision before the blocks below its snapshot are final.
@@ -1072,6 +1068,20 @@ fn pow_chain_for(tf: &mut TF, n: usize) -> (BlockGen, Address, Vec<Arc<Block>>) 
     (gen, miner_addr, pow)
 }
 
+/// As `pow_chain_for`, starting from `bonded_start`, so a BFT genesis over it has a roster:
+/// `pow[i]` is at height `i + 1 + BONDED_SHIFT`.
+fn bonded_pow_chain_for(tf: &mut TF, n: usize) -> (BlockGen, Address, Vec<Arc<Block>>) {
+    let network = regtest_network(&HARNESS_PARAMETERS);
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen = bonded_start(tf, network);
+    let mut pow = vec![gen.tip.clone()];
+    for _ in 1..n {
+        pow.push(gen.next_block(&miner_addr));
+        tf.push_instr_load_pow(&gen.tip, 0);
+    }
+    (gen, miner_addr, pow)
+}
+
 /// Tail Confirmation (FINALITY.md §3.4): `headers_bc` holds exactly `sigma` headers. One short is
 /// not the tail of anything, and the shortfall is the only defect: the headers that are there are
 /// consecutive and their blocks are on the chain.
@@ -1080,12 +1090,12 @@ fn crosslink_reject_pos_block_with_lt_sigma_headers() {
     set_test_name(function_name!());
     let mut tf = TF::new(&HARNESS_PARAMETERS);
     let sigma = HARNESS_PARAMETERS.bc_confirmation_depth_sigma as usize;
-    let (_gen, _miner_addr, pow) = pow_chain_for(&mut tf, 8);
+    let (_gen, _miner_addr, pow) = bonded_pow_chain_for(&mut tf, 8);
 
     // P5..P7 would be the sigma-block tail above P4; this stops one header short of it.
     let short = pos_from_headers(0, FatPointerToBftBlock::null(), &pow[4..3 + sigma]);
     assert_eq!(short.0.block.headers.len(), sigma - 1);
-    tf.push_instr_load_pos(&short, SHOULD_FAIL);
+    push_decided_pos(&mut tf, &short, SHOULD_FAIL);
     tf.push_instr_expect_pos_chain_length(0, 0);
 
     test_bytes(tf.write_to_bytes());
@@ -1102,7 +1112,7 @@ fn crosslink_reject_pos_block_with_unlinked_headers() {
         HARNESS_PARAMETERS.bc_confirmation_depth_sigma, 3,
         "the header window below is written for sigma = 3"
     );
-    let (_gen, _miner_addr, pow) = pow_chain_for(&mut tf, 8);
+    let (_gen, _miner_addr, pow) = bonded_pow_chain_for(&mut tf, 8);
 
     // P5, P7, P8: P7 names P6 as its parent, not P5.
     let unlinked = pos_from_headers(
@@ -1110,7 +1120,7 @@ fn crosslink_reject_pos_block_with_unlinked_headers() {
         FatPointerToBftBlock::null(),
         &[pow[4].clone(), pow[6].clone(), pow[7].clone()],
     );
-    tf.push_instr_load_pos(&unlinked, SHOULD_FAIL);
+    push_decided_pos(&mut tf, &unlinked, SHOULD_FAIL);
     tf.push_instr_expect_pos_chain_length(0, 0);
 
     test_bytes(tf.write_to_bytes());
@@ -1123,17 +1133,18 @@ fn crosslink_reject_pos_block_with_unlinked_headers() {
 fn crosslink_reject_pos_block_that_regresses_the_snapshot() {
     set_test_name(function_name!());
     let mut tf = TF::new(&HARNESS_PARAMETERS);
-    let (_gen, _miner_addr, pow) = pow_chain_for(&mut tf, 8);
+    let (_gen, _miner_addr, pow) = bonded_pow_chain_for(&mut tf, 8);
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
-    // Headers P5..P7, so the snapshot is P4.
-    let bft0 = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
-    tf.push_instr_load_pos(&bft0, 0);
+    // Headers pow[4..7], so the snapshot is pow[3].
+    let bft0 = next_signed_pos(pos_h, fat_ptr, &pow[4..7]);
+    push_decided_pos(&mut tf, &bft0, 0);
 
-    // Headers P4..P6, so the snapshot is P3. Everything else about the block is well formed:
-    // the parent pointer, the height and the header window are all what the chain expects.
-    let regressed = create_pos_and_ptr_to_finalize_pow(*pos_h, fat_ptr.clone(), &pow[3..6], &[]);
-    tf.push_instr_load_pos(&regressed, SHOULD_FAIL);
+    // Headers pow[3..6], so the snapshot is pow[2]. Everything else about the block is well formed:
+    // the parent pointer, the height, the header window and the signatures are all what the chain
+    // expects.
+    let regressed = next_signed_pos(&mut pos_h.clone(), &mut fat_ptr.clone(), &pow[3..6]);
+    push_decided_pos(&mut tf, &regressed, SHOULD_FAIL);
     tf.push_instr_expect_pos_chain_length(1, 0);
 
     test_bytes(tf.write_to_bytes());
@@ -1159,8 +1170,10 @@ fn crosslink_reject_fat_pointer_below_bootstrap_activation() {
         tf.push_instr_load_pow(&gen.tip, 0);
     }
 
+    // The BFT block the PoW block points at is never loaded: on a network that bootstraps BFT
+    // from the chain there is no BFT block before the activation height, and none is needed for
+    // a rule that refuses any pointer at or below it.
     let bft = next_pos(pos_h, fat_ptr, &pow[1..4], &[]);
-    tf.push_instr_load_pos(&bft, 0);
 
     let fat_pointer_to_bft_block = FatPointerToBftBlock {
         vote_for_block_without_finalizer_public_key: bft.0.fat_ptr.vote_for_block_without_finalizer_public_key,
@@ -1197,20 +1210,16 @@ fn crosslink_test_pow_to_pos_link() {
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = regtest_network(&HARNESS_PARAMETERS);
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
-    let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut gen = bonded_start(&mut tf, network);
     let mut pow = vec![gen.tip.clone()];
-    tf.push_instr_load_pow(&gen.tip, 0);
 
     for _ in 2..5 {
         pow.push(gen.next_block(&miner_addr));
         tf.push_instr_load_pow(&gen.tip, 0);
     }
 
-    // TODO: push
-
-    let bft = next_pos(pos_h, fat_ptr, &pow[1..4], &[]);
-    tf.push_instr_load_pos(&bft, 0);
+    let bft = next_signed_pos(pos_h, fat_ptr, &pow[1..4]);
+    push_decided_pos(&mut tf, &bft, 0);
 
     let fat_pointer_to_bft_block = FatPointerToBftBlock {
         vote_for_block_without_finalizer_public_key: bft
@@ -1260,10 +1269,8 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = regtest_network(&HARNESS_PARAMETERS);
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
-    let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut gen = bonded_start(&mut tf, network);
     let mut pow = vec![gen.tip.clone()];
-    tf.push_instr_load_pow(&gen.tip, 0);
 
     for _ in 2..9 {
         pow.push(gen.next_block(&miner_addr));
@@ -1271,8 +1278,8 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
     }
 
     for i in 0..3 {
-        let bft = next_pos(pos_h, fat_ptr, &pow[2*i..2*i+3], &[]);
-        tf.push_instr_load_pos(&bft, 0);
+        let bft = next_signed_pos(pos_h, fat_ptr, &pow[2*i..2*i+3]);
+        push_decided_pos(&mut tf, &bft, 0);
     }
 
     for _ in 9..10 {
@@ -1281,22 +1288,22 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
     }
     let mut genb = gen.clone(); // fork
 
-    let bft = next_pos(pos_h, fat_ptr, &pow[6..9], &[]);
-    tf.push_instr_load_pos(&bft, 0);
+    let bft = next_signed_pos(pos_h, fat_ptr, &pow[6..9]);
+    push_decided_pos(&mut tf, &bft, 0);
 
     for _ in 10..14 {
         pow.push(gen.next_block(&miner_addr));
         tf.push_instr_load_pow(&gen.tip, 0);
     }
 
-    // Snapshot h10 = pow[9]: the block right above the fork point, so the fork conflicts with
-    // the finalized chain. Its three headers are h11..h13.
-    let bft = next_pos(pos_h, fat_ptr, &pow[10..13], &[]);
-    tf.push_instr_load_pos(&bft, 0);
+    // Snapshot pow[9]: the block right above the fork point, so the fork conflicts with the
+    // finalized chain. Its three headers are pow[10..13].
+    let bft = next_signed_pos(pos_h, fat_ptr, &pow[10..13]);
+    push_decided_pos(&mut tf, &bft, 0);
 
-    // h14 cites that decision. The decision alone finalizes nothing (FINALITY.md §4.3): `fin`
-    // reaches h10 only once the best chain carries the fat pointer, and it is `fin` that the
-    // fork below has to conflict with.
+    // The next block cites that decision. The decision alone finalizes nothing (FINALITY.md
+    // §4.3): `fin` reaches pow[9] only once the best chain carries the fat pointer, and it is
+    // `fin` that the fork below has to conflict with.
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
@@ -1308,11 +1315,11 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
         zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
     );
     // Refused at its first block; the rest wait on a parent that never commits.
-    for height in 10..18 {
-        let flags = if height == 10 { SHOULD_FAIL } else { SHOULD_DEFER };
+    for i in 0..8 {
+        let flags = if i == 0 { SHOULD_FAIL } else { SHOULD_DEFER };
         tf.push_instr_load_pow(&genb.next_block(&miner_addr2), flags);
     }
-    tf.push_instr_expect_pow_chain_length(15, 0);
+    tf.push_instr_expect_pow_chain_length(15 + BONDED_SHIFT, 0);
 
     test_bytes(tf.write_to_bytes());
 }
@@ -1335,41 +1342,39 @@ fn crosslink_pow_follows_the_heaviest_chain_until_fin_moves_to_the_decided_branc
     let miner_addr2 = zcash_keys::address::Address::Transparent(
         zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
     );
-    let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut gen = bonded_start(&mut tf, network);
     let mut pow = vec![gen.tip.clone()];
-    tf.push_instr_load_pow(&gen.tip, 0);
 
-    // Heights 1..9, common to both branches.
+    // pow[0..9], common to both branches.
     for _ in 2..10 {
         pow.push(gen.next_block(&miner_addr));
         tf.push_instr_load_pow(&gen.tip, 0);
     }
     for i in 0..3 {
-        let bft = next_pos(pos_h, fat_ptr, &pow[i..i + 3], &[]);
-        tf.push_instr_load_pos(&bft, 0);
+        let bft = next_signed_pos(pos_h, fat_ptr, &pow[i..i + 3]);
+        push_decided_pos(&mut tf, &bft, 0);
     }
 
-    // Branch A: heights 10..18, the heaviest chain for most of this test.
+    // Branch A: the nine blocks after pow[8], the heaviest chain for most of this test.
     let mut genb = gen.clone(); // fork
     for _ in 10..19 {
         tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
     }
-    tf.push_instr_expect_pow_chain_length(19, 0);
+    tf.push_instr_expect_pow_chain_length(19 + BONDED_SHIFT, 0);
 
-    // Branch B: heights 10..13, a side chain of four blocks. pow[9..13].
+    // Branch B: a side chain of four blocks at the same heights, pow[9..13].
     for _ in 10..14 {
         pow.push(genb.next_block(&miner_addr2));
         tf.push_instr_load_pow(&genb.tip, 0);
     }
-    tf.push_instr_expect_pow_chain_length(19, 0);
+    tf.push_instr_expect_pow_chain_length(19 + BONDED_SHIFT, 0);
 
-    // Decide a bft-block whose snapshot is pow[9], branch B's first block: headers 11..13 put
+    // Decide a bft-block whose snapshot is pow[9], branch B's first block: headers pow[10..13] put
     // the snapshot at their parent. Under §4.3 this moves `bft_final_snapshot` and nothing else
     // -- the node stays on branch A, and the decided block is not final on it.
-    let bft = next_pos(pos_h, fat_ptr, &pow[10..13], &[]);
-    tf.push_instr_load_pos(&bft, 0);
-    tf.push_instr_expect_pow_chain_length(19, 0);
+    let bft = next_signed_pos(pos_h, fat_ptr, &pow[10..13]);
+    push_decided_pos(&mut tf, &bft, 0);
+    tf.push_instr_expect_pow_chain_length(19 + BONDED_SHIFT, 0);
     tf.push_instr_expect_pow_block_finality(
         &pow[9].hash(),
         Some(TFLBlockFinality::CantBeFinalized),
@@ -1378,7 +1383,7 @@ fn crosslink_pow_follows_the_heaviest_chain_until_fin_moves_to_the_decided_branc
 
     // Branch A still extends, because `fin` is below the fork.
     tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
-    tf.push_instr_expect_pow_chain_length(20, 0);
+    tf.push_instr_expect_pow_chain_length(20 + BONDED_SHIFT, 0);
 
     let fat_pointer_to_bft_block = FatPointerToBftBlock {
         vote_for_block_without_finalizer_public_key: bft
@@ -1397,7 +1402,7 @@ fn crosslink_pow_follows_the_heaviest_chain_until_fin_moves_to_the_decided_branc
             .collect(),
     };
 
-    // Branch B overtakes: heights 14..21, the last of them citing the decided bft-block. Only
+    // Branch B overtakes: eight more blocks, the last of them citing the decided bft-block. Only
     // the tip's pointer matters, since `candidate` reads the best tip.
     for _ in 14..21 {
         pow.push(genb.next_block(&miner_addr2));
@@ -1416,13 +1421,13 @@ fn crosslink_pow_follows_the_heaviest_chain_until_fin_moves_to_the_decided_branc
     tf.push_instr_load_pow(&genb.tip, 0);
 
     // Branch B is now the best chain and its tip cites the decision, so `fin` reaches pow[9].
-    tf.push_instr_expect_pow_chain_length(22, 0);
+    tf.push_instr_expect_pow_chain_length(22 + BONDED_SHIFT, 0);
     tf.push_instr_expect_pow_block_finality(&pow[9].hash(), Some(TFLBlockFinality::Finalized), 0);
 
     // With `fin` on branch B, branch A is gone: a block extending it forks below the finalized
     // tip, which is the fork-choice floor as Zebra enforces it (§4.3, §6.3).
     tf.push_instr_load_pow(&gen.next_block(&miner_addr), SHOULD_DEFER);
-    tf.push_instr_expect_pow_chain_length(22, 0);
+    tf.push_instr_expect_pow_chain_length(22 + BONDED_SHIFT, 0);
 
     test_bytes(tf.write_to_bytes());
 }
@@ -1441,40 +1446,38 @@ fn crosslink_dropping_bft_at_the_reorg_depth_records_it_and_keeps_pow_running() 
     let miner_addr2 = zcash_keys::address::Address::Transparent(
         zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
     );
-    let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut gen = bonded_start(&mut tf, network);
     let mut pow = vec![gen.tip.clone()];
-    tf.push_instr_load_pow(&gen.tip, 0);
 
-    // Heights 1..9, common to both branches.
+    // pow[0..9], common to both branches.
     for _ in 2..10 {
         pow.push(gen.next_block(&miner_addr));
         tf.push_instr_load_pow(&gen.tip, 0);
     }
     for i in 0..3 {
-        let bft = next_pos(pos_h, fat_ptr, &pow[i..i + 3], &[]);
-        tf.push_instr_load_pos(&bft, 0);
+        let bft = next_signed_pos(pos_h, fat_ptr, &pow[i..i + 3]);
+        push_decided_pos(&mut tf, &bft, 0);
     }
 
-    // Branch B, heights 10..14: pow[9..14], a side chain holding the snapshot that gets decided.
+    // Branch B, the five blocks after pow[8]: pow[9..14], a side chain holding the snapshot that gets decided.
     let mut genb = gen.clone();
     for _ in 10..15 {
         pow.push(genb.next_block(&miner_addr2));
         tf.push_instr_load_pow(&genb.tip, 0);
     }
-    // Branch A, heights 10..20: the best chain.
+    // Branch A, eleven blocks at the same heights: the best chain.
     for _ in 10..21 {
         tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
     }
 
-    // Decided: snapshot pow[9], branch B's height 10.
-    let decided = next_pos(pos_h, fat_ptr, &pow[10..13], &[]);
-    tf.push_instr_load_pos(&decided, 0);
+    // Decided: snapshot pow[9], branch B's first block.
+    let decided = next_signed_pos(pos_h, fat_ptr, &pow[10..13]);
+    push_decided_pos(&mut tf, &decided, 0);
     let decided_snapshot = pow[9].hash();
     // The next height on it, snapshot pow[10]. Checked, never stored.
-    let next = create_pos_and_ptr_to_finalize_pow(*pos_h, fat_ptr.clone(), &pow[11..14], &[]);
+    let next = next_signed_pos(&mut pos_h.clone(), &mut fat_ptr.clone(), &pow[11..14]);
 
-    // Branch A runs on. Height 109 is the first whose commit takes branch A's height 10 into the
+    // Branch A runs on. The block after this loop is the first whose commit takes branch A's first block into the
     // finalized state, which leaves branch B on no chain this node holds.
     for _ in 21..109 {
         tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
@@ -1488,15 +1491,15 @@ fn crosslink_dropping_bft_at_the_reorg_depth_records_it_and_keeps_pow_running() 
     // Indeterminate, and with no block named: nothing on the dropped branch can arrive.
     tf.push_instr_check_pos(&next, SHOULD_DEFER);
     tf.push_instr_expect_rejection_reason("pending: None", 0);
-    tf.push_instr_load_pos(&next, SHOULD_FAIL);
+    push_decided_pos(&mut tf, &next, SHOULD_FAIL);
     tf.push_instr_expect_rejection_reason("BFT is dropped", 0);
     tf.push_instr_expect_node_alive(0);
 
     // Proof of work goes on, from loaded blocks and from the node's own templates.
     tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
-    tf.push_instr_expect_pow_chain_length(111, 0);
+    tf.push_instr_expect_pow_chain_length(111 + BONDED_SHIFT, 0);
     tf.push_instr_mine_from_template(0);
-    tf.push_instr_expect_pow_chain_length(112, 0);
+    tf.push_instr_expect_pow_chain_length(112 + BONDED_SHIFT, 0);
 
     test_bytes(tf.write_to_bytes());
 }
@@ -1582,35 +1585,33 @@ fn crosslink_reject_pow_block_citing_a_snapshot_off_its_own_chain() {
     let miner_addr2 = zcash_keys::address::Address::Transparent(
         zcash_transparent::address::TransparentAddress::PublicKeyHash([1u8; 20]),
     );
-    let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut gen = bonded_start(&mut tf, network);
     let mut pow = vec![gen.tip.clone()];
-    tf.push_instr_load_pow(&gen.tip, 0);
 
-    // Heights 1..9, common to both branches.
+    // pow[0..9], common to both branches.
     for _ in 2..10 {
         pow.push(gen.next_block(&miner_addr));
         tf.push_instr_load_pow(&gen.tip, 0);
     }
     for i in 0..3 {
-        let bft = next_pos(pos_h, fat_ptr, &pow[i..i + 3], &[]);
-        tf.push_instr_load_pos(&bft, 0);
+        let bft = next_signed_pos(pos_h, fat_ptr, &pow[i..i + 3]);
+        push_decided_pos(&mut tf, &bft, 0);
     }
 
-    // Branch A, heights 10..13: the best chain, and the one that will cite the bft-block.
+    // Branch A, the four blocks after pow[8]: the best chain, and the one that will cite the bft-block.
     let mut genb = gen.clone(); // fork
     for _ in 10..14 {
         tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
     }
 
-    // Branch B, heights 10..13: pow[9..13], holding the snapshot that gets decided.
+    // Branch B, at the same heights: pow[9..13], holding the snapshot that gets decided.
     for _ in 10..14 {
         pow.push(genb.next_block(&miner_addr2));
         tf.push_instr_load_pow(&genb.tip, 0);
     }
 
-    let bft = next_pos(pos_h, fat_ptr, &pow[10..13], &[]);
-    tf.push_instr_load_pos(&bft, 0);
+    let bft = next_signed_pos(pos_h, fat_ptr, &pow[10..13]);
+    push_decided_pos(&mut tf, &bft, 0);
     tf.push_instr_expect_pos_chain_length(4, 0);
 
     let fat_pointer_to_bft_block = FatPointerToBftBlock {
@@ -1630,7 +1631,7 @@ fn crosslink_reject_pow_block_citing_a_snapshot_off_its_own_chain() {
             .collect(),
     };
 
-    // Branch A's height 14 cites a bft-block whose snapshot is branch B's height 10. It is σ + 1
+    // Branch A's next block cites a bft-block whose snapshot is branch B's pow[9]. It is σ + 1
     // above that snapshot, so only Last Final Snapshot can refuse it.
     gen.next_block(&miner_addr);
     gen.tip = Arc::new(Block {
@@ -1642,7 +1643,7 @@ fn crosslink_reject_pow_block_citing_a_snapshot_off_its_own_chain() {
         ..gen.tip.as_ref().clone()
     });
     tf.push_instr_load_pow(&gen.tip, SHOULD_FAIL);
-    tf.push_instr_expect_pow_chain_length(14, 0);
+    tf.push_instr_expect_pow_chain_length(14 + BONDED_SHIFT, 0);
 
     test_bytes(tf.write_to_bytes());
 }
@@ -2491,14 +2492,14 @@ fn crosslink_check_pos_answers_without_storing() {
     set_test_name(function_name!());
     let mut tf = TF::new(&HARNESS_PARAMETERS);
     let sigma = HARNESS_PARAMETERS.bc_confirmation_depth_sigma as usize;
-    let (_gen, _miner_addr, pow) = pow_chain_for(&mut tf, 8);
+    let (_gen, _miner_addr, pow) = bonded_pow_chain_for(&mut tf, 8);
 
     let valid = pos_from_headers(0, FatPointerToBftBlock::null(), &pow[4..4 + sigma]);
     let short = pos_from_headers(0, FatPointerToBftBlock::null(), &pow[4..3 + sigma]);
     tf.push_instr_check_pos(&valid, 0);
     tf.push_instr_check_pos(&short, SHOULD_FAIL);
     tf.push_instr_expect_pos_chain_length(0, 0);
-    tf.push_instr_load_pos(&valid, 0);
+    push_decided_pos(&mut tf, &valid, 0);
     tf.push_instr_expect_pos_chain_length(1, 0);
 
     test_bytes(tf.write_to_bytes());
@@ -4954,4 +4955,80 @@ fn crosslink_load_pos_refuses_a_decision_with_no_signatures() {
     let mut tf = signed_decision_scene(None, -1, -1, SHOULD_FAIL);
     tf.push_instr_expect_rejection_reason("0 proposal signatures", 0);
     test_bytes(tf.write_to_bytes());
+}
+
+// # Supplied BFT with a roster
+//
+// A scene that supplies its BFT blocks (HARNESS_PARAMETERS) still has a roster from the BFT
+// genesis on, as a real network does: SUPPLIED_FINALIZERS are bonded before the genesis's
+// snapshot, every decision's certificate is signed by all of them, and every decision above the
+// genesis carries its proposer's chunk signatures.
+
+/// The synthetic finalizers a supplied-BFT scene bonds, each with the same stake.
+const SUPPLIED_FINALIZERS: [u16; 4] = [0, 1, 2, 3];
+const SUPPLIED_STAKE: u64 = 100_000_000;
+
+/// How much higher a scene's `pow[0]` is after `bonded_start` than at the block after the PoW
+/// genesis, where scenes started before they had a roster: `pow[i]` is at height
+/// `i + 1 + BONDED_SHIFT`.
+const BONDED_SHIFT: usize = 6;
+
+/// The start of a supplied-BFT scene: loads blocks mined to the test miner until enough coinbases
+/// mature, a block bonding every one of SUPPLIED_FINALIZERS, and one more. Returns the generator at
+/// that last block, which the scene treats as its first, so even a BFT genesis whose headers start
+/// at it finalizes the bonds: its snapshot is the bond block.
+fn bonded_start(tf: &mut TF, network: Network) -> BlockGen {
+    let key = TestKey::new(b"crosslink test miner");
+    let miner = key.address();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    let inputs = matured_coinbases(tf, &mut gen, &key, SUPPLIED_FINALIZERS.len());
+    let bonds: Vec<Arc<Transaction>> = inputs
+        .into_iter()
+        .zip(SUPPLIED_FINALIZERS)
+        .map(|(input, k)| {
+            let signing_key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k.into()).as_bytes()).1;
+            let finalizer = zcash_primitives::bft::FinalizerAddress::create(&signing_key);
+            staking_tx_create_bond_funded(gen.next_upgrade(), format!("supplied-bond-{k}").as_bytes(), finalizer, SUPPLIED_STAKE, &key, input)
+        })
+        .collect();
+    tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &bonds), 0);
+    tf.push_instr_load_pow(&gen.next_block(&miner), 0);
+    let height = gen.tip.coinbase_height().expect("generated blocks have a height").0 as usize;
+    assert_eq!(height, 1 + BONDED_SHIFT, "BONDED_SHIFT names where the bond block lands");
+    gen
+}
+
+/// As `next_pos_at_round`, with the certificate SUPPLIED_FINALIZERS sign. The genesis's is empty:
+/// its roster is the stake it finalizes, which no one voted with before it.
+fn next_signed_pos_at_round(
+    cur_bft_height: &mut u32,
+    cur_fat_ptr: &mut FatPointerToBftBlock,
+    pow_blocks: &[Arc<Block>],
+    round: u32,
+) -> BftBlockAndFatPointerToItWrap {
+    let unsigned = create_pos_and_ptr_to_finalize_pow_at_round(*cur_bft_height, cur_fat_ptr.clone(), pow_blocks, round, &[]);
+    let bft = if *cur_bft_height == 0 {
+        unsigned
+    } else {
+        let seeds: Vec<String> = SUPPLIED_FINALIZERS.iter().map(|&k| synthetic_finalizer_seed(k.into())).collect();
+        let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
+        let fat_ptr = signed_fat_pointer(&unsigned.0.block, u64::from(*cur_bft_height), round, &seeds, &[0; 32]);
+        BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block: unsigned.0.block, fat_ptr })
+    };
+    *cur_bft_height += 1;
+    *cur_fat_ptr = bft.0.fat_ptr.clone();
+    bft
+}
+
+/// `next_signed_pos_at_round` at round 1, as `next_pos` is.
+fn next_signed_pos(cur_bft_height: &mut u32, cur_fat_ptr: &mut FatPointerToBftBlock, pow_blocks: &[Arc<Block>]) -> BftBlockAndFatPointerToItWrap {
+    next_signed_pos_at_round(cur_bft_height, cur_fat_ptr, pow_blocks, 1)
+}
+
+/// Loads `bft` signed by its round's proposer, as the node picks it on its own roster (which the
+/// writer cannot: voting power grows with the rewards every block pays). The genesis is not
+/// proposed, so it carries no signatures.
+fn push_decided_pos(tf: &mut TF, bft: &BftBlockAndFatPointerToItWrap, flags: u32) {
+    tf.push_instr_load_pos(bft, flags | SIGN_AS_PROPOSER);
 }
