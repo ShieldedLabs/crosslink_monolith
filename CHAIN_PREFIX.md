@@ -61,10 +61,18 @@ it.
 
 ## Importing
 
-    zebrad -c node.toml import-chain prefix.zeccltf [--trusted]
+    zebrad -c node.toml import-chain prefix.zeccltf [--cache-dir DIR] [--trusted] [--connect]
 
-This starts the node as `start` would and, once it has a tip, loads the file through the test
-format's instruction reader:
+This builds a new state and runs a node on it. The configured state is never touched. By default
+the new state goes beside the configured one, named for the file, as in
+`<cache_dir>-import-prefix`. `--cache-dir` picks another directory. The command refuses any
+directory that already holds anything. The RPC cookie is written into the new directory too, so
+the configured node's RPC clients keep theirs.
+
+The rest of the config applies as written, ports included. Stop the configured node first, or
+give the import a config with other ports.
+
+Once the node has a tip, the file is loaded through the test format's instruction reader:
 
 - PoW blocks go through the same ingest queue `submitblock` uses. That means header and PoW,
   body, the crosslink fat-pointer gate, the proof/signature/script checks, then contextual
@@ -74,7 +82,16 @@ format's instruction reader:
 The state comes out as a node following that chain would have built it: staking, rosters and
 `fin` advance by the live rules. The node keeps running afterwards. The log ends with
 `chain import: done`, followed by either `all as the file expects` or the instructions that
-were not, and the best tip.
+were not, and the best tip. Stop the node with Ctrl-C, not a hard kill: the blocks above `fin`
+reach disk on a graceful shutdown.
+
+The node is isolated while it loads, so only the file's blocks reach it: no PoW or BFT peers,
+and no internal miner. `--connect` keeps the configured peers and miner instead, for example to
+let the rebuilt node rejoin a network once the file is in.
+
+A new state directory is a new node. Its `secret.seed`, and with it the node's network identity,
+wallet and default finalizer key, is generated fresh. To rebuild a node as itself, copy the old
+`secret.seed` into the new directory before importing, or set `explicit_bft_key_seed`.
 
 `--trusted` skips only the proof, signature and script checks (`verify_expensive`) for the
 file's PoW blocks. Everything else above still runs. Use it for files from a node you trust,
@@ -82,17 +99,13 @@ typically your own export. The saving grows with the shielded transactions a cha
 600-block regtest chain of mostly coinbase blocks loaded in 75 s fully verified and in 67 s
 trusted, in a debug build, with identical results: same tip, `fin` and roster.
 
-Import into an empty state directory. Blocks the state already holds load as known. Blocks on
-another chain are treated as any competing branch would be: the node's fork choice and `fin`
-decide what becomes of them.
+### Parameters
 
-To replay without outside influence, start the importing node isolated:
-
-- `[state] network_initial_peers = []`
-- `[crosslink] bft_peers = []`
-- `[mining] internal_miner = false`
-
-Otherwise peers and the node's own miner add blocks while the file is loading.
+The node imports under its own consensus parameters, which are fixed per network and change
+with network upgrades. The file's `SET_PARAMS` records the Crosslink parameters it was exported
+under, for diagnosis. If they differ from the node's, that one instruction is reported as not
+as the file expects and the import carries on. Whether the blocks are accepted depends only on
+the node's own rules for their heights.
 
 ## Limits
 
