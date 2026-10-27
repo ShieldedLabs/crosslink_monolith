@@ -421,34 +421,37 @@ fn fat_pointer_binding_node(activation: Option<u32>) -> (TF, Network) {
     (TF::new_with_node_config(&params, &node_config), network)
 }
 
-/// Loads six blocks and two BFT blocks over them, bft0 finalizing P1 and bft1 finalizing P2, and
-/// builds P7 citing bft1: the honest block. Then one copy of P7 with the pointer changed and the
-/// commitment left as it was: bft0 cited in place of bft1. The copy is a valid block apart from
-/// the commitment, which is what the two sides of the upgrade disagree on.
+/// Where these scenes schedule FeaturenetUpgrade2: four blocks into the scene, below the honest
+/// block and above the snapshots the BFT blocks' rosters come from, so the decisions keep the
+/// pre-upgrade quorum and namespace while the blocks citing them are under the binding.
+const FAT_POINTER_BINDING_UPGRADE: u32 = 4 + BONDED_SHIFT as u32;
+
+/// On the bonded roster, loads six blocks and two BFT blocks over them, bft0 finalizing pow[0] and
+/// bft1 finalizing pow[1], and builds pow[6] citing bft1: the honest block. Then one copy of it
+/// with the pointer changed and the commitment left as it was: bft0 cited in place of bft1. The
+/// copy is a valid block apart from the commitment, which is what the two sides of the upgrade
+/// disagree on.
 ///
-/// The scene runs on the nil roster of `HARNESS_PARAMETERS`, under which the node admits exactly
-/// one certificate for a BFT block from FeaturenetUpgrade2: no signatures, round 0
-/// (`certificate_is_valid`). So the BFT blocks are decided at round 0 with no signatures, and a
-/// pointer with a changed height byte or an added signature is not a variant this scene can
-/// offer: the certificate check would refuse it before the commitment check ran, proving nothing
-/// about the binding. Changed signature lists are covered on a real roster by
-/// `fat_pointer_binding_on_a_roster_across_featurenet_upgrade_2`.
+/// bft0 is the BFT genesis, which the bootstrap decides with an empty certificate; bft1 carries a
+/// certificate all of SUPPLIED_FINALIZERS sign. Both are certificates the node admits, so the copy
+/// passes the certificate check and fails only the commitment. A pointer with a changed height
+/// byte or signature list is not a variant this scene offers: the certificate check would refuse
+/// it before the commitment check ran, proving nothing about the binding. Changed signature lists
+/// are covered by `fat_pointer_binding_on_a_roster_across_featurenet_upgrade_2`.
 fn fat_pointer_binding_scene(tf: &mut TF, network: Network) -> (Arc<Block>, Vec<Arc<Block>>) {
     let miner = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
-    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+    let mut gen = bonded_start(tf, network);
     let mut pow = vec![gen.tip.clone()];
-    for _ in 2..=6 {
+    for _ in 1..6 {
         pow.push(gen.next_block(&miner));
-    }
-    for block in &pow {
-        tf.push_instr_load_pow(block, 0);
+        tf.push_instr_load_pow(pow.last().unwrap(), 0);
     }
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
-    let bft0 = next_pos_at_round(pos_h, fat_ptr, &pow[1..4], 0, &[]);
-    tf.push_instr_load_pos(&bft0, 0);
-    let bft1 = next_pos_at_round(pos_h, fat_ptr, &pow[2..5], 0, &[]);
-    tf.push_instr_load_pos(&bft1, 0);
+    let bft0 = next_signed_pos_at_round(pos_h, fat_ptr, &pow[1..4], 0);
+    push_decided_pos(tf, &bft0, 0);
+    let bft1 = next_signed_pos_at_round(pos_h, fat_ptr, &pow[2..5], 0);
+    push_decided_pos(tf, &bft1, 0);
 
     gen.next_block(&miner);
     let honest = point_tip_at_bft(&mut gen, &bft1.0.fat_ptr);
@@ -473,16 +476,16 @@ fn fat_pointer_binding_scene(tf: &mut TF, network: Network) -> (Arc<Block>, Vec<
 #[test]
 fn crosslink_fat_pointer_changed_after_the_commitment_is_refused_from_featurenet_upgrade_2() {
     set_test_name(function_name!());
-    let (mut tf, network) = fat_pointer_binding_node(Some(4));
+    let (mut tf, network) = fat_pointer_binding_node(Some(FAT_POINTER_BINDING_UPGRADE));
     let (honest, tampered) = fat_pointer_binding_scene(&mut tf, network);
 
     tf.push_instr_load_pow(&honest, 0);
-    tf.push_instr_expect_pow_chain_length(8, 0);
+    tf.push_instr_expect_pow_chain_length(8 + BONDED_SHIFT, 0);
     tf.push_instr_expect_pow_tip(&honest.hash(), 0);
     for block in &tampered {
         tf.push_instr_load_pow(block, SHOULD_FAIL);
         tf.push_instr_expect_rejection_reason("InvalidChainHistoryBlockTxAuthCommitment", 0);
-        tf.push_instr_expect_pow_chain_length(8, 0);
+        tf.push_instr_expect_pow_chain_length(8 + BONDED_SHIFT, 0);
         tf.push_instr_expect_pow_tip(&honest.hash(), 0);
     }
     tf.push_instr_expect_node_alive(0);
@@ -500,10 +503,10 @@ fn crosslink_fat_pointer_changed_after_the_commitment_is_accepted_without_featur
     let (honest, tampered) = fat_pointer_binding_scene(&mut tf, network);
 
     tf.push_instr_load_pow(&honest, 0);
-    tf.push_instr_expect_pow_chain_length(8, 0);
+    tf.push_instr_expect_pow_chain_length(8 + BONDED_SHIFT, 0);
     for block in &tampered {
         tf.push_instr_load_pow(block, 0);
-        tf.push_instr_expect_pow_chain_length(8, 0);
+        tf.push_instr_expect_pow_chain_length(8 + BONDED_SHIFT, 0);
     }
     tf.push_instr_expect_node_alive(0);
 
@@ -545,19 +548,19 @@ fn crosslink_block_hashes_without_featurenet_upgrade_2_are_unchanged() {
 
 /// From FeaturenetUpgrade2 the node's own template carries a commitment over its pointer: the
 /// template's `blockcommitmentshash` is built with the pointer's digest, so the block mined from
-/// it unchanged commits. Its parent cites a BFT block with the one certificate the nil roster
-/// admits (see `fat_pointer_binding_scene`), so the mined block must cite one too (a pointer
-/// cannot revert to null), and its commitment therefore binds a real digest.
+/// it unchanged commits. Its parent cites a signed BFT decision (see `fat_pointer_binding_scene`),
+/// so the mined block must cite one too (a pointer cannot revert to null), and its commitment
+/// therefore binds a real digest.
 #[test]
 fn crosslink_template_commits_to_its_fat_pointer_from_featurenet_upgrade_2() {
     set_test_name(function_name!());
-    let (mut tf, network) = fat_pointer_binding_node(Some(4));
+    let (mut tf, network) = fat_pointer_binding_node(Some(FAT_POINTER_BINDING_UPGRADE));
     let (honest, _) = fat_pointer_binding_scene(&mut tf, network);
 
     tf.push_instr_load_pow(&honest, 0);
     tf.push_instr_mine_from_template_into(1, 0);
     tf.push_instr_expect_pow_tip_slot(1, 0);
-    tf.push_instr_expect_pow_chain_length(9, 0);
+    tf.push_instr_expect_pow_chain_length(9 + BONDED_SHIFT, 0);
     tf.push_instr_expect_node_alive(0);
 
     test_bytes(tf.write_to_bytes());
@@ -565,8 +568,7 @@ fn crosslink_template_commits_to_its_fat_pointer_from_featurenet_upgrade_2() {
 
 /// Rewrite the checked-in binaries in `crosslink-test-data` from the current block format.
 ///
-/// A tool rather than a test, so it is `#[ignore]`d like `read_from_file` and runs only when
-/// named. The checked-in files predate Ironwood v6: the PoS blocks no longer deserialize and
+/// A tool rather than a test, so it is `#[ignore]`d and runs only when named. The checked-in files predate Ironwood v6: the PoS blocks no longer deserialize and
 /// the PoW blocks carry pre-rework `hashBlockCommitments`.
 ///
 /// Two invariants the consumers depend on, neither obvious from the data itself:
@@ -5070,8 +5072,39 @@ fn bonded_start(tf: &mut TF, network: Network) -> BlockGen {
     gen
 }
 
-/// As `next_pos_at_round`, with the certificate SUPPLIED_FINALIZERS sign. The genesis's is empty:
-/// its roster is the stake it finalizes, which no one voted with before it.
+/// The seeds of SUPPLIED_FINALIZERS in roster order, which is the order a certificate must list
+/// its signers in from FeaturenetUpgrade2 (`certificate_is_valid`); before it a pointer is checked
+/// by hash alone. Ordered by the node's own roster ordering on their equal bonds, so by key.
+/// Rewards can untie them: each payout's rounding remainder goes to the biggest bond, ties to the
+/// smaller key, so a decision whose snapshot is many payouts after bonding may rank them by stake
+/// instead. The node then refuses the certificate, so a scene that gets this wrong fails loudly.
+/// The order has to be right when the file is written: the certificate is embedded in every PoW
+/// header citing the decision, so it cannot be re-signed at load. Such a scene needs the stakes at
+/// the snapshot (as PayoutModel computes them), or bonds sized so every share divides evenly.
+fn supplied_finalizer_seeds_in_roster_order() -> Vec<String> {
+    let members: Vec<zcash_primitives::transaction::RosterMember> = SUPPLIED_FINALIZERS
+        .iter()
+        .map(|&k| zcash_primitives::transaction::RosterMember {
+            pub_key: synthetic_finalizer_pub_key(k.into()),
+            voting_power: SUPPLIED_STAKE,
+            ..Default::default()
+        })
+        .collect();
+    let roster = zebra_state::new_network::bft::tenderlink_roster_from_internal(&members, &Default::default());
+    roster
+        .iter()
+        .map(|member| {
+            let k = SUPPLIED_FINALIZERS
+                .into_iter()
+                .find(|&k| synthetic_finalizer_pub_key(k.into()) == member.pub_key.0)
+                .expect("the roster holds only SUPPLIED_FINALIZERS");
+            synthetic_finalizer_seed(k.into())
+        })
+        .collect()
+}
+
+/// As `next_pos_at_round`, with the certificate SUPPLIED_FINALIZERS sign, in roster order. The
+/// genesis's is empty: its roster is the stake it finalizes, which no one voted with before it.
 fn next_signed_pos_at_round(
     cur_bft_height: &mut u32,
     cur_fat_ptr: &mut FatPointerToBftBlock,
@@ -5082,7 +5115,7 @@ fn next_signed_pos_at_round(
     let bft = if *cur_bft_height == 0 {
         unsigned
     } else {
-        let seeds: Vec<String> = SUPPLIED_FINALIZERS.iter().map(|&k| synthetic_finalizer_seed(k.into())).collect();
+        let seeds = supplied_finalizer_seeds_in_roster_order();
         let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
         let fat_ptr = signed_fat_pointer(&unsigned.0.block, u64::from(*cur_bft_height), round, &seeds, &[0; 32]);
         BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block: unsigned.0.block, fat_ptr })
