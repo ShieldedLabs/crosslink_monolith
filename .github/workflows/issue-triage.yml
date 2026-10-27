@@ -48,12 +48,11 @@ jobs:
         1. Check the issue's main claims against the code.
         2. Look for a duplicate in triage_input/issues.txt, and in reviews/, the security review findings indexed by reviews/REVIEW_STATUS.md.
         3. Look for a fix already on dev: start with the git log for commits whose message mentions the issue number, then the code the issue names.
-        4. Rate the issue as reported, even if it is fixed on dev. Severity measures the harm a defect does, so a planned task, missing feature, design question or chore gets none rather than a guess:
-           - sev:critical: exploitable now on the live featurenet to halt finality, split consensus, or lose or steal funds.
-           - sev:high: anyone, or ordinary use, can crash a node, corrupt its state, or block staking or sending with no workaround; or a security flaw that must be fixed before mainnet.
-           - sev:medium: a broken feature with a workaround, a misleading UI or error, or a weakness nobody can exploit.
-           - sev:low: cosmetic, docs or minor UX.
-           - none: not a defect.
+        4. Rate every issue, even if it is fixed on dev. A defect, including one a doc, TODO, review or issue title already treats as known or planned work (a stall, crash, fork, wrong result, or missing validation or security check in the code that runs now), is rated by the harm it does. Any other issue (a task, feature, design question or chore) is rated by how soon it must be done:
+           - sev:critical: a defect exploitable now on the live featurenet to halt finality, split consensus, or lose or steal funds; or work that the current featurenet or work in progress is stuck on.
+           - sev:high: a defect that lets anyone, or ordinary use, crash a node, corrupt its state, or block staking or sending with no workaround; a security flaw that must be fixed before mainnet; or work mainnet cannot launch without.
+           - sev:medium: a broken feature with a workaround, a misleading UI or error, or a weakness nobody can exploit; or work that clearly helps node operators, testers or developers and belongs in an upcoming release.
+           - sev:low: a cosmetic, docs or minor UX defect; or a nice-to-have, long-term idea, or open question that nothing is waiting on.
         5. Give the reason in one or two plain sentences, with no links and no @-mentions.
 
         Leave duplicate_issue at 0, duplicate_review empty and fixed_by empty when there is none. duplicate_review is a review finding ID such as K5 or C7.1; fixed_by holds commit hashes.
@@ -61,7 +60,7 @@ jobs:
         {"type": "object", "additionalProperties": false,
         "required": ["severity", "area", "reason", "duplicate_issue", "duplicate_review", "fixed_by"],
         "properties": {
-        "severity": {"type": "string", "enum": ["sev:critical", "sev:high", "sev:medium", "sev:low", "none"]},
+        "severity": {"type": "string", "enum": ["sev:critical", "sev:high", "sev:medium", "sev:low"]},
         "area": {"type": "string", "enum": ["App", "BFT", "BFT/networking", "Bonds", "Database", "Featurenet", "Fees", "Finalizer UX", "Infra", "Mining", "Networking", "PoW sync", "RPC", "Reward", "Slashing", "Staking", "Staking TX", "Sync", "Testing", "UI", "Visualization", "Wallet", "Wallet CLI"]},
         "reason": {"type": "string", "maxLength": 400},
         "duplicate_issue": {"type": "integer", "minimum": 0},
@@ -316,7 +315,7 @@ jobs:
           else
             set_option Area "$(jq -r .area <<<"$OUT")"
           fi
-          if [ -z "$(jq -r '.urgency.text // empty' <<<"$node")" ] && [ "$(jq -r .severity <<<"$OUT")" != none ]; then
+          if [ -z "$(jq -r '.urgency.text // empty' <<<"$node")" ]; then
             urgency=$(jq -r '.severity + ": " + (.reason | gsub("\\s+"; " ") | .[:200])' <<<"$OUT")
             gh api graphql --silent -f project="$PROJECT_ID" -f item="$item" -f field="$(fid Urgency)" -f text="$urgency" \
               -f query='mutation($project: ID!, $item: ID!, $field: ID!, $text: String!) { updateProjectV2ItemFieldValue(input: { projectId: $project, itemId: $item, fieldId: $field, value: { text: $text } }) { clientMutationId } }'
@@ -333,7 +332,7 @@ jobs:
           if [ -z "$OUT" ]; then echo "Triage returned nothing."; exit 0; fi
 
           sev=$(jq -r .severity <<<"$OUT")
-          case "$sev" in sev:critical|sev:high|sev:medium|sev:low|none) ;; *) echo "Unexpected severity."; exit 1 ;; esac
+          case "$sev" in sev:critical|sev:high|sev:medium|sev:low) ;; *) echo "Unexpected severity."; exit 1 ;; esac
           area=$(jq -r .area <<<"$OUT")
           [[ "$area" =~ ^[A-Za-z/\ ]{1,30}$ ]] || area="unknown"
           [[ "$ENGINE" =~ ^[A-Za-z0-9.\ -]{1,40}$ ]] || ENGINE="a model"
@@ -353,8 +352,7 @@ jobs:
           done
 
           declare -A color=([sev:critical]=b60205 [sev:high]=d93f0b [sev:medium]=fbca04 [sev:low]=0e8a16 [duplicate]=cfd3d7)
-          labels=()
-          if [ "$sev" != none ]; then labels+=("$sev"); fi
+          labels=("$sev")
           if [ "$dup" != 0 ]; then labels+=(duplicate); fi
           args=()
           for l in "${labels[@]}"; do
@@ -366,7 +364,7 @@ jobs:
           done
           if [ ${#args[@]} -gt 0 ]; then gh issue edit "$ISSUE" "${args[@]}"; fi
 
-          if [ "$sev" = none ]; then rating="**no severity**"; else rating="**$sev**"; fi
+          rating="**$sev**"
           if [ -z "$KEPT_AREA" ]; then rating="$rating, area **$area**"; fi
           {
             echo "Automated triage by $ENGINE: $rating. $reason"
@@ -376,4 +374,11 @@ jobs:
             echo
             echo "A maintainer will review this."
           } > "$RUNNER_TEMP/comment.md"
-          gh issue comment "$ISSUE" --body-file "$RUNNER_TEMP/comment.md"
+          # A rerun replaces its earlier verdict rather than stacking a second comment.
+          old=$(gh api "repos/$GH_REPO/issues/$ISSUE/comments" --paginate \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("Automated triage by"))) | .id' | tail -1)
+          if [ -n "$old" ]; then
+            gh api --method PATCH "repos/$GH_REPO/issues/comments/$old" -F body=@"$RUNNER_TEMP/comment.md" --silent
+          else
+            gh issue comment "$ISSUE" --body-file "$RUNNER_TEMP/comment.md"
+          fi
