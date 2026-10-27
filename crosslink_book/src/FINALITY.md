@@ -739,7 +739,9 @@ reorganizations).
   on the heavier branch while `fin` is below the fork point, switches it to the decided branch
   once that branch has more work, and then has it refuse the other branch. The test
   `crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized_pow_chain`
-  delivers a heavier branch after `fin` has passed the fork point, and the node refuses it.
+  delivers a heavier branch after `fin` has passed the fork point, and the node refuses it. No
+  test runs a node more than `MAX_BLOCK_REORG_HEIGHT` blocks past the fork point on the heavier
+  branch, so dropping BFT in that case is untested.
 
 ## 5. Current tree: implementation inventory
 
