@@ -103,13 +103,13 @@ pub fn bft_value_id(value: &[u8]) -> [u8; 32] {
 /// The finalizer that proposes at `height` and `round` when the roster is `members` (finalizer
 /// key, stake), by the node's own roster ordering and proposer choice. For writing a scenario
 /// that has to know who proposes before the node runs.
-pub fn bft_proposer(members: &[([u8; 32], u64)], height: u64, round: u32) -> Option<[u8; 32]> {
+pub fn bft_proposer(members: &[([u8; 32], u64)], active_roster_max_n: usize, height: u64, round: u32) -> Option<[u8; 32]> {
     let members: Vec<zcash_primitives::transaction::RosterMember> = members
         .iter()
         .map(|&(pub_key, voting_power)| zcash_primitives::transaction::RosterMember { pub_key, voting_power, ..Default::default() })
         .collect();
     let roster = zebra_state::new_network::bft::tenderlink_roster_from_internal(&members, &Default::default());
-    let proposer_i = tenderlink::proposer_index(&HashKeys::default(), &roster, height, round)?;
+    let proposer_i = tenderlink::proposer_index(&HashKeys::default(), &roster, active_roster_max_n, height, round)?;
     Some(roster[proposer_i].pub_key.0)
 }
 
@@ -337,8 +337,8 @@ impl TFInstr {
             },
             Some(TestInstr::SetParams(params)) => {
                 str += &format!(
-                    "{} {:?}",
-                    params.bc_confirmation_depth_sigma, params.bootstrap
+                    "{} {:?}, roster {}",
+                    params.bc_confirmation_depth_sigma, params.bootstrap, params.active_roster_max_n
                 )
             }
             Some(TestInstr::ExpectPoWChainLength(h)) => str += &h.to_string(),
@@ -533,12 +533,13 @@ impl TF {
             bc_confirmation_depth_sigma,
             bootstrap,
             staking,
+            active_roster_max_n,
         } = *params;
         tf.push_instr_ex(
             TFInstr::SET_PARAMS,
             0,
             &params_to_bytes(bootstrap, staking, node_config),
-            [bc_confirmation_depth_sigma, 0],
+            [bc_confirmation_depth_sigma, u64::try_from(active_roster_max_n).expect("a roster cap fits in a u64")],
         );
 
         tf
@@ -986,8 +987,8 @@ fn check_ingest(flags: u32, label: &str, outcome: Result<zebra_state::new_networ
 use crate::*;
 
 /// Parameters for scenarios that feed BFT blocks in directly, which is every scenario that is not
-/// testing the bootstrap itself. A file with no `SET_PARAMS` is read as these: every scenario was
-/// written that way before the bootstrap became a parameter.
+/// testing the bootstrap itself: the prototype's, with the fields those scenes are built around
+/// set here. A file with no `SET_PARAMS` is read as `PROTOTYPE_PARAMETERS`, not these.
 pub const HARNESS_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParameters {
     bootstrap: BftBootstrap::Supplied,
     // Sigma is pinned here rather than inherited from `PROTOTYPE_PARAMETERS`. The
@@ -1001,6 +1002,7 @@ pub const HARNESS_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParameter
     // Pinned for the same reason as sigma: the staking scenes are built at heights chosen for
     // this calendar. A scenario that wants a short one uses `short_staking`.
     staking: PROTOTYPE_STAKING,
+    ..PROTOTYPE_PARAMETERS
 };
 
 /// The shortest staking calendar a scenario on `params` can use and still mean what it would on
@@ -1053,8 +1055,9 @@ fn short_calendar(params: &ZcashCrosslinkParameters) -> StakingParameters {
 // only when it isn't the prototype's, and data that ends after the bootstrap is read as the
 // prototype calendar, so files from before the calendar was a parameter, and every file that
 // keeps the prototype calendar, stay byte-identical.
-// `val[1]` is written as zero and never read: it used to carry the Book's `L`, which Zebra
-// Crosslink does not have.
+// `val[1]` is the active roster cap, always written. Files from before the cap was a parameter
+// hold 0 there, read as the prototype's cap. Long before that it carried the Book's `L`, which
+// Zebra Crosslink does not have; no file in the test data still does.
 const TF_BOOTSTRAP_SUPPLIED: u8 = 0;
 const TF_BOOTSTRAP_FROM_CHAIN: u8 = 1;
 
@@ -1140,23 +1143,23 @@ pub fn node_config_for_test(bytes: &[u8]) -> String {
 }
 
 /// The Crosslink parameters a test file's node must run with: its leading `SET_PARAMS`, or
-/// [`HARNESS_PARAMETERS`] if it has none. They are consensus parameters, so the harness builds the
+/// [`PROTOTYPE_PARAMETERS`] if it has none. They are consensus parameters, so the harness builds the
 /// network with them before the node boots instead of applying them when the instruction runs.
 pub fn crosslink_parameters_for_test(bytes: &[u8]) -> ZcashCrosslinkParameters {
     let Ok(tf) = TF::read_from_bytes(bytes) else {
-        return HARNESS_PARAMETERS;
+        return PROTOTYPE_PARAMETERS;
     };
     let Some(first) = tf.instrs.first() else {
-        return HARNESS_PARAMETERS;
+        return PROTOTYPE_PARAMETERS;
     };
     if first.kind != TFInstr::SET_PARAMS {
-        return HARNESS_PARAMETERS;
+        return PROTOTYPE_PARAMETERS;
     }
     // A malformed SET_PARAMS falls back here, then fails loudly when the instruction is read.
     if let Some(TestInstr::SetParams(params)) = tf_read_instr(bytes, first) {
         params
     } else {
-        HARNESS_PARAMETERS
+        PROTOTYPE_PARAMETERS
     }
 }
 
@@ -1179,10 +1182,15 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
 
         TFInstr::SET_PARAMS => {
             let (bootstrap, staking, _node_config) = params_from_bytes(instr.data_slice(bytes), file_version(bytes))?;
+            let active_roster_max_n = match instr.val[1] {
+                0 => PROTOTYPE_PARAMETERS.active_roster_max_n,
+                n => usize::try_from(n).ok()?,
+            };
             Some(TestInstr::SetParams(ZcashCrosslinkParameters {
                 bc_confirmation_depth_sigma: instr.val[0],
                 bootstrap,
                 staking,
+                active_roster_max_n,
             }))
         }
 
@@ -2188,7 +2196,7 @@ fn node_roster_index(internal_handle: &TFLServiceHandle, view: &tenderlink::Engi
 }
 
 fn view_proposer(view: &tenderlink::EngineView, height: u64, round: u32) -> Option<usize> {
-    tenderlink::proposer_index(&view.hash_keys, &view.roster, height, round)
+    tenderlink::proposer_index(&view.hash_keys, &view.roster, view.active_roster_max_n, height, round)
 }
 
 /// The id of the proposal the node sent at `height` and `round`, when it was that round's proposer.
@@ -2708,6 +2716,53 @@ mod tests {
         assert_eq!(params_from_bytes(&[TF_BOOTSTRAP_SUPPLIED], 0), Some((BftBootstrap::Supplied, PROTOTYPE_STAKING, String::new())));
         assert_eq!(params_from_bytes(&[TF_BOOTSTRAP_SUPPLIED], 1), None);
         assert_eq!(params_to_bytes(BftBootstrap::Supplied, PROTOTYPE_STAKING, "").len(), 1 + 12);
+    }
+
+    /// The roster cap rides in SET_PARAMS `val[1]`; a file from before it did holds 0 there, read
+    /// as the prototype's cap.
+    #[test]
+    fn set_params_carries_the_roster_cap() {
+        let read = |params: &ZcashCrosslinkParameters| {
+            let bytes = TF::new(params).write_to_bytes();
+            let tf = TF::read_from_bytes(&bytes).expect("a written file reads");
+            (tf.instrs[0].val[1], crosslink_parameters_for_test(&bytes))
+        };
+        let prototype_cap = u64::try_from(PROTOTYPE_PARAMETERS.active_roster_max_n).expect("a roster cap fits in a u64");
+        assert_eq!(read(&HARNESS_PARAMETERS), (prototype_cap, HARNESS_PARAMETERS));
+        let four = ZcashCrosslinkParameters { active_roster_max_n: 4, ..HARNESS_PARAMETERS };
+        assert_eq!(read(&four), (4, four));
+
+        let mut legacy = TF::new(&four);
+        legacy.instrs[0].val[1] = 0;
+        assert_eq!(crosslink_parameters_for_test(&legacy.write_to_bytes()).active_roster_max_n, PROTOTYPE_PARAMETERS.active_roster_max_n);
+    }
+
+    /// Every committed test file names its parameters with a leading SET_PARAMS. A file without
+    /// one runs under the prototype's, which a file made for any other set would not mean.
+    #[test]
+    fn committed_test_files_name_their_parameters() {
+        fn files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("the test data directory reads") {
+                let path = entry.expect("a directory entry reads").path();
+                if path.is_dir() {
+                    files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "zeccltf") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        files(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../crosslink-test-data"), &mut paths);
+        assert!(!paths.is_empty(), "found the committed test files");
+        let mut problems = Vec::new();
+        for path in paths {
+            let bytes = std::fs::read(&path).expect("a test file reads");
+            let Ok(tf) = TF::read_from_bytes(&bytes) else { continue };
+            if tf.instrs.first().map_or(true, |first| first.kind != TFInstr::SET_PARAMS) {
+                problems.push(format!("{}: no leading SET_PARAMS", path.display()));
+            }
+        }
+        assert!(problems.is_empty(), "{problems:#?}");
     }
 
     #[test]

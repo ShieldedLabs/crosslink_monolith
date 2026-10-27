@@ -269,6 +269,7 @@ where
             let now = zebra_debug_time::now();
             check::time_is_valid_at(&block.header, now, &height, &hash)
                 .map_err(VerifyBlockError::Time)?;
+            check::fat_pointer_fits_active_roster(&block.header, &network, &hash)?;
             let coinbase_tx = check::coinbase_is_first(&block)?;
 
             let expected_block_subsidy =

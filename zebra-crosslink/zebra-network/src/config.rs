@@ -649,6 +649,7 @@ struct DCrosslinkParameters {
     staking_period: Option<u32>,
     staking_day_window: Option<u32>,
     staking_action_delay: Option<u32>,
+    active_roster_max_n: Option<usize>,
 }
 
 impl DCrosslinkParameters {
@@ -676,6 +677,7 @@ impl DCrosslinkParameters {
                 day_window: self.staking_day_window.unwrap_or(prototype.staking.day_window),
                 action_delay: self.staking_action_delay.unwrap_or(prototype.staking.action_delay),
             },
+            active_roster_max_n: self.active_roster_max_n.unwrap_or(prototype.active_roster_max_n),
         }
     }
 }
@@ -693,6 +695,9 @@ impl From<ZcashCrosslinkParameters> for DCrosslinkParameters {
             staking_period: staking.map(|s| s.period),
             staking_day_window: staking.map(|s| s.day_window),
             staking_action_delay: staking.map(|s| s.action_delay),
+            // Likewise written only when it differs from the prototype's.
+            active_roster_max_n: (params.active_roster_max_n != PROTOTYPE_PARAMETERS.active_roster_max_n)
+                .then_some(params.active_roster_max_n),
         }
     }
 }

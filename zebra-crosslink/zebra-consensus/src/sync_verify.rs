@@ -117,6 +117,8 @@ pub fn block_check_header(
 
     check::time_is_valid_at(header, now, &alleged_height, &hash).map_err(VerifyBlockError::Time)?;
 
+    check::fat_pointer_fits_active_roster(header, network, &hash).map_err(VerifyBlockError::from)?;
+
     Ok(())
 }
 

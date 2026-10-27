@@ -96,4 +96,8 @@ pub enum ParametersBuilderError {
     #[error("the staking calendar needs 0 < day window <= period and an action delay longer than the day window")]
     #[non_exhaustive]
     InvalidStakingParameters,
+
+    #[error("the active roster cap needs at least one seat and at most FAT_POINTER_SIGNATURES_MAX")]
+    #[non_exhaustive]
+    InvalidActiveRoster,
 }

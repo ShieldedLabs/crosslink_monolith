@@ -465,6 +465,13 @@ pub struct ZcashCrosslinkParameters {
 
     /// When staking actions may land, and how far apart.
     pub staking: StakingParameters,
+
+    /// The active BFT roster is the top this-many finalizers by stake (ties broken by public
+    /// key, larger first). Tenderlink votes with exactly this set, and PoS issuance credits
+    /// commission only to finalizers inside it, so a bond pointed at a key outside the roster
+    /// never opens a reward bank. At most [`FAT_POINTER_SIGNATURES_MAX`], the bound fat
+    /// pointers are parsed under.
+    pub active_roster_max_n: usize,
 }
 
 /// The staking calendar of a network.
@@ -535,6 +542,12 @@ impl ZcashCrosslinkParameters {
             BftBootstrap::Supplied => true,
         }
     }
+
+    /// Whether the active roster cap is one a fat pointer can carry: at least one seat, and no
+    /// more than a fat pointer may hold signatures.
+    pub const fn active_roster_is_valid(&self) -> bool {
+        self.active_roster_max_n > 0 && self.active_roster_max_n <= FAT_POINTER_SIGNATURES_MAX
+    }
 }
 
 /// Crosslink parameters chosed for prototyping / testing
@@ -552,7 +565,9 @@ pub const PROTOTYPE_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParamet
         activation_height: 7 * crate::transaction::STAKING_PERIOD / 2,
     },
     staking: PROTOTYPE_STAKING,
+    active_roster_max_n: 12,
 };
+const _: () = assert!(PROTOTYPE_PARAMETERS.active_roster_is_valid(), "the prototype roster cap must fit a fat pointer");
 const _: () = assert!(
     PROTOTYPE_PARAMETERS.bootstrap_is_valid(),
     "h0 must start a staking day, h1 must not precede it, and the roster block must be below the reorg limit when any activation-height block is accepted"
@@ -877,11 +892,12 @@ impl FinalizerAddress {
     }
 }
 
-/// The active BFT roster is the top this-many finalizers by stake (ties broken by public
-/// key, larger first). Tenderlink votes with exactly this set, and PoS issuance credits
-/// commission only to finalizers inside it, so a bond pointed at a key outside the roster
-/// never opens a reward bank.
-pub const ACTIVE_ROSTER_MAX_N: usize = 12;
+/// The most signatures a fat pointer is parsed with. Parsing has no network to read the roster
+/// cap from, so this is a fixed allocation bound, as `MAX_BLOCK_BYTES` is for blocks: a length
+/// read off the wire is checked against it before anything is reserved. That a fat pointer has
+/// no more signatures than its network's active roster is a consensus rule, checked where the
+/// network is known (the PoW header check, and BFT validation).
+pub const FAT_POINTER_SIGNATURES_MAX: usize = 256;
 
 /// Domain prefix of the message a finalizer signs to release reward-bank value into a
 /// bond (`StakingAction::ConvertFinalizerRewardToDelegationBond`).
@@ -1098,6 +1114,11 @@ impl FatPointerToBftBlock {
             .collect()
     }
 
+    /// Whether this pointer carries no more signatures than `params`' active roster has seats.
+    pub fn fits_active_roster(&self, params: &ZcashCrosslinkParameters) -> bool {
+        self.signatures.len() <= params.active_roster_max_n
+    }
+
     pub fn validate_signatures(&self, vote_namespace: &[u8; 32]) -> bool {
         // Only precommits certify a block. Prevotes for it sign the same bytes with the
         // precommit bit of the round clear, and would otherwise pass as a certificate.
@@ -1149,12 +1170,13 @@ impl FatPointerToBftBlock {
         reader.read_exact(&mut vote_for_block_without_finalizer_public_key)?;
 
         let len = reader.read_u16::<LittleEndian>()?;
-        // One signature per active roster member at most. Checked before allocating: len comes off
-        // the wire, and unchecked it would reserve up to 65535 * 96 bytes (~6 MiB).
-        if usize::from(len) > ACTIVE_ROSTER_MAX_N {
+        // Checked before allocating: len comes off the wire, and unchecked it would reserve up to
+        // 65535 * 96 bytes (~6 MiB). The network's own, smaller cap is a consensus rule checked
+        // where the network is known; see FAT_POINTER_SIGNATURES_MAX.
+        if usize::from(len) > FAT_POINTER_SIGNATURES_MAX {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "fat pointer signature count exceeds the active roster maximum",
+                "fat pointer signature count exceeds the most a fat pointer is parsed with",
             ));
         }
         let mut signatures: Vec<FatPointerSignature> = Vec::with_capacity(len.into());

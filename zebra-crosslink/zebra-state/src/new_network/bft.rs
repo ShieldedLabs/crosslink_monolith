@@ -26,7 +26,6 @@ use zcash_primitives::block::{
     BlockHash, BlockHeader as BcBlockHeaderWrap, BlockHeaderData as BcBlockHeader,
 };
 use zcash_primitives::transaction::RosterMember;
-use zcash_primitives::bft::ACTIVE_ROSTER_MAX_N;
 use zcash_protocol::consensus::{BranchId, NetworkUpgrade, Parameters as _};
 use zebra_chain::block::{Hash, Header, Height};
 use zebra_chain::parameters::Network;
@@ -95,7 +94,8 @@ pub struct BftChain {
 /// from is the stake at a snapshot a later reader may no longer hold.
 #[derive(Debug)]
 pub struct VotingRoster {
-    /// The active part of the roster, in roster order. Nobody past `ACTIVE_ROSTER_MAX_N` votes,
+    /// The active part of the roster, in roster order: at most the network's
+    /// `active_roster_max_n` members, cut when the roster is built. Nobody past them votes,
     /// and the whole roster is as long as the bond set.
     pub roster: Vec<SortedRosterMember>,
     pub vote_namespace: [u8; 32],
@@ -594,7 +594,7 @@ pub fn roster_for_bft_height(
     let roster = tenderlink_roster_from_internal(stakes, &terminated);
     let strict_quorum = strict_quorum_at(network, roster_snapshot_height);
     let voting = VotingRoster {
-        roster: roster[..roster.len().min(ACTIVE_ROSTER_MAX_N)].to_vec(),
+        roster: roster[..roster.len().min(network.crosslink_parameters().active_roster_max_n)].to_vec(),
         vote_namespace: namespace_for_bft_height(hardforks, bft_height, strict_quorum),
         strict_quorum,
     };
@@ -620,7 +620,7 @@ pub fn certificate_is_valid(fat_pointer: &FatPointerToBftBlock, bft_height: u64,
     if vote.height != bft_height || !vote.typ {
         return false;
     }
-    let active = &voting.roster[..voting.roster.len().min(ACTIVE_ROSTER_MAX_N)];
+    let active = &voting.roster[..];
     let total_stake: u64 = active.iter().map(|member| member.stake).sum();
     if total_stake == 0 {
         return fat_pointer.signatures.is_empty() && vote.round == 0;
@@ -698,6 +698,7 @@ fn decided_round_data(
     voting: &VotingRoster,
     proposal_sigs: Vec<TMSig>,
     bft_height: u64,
+    active_roster_max_n: usize,
 ) -> RoundData {
     let mut round_data = RoundData::EMPTY;
     round_data.msg_val_sigs = roster
@@ -729,6 +730,7 @@ fn decided_round_data(
     round_data.round = fat_pointer.get_vote_template().round as u32;
     round_data.vote_namespace = voting.vote_namespace;
     round_data.strict_quorum = voting.strict_quorum;
+    round_data.active_roster_max_n = active_roster_max_n;
     round_data
 }
 
@@ -1191,6 +1193,13 @@ impl BftRunner {
                     )));
                     return;
                 }
+                if !fat_pointer.fits_active_roster(&self.params) {
+                    let _ = reply.send(Err(format!(
+                        "the fat pointer has {} signatures, more than the {} seats of the active roster",
+                        fat_pointer.signatures.len(), self.params.active_roster_max_n,
+                    )));
+                    return;
+                }
                 let (status, reason) = {
                     let chain = BFT_CHAIN.read().unwrap();
                     self.validate(&chain, read_state, &block)
@@ -1389,6 +1398,15 @@ impl BftRunner {
 
     fn validate(&self, chain: &BftChain, read_state: &ReadState, new_block: &BftBlock) -> (TMStatus, TMStatusReason) {
         let fail = (TMStatus::Fail, TMStatusReason::None);
+
+        if !new_block.previous_block_fat_ptr.fits_active_roster(&self.params) {
+            tracing::warn!(
+                "Block's previous block fat pointer has {} signatures, more than the {} seats of the active roster",
+                new_block.previous_block_fat_ptr.signatures.len(),
+                self.params.active_roster_max_n,
+            );
+            return fail;
+        }
 
         if new_block.previous_block_fat_ptr.points_at_block_hash() != chain.fat_pointer_to_tip.points_at_block_hash() {
             tracing::warn!(
@@ -1906,7 +1924,7 @@ impl BftRunner {
                 }
             }
 
-            ingest.push(decided_round_data(&block, &fat_pointer, roster, &voting, proposal_sigs, this_bft_height));
+            ingest.push(decided_round_data(&block, &fat_pointer, roster, &voting, proposal_sigs, this_bft_height, self.params.active_roster_max_n));
             push_voting_roster(&mut voting_rosters, voting);
             blocks.push(block);
             fat_pointer_to_tip = fat_pointer;
@@ -2047,7 +2065,7 @@ impl BftRunner {
         };
         let PendingBootstrap { genesis, fat_pointer, .. } = self.pending_bootstrap.take().unwrap();
         let (genesis_roster, genesis_voting) = roster_for_bft_height(&self.network, self.hardforks.rules(), &[], 0, None);
-        let genesis_round = decided_round_data(&genesis, &fat_pointer, genesis_roster, &genesis_voting, Vec::new(), 0);
+        let genesis_round = decided_round_data(&genesis, &fat_pointer, genesis_roster, &genesis_voting, Vec::new(), 0, self.params.active_roster_max_n);
         self.spawn_tenderlink(roster, vec![genesis_round], vote_namespace, strict_quorum);
     }
 
@@ -2087,6 +2105,7 @@ impl BftRunner {
             Some(static_keypair),
             Some(endpoint),
             roster,
+            self.params.active_roster_max_n,
             finalizer_peer_addresses,
             None,
             tenderlink::ClosureToProposeNewBlock(Arc::new(move || {
@@ -2162,7 +2181,7 @@ fn recency_status_from(bft_state: &TMState, bft_key_address_map: &BftAddressMap)
     for round in &bft_state.rounds_data {
         let is_my_height = round.height == bft_state.height;
 
-        // The vote arrays are sized to the *active* roster (the top ACTIVE_ROSTER_MAX_N by
+        // The vote arrays are sized to the *active* roster (the top `active_roster_max_n` by
         // stake); members past that have no slot.
         let active_n = round.msg_val_sigs.len().min(round.msg_nil_sigs.len());
         for (roster_i, member) in round.roster.iter().take(active_n).enumerate() {

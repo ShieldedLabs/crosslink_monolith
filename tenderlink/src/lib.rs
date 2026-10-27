@@ -300,6 +300,10 @@ pub struct RoundData {
     /// Whether this height decides by the strict quorum rather than `2f+1` (see
     /// [`decision_threshold`]). Supplied per height like `vote_namespace`.
     pub strict_quorum: bool,
+    /// The network's roster cap: only the first this-many of `roster` vote. Copied from
+    /// [`TMState::active_roster_max_n`] at creation, or set by whoever builds ingest data. Zero
+    /// in `EMPTY`, so a builder that forgets it gets a round nobody votes in, not a guess.
+    pub active_roster_max_n: usize,
 }
 impl RoundData {
     pub const EMPTY: RoundData = RoundData {
@@ -323,6 +327,7 @@ impl RoundData {
         timeout_triggered: [false;2],
         vote_namespace: [0u8; 32],
         strict_quorum: false,
+        active_roster_max_n: 0,
     };
 
     fn has_full_proposal(&self) -> bool {
@@ -343,7 +348,7 @@ impl RoundData {
     /// Stake of the active roster that voted for exactly `value_id` in this step, whatever else the
     /// same finalizers signed.
     fn stake_voting_for(&self, is_precommit: usize, value_id: ValueId) -> u64 {
-        let roster_n = active_roster_len(&self.roster).min(self.msg_val_sigs.len());
+        let roster_n = active_roster_len(&self.roster, self.active_roster_max_n).min(self.msg_val_sigs.len());
         (0..roster_n).filter(|&i| {
             let (val_id, val_sig) = self.msg_val_sigs[i][is_precommit];
             let (other_id, other_sig) = self.other_vote(i, is_precommit);
@@ -376,7 +381,7 @@ impl RoundData {
 
     /// The decision quorum of the active roster's stake, as `bft_update` computes it.
     fn big_threshold(&self, roster: &[SortedRosterMember]) -> u64 {
-        let total: u64 = roster[..active_roster_len(roster)].iter().map(|m| m.stake).sum();
+        let total: u64 = roster[..active_roster_len(roster, self.active_roster_max_n)].iter().map(|m| m.stake).sum();
         decision_threshold(total, self.strict_quorum)
     }
 
@@ -454,7 +459,7 @@ impl RoundData {
     }
 
     fn flush_for_amnesiac_proposer(&mut self, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], proposal_size: u32) {
-        let roster_n = active_roster_len(roster);
+        let roster_n = active_roster_len(roster, self.active_roster_max_n);
         *self = RoundData {
             height:               self.height,
             round:                self.round,
@@ -468,6 +473,7 @@ impl RoundData {
             timeout_triggered:    self.timeout_triggered,
             vote_namespace:       self.vote_namespace, // current height's namespace
             strict_quorum:        self.strict_quorum,
+            active_roster_max_n:  self.active_roster_max_n,
             ..RoundData::EMPTY
         };
         self.proposal.0    = vec![0;          proposal_size as usize];
@@ -638,8 +644,8 @@ impl Timeout {
 }
 
 
-const ROSTER_MAX_N: usize = zcash_primitives::bft::ACTIVE_ROSTER_MAX_N;
-fn active_roster_len(roster: &[SortedRosterMember]) -> usize { usize::min(ROSTER_MAX_N, roster.len()) }
+/// How many of `roster` vote: the first `active_roster_max_n`, the network's roster cap.
+fn active_roster_len(roster: &[SortedRosterMember], active_roster_max_n: usize) -> usize { usize::min(active_roster_max_n, roster.len()) }
 fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
 
 // Tendermint line 28 needs 2f+1 prevotes for the value in the round the proposal cites, vr, not in the
@@ -654,7 +660,7 @@ fn has_prevote_certificate(rounds_data: &[RoundData], height: u64, round: u32, v
     let Ok(vr_i) = rounds_data.binary_search_by_key(&(height, vr), |el| (el.height, el.round)) else { return false; };
     let rd = &rounds_data[vr_i];
 
-    let roster_n = active_roster_len(&rd.roster);
+    let roster_n = active_roster_len(&rd.roster, rd.active_roster_max_n);
     let total_stake: u64 = rd.roster[..roster_n].iter().map(|m| m.stake).sum();
     if total_stake == 0 { return false; }
     let value_stake = rd.stake_voting_for(0, value_id);
@@ -698,6 +704,8 @@ pub struct TMState {
     /// externally per height (initial value at startup; updated from the decided-block closure's
     /// return when the height advances), and copied into each [`RoundData`] as rounds are created.
     pub vote_namespace: [u8; 32],
+    /// The network's roster cap: only the first this-many roster members vote.
+    pub active_roster_max_n: usize,
     /// Whether the current height decides by the strict quorum; supplied and copied as
     /// [`vote_namespace`](Self::vote_namespace) is.
     pub strict_quorum: bool,
@@ -728,7 +736,7 @@ pub struct TMState {
 
 impl TMState {
     fn init(
-        my_signing_key: SigningKey, my_pub_key: PubKeyID, my_port: u16,
+        my_signing_key: SigningKey, my_pub_key: PubKeyID, my_port: u16, active_roster_max_n: usize,
         propose_closure: ClosureToProposeNewBlock,
         validate_closure: ClosureToValidateProposedBlock,
         push_block_closure: ClosureToPushDecidedBlock,
@@ -744,6 +752,7 @@ impl TMState {
             step: TMStep::Propose,
             height: 0,
             vote_namespace: [0u8; 32],
+            active_roster_max_n,
             strict_quorum: false,
             valid_value_round: (None, -1), // TODO: is this actually protocol-relevant or just a cache?
             locked_value_round: (None, -1),
@@ -769,7 +778,7 @@ impl TMState {
         let height   = self.rounds_data[round_i].height;
         let round    = self.rounds_data[round_i].round;
         let ctx_str = self.ctx_str(roster);
-        let Some(roster_i) = roster_i_from_pub_key(&roster[..active_roster_len(roster)], self.my_pub_key) else {
+        let Some(roster_i) = roster_i_from_pub_key(&roster[..active_roster_len(roster, self.active_roster_max_n)], self.my_pub_key) else {
             eprintln!("{ctx_str} {ANSI_RED}BFT ERROR{ANSI_RST}: failed to find my own public key in the roster");
             return self.step;
         };
@@ -824,7 +833,7 @@ impl TMState {
     }
 
     /// Deterministic weighted round robin (hash & mod total zec on cumulative list)
-    fn proposer_from_height_round(hash_keys: &HashKeys, roster: &[SortedRosterMember], height: u64, round: u32) -> (Option<usize>, PubKeyID) {
+    fn proposer_from_height_round(hash_keys: &HashKeys, roster: &[SortedRosterMember], active_roster_max_n: usize, height: u64, round: u32) -> (Option<usize>, PubKeyID) {
         if roster.len() == 0 {
             eprintln!("{ANSI_RED}BFT ERROR{ANSI_RST}: trying to get proposer from empty roster");
             return (None, PubKeyID::NIL); // TODO: is a fixed value here exploitable? Presumably nobody can sign for it?
@@ -837,7 +846,7 @@ impl TMState {
         hash.as_bytes()[..8].write_to(&mut hash_stake_bytes);
         let hash_stake = u64::from_le_bytes(hash_stake_bytes);
 
-        let last_included_i = active_roster_len(roster) - 1;
+        let last_included_i = active_roster_len(roster, active_roster_max_n) - 1;
         let total_included_stake = roster[last_included_i].cumulative_stake;
         if total_included_stake == 0 {
             eprintln!("{ANSI_RED}BFT ERROR{ANSI_RST}: all roster members have no stake");
@@ -853,7 +862,7 @@ impl TMState {
     }
 
     fn insert_round(&mut self, insert_i: usize, round: u32, roster: &[SortedRosterMember]) -> usize {
-        let roster_n = active_roster_len(roster);
+        let roster_n = active_roster_len(roster, self.active_roster_max_n);
         self.rounds_data.insert(insert_i, RoundData {
             height: self.height,
             round,
@@ -863,6 +872,7 @@ impl TMState {
             roster: roster.to_vec(),
             vote_namespace: self.vote_namespace,
             strict_quorum: self.strict_quorum,
+            active_roster_max_n: self.active_roster_max_n,
             ..RoundData::EMPTY
         });
         insert_i
@@ -877,7 +887,7 @@ impl TMState {
             Err(round_i) => self.insert_round(round_i, round, roster)
         };
 
-        if Self::proposer_from_height_round(&self.hash_keys, roster, self.height, round).1 == self.my_pub_key {
+        if Self::proposer_from_height_round(&self.hash_keys, roster, self.active_roster_max_n, self.height, round).1 == self.my_pub_key {
             let ctx_str = self.ctx_str(roster);
             let proposal = if let Some(valid_value) = self.valid_value_round.0.clone() {
                 Some(valid_value)
@@ -920,7 +930,7 @@ impl TMState {
         }
 
         // check if in (active) roster
-        if roster_i >= active_roster_len(roster) {
+        if roster_i >= active_roster_len(roster, self.active_roster_max_n) {
             let ctx_str  = self.ctx_str(roster);
             let pkt_str = format!("{:20} {}.{}.{}", packet_name_from_tag(packet_type), height, round, chunk_i);
             eprintln!("{ctx_str} ({}): {ANSI_RED}BFT FAULT{ANSI_RST}: {} is not in the active roster.", pkt_str, roster_i);
@@ -982,7 +992,7 @@ impl TMState {
                 let is_vote      = packet_type == PACKET_TYPE_PREVOTE_SIGNATURES || packet_type == PACKET_TYPE_PRECOMMIT_SIGNATURES;
                 let is_precommit = packet_type == PACKET_TYPE_PRECOMMIT_SIGNATURES;
                 let variant      = (value_id != ValueId::NIL) as usize;
-                let actual = (0..active_roster_len(roster)).find(|&i| {
+                let actual = (0..active_roster_len(roster, self.active_roster_max_n)).find(|&i| {
                     if is_vote {
                         let sd = make_vote_sign_datas(roster[i].pub_key, is_precommit, height, round, value_id);
                         sig.verify_with_namespace(roster[i].pub_key, &sd[variant], &self.vote_namespace).is_ok()
@@ -1296,7 +1306,7 @@ impl TMState {
 
         let now = zebra_debug_time::instant_now();
         let mut total_active_stake = 0;
-        for i in 0..active_roster_len(roster) {
+        for i in 0..active_roster_len(roster, self.active_roster_max_n) {
             total_active_stake += roster[i].stake;
         }
         let total_active_stake = total_active_stake;
@@ -1316,7 +1326,7 @@ impl TMState {
         let current_height_start_i = self.rounds_data.binary_search_by_key(&(self.height, 0), |el| (el.height, el.round)).unwrap_or(0);
 
         for i in current_height_start_i..self.rounds_data.len() {
-            let on_roster = roster_i_from_pub_key(&roster[..active_roster_len(roster)], self.my_pub_key).is_some();
+            let on_roster = roster_i_from_pub_key(&roster[..active_roster_len(roster, self.active_roster_max_n)], self.my_pub_key).is_some();
             self.rounds_data[i].settle_faulty_if_certified(roster, &self.hash_keys, &ctx_str);
             let counts = self.rounds_data[i].counts.clone();
             let has_enough_info_to_determine_validity = self.rounds_data[i].has_enough_info_to_determine_validity();
@@ -1702,7 +1712,7 @@ async fn instance(
     let roster2 = roster.clone();
     let pub_key = PubKeyID(VerificationKeyBytes::from(&my_root_private_key.clone()).into());
 
-    entry_point(my_root_private_key, my_stp_keypair, my_endpoint, roster, finalizer_peer_addresses, maybe_seed,
+    entry_point(my_root_private_key, my_stp_keypair, my_endpoint, roster, zcash_primitives::bft::PROTOTYPE_PARAMETERS.active_roster_max_n, finalizer_peer_addresses, maybe_seed,
         ClosureToProposeNewBlock(Arc::new(move || {
             let block_rng = Arc::clone(&block_rng);
             Box::pin(async move {
@@ -1882,6 +1892,7 @@ pub struct EngineView {
     pub step: TMStep,
     pub vote_namespace: [u8; 32],
     pub roster: Vec<SortedRosterMember>,
+    pub active_roster_max_n: usize,
     pub hash_keys: HashKeys,
 }
 
@@ -1895,6 +1906,7 @@ impl Clone for EngineView {
             step: self.step,
             vote_namespace: self.vote_namespace,
             roster: self.roster.clone(),
+            active_roster_max_n: self.active_roster_max_n,
             hash_keys: HashKeys { proposer: hk.proposer, value_id: hk.value_id, connect_contention: hk.connect_contention, proposal_sig: hk.proposal_sig },
         }
     }
@@ -1918,6 +1930,7 @@ fn publish_engine_view(bft_state: &TMState, roster: &[SortedRosterMember]) {
         step: bft_state.step,
         vote_namespace: bft_state.vote_namespace,
         roster: roster.to_vec(),
+        active_roster_max_n: bft_state.active_roster_max_n,
         hash_keys: HashKeys { proposer: hk.proposer, value_id: hk.value_id, connect_contention: hk.connect_contention, proposal_sig: hk.proposal_sig },
     });
 }
@@ -1928,8 +1941,8 @@ pub fn engine_view() -> Option<EngineView> {
 }
 
 /// The roster index of the proposer for `height` and `round`, as the engine picks it.
-pub fn proposer_index(hash_keys: &HashKeys, roster: &[SortedRosterMember], height: u64, round: u32) -> Option<usize> {
-    TMState::proposer_from_height_round(hash_keys, roster, height, round).0
+pub fn proposer_index(hash_keys: &HashKeys, roster: &[SortedRosterMember], active_roster_max_n: usize, height: u64, round: u32) -> Option<usize> {
+    TMState::proposer_from_height_round(hash_keys, roster, active_roster_max_n, height, round).0
 }
 
 /// The id a proposal of `value` goes by.
@@ -2078,6 +2091,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          my_stp_keypair: Option<IdentityKeyPair>,
                          my_endpoint: Option<STPAddress>,
                          roster: Vec<SortedRosterMember>,
+                         // The network's roster cap: only the first this-many members vote.
+                         active_roster_max_n: usize,
                          finalizer_peer_addresses: Vec<FinalizerPeerAddress>,
                          maybe_seed: Option<u128>,
                          propose_closure: ClosureToProposeNewBlock,
@@ -2152,6 +2167,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         my_root_private_key,
         PubKeyID(my_root_public_bft_key.into()),
         my_port,
+        active_roster_max_n,
         propose_closure,
         validate_closure,
         push_block_closure,
@@ -2232,7 +2248,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     height: bft_state.height,
                     round: bft_state.round,
                     need_proposal_chunk_rngs: [[0, 0]],
-                    need_vote_rngs: [[[0, active_roster_len(roster) as u16]]; 2],
+                    need_vote_rngs: [[[0, active_roster_len(roster, bft_state.active_roster_max_n) as u16]]; 2],
                 };
 
 
@@ -2257,7 +2273,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     if PRINT_RNGS { println!("{ctx_str} {ANSI_GRY}RNGS{ANSI_RST}: request proposal  chunks {:?} from {:?}", status.need_proposal_chunk_rngs, proposal_chunk_rngs); }
 
                     for is_precommit in 0..2 {
-                        let vote_rngs = gen_mostly_empty_rngs(active_roster_len(roster), |i| round_data.msg_val_sigs[i][is_precommit].1 == TMSig::NIL);
+                        let vote_rngs = gen_mostly_empty_rngs(active_roster_len(roster, bft_state.active_roster_max_n), |i| round_data.msg_val_sigs[i][is_precommit].1 == TMSig::NIL);
                         if vote_rngs.len() > 0 {
                             let mut random_i = peer_random;
                             for dst_rng in &mut status.need_vote_rngs[is_precommit] {
@@ -2348,7 +2364,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         send_stp_msg(messages_to_send, connection_key, &send_buf1[..o], stats);
                     }
 
-                    let (_, proposer_pub_key) = TMState::proposer_from_height_round(&bft_state.hash_keys, &round_data.roster, height, round);
+                    let (_, proposer_pub_key) = TMState::proposer_from_height_round(&bft_state.hash_keys, &round_data.roster, round_data.active_roster_max_n, height, round);
 
                     let mut sent_chunk_cs = 0;
                     let mut sent_c: [usize; 2] = [0; 2];
@@ -2522,7 +2538,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                                 peer_bft_key,
                                                 &mut net_stats);
                     }
-                    else if roster_i_from_pub_key(&roster[..active_roster_len(&roster)], peer_bft_key).is_some() {
+                    else if roster_i_from_pub_key(&roster[..active_roster_len(&roster, bft_state.active_roster_max_n)], peer_bft_key).is_some() {
                         if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
                         {
                             for round_i in (current_height_start_i..bft_state.rounds_data.len()).rev()
@@ -2672,7 +2688,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 // in healthy operation, so it can stay on permanently.
                 {
                     let mut total_active_stake = 0;
-                    for i in 0..active_roster_len(&roster) { total_active_stake += roster[i].stake; }
+                    for i in 0..active_roster_len(&roster, bft_state.active_roster_max_n) { total_active_stake += roster[i].stake; }
                     if total_active_stake > 0 {
                         let f = TMState::f_from_n(total_active_stake);
                         let big_threshold = decision_threshold(total_active_stake, bft_state.strict_quorum);
@@ -2680,7 +2696,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             // Per-member vote fill, one char per active roster index:
                             // C yes-precommit (counts toward yc), o precommit for another value, n nil-precommit,
                             // p prevote only, . silent.
-                            let n = active_roster_len(&rd.roster).min(rd.msg_val_sigs.len());
+                            let n = active_roster_len(&rd.roster, rd.active_roster_max_n).min(rd.msg_val_sigs.len());
                             let fill: String = (0..n).map(|i| {
                                 if      rd.msg_val_sigs[i][1].1 != TMSig::NIL {
                                     if rd.proposal_id == ValueId::NIL || rd.msg_val_sigs[i][1].0 == rd.proposal_id { 'C' } else { 'o' }
@@ -2839,7 +2855,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 // NOTE: assume for the moment that this is the valid height, we'll check in the subsequent call
                 // ALT:  cache proposer for *current* round
                 if msg.len() == packet_size {
-                    if let (Some(roster_i), _) = TMState::proposer_from_height_round(&bft_state.hash_keys, &roster, hdr.height, hdr.round) {
+                    if let (Some(roster_i), _) = TMState::proposer_from_height_round(&bft_state.hash_keys, &roster, bft_state.active_roster_max_n, hdr.height, hdr.round) {
                         let sig_o = read_o + PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
                         bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
                             &roster, roster_i, packet_type, &msg[read_o..sig_o], TMSig(msg[sig_o..sig_o+64].try_into().unwrap()));
@@ -3759,6 +3775,10 @@ use helpers::*;
 mod tests {
     use super::*;
 
+    /// The roster cap these tests run under: the prototype's, as every network uses unless it says
+    /// otherwise.
+    const ROSTER_MAX_N: usize = zcash_primitives::bft::PROTOTYPE_PARAMETERS.active_roster_max_n;
+
     /// Restored signatures are over the legacy application format, not the active STP MTU.
     /// Exercise the production sender serializer and receiver authentication through real Pumps.
     #[test]
@@ -3862,7 +3882,7 @@ mod tests {
         let pub_key = PubKeyID(VerificationKeyBytes::from(&key).into());
         let roster = [SortedRosterMember { pub_key, stake: 1, cumulative_stake: 1 }];
         let mut state = TMState::init(
-            key, pub_key, 0,
+            key, pub_key, 0, ROSTER_MAX_N,
             ClosureToProposeNewBlock(Arc::new(|| Box::pin(async { None }))),
             ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
             ClosureToPushDecidedBlock(Arc::new(|_, _, _| Box::pin(async { (Vec::new(), [0; 32], false) }))),
@@ -4043,7 +4063,7 @@ mod tests {
             pub_key: PubKeyID(VerificationKeyBytes::from(k).into()), stake: 1, cumulative_stake: i as u64 + 1 }).collect();
         let me = ROSTER_N / 2;
         let mut state = TMState::init(
-            keys[me].clone(), roster[me].pub_key, 0,
+            keys[me].clone(), roster[me].pub_key, 0, ROSTER_MAX_N,
             ClosureToProposeNewBlock(Arc::new(|| Box::pin(async { None }))),
             ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
             ClosureToPushDecidedBlock(Arc::new(|_, _, _| Box::pin(async { (Vec::new(), [0; 32], false) }))),
@@ -4145,12 +4165,13 @@ mod tests {
     fn line28_round(round: u32, stakes: &[u64]) -> RoundData {
         let roster: Vec<SortedRosterMember> = stakes.iter().enumerate().map(|(i, &stake)| SortedRosterMember {
             pub_key: PubKeyID([i as u8 + 1; 32]), stake, cumulative_stake: stakes[..=i].iter().sum() }).collect();
-        let roster_n = active_roster_len(&roster);
+        let roster_n = active_roster_len(&roster, ROSTER_MAX_N);
         RoundData {
             height: 0, round,
             msg_val_sigs: vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n],
             msg_nil_sigs: vec![[TMSig::NIL; 2]; roster_n],
             roster,
+            active_roster_max_n: ROSTER_MAX_N,
             ..RoundData::EMPTY
         }
     }
@@ -4241,16 +4262,19 @@ mod tests {
 
     #[test]
     fn line28_inactive_roster_members_ignored() {
-        // The first ROSTER_MAX_N members are active with stake 1 each (f = 33, threshold 67); one more,
-        // inactive, carries enough stake to outvote them all and has a vote slot anyway.
+        // The first ROSTER_MAX_N members are active with stake 1 each; one more, inactive, carries
+        // enough stake to outvote them all and has a vote slot anyway. One active vote short of the
+        // quorum is no certificate, the quorum is one, whatever the cap and the round's quorum rule.
         let mut stakes = vec![1u64; ROSTER_MAX_N];
         stakes.push(1000);
         let mut rounds = vec![line28_round(1, &stakes)];
         rounds[0].msg_val_sigs.push([(LINE28_V, LINE28_SIG), (ValueId::NIL, TMSig::NIL)]);
-        let voters: Vec<usize> = (0..66).collect();
+        let active_stake = u64::try_from(ROSTER_MAX_N).expect("a roster cap fits in a u64");
+        let quorum = usize::try_from(decision_threshold(active_stake, rounds[0].strict_quorum)).expect("a quorum of seats fits in a usize");
+        let voters: Vec<usize> = (0..quorum - 1).collect();
         line28_prevote(&mut rounds[0], &voters, LINE28_V);
         assert!(!has_prevote_certificate(&rounds, 0, 2, 1, LINE28_V));
-        line28_prevote(&mut rounds[0], &[66], LINE28_V);
+        line28_prevote(&mut rounds[0], &[quorum - 1], LINE28_V);
         assert!( has_prevote_certificate(&rounds, 0, 2, 1, LINE28_V));
     }
 
@@ -4261,7 +4285,7 @@ mod tests {
         let mut roster: Vec<SortedRosterMember> = keys.iter().enumerate().map(|(i, k)| SortedRosterMember {
             pub_key: PubKeyID(VerificationKeyBytes::from(k).into()), stake: 1, cumulative_stake: i as u64 + 1 }).collect();
         let mut state = TMState::init(
-            keys[0].clone(), roster[0].pub_key, 0,
+            keys[0].clone(), roster[0].pub_key, 0, ROSTER_MAX_N,
             ClosureToProposeNewBlock(Arc::new(|| Box::pin(async { None }))),
             ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
             ClosureToPushDecidedBlock(Arc::new(|_, _, _| Box::pin(async { (Vec::new(), [0; 32], false) }))),
@@ -4313,7 +4337,7 @@ mod tests {
     fn split_engine(keys: &[SigningKey], roster: &[SortedRosterMember], i: usize, proposes: Option<BlockValue>) -> TMState {
         let decided_roster = roster.to_vec();
         TMState::init(
-            keys[i].clone(), roster[i].pub_key, 0,
+            keys[i].clone(), roster[i].pub_key, 0, ROSTER_MAX_N,
             ClosureToProposeNewBlock(Arc::new(move || { let value = proposes.clone(); Box::pin(async move { value }) })),
             ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
             ClosureToPushDecidedBlock(Arc::new(move |_, _, _| { let roster = decided_roster.clone(); Box::pin(async move { (roster, [0; 32], false) }) })),
@@ -4327,7 +4351,7 @@ mod tests {
         let keys: Vec<SigningKey> = (0..4).map(|i| SigningKey::from([i as u8 + 1; 32])).collect();
         let roster: Vec<SortedRosterMember> = keys.iter().enumerate().map(|(i, k)| SortedRosterMember {
             pub_key: PubKeyID(VerificationKeyBytes::from(k).into()), stake: 1, cumulative_stake: i as u64 + 1 }).collect();
-        let proposer = TMState::proposer_from_height_round(&HashKeys::default(), &roster, 0, 0).0.unwrap();
+        let proposer = TMState::proposer_from_height_round(&HashKeys::default(), &roster, ROSTER_MAX_N, 0, 0).0.unwrap();
         (keys, roster, proposer, [(proposer + 1) % 4, (proposer + 2) % 4, (proposer + 3) % 4])
     }
 
@@ -4336,7 +4360,7 @@ mod tests {
         let live = nodes[from].rounds_data.iter().find(is_round).cloned();
         let from_cache = live.is_none();
         let Some(rd) = live.or_else(|| nodes[from].recent_commit_round_cache.iter().find(is_round).cloned()) else { return; };
-        let proposer = TMState::proposer_from_height_round(&nodes[from].hash_keys, roster, 0, 0).0.unwrap();
+        let proposer = TMState::proposer_from_height_round(&nodes[from].hash_keys, roster, ROSTER_MAX_N, 0, 0).0.unwrap();
 
         for chunk_i in 0..rd.proposal_sigs.len() {
             if rd.proposal_sigs[chunk_i] == TMSig::NIL { continue; }
@@ -4733,7 +4757,7 @@ mod tests {
         let keys: Vec<SigningKey> = (0..5).map(|i| SigningKey::from([i as u8 + 1; 32])).collect();
         let roster: Vec<SortedRosterMember> = keys.iter().enumerate().map(|(i, k)| SortedRosterMember {
             pub_key: PubKeyID(VerificationKeyBytes::from(k).into()), stake: 1, cumulative_stake: i as u64 + 1 }).collect();
-        let proposer = TMState::proposer_from_height_round(&HashKeys::default(), &roster, 0, 0).0.unwrap();
+        let proposer = TMState::proposer_from_height_round(&HashKeys::default(), &roster, ROSTER_MAX_N, 0, 0).0.unwrap();
         let others: Vec<usize> = (1..5).map(|o| (proposer + o) % 5).collect();
         let value_a = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
         let value_b = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| (i as u8).wrapping_add(1)).collect());
@@ -4845,14 +4869,14 @@ mod tests {
             SortedRosterMember{ pub_key: PubKeyID([2;32]), stake: 0, cumulative_stake: 0 },
             SortedRosterMember{ pub_key: PubKeyID([3;32]), stake: 0, cumulative_stake: 0 },
         ];
-        assert!((None, PubKeyID::NIL) == TMState::proposer_from_height_round(&HashKeys::default(), &[], 2, 1));
+        assert!((None, PubKeyID::NIL) == TMState::proposer_from_height_round(&HashKeys::default(), &[], ROSTER_MAX_N, 2, 1));
         for height in 0..8 {
             for round in 0..6 {
-                let (Some(i), _) = TMState::proposer_from_height_round(&HashKeys::default(), &roster_[..], height, round) else { panic!(); };
+                let (Some(i), _) = TMState::proposer_from_height_round(&HashKeys::default(), &roster_[..], ROSTER_MAX_N, height, round) else { panic!(); };
                 println!("BFT Proposer at {}.{}: {}", height, round, i);
-                let (Some(i), _) = TMState::proposer_from_height_round(&HashKeys::default(), &roster[..], height, round) else { panic!(); };
+                let (Some(i), _) = TMState::proposer_from_height_round(&HashKeys::default(), &roster[..], ROSTER_MAX_N, height, round) else { panic!(); };
                 println!("BFT Proposer at {}.{}: {}", height, round, i);
-                let (Some(i), _) = TMState::proposer_from_height_round(&HashKeys::default(), &roster[..1], height, round) else { panic!(); };
+                let (Some(i), _) = TMState::proposer_from_height_round(&HashKeys::default(), &roster[..1], ROSTER_MAX_N, height, round) else { panic!(); };
                 println!("BFT Proposer at {}.{}: {}", height, round, i);
                 // assert!(TMState::proposer_from_height_round(&roster0, 100, height, round).0.is_none());
             }

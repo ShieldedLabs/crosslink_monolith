@@ -142,12 +142,6 @@ pub fn test_path(path: PathBuf) {
     test_start();
 }
 
-#[ignore]
-#[test]
-fn read_from_file() {
-    test_path("../crosslink-test-data/blocks.zeccltf".into());
-}
-
 const REGTEST_BLOCK_BYTES: &[&[u8]] = &[
     //                                                                     i   h
     include_bytes!("../../crosslink-test-data/test_pow_block_0.bin"), //   0,  1: 02a610...
@@ -3818,11 +3812,13 @@ struct PayoutModel {
     /// (bond key, amount, target finalizer)
     bonds: Vec<([u8; 32], u64, [u8; 32])>,
     banks: std::collections::BTreeMap<[u8; 32], u64>,
+    /// The network's roster cap.
+    active_roster_max_n: usize,
 }
 
 impl PayoutModel {
     /// Finalizers with stake, biggest first, ties to the larger key; the first
-    /// ACTIVE_ROSTER_MAX_N are the roster.
+    /// `active_roster_max_n` are the roster.
     fn ranked(&self) -> Vec<(u64, [u8; 32])> {
         let mut stakes = std::collections::BTreeMap::<[u8; 32], u64>::new();
         for &(_, amount, target) in &self.bonds {
@@ -3839,7 +3835,7 @@ impl PayoutModel {
     }
 
     fn roster(&self) -> Vec<[u8; 32]> {
-        self.ranked().into_iter().take(zcash_primitives::bft::ACTIVE_ROSTER_MAX_N).map(|(_, finalizer)| finalizer).collect()
+        self.ranked().into_iter().take(self.active_roster_max_n).map(|(_, finalizer)| finalizer).collect()
     }
 
     /// The stakers that share a pool: every bond, then every roster bank with something in it.
@@ -3894,7 +3890,7 @@ impl PayoutModel {
         let finalizer_pool = issuance / 10;
         let bond_pool = issuance - finalizer_pool;
         let ranked: Vec<(u64, [u8; 32])> =
-            self.ranked().into_iter().take(zcash_primitives::bft::ACTIVE_ROSTER_MAX_N).collect();
+            self.ranked().into_iter().take(self.active_roster_max_n).collect();
         let roster: Vec<[u8; 32]> = ranked.iter().map(|&(_, finalizer)| finalizer).collect();
 
         let (stakers, biggest) = self.stakers(&roster);
@@ -3944,8 +3940,8 @@ fn pos_issuance(network: &Network, height: u32) -> u64 {
     u64::from(pos_subsidy(height, network, subsidy).expect("the staking share is a valid amount"))
 }
 
-/// FeaturenetUpgrade1 changes how a block's staking issuance is paid out. Thirteen finalizers have
-/// a bond each; the smallest is outside the roster of ACTIVE_ROSTER_MAX_N. The bonds are made in
+/// FeaturenetUpgrade1 changes how a block's staking issuance is paid out. One more finalizer than
+/// the roster has seats has a bond each, so the smallest is outside it. The bonds are made in
 /// the block before the upgrade, which pays them under the old rule, and the upgrade block pays
 /// under the new one. After each, every bond, every bank and the pool totals are checked.
 ///
@@ -3957,7 +3953,7 @@ fn pos_issuance(network: &Network, height: u32) -> u64 {
 fn crosslink_payout_changes_rule_at_featurenet_upgrade_1() {
     set_test_name(function_name!());
     const UPGRADE: u32 = 20;
-    const FINALIZERS: usize = zcash_primitives::bft::ACTIVE_ROSTER_MAX_N + 1;
+    const FINALIZERS: usize = HARNESS_PARAMETERS.active_roster_max_n + 1;
     let (network, node_config) = network_with_featurenet_upgrade_at(&HARNESS_PARAMETERS, UPGRADE);
     let mut tf = TF::new_with_node_config(&HARNESS_PARAMETERS, &node_config);
 
@@ -3974,7 +3970,7 @@ fn crosslink_payout_changes_rule_at_featurenet_upgrade_1() {
 
     // Twelve bonds of 1 ZEC and one of 0.1 ZEC, each to its own finalizer, in the block before the
     // upgrade. Powers of 10, so the bond rule that starts with the upgrade is not in play.
-    let mut model = PayoutModel { bonds: Vec::new(), banks: Default::default() };
+    let mut model = PayoutModel { bonds: Vec::new(), banks: Default::default(), active_roster_max_n: HARNESS_PARAMETERS.active_roster_max_n };
     let mut bonds = Vec::new();
     for (index, input) in inputs.into_iter().enumerate() {
         let finalizer = zcash_primitives::bft::FinalizerAddress::create(
@@ -4089,7 +4085,7 @@ fn bft_rounds_scene(tf: &mut TF, node_proposes: &[bool]) -> BftRoundsScene {
             let members: Vec<([u8; 32], u64)> = std::iter::once((node.2 .0, *node_stake))
                 .chain(finalizers.iter().map(|&k| (pub_keys[usize::from(k)], STAKE)))
                 .collect();
-            node_proposes.iter().enumerate().all(|(round, &is_node)| (bft_proposer(&members, 1, round as u32) == Some(node.2 .0)) == is_node)
+            node_proposes.iter().enumerate().all(|(round, &is_node)| (bft_proposer(&members, BFT_ROUNDS_PARAMETERS.active_roster_max_n, 1, round as u32) == Some(node.2 .0)) == is_node)
         })
         .expect("some stakes and three synthetic finalizers put the proposer where asked");
 
@@ -4118,7 +4114,7 @@ fn bft_rounds_scene(tf: &mut TF, node_proposes: &[bool]) -> BftRoundsScene {
     let member_pub_keys: Vec<([u8; 32], u64)> = std::iter::once((node.2 .0, node_stake))
         .chain(finalizers.iter().map(|&k| (pub_keys[usize::from(k)], STAKE)))
         .collect();
-    BftRoundsScene { finalizers, node_stake, total_stake: node_stake + 3 * STAKE, member_pub_keys, pow, gen, miner }
+    BftRoundsScene { finalizers, node_stake, total_stake: node_stake + 3 * STAKE, member_pub_keys, active_roster_max_n: BFT_ROUNDS_PARAMETERS.active_roster_max_n, pow, gen, miner }
 }
 
 /// What `bft_rounds_scene` built.
@@ -4128,6 +4124,8 @@ struct BftRoundsScene {
     total_stake: u64,
     /// The node first, then `finalizers` in order, as `bft_proposer` takes them.
     member_pub_keys: Vec<([u8; 32], u64)>,
+    /// The roster cap the scene's network runs.
+    active_roster_max_n: usize,
     /// The blocks loaded after the bonds, which include every height above the roster height.
     pow: Vec<Arc<Block>>,
     /// At the last block loaded, for scenarios that extend the chain.
@@ -4138,7 +4136,7 @@ struct BftRoundsScene {
 impl BftRoundsScene {
     /// The synthetic finalizer that proposes at `height` and `round`, or TF_BFT_THE_NODE.
     fn proposer(&self, height: u64, round: u32) -> u64 {
-        let proposer = bft_proposer(&self.member_pub_keys, height, round).expect("a roster has a proposer");
+        let proposer = bft_proposer(&self.member_pub_keys, self.active_roster_max_n, height, round).expect("a roster has a proposer");
         match self.member_pub_keys.iter().position(|(pub_key, _)| *pub_key == proposer) {
             Some(0) => TF_BFT_THE_NODE,
             Some(i) => self.finalizers[i - 1].into(),
@@ -4450,6 +4448,8 @@ struct TwelveSeats {
     finalizers: Vec<u16>,
     /// The node first, then the synthetic finalizers, as `bft_proposer` takes them.
     member_pub_keys: Vec<([u8; 32], u64)>,
+    /// The roster cap the scene's network runs.
+    active_roster_max_n: usize,
     /// The blocks loaded after the bonds, which include every height above the roster height.
     pow: Vec<Arc<Block>>,
     /// At the last block loaded, for scenarios that extend the chain.
@@ -4464,6 +4464,7 @@ struct TwelveSeats {
 fn twelve_seats_scene(tf: &mut TF, network: Network, node_proposes: &[((u64, u32), bool)]) -> TwelveSeats {
     let key = TestKey::new(b"crosslink test miner");
     let miner = key.address();
+    let active_roster_max_n = network.crosslink_parameters().active_roster_max_n;
     let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
     tf.push_instr_load_pow(&gen.tip, 0);
 
@@ -4488,7 +4489,7 @@ fn twelve_seats_scene(tf: &mut TF, network: Network, node_proposes: &[((u64, u32
             let members = members_with(&picked);
             node_proposes
                 .iter()
-                .all(|&((height, round), is_node)| (bft_proposer(&members, height, round) == Some(node.2 .0)) == is_node)
+                .all(|&((height, round), is_node)| (bft_proposer(&members, active_roster_max_n, height, round) == Some(node.2 .0)) == is_node)
                 .then_some(picked)
         })
         .expect("some eleven synthetic finalizers put the proposer where asked");
@@ -4520,7 +4521,7 @@ fn twelve_seats_scene(tf: &mut TF, network: Network, node_proposes: &[((u64, u32
         pow.push(block);
     }
     let member_pub_keys = members_with(&finalizers);
-    TwelveSeats { finalizers, member_pub_keys, pow, gen, miner }
+    TwelveSeats { finalizers, member_pub_keys, active_roster_max_n, pow, gen, miner }
 }
 
 /// The members' keys in the order the node's roster puts them.
@@ -4538,7 +4539,7 @@ fn bft_roster_order(members: &[([u8; 32], u64)]) -> Vec<[u8; 32]> {
 impl TwelveSeats {
     /// The synthetic finalizer that proposes at `height` and `round`, or TF_BFT_THE_NODE.
     fn proposer(&self, height: u64, round: u32) -> u64 {
-        let proposer = bft_proposer(&self.member_pub_keys, height, round).expect("a roster has a proposer");
+        let proposer = bft_proposer(&self.member_pub_keys, self.active_roster_max_n, height, round).expect("a roster has a proposer");
         match self.member_pub_keys.iter().position(|(pub_key, _)| *pub_key == proposer) {
             Some(0) => TF_BFT_THE_NODE,
             Some(i) => self.finalizers[i - 1].into(),

@@ -935,6 +935,9 @@ impl ParametersBuilder {
         if !crosslink.staking.is_valid() {
             return Err(ParametersBuilderError::InvalidStakingParameters);
         }
+        if !crosslink.active_roster_is_valid() {
+            return Err(ParametersBuilderError::InvalidActiveRoster);
+        }
         self.crosslink = crosslink;
         Ok(self)
     }
