@@ -176,6 +176,9 @@ pub(super) const PARAM_RAW_TRANSACTION_HEX_DESC: &str = "The hex-encoded raw tra
 pub(super) const PARAM__ALLOW_HIGH_FEES_DESC: &str = "Whether to allow high fees.";
 pub(super) const PARAM_NUM_BLOCKS_DESC: &str = "The number of blocks to return.";
 pub(super) const PARAM_HEIGHT_DESC: &str = "The height of the block to return.";
+pub(super) const PARAM_MAX_HEIGHT_DESC: &str = "The last PoW height to include. Defaults to the best tip.";
+pub(super) const PARAM_BFT_DESC: &str =
+    "Which decided BFT blocks to include: cited (default), supported, none, or a count from BFT genesis.";
 pub(super) const PARAM_COMMAND_DESC: &str = "The command to execute.";
 #[allow(non_upper_case_globals)]
 pub(super) const PARAM__PARAMETERS_DESC: &str = "The parameters for the command.";
@@ -709,6 +712,24 @@ pub trait Rpc {
     /// - `last_height`: (numeric, required) The last block height to scan, inclusive.
     #[method(name = "get_total_issuance")]
     async fn get_total_issuance(&self, ufvk_strs: UfvkList, first_height: u32, last_height: u32) -> Result<Vec<ScanInfo>>;
+
+    /// Writes this node's best chain, from genesis to a height, to a chain prefix file, which
+    /// `zebrad import-chain` loads into a fresh node to return it to that height.
+    ///
+    /// The file is written on the node's machine, in `chain_prefixes` under the state cache
+    /// directory, named for its tip and BFT cutoff. Returns where it is and what it holds.
+    ///
+    /// # Parameters
+    ///
+    /// - `max_height`: (numeric, optional) The last PoW height to include. Defaults to the best tip.
+    /// - `bft`: (string, optional) Which decided BFT blocks to include: `cited` (the default, up
+    ///   to the newest one a PoW block in the prefix cites), `supported` (every one whose
+    ///   snapshot is in the prefix), `none`, or a count from BFT genesis.
+    ///
+    /// method: post
+    /// tags: tfl
+    #[method(name = "export_chain_prefix")]
+    async fn export_chain_prefix(&self, max_height: Option<u32>, bft: Option<String>) -> Result<serde_json::Value>;
 
     /// Returns all transaction ids in the memory pool, as a JSON array.
     ///
@@ -2716,6 +2737,32 @@ where
             })
         } else {
             unreachable!("unexpected response to QueueStats request")
+        }
+    }
+
+    async fn export_chain_prefix(&self, max_height: Option<u32>, bft: Option<String>) -> Result<serde_json::Value> {
+        let failed = |err: String| {
+            ErrorObject::owned(ErrorCode::InvalidParams.code(), format!("chain prefix export failed: {err}"), None::<()>)
+        };
+        let bft = match bft {
+            Some(bft) => bft.parse().map_err(failed)?,
+            None => zebra_state::BftCutoff::default(),
+        };
+        let res = self
+            .tfl_service
+            .clone()
+            .ready()
+            .await
+            .map_err(|err| failed(err.to_string()))?
+            .call(TFLServiceRequest::ExportChainPrefix { max_height: max_height.map(Height), bft })
+            .await;
+        match res {
+            Ok(TFLServiceResponse::ExportChainPrefix(Ok(export))) => {
+                serde_json::to_value(export).map_err(|err| failed(err.to_string()))
+            }
+            Ok(TFLServiceResponse::ExportChainPrefix(Err(err))) => Err(failed(err)),
+            Ok(other) => Err(failed(format!("unexpected response {other:?}"))),
+            Err(err) => Err(failed(err.to_string())),
         }
     }
 

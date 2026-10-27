@@ -3180,6 +3180,77 @@ fn crosslink_finality_diagram_2_benign_reorg() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// Scene 2's best chain and decided BFT blocks, as `export-chain` would read them from the node
+/// that ran it: genesis, P1..P8, Q9..Q11, and bft0..bft2.
+fn diagram_scene_2_chain_prefix() -> zebra_state::ChainPrefix {
+    let (tf, pow, fork) = diagram_scene_2();
+    let bytes = tf.write_to_bytes();
+    let decisions = TF::read_from_bytes(&bytes)
+        .expect("the scene reads back")
+        .instrs
+        .iter()
+        .filter(|instr| instr.kind == TFInstr::LOAD_POS)
+        .map(|instr| {
+            let decided = BftBlockAndFatPointerToItWrap::zcash_deserialize(instr.data_slice(&bytes))
+                .expect("the scene's BFT blocks parse")
+                .0;
+            zebra_state::BftDecision { block: decided.block, fat_pointer: decided.fat_ptr, proposal_sigs: Vec::new() }
+        })
+        .collect();
+    let best_chain = std::iter::once(zebra_chain::block::genesis::regtest_genesis_block())
+        .chain(pow[..8].iter().cloned())
+        .chain(fork)
+        .collect();
+    zebra_state::ChainPrefix::new(best_chain, decisions).expect("P8 is Q9's parent")
+}
+
+/// A chain prefix file of scene 2 loads through the real admission paths. The node ends on the
+/// file's best chain and holds the BFT blocks the cutoff kept. Its finalized marker sits where
+/// following that chain puts it: on P4, which the branch's own pointer to bft1 finalizes. The
+/// scene's node had moved it to P5 while the abandoned P9..P10 were its best chain, and that
+/// memory is not part of the chain.
+fn chain_prefix_of_scene_2_loads(cutoff: zebra_state::BftCutoff, trusted: bool) {
+    let prefix = diagram_scene_2_chain_prefix();
+    let mut tf = zebra_crosslink::chain_prefix::prefix_tf(&HARNESS_PARAMETERS, &prefix, cutoff);
+    let (_, tip) = prefix.tip().expect("the prefix has blocks");
+    let p4 = prefix.blocks[4].hash();
+    let p5 = prefix.blocks[5].hash();
+
+    tf.push_instr_expect_pow_chain_length(prefix.blocks.len(), 0);
+    tf.push_instr_expect_pow_tip(&tip, 0);
+    tf.push_instr_expect_pos_chain_length(prefix.bft_count(cutoff), 0);
+    tf.push_instr_expect_finalized_tip(Some(&p4), 0);
+    tf.push_instr_expect_pow_block_finality(&p4, Some(TFLBlockFinality::Finalized), 0);
+    tf.push_instr_expect_pow_block_finality(&p5, Some(TFLBlockFinality::NotYetFinalized), 0);
+
+    zebra_crosslink::test_format::TRUSTED_LOAD_POW.store(trusted, std::sync::atomic::Ordering::Relaxed);
+    test_bytes(tf.write_to_bytes());
+}
+
+#[test]
+fn crosslink_chain_prefix_cited_loads() {
+    set_test_name(function_name!());
+    let prefix = diagram_scene_2_chain_prefix();
+    // Q9..Q11 and P8 cite bft1; bft2 was cited only by the abandoned P9..P10.
+    assert_eq!(prefix.bft_count(zebra_state::BftCutoff::Cited), 2);
+    chain_prefix_of_scene_2_loads(zebra_state::BftCutoff::Cited, false);
+}
+
+#[test]
+fn crosslink_chain_prefix_supported_loads() {
+    set_test_name(function_name!());
+    let prefix = diagram_scene_2_chain_prefix();
+    // bft2's snapshot, P5, is on the best chain, so the prefix can validate it.
+    assert_eq!(prefix.bft_count(zebra_state::BftCutoff::Supported), 3);
+    chain_prefix_of_scene_2_loads(zebra_state::BftCutoff::Supported, false);
+}
+
+#[test]
+fn crosslink_chain_prefix_trusted_loads() {
+    set_test_name(function_name!());
+    chain_prefix_of_scene_2_loads(zebra_state::BftCutoff::Cited, true);
+}
+
 // TODO:
 // - reject signatures from outside the roster
 // - reject pos block with < 2/3rds roster stake

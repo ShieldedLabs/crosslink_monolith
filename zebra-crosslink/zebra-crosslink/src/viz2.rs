@@ -687,74 +687,28 @@ pub async fn service_viz_requests(
                     }
 
                     if !request.serialize_instrs_path.is_empty() {
-                        let handle = tfl_handle.clone();
                         let ser_call = call.clone();
                         let path_string = request.serialize_instrs_path.clone();
                         tokio::task::spawn(async move {
-                            let Ok(StateResponse::Tip(Some(tip))) = (ser_call.state)(StateRequest::Tip).await else { return; };
-
-                            // The whole chain, paged so no single response has to hold it.
-                            // Each page is anchored on the previous page's parent hash, so
-                            // consecutive pages join into one chain by construction; a page
-                            // coming back short means the chain moved and the file would be
-                            // missing its base, so abandon it rather than write a gap.
-                            const SER_PAGE_SIZE: u32 = 8192;
-                            let mut pages: Vec<Vec<(ZebBlockHeight, ZebBlockHash, Arc<Block>)>> = Vec::new();
-                            let (mut hi_hash, mut hi_height) = (tip.1, tip.0);
-                            loop {
-                                let page = tfl_block_sequence(&ser_call, hi_hash, hi_height, ZebBlockHeight(1), SER_PAGE_SIZE).await;
-                                let Some((lo_height, _, lowest)) = page.first().cloned() else {
-                                    info!("serialization abandoned: the chain moved while paging");
+                            // The whole best chain and every decided BFT block it can validate,
+                            // as a chain prefix file (see `chain_prefix`).
+                            let cutoff = zebra_state::BftCutoff::Supported;
+                            let prefix = match (ser_call.read_state)(zebra_state::ReadRequest::CrosslinkChainPrefix(None)).await {
+                                Ok(zebra_state::ReadResponse::CrosslinkChainPrefix(Ok(prefix))) => prefix,
+                                other => {
+                                    error!("serialization abandoned: could not read the chain: {other:?}");
                                     return;
-                                };
-                                hi_hash = lowest.header.previous_block_hash;
-                                hi_height = ZebBlockHeight(lo_height.0.saturating_sub(1));
-                                pages.push(page);
-                                if lo_height <= ZebBlockHeight(1) { break; }
-                            }
-                            pages.reverse();
-                            let blocks: Vec<Arc<Block>> = pages.into_iter().flatten().map(|(_, _, block)| block).collect();
-
-                            let (bft_blocks, fat_pointer_to_tip) = {
-                                let internal = zebra_state::new_network::bft::bft_chain().read().unwrap();
-                                (internal.blocks.clone(), internal.fat_pointer_to_tip.clone())
-                            };
-                            // The signed fat pointer to BFT block i rides in block i+1; the tip's rides alone.
-                            let fat_ptr_to = |i: usize| {
-                                if i + 1 < bft_blocks.len() { bft_blocks[i + 1].previous_block_fat_ptr.clone() }
-                                else { fat_pointer_to_tip.clone() }
-                            };
-                            let bft_hashes: Vec<_> = bft_blocks.iter().map(|b| b.blake3_hash()).collect();
-
-                            let mut tf = test_format::TF::new(&params);
-                            let mut next_bft = 0usize;
-                            // Each BFT block goes just before the first PoW block that commits to it,
-                            // preserving the chronology a replay needs.
-                            for block in blocks.iter() {
-                                let target = block.header.fat_pointer_to_bft_block.points_at_block_hash();
-                                if let Some(j) = bft_hashes.iter().position(|h| *h == target) {
-                                    while next_bft <= j {
-                                        tf.push_instr_load_pos(&test_format::BftBlockAndFatPointerToItWrap(
-                                            zcash_primitives::bft::BftBlockAndFatPointerToIt {
-                                                block: bft_blocks[next_bft].clone(),
-                                                fat_ptr: fat_ptr_to(next_bft),
-                                            }), 0);
-                                        next_bft += 1;
-                                    }
                                 }
-                                tf.push_instr_load_pow(block.as_ref(), 0);
+                            };
+                            let written = tokio::task::spawn_blocking(move || {
+                                crate::chain_prefix::write_prefix_file(&params, &prefix, cutoff, std::path::Path::new(&path_string))
+                            }).await;
+                            match written {
+                                Ok(Ok(export)) => info!("serialized {} PoW and {} BFT blocks to {} ({} bytes)",
+                                                        export.pow_blocks, export.bft_blocks, export.path, export.bytes),
+                                Ok(Err(err)) => error!("serialization failed: {err}"),
+                                Err(err) => error!("serialization task failed: {err}"),
                             }
-                            while next_bft < bft_blocks.len() {
-                                tf.push_instr_load_pos(&test_format::BftBlockAndFatPointerToItWrap(
-                                    zcash_primitives::bft::BftBlockAndFatPointerToIt {
-                                        block: bft_blocks[next_bft].clone(),
-                                        fat_ptr: fat_ptr_to(next_bft),
-                                    }), 0);
-                                next_bft += 1;
-                            }
-
-                            let ok = tf.write_to_file(std::path::Path::new(&path_string));
-                            info!("serialized {} instructions to {}: ok={}", tf.instrs.len(), path_string, ok);
                         });
                     }
 

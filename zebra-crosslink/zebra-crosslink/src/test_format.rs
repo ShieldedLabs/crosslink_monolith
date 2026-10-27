@@ -491,6 +491,11 @@ pub fn val_from_finality(val: Option<TFLBlockFinality>) -> [u64; 2] {
 
 /// The file magic this build writes. Version 1 always writes the staking calendar in SET_PARAMS
 /// and may follow it with a node config fragment; version 0 files are still read.
+/// While set, `LOAD_POW` submits through [`zebra_state::new_network::submit_trusted_block_to_new_network`]:
+/// the block's proofs, signatures and scripts are not checked. Set only by a chain prefix import
+/// the operator has marked trusted (see `chain_prefix`).
+pub static TRUSTED_LOAD_POW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub const TF_MAGIC: &[u8; 8] = b"ZECCLTF1";
 const TF_MAGIC_V0: &[u8; 8] = b"ZECCLTF0";
 
@@ -1382,7 +1387,11 @@ pub(crate) async fn handle_instr(
 
             // Through new_network's ingest queue, the doorway submitblock uses, so blocks take
             // the production admission path rather than a parallel one.
-            let outcome = zebra_state::new_network::submit_block_to_new_network(Arc::new(block), NODE_ANSWER_WAIT).await;
+            let outcome = if TRUSTED_LOAD_POW.load(std::sync::atomic::Ordering::Relaxed) {
+                zebra_state::new_network::submit_trusted_block_to_new_network(Arc::new(block), NODE_ANSWER_WAIT).await
+            } else {
+                zebra_state::new_network::submit_block_to_new_network(Arc::new(block), NODE_ANSWER_WAIT).await
+            };
             check_ingest(flags, "", outcome);
         }
 

@@ -60,6 +60,7 @@ use crate::{
 };
 
 pub mod block_iter;
+pub mod chain_prefix;
 pub mod chain_tip;
 pub mod watch_receiver;
 
@@ -1125,6 +1126,11 @@ impl Service<ReadRequest> for ReadStateService {
                     ),
                 ))
             }
+
+            // Used by the chain prefix export, which writes the result to a file.
+            ReadRequest::CrosslinkChainPrefix(max_height) => Ok(
+                ReadResponse::CrosslinkChainPrefix(state.chain_prefix(max_height).map(Arc::new)),
+            ),
 
             ReadRequest::CrosslinkRoster => Ok(ReadResponse::CrosslinkRoster(
                 crate::new_network::bft::bft_chain().read().unwrap().roster.clone(),

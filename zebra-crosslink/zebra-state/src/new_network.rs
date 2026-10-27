@@ -1517,6 +1517,9 @@ pub enum IngestOutcome {
 pub struct BlockSubmission {
     pub block: std::sync::Arc<Block>,
     pub reply: tokio::sync::oneshot::Sender<IngestOutcome>,
+    /// Skip `verify_expensive` (proofs, signatures, scripts) for this block: see
+    /// [`submit_trusted_block_to_new_network`].
+    pub trusted: bool,
 }
 
 /// Bounded, but sized for bulk: the legacy syncer submits here too, and it runs with a
@@ -1678,6 +1681,29 @@ pub async fn submit_block_to_new_network(
     block: std::sync::Arc<Block>,
     timeout: std::time::Duration,
 ) -> Result<IngestOutcome, String> {
+    submit_to_new_network(block, false, timeout).await
+}
+
+/// Submit a block the caller vouches for, such as one from a chain prefix this node exported
+/// earlier, and wait for its verdict.
+///
+/// It takes the same path as [`submit_block_to_new_network`] -- header and PoW, body, the
+/// crosslink fat-pointer gate, and contextual validation with its staking and finality effects --
+/// except that `verify_expensive` is skipped: no proofs, signatures or scripts are checked. The
+/// transparent outputs that check would have returned are computed directly instead. Only for
+/// bytes whose origin the caller trusts; blocks from the network are never trusted.
+pub async fn submit_trusted_block_to_new_network(
+    block: std::sync::Arc<Block>,
+    timeout: std::time::Duration,
+) -> Result<IngestOutcome, String> {
+    submit_to_new_network(block, true, timeout).await
+}
+
+async fn submit_to_new_network(
+    block: std::sync::Arc<Block>,
+    trusted: bool,
+    timeout: std::time::Duration,
+) -> Result<IngestOutcome, String> {
     let Some(tx) = BLOCK_SUBMISSION_SENDER.get() else {
         return Err("new_network is not running".to_string());
     };
@@ -1689,7 +1715,7 @@ pub async fn submit_block_to_new_network(
     };
 
     let (reply, rx) = tokio::sync::oneshot::channel();
-    permit.send(BlockSubmission { block, reply });
+    permit.send(BlockSubmission { block, reply, trusted });
 
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(outcome)) => Ok(outcome),
@@ -1706,6 +1732,8 @@ struct BlockFate {
     delivered_by: Option<ConnectionKey>,
     cheap_checks: Option<CheapBlockChecks>,
     pending_told: bool,
+    /// Submitted with [`submit_trusted_block_to_new_network`]: `verify_expensive` is skipped.
+    trusted: bool,
 }
 
 impl BlockFate {
@@ -2036,7 +2064,7 @@ pub fn sync(
         // same commit queue the network path uses, so they go through identical verification.
         loop {
             match submit_rx.try_recv() {
-                Ok(BlockSubmission { block, reply }) => {
+                Ok(BlockSubmission { block, reply, trusted }) => {
                     let hash = block.hash();
 
                     if let Some(known) = read_state.known_block(hash) {
@@ -2066,7 +2094,7 @@ pub fn sync(
                     }
 
                     blocks_to_commit.push((hash, block));
-                    fates.insert(hash, BlockFate { reply: Some(reply), ..Default::default() });
+                    fates.insert(hash, BlockFate { reply: Some(reply), trusted, ..Default::default() });
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(err) => { tracing::error!("block submission queue: {err:?}"); break; }
@@ -3544,9 +3572,14 @@ pub fn sync(
                                         }
                                     }
                                 }
-                                let Some(result) = verify_expensive_cancellable(
-                                    verify_fns, block_arc.clone(), network, cheap.clone(), spent_utxos,
-                                ) else { return true; };
+                                let result = if fate.trusted {
+                                    Ok(zebra_chain::transparent::new_ordered_outputs(&block_arc, &cheap.transaction_hashes))
+                                } else {
+                                    let Some(result) = verify_expensive_cancellable(
+                                        verify_fns, block_arc.clone(), network, cheap.clone(), spent_utxos,
+                                    ) else { return true; };
+                                    result
+                                };
                                 match result {
                                     Err(err) => Err(("expensive", err, false)),
                                     Ok(new_outputs) => Ok((cheap, new_outputs, pos_payout)),

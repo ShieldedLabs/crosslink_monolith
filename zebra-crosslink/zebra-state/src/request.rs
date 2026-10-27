@@ -1532,6 +1532,11 @@ pub enum ReadRequest {
     /// the parent.s own pointer (honest context selection, FINALITY.md §3.4).
     CrosslinkFatPointerToBftChainTip(u64),
 
+    /// The best chain from genesis to this height (the best tip if `None`), with the decided BFT
+    /// chain, for writing out as a chain prefix. Reads every block in the range, so it is for
+    /// occasional exports, not for anything on a hot path.
+    CrosslinkChainPrefix(Option<block::Height>),
+
     /// The roster for the next BFT height to decide: the stakes at the bft-tip.s snapshot, or
     /// the last non-empty roster when those are empty.
     CrosslinkRoster,
@@ -1693,6 +1698,7 @@ impl ReadRequest {
             ReadRequest::CrosslinkAggregatedStakes(_) => "crosslink_aggregated_stakes",
             ReadRequest::CrosslinkIsAncestor { .. } => "crosslink_is_ancestor",
             ReadRequest::CrosslinkFatPointerToBftChainTip(_) => "crosslink_fat_pointer_to_bft_chain_tip",
+            ReadRequest::CrosslinkChainPrefix(_) => "crosslink_chain_prefix",
             ReadRequest::CrosslinkRoster => "crosslink_roster",
             ReadRequest::CrosslinkRosterWithAddresses => "crosslink_roster_with_addresses",
             ReadRequest::CrosslinkBcTipRoster => "crosslink_bc_tip_roster",

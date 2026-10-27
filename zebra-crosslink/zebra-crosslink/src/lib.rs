@@ -160,6 +160,7 @@ pub fn dump_test_instrs() {
     }
 }
 
+pub mod chain_prefix;
 pub mod service;
 /// Configuration for the state service.
 pub mod config {
@@ -450,6 +451,10 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle) -> Result<(), 
 
     if *TEST_MODE.lock().unwrap() {
         run_tfl_test(internal_handle.clone());
+    }
+
+    if let Some(import) = chain_prefix::CHAIN_IMPORT.lock().unwrap().take() {
+        tokio::task::spawn(chain_prefix::run_import(internal_handle.clone(), import));
     }
 
     // The BFT chain, the engine and every reader of them live in `zebra_state::new_network::bft`.
@@ -757,6 +762,10 @@ async fn tfl_service_incoming_request(
         }
 
         TFLServiceRequest::WalletUfvk => Ok(TFLServiceResponse::WalletUfvk(wallet::USER_UFVK_STRING.lock().unwrap().clone())),
+
+        TFLServiceRequest::ExportChainPrefix { max_height, bft } => Ok(TFLServiceResponse::ExportChainPrefix(
+            chain_prefix::export_from_node(&internal_handle, max_height, bft).await,
+        )),
     }
 }
 

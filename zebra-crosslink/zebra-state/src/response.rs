@@ -441,6 +441,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::CrosslinkFatPointerToBftChainTip`].
     CrosslinkFatPointerToBftChainTip(zcash_primitives::bft::FatPointerToBftBlock),
 
+    /// Response to [`ReadRequest::CrosslinkChainPrefix`], or why the prefix could not be read.
+    CrosslinkChainPrefix(Result<std::sync::Arc<crate::service::chain_prefix::ChainPrefix>, String>),
+
     /// Response to [`ReadRequest::CrosslinkRoster`].
     CrosslinkRoster(Vec<zcash_primitives::transaction::RosterMember>),
 
@@ -780,6 +783,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::CrosslinkIsAncestor(_)
             | ReadResponse::CrosslinkAggregatedStakes(_)
             | ReadResponse::CrosslinkFatPointerToBftChainTip(_)
+            | ReadResponse::CrosslinkChainPrefix(_)
             | ReadResponse::CrosslinkRoster(_)
             | ReadResponse::CrosslinkRosterWithAddresses(_)
             | ReadResponse::CrosslinkBcTipRoster { .. }

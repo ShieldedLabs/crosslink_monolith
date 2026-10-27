@@ -557,6 +557,10 @@ impl StartCmd {
         let mempool2 = mempool.clone();
         let block_from_template = Arc::new(std::sync::OnceLock::new());
         let rpc_call = Arc::new(std::sync::OnceLock::new());
+        // Where the `export_chain_prefix` RPC writes, beside the state it exports.
+        *zebra_crosslink::chain_prefix::CHAIN_PREFIX_DIR.lock().unwrap() =
+            Some(config.state.cache_dir.join("chain_prefixes"));
+
         info!("spawning tfl service task");
         let (tfl_handle, tfl_service_task_handle) = {
             let state = state.clone();

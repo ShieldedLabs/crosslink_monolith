@@ -43,6 +43,14 @@ pub enum TFLServiceRequest {
     WalletSpendableFunds,
     /// Send a basic shielded value transfer from the wallet: (value in zatoshis, unified address)
     WalletBasicSend(u64, String),
+    /// Write the best chain from genesis to a height (the best tip if `None`) to a chain prefix
+    /// file in this node's export directory, with the BFT blocks `bft` selects.
+    ExportChainPrefix {
+        /// The last PoW height to include; the best tip if `None`.
+        max_height: Option<BlockHeight>,
+        /// Which decided BFT blocks to include.
+        bft: crate::BftCutoff,
+    },
 }
 
 /// Types of responses that can be returned by the TFLService.
@@ -64,6 +72,27 @@ pub enum TFLServiceResponse {
     WalletSpendableFunds(Option<WalletSpendableFunds>),
     /// Send a basic shielded value transfer from the wallet
     WalletBasicSend(Result<String, String>),
+    /// What was written for [`TFLServiceRequest::ExportChainPrefix`], or why nothing was
+    ExportChainPrefix(Result<ChainPrefixExport, String>),
+}
+
+/// A chain prefix file that was written.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChainPrefixExport {
+    /// Where the file is, on the node's machine.
+    pub path: String,
+    /// The height of the last PoW block in the file.
+    pub tip_height: u32,
+    /// The hash of the last PoW block in the file.
+    pub tip_hash: String,
+    /// How many PoW blocks the file holds, genesis included.
+    pub pow_blocks: usize,
+    /// How many decided BFT blocks the file holds.
+    pub bft_blocks: usize,
+    /// The rule that chose the BFT blocks: `cited`, `supported`, `none`, or a count.
+    pub bft_cutoff: String,
+    /// The file's size.
+    pub bytes: usize,
 }
 
 /// Errors that can occur when interacting with the TFLService.

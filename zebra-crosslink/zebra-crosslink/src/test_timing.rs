@@ -143,7 +143,14 @@ fn run_id() -> String {
     std::env::var("CROSSLINK_TEST_RUN_ID").unwrap_or_else(|_| "adhoc".to_string())
 }
 
+/// Whether rows are written at all. A node loading a chain prefix file runs the test format's
+/// instruction reader but is not a test run, so it turns this off.
+pub(crate) static RECORD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 fn path() -> Option<PathBuf> {
+    if !RECORD.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     match std::env::var("CROSSLINK_TEST_TIMINGS") {
         Ok(path) if path == "off" => None,
         Ok(path) => Some(PathBuf::from(path)),

@@ -11,16 +11,18 @@ use crate::config::ZebradConfig;
 pub use self::{entry_point::EntryPoint, start::StartCmd};
 
 use self::{
-    copy_state::CopyStateCmd, fixup_db_stake::FixupDbStakeCmd, generate::GenerateCmd,
-    tip_height::TipHeightCmd,
+    copy_state::CopyStateCmd, export_chain::ExportChainCmd, fixup_db_stake::FixupDbStakeCmd,
+    generate::GenerateCmd, import_chain::ImportChainCmd, tip_height::TipHeightCmd,
 };
 
 pub mod start;
 
 mod copy_state;
 mod entry_point;
+mod export_chain;
 mod fixup_db_stake;
 mod generate;
+mod import_chain;
 mod tip_height;
 
 #[cfg(test)]
@@ -38,11 +40,17 @@ pub enum ZebradCmd {
     // TODO: hide this command from users in release builds (#3279)
     CopyState(CopyStateCmd),
 
+    /// Write the chain on disk, from genesis to a height, to a chain prefix file
+    ExportChain(ExportChainCmd),
+
     /// Check the state cache's aggregated-stakes rows and repair any missing ones
     FixupDbStake(FixupDbStakeCmd),
 
     /// Generate a default `zebrad.toml` configuration
     Generate(GenerateCmd),
+
+    /// Start the node and load a chain prefix file into it
+    ImportChain(ImportChainCmd),
 
     /// Start the application (default command)
     Start(StartCmd),
@@ -61,10 +69,10 @@ impl ZebradCmd {
         // List all the commands, so new commands have to make a choice here
         match self {
             // Commands that run as a configured server
-            CopyState(_) | Start(_) => true,
+            CopyState(_) | ImportChain(_) | Start(_) => true,
 
             // Utility commands that don't use server components
-            FixupDbStake(_) | Generate(_) | TipHeight(_) => false,
+            ExportChain(_) | FixupDbStake(_) | Generate(_) | TipHeight(_) => false,
         }
     }
 
@@ -75,10 +83,10 @@ impl ZebradCmd {
         // List all the commands, so new commands have to make a choice here
         match self {
             // Commands that need an intro
-            Start(_) => true,
+            ImportChain(_) | Start(_) => true,
 
             // Utility commands
-            CopyState(_) | FixupDbStake(_) | Generate(_) | TipHeight(_) => false,
+            CopyState(_) | ExportChain(_) | FixupDbStake(_) | Generate(_) | TipHeight(_) => false,
         }
     }
 
@@ -97,10 +105,10 @@ impl ZebradCmd {
             // This output:
             // - is used by automated tools, or
             // - needs to be read easily.
-            FixupDbStake(_) | Generate(_) | TipHeight(_) => true,
+            ExportChain(_) | FixupDbStake(_) | Generate(_) | TipHeight(_) => true,
 
             // Commands that generate informative logging output by default.
-            CopyState(_) | Start(_) => false,
+            CopyState(_) | ImportChain(_) | Start(_) => false,
         };
 
         if only_show_warnings && !verbose {
@@ -117,8 +125,10 @@ impl Runnable for ZebradCmd {
     fn run(&self) {
         match self {
             CopyState(cmd) => cmd.run(),
+            ExportChain(cmd) => cmd.run(),
             FixupDbStake(cmd) => cmd.run(),
             Generate(cmd) => cmd.run(),
+            ImportChain(cmd) => cmd.run(),
             Start(cmd) => cmd.run(),
             TipHeight(cmd) => cmd.run(),
         }
@@ -147,6 +157,7 @@ impl Configurable<ZebradConfig> for ZebradCmd {
     fn process_config(&self, config: ZebradConfig) -> Result<ZebradConfig, FrameworkError> {
         match self {
             ZebradCmd::Start(cmd) => cmd.override_config(config),
+            ZebradCmd::ImportChain(cmd) => cmd.override_config(config),
             _ => Ok(config),
         }
     }
