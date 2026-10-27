@@ -53,14 +53,16 @@ jobs:
            - sev:high: a defect that lets anyone, or ordinary use, crash a node, corrupt its state, or block staking or sending with no workaround; a security flaw that must be fixed before mainnet; or work mainnet cannot launch without.
            - sev:medium: a broken feature with a workaround, a misleading UI or error, or a weakness nobody can exploit; or work that clearly helps node operators, testers or developers and belongs in an upcoming release.
            - sev:low: a cosmetic, docs or minor UX defect; or a nice-to-have, long-term idea, or open question that nothing is waiting on.
-        5. Give the reason in one or two plain sentences, with no links and no @-mentions.
+        5. Set bft_stall to true when the issue reports BFT finality stopping, or a flaw that could stop it: a liveness stall or halt, or finalizers unable to decide, propose or sync the BFT chain. A PoW-only stall is not one.
+        6. Give the reason in one or two plain sentences, with no links and no @-mentions.
 
         Leave duplicate_issue at 0, duplicate_review empty and fixed_by empty when there is none. duplicate_review is a review finding ID such as K5 or C7.1; fixed_by holds commit hashes.
       TRIAGE_SCHEMA: >-
         {"type": "object", "additionalProperties": false,
-        "required": ["severity", "area", "reason", "duplicate_issue", "duplicate_review", "fixed_by"],
+        "required": ["severity", "bft_stall", "area", "reason", "duplicate_issue", "duplicate_review", "fixed_by"],
         "properties": {
         "severity": {"type": "string", "enum": ["sev:critical", "sev:high", "sev:medium", "sev:low"]},
+        "bft_stall": {"type": "boolean"},
         "area": {"type": "string", "enum": ["App", "BFT", "BFT/networking", "Bonds", "Database", "Featurenet", "Fees", "Finalizer UX", "Infra", "Mining", "Networking", "PoW sync", "RPC", "Reward", "Slashing", "Staking", "Staking TX", "Sync", "Testing", "UI", "Visualization", "Wallet", "Wallet CLI"]},
         "reason": {"type": "string", "maxLength": 400},
         "duplicate_issue": {"type": "integer", "minimum": 0},
@@ -351,9 +353,10 @@ jobs:
             fi
           done
 
-          declare -A color=([sev:critical]=b60205 [sev:high]=d93f0b [sev:medium]=fbca04 [sev:low]=0e8a16 [duplicate]=cfd3d7)
+          declare -A color=([sev:critical]=b60205 [sev:high]=d93f0b [sev:medium]=fbca04 [sev:low]=0e8a16 [duplicate]=cfd3d7 ["BFT stall"]=b60205)
           labels=("$sev")
           if [ "$dup" != 0 ]; then labels+=(duplicate); fi
+          if [ "$(jq -r '.bft_stall // false' <<<"$OUT")" = true ]; then labels+=("BFT stall"); fi
           args=()
           for l in "${labels[@]}"; do
             gh label create "$l" --color "${color[$l]}" > /dev/null 2>&1 || true
