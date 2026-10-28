@@ -1442,6 +1442,10 @@ pub struct Peer {
 
     // block responses queued to this peer and not yet known transmitted (duplicate guard)
     queued_block_responses: QueuedBlockResponses,
+
+    // their last STATUS showed them wholly below our near-tip window: send them the next
+    // historical window on the next tick rather than at the heartbeat
+    history_wanted: bool,
 }
 
 #[derive(Debug)]
@@ -2469,9 +2473,16 @@ pub fn sync(
         let tip_for_status = read_state.best_tip().map(|(_, hash)| hash);
         let tip_is_news = tip_for_status.is_some() && tip_for_status != last_status_tip;
 
-        if tip_is_news || std::time::Instant::now() >= next_status { 'send_status: {
-            next_status = std::time::Instant::now() + status_interval;
-            last_status_tip = tip_for_status;
+        // Peers catching up from far behind get their next historical window as soon as they
+        // report progress; everyone else waits for news or the heartbeat.
+        let heartbeat_due = tip_is_news || std::time::Instant::now() >= next_status;
+        let history_due = peers.values().any(|peer| peer.history_wanted);
+
+        if heartbeat_due || history_due { 'send_status: {
+            if heartbeat_due {
+                next_status = std::time::Instant::now() + status_interval;
+                last_status_tip = tip_for_status;
+            }
 
             // Our chain tree, as of right now. Built here and dropped at the end of the block, so
             // it cannot go stale and nothing has to keep it up to date.
@@ -2486,10 +2497,15 @@ pub fn sync(
             for (address, _) in &current_connections {
                 let key = address.connection_key();
 
-                let Some(peer) = peers.get(&key) else {
+                let Some(peer) = peers.get_mut(&key) else {
                     if TRACE { tracing::info!("Trying to send a STATUS to {:?} but they haven't finished being created", address); }
                     continue;
                 };
+                if !heartbeat_due && !peer.history_wanted {
+                    continue;
+                }
+                peer.history_wanted = false;
+                let peer = &*peer;
 
                 let mut send_tip_chains = near_tip_chains.finalized_height < peer.their_tree.finalized_height;
                 if ! send_tip_chains {
@@ -3204,6 +3220,13 @@ pub fn sync(
                 );
                 peer.their_tree = their_tree;
                 peer.their_queue = their_queue;
+
+                // A far-behind peer learns what to fetch only from historical windows, 100 hashes
+                // at a time. It sends a STATUS whenever its tip moves, so answering each one with
+                // the next window moves it on once per round trip instead of once per heartbeat.
+                let their_height = peer.their_tree.branches.iter().filter_map(|b| b.last()).map(|b| b.this_height).max().unwrap_or(peer.their_tree.finalized_height);
+                let our_height = read_state.best_tip().map_or(0, |(h, _)| h.0);
+                peer.history_wanted = their_height < near_tip_start_height(our_height);
 
             } else if packet_type == PACKET_TYPE_BLOCK_REQ {
 
