@@ -517,6 +517,11 @@ fn crosslink_fat_pointer_changed_after_the_commitment_is_accepted_without_featur
 /// the regtest genesis, and the ten blocks of finality diagram scene 1, the last four of which
 /// cite BFT blocks. The hashes were recorded from the scene as the node loaded it before the
 /// binding existed (commit 32a059c6). Needs no node.
+///
+/// NOTE: this builds scene 1 UNBONDED (`diagram_scene_1(false)`), the shape it had when the hashes
+/// were recorded; every other user of the scene builds it bonded. Re-recording the hashes from
+/// `diagram_scene_1(true)` would let the unbonded path go, at the cost of no longer comparing
+/// against output from before the binding.
 #[test]
 fn crosslink_block_hashes_without_featurenet_upgrade_2_are_unchanged() {
     assert_eq!(
@@ -529,7 +534,7 @@ fn crosslink_block_hashes_without_featurenet_upgrade_2_are_unchanged() {
         "029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327"
     );
 
-    let (_, pow) = diagram_scene_1();
+    let (_, pow) = diagram_scene_1(false);
     let recorded = [
         "cfb89d521721f3701f91e9694c2af5c771e824151f7c97b43be933fb48edc62f",
         "fdfad1b116eedb950a10c390c90dadf9a1c51474c309e0c908b8bf950a21d0ba",
@@ -3318,15 +3323,17 @@ fn diagram_fork_miner() -> Address {
 /// can only point at a BFT block that already exists, so the two chains have to be
 /// interleaved this way; the diagram's `P10.context_bft = S6` with `S6` covering P8..P10
 /// is not constructible at all, since the pointer is inside the hashed header.
-fn diagram_scene_1() -> (TF, Vec<Arc<Block>>) {
+fn diagram_scene_1(bonded: bool) -> (TF, Vec<Arc<Block>>) {
     let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let network = regtest_network(&HARNESS_PARAMETERS);
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
-    let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut gen = diagram_start(&mut tf, network, &miner_addr, bonded);
+    let next = |pos_h: &mut u32, fat_ptr: &mut FatPointerToBftBlock, window: &[Arc<Block>]| diagram_next_pos(bonded, pos_h, fat_ptr, window);
+    let push = |tf: &mut TF, bft: &BftBlockAndFatPointerToItWrap| diagram_push_pos(bonded, tf, bft);
 
-    // pow[i] is the block at height i + 1, so pow[4] is the diagram's P5.
+    // pow[i] is the diagram's P(i + 1), so pow[4] is its P5. Bonded, it is at height
+    // i + 1 + BONDED_SHIFT; unbonded, at height i + 1, as the diagram draws it.
     let mut pow: Vec<Arc<Block>> = vec![gen.tip.clone()];
     for _ in 2..=6 {
         pow.push(gen.next_block(&miner_addr));
@@ -3338,22 +3345,22 @@ fn diagram_scene_1() -> (TF, Vec<Arc<Block>>) {
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
 
     // bft0 over [P4,P5,P6], snapshot P3; P7 then cites it.
-    let bft0 = next_pos(pos_h, fat_ptr, &pow[3..6], &[]);
-    tf.push_instr_load_pos(&bft0, 0);
+    let bft0 = next(pos_h, fat_ptr, &pow[3..6]);
+    push(&mut tf, &bft0);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft0.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
     // bft1 over [P5,P6,P7], snapshot P4; P8 then cites it.
-    let bft1 = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
-    tf.push_instr_load_pos(&bft1, 0);
+    let bft1 = next(pos_h, fat_ptr, &pow[4..7]);
+    push(&mut tf, &bft1);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft1.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
     // bft2 over [P6,P7,P8]. Its snapshot is P5, so the finalized marker lands there.
-    let bft2 = next_pos(pos_h, fat_ptr, &pow[5..8], &[]);
-    tf.push_instr_load_pos(&bft2, 0);
+    let bft2 = next(pos_h, fat_ptr, &pow[5..8]);
+    push(&mut tf, &bft2);
     for _ in 9..=10 {
         gen.next_block(&miner_addr);
         pow.push(point_tip_at_bft(&mut gen, &bft2.0.fat_ptr));
@@ -3370,20 +3377,51 @@ fn diagram_scene_1() -> (TF, Vec<Arc<Block>>) {
     (tf, pow)
 }
 
+// NOTE: the diagram scenes are built UNBONDED (`bonded == false`) for two readers only:
+// - `crosslink_write_finality_diagram_scenes`: the files are pictures for the GUI's "View (no
+//   consensus)" path and for viz2's tests, which assert the diagram's own heights (P1 at 1, fin
+//   at 5); bonding would put six blocks under P1.
+// - `crosslink_block_hashes_without_featurenet_upgrade_2_are_unchanged`: it pins scene 1's hashes
+//   as recorded before the fat pointer was bound into the header (commit 32a059c6), when the
+//   scene had no roster and unsigned certificates.
+// A real network has a roster from its BFT genesis on, so the tests that run a scene through the
+// node build it bonded. If the pictures and the pin are ever re-recorded from the bonded scenes,
+// delete `bonded` and these three helpers.
+
+fn diagram_start(tf: &mut TF, network: Network, miner_addr: &Address, bonded: bool) -> BlockGen {
+    match bonded {
+        true => bonded_start(tf, network),
+        false => BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, miner_addr),
+    }
+}
+
+fn diagram_next_pos(bonded: bool, pos_h: &mut u32, fat_ptr: &mut FatPointerToBftBlock, window: &[Arc<Block>]) -> BftBlockAndFatPointerToItWrap {
+    match bonded {
+        true => next_signed_pos(pos_h, fat_ptr, window),
+        false => next_pos(pos_h, fat_ptr, window, &[]),
+    }
+}
+
+fn diagram_push_pos(bonded: bool, tf: &mut TF, bft: &BftBlockAndFatPointerToItWrap) {
+    match bonded {
+        true => push_decided_pos(tf, bft, 0),
+        false => tf.push_instr_load_pos(bft, 0),
+    }
+}
+
 /// Scene 2: the benign case, where a reorganization exposes an older BFT context so the
 /// derived candidate moves backward while the whole new best chain still contains `fin`.
 ///
 /// Scene 1, then a branch off P8 whose blocks cite `bft1` rather than `bft2`. The diagram
 /// replaces P8-P10 with three Q blocks of higher work; regtest difficulty is constant, so
 /// here the branch wins by being one block longer instead, Q9..Q11.
-fn diagram_scene_2() -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
+fn diagram_scene_2(bonded: bool) -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
     let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let network = regtest_network(&HARNESS_PARAMETERS);
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
     let fork_addr = diagram_fork_miner();
-    let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut gen = diagram_start(&mut tf, network, &miner_addr, bonded);
 
     let mut pow: Vec<Arc<Block>> = vec![gen.tip.clone()];
     for _ in 2..=6 {
@@ -3395,14 +3433,14 @@ fn diagram_scene_2() -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
 
-    let bft0 = next_pos(pos_h, fat_ptr, &pow[3..6], &[]);
-    tf.push_instr_load_pos(&bft0, 0);
+    let bft0 = diagram_next_pos(bonded, pos_h, fat_ptr, &pow[3..6]);
+    diagram_push_pos(bonded, &mut tf, &bft0);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft0.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
-    let bft1 = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
-    tf.push_instr_load_pos(&bft1, 0);
+    let bft1 = diagram_next_pos(bonded, pos_h, fat_ptr, &pow[4..7]);
+    diagram_push_pos(bonded, &mut tf, &bft1);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft1.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
@@ -3411,8 +3449,8 @@ fn diagram_scene_2() -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
     // branches descend from the same block.
     let mut fork_gen = gen.clone();
 
-    let bft2 = next_pos(pos_h, fat_ptr, &pow[5..8], &[]);
-    tf.push_instr_load_pos(&bft2, 0);
+    let bft2 = diagram_next_pos(bonded, pos_h, fat_ptr, &pow[5..8]);
+    diagram_push_pos(bonded, &mut tf, &bft2);
     for _ in 9..=10 {
         gen.next_block(&miner_addr);
         pow.push(point_tip_at_bft(&mut gen, &bft2.0.fat_ptr));
@@ -3451,14 +3489,13 @@ fn diagram_scene_2() -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
 /// refused on ingest. It is a view-only scene, and there is no test that runs it through
 /// the node, because the behaviour under test would be the refusal rather than the
 /// picture.
-fn diagram_scene_3(fork_flags: u32) -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
+fn diagram_scene_3(bonded: bool, fork_flags: u32) -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
     let mut tf = TF::new(&HARNESS_PARAMETERS);
 
     let network = regtest_network(&HARNESS_PARAMETERS);
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
     let fork_addr = diagram_fork_miner();
-    let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut gen = diagram_start(&mut tf, network, &miner_addr, bonded);
 
     let mut pow: Vec<Arc<Block>> = vec![gen.tip.clone()];
     for _ in 2..=3 {
@@ -3475,22 +3512,22 @@ fn diagram_scene_3(fork_flags: u32) -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
 
-    let bft0 = next_pos(pos_h, fat_ptr, &pow[3..6], &[]);
-    tf.push_instr_load_pos(&bft0, 0);
+    let bft0 = diagram_next_pos(bonded, pos_h, fat_ptr, &pow[3..6]);
+    diagram_push_pos(bonded, &mut tf, &bft0);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft0.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
-    let bft1 = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
-    tf.push_instr_load_pos(&bft1, 0);
+    let bft1 = diagram_next_pos(bonded, pos_h, fat_ptr, &pow[4..7]);
+    diagram_push_pos(bonded, &mut tf, &bft1);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft1.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
 
     // Snapshot P5. Everything after this conflicts with it. P9 cites it: a decision alone
     // moves nothing (FINALITY.md §4.3), so without the citation `fin` would stop at P4.
-    let bft2 = next_pos(pos_h, fat_ptr, &pow[5..8], &[]);
-    tf.push_instr_load_pos(&bft2, 0);
+    let bft2 = diagram_next_pos(bonded, pos_h, fat_ptr, &pow[5..8]);
+    diagram_push_pos(bonded, &mut tf, &bft2);
     gen.next_block(&miner_addr);
     pow.push(point_tip_at_bft(&mut gen, &bft2.0.fat_ptr));
     tf.push_instr_load_pow(pow.last().unwrap(), 0);
@@ -3528,9 +3565,9 @@ fn diagram_scene_3(fork_flags: u32) -> (TF, Vec<Arc<Block>>, Vec<Arc<Block>>) {
 /// built from `BlockGen` alone, so this runs alongside anything else.
 #[test]
 fn crosslink_write_finality_diagram_scenes() {
-    let (tf1, pow1) = diagram_scene_1();
-    let (tf2, pow2, fork2) = diagram_scene_2();
-    let (tf3, pow3, fork3) = diagram_scene_3(0);
+    let (tf1, pow1) = diagram_scene_1(false);
+    let (tf2, pow2, fork2) = diagram_scene_2(false);
+    let (tf3, pow3, fork3) = diagram_scene_3(false, 0);
 
     // The first two scenes share their common prefix exactly, so scene 2 really is scene 1
     // plus a branch rather than a differently-generated chain.
@@ -3556,9 +3593,9 @@ fn crosslink_write_finality_diagram_scenes() {
 #[test]
 fn crosslink_finality_diagram_1_candidate() {
     set_test_name(function_name!());
-    let (mut tf, pow) = diagram_scene_1();
+    let (mut tf, pow) = diagram_scene_1(true);
 
-    tf.push_instr_expect_pow_chain_length(11, 0);
+    tf.push_instr_expect_pow_chain_length(11 + BONDED_SHIFT, 0);
     tf.push_instr_expect_pos_chain_length(3, 0);
     tf.push_instr_expect_pow_block_finality(&pow[4].hash(), Some(TFLBlockFinality::Finalized), 0);
     tf.push_instr_expect_pow_block_finality(
@@ -3575,9 +3612,9 @@ fn crosslink_finality_diagram_1_candidate() {
 #[test]
 fn crosslink_finality_diagram_2_benign_reorg() {
     set_test_name(function_name!());
-    let (mut tf, pow, _fork) = diagram_scene_2();
+    let (mut tf, pow, _fork) = diagram_scene_2(true);
 
-    tf.push_instr_expect_pow_chain_length(12, 0);
+    tf.push_instr_expect_pow_chain_length(12 + BONDED_SHIFT, 0);
     tf.push_instr_expect_pos_chain_length(3, 0);
     tf.push_instr_expect_pow_block_finality(&pow[4].hash(), Some(TFLBlockFinality::Finalized), 0);
 
@@ -3587,7 +3624,10 @@ fn crosslink_finality_diagram_2_benign_reorg() {
 /// Scene 2's best chain and decided BFT blocks, as `export-chain` would read them from the node
 /// that ran it: genesis, P1..P8, Q9..Q11, and bft0..bft2.
 fn diagram_scene_2_chain_prefix() -> zebra_state::ChainPrefix {
-    let (tf, pow, fork) = diagram_scene_2();
+    // TODO: build it bonded, as the other node-run scenes are. That needs the bonding blocks in the
+    // prefix (shifting every index below by BONDED_SHIFT) and decisions carrying their proposal
+    // signatures, which a SIGN_AS_PROPOSER scene file leaves to the harness.
+    let (tf, pow, fork) = diagram_scene_2(false);
     let bytes = tf.write_to_bytes();
     let decisions = TF::read_from_bytes(&bytes)
         .expect("the scene reads back")
@@ -3674,9 +3714,9 @@ fn crosslink_chain_prefix_trusted_loads() {
 #[test]
 fn crosslink_finality_diagram_3_conflicting_fork_is_refused() {
     set_test_name(function_name!());
-    let (mut tf, pow, _fork) = diagram_scene_3(SHOULD_FAIL);
+    let (mut tf, pow, _fork) = diagram_scene_3(true, SHOULD_FAIL);
 
-    tf.push_instr_expect_pow_chain_length(10, 0);
+    tf.push_instr_expect_pow_chain_length(10 + BONDED_SHIFT, 0);
     tf.push_instr_expect_pos_chain_length(3, 0);
     tf.push_instr_expect_pow_block_finality(&pow[4].hash(), Some(TFLBlockFinality::Finalized), 0);
 
