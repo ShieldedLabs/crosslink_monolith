@@ -1491,6 +1491,12 @@ impl BftRunner {
     fn validate(&self, chain: &BftChain, read_state: &ReadState, new_block: &BftBlock) -> (TMStatus, TMStatusReason) {
         let fail = (TMStatus::Fail, TMStatusReason::None);
 
+        // A block already decided at its height is valid there. Tenderlink asks this while it
+        // catches up behind decisions the sync loop fetched from peers.
+        if chain.hash_to_height.get(&new_block.blake3_hash()) == Some(&u64::from(new_block.height)) {
+            return (TMStatus::Pass, TMStatusReason::None);
+        }
+
         if !new_block.previous_block_fat_ptr.fits_active_roster(&self.params) {
             tracing::warn!(
                 "Block's previous block fat pointer has {} signatures, more than the {} seats of the active roster",
@@ -1722,6 +1728,45 @@ impl BftRunner {
                 fat_pointer.points_at_block_hash(), new_block.blake3_hash(),
             );
         }
+
+        // A height decided already: the sync loop fed it from peers while tenderlink lagged.
+        // Answer as that decision did, so tenderlink moves on. Another block at a decided height
+        // would need a conflicting quorum; it is never stored, and tenderlink is left waiting.
+        {
+            let chain = BFT_CHAIN.read().unwrap();
+            let height = new_block.height as usize;
+            if chain.blocks.get(height).is_some_and(|stored| !stored.headers.is_empty()) {
+                let same = chain.blocks[height].blake3_hash() == new_block.blake3_hash();
+                let next = match chain.voting_rosters.get(height + 1) {
+                    Some(voting) => (voting.roster.clone(), voting.vote_namespace, voting.strict_quorum),
+                    None => {
+                        let voting = self.next_voting_roster(&chain);
+                        (voting.roster, voting.vote_namespace, voting.strict_quorum)
+                    }
+                };
+                drop(chain);
+                if !same {
+                    tracing::error!(
+                        "BFT height {height} is decided already with another block; refusing {}",
+                        new_block.blake3_hash(),
+                    );
+                    if let DecisionReply::ForceFeed(reply) = reply {
+                        let _ = reply.send(Err(format!("BFT height {height} is decided already with another block")));
+                    }
+                    return;
+                }
+                match reply {
+                    DecisionReply::Tenderlink(reply) => {
+                        let _ = reply.send(next);
+                    }
+                    DecisionReply::ForceFeed(reply) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                }
+                return;
+            }
+        }
+
         let mut chain = BFT_CHAIN.write().unwrap();
         // Who voted at this height, read before the decision moves the chain on.
         let voting = self.next_voting_roster(&chain);
