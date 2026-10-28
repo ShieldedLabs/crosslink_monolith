@@ -765,8 +765,9 @@ impl BftRunner {
     }
 
     /// Whether a decided block is waiting for its snapshot PoW block before it can be stored.
+    /// This commit predates parked decisions (2edd11b1), so there never is one.
     pub(super) fn has_parked_decision(&self) -> bool {
-        self.parked_decision.is_some()
+        false
     }
 
     /// Work that runs at the start of every tick.
