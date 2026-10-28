@@ -738,6 +738,98 @@ const PEER_RESPOND_MS: u64 = 300;
 
 const IDLE_MS: u64 = 100;
 
+const SYNC_PROFILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the lowest queued block did in one pass of the commit loop: the block every later one
+/// waits behind, so the reason it did not commit is the reason the sync did not advance.
+#[derive(Clone, Copy)]
+enum CommitHead {
+    Committed,
+    ParentMissing,
+    /// `admit_fat_pointer` could not resolve the BFT block the PoW block cites.
+    BftGate,
+    DeferredOther,
+    Failed,
+}
+
+/// Where the sync's time goes, counted per tick and logged every `SYNC_PROFILE_INTERVAL` as one
+/// `key=value` line, so a run's log can be read back into a table.
+struct SyncProfile {
+    since: std::time::Instant,
+    ticks: u64,
+    committed: u64,
+    ticks_committing: u64,
+    ticks_queue_empty: u64,
+    ticks_parent_missing: u64,
+    ticks_bft_gate: u64,
+    ticks_deferred_other: u64,
+    ticks_failed: u64,
+    ticks_bft_parked: u64,
+    commit_time: std::time::Duration,
+}
+
+impl SyncProfile {
+    fn new() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            ticks: 0,
+            committed: 0,
+            ticks_committing: 0,
+            ticks_queue_empty: 0,
+            ticks_parent_missing: 0,
+            ticks_bft_gate: 0,
+            ticks_deferred_other: 0,
+            ticks_failed: 0,
+            ticks_bft_parked: 0,
+            commit_time: std::time::Duration::ZERO,
+        }
+    }
+
+    fn record_tick(&mut self, head: Option<CommitHead>, committed: u64, commit_time: std::time::Duration, bft_parked: bool) {
+        self.ticks += 1;
+        self.committed += committed;
+        self.commit_time += commit_time;
+        self.ticks_bft_parked += u64::from(bft_parked);
+        if committed > 0 {
+            self.ticks_committing += 1;
+            return;
+        }
+        match head {
+            None => self.ticks_queue_empty += 1,
+            Some(CommitHead::Committed) => self.ticks_committing += 1,
+            Some(CommitHead::ParentMissing) => self.ticks_parent_missing += 1,
+            Some(CommitHead::BftGate) => self.ticks_bft_gate += 1,
+            Some(CommitHead::DeferredOther) => self.ticks_deferred_other += 1,
+            Some(CommitHead::Failed) => self.ticks_failed += 1,
+        }
+    }
+
+    fn report_if_due(&mut self, tip_height: u32, bft_height: usize, queued: usize, downloads: u32, peers: usize) {
+        let elapsed = self.since.elapsed();
+        if elapsed < SYNC_PROFILE_INTERVAL {
+            return;
+        }
+        tracing::info!(
+            "NewNet: sync profile: seconds={:.1} tip={tip_height} bft_height={bft_height} committed={} blocks_per_s={:.2} \
+             ticks={} committing={} queue_empty={} parent_missing={} bft_gate={} deferred_other={} failed={} \
+             bft_parked={} commit_ms={} queued={queued} downloads={downloads} peers={peers}",
+            elapsed.as_secs_f64(),
+            self.committed,
+            self.committed as f64 / elapsed.as_secs_f64(),
+            self.ticks,
+            self.ticks_committing,
+            self.ticks_queue_empty,
+            self.ticks_parent_missing,
+            self.ticks_bft_gate,
+            self.ticks_deferred_other,
+            self.ticks_failed,
+            self.ticks_bft_parked,
+            self.commit_time.as_millis(),
+        );
+        *self = Self::new();
+    }
+}
+
 const MAX_BANDWIDTH_BYTES_PER_MS: usize = 7_000; // 7 MB/s
 const MAX_BANDWIDTH_BYTES_PER_RES: usize = MAX_BANDWIDTH_BYTES_PER_MS * PEER_RESPOND_MS as usize;
 // x2: the budget sizes every in-flight block at MAX_BLOCK_BYTES, but real blocks are a small
@@ -2005,6 +2097,8 @@ pub fn sync(
         let short = &addr[addr.len().saturating_sub(6)..]; // 6 base64 chars -> 4 bytes -> probably unique up to 65536 connections
         short.to_string()
     };
+
+    let mut sync_profile = SyncProfile::new();
 
     // Stop only between writes. A commit and its chain/BFT bookkeeping finish
     // together on this thread; dropping it mid-commit is never a shutdown path.
@@ -3468,6 +3562,9 @@ pub fn sync(
 
         // @Temporary: just pull one and wait to commit it.
         let mut any_blocks_in_the_queue_can_make_progress = false;
+        let commit_start = std::time::Instant::now();
+        let mut commit_head: Option<CommitHead> = None;
+        let mut committed_this_tick = 0u64;
         blocks_to_commit.retain(|(hash, block_arc)| {
             if zebra_chain::shutdown::is_shutting_down() { return true; }
             let hash = *hash;
@@ -3477,6 +3574,7 @@ pub fn sync(
             let fate = fates.get_mut(&hash).expect("every queued block has a fate");
 
             if read_state.known_block(parent_hash).is_none() {
+                commit_head.get_or_insert(CommitHead::ParentMissing);
                 fate.tell_pending(&synthetic_peers, hash, format_args!("parent {parent_hash} is not committed yet"));
                 return true; // keep
             }
@@ -3609,6 +3707,7 @@ pub fn sync(
             // A deferrable verdict means "not yet", not "no": keep the block so the next tick
             // can retry it, instead of dropping it and paying for another download.
             if let Err((phase, err, true)) = &verdict {
+                commit_head.get_or_insert(if *phase == "crosslink" { CommitHead::BftGate } else { CommitHead::DeferredOther });
                 if first_attempt { println!("Deferring: @ {height}, {hash}: {phase}: {}", err.msg); }
                 fate.tell_pending(&synthetic_peers, hash, format_args!("{phase}: {}", err.msg));
                 return true; // keep
@@ -3661,6 +3760,10 @@ pub fn sync(
                 },
             };
             let failed = matches!(outcome, IngestOutcome::Failed { .. });
+            if res.is_ok() {
+                committed_this_tick += 1;
+            }
+            commit_head.get_or_insert(if failed { CommitHead::Failed } else { CommitHead::Committed });
             let delivered_by = settle_fate(&mut fates, &synthetic_peers, hash, outcome);
 
             // Only a bad header gets the peer killed: the hash commits to the header and nothing
@@ -3696,6 +3799,15 @@ pub fn sync(
                 }
             }
         });
+
+        sync_profile.record_tick(commit_head, committed_this_tick, commit_start.elapsed(), bft_runner.has_parked_decision());
+        sync_profile.report_if_due(
+            read_state.best_tip().map_or(0, |(h, _)| h.0),
+            bft::bft_chain().read().unwrap().blocks.len(),
+            blocks_to_commit.len(),
+            peers.iter().map(|(_, peer)| peer.block_downloads.used_flags.count_ones()).sum(),
+            current_connections.len(),
+        );
 
         // Blocks at or below the finalized height can never commit, so holding them is pure
         // waste. This replaces a blanket clear() that used to throw away the whole cache --
