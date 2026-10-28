@@ -24,6 +24,7 @@ use tenderlink::{dbg_panic, dbg_verify};
 
 mod checkpoint;
 pub mod bft;
+mod bft_sync;
 pub mod fin;
 use checkpoint::Checkpoint;
 
@@ -45,7 +46,10 @@ const PACKET_TYPE_BLOCK_REQ:         u8 = 3;
 const PACKET_TYPE_PEER_ADDRESS_LIST: u8 = 4;
 const PACKET_TYPE_WANT_HOLE_PUNCH:   u8 = 5;
 const PACKET_TYPE_TRY_HOLE_PUNCH:    u8 = 6;
-const PACKET_TYPE_COUNT:             u8 = 7;
+const PACKET_TYPE_BFT_STATUS:        u8 = 7;
+const PACKET_TYPE_BFT_REQ:           u8 = 8;
+const PACKET_TYPE_BFT_DECISIONS:     u8 = 9;
+const PACKET_TYPE_COUNT:             u8 = 10;
 
 #[allow(dead_code)] // looked up by the commented packet-type log in the recv loop
 const PACKET_TYPE_NAMES: [&str; PACKET_TYPE_COUNT as usize] = {
@@ -56,7 +60,10 @@ const PACKET_TYPE_NAMES: [&str; PACKET_TYPE_COUNT as usize] = {
     names[PACKET_TYPE_PEER_ADDRESS_LIST as usize] = "PEER_ADDRESS_LIST";
     names[PACKET_TYPE_WANT_HOLE_PUNCH   as usize] = "WANT_HOLE_PUNCH";
     names[PACKET_TYPE_TRY_HOLE_PUNCH    as usize] = "TRY_HOLE_PUNCH";
-    const_assert!(PACKET_TYPE_COUNT == 7); // keep names array updated when adding other types
+    names[PACKET_TYPE_BFT_STATUS        as usize] = "BFT_STATUS";
+    names[PACKET_TYPE_BFT_REQ           as usize] = "BFT_REQ";
+    names[PACKET_TYPE_BFT_DECISIONS     as usize] = "BFT_DECISIONS";
+    const_assert!(PACKET_TYPE_COUNT == 10); // keep names array updated when adding other types
     names
 };
 #[allow(dead_code)] // looked up by the commented packet-type log in the recv loop
@@ -740,6 +747,46 @@ const IDLE_MS: u64 = 100;
 
 const SYNC_PROFILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How many decided BFT heights past our own the sync loop keeps fetched and waiting. Each is
+/// about 10 KB, and each waits only for its snapshot PoW block, which is fetched alongside.
+const BFT_FETCH_AHEAD: u64 = 512;
+/// A peer this many decided heights ahead of us means we are catching up: decisions are fetched
+/// as data, and tenderlink is held back until we are within it.
+const BFT_CATCH_UP_SLACK: u64 = 3;
+/// A BFT_REQ unanswered for this long is sent again, to another peer if one has the heights.
+const BFT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Store every fetched decision that is ready: the next height, its snapshot committed. Called
+/// between PoW commits, so a decision lands as soon as its snapshot does and the PoW blocks
+/// citing it find it decided.
+fn feed_ready_decisions(
+    fetched: &mut std::collections::BTreeMap<u64, bft_sync::WireDecision>,
+    bft_runner: &mut bft::BftRunner,
+    read_state: &ReadState,
+    block_writer: &mut crate::service::write::WriteBlockWorkerTask,
+) -> u64 {
+    let mut fed = 0;
+    loop {
+        let next = bft::decided_len();
+        // Heights decided meanwhile, by tenderlink or an earlier feed, are no longer wanted.
+        while fetched.first_key_value().is_some_and(|(&height, _)| height < next) {
+            fetched.pop_first();
+        }
+        let Some(decision) = fetched.remove(&next) else { return fed; };
+        match bft_runner.feed_fetched(decision, read_state, block_writer) {
+            bft::FeedOutcome::Fed => fed += 1,
+            bft::FeedOutcome::NotReady(decision) => {
+                fetched.insert(decision.height, decision);
+                return fed;
+            }
+            bft::FeedOutcome::Refused(why) => {
+                tracing::warn!("NewNet: refused a fetched BFT decision at height {next}: {why}");
+                return fed;
+            }
+        }
+    }
+}
+
 /// What the lowest queued block did in one pass of the commit loop: the block every later one
 /// waits behind, so the reason it did not commit is the reason the sync did not advance.
 #[derive(Clone, Copy)]
@@ -804,7 +851,7 @@ impl SyncProfile {
         }
     }
 
-    fn report_if_due(&mut self, tip_height: u32, bft_height: usize, queued: usize, downloads: u32, peers: usize) {
+    fn report_if_due(&mut self, tip_height: u32, bft_height: usize, bft_waiting: usize, queued: usize, downloads: u32, peers: usize) {
         let elapsed = self.since.elapsed();
         if elapsed < SYNC_PROFILE_INTERVAL {
             return;
@@ -812,7 +859,7 @@ impl SyncProfile {
         tracing::info!(
             "NewNet: sync profile: seconds={:.1} tip={tip_height} bft_height={bft_height} committed={} blocks_per_s={:.2} \
              ticks={} committing={} queue_empty={} parent_missing={} bft_gate={} deferred_other={} failed={} \
-             bft_parked={} commit_ms={} queued={queued} downloads={downloads} peers={peers}",
+             bft_parked={} commit_ms={} queued={queued} downloads={downloads} peers={peers} bft_waiting={bft_waiting}",
             elapsed.as_secs_f64(),
             self.committed,
             self.committed as f64 / elapsed.as_secs_f64(),
@@ -1446,6 +1493,9 @@ pub struct Peer {
     // their last STATUS showed them wholly below our near-tip window: send them the next
     // historical window on the next tick rather than at the heartbeat
     history_wanted: bool,
+
+    // how many decided BFT heights they hold, from their last BFT_STATUS
+    their_bft_len: u64,
 }
 
 #[derive(Debug)]
@@ -2104,12 +2154,22 @@ pub fn sync(
 
     let mut sync_profile = SyncProfile::new();
 
+    // Decided BFT heights fetched from peers and waiting for their snapshot, and the one BFT_REQ
+    // in flight: (peer, first height asked for, when).
+    let mut bft_fetched: std::collections::BTreeMap<u64, bft_sync::WireDecision> = std::collections::BTreeMap::new();
+    let mut bft_request: Option<(ConnectionKey, u64, std::time::Instant)> = None;
+    let mut last_bft_request_peer: Option<ConnectionKey> = None;
+
     // Stop only between writes. A commit and its chain/BFT bookkeeping finish
     // together on this thread; dropping it mid-commit is never a shutdown path.
     while !zebra_chain::shutdown::is_shutting_down() {
         let loop_start = std::time::Instant::now();
 
+        let our_bft_len = bft::decided_len();
+        let peers_bft_len = peers.values().map(|peer| peer.their_bft_len).max().unwrap_or(0);
+        bft_runner.set_catching_up(peers_bft_len > our_bft_len + BFT_CATCH_UP_SLACK);
         bft_runner.tick(&read_state, &mut block_writer);
+        feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer);
 
         if loop_start > next_console_status_print {
             let mut my_peers_to_print = Vec::new();
@@ -2506,6 +2566,9 @@ pub fn sync(
                 }
                 peer.history_wanted = false;
                 let peer = &*peer;
+                if heartbeat_due {
+                    packets_to_send.push((key, bft_sync::bft_status_packet(bft::decided_len())));
+                }
 
                 let mut send_tip_chains = near_tip_chains.finalized_height < peer.their_tree.finalized_height;
                 if ! send_tip_chains {
@@ -3040,6 +3103,30 @@ pub fn sync(
         // did not answer in time because it died or wedged: keep our connection
         // list as it was instead of replacing it with an empty answer, so this
         // tick loop -- and with it Zebra's shutdown -- can continue.
+        // Fetch decided BFT heights ahead of our own from a peer that holds them, one request
+        // in flight, so the decisions PoW blocks cite are here when those blocks are.
+        if bft_request.is_some_and(|(_, _, sent)| sent.elapsed() >= BFT_REQUEST_TIMEOUT) {
+            bft_request = None;
+        }
+        if bft_request.is_none() {
+            let our_len = bft::decided_len();
+            let mut want = our_len;
+            while bft_fetched.contains_key(&want) {
+                want += 1;
+            }
+            let room = (our_len + BFT_FETCH_AHEAD).saturating_sub(want);
+            // Rotate among the peers that hold them, so one silent peer cannot hold up the fetch.
+            let holders: Vec<ConnectionKey> = peers.iter().filter(|(_, peer)| peer.their_bft_len > want).map(|(key, _)| *key).collect();
+            let holder = holders.iter().copied().find(|&key| Some(key) != last_bft_request_peer).or(holders.first().copied());
+            if let (Some(key), true) = (holder, room > 0) {
+                // A u16 count, at most the per-message cap.
+                let count = room.min(u64::from(bft_sync::MAX_DECISIONS_PER_MESSAGE)) as u16;
+                packets_to_send.push((key, bft_sync::bft_req_packet(want, count)));
+                bft_request = Some((key, want, std::time::Instant::now()));
+                last_bft_request_peer = Some(key);
+            }
+        }
+
         let mut packets_received = match service_connections(&mut network_thread_handle, NetworkThreadPush {
             initiate_connections,
             wanted_connections: current_connections.iter().filter(|(addr, _)| !synthetic_peers.iter().any(|p| p.address == *addr)).cloned().collect(),
@@ -3544,6 +3631,41 @@ pub fn sync(
                 println!("Queueing for commit: {}", hash);
                 blocks_to_commit.push((hash, std::sync::Arc::new(block)));
                 fates.insert(hash, BlockFate { delivered_by: Some(connection_key), ..Default::default() });
+            } else if packet_type == PACKET_TYPE_BFT_STATUS {
+                let Some(their_bft_len) = some_or_kill!(bft_sync::read_bft_status(msg), "Malformed BFT_STATUS") else {
+                    continue 'process_packets;
+                };
+                peer.their_bft_len = their_bft_len;
+
+            } else if packet_type == PACKET_TYPE_BFT_REQ {
+                let Some((from, count)) = some_or_kill!(bft_sync::read_bft_req(msg), "Malformed BFT_REQ") else {
+                    continue 'process_packets;
+                };
+                // Heights past u32 cannot be stored, so nothing is there to send.
+                if let Ok(from) = u32::try_from(from) {
+                    let decisions = block_writer.finalized_state.db.bft_decisions(from, count.into());
+                    if !decisions.is_empty() {
+                        let packet = bft_sync::bft_decisions_packet(decisions.iter().enumerate().map(|(i, d)| {
+                            (u64::from(from) + i as u64, &d.block, &d.fat_pointer, d.proposal_sigs.as_slice())
+                        }));
+                        bulk_packets_to_send.push((connection_key, packet));
+                    }
+                }
+
+            } else if packet_type == PACKET_TYPE_BFT_DECISIONS {
+                let Some(decisions) = some_or_kill!(bft_sync::read_bft_decisions(msg), "Malformed BFT_DECISIONS") else {
+                    continue 'process_packets;
+                };
+                let next = bft::decided_len();
+                for decision in decisions {
+                    if decision.height >= next && decision.height < next + BFT_FETCH_AHEAD {
+                        bft_fetched.entry(decision.height).or_insert(decision);
+                    }
+                }
+                if bft_request.is_some_and(|(key, ..)| key == connection_key) {
+                    bft_request = None;
+                }
+
             } else {
                 warning!("NewNet: Got unknown msg type={} len={}, ignoring.", packet_type, msg.len());
                 continue 'process_packets;
@@ -3594,6 +3716,7 @@ pub fn sync(
             // Validate and Decided answer. Serve it between blocks, not only between ticks; a
             // decision stored here can also let the next block's fat pointer resolve.
             bft_runner.drain(&read_state, &mut block_writer);
+            feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer);
             let hash = *hash;
             let block_arc = block_arc.clone();
 
@@ -3827,10 +3950,12 @@ pub fn sync(
             }
         });
 
+        feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer);
         sync_profile.record_tick(commit_head, committed_this_tick, commit_start.elapsed(), bft_runner.has_parked_decision());
         sync_profile.report_if_due(
             read_state.best_tip().map_or(0, |(h, _)| h.0),
             bft::bft_chain().read().unwrap().blocks.len(),
+            bft_fetched.len(),
             blocks_to_commit.len(),
             peers.iter().map(|(_, peer)| peer.block_downloads.used_flags.count_ones()).sum(),
             current_connections.len(),

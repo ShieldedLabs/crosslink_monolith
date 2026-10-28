@@ -90,6 +90,29 @@ impl ZebraDb {
         chain
     }
 
+    /// Up to `count` decided heights from `from` on, ascending, stopping at the first gap like
+    /// [`Self::bft_chain`]: what a peer catching up asks for.
+    pub fn bft_decisions(&self, from: u32, count: u32) -> Vec<StoredDecision> {
+        let range = BftHeight(from)..BftHeight(from.saturating_add(count));
+        let blocks = self.bft_block_by_height_cf().zs_items_in_range_ordered(range.clone());
+        let fat_pointers = self.bft_fat_pointer_by_height_cf().zs_items_in_range_ordered(range.clone());
+        let sigs = self.bft_proposal_sigs_by_height_cf().zs_items_in_range_ordered(range);
+
+        let mut decisions = Vec::with_capacity(blocks.len());
+        for (i, (height, block)) in blocks.into_iter().enumerate() {
+            if height.0 as usize != from as usize + i {
+                break;
+            }
+            let Some(fat_pointer) = fat_pointers.get(&height) else { break; };
+            decisions.push(StoredDecision {
+                block: block.0,
+                fat_pointer: fat_pointer.0.clone(),
+                proposal_sigs: sigs.get(&height).map(|s| s.0.clone()).unwrap_or_default(),
+            });
+        }
+        decisions
+    }
+
     /// Write one decided BFT height. The roster is not stored: it is recomputed from the bonds
     /// at the block's snapshot on every load (FINALITY.md §8.1).
     pub fn write_bft_decision(

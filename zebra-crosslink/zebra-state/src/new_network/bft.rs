@@ -356,6 +356,10 @@ pub enum BftRequest {
         /// The proposal's valid round, which its chunk signatures cover; -1 for none. Checked,
         /// not stored: `restore` reads it back from the signatures (`proposal_valid_round`).
         valid_round: i64,
+        /// Require the certificate to carry a quorum of the height's roster even before
+        /// FeaturenetUpgrade2: set for decisions fetched from peers, where nothing else vouches
+        /// for them. Imports keep the rule of the height they were decided at.
+        require_certificate: bool,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
 }
@@ -381,7 +385,7 @@ pub async fn force_feed_bft_block(
     valid_round: i64,
 ) -> Result<(), String> {
     let (reply, rx) = tokio::sync::oneshot::channel();
-    let request = BftRequest::ForceFeed { block, fat_pointer, proposal_sigs, valid_round, reply };
+    let request = BftRequest::ForceFeed { block, fat_pointer, proposal_sigs, valid_round, require_certificate: false, reply };
     if !send_request(request) {
         return Err("new_network is not running".to_string());
     }
@@ -403,7 +407,7 @@ pub async fn validate_bft_block(block: BftBlock) -> Result<(TMStatus, TMStatusRe
 /// Tenderlink certifies a hash of a proposal's raw bytes, but `decide` checks the hash of the
 /// block re-serialized. A proposal that parses but is not canonical (trailing bytes, for one)
 /// would be certified and then abort every node that reaches `decide`, so validation refuses it.
-fn bft_block_from_canonical_bytes(bytes: &[u8]) -> Option<BftBlock> {
+pub(super) fn bft_block_from_canonical_bytes(bytes: &[u8]) -> Option<BftBlock> {
     let block = BftBlock::zcash_deserialize(bytes).ok()?;
     let canonical = block.zcash_serialize_to_vec().ok()?;
     (canonical == bytes).then_some(block)
@@ -1054,6 +1058,19 @@ enum DecisionReply {
 
 /// The BFT side of the sync thread: answers tenderlink's requests against the writer's chains,
 /// bootstraps BFT from the bc-chain, and persists decisions.
+/// What [`BftRunner::feed_fetched`] did with a decision.
+pub(super) enum FeedOutcome {
+    Fed,
+    /// Not the next height, or its snapshot is not committed yet: handed back to keep.
+    NotReady(super::bft_sync::WireDecision),
+    Refused(String),
+}
+
+/// How many decided BFT heights this node holds: the chain up to its first placeholder.
+pub(super) fn decided_len() -> u64 {
+    BFT_CHAIN.read().unwrap().blocks.iter().take_while(|block| !block.headers.is_empty()).count() as u64
+}
+
 pub(super) struct BftRunner {
     rx: std::sync::mpsc::Receiver<BftRequest>,
     rt: tokio::runtime::Handle,
@@ -1079,6 +1096,12 @@ pub(super) struct BftRunner {
     /// Set while `tick` retries the parked decision, so only the first park is a warning.
     retrying_parked_decision: bool,
     next_diagnostic: std::time::Instant,
+    /// Set by the sync loop while peers hold many more decided heights than this node. It fetches
+    /// them as data then, and tenderlink would only crawl after them one height per exchange.
+    catching_up: bool,
+    /// Tenderlink was due to start while catching up. It starts from the stored chain once the
+    /// node has caught up.
+    spawn_deferred: bool,
 }
 
 struct ParkedDecision {
@@ -1118,6 +1141,8 @@ impl BftRunner {
             parked_decision: None,
             retrying_parked_decision: false,
             next_diagnostic: std::time::Instant::now(),
+            catching_up: false,
+            spawn_deferred: false,
         };
         metrics::gauge!("state.crosslink.bft_dropped").set(0.0);
         crate::new_network::fin::load(&block_writer.finalized_state.db);
@@ -1132,8 +1157,56 @@ impl BftRunner {
         self.parked_decision.is_some()
     }
 
+    /// Tell BFT whether the node is catching up on decided heights it fetches from peers.
+    pub(super) fn set_catching_up(&mut self, catching_up: bool) {
+        self.catching_up = catching_up;
+    }
+
+    /// Store a decided height fetched from a peer, if it is the next one and its snapshot is
+    /// committed. It is checked as a force-fed decision, and its certificate must carry a quorum
+    /// of the height's roster whatever the upgrade: no tenderlink round vouches for it.
+    pub(super) fn feed_fetched(&mut self, decision: super::bft_sync::WireDecision, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) -> FeedOutcome {
+        let valid_round = {
+            let chain = BFT_CHAIN.read().unwrap();
+            if decision.height != chain.blocks.len() as u64 {
+                return FeedOutcome::NotReady(decision);
+            }
+            if decision.block.height as u64 != decision.height {
+                return FeedOutcome::Refused(format!("a block for BFT height {} sent as height {}", decision.block.height, decision.height));
+            }
+            if read_state.known_block(Hash(decision.block.snapshot_block_hash().0)).is_none() {
+                return FeedOutcome::NotReady(decision);
+            }
+            let voting = self.next_voting_roster(&chain);
+            proposal_valid_round(&decision.block, &decision.fat_pointer, &decision.proposal_sigs, &voting, self.params.active_roster_max_n).unwrap_or(-1)
+        };
+        let (reply, mut rx) = tokio::sync::oneshot::channel();
+        let request = BftRequest::ForceFeed {
+            block: Arc::new(decision.block),
+            fat_pointer: decision.fat_pointer,
+            proposal_sigs: decision.proposal_sigs,
+            valid_round,
+            require_certificate: true,
+            reply,
+        };
+        self.handle(request, read_state, block_writer);
+        match rx.try_recv() {
+            Ok(Ok(())) => FeedOutcome::Fed,
+            Ok(Err(why)) => FeedOutcome::Refused(why),
+            // Parked: the decision is stored once its snapshot is back, like tenderlink's own.
+            Err(_) => FeedOutcome::Fed,
+        }
+    }
+
     /// Work that runs at the start of every tick.
     pub(super) fn tick(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
+        // Caught up with peers: start tenderlink from everything stored, fetched decisions
+        // included, rather than at the height it would have started at.
+        if self.spawn_deferred && !self.catching_up && self.launch.is_some() {
+            self.spawn_deferred = false;
+            self.restore(read_state, block_writer);
+        }
+
         // Crosslink bootstrap: the first accepted PoW block at the activation height (h2)
         // finalizes h1 through a deterministic genesis decision, and BFT starts at height 1 with
         // h1's roster. A network whose BFT is supplied has no activation height and never
@@ -1224,7 +1297,7 @@ impl BftRunner {
                 }
                 self.decide(block, fat_pointer, proposal_sigs, DecisionReply::Tenderlink(reply), read_state, block_writer);
             }
-            BftRequest::ForceFeed { block, fat_pointer, proposal_sigs, valid_round, reply } => {
+            BftRequest::ForceFeed { block, fat_pointer, proposal_sigs, valid_round, require_certificate, reply } => {
                 if bft_is_dropped() {
                     let _ = reply.send(Err("BFT is dropped on this node".to_string()));
                     return;
@@ -1272,7 +1345,7 @@ impl BftRunner {
                         )));
                         return;
                     }
-                    if voting.strict_quorum && !certificate_is_valid(&fat_pointer, u64::from(block.height), &voting) {
+                    if (voting.strict_quorum || require_certificate) && !certificate_is_valid(&fat_pointer, u64::from(block.height), &voting) {
                         let _ = reply.send(Err(format!(
                             "the fat pointer is not a valid certificate for BFT height {}", block.height,
                         )));
@@ -2221,6 +2294,13 @@ impl BftRunner {
         }
         if bft_is_dropped() {
             self.launch = None;
+            return;
+        }
+        if self.catching_up {
+            if !self.spawn_deferred {
+                tracing::info!("holding tenderlink back while the decided BFT chain is fetched from peers");
+            }
+            self.spawn_deferred = true;
             return;
         }
         let Some(launch) = self.launch.take() else { return; };
