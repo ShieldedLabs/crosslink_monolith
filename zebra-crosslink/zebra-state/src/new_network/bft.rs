@@ -764,6 +764,11 @@ impl BftRunner {
         runner
     }
 
+    /// Whether a decided block is waiting for its snapshot PoW block before it can be stored.
+    pub(super) fn has_parked_decision(&self) -> bool {
+        self.parked_decision.is_some()
+    }
+
     /// Work that runs at the start of every tick.
     pub(super) fn tick(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
         // Crosslink bootstrap: the first accepted PoW block at the activation height (h2)
