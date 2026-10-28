@@ -433,7 +433,7 @@ const FAT_POINTER_BINDING_UPGRADE: u32 = 4 + BONDED_SHIFT as u32;
 /// disagree on.
 ///
 /// bft0 is the BFT genesis, which the bootstrap decides with an empty certificate; bft1 carries a
-/// certificate all of SUPPLIED_FINALIZERS sign. Both are certificates the node admits, so the copy
+/// certificate SUPPLIED_FINALIZER signs. Both are certificates the node admits, so the copy
 /// passes the certificate check and fails only the commitment. A pointer with a changed height
 /// byte or signature list is not a variant this scene offers: the certificate check would refuse
 /// it before the commitment check ran, proving nothing about the binding. Changed signature lists
@@ -3625,8 +3625,7 @@ fn crosslink_finality_diagram_2_benign_reorg() {
 /// that ran it: genesis, P1..P8, Q9..Q11, and bft0..bft2.
 fn diagram_scene_2_chain_prefix() -> zebra_state::ChainPrefix {
     // TODO: build it bonded, as the other node-run scenes are. That needs the bonding blocks in the
-    // prefix (shifting every index below by BONDED_SHIFT) and decisions carrying their proposal
-    // signatures, which a SIGN_AS_PROPOSER scene file leaves to the harness.
+    // prefix, shifting every index below by BONDED_SHIFT.
     let (tf, pow, fork) = diagram_scene_2(false);
     let bytes = tf.write_to_bytes();
     let decisions = TF::read_from_bytes(&bytes)
@@ -5073,78 +5072,47 @@ fn crosslink_load_pos_refuses_a_decision_with_no_signatures() {
 // # Supplied BFT with a roster
 //
 // A scene that supplies its BFT blocks (HARNESS_PARAMETERS) still has a roster from the BFT
-// genesis on, as a real network does: SUPPLIED_FINALIZERS are bonded before the genesis's
-// snapshot, every decision's certificate is signed by all of them, and every decision above the
-// genesis carries its proposer's chunk signatures.
+// genesis on, as a real network does. A scene not testing BFT behaviour bonds one finalizer,
+// SUPPLIED_FINALIZER, before the genesis's snapshot. As the whole roster it signs every certificate
+// alone and proposes every round, whatever rewards do to its stake, so the writer signs everything
+// when the file is written. Scenes about quorums, signer lists or proposer choice keep rosters of
+// their own (BFT_ROUNDS_PARAMETERS, `fat_pointer_binding_on_a_roster_across_featurenet_upgrade_2`).
+//
+// The signatures are made under the namespace `[0; 32]`, which is the node's for a height with no
+// slashfork scheduled at or below it and a snapshot before FeaturenetUpgrade2
+// (`namespace_for_bft_height`). The node refuses a decision signed otherwise.
 
-/// The synthetic finalizers a supplied-BFT scene bonds, each with the same stake.
-const SUPPLIED_FINALIZERS: [u16; 4] = [0, 1, 2, 3];
+/// The synthetic finalizer a supplied-BFT scene bonds, and its bond.
+const SUPPLIED_FINALIZER: u64 = 0;
 const SUPPLIED_STAKE: u64 = 100_000_000;
 
 /// How much higher a scene's `pow[0]` is after `bonded_start` than at the block after the PoW
 /// genesis, where scenes started before they had a roster: `pow[i]` is at height
 /// `i + 1 + BONDED_SHIFT`.
-const BONDED_SHIFT: usize = 6;
+const BONDED_SHIFT: usize = 3;
 
-/// The start of a supplied-BFT scene: loads blocks mined to the test miner until enough coinbases
-/// mature, a block bonding every one of SUPPLIED_FINALIZERS, and one more. Returns the generator at
-/// that last block, which the scene treats as its first, so even a BFT genesis whose headers start
-/// at it finalizes the bonds: its snapshot is the bond block.
+/// The start of a supplied-BFT scene: loads blocks mined to the test miner until a coinbase
+/// matures, a block bonding SUPPLIED_FINALIZER, and one more. Returns the generator at that last
+/// block, which the scene treats as its first, so even a BFT genesis whose headers start at it
+/// finalizes the bond: its snapshot is the bond block.
 fn bonded_start(tf: &mut TF, network: Network) -> BlockGen {
     let key = TestKey::new(b"crosslink test miner");
     let miner = key.address();
     let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
     tf.push_instr_load_pow(&gen.tip, 0);
-    let inputs = matured_coinbases(tf, &mut gen, &key, SUPPLIED_FINALIZERS.len());
-    let bonds: Vec<Arc<Transaction>> = inputs
-        .into_iter()
-        .zip(SUPPLIED_FINALIZERS)
-        .map(|(input, k)| {
-            let signing_key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k.into()).as_bytes()).1;
-            let finalizer = zcash_primitives::bft::FinalizerAddress::create(&signing_key);
-            staking_tx_create_bond_funded(gen.next_upgrade(), format!("supplied-bond-{k}").as_bytes(), finalizer, SUPPLIED_STAKE, &key, input)
-        })
-        .collect();
-    tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &bonds), 0);
+    let [input] = <[_; 1]>::try_from(matured_coinbases(tf, &mut gen, &key, 1)).expect("one matured coinbase");
+    let signing_key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(SUPPLIED_FINALIZER).as_bytes()).1;
+    let finalizer = zcash_primitives::bft::FinalizerAddress::create(&signing_key);
+    let bond = staking_tx_create_bond_funded(gen.next_upgrade(), b"supplied-bond", finalizer, SUPPLIED_STAKE, &key, input);
+    tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &[bond]), 0);
     tf.push_instr_load_pow(&gen.next_block(&miner), 0);
     let height = gen.tip.coinbase_height().expect("generated blocks have a height").0 as usize;
     assert_eq!(height, 1 + BONDED_SHIFT, "BONDED_SHIFT names where the bond block lands");
     gen
 }
 
-/// The seeds of SUPPLIED_FINALIZERS in roster order, which is the order a certificate must list
-/// its signers in from FeaturenetUpgrade2 (`certificate_is_valid`); before it a pointer is checked
-/// by hash alone. Ordered by the node's own roster ordering on their equal bonds, so by key.
-/// Rewards can untie them: each payout's rounding remainder goes to the biggest bond, ties to the
-/// smaller key, so a decision whose snapshot is many payouts after bonding may rank them by stake
-/// instead. The node then refuses the certificate, so a scene that gets this wrong fails loudly.
-/// The order has to be right when the file is written: the certificate is embedded in every PoW
-/// header citing the decision, so it cannot be re-signed at load. Such a scene needs the stakes at
-/// the snapshot (as PayoutModel computes them), or bonds sized so every share divides evenly.
-fn supplied_finalizer_seeds_in_roster_order() -> Vec<String> {
-    let members: Vec<zcash_primitives::transaction::RosterMember> = SUPPLIED_FINALIZERS
-        .iter()
-        .map(|&k| zcash_primitives::transaction::RosterMember {
-            pub_key: synthetic_finalizer_pub_key(k.into()),
-            voting_power: SUPPLIED_STAKE,
-            ..Default::default()
-        })
-        .collect();
-    let roster = zebra_state::new_network::bft::tenderlink_roster_from_internal(&members, &Default::default());
-    roster
-        .iter()
-        .map(|member| {
-            let k = SUPPLIED_FINALIZERS
-                .into_iter()
-                .find(|&k| synthetic_finalizer_pub_key(k.into()) == member.pub_key.0)
-                .expect("the roster holds only SUPPLIED_FINALIZERS");
-            synthetic_finalizer_seed(k.into())
-        })
-        .collect()
-}
-
-/// As `next_pos_at_round`, with the certificate SUPPLIED_FINALIZERS sign, in roster order. The
-/// genesis's is empty: its roster is the stake it finalizes, which no one voted with before it.
+/// As `next_pos_at_round`, with the certificate SUPPLIED_FINALIZER signs. The genesis's is empty:
+/// its roster is the stake it finalizes, which no one voted with before it.
 fn next_signed_pos_at_round(
     cur_bft_height: &mut u32,
     cur_fat_ptr: &mut FatPointerToBftBlock,
@@ -5155,9 +5123,8 @@ fn next_signed_pos_at_round(
     let bft = if *cur_bft_height == 0 {
         unsigned
     } else {
-        let seeds = supplied_finalizer_seeds_in_roster_order();
-        let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
-        let fat_ptr = signed_fat_pointer(&unsigned.0.block, u64::from(*cur_bft_height), round, &seeds, &[0; 32]);
+        let seed = synthetic_finalizer_seed(SUPPLIED_FINALIZER);
+        let fat_ptr = signed_fat_pointer(&unsigned.0.block, u64::from(*cur_bft_height), round, &[seed.as_bytes()], &[0; 32]);
         BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block: unsigned.0.block, fat_ptr })
     };
     *cur_bft_height += 1;
@@ -5170,9 +5137,16 @@ fn next_signed_pos(cur_bft_height: &mut u32, cur_fat_ptr: &mut FatPointerToBftBl
     next_signed_pos_at_round(cur_bft_height, cur_fat_ptr, pow_blocks, 1)
 }
 
-/// Loads `bft` signed by its round's proposer, as the node picks it on its own roster (which the
-/// writer cannot: voting power grows with the rewards every block pays). The genesis is not
-/// proposed, so it carries no signatures.
+/// Loads `bft` with SUPPLIED_FINALIZER's proposal signatures, made in the round its certificate
+/// names with no valid round. The genesis is not proposed, so it carries none.
 fn push_decided_pos(tf: &mut TF, bft: &BftBlockAndFatPointerToItWrap, flags: u32) {
-    tf.push_instr_load_pos(bft, flags | SIGN_AS_PROPOSER);
+    let sigs = match bft.0.block.height {
+        0 => Vec::new(),
+        _ => {
+            let round = u32::try_from(bft.0.fat_ptr.get_vote_template().round).expect("a decided round is not negative");
+            let signing_key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(SUPPLIED_FINALIZER).as_bytes()).1;
+            bft_proposal_sigs(&signing_key, &bft.0.block, round, -1, &[0; 32])
+        }
+    };
+    tf.push_instr_load_pos_signed(bft, &sigs, -1, flags);
 }

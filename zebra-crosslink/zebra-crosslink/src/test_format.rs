@@ -464,9 +464,6 @@ impl TFInstr {
             if (instr.flags & ANY_OUTCOME) != 0 {
                 str += " ANY_OUTCOME";
             }
-            if (instr.flags & SIGN_AS_PROPOSER) != 0 {
-                str += " SIGN_AS_PROPOSER";
-            }
             str += " ]";
         }
 
@@ -487,11 +484,6 @@ pub const SHOULD_DEFER: u32 = 1 << 1;
 /// block. What it does not cover is the node giving no verdict at all, which still fails, as do
 /// the expectations that follow. Overrides SHOULD_FAIL and SHOULD_DEFER.
 pub const ANY_OUTCOME: u32 = 1 << 2;
-/// LOAD_POS only: the harness signs the proposal's chunks as the node would check them, by the
-/// round's proposer on the node's own roster, which must be a synthetic finalizer; any signatures
-/// in the data are replaced. For a writer that cannot know the proposer when it writes the file:
-/// voting power grows with the rewards every block pays, and the proposer follows it.
-pub const SIGN_AS_PROPOSER: u32 = 1 << 3;
 
 pub struct TF {
     pub instrs: Vec<TFInstr>,
@@ -1752,22 +1744,11 @@ pub(crate) async fn handle_instr(
             }
         },
 
-        TestInstr::LoadPoS { block, fat_ptr, mut proposal_sigs, valid_round } => {
+        TestInstr::LoadPoS { block, fat_ptr, proposal_sigs, valid_round } => {
             // let path = format!("../crosslink-test-data/test_pos_block_{}.bin", instr_i);
             // info!("writing binary at {}", path);
             // let mut file = std::fs::File::create(&path).expect("valid file");
             // file.write_all(instr.data_slice(bytes)).expect("write success");
-
-            if flags & SIGN_AS_PROPOSER != 0 && block.height != 0 {
-                match signed_as_proposer(internal_handle, &block, &fat_ptr, valid_round) {
-                    Ok(Some(sigs)) => proposal_sigs = sigs,
-                    Ok(None) => {}
-                    Err(err) => {
-                        test_check_outcome(false, false, &format!("SIGN_AS_PROPOSER: {err}"));
-                        return;
-                    }
-                }
-            }
 
             // A force-feed is decided or refused at once, so it is never pending: SHOULD_DEFER
             // cannot hold. Not reaching the BFT loop at all is no verdict, as for LOAD_POW.
@@ -2254,44 +2235,6 @@ static TEST_BFT_PEERS: Mutex<Vec<HarnessBftPeer>> = Mutex::new(Vec::new());
 /// The votes and proposal chunks the node has sent any synthetic finalizer during the test, each
 /// once. The node resends what a peer's status asks for on every tick, so most arrive many times.
 static TEST_BFT_SENT: Mutex<Vec<tenderlink::SentConsensus>> = Mutex::new(Vec::new());
-
-/// The chunk signatures of `block`, made by the proposer of the round `fat_ptr` was decided in,
-/// which must be one of the synthetic finalizers. The roster is read from the node's BFT chain
-/// rather than from the file: its stakes include the rewards every block pays, which the writer
-/// would have to replay to know.
-///
-/// `None` for a block that is not at the next height to decide: its roster depends on decisions
-/// the node does not have, and the node refuses it on its height before reading any signature,
-/// so it keeps the file's.
-fn signed_as_proposer(internal_handle: &TFLServiceHandle, block: &BftBlock, fat_ptr: &FatPointerToBftBlock, valid_round: i64) -> Result<Option<Vec<TMSig>>, String> {
-    let Ok(round) = u32::try_from(fat_ptr.get_vote_template().round) else {
-        return Err("the fat pointer's round is negative".to_string());
-    };
-    let network = &internal_handle.network;
-    let slashforks = zebra_chain::parameters::SlashForkSchedule::from_canonical(internal_handle.config.slashforks.clone());
-    let (bft_height, voting) = {
-        let chain = zebra_state::new_network::bft::bft_chain().read().unwrap();
-        // usize to u64 is lossless on every supported target.
-        let bft_height = chain.blocks.len() as u64;
-        let roster_snapshot_height = chain.bft_final_snapshot.map(|(height, _)| height);
-        let (_, voting) = zebra_state::new_network::bft::roster_for_bft_height(network, slashforks.rules(), &chain.roster, bft_height, roster_snapshot_height);
-        (bft_height, voting)
-    };
-    if bft_height != u64::from(block.height) {
-        return Ok(None);
-    }
-    let active_roster_max_n = network.crosslink_parameters().active_roster_max_n;
-    let Some(proposer_i) = tenderlink::proposer_index(&HashKeys::default(), &voting.roster, active_roster_max_n, bft_height, round) else {
-        return Err(format!("BFT height {bft_height} round {round} has no proposer"));
-    };
-    let proposer = voting.roster[proposer_i].pub_key;
-    let Some(key) = (0..u64::from(SYNTHETIC_FINALIZERS_MAX_N)).map(synthetic_finalizer_key).find(|key| {
-        PubKeyID(ed25519_zebra::VerificationKeyBytes::from(key).into()) == proposer
-    }) else {
-        return Err(format!("the proposer {proposer:?} is not a synthetic finalizer"));
-    };
-    Ok(Some(bft_proposal_sigs(&key, block, round, valid_round, &voting.vote_namespace)))
-}
 
 fn synthetic_finalizer_key(k: u64) -> ed25519_zebra::SigningKey {
     finalizer_key_from_seed(synthetic_finalizer_seed(k).as_bytes()).1
