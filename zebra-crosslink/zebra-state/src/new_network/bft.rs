@@ -354,9 +354,7 @@ pub enum BftRequest {
         fat_pointer: FatPointerToBftBlock,
         proposal_sigs: Vec<TMSig>,
         /// The proposal's valid round, which its chunk signatures cover; -1 for none. Checked,
-        /// not stored: the database has no place for it yet, so `restore` rebuilds every decided
-        /// round with -1, and chunks of a re-proposed value re-served after a restart carry the
-        /// wrong valid round for their signatures.
+        /// not stored: `restore` reads it back from the signatures (`proposal_valid_round`).
         valid_round: i64,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
@@ -701,6 +699,38 @@ pub fn fat_pointer_to_block_at_height(
     }
 }
 
+/// The valid round a decided height's proposal signatures were made in. The database keeps the
+/// signatures but not that round, and tenderlink re-serves each chunk signed over it, so restoring
+/// it as -1 re-serves a re-proposed value with signatures that do not verify. With the height's
+/// voting roster the proposer and namespace are known exactly, and a valid round lies below the
+/// decided round: round 0 and a round with no proposer need no search.
+///
+/// `None` when no valid round makes every signature verify.
+fn proposal_valid_round(
+    block: &BftBlock,
+    fat_pointer: &FatPointerToBftBlock,
+    proposal_sigs: &[TMSig],
+    voting: &VotingRoster,
+    active_roster_max_n: usize,
+) -> Option<i64> {
+    let round = fat_pointer.get_vote_template().round;
+    if proposal_sigs.is_empty() || round <= 0 {
+        return Some(-1);
+    }
+    // A positive i32 round fits u32.
+    let round_u32 = round as u32;
+    let height = u64::from(block.height);
+    let Some(proposer_i) = tenderlink::proposer_index(&HashKeys::default(), &voting.roster, active_roster_max_n, height, round_u32) else {
+        return Some(-1);
+    };
+    let proposer = voting.roster[proposer_i].pub_key;
+    let value = block.zcash_serialize_to_vec().ok()?;
+    let value_id = tenderlink::ValueId(fat_pointer.points_at_block_hash().0);
+    (-1..i64::from(round)).find(|&valid_round| {
+        tenderlink::first_bad_proposal_chunk_sig(proposer, &value, value_id, height, round_u32, valid_round, &voting.vote_namespace, proposal_sigs).is_none()
+    })
+}
+
 /// The round data tenderlink keeps for an already-decided height, as the live path would have
 /// left it: precommit signatures placed by roster index, counts from the fat pointer.
 fn decided_round_data(
@@ -734,6 +764,7 @@ fn decided_round_data(
     round_data.roster = roster;
     round_data.counts.precommits = fat_pointer.signatures.len() as u64;
     round_data.counts.yes_precommits = fat_pointer.signatures.len() as u64;
+    round_data.proposal_valid_round = proposal_valid_round(block, fat_pointer, &proposal_sigs, voting, active_roster_max_n).unwrap_or(-1);
     round_data.proposal_sigs_n = proposal_sigs.len();
     round_data.proposal_sigs = proposal_sigs;
     round_data.proposal = BlockValue(block.zcash_serialize_to_vec().unwrap());
@@ -2377,6 +2408,38 @@ mod tests {
         template[32..40].copy_from_slice(&height.to_le_bytes());
         template[40..44].copy_from_slice(&round_bits.to_le_bytes());
         template
+    }
+
+    /// A restored decision gets back the valid round its proposal signatures were made in, which
+    /// tenderlink signs every re-served chunk over.
+    #[test]
+    fn proposal_valid_round_is_read_back_from_the_signatures() {
+        let (keys, voting) = four_finalizers(false, [0; 32]);
+        let block = test_block(2);
+        let height = u64::from(block.height);
+        let value = block.zcash_serialize_to_vec().unwrap();
+        let fat_pointer = certificate(template(height, 2 | 0x8000_0000), &keys, &[0, 1, 2], &voting.vote_namespace);
+        let value_id = tenderlink::ValueId(fat_pointer.points_at_block_hash().0);
+        let proposer = tenderlink::proposer_index(&HashKeys::default(), &voting.roster, 4, height, 2).unwrap();
+        let sign = |key: &ed25519_zebra::SigningKey, valid_round: i64| {
+            tenderlink::proposal_chunk_sigs(key, &value, value_id, height, 2, valid_round, &voting.vote_namespace)
+        };
+
+        for valid_round in [-1, 0, 1] {
+            let sigs = sign(&keys[proposer], valid_round);
+            assert_eq!(proposal_valid_round(&block, &fat_pointer, &sigs, &voting, 4), Some(valid_round));
+        }
+
+        // Another finalizer's signatures verify under no valid round.
+        let other = (proposer + 1) % keys.len();
+        assert_eq!(proposal_valid_round(&block, &fat_pointer, &sign(&keys[other], 1), &voting, 4), None);
+
+        // Round 0 has no earlier round to have locked a value in.
+        let round_0 = certificate(template(height, 0x8000_0000), &keys, &[0, 1, 2], &voting.vote_namespace);
+        assert_eq!(proposal_valid_round(&block, &round_0, &sign(&keys[proposer], -1), &voting, 4), Some(-1));
+
+        let round_data = decided_round_data(&block, &fat_pointer, voting.roster.clone(), &voting, sign(&keys[proposer], 1), height, 4);
+        assert_eq!(round_data.proposal_valid_round, 1);
     }
 
     /// Every way a certificate can fail, each alone on an otherwise valid one, at a height that
