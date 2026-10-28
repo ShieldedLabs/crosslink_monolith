@@ -5069,6 +5069,31 @@ fn crosslink_load_pos_refuses_a_decision_with_no_signatures() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// A certificate carrying a signature that does not verify is refused. `decide` treats one as
+/// impossible and stops the node, so a fed decision must be turned away before it gets there.
+#[test]
+fn crosslink_load_pos_refuses_a_certificate_with_a_bad_signature() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene(&mut tf, &[false]);
+    let proposer = scene.proposer(1, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+
+    let block = scene.height_1_proposal(20);
+    let seeds: Vec<String> = scene.finalizers.iter().map(|&k| synthetic_finalizer_seed(k.into())).collect();
+    let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
+    let mut fat_ptr = signed_fat_pointer(&block, 1, 0, &seeds, &[0; 32]);
+    fat_ptr.signatures[0].vote_signature[0] ^= 1;
+    let key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(proposer).as_bytes()).1;
+    let sigs = bft_proposal_sigs(&key, &block, 0, -1, &[0; 32]);
+
+    let data = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr });
+    tf.push_instr_load_pos_signed(&data, &sigs, -1, SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("does not verify", 0);
+    tf.push_instr_expect_pos_chain_length(1, 0);
+    test_bytes(tf.write_to_bytes());
+}
+
 // # Supplied BFT with a roster
 //
 // A scene that supplies its BFT blocks (HARNESS_PARAMETERS) still has a roster from the BFT

@@ -1232,6 +1232,15 @@ impl BftRunner {
                 {
                     let chain = BFT_CHAIN.read().unwrap();
                     let voting = self.next_voting_roster(&chain);
+                    // decide() treats a signature that does not verify as impossible and panics,
+                    // as it is for tenderlink's own decisions. A fed decision can carry one, so
+                    // refuse it here: before FeaturenetUpgrade2 nothing else checks first.
+                    if !fat_pointer.validate_signatures(&voting.vote_namespace) {
+                        let _ = reply.send(Err(format!(
+                            "the fat pointer for BFT height {} carries a signature that does not verify", block.height,
+                        )));
+                        return;
+                    }
                     if voting.strict_quorum && !certificate_is_valid(&fat_pointer, u64::from(block.height), &voting) {
                         let _ = reply.send(Err(format!(
                             "the fat pointer is not a valid certificate for BFT height {}", block.height,
