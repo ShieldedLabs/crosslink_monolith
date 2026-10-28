@@ -1163,7 +1163,8 @@ impl BftRunner {
         }
     }
 
-    fn drain(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
+    /// Serve every request already waiting, without blocking.
+    pub(super) fn drain(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
         loop {
             match self.rx.try_recv() {
                 Ok(request) => self.handle(request, read_state, block_writer),

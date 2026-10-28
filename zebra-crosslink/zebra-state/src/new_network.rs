@@ -3567,6 +3567,10 @@ pub fn sync(
         let mut committed_this_tick = 0u64;
         blocks_to_commit.retain(|(hash, block_arc)| {
             if zebra_chain::shutdown::is_shutting_down() { return true; }
+            // A pass can verify many blocks, and tenderlink waits on this thread for every
+            // Validate and Decided answer. Serve it between blocks, not only between ticks; a
+            // decision stored here can also let the next block's fat pointer resolve.
+            bft_runner.drain(&read_state, &mut block_writer);
             let hash = *hash;
             let block_arc = block_arc.clone();
 
