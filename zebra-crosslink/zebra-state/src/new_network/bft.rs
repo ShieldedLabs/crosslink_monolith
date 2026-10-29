@@ -380,8 +380,8 @@ fn send_request(request: BftRequest) -> bool {
 }
 
 /// Store a decided block supplied from outside, as if tenderlink had decided it, with the
-/// proposer's chunk signatures and the valid round they were made in: one per chunk, the round's
-/// proposer's, or none when the round has no proposer.
+/// proposer's chunk signatures and the valid round they were made in: none for the genesis, which
+/// is not proposed, and the round's proposer's, one per chunk, for every later height.
 pub async fn force_feed_bft_block(
     block: Arc<BftBlock>,
     fat_pointer: FatPointerToBftBlock,
@@ -1275,7 +1275,7 @@ impl BftRunner {
         }
         // Proposal signatures are not checked here: the certificate is what makes a decision
         // decided. They are kept only if they verify as a fresh proposal's, below.
-        match self.check_force_fed(&decision.block, &decision.fat_pointer, &decision.proposal_sigs, -1, true, false, read_state) {
+        match self.check_force_fed(&decision.block, &decision.fat_pointer, &decision.proposal_sigs, -1, true, false, read_state, block_writer) {
             Err(refusal) if refusal.peer_fault => FeedOutcome::Refused { why: refusal.why, peer_fault: true },
             Err(_) => FeedOutcome::NotReady(decision),
             Ok(ForceFed::AlreadyDecided) => FeedOutcome::Fed,
@@ -1394,7 +1394,7 @@ impl BftRunner {
                 self.decide(block, fat_pointer, proposal_sigs, DecisionReply::Tenderlink(reply), read_state, block_writer);
             }
             BftRequest::ForceFeed { block, fat_pointer, proposal_sigs, valid_round, require_certificate, reply } => {
-                match self.check_force_fed(&block, &fat_pointer, &proposal_sigs, valid_round, require_certificate, true, read_state) {
+                match self.check_force_fed(&block, &fat_pointer, &proposal_sigs, valid_round, require_certificate, true, read_state, block_writer) {
                     Err(refusal) => {
                         let _ = reply.send(Err(refusal.why));
                     }
@@ -1423,6 +1423,7 @@ impl BftRunner {
         require_certificate: bool,
         verify_proposal_sigs: bool,
         read_state: &ReadState,
+        block_writer: &WriteBlockWorkerTask,
     ) -> Result<ForceFed, FeedRefusal> {
         if bft_is_dropped() {
             return Err(FeedRefusal::not_yet("BFT is dropped on this node".to_string()));
@@ -1479,29 +1480,42 @@ impl BftRunner {
             }
         }
         if verify_proposal_sigs {
-            self.check_proposal_sigs(block, fat_pointer, proposal_sigs, valid_round).map_err(FeedRefusal::fault)?;
+            self.check_decision_roster(block, fat_pointer, proposal_sigs, valid_round, block_writer).map_err(FeedRefusal::fault)?;
         }
         Ok(ForceFed::New)
     }
 
-    /// A force-fed decision's proposal signatures, as a tenderlink decision has them: the round's
-    /// proposer's, one per chunk, over each chunk as it was sent in `valid_round`. Whether there
-    /// is a proposer is tenderlink's choice on the roster the certificate is checked against, not
-    /// a rule of this path: a round with none (the bootstrap genesis, a roster with no stake) has
-    /// no signatures.
-    fn check_proposal_sigs(&self, block: &BftBlock, fat_pointer: &FatPointerToBftBlock, sigs: &[TMSig], valid_round: i64) -> Result<(), String> {
+    /// A force-fed decision against the roster, as a real network has one. The genesis decision is
+    /// not proposed, so it has no proposal signatures, as the bootstrap decides it; but the stake
+    /// at its snapshot is the next height's roster, so it must have some, or BFT could never
+    /// decide again (the bootstrap refuses to start tenderlink on such a roster). Every later
+    /// decision has the round's proposer's signatures, one per chunk, over each chunk as it was
+    /// sent in `valid_round`.
+    fn check_decision_roster(&self, block: &BftBlock, fat_pointer: &FatPointerToBftBlock, sigs: &[TMSig], valid_round: i64, block_writer: &WriteBlockWorkerTask) -> Result<(), String> {
+        if block.height == 0 {
+            if !sigs.is_empty() {
+                return Err(format!("{} proposal signatures on the genesis decision, which is not proposed", sigs.len()));
+            }
+            let snapshot = Hash(block.snapshot_block_hash().0);
+            let stakes = block_writer
+                .non_finalized_state
+                .aggregated_stakes_at(snapshot)
+                .or_else(|| block_writer.finalized_state.db.aggregated_stakes(&snapshot))
+                .unwrap_or_default();
+            if stakes.is_empty() {
+                return Err(format!("the BFT genesis finalizes {snapshot}, where nothing is bonded, so BFT would have no roster"));
+            }
+            return Ok(());
+        }
         let (height, round) = (u64::from(block.height), fat_pointer.get_vote_template().round);
         let Ok(round) = u32::try_from(round) else {
             return Err(format!("the fat pointer's round {round} is negative"));
         };
         let voting = self.next_voting_roster(&BFT_CHAIN.read().unwrap());
-        // An empty roster (the genesis height) has no proposer; tenderlink would log asking it for one.
+        // An empty roster has no proposer; tenderlink would log asking it for one.
         let proposer_i = if voting.roster.is_empty() { None } else { tenderlink::proposer_index(&HashKeys::default(), &voting.roster, self.params.active_roster_max_n, height, round) };
         let Some(proposer_i) = proposer_i else {
-            return match sigs.is_empty() {
-                true => Ok(()),
-                false => Err(format!("{} proposal signatures for {height}.{round}, which has no proposer", sigs.len())),
-            };
+            return Err(format!("BFT height {height} has no proposer: its roster has no stake"));
         };
         let value = block.zcash_serialize_to_vec().expect("a BFT block serializes");
         let chunks_n = tenderlink::proposal_chunks_n(value.len());

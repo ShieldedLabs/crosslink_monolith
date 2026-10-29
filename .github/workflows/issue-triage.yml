@@ -48,19 +48,21 @@ jobs:
         1. Check the issue's main claims against the code.
         2. Look for a duplicate in triage_input/issues.txt, and in reviews/, the security review findings indexed by reviews/REVIEW_STATUS.md.
         3. Look for a fix already on dev: start with the git log for commits whose message mentions the issue number, then the code the issue names.
-        4. Rate every issue, even if it is fixed on dev. A defect, including one a doc, TODO, review or issue title already treats as known or planned work (a stall, crash, fork, wrong result, or missing validation or security check in the code that runs now), is rated by the harm it does. Any other issue (a task, feature, design question or chore) is rated by how soon it must be done:
+        4. Rate every issue, even if it is fixed on dev. Rate a defect by the harm it would do if the code shipped to mainnet as it is now. It is a defect even when a doc, TODO, review or its own title calls it known, planned or open work: a stall, crash, fork, wrong result, or a missing consensus, validation or security check. Being documented, already known, or not yet exploited never lowers a rating. Rate any other issue (a task, feature, design question or chore) by how soon it must be done:
            - sev:critical: a defect exploitable now on the live featurenet to halt finality, split consensus, or lose or steal funds; or work that the current featurenet or work in progress is stuck on.
-           - sev:high: a defect that lets anyone, or ordinary use, crash a node, corrupt its state, or block staking or sending with no workaround; a security flaw that must be fixed before mainnet; or work mainnet cannot launch without.
+           - sev:high: a defect that lets anyone, or ordinary use or load, crash a node, stall BFT finality, fork the chain, corrupt its state, or block staking or sending with no workaround; a missing consensus, validation or security check that mainnet needs; or work mainnet cannot launch without.
            - sev:medium: a broken feature with a workaround, a misleading UI or error, or a weakness nobody can exploit; or work that clearly helps node operators, testers or developers and belongs in an upcoming release.
            - sev:low: a cosmetic, docs or minor UX defect; or a nice-to-have, long-term idea, or open question that nothing is waiting on.
-        5. Give the reason in one or two plain sentences, with no links and no @-mentions.
+        5. Set bft_stall to true when the issue reports BFT finality stopping, or a flaw that could stop it: a liveness stall or halt, or finalizers unable to decide, propose or sync the BFT chain. A PoW-only stall is not one.
+        6. Give the reason in one or two plain sentences, with no links and no @-mentions.
 
         Leave duplicate_issue at 0, duplicate_review empty and fixed_by empty when there is none. duplicate_review is a review finding ID such as K5 or C7.1; fixed_by holds commit hashes.
       TRIAGE_SCHEMA: >-
         {"type": "object", "additionalProperties": false,
-        "required": ["severity", "area", "reason", "duplicate_issue", "duplicate_review", "fixed_by"],
+        "required": ["severity", "bft_stall", "area", "reason", "duplicate_issue", "duplicate_review", "fixed_by"],
         "properties": {
         "severity": {"type": "string", "enum": ["sev:critical", "sev:high", "sev:medium", "sev:low"]},
+        "bft_stall": {"type": "boolean"},
         "area": {"type": "string", "enum": ["App", "BFT", "BFT/networking", "Bonds", "Database", "Featurenet", "Fees", "Finalizer UX", "Infra", "Mining", "Networking", "PoW sync", "RPC", "Reward", "Slashing", "Staking", "Staking TX", "Sync", "Testing", "UI", "Visualization", "Wallet", "Wallet CLI"]},
         "reason": {"type": "string", "maxLength": 400},
         "duplicate_issue": {"type": "integer", "minimum": 0},
@@ -309,13 +311,14 @@ jobs:
             set_option Status "new uncategorized"
           fi
           if [ -z "$OUT" ]; then exit 0; fi
-          # Triage only fills in an empty Area or Urgency, so it never overwrites what people set.
+          # Triage only fills in an empty Area or Urgency, so it never overwrites what people set. An Urgency
+          # starting with "sev:" is triage's own, so a rerun replaces it.
           if [ -n "$(jq -r '.area.name // empty' <<<"$node")" ]; then
             echo "kept_area=true" >> "$GITHUB_OUTPUT"
           else
             set_option Area "$(jq -r .area <<<"$OUT")"
           fi
-          if [ -z "$(jq -r '.urgency.text // empty' <<<"$node")" ]; then
+          if jq -e '(.urgency.text // "") | . == "" or startswith("sev:")' <<<"$node" > /dev/null; then
             urgency=$(jq -r '.severity + ": " + (.reason | gsub("\\s+"; " ") | .[:200])' <<<"$OUT")
             gh api graphql --silent -f project="$PROJECT_ID" -f item="$item" -f field="$(fid Urgency)" -f text="$urgency" \
               -f query='mutation($project: ID!, $item: ID!, $field: ID!, $text: String!) { updateProjectV2ItemFieldValue(input: { projectId: $project, itemId: $item, fieldId: $field, value: { text: $text } }) { clientMutationId } }'
@@ -351,9 +354,10 @@ jobs:
             fi
           done
 
-          declare -A color=([sev:critical]=b60205 [sev:high]=d93f0b [sev:medium]=fbca04 [sev:low]=0e8a16 [duplicate]=cfd3d7)
+          declare -A color=([sev:critical]=b60205 [sev:high]=d93f0b [sev:medium]=fbca04 [sev:low]=0e8a16 [duplicate]=cfd3d7 ["BFT stall"]=b60205)
           labels=("$sev")
           if [ "$dup" != 0 ]; then labels+=(duplicate); fi
+          if [ "$(jq -r '.bft_stall // false' <<<"$OUT")" = true ]; then labels+=("BFT stall"); fi
           args=()
           for l in "${labels[@]}"; do
             gh label create "$l" --color "${color[$l]}" > /dev/null 2>&1 || true

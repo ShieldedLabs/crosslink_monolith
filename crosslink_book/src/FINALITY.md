@@ -635,7 +635,14 @@ describe it. Statements under *Without Linearity* show what the rule prevents.
   the heavier branch first keeps `fin` at or below the fork and does not switch to the lighter
   branch until it has more work. Under raw fork choice both nodes end on the heavier branch.
   - *With Linearity:* the premise persists: no later final snapshot can move onto the heavier
-    branch past the fork point.
+    branch past the fork point. The two nodes stay on different branches until the finalized
+    branch has more work; miners whose nodes follow the heavier branch keep extending it. The
+    node that processed the heavier branch first then switches to the finalized branch, which
+    contains its `fin`. If its best chain runs more than `MAX_BLOCK_REORG_HEIGHT` blocks past
+    the fork point first, the fork point falls below its depth commit, and it drops BFT and
+    stays on the heavier branch until its operator resyncs it (implementation below). That
+    takes a branch that out-mines the finalized one across `MAX_BLOCK_REORG_HEIGHT` blocks: a
+    hash-rate majority, or a partition with most hash rate on the heavier side.
   - *Without Linearity:* the heavier branch can later gain final snapshots past the fork point
     as well. A node that processed it first then advances `fin` into it, and the two nodes stay
     on different branches whatever the work.
@@ -727,6 +734,14 @@ reorganizations).
 - It computes `fin` where the best chain changes and commits up to it, which discards the
   non-finalized branches that do not hold it (§4.2, §6.3). A decision alone moves nothing.
 - It enforces Linearity and Last Final Snapshot (§6.2).
+- Both orders of observation are tested on a single node. The test
+  `crosslink_pow_follows_the_heaviest_chain_until_fin_moves_to_the_decided_branch` keeps the node
+  on the heavier branch while `fin` is below the fork point, switches it to the decided branch
+  once that branch has more work, and then has it refuse the other branch. The test
+  `crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized_pow_chain`
+  delivers a heavier branch after `fin` has passed the fork point, and the node refuses it. No
+  test runs a node more than `MAX_BLOCK_REORG_HEIGHT` blocks past the fork point on the heavier
+  branch, so dropping BFT in that case is untested.
 
 ## 5. Current tree: implementation inventory
 

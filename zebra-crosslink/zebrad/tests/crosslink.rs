@@ -3141,8 +3141,10 @@ fn signed_fat_pointer_verifies_under_its_own_namespace_only() {
     }
 }
 
+/// A BFT genesis over a chain where nothing is bonded is refused: a real network has a roster from
+/// its BFT genesis on, and with none BFT could never decide again. PoW carries on without it.
 #[test]
-fn crosslink_gen_pow_and_no_signature_no_roster_pos() {
+fn crosslink_bft_genesis_with_no_roster_is_refused() {
     set_test_name(function_name!());
     let mut tf = TF::new(&HARNESS_PARAMETERS);
 
@@ -3162,11 +3164,12 @@ fn crosslink_gen_pow_and_no_signature_no_roster_pos() {
     let fat_ptr = &mut FatPointerToBftBlock::null();
     let pos_h = &mut 0;
     let bft = next_pos(pos_h, fat_ptr, &pow_common[0..3], &[]);
-    tf.push_instr_load_pos(&bft, 0);
+    tf.push_instr_load_pos(&bft, SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("nothing is bonded", 0);
+    tf.push_instr_expect_pos_chain_length(0, 0);
 
     for _ in 4..7 {
         tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
-        // push bft pointer
     }
     tf.push_instr_expect_pow_chain_length(7, 0);
 
@@ -3622,15 +3625,22 @@ fn crosslink_finality_diagram_2_benign_reorg() {
 }
 
 /// Scene 2's best chain and decided BFT blocks, as `export-chain` would read them from the node
-/// that ran it: genesis, P1..P8, Q9..Q11, and bft0..bft2.
+/// that ran it: genesis, the BONDED_SHIFT blocks `bonded_start` loads below P1, P1..P8, Q9..Q11,
+/// and bft0..bft2.
 fn diagram_scene_2_chain_prefix() -> zebra_state::ChainPrefix {
-    // TODO: build it bonded, as the other node-run scenes are. That needs the bonding blocks in the
-    // prefix, shifting every index below by BONDED_SHIFT.
-    let (tf, pow, fork) = diagram_scene_2(false);
+    let (tf, pow, fork) = diagram_scene_2(true);
     let bytes = tf.write_to_bytes();
-    let decisions = TF::read_from_bytes(&bytes)
-        .expect("the scene reads back")
-        .instrs
+    let instrs = TF::read_from_bytes(&bytes).expect("the scene reads back").instrs;
+    // `bonded_start` loads its blocks first, then P1, so the scene's first BONDED_SHIFT LOAD_POW
+    // blocks are the ones below P1.
+    let setup: Vec<Arc<Block>> = instrs
+        .iter()
+        .filter(|instr| instr.kind == TFInstr::LOAD_POW)
+        .take(BONDED_SHIFT)
+        .map(|instr| Arc::new(Block::zcash_deserialize(instr.data_slice(&bytes)).expect("the scene's blocks parse")))
+        .collect();
+    assert_eq!(setup.last().map(|block| block.hash()), Some(pow[0].header.previous_block_hash), "the setup ends below P1");
+    let decisions = instrs
         .iter()
         .filter_map(|instr| read_load_pos(&bytes, instr))
         .map(|(block, fat_pointer, proposal_sigs, valid_round)| zebra_state::BftDecision {
@@ -3641,6 +3651,7 @@ fn diagram_scene_2_chain_prefix() -> zebra_state::ChainPrefix {
         })
         .collect();
     let best_chain = std::iter::once(zebra_chain::block::genesis::regtest_genesis_block())
+        .chain(setup)
         .chain(pow[..8].iter().cloned())
         .chain(fork)
         .collect();
@@ -3656,8 +3667,8 @@ fn chain_prefix_of_scene_2_loads(cutoff: zebra_state::BftCutoff, trusted: bool) 
     let prefix = diagram_scene_2_chain_prefix();
     let mut tf = zebra_crosslink::chain_prefix::prefix_tf(&HARNESS_PARAMETERS, &prefix, cutoff);
     let (_, tip) = prefix.tip().expect("the prefix has blocks");
-    let p4 = prefix.blocks[4].hash();
-    let p5 = prefix.blocks[5].hash();
+    let p4 = prefix.blocks[4 + BONDED_SHIFT].hash();
+    let p5 = prefix.blocks[5 + BONDED_SHIFT].hash();
 
     tf.push_instr_expect_pow_chain_length(prefix.blocks.len(), 0);
     tf.push_instr_expect_pow_tip(&tip, 0);
