@@ -5094,6 +5094,65 @@ fn crosslink_load_pos_refuses_a_certificate_with_a_bad_signature() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// A decision already decided at its height is refused as exactly that, not by a check against
+/// the next height's roster, and changes nothing.
+#[test]
+fn crosslink_load_pos_of_an_already_decided_height_is_refused_as_decided() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene(&mut tf, &[false]);
+    let proposer = scene.proposer(1, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+
+    let block = scene.height_1_proposal(20);
+    let seeds: Vec<String> = scene.finalizers.iter().map(|&k| synthetic_finalizer_seed(k.into())).collect();
+    let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
+    let fat_ptr = signed_fat_pointer(&block, 1, 0, &seeds, &[0; 32]);
+    let key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(proposer).as_bytes()).1;
+    let sigs = bft_proposal_sigs(&key, &block, 0, -1, &[0; 32]);
+    let data = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr });
+
+    tf.push_instr_load_pos_signed(&data, &sigs, -1, 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+    tf.push_instr_load_pos_signed(&data, &sigs, -1, SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("decided already with this block", 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+    test_bytes(tf.write_to_bytes());
+}
+
+/// On a network that bootstraps BFT from the chain, genesis is the block every node derives:
+/// one finalizing any other height is refused, however well its headers chain. Its nil roster
+/// lets any empty certificate pass, so nothing else would tell it apart.
+#[test]
+fn crosslink_load_pos_refuses_a_genesis_that_is_not_the_chains() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let network = regtest_network(&BFT_ROUNDS_PARAMETERS);
+    let miner = TestKey::new(b"crosslink test miner").address();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    // Short of the activation height, so the node has not derived genesis itself yet.
+    let mut pow = Vec::new();
+    while gen.tip.coinbase_height().expect("generated blocks have a height").0 < 40 {
+        let block = gen.next_block(&miner);
+        tf.push_instr_load_pow(&block, 0);
+        pow.push(block);
+    }
+    // Well-formed sigma headers, but above height 30 rather than the roster height.
+    let sigma = BFT_ROUNDS_PARAMETERS.bc_confirmation_depth_sigma as u32;
+    let tail: Vec<Arc<Block>> = (31..=30 + sigma)
+        .map(|h| pow.iter().find(|b| b.coinbase_height().map(|bh| bh.0) == Some(h)).expect("loaded").clone())
+        .collect();
+    let fake = bft_proposal(&BFT_ROUNDS_PARAMETERS, 0, FatPointerToBftBlock::null(), 0, &tail);
+    let fat_ptr = FatPointerToBftBlock::from_parts(fake.blake3_hash(), 0, 0, &[]);
+    let data = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block: fake, fat_ptr });
+
+    tf.push_instr_load_pos_signed(&data, &[], -1, SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("PoS validation = Fail", 0);
+    tf.push_instr_expect_pos_chain_length(0, 0);
+    test_bytes(tf.write_to_bytes());
+}
+
 // # Supplied BFT with a roster
 //
 // A scene that supplies its BFT blocks (HARNESS_PARAMETERS) still has a roster from the BFT

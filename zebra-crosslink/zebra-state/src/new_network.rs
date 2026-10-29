@@ -755,16 +755,49 @@ const BFT_FETCH_AHEAD: u64 = 512;
 const BFT_CATCH_UP_SLACK: u64 = 3;
 /// A BFT_REQ unanswered for this long is sent again, to another peer if one has the heights.
 const BFT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// A peer's advertised BFT length counts towards holding tenderlink back only if it answered a
+/// BFT_REQ of ours this recently: a length nobody serves holds nothing.
+const BFT_EVIDENCE_WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The peers that hold decided height `want` and are not backing off, in a stable order for the
+/// round-robin that picks which one to ask.
+fn bft_holders(peers: &HashMap<ConnectionKey, Peer>, rejections: &HashMap<ConnectionKey, Rejection>, want: u64) -> Vec<ConnectionKey> {
+    let mut holders: Vec<ConnectionKey> = peers
+        .iter()
+        .filter(|(key, peer)| peer.their_bft_len > want && !is_backing_off(rejections, **key))
+        .map(|(key, _)| *key)
+        .collect();
+    holders.sort();
+    holders
+}
+
+/// Whether we are catching up on decided BFT heights: a peer that has recently served us and is
+/// not backing off holds more than `BFT_CATCH_UP_SLACK` heights beyond ours.
+fn bft_catching_up(peers: &HashMap<ConnectionKey, Peer>, rejections: &HashMap<ConnectionKey, Rejection>, our_len: u64, now: std::time::Instant) -> bool {
+    peers
+        .iter()
+        .filter(|(key, peer)| {
+            peer.bft_answered_at.is_some_and(|at| now.saturating_duration_since(at) < BFT_EVIDENCE_WINDOW)
+                && !is_backing_off(rejections, **key)
+        })
+        .any(|(_, peer)| peer.their_bft_len > our_len + BFT_CATCH_UP_SLACK)
+}
 
 /// Store every fetched decision that is ready: the next height, its snapshot committed. Called
 /// between PoW commits, so a decision lands as soon as its snapshot does and the PoW blocks
 /// citing it find it decided.
 fn feed_ready_decisions(
-    fetched: &mut std::collections::BTreeMap<u64, bft_sync::WireDecision>,
+    fetched: &mut std::collections::BTreeMap<u64, (ConnectionKey, bft_sync::WireDecision)>,
     bft_runner: &mut bft::BftRunner,
     read_state: &ReadState,
     block_writer: &mut crate::service::write::WriteBlockWorkerTask,
+    peers_to_kill: &mut Vec<(ConnectionKey, String)>,
+    bft_peer_rejections: &mut HashMap<ConnectionKey, Rejection>,
 ) -> u64 {
+    if bft::bft_is_dropped() {
+        fetched.clear();
+        return 0;
+    }
     let mut fed = 0;
     loop {
         let next = bft::decided_len();
@@ -772,15 +805,23 @@ fn feed_ready_decisions(
         while fetched.first_key_value().is_some_and(|(&height, _)| height < next) {
             fetched.pop_first();
         }
-        let Some(decision) = fetched.remove(&next) else { return fed; };
+        let Some((from, decision)) = fetched.remove(&next) else { return fed; };
         match bft_runner.feed_fetched(decision, read_state, block_writer) {
             bft::FeedOutcome::Fed => fed += 1,
             bft::FeedOutcome::NotReady(decision) => {
-                fetched.insert(decision.height, decision);
+                fetched.insert(decision.height, (from, decision));
                 return fed;
             }
-            bft::FeedOutcome::Refused(why) => {
+            bft::FeedOutcome::Refused { why, peer_fault } => {
                 tracing::warn!("NewNet: refused a fetched BFT decision at height {next}: {why}");
+                if peer_fault {
+                    // A decision that does not verify for its height is not something an honest
+                    // peer serves: drop the peer and everything else it sent.
+                    fetched.retain(|_, (sender, _)| *sender != from);
+                    peers_to_kill.push((from, format!("served BFT height {next}, which does not verify: {why}")));
+                } else {
+                    note_rejection(bft_peer_rejections, from);
+                }
                 return fed;
             }
         }
@@ -1496,6 +1537,10 @@ pub struct Peer {
 
     // how many decided BFT heights they hold, from their last BFT_STATUS
     their_bft_len: u64,
+
+    // when they last answered a BFT_REQ of ours: only then is their_bft_len evidence enough to
+    // hold tenderlink back (`bft_catching_up`)
+    bft_answered_at: Option<std::time::Instant>,
 }
 
 #[derive(Debug)]
@@ -1929,16 +1974,16 @@ struct Rejection {
     retry_at: std::time::Instant,
 }
 
-fn note_rejection(rejections: &mut HashMap<Hash, Rejection>, hash: Hash) {
+fn note_rejection<K: Eq + std::hash::Hash>(rejections: &mut HashMap<K, Rejection>, key: K) {
     let now = std::time::Instant::now();
-    let rejection = rejections.entry(hash).or_insert(Rejection { strikes: 0, retry_at: now });
+    let rejection = rejections.entry(key).or_insert(Rejection { strikes: 0, retry_at: now });
     rejection.strikes += 1;
     let backoff = REJECTED_BLOCK_BACKOFF_MIN.saturating_mul(1 << (rejection.strikes - 1).min(16));
     rejection.retry_at = now + backoff.min(REJECTED_BLOCK_BACKOFF_MAX);
 }
 
-fn is_backing_off(rejections: &HashMap<Hash, Rejection>, hash: Hash) -> bool {
-    rejections.get(&hash).is_some_and(|rejection| std::time::Instant::now() < rejection.retry_at)
+fn is_backing_off<K: Eq + std::hash::Hash>(rejections: &HashMap<K, Rejection>, key: K) -> bool {
+    rejections.get(&key).is_some_and(|rejection| std::time::Instant::now() < rejection.retry_at)
 }
 
 fn kill_peer(
@@ -2156,20 +2201,24 @@ pub fn sync(
 
     // Decided BFT heights fetched from peers and waiting for their snapshot, and the one BFT_REQ
     // in flight: (peer, first height asked for, when).
-    let mut bft_fetched: std::collections::BTreeMap<u64, bft_sync::WireDecision> = std::collections::BTreeMap::new();
-    let mut bft_request: Option<(ConnectionKey, u64, std::time::Instant)> = None;
-    let mut last_bft_request_peer: Option<ConnectionKey> = None;
+    let mut bft_fetched: std::collections::BTreeMap<u64, (ConnectionKey, bft_sync::WireDecision)> = std::collections::BTreeMap::new();
+    let mut bft_request: Option<(ConnectionKey, u64, u16, std::time::Instant)> = None;
+    let mut bft_request_cursor = 0usize;
+    let mut bft_peer_rejections: HashMap<ConnectionKey, Rejection> = HashMap::new();
+    // BFT_REQs received, served under the block-response backpressure: at most one per peer.
+    let mut bft_requests_to_serve: Vec<(ConnectionKey, u64, u16)> = Vec::new();
 
     // Stop only between writes. A commit and its chain/BFT bookkeeping finish
     // together on this thread; dropping it mid-commit is never a shutdown path.
     while !zebra_chain::shutdown::is_shutting_down() {
         let loop_start = std::time::Instant::now();
 
-        let our_bft_len = bft::decided_len();
-        let peers_bft_len = peers.values().map(|peer| peer.their_bft_len).max().unwrap_or(0);
-        bft_runner.set_catching_up(peers_bft_len > our_bft_len + BFT_CATCH_UP_SLACK);
+        bft_peer_rejections.retain(|_, rejection| std::time::Instant::now() < rejection.retry_at + REJECTED_BLOCK_BACKOFF_MAX);
+        let catching_up = !bft::bft_is_dropped()
+            && bft_catching_up(&peers, &bft_peer_rejections, bft::decided_len(), std::time::Instant::now());
+        bft_runner.set_catching_up(catching_up);
         bft_runner.tick(&read_state, &mut block_writer);
-        feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer);
+        feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer, &mut peers_to_kill, &mut bft_peer_rejections);
 
         if loop_start > next_console_status_print {
             let mut my_peers_to_print = Vec::new();
@@ -2515,6 +2564,31 @@ pub fn sync(
             for packet in packets {
                 bulk_packets_to_send.push((*connection_key, packet));
             }
+        }
+        // Decided BFT heights asked for, under the same backpressure: a response is built only
+        // when the peer's backlog leaves room for the largest one. A skipped request is not lost:
+        // the requester asks again, or another peer, after its timeout.
+        for (connection_key, from, count) in bft_requests_to_serve.drain(..) {
+            if !current_connections.iter().any(|(addr, _)| addr.connection_key() == connection_key) {
+                continue;
+            }
+            let reserved = reserved_send_bytes.get(&connection_key).copied().unwrap_or(0);
+            let is_synthetic = synthetic_peers.iter().any(|p| p.address.connection_key() == connection_key);
+            if !is_synthetic && network_thread_handle.send_budget(connection_key, Channel::Bulk) < reserved.saturating_add(bft_sync::DECISIONS_MESSAGE_BUDGET as u64) {
+                deferred_block_responses += 1;
+                continue;
+            }
+            // Heights past u32 cannot be stored, so nothing is there to send.
+            let Ok(from) = u32::try_from(from) else { continue };
+            let decisions = block_writer.finalized_state.db.bft_decisions(from, count.into());
+            if decisions.is_empty() {
+                continue;
+            }
+            let packet = bft_sync::bft_decisions_packet(decisions.iter().enumerate().map(|(i, d)| {
+                (u64::from(from) + i as u64, &d.block, &d.fat_pointer, d.proposal_sigs.as_slice())
+            }));
+            *reserved_send_bytes.entry(connection_key).or_insert(0) += packet.len() as u64;
+            bulk_packets_to_send.push((connection_key, packet));
         }
         if deferred_block_responses > 0 {
             tracing::debug!("NewNet: deferred {deferred_block_responses} block responses: peer send backlog full");
@@ -3105,25 +3179,31 @@ pub fn sync(
         // tick loop -- and with it Zebra's shutdown -- can continue.
         // Fetch decided BFT heights ahead of our own from a peer that holds them, one request
         // in flight, so the decisions PoW blocks cite are here when those blocks are.
-        if bft_request.is_some_and(|(_, _, sent)| sent.elapsed() >= BFT_REQUEST_TIMEOUT) {
-            bft_request = None;
+        if let Some((key, _, _, sent)) = bft_request {
+            if sent.elapsed() >= BFT_REQUEST_TIMEOUT {
+                // Unanswered: ask someone else for a while.
+                note_rejection(&mut bft_peer_rejections, key);
+                bft_request = None;
+            }
         }
-        if bft_request.is_none() {
+        if bft_request.is_none() && !bft::bft_is_dropped() {
             let our_len = bft::decided_len();
-            let mut want = our_len;
+            // On a chain-bootstrapped network genesis is derived, never fetched.
+            let mut want = our_len.max(if bft_runner.fetches_genesis() { 0 } else { 1 });
             while bft_fetched.contains_key(&want) {
                 want += 1;
             }
             let room = (our_len + BFT_FETCH_AHEAD).saturating_sub(want);
-            // Rotate among the peers that hold them, so one silent peer cannot hold up the fetch.
-            let holders: Vec<ConnectionKey> = peers.iter().filter(|(_, peer)| peer.their_bft_len > want).map(|(key, _)| *key).collect();
-            let holder = holders.iter().copied().find(|&key| Some(key) != last_bft_request_peer).or(holders.first().copied());
-            if let (Some(key), true) = (holder, room > 0) {
+            // Round-robin among the peers that hold them and are not backing off, so a silent
+            // or slow peer cannot hold up the fetch.
+            let holders = bft_holders(&peers, &bft_peer_rejections, want);
+            if let (false, true) = (holders.is_empty(), room > 0) {
+                let key = holders[bft_request_cursor % holders.len()];
+                bft_request_cursor = bft_request_cursor.wrapping_add(1);
                 // A u16 count, at most the per-message cap.
                 let count = room.min(u64::from(bft_sync::MAX_DECISIONS_PER_MESSAGE)) as u16;
                 packets_to_send.push((key, bft_sync::bft_req_packet(want, count)));
-                bft_request = Some((key, want, std::time::Instant::now()));
-                last_bft_request_peer = Some(key);
+                bft_request = Some((key, want, count, std::time::Instant::now()));
             }
         }
 
@@ -3641,29 +3721,51 @@ pub fn sync(
                 let Some((from, count)) = some_or_kill!(bft_sync::read_bft_req(msg), "Malformed BFT_REQ") else {
                     continue 'process_packets;
                 };
-                // Heights past u32 cannot be stored, so nothing is there to send.
-                if let Ok(from) = u32::try_from(from) {
-                    let decisions = block_writer.finalized_state.db.bft_decisions(from, count.into());
-                    if !decisions.is_empty() {
-                        let packet = bft_sync::bft_decisions_packet(decisions.iter().enumerate().map(|(i, d)| {
-                            (u64::from(from) + i as u64, &d.block, &d.fat_pointer, d.proposal_sigs.as_slice())
-                        }));
-                        bulk_packets_to_send.push((connection_key, packet));
-                    }
-                }
+                // Served after this tick's block responses, under the same backpressure; a newer
+                // request from the same peer replaces an unserved one.
+                bft_requests_to_serve.retain(|(key, ..)| *key != connection_key);
+                bft_requests_to_serve.push((connection_key, from, count));
 
             } else if packet_type == PACKET_TYPE_BFT_DECISIONS {
                 let Some(decisions) = some_or_kill!(bft_sync::read_bft_decisions(msg), "Malformed BFT_DECISIONS") else {
                     continue 'process_packets;
                 };
-                let next = bft::decided_len();
-                for decision in decisions {
-                    if decision.height >= next && decision.height < next + BFT_FETCH_AHEAD {
-                        bft_fetched.entry(decision.height).or_insert(decision);
-                    }
+                if bft::bft_is_dropped() {
+                    continue 'process_packets;
                 }
-                if bft_request.is_some_and(|(key, ..)| key == connection_key) {
+                let next = bft::decided_len();
+                let first_fetchable = if bft_runner.fetches_genesis() { 0 } else { 1 };
+                let requested = bft_request.filter(|&(key, from, ..)| key == connection_key && decisions.first().is_some_and(|d| d.height == from));
+                if let Some((_, from, count, _)) = requested {
+                    // The answer to our request: keep the heights asked for, and who sent them.
+                    for decision in decisions {
+                        let height = decision.height;
+                        if height >= from.max(first_fetchable) && height < from + u64::from(count) && height >= next && height < next + BFT_FETCH_AHEAD {
+                            bft_fetched.insert(height, (connection_key, decision));
+                        }
+                    }
+                    peer.bft_answered_at = Some(std::time::Instant::now());
                     bft_request = None;
+                } else {
+                    // Not asked for: a decision for our next height that can be stored at once is
+                    // as good as one we asked for, since its certificate vouches for it. Nothing
+                    // else is kept, so no peer can occupy the fetch window with what it chooses.
+                    for decision in decisions {
+                        if decision.height != bft::decided_len() || decision.height < first_fetchable {
+                            continue;
+                        }
+                        match bft_runner.feed_fetched(decision, &read_state, &mut block_writer) {
+                            bft::FeedOutcome::Fed => {}
+                            bft::FeedOutcome::NotReady(_) => break,
+                            bft::FeedOutcome::Refused { why, peer_fault } => {
+                                if peer_fault {
+                                    kill!("Sent a BFT decision that does not verify: {why}");
+                                    continue 'process_packets;
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
 
             } else {
@@ -3716,7 +3818,7 @@ pub fn sync(
             // Validate and Decided answer. Serve it between blocks, not only between ticks; a
             // decision stored here can also let the next block's fat pointer resolve.
             bft_runner.drain(&read_state, &mut block_writer);
-            feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer);
+            feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer, &mut peers_to_kill, &mut bft_peer_rejections);
             let hash = *hash;
             let block_arc = block_arc.clone();
 
@@ -3950,7 +4052,7 @@ pub fn sync(
             }
         });
 
-        feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer);
+        feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer, &mut peers_to_kill, &mut bft_peer_rejections);
         sync_profile.record_tick(commit_head, committed_this_tick, commit_start.elapsed(), bft_runner.has_parked_decision());
         sync_profile.report_if_due(
             read_state.best_tip().map_or(0, |(h, _)| h.0),
@@ -4013,6 +4115,59 @@ pub fn sync(
 mod tests {
     #[allow(unused_imports)]
     use super::*;
+
+    #[cfg(test)]
+    fn bft_peer(port: u16, their_bft_len: u64, answered_ago: Option<std::time::Duration>, now: std::time::Instant) -> (ConnectionKey, Peer) {
+        let key = ConnectionKey { ip: std::net::Ipv6Addr::LOCALHOST, port, key_15_bits: 0 };
+        let peer = Peer { their_bft_len, bft_answered_at: answered_ago.map(|ago| now - ago), ..Default::default() };
+        (key, peer)
+    }
+
+    /// Only a peer that has recently answered our requests can hold tenderlink back: a length
+    /// advertised by a peer that never serves holds nothing, nor does one from a peer backing off.
+    #[test]
+    fn bft_catch_up_hold_needs_a_peer_that_serves() {
+        let now = std::time::Instant::now();
+        let mut peers = HashMap::new();
+        let no_rejections = HashMap::new();
+
+        let (liar, peer) = bft_peer(1, u64::MAX, None, now);
+        peers.insert(liar, peer);
+        assert!(!bft_catching_up(&peers, &no_rejections, 10, now), "an advertised length alone holds nothing");
+
+        let (stale, peer) = bft_peer(2, 1_000, Some(BFT_EVIDENCE_WINDOW * 2), now);
+        peers.insert(stale, peer);
+        assert!(!bft_catching_up(&peers, &no_rejections, 10, now), "an answer long ago holds nothing");
+
+        let (server, peer) = bft_peer(3, 10 + BFT_CATCH_UP_SLACK, Some(std::time::Duration::from_secs(1)), now);
+        peers.insert(server, peer);
+        assert!(!bft_catching_up(&peers, &no_rejections, 10, now), "within the slack is caught up");
+
+        peers.get_mut(&server).unwrap().their_bft_len = 10 + BFT_CATCH_UP_SLACK + 1;
+        assert!(bft_catching_up(&peers, &no_rejections, 10, now));
+
+        let mut rejections = HashMap::new();
+        note_rejection(&mut rejections, server);
+        assert!(!bft_catching_up(&peers, &rejections, 10, now), "a peer backing off holds nothing");
+    }
+
+    /// Requests go round all the peers that hold the wanted height, skipping those backing off.
+    #[test]
+    fn bft_holders_are_every_peer_with_the_height_and_not_backing_off() {
+        let now = std::time::Instant::now();
+        let mut peers = HashMap::new();
+        for (port, len) in [(1, 50), (2, 80), (3, 80), (4, 20)] {
+            let (key, peer) = bft_peer(port, len, None, now);
+            peers.insert(key, peer);
+        }
+        let ports = |holders: Vec<ConnectionKey>| holders.iter().map(|key| key.port).collect::<Vec<_>>();
+        assert_eq!(ports(bft_holders(&peers, &HashMap::new(), 30)), vec![1, 2, 3]);
+
+        let mut rejections = HashMap::new();
+        note_rejection(&mut rejections, ConnectionKey { ip: std::net::Ipv6Addr::LOCALHOST, port: 2, key_15_bits: 0 });
+        assert_eq!(ports(bft_holders(&peers, &rejections, 30)), vec![1, 3]);
+        assert_eq!(ports(bft_holders(&peers, &rejections, 60)), vec![3]);
+    }
 
     #[cfg(test)]
     fn parse_chunk(packet: &[u8]) -> (PeerPowBlockResponseChunkHdr, &[u8]) {
