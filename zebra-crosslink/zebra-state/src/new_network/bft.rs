@@ -1200,9 +1200,10 @@ impl BftRunner {
 
     /// Work that runs at the start of every tick.
     pub(super) fn tick(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
-        // Caught up with peers: start tenderlink from everything stored, fetched decisions
-        // included, rather than at the height it would have started at.
-        if self.spawn_deferred && !self.catching_up && self.launch.is_some() {
+        // Tenderlink is not running but decisions are stored: held back while catching up, or the
+        // genesis (or more) arrived from peers or an import before bootstrap could decide it, so
+        // bootstrap never starts it. Start it from everything stored once not catching up.
+        if self.launch.is_some() && !self.catching_up && self.pending_bootstrap.is_none() && decided_len() > 0 {
             self.spawn_deferred = false;
             self.restore(read_state, block_writer);
         }
