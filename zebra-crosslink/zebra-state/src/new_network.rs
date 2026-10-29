@@ -747,9 +747,11 @@ const IDLE_MS: u64 = 100;
 
 const SYNC_PROFILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How many decided BFT heights past our own the sync loop keeps fetched and waiting. Each is
-/// about 10 KB, and each waits only for its snapshot PoW block, which is fetched alongside.
-const BFT_FETCH_AHEAD: u64 = 512;
+/// How many decided BFT heights past our own the sync loop keeps fetched and waiting: two
+/// requests' worth. A decision is stored only once its snapshot is committed, and PoW holds at
+/// most `MAX_DEFERRED_BLOCKS` queued blocks at about one BFT height each, so a larger window only
+/// holds what cannot be used yet.
+const BFT_FETCH_AHEAD: u64 = 2 * bft_sync::MAX_DECISIONS_PER_MESSAGE as u64;
 /// A peer this many decided heights ahead of us means we are catching up: decisions are fetched
 /// as data, and tenderlink is held back until we are within it.
 const BFT_CATCH_UP_SLACK: u64 = 3;
