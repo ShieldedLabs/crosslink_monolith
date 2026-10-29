@@ -42,7 +42,8 @@ pub static DBG_TRAPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 #[cfg(debug_assertions)] pub fn dbg_break() {
     if !DBG_TRAPS.load(std::sync::atomic::Ordering::Relaxed) { return; }
     #[cfg(target_arch = "x86_64")] #[allow(unsafe_code)] unsafe { std::arch::asm!("int 3"); }
-    // @Todo: AArch64 debugbreak.
+    // 0xf000 is the immediate clang's __builtin_debugtrap uses, which debuggers step past.
+    #[cfg(target_arch = "aarch64")] #[allow(unsafe_code)] unsafe { std::arch::asm!("brk #0xf000"); }
 }
 
 #[cfg(debug_assertions)] #[track_caller] pub fn dbg_panic_internal(msg: std::fmt::Arguments<'_>) {
@@ -59,12 +60,6 @@ pub static DBG_TRAPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 pub fn dbg_verify<T>(t: Option<T>) -> Option<T> {
     #[cfg(debug_assertions)] {
         if t.is_none() { dbg_break(); }
-
-        // No debug break on this architecture yet, so stop by panicking, unless traps are off.
-        #[cfg(not(target_arch = "x86_64"))]
-        if t.is_none() && DBG_TRAPS.load(std::sync::atomic::Ordering::Relaxed) {
-            panic!("dbg_verify: None");
-        }
     }
 
     t
