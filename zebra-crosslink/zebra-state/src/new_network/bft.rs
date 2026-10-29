@@ -724,7 +724,9 @@ fn proposal_valid_round(
     // A positive i32 round fits u32.
     let round_u32 = round as u32;
     let height = u64::from(block.height);
-    let Some(proposer_i) = tenderlink::proposer_index(&HashKeys::default(), &voting.roster, active_roster_max_n, height, round_u32) else {
+    // An empty roster (the genesis height) has no proposer; tenderlink would log asking it for one.
+    let proposer_i = if voting.roster.is_empty() { None } else { tenderlink::proposer_index(&HashKeys::default(), &voting.roster, active_roster_max_n, height, round_u32) };
+    let Some(proposer_i) = proposer_i else {
         return Some(-1);
     };
     let proposer = voting.roster[proposer_i].pub_key;
@@ -1374,7 +1376,9 @@ impl BftRunner {
             return Err(format!("the fat pointer's round {round} is negative"));
         };
         let voting = self.next_voting_roster(&BFT_CHAIN.read().unwrap());
-        let Some(proposer_i) = tenderlink::proposer_index(&HashKeys::default(), &voting.roster, self.params.active_roster_max_n, height, round) else {
+        // An empty roster (the genesis height) has no proposer; tenderlink would log asking it for one.
+        let proposer_i = if voting.roster.is_empty() { None } else { tenderlink::proposer_index(&HashKeys::default(), &voting.roster, self.params.active_roster_max_n, height, round) };
+        let Some(proposer_i) = proposer_i else {
             return match sigs.is_empty() {
                 true => Ok(()),
                 false => Err(format!("{} proposal signatures for {height}.{round}, which has no proposer", sigs.len())),
