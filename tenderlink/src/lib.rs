@@ -59,12 +59,14 @@ pub static DBG_TRAPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 pub fn dbg_verify<T>(t: Option<T>) -> Option<T> {
     #[cfg(debug_assertions)] {
         if t.is_none() { dbg_break(); }
+
+        // No debug break on this architecture yet, so stop by panicking, unless traps are off.
+        #[cfg(not(target_arch = "x86_64"))]
+        if t.is_none() && DBG_TRAPS.load(std::sync::atomic::Ordering::Relaxed) {
+            panic!("dbg_verify: None");
+        }
     }
 
-    #[cfg(all(debug_assertions, not(target_arch = "x86_64")))]
-    return Some(t.unwrap());
-
-    #[cfg(not(all(debug_assertions, not(target_arch = "x86_64"))))]
     t
 }
 pub fn verify<T>(t: Option<T>) -> T {
