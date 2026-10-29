@@ -132,6 +132,10 @@ pub fn read_bft_decisions(body: &[u8]) -> Option<Vec<WireDecision>> {
     for _ in 0..n {
         let height = r.u64()?;
         let block_len = r.u32()? as usize;
+        // Tenderlink decides nothing larger, so a larger block is not a decision.
+        if block_len > tenderlink::PROPOSAL_MAX_SIZE {
+            return None;
+        }
         let block = super::bft::bft_block_from_canonical_bytes(r.take(block_len)?)?;
         let fp_len = r.u32()? as usize;
         let mut fp_bytes = r.take(fp_len)?;
@@ -231,6 +235,15 @@ mod tests {
 
         assert_eq!(read_bft_status(&[1, 2, 3]), None);
         assert_eq!(read_bft_req(&[0; 11]), None);
+    }
+
+    #[test]
+    fn a_block_larger_than_any_proposal_is_refused_before_decoding() {
+        let mut body = 1u16.to_le_bytes().to_vec();
+        body.extend_from_slice(&5u64.to_le_bytes());
+        body.extend_from_slice(&((tenderlink::PROPOSAL_MAX_SIZE + 1) as u32).to_le_bytes());
+        body.resize(body.len() + tenderlink::PROPOSAL_MAX_SIZE + 1, 0);
+        assert_eq!(read_bft_decisions(&body), None);
     }
 
     #[test]

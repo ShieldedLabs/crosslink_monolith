@@ -1099,8 +1099,9 @@ pub(super) enum FeedOutcome {
     /// Not the next height, its snapshot is not committed yet, a decision is parked, or
     /// validation cannot settle it yet: handed back to keep.
     NotReady(super::bft_sync::WireDecision),
-    /// `peer_fault`: the decision itself is wrong (a block or certificate that does not verify
-    /// for its height), which no honest peer sends.
+    /// Not stored. `peer_fault`: the decision is wrong whatever this node's state (its
+    /// certificate names another block, or it is labelled with the wrong height), which no honest
+    /// peer sends. Otherwise the refusal may be this node's own state disagreeing.
     Refused { why: String, peer_fault: bool },
 }
 
@@ -1110,18 +1111,32 @@ enum ForceFed {
     AlreadyDecided,
 }
 
-/// Why a force-fed decision was not stored, and whether the decision itself is at fault.
+/// Why a force-fed decision was not stored.
 struct FeedRefusal {
     why: String,
-    peer_fault: bool,
+    kind: RefusalKind,
+}
+
+enum RefusalKind {
+    /// The decision is wrong whatever this node's state (its certificate names another block):
+    /// no honest peer sends it.
+    Fault,
+    /// Refused here, but the reason depends on this node's own state (its decided chain, roster,
+    /// slashfork schedule), so the sender may be honest and this node the odd one out.
+    Refused,
+    /// Cannot be settled yet (BFT dropped, a decision parked, validation indeterminate).
+    NotYet,
 }
 
 impl FeedRefusal {
     fn fault(why: String) -> Self {
-        Self { why, peer_fault: true }
+        Self { why, kind: RefusalKind::Fault }
+    }
+    fn refused(why: String) -> Self {
+        Self { why, kind: RefusalKind::Refused }
     }
     fn not_yet(why: String) -> Self {
-        Self { why, peer_fault: false }
+        Self { why, kind: RefusalKind::NotYet }
     }
 }
 
@@ -1276,8 +1291,9 @@ impl BftRunner {
         // Proposal signatures are not checked here: the certificate is what makes a decision
         // decided. They are kept only if they verify as a fresh proposal's, below.
         match self.check_force_fed(&decision.block, &decision.fat_pointer, &decision.proposal_sigs, -1, true, false, read_state, block_writer) {
-            Err(refusal) if refusal.peer_fault => FeedOutcome::Refused { why: refusal.why, peer_fault: true },
-            Err(_) => FeedOutcome::NotReady(decision),
+            Err(FeedRefusal { why, kind: RefusalKind::Fault }) => FeedOutcome::Refused { why, peer_fault: true },
+            Err(FeedRefusal { why, kind: RefusalKind::Refused }) => FeedOutcome::Refused { why, peer_fault: false },
+            Err(FeedRefusal { kind: RefusalKind::NotYet, .. }) => FeedOutcome::NotReady(decision),
             Ok(ForceFed::AlreadyDecided) => FeedOutcome::Fed,
             Ok(ForceFed::New) => {
                 let proposal_sigs = fresh_proposal_sigs(&decision.block, &decision.fat_pointer, decision.proposal_sigs, &voting, self.params.active_roster_max_n);
@@ -1445,7 +1461,7 @@ impl BftRunner {
             )));
         }
         if !fat_pointer.fits_active_roster(&self.params) {
-            return Err(FeedRefusal::fault(format!(
+            return Err(FeedRefusal::refused(format!(
                 "the fat pointer has {} signatures, more than the {} seats of the active roster",
                 fat_pointer.signatures.len(), self.params.active_roster_max_n,
             )));
@@ -1456,7 +1472,7 @@ impl BftRunner {
         };
         match status {
             TMStatus::Pass => {}
-            TMStatus::Fail => return Err(FeedRefusal::fault(format!("PoS validation = {status:?}: {reason:?}"))),
+            TMStatus::Fail => return Err(FeedRefusal::refused(format!("PoS validation = {status:?}: {reason:?}"))),
             _ => return Err(FeedRefusal::not_yet(format!("PoS validation = {status:?}: {reason:?}"))),
         }
         // Tenderlink decides only on a quorum, so from FeaturenetUpgrade2 a force-fed
@@ -1469,18 +1485,18 @@ impl BftRunner {
             // as it is for tenderlink's own decisions. A fed decision can carry one, so
             // refuse it here: before FeaturenetUpgrade2 nothing else checks first.
             if !fat_pointer.validate_signatures(&voting.vote_namespace) {
-                return Err(FeedRefusal::fault(format!(
+                return Err(FeedRefusal::refused(format!(
                     "the fat pointer for BFT height {} carries a signature that does not verify", block.height,
                 )));
             }
             if (voting.strict_quorum || require_certificate) && !certificate_is_valid(fat_pointer, u64::from(block.height), &voting) {
-                return Err(FeedRefusal::fault(format!(
+                return Err(FeedRefusal::refused(format!(
                     "the fat pointer is not a valid certificate for BFT height {}", block.height,
                 )));
             }
         }
         if verify_proposal_sigs {
-            self.check_decision_roster(block, fat_pointer, proposal_sigs, valid_round, block_writer).map_err(FeedRefusal::fault)?;
+            self.check_decision_roster(block, fat_pointer, proposal_sigs, valid_round, block_writer).map_err(FeedRefusal::refused)?;
         }
         Ok(ForceFed::New)
     }

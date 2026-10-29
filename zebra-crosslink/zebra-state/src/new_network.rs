@@ -817,11 +817,13 @@ fn feed_ready_decisions(
             bft::FeedOutcome::Refused { why, peer_fault } => {
                 tracing::warn!("NewNet: refused a fetched BFT decision at height {next}: {why}");
                 if peer_fault {
-                    // A decision that does not verify for its height is not something an honest
-                    // peer serves: drop the peer and everything else it sent.
+                    // Wrong whatever our state: not something an honest peer serves. Drop the peer
+                    // and everything else it sent.
                     fetched.retain(|_, (sender, _)| *sender != from);
-                    peers_to_kill.push((from, format!("served BFT height {next}, which does not verify: {why}")));
+                    peers_to_kill.push((from, format!("served a malformed BFT decision for height {next}: {why}")));
                 } else {
+                    // Possibly our own state disagreeing (decided chain, roster, slashforks): ask
+                    // others for a while rather than drop a peer that may be honest.
                     note_rejection(bft_peer_rejections, from);
                 }
                 return fed;
@@ -3761,7 +3763,7 @@ pub fn sync(
                             bft::FeedOutcome::NotReady(_) => break,
                             bft::FeedOutcome::Refused { why, peer_fault } => {
                                 if peer_fault {
-                                    kill!("Sent a BFT decision that does not verify: {why}");
+                                    kill!("Sent a malformed BFT decision: {why}");
                                     continue 'process_packets;
                                 }
                                 break;
