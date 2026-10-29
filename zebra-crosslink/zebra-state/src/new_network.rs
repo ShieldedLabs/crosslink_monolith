@@ -755,7 +755,8 @@ const BFT_FETCH_AHEAD: u64 = 2 * bft_sync::MAX_DECISIONS_PER_MESSAGE as u64;
 /// A peer this many decided heights ahead of us means we are catching up: decisions are fetched
 /// as data, and tenderlink is held back until we are within it.
 const BFT_CATCH_UP_SLACK: u64 = 3;
-/// A BFT_REQ unanswered for this long is sent again, to another peer if one has the heights.
+/// A BFT_REQ unanswered for this long is sent again, to another peer if one has the heights. The
+/// first stays open for its answer until the block-response deadline: a slow answer is no fault.
 const BFT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// A peer's advertised BFT length counts towards holding tenderlink back only if it answered a
 /// BFT_REQ of ours this recently: a length nobody serves holds nothing.
@@ -2203,10 +2204,10 @@ pub fn sync(
 
     let mut sync_profile = SyncProfile::new();
 
-    // Decided BFT heights fetched from peers and waiting for their snapshot, and the one BFT_REQ
-    // in flight: (peer, first height asked for, when).
+    // Decided BFT heights fetched from peers and waiting for their snapshot, and the BFT_REQs still
+    // open for an answer: (peer, first height asked for, count, when).
     let mut bft_fetched: std::collections::BTreeMap<u64, (ConnectionKey, bft_sync::WireDecision)> = std::collections::BTreeMap::new();
-    let mut bft_request: Option<(ConnectionKey, u64, u16, std::time::Instant)> = None;
+    let mut bft_requests: Vec<(ConnectionKey, u64, u16, std::time::Instant)> = Vec::new();
     let mut bft_request_cursor = 0usize;
     let mut bft_peer_rejections: HashMap<ConnectionKey, Rejection> = HashMap::new();
     // BFT_REQs received, served under the block-response backpressure: at most one per peer.
@@ -3181,16 +3182,15 @@ pub fn sync(
         // did not answer in time because it died or wedged: keep our connection
         // list as it was instead of replacing it with an empty answer, so this
         // tick loop -- and with it Zebra's shutdown -- can continue.
-        // Fetch decided BFT heights ahead of our own from a peer that holds them, one request
-        // in flight, so the decisions PoW blocks cite are here when those blocks are.
-        if let Some((key, _, _, sent)) = bft_request {
-            if sent.elapsed() >= BFT_REQUEST_TIMEOUT {
-                // Unanswered: ask someone else for a while.
-                note_rejection(&mut bft_peer_rejections, key);
-                bft_request = None;
-            }
-        }
-        if bft_request.is_none() && !bft::bft_is_dropped() {
+        // Fetch decided BFT heights ahead of our own from a peer that holds them, one fresh request
+        // at a time, so the decisions PoW blocks cite are here when those blocks are. As with block
+        // downloads, slowness is no fault: an unanswered request is sent again after
+        // BFT_REQUEST_TIMEOUT, and stays open for its answer until the block-response deadline,
+        // since BFT_DECISIONS queue behind block responses on Bulk.
+        let now = std::time::Instant::now();
+        bft_requests.retain(|&(key, .., sent)| peers.contains_key(&key) && now.saturating_duration_since(sent) < block_response_deadline);
+        let request_fresh = bft_requests.iter().any(|&(.., sent)| now.saturating_duration_since(sent) < BFT_REQUEST_TIMEOUT);
+        if !request_fresh && !bft::bft_is_dropped() {
             let our_len = bft::decided_len();
             // On a chain-bootstrapped network genesis is derived, never fetched.
             let mut want = our_len.max(if bft_runner.fetches_genesis() { 0 } else { 1 });
@@ -3198,16 +3198,19 @@ pub fn sync(
                 want += 1;
             }
             let room = (our_len + BFT_FETCH_AHEAD).saturating_sub(want);
-            // Round-robin among the peers that hold them and are not backing off, so a silent
-            // or slow peer cannot hold up the fetch.
+            // Round-robin among the peers that hold them and are not backing off, preferring one
+            // not already waited on, so a silent or slow peer cannot hold up the fetch. With no
+            // other, a waited-on peer is asked again: delivery is best-effort, the ask may be lost.
             let holders = bft_holders(&peers, &bft_peer_rejections, want);
+            let unasked: Vec<ConnectionKey> = holders.iter().copied().filter(|key| !bft_requests.iter().any(|(asked, ..)| asked == key)).collect();
+            let holders = if unasked.is_empty() { holders } else { unasked };
             if let (false, true) = (holders.is_empty(), room > 0) {
                 let key = holders[bft_request_cursor % holders.len()];
                 bft_request_cursor = bft_request_cursor.wrapping_add(1);
                 // A u16 count, at most the per-message cap.
                 let count = room.min(u64::from(bft_sync::MAX_DECISIONS_PER_MESSAGE)) as u16;
                 packets_to_send.push((key, bft_sync::bft_req_packet(want, count)));
-                bft_request = Some((key, want, count, std::time::Instant::now()));
+                bft_requests.push((key, want, count, now));
             }
         }
 
@@ -3739,9 +3742,10 @@ pub fn sync(
                 }
                 let next = bft::decided_len();
                 let first_fetchable = if bft_runner.fetches_genesis() { 0 } else { 1 };
-                let requested = bft_request.filter(|&(key, from, ..)| key == connection_key && decisions.first().is_some_and(|d| d.height == from));
-                if let Some((_, from, count, _)) = requested {
-                    // The answer to our request: keep the heights asked for, and who sent them.
+                let requested = bft_requests.iter().position(|&(key, from, ..)| key == connection_key && decisions.first().is_some_and(|d| d.height == from));
+                if let Some((_, from, count, _)) = requested.map(|i| bft_requests.swap_remove(i)) {
+                    // The answer to a request still open, however late: keep the heights asked
+                    // for, and who sent them.
                     for decision in decisions {
                         let height = decision.height;
                         if height >= from.max(first_fetchable) && height < from + u64::from(count) && height >= next && height < next + BFT_FETCH_AHEAD {
@@ -3749,7 +3753,6 @@ pub fn sync(
                         }
                     }
                     peer.bft_answered_at = Some(std::time::Instant::now());
-                    bft_request = None;
                 } else {
                     // Not asked for: a decision for our next height that can be stored at once is
                     // as good as one we asked for, since its certificate vouches for it. Nothing
