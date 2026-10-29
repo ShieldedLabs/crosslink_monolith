@@ -14,7 +14,8 @@ split-debuginfo = "unpacked"  # produce separate .pdb files
 lto = false
 
 [dependencies]
-shielded_transport_pigeon = "2.0.0"
+# 2.0.0 plus the macOS socket-buffer fix (a connection whose TU reached 8192 stopped sending).
+shielded_transport_pigeon = { git = "https://github.com/ShieldedLabs/shielded_transport_pigeon", rev = "1747e547672e49604e209c2315640846a961b1c3" }
 blake3 = "1.8.2"
 byteorder = "1.5.0"
 ed25519-zebra = "4.1.0"
