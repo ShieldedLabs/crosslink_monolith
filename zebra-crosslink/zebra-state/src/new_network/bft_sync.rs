@@ -120,6 +120,12 @@ pub fn read_bft_req(body: &[u8]) -> Option<(u64, u16)> {
     r.0.is_empty().then_some((from, count.min(MAX_DECISIONS_PER_MESSAGE)))
 }
 
+/// Assumption, established at ingest: every BFT block a peer gives us has at least one header.
+/// `read_bft_decisions` refuses one with none, and nothing else turns peer bytes into a block.
+/// Code that relies on it (a block's snapshot is `headers[0]`'s parent) names this, so removing
+/// the check here means revisiting every such site.
+pub(crate) const ASSUME_BFT_BLOCK_HAS_HEADERS: () = ();
+
 /// The decisions in a `BFT_DECISIONS` body, which must be consecutive heights. Blocks must be
 /// canonically encoded, as tenderlink requires of proposals (`bft_block_from_canonical_bytes`).
 pub fn read_bft_decisions(body: &[u8]) -> Option<Vec<WireDecision>> {
@@ -137,6 +143,11 @@ pub fn read_bft_decisions(body: &[u8]) -> Option<Vec<WireDecision>> {
             return None;
         }
         let block = super::bft::bft_block_from_canonical_bytes(r.take(block_len)?)?;
+        // ASSUME_BFT_BLOCK_HAS_HEADERS: a block's snapshot is its first header's parent, so a
+        // block with none is no block.
+        if block.headers.is_empty() {
+            return None;
+        }
         let fp_len = r.u32()? as usize;
         let mut fp_bytes = r.take(fp_len)?;
         let fat_pointer = FatPointerToBftBlock::zcash_deserialize(&mut fp_bytes).ok()?;
@@ -144,6 +155,11 @@ pub fn read_bft_decisions(body: &[u8]) -> Option<Vec<WireDecision>> {
             return None;
         }
         let sigs_n = r.u16()?;
+        // A decision carries no proposal signatures (genesis, or ones that would not verify
+        // fresh), or one per chunk of its block, as tenderlink signs proposals.
+        if sigs_n != 0 && usize::from(sigs_n) != block_len.div_ceil(tenderlink::PROPOSAL_CHUNK_DATA_SIZE) {
+            return None;
+        }
         let mut proposal_sigs = Vec::with_capacity(usize::from(sigs_n).min(r.0.len() / 64));
         for _ in 0..sigs_n {
             proposal_sigs.push(TMSig(r.take(64)?.try_into().ok()?));
@@ -163,7 +179,8 @@ mod tests {
     use super::*;
     use zcash_primitives::block::{BlockHash, BlockHeaderData as BcBlockHeader};
 
-    fn decision(height: u64, sigs: usize) -> WireDecision {
+    /// A decision with no proposal signatures, or (`signed`) one per chunk of its block.
+    fn decision(height: u64, signed: bool) -> WireDecision {
         let header = BcBlockHeader {
             version: 4,
             prev_block: BlockHash([1; 32]),
@@ -175,20 +192,26 @@ mod tests {
             solution: vec![7; 1344],
             fat_pointer_to_bft_block: FatPointerToBftBlock::null(),
         };
+        let block = BftBlock {
+            version: 2,
+            // Heights fit u32 in these tests.
+            height: height as u32,
+            previous_block_fat_ptr: FatPointerToBftBlock::null(),
+            headers: vec![header; 4],
+            slashforks: Vec::new(),
+            do_not_include_until_bc_height: 0,
+        };
+        let sigs = if signed { chunks_n(&block) } else { 0 };
         WireDecision {
             height,
-            // Heights fit u32 in these tests.
-            block: BftBlock {
-                version: 2,
-                height: height as u32,
-                previous_block_fat_ptr: FatPointerToBftBlock::null(),
-                headers: vec![header; 4],
-                slashforks: Vec::new(),
-                do_not_include_until_bc_height: 0,
-            },
+            block,
             fat_pointer: FatPointerToBftBlock::null(),
             proposal_sigs: (0..sigs).map(|i| TMSig([i as u8; 64])).collect(),
         }
+    }
+
+    fn chunks_n(block: &BftBlock) -> usize {
+        block.zcash_serialize_to_vec().unwrap().len().div_ceil(tenderlink::PROPOSAL_CHUNK_DATA_SIZE)
     }
 
     fn encode(decisions: &[WireDecision]) -> Vec<u8> {
@@ -205,7 +228,7 @@ mod tests {
         assert_eq!(req[0], PACKET_TYPE_BFT_REQ);
         assert_eq!(read_bft_req(&req[1..]), Some((70, MAX_DECISIONS_PER_MESSAGE)));
 
-        let decisions = vec![decision(5, 1), decision(6, 0), decision(7, 3)];
+        let decisions = vec![decision(5, true), decision(6, false), decision(7, true)];
         let packet = encode(&decisions);
         assert_eq!(packet[0], PACKET_TYPE_BFT_DECISIONS);
         assert_eq!(read_bft_decisions(&packet[1..]), Some(decisions));
@@ -213,7 +236,7 @@ mod tests {
 
     #[test]
     fn malformed_bft_sync_messages_are_refused() {
-        let decisions = vec![decision(5, 1), decision(6, 1)];
+        let decisions = vec![decision(5, true), decision(6, true)];
         let packet = encode(&decisions);
 
         // Truncated anywhere, or with a trailing byte.
@@ -225,8 +248,20 @@ mod tests {
         assert_eq!(read_bft_decisions(&trailing[1..]), None);
 
         // Heights that do not follow on from each other.
-        let gap = encode(&[decision(5, 1), decision(7, 1)]);
+        let gap = encode(&[decision(5, true), decision(7, true)]);
         assert_eq!(read_bft_decisions(&gap[1..]), None);
+
+        // A block with no headers has no snapshot (asking for it panics). It encodes canonically
+        // and carries no signatures, so only the explicit check refuses it.
+        let mut headerless = decision(5, false);
+        headerless.block.headers.clear();
+        let headerless = encode(&[headerless]);
+        assert_eq!(read_bft_decisions(&headerless[1..]), None);
+
+        // Signatures neither absent nor one per chunk of the block.
+        let mut padded = decision(5, true);
+        padded.proposal_sigs.push(TMSig([9; 64]));
+        assert_eq!(read_bft_decisions(&encode(&[padded])[1..]), None);
 
         // A count beyond the cap, before anything is allocated for it.
         let mut too_many = vec![0u8; 2];
@@ -239,16 +274,16 @@ mod tests {
 
     #[test]
     fn a_block_larger_than_any_proposal_is_refused_before_decoding() {
-        let mut body = 1u16.to_le_bytes().to_vec();
-        body.extend_from_slice(&5u64.to_le_bytes());
-        body.extend_from_slice(&((tenderlink::PROPOSAL_MAX_SIZE + 1) as u32).to_le_bytes());
-        body.resize(body.len() + tenderlink::PROPOSAL_MAX_SIZE + 1, 0);
-        assert_eq!(read_bft_decisions(&body), None);
+        // A well-formed block, canonically encoded, that only the size cap refuses.
+        let mut big = decision(5, false);
+        big.block.headers = vec![big.block.headers[0].clone(); 1000];
+        assert!(big.block.zcash_serialize_to_vec().unwrap().len() > tenderlink::PROPOSAL_MAX_SIZE);
+        assert_eq!(read_bft_decisions(&encode(&[big])[1..]), None);
     }
 
     #[test]
     fn a_decisions_message_stays_within_its_budget() {
-        let big: Vec<WireDecision> = (0..MAX_DECISIONS_PER_MESSAGE as u64 + 10).map(|h| decision(h, 2)).collect();
+        let big: Vec<WireDecision> = (0..MAX_DECISIONS_PER_MESSAGE as u64 + 10).map(|h| decision(h, true)).collect();
         let packet = encode(&big);
         let read = read_bft_decisions(&packet[1..]).unwrap();
         assert!(read.len() <= MAX_DECISIONS_PER_MESSAGE as usize);

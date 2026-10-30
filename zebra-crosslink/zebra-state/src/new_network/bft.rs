@@ -1257,8 +1257,9 @@ impl BftRunner {
         if bft_is_dropped() || self.parked_decision.is_some() {
             return FeedOutcome::NotReady(decision);
         }
+        // Judged by our bootstrap config, so not the peer's fault.
         if decision.height == 0 && !self.fetches_genesis() {
-            return FeedOutcome::Refused { why: "genesis is derived from the chain, never fetched".to_string(), peer_fault: true };
+            return FeedOutcome::Refused { why: "genesis is derived from the chain, never fetched".to_string(), peer_fault: false };
         }
         let voting = {
             let chain = BFT_CHAIN.read().unwrap();
@@ -1271,6 +1272,8 @@ impl BftRunner {
                     peer_fault: true,
                 };
             }
+            let () = super::bft_sync::ASSUME_BFT_BLOCK_HAS_HEADERS;
+            debug_assert!(!decision.block.headers.is_empty());
             if read_state.known_block(Hash(decision.block.snapshot_block_hash().0)).is_none() {
                 return FeedOutcome::NotReady(decision);
             }
