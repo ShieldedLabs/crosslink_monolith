@@ -50,3 +50,99 @@ fn verification_errors_have_high_misbehavior_score() {
         assert_eq!(error.mempool_misbehavior_score(), 100, "{error:?}");
     }
 }
+
+/// Proof, signature, script and structural failures are verdicts no honest peer can earn, so
+/// they are not state-dependent for a transaction that embeds its branch ID.
+#[test]
+fn crypto_and_structural_failures_are_state_independent() {
+    for error in [
+        TransactionError::Groth16("bad proof".to_string()),
+        TransactionError::MalformedGroth16("bad encoding".to_string()),
+        TransactionError::Halo2VerificationFailed,
+        TransactionError::SaplingVerificationFailed,
+        TransactionError::SmallOrder,
+        TransactionError::OrchardProofSize,
+        TransactionError::IronwoodProofSize,
+        TransactionError::Ed25519(zebra_chain::primitives::ed25519::Error::InvalidSignature),
+        TransactionError::RedJubjub(zebra_chain::primitives::redjubjub::Error::InvalidSignature),
+        TransactionError::RedPallas(zebra_chain::primitives::reddsa::Error::InvalidSignature),
+        TransactionError::Script(zebra_script::Error::ScriptInvalid),
+        TransactionError::StakingActionBondKeyInvalid { bond_key: [0; 32] },
+        TransactionError::StakingActionSignatureInvalid { bond_key: [0; 32] },
+        TransactionError::StakingActionInvalidFinalizerAddress { pub_key: [0; 32] },
+        TransactionError::StakingActionFinalizerAuthorizationInvalid { finalizer: [0; 32] },
+        TransactionError::BadBalance,
+        TransactionError::NoInputs,
+        TransactionError::NoOutputs,
+        TransactionError::WrongVersion,
+    ] {
+        assert!(!error.is_state_dependent(true), "{error:?}");
+    }
+}
+
+/// A pre-v5 transaction's sighash and Halo2 circuit come from our upgrade schedule, so its
+/// signature, script and Halo2 failures are state-dependent; its proofs and structure are not.
+#[test]
+fn sighash_failures_depend_on_schedule_without_embedded_branch_id() {
+    for error in [
+        TransactionError::SaplingVerificationFailed,
+        TransactionError::Halo2VerificationFailed,
+        TransactionError::Ed25519(zebra_chain::primitives::ed25519::Error::InvalidSignature),
+        TransactionError::RedJubjub(zebra_chain::primitives::redjubjub::Error::InvalidSignature),
+        TransactionError::RedPallas(zebra_chain::primitives::reddsa::Error::InvalidSignature),
+        TransactionError::Script(zebra_script::Error::ScriptInvalid),
+        TransactionError::StakingActionSignatureInvalid { bond_key: [0; 32] },
+    ] {
+        assert!(error.is_state_dependent(false), "{error:?}");
+    }
+
+    for error in [
+        TransactionError::Groth16("bad proof".to_string()),
+        TransactionError::SmallOrder,
+        TransactionError::BadBalance,
+        TransactionError::WrongVersion,
+    ] {
+        assert!(!error.is_state_dependent(false), "{error:?}");
+    }
+}
+
+/// Failures that depend on our tip, clock, upgrade schedule, staking schedule, mempool, or an
+/// internal error are state-dependent, even where `mempool_misbehavior_score` punishes them.
+#[test]
+fn contextual_failures_are_state_dependent() {
+    let height = block::Height(1);
+    let hash = zebra_chain::transaction::Hash([0; 32]);
+    let outpoint = transparent::OutPoint::from_usize(hash, 0);
+    for error in [
+        TransactionError::LockedUntilAfterBlockHeight(height),
+        TransactionError::ExpiredTransaction {
+            expiry_height: height,
+            block_height: height,
+            transaction_hash: hash,
+        },
+        TransactionError::ImmatureTransparentCoinbaseSpend {
+            outpoint,
+            spend_height: height,
+            min_spend_height: height,
+            created_height: height,
+        },
+        TransactionError::WrongConsensusBranchId,
+        TransactionError::UnsupportedByNetworkUpgrade(
+            5,
+            zebra_chain::parameters::NetworkUpgrade::Nu5,
+        ),
+        TransactionError::StakingActionOutsideWindow {
+            block_height: 1,
+            period: 2,
+            window: 1,
+        },
+        TransactionError::StakingActionBondNotFound { bond_key: [0; 32] },
+        TransactionError::TransparentInputNotFound,
+        TransactionError::DuplicateTransparentSpend(outpoint),
+        TransactionError::NonStandardInputs,
+        TransactionError::InternalDowncastError("lost".to_string()),
+        TransactionError::Script(zebra_script::Error::TxIndex),
+    ] {
+        assert!(error.is_state_dependent(true), "{error:?}");
+    }
+}

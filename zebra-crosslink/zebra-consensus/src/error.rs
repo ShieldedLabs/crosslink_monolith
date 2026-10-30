@@ -440,6 +440,148 @@ impl From<BoxError> for TransactionError {
 }
 
 impl TransactionError {
+    /// Returns `true` if this verification failure could depend on the verifying node's local
+    /// state, so an honest peer could have relayed the transaction: our chain tip, clock, mempool
+    /// contents, network upgrade schedule, mempool policy, or an internal failure.
+    ///
+    /// Returns `false` only for failures that no honest peer can trigger whatever our state is:
+    /// proof and signature verification failures, malformed proofs and keys, transparent script
+    /// failures, and structural rules on the transaction's own fields. A peer that relays a
+    /// transaction with such a failure relayed something it could have checked itself.
+    ///
+    /// `tx_embeds_branch_id` is whether the transaction carries its own consensus branch ID
+    /// ([`Transaction::network_upgrade`] is `Some`, v5 onward). Pre-v5 transactions sign a
+    /// sighash over the branch ID of the network upgrade *we* think is active at the
+    /// verification height, so their signature and script failures depend on our upgrade
+    /// schedule: an honest v4 transaction signed just before an upgrade fails just after it.
+    ///
+    /// The match is exhaustive, including nested errors, so a new variant must be classified
+    /// here before it compiles. Unlike [`Self::mempool_misbehavior_score`], which scores some
+    /// state-dependent failures (lock times, branch IDs, coinbase maturity), this is the
+    /// classification a peer may be penalised by.
+    ///
+    /// [`Transaction::network_upgrade`]: zebra_chain::transaction::Transaction::network_upgrade
+    pub fn is_state_dependent(&self, tx_embeds_branch_id: bool) -> bool {
+        use TransactionError::*;
+
+        // A signature or script failure over a sighash. Only a transaction that embeds its
+        // branch ID reaches these checks with a sighash that is independent of our upgrade
+        // schedule: the mempool verifier rejects a mismatching embedded branch ID first, and
+        // the spent outputs the sighash commits to are fixed by the outpoints, in input order.
+        let () = crate::transaction::ASSUME_EMBEDDED_BRANCH_ID_CHECKED_BEFORE_CRYPTO;
+        let () = crate::transaction::ASSUME_SPENT_OUTPUTS_IN_INPUT_ORDER;
+        let sighash_failure = !tx_embeds_branch_id;
+        // The Halo2 circuit is chosen by the network upgrade, which is ours unless the
+        // transaction embeds its branch ID (and so passed the same check).
+        let circuit_failure = !tx_embeds_branch_id;
+
+        match self {
+            // Proofs, and keys and points that are malformed whatever the sighash.
+            Groth16(_)
+            | MalformedGroth16(_)
+            | SmallOrder
+            | OrchardProofSize
+            | IronwoodProofSize
+            | StakingActionBondKeyInvalid { .. }
+            // Signatures over standalone messages, not the sighash.
+            | StakingActionInvalidFinalizerAddress { .. }
+            | StakingActionFinalizerAuthorizationInvalid { .. }
+            // Structural rules on the transaction's own fields.
+            | WrongVersion
+            | NoInputs
+            | NoOutputs
+            | BadBalance => false,
+
+            // Signatures over the sighash. `SaplingVerificationFailed` batches proofs with the
+            // spend-auth and binding signatures, so it is classified as a signature failure.
+            Ed25519(_)
+            | RedJubjub(_)
+            | RedPallas(_)
+            | SaplingVerificationFailed
+            | StakingActionSignatureInvalid { .. } => sighash_failure,
+
+            Halo2VerificationFailed => circuit_failure,
+
+            Script(script_error) => match script_error {
+                zebra_script::Error::ScriptInvalid => sighash_failure,
+                zebra_script::Error::Unknown(libzcash_script::Error::Script(_)) => sighash_failure,
+                // The C++ verifier threw, or returned a code we don't know: not a verdict on
+                // the script.
+                zebra_script::Error::Unknown(libzcash_script::Error::CaughtException)
+                | zebra_script::Error::Unknown(libzcash_script::Error::Unknown(_))
+                // Our spent outputs don't line up with the inputs, or we were asked to verify
+                // a coinbase input: our bugs, not the peer's.
+                | zebra_script::Error::TxIndex
+                | zebra_script::Error::TxCoinbase
+                | zebra_script::Error::TxInvalid(_) => true,
+            },
+
+            // Chain tip, clock, upgrade schedule, staking schedule and bond state.
+            LockedUntilAfterBlockHeight(_)
+            | LockedUntilAfterBlockTime(_)
+            | ValidateMempoolLockTimeError(_)
+            | MaximumExpiryHeight { .. }
+            | ExpiredTransaction { .. }
+            | ImmatureTransparentCoinbaseSpend { .. }
+            | UnshieldedTransparentCoinbaseSpend { .. }
+            | UnsupportedByNetworkUpgrade(..)
+            | WrongConsensusBranchId
+            | MissingConsensusBranchId
+            | DisabledAddToSproutPool
+            | NegativeOrchardValueBalance
+            | StakingActionDelayNotMet { .. }
+            | StakingActionBondNotFound { .. }
+            | StakingActionBondStateInvalid { .. }
+            | StakingActionOutsideWindow { .. }
+            | StakingActionBeforeActivation { .. }
+            | StakingActionAmountNotPowerOf10 { .. }
+            // Spent outputs, nullifiers and anchors in our best chain and mempool.
+            | TransparentInputNotFound
+            | ValidateContextError(_)
+            | DuplicateTransparentSpend(_)
+            | DuplicateSproutNullifier(_)
+            | DuplicateSaplingNullifier(_)
+            | DuplicateOrchardNullifier(_)
+            | DuplicateIronwoodNullifier(_)
+            // Fees, which depend on the spent outputs, and our mempool policy.
+            | IncorrectFee
+            | Zip317(_)
+            | NonStandardScriptSigSize { .. }
+            | NonStandardScriptSigNotPushOnly { .. }
+            | NonStandardInputs
+            // Coinbase rules: block verification only, or checked against the block height.
+            | CoinbasePosition
+            | CoinbaseAfterFirst
+            | CoinbaseHasJoinSplit
+            | CoinbaseHasSpend
+            | CoinbaseHasOutputPreHeartwood
+            | CoinbaseHasEnableSpendsOrchard
+            | CoinbaseHasEnableSpendsIronwood
+            | CoinbaseHasOrchardActions
+            | CoinbaseOutputsNotDecryptable
+            | CoinbaseInMempool
+            | NonCoinbaseHasCoinbaseInput
+            | NotCoinbase
+            | CoinbaseExpiryBlockHeight { .. }
+            | CoinbaseConstruction(_)
+            | Subsidy(_)
+            // Structural, but not on the list of failures we penalise for: kept conservative,
+            // since some of them are only enforced from a network upgrade on.
+            | BothVPubsNonZero
+            | StakingActionAmountInvalid { .. }
+            | NotEnoughOrchardFlags
+            | NotEnoughIronwoodFlags
+            | OrchardHasEnableCrossAddress
+            // Conversions and internal failures that are not verdicts on the transaction.
+            | InternalDowncastError(_)
+            | Io(_)
+            | TryFromSlice(_)
+            | Amount(_)
+            | Balance(_)
+            | Other(_) => true,
+        }
+    }
+
     /// Returns a suggested misbehaviour score increment for a certain error when
     /// verifying a mempool transaction.
     pub fn mempool_misbehavior_score(&self) -> u32 {
