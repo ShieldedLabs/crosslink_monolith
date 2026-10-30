@@ -1318,6 +1318,9 @@ const MAX_QUEUED_BLOCK_RESPONSES_PER_PEER: usize = 32;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct QueuedBlockResponses {
     queued: Vec<(Hash, u32)>, // at most MAX_QUEUED_BLOCK_RESPONSES_PER_PEER
+    /// The first height of the BFT_DECISIONS response queued, by the same rule: a requester
+    /// re-asks every `BFT_REQUEST_TIMEOUT` while a 2 MiB answer may take far longer to drain.
+    bft_decisions_from: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1338,6 +1341,7 @@ impl QueuedBlockResponses {
     fn forget_if_drained(&mut self, bulk_backlog_bytes: Option<u64>) {
         if bulk_backlog_bytes.is_none_or(|bytes| bytes == 0) {
             self.queued.clear();
+            self.bft_decisions_from = None;
         }
     }
 
@@ -2583,17 +2587,25 @@ pub fn sync(
                 deferred_block_responses += 1;
                 continue;
             }
+            // A retry of the answer still queued to this peer: a second copy would only queue
+            // behind the first (see `QueuedBlockResponses`).
+            let Some(peer) = peers.get_mut(&connection_key) else { continue };
+            if peer.queued_block_responses.bft_decisions_from == Some(from) {
+                duplicate_block_responses += 1;
+                continue;
+            }
             // Heights past u32 cannot be stored, so nothing is there to send.
-            let Ok(from) = u32::try_from(from) else { continue };
-            let decisions = block_writer.finalized_state.db.bft_decisions(from, count.into());
+            let Ok(from_u32) = u32::try_from(from) else { continue };
+            let decisions = block_writer.finalized_state.db.bft_decisions(from_u32, count.into());
             if decisions.is_empty() {
                 continue;
             }
             let packet = bft_sync::bft_decisions_packet(decisions.iter().enumerate().map(|(i, d)| {
-                (u64::from(from) + i as u64, &d.block, &d.fat_pointer, d.proposal_sigs.as_slice())
+                (from + i as u64, &d.block, &d.fat_pointer, d.proposal_sigs.as_slice())
             }));
             *reserved_send_bytes.entry(connection_key).or_insert(0) += packet.len() as u64;
             bulk_packets_to_send.push((connection_key, packet));
+            peer.queued_block_responses.bft_decisions_from = Some(from);
         }
         if deferred_block_responses > 0 {
             tracing::debug!("NewNet: deferred {deferred_block_responses} block responses: peer send backlog full");
@@ -3757,6 +3769,11 @@ pub fn sync(
                     // Not asked for: a decision for our next height that can be stored at once is
                     // as good as one we asked for, since its certificate vouches for it. Nothing
                     // else is kept, so no peer can occupy the fetch window with what it chooses.
+                    // A peer we are backing off is not heard: checking a decision costs PoW and
+                    // signature checks on this thread.
+                    if is_backing_off(&bft_peer_rejections, connection_key) {
+                        continue 'process_packets;
+                    }
                     for decision in decisions {
                         if decision.height != bft::decided_len() || decision.height < first_fetchable {
                             continue;
@@ -3769,6 +3786,8 @@ pub fn sync(
                                     kill!("Sent a malformed BFT decision: {why}");
                                     continue 'process_packets;
                                 }
+                                // Possibly our own state disagreeing, as for a fetched decision.
+                                note_rejection(&mut bft_peer_rejections, connection_key);
                                 break;
                             }
                         }
