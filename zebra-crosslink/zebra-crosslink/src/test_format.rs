@@ -152,6 +152,7 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::EXPECT_POOL_TOTALS as usize] = "EXPECT_POOL_TOTALS";
     strs[TFInstr::RECV_POW as usize] = "RECV_POW";
     strs[TFInstr::RECV_STP_PACKET as usize] = "RECV_STP_PACKET";
+    strs[TFInstr::RECV_TX_STP as usize] = "RECV_TX_STP";
     strs[TFInstr::MINE_FROM_TEMPLATE as usize] = "MINE_FROM_TEMPLATE";
     strs[TFInstr::EXPECT_POW_TIP as usize] = "EXPECT_POW_TIP";
     strs[TFInstr::EXPECT_FINALIZED_TIP as usize] = "EXPECT_FINALIZED_TIP";
@@ -169,7 +170,7 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::EXPECT_BFT_PROPOSER as usize] = "EXPECT_BFT_PROPOSER";
     strs[TFInstr::EXPECT_BFT_DROPPED as usize] = "EXPECT_BFT_DROPPED";
 
-    const_assert!(TFInstr::COUNT == 36);
+    const_assert!(TFInstr::COUNT == 37);
     strs
 };
 
@@ -311,7 +312,12 @@ impl TFInstr {
     /// The node has stopped taking part in BFT (`val[0]` 1) or has not (0), and its database
     /// records it the same way: with the data a block hash, the record names that block.
     pub const EXPECT_BFT_DROPPED: TFInstrKind = 35;
-    pub const COUNT: TFInstrKind = 36;
+    /// A transaction relayed over STP by synthetic peer `val[0]`: the peer lists it
+    /// (TX_STATUS), and answers the node's TX_REQ for it with a TX. Passes once the node asked
+    /// for it and was sent it; whether the mempool took it is for EXPECT_MEMPOOL_*. Fails when
+    /// the node kills the peer or never asks.
+    pub const RECV_TX_STP: TFInstrKind = 36;
+    pub const COUNT: TFInstrKind = 37;
 
     pub fn str_from_kind(kind: TFInstrKind) -> &'static str {
         let kind = kind as usize;
@@ -441,6 +447,9 @@ impl TFInstr {
             }
             Some(TestInstr::RecvStpPacket { packet, peer }) => {
                 str += &format!("type {:?}, {} bytes from peer {peer}", packet.first(), packet.len())
+            }
+            Some(TestInstr::RecvTxStp { tx, peer }) => {
+                str += &format!("{} bytes from peer {peer}", tx.len())
             }
             Some(TestInstr::ExpectBftDropped { dropped, hash }) => {
                 str += &format!("{dropped}");
@@ -749,6 +758,10 @@ impl TF {
 
     pub fn push_instr_recv_stp_packet(&mut self, packet: &[u8], peer: u64, flags: u32) {
         self.push_instr_ex(TFInstr::RECV_STP_PACKET, flags, packet, [peer, 0])
+    }
+
+    pub fn push_instr_recv_tx_stp(&mut self, tx: &Transaction, peer: u64, flags: u32) {
+        self.push_instr_serialize_ex(TFInstr::RECV_TX_STP, flags, tx, [peer, 0])
     }
 
     pub fn push_instr_mine_from_template(&mut self, flags: u32) {
@@ -1205,7 +1218,7 @@ pub fn read_load_pos(bytes: &[u8], instr: &TFInstr) -> Option<(BftBlock, FatPoin
 }
 
 pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> {
-    const_assert!(TFInstr::COUNT == 36);
+    const_assert!(TFInstr::COUNT == 37);
     match instr.kind {
         TFInstr::LOAD_POW => {
             let block = Block::zcash_deserialize(instr.data_slice(bytes)).ok()?;
@@ -1376,6 +1389,10 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
             packet: instr.data_slice(bytes).to_vec(),
             peer: instr.val[0],
         }),
+        TFInstr::RECV_TX_STP => Some(TestInstr::RecvTxStp {
+            tx: instr.data_slice(bytes).to_vec(),
+            peer: instr.val[0],
+        }),
         TFInstr::EXPECT_BFT_DROPPED => {
             let data = instr.data_slice(bytes);
             let hash = if data.is_empty() { None } else { Some(ZebBlockHash(data.try_into().ok()?)) };
@@ -1412,6 +1429,7 @@ pub(crate) enum TestInstr {
     /// Raw bytes: the peer serves exactly what the file holds, parseable or not.
     RecvPoW { block: Vec<u8>, peer: u64 },
     RecvStpPacket { packet: Vec<u8>, peer: u64 },
+    RecvTxStp { tx: Vec<u8>, peer: u64 },
     MineFromTemplate { slot: u64 },
     /// The block named by `hash`, or by `slot` when there is no hash.
     ExpectPoWTip { hash: Option<ZebBlockHash>, slot: u64 },
@@ -1886,6 +1904,15 @@ pub(crate) async fn handle_instr(
                 let (survived, message) = deliver_stp_packet(&mut stp, packet).await;
                 put_stp_peer(stp);
                 test_check(flags, survived, &message);
+            }
+        },
+
+        TestInstr::RecvTxStp { tx, peer } => match take_stp_peer(peer) {
+            Err(err) => test_check_outcome(false, false, &format!("RECV_TX_STP: {err}")),
+            Ok(mut stp) => {
+                let (served, message) = serve_tx(&mut stp, &tx).await;
+                put_stp_peer(stp);
+                test_check(flags, served, &message);
             }
         },
 
@@ -2498,6 +2525,54 @@ async fn serve_block(
                 return Err(format!(
                     "{hash} @ {height} after {NODE_ANSWER_WAIT:?}; the node sent {requests} request(s) for it, answered with {chunks} chunk(s)"
                 ));
+            }
+        }
+    }
+}
+
+/// Plays a peer that has `wire_tx` in its mempool: lists it, then answers the node's TX_REQ for
+/// it with a TX. `true` once it was asked for and sent; a kill or no ask is `false`.
+async fn serve_tx(stp: &mut HarnessStpPeer, wire_tx: &[u8]) -> (bool, String) {
+    use zebra_chain::transaction::UnminedTxId;
+    use zebra_state::new_network::tx_relay::{parse_tx_req, tx_packets, tx_status_packet};
+    use zebra_state::new_network::SyntheticPeerEvent;
+    let index = stp.index;
+    let Ok(tx) = Transaction::zcash_deserialize(wire_tx) else {
+        return (false, "RECV_TX_STP: the transaction does not parse; send its packets with RECV_STP_PACKET".to_string());
+    };
+    let id = UnminedTxId::from(&tx);
+    drain_stp_peer(stp);
+    if let Some(reason) = &stp.killed {
+        return (false, format!("RECV_TX_STP: peer {index} was already killed: {reason}"));
+    }
+    // Wire sizes fit u32: a transaction is at most MAX_BLOCK_BYTES.
+    let _ = stp.link.inbound.send(tx_status_packet(1, [(&id, wire_tx.len() as u32)]));
+
+    let deadline = tokio::time::Instant::now() + NODE_ANSWER_WAIT;
+    loop {
+        tokio::select! {
+            packet = stp.link.outbound.recv() => {
+                let Some(packet) = packet else {
+                    return (false, "RECV_TX_STP: the sync loop is gone".to_string());
+                };
+                // HELLO, STATUS, TX_STATUS, MEMPOOL_REQ: not this exchange.
+                if parse_tx_req(&packet).is_some_and(|ids| ids.contains(&id)) {
+                    for packet in tx_packets([&tx]) {
+                        let _ = stp.link.inbound.send(packet);
+                    }
+                    return (true, format!("RECV_TX_STP: peer {index} was asked for {id} and sent it"));
+                }
+            }
+            event = stp.link.events.recv() => match event {
+                Some(SyntheticPeerEvent::Killed(reason)) => {
+                    stp.killed = Some(reason.clone());
+                    return (false, format!("RECV_TX_STP: the node killed peer {index}: {reason}"));
+                }
+                Some(_) => {}
+                None => return (false, "RECV_TX_STP: the sync loop is gone".to_string()),
+            },
+            _ = tokio::time::sleep_until(deadline) => {
+                return (false, format!("RECV_TX_STP: the node never asked peer {index} for {id} within {NODE_ANSWER_WAIT:?}"));
             }
         }
     }

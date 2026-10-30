@@ -2286,6 +2286,41 @@ fn crosslink_tx_spending_chain_and_mempool_outputs_in_mixed_order() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// Transactions relayed over our own connections: a peer lists one, the node asks for it and the
+/// mempool takes it. A forged one is asked for and refused, and its peer is backed off, not
+/// killed: failing verification is not malformed bytes.
+#[test]
+fn crosslink_tx_relayed_over_stp_reaches_the_mempool() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+
+    let network = regtest_network(&HARNESS_PARAMETERS);
+    let key = TestKey::new(b"crosslink test miner");
+    let miner = key.address();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network.clone(), BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    let mature = |gen: &mut BlockGen, tf: &mut TF| {
+        while gen.mature_coinbase_for(&key).is_none() {
+            tf.push_instr_load_pow(&gen.next_block(&miner), 0);
+        }
+        gen.mature_coinbase_for(&key).expect("matured above")
+    };
+
+    let spend = transparent_spend(gen.next_upgrade(), &key, mature(&mut gen, &mut tf));
+    tf.push_instr_recv_tx_stp(&spend, 0, 0);
+    tf.push_instr_expect_mempool_contains(&spend, 0);
+    // Mined, so the next spend's input is not one a mempool transaction already spends (that
+    // would be refused before verification, as a spend conflict).
+    tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &[spend.clone()]), 0);
+
+    let forged = forged_signature(&transparent_spend(gen.next_upgrade(), &key, mature(&mut gen, &mut tf)));
+    tf.push_instr_recv_tx_stp(&forged, 1, 0);
+    tf.push_instr_expect_mempool_rejected(&forged, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 /// The instructions no scenario used before: RECV_TX, EXPECT_MEMPOOL_REJECTED (including that a
 /// mined transaction is not "rejected"), EXPECT_POOL_TOTALS, EXPECT_FINALIZER_BANK, and the
 /// load-rejected helper.

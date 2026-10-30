@@ -137,6 +137,12 @@ pub fn tx_req_packet<'a>(ids: impl IntoIterator<Item = &'a UnminedTxId>) -> Vec<
     ids_packet(PACKET_TYPE_TX_REQ, ids, MAX_TXS_PER_MESSAGE)
 }
 
+/// The ids a whole packet asks for, if it is a well-formed `TX_REQ`.
+pub fn parse_tx_req(packet: &[u8]) -> Option<Vec<UnminedTxId>> {
+    let (&packet_type, body) = packet.split_first()?;
+    (packet_type == PACKET_TYPE_TX_REQ).then(|| read_tx_req(body)).flatten()
+}
+
 pub fn read_tx_req(body: &[u8]) -> Option<Vec<UnminedTxId>> {
     let mut r = Reader(body);
     let ids = read_ids(&mut r, MAX_TXS_PER_MESSAGE)?;

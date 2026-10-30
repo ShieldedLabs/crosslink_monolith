@@ -3263,16 +3263,8 @@ pub fn sync(
         // Synthetic peers are served here instead of by the network thread, which never hears of
         // them: their packets leave and arrive around it, and they are re-added to the connection
         // list it hands back each tick until the node kills them.
+        // (Their packets are diverted just before the service call, after every step that sends.)
         synthetic_peers.extend(SYNTHETIC_PEERS_TO_ATTACH.lock().unwrap().drain(..));
-        for queue in [&mut packets_to_send, &mut bulk_packets_to_send] {
-            queue.retain(|(key, packet)| {
-                let Some(synthetic) = synthetic_peers.iter().find(|p| p.address.connection_key() == *key) else {
-                    return true;
-                };
-                let _ = synthetic.outbound.send(packet.clone());
-                false
-            });
-        }
 
         // Service STP connections (send/recv). `None` means the network thread
         // did not answer in time because it died or wedged: keep our connection
@@ -3412,6 +3404,18 @@ pub fn sync(
                     packets_to_send.push((session.0, hello_packet()));
                 }
             }
+        }
+
+        // Packets for synthetic peers go to them, not to the network thread. Last, so every
+        // step above that sends (BFT requests, transaction relay) is covered.
+        for queue in [&mut packets_to_send, &mut bulk_packets_to_send] {
+            queue.retain(|(key, packet)| {
+                let Some(synthetic) = synthetic_peers.iter().find(|p| p.address.connection_key() == *key) else {
+                    return true;
+                };
+                let _ = synthetic.outbound.send(packet.clone());
+                false
+            });
         }
 
         let mut packets_received = match service_connections(&mut network_thread_handle, NetworkThreadPush {
