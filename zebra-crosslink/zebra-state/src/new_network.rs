@@ -4548,6 +4548,26 @@ mod tests {
         assert_eq!(read_hello(&hello[1..hello.len() - 1]), None);
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2048))]
+
+        /// Any 10 bytes are a HELLO, whatever follows (a newer version's fields); fewer are not.
+        #[test]
+        fn a_hello_reads_its_first_ten_bytes_and_ignores_the_rest(body in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64)) {
+            let expected = (body.len() >= 10).then(|| (u16::from_le_bytes([body[0], body[1]]), u64::from_le_bytes(body[2..10].try_into().unwrap())));
+            proptest::prop_assert_eq!(read_hello(&body), expected);
+        }
+
+        /// Ours, with anything a newer version might append, reads as ours.
+        #[test]
+        fn our_hello_reads_back_whatever_a_newer_version_appends(appended in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64)) {
+            let mut hello = hello_packet();
+            proptest::prop_assert_eq!(hello.len(), 1 + 2 + 8);
+            hello.extend_from_slice(&appended);
+            proptest::prop_assert_eq!(read_hello(&hello[1..]), Some((PROTOCOL_VERSION, OUR_CAPABILITIES)));
+        }
+    }
+
     #[test]
     fn max_size_block_is_answered_in_one_bounded_message() {
         let block: Vec<u8> = (0..BLOCK_RESPONSE_MAX_PAYLOAD).map(|i| (i * 7) as u8).collect();

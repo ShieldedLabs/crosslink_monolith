@@ -304,4 +304,249 @@ mod tests {
         let last = vec![decision(u64::MAX, true)];
         assert_eq!(read_bft_decisions(&encode(&last)[1..]), Some(last));
     }
+
+    // ---- property tests: these parsers run at ingest, on whatever bytes a peer sends ----
+
+    use proptest::prelude::*;
+    use proptest::sample::Index;
+    use zcash_primitives::bft::{FatPointerSignature, PubKeyID, SlashForkConfig};
+
+    fn bytes<const N: usize>() -> impl Strategy<Value = [u8; N]> {
+        proptest::collection::vec(any::<u8>(), N).prop_map(|v| v.try_into().expect("N bytes"))
+    }
+
+    fn any_fat_pointer() -> impl Strategy<Value = FatPointerToBftBlock> {
+        let signature = (bytes::<32>(), bytes::<64>()).prop_map(|(pub_key, vote_signature)| FatPointerSignature { pub_key: PubKeyID(pub_key), vote_signature });
+        (bytes::<44>(), proptest::collection::vec(signature, 0..4))
+            .prop_map(|(vote_for_block_without_finalizer_public_key, signatures)| FatPointerToBftBlock { vote_for_block_without_finalizer_public_key, signatures })
+    }
+
+    fn any_header() -> impl Strategy<Value = BcBlockHeader> {
+        let solution = prop_oneof![proptest::collection::vec(any::<u8>(), 0..40), Just(vec![7; 1344])];
+        (any::<i32>(), bytes::<32>(), bytes::<32>(), bytes::<32>(), any::<u32>(), any::<u32>(), bytes::<32>(), solution, any_fat_pointer()).prop_map(
+            |(version, prev_block, merkle_root, final_sapling_root, time, bits, nonce, solution, fat_pointer_to_bft_block)| BcBlockHeader {
+                version,
+                prev_block: BlockHash(prev_block),
+                merkle_root,
+                final_sapling_root,
+                time,
+                bits,
+                nonce,
+                solution,
+                fat_pointer_to_bft_block,
+            },
+        )
+    }
+
+    fn any_slashfork() -> impl Strategy<Value = SlashForkConfig> {
+        (any::<u64>(), any::<u64>(), proptest::collection::vec(bytes::<32>().prop_map(PubKeyID), 0..3))
+            .prop_map(|(pow_activation_height, bft_certificate_height, terminated_finalizers)| SlashForkConfig { pow_activation_height, bft_certificate_height, terminated_finalizers })
+    }
+
+    /// A version 2 block (what this node proposes) with 1..`max_headers` headers.
+    fn any_block(max_headers: usize) -> impl Strategy<Value = BftBlock> {
+        (any::<u32>(), any_fat_pointer(), proptest::collection::vec(any_header(), 1..max_headers), proptest::collection::vec(any_slashfork(), 0..3), any::<u64>()).prop_map(
+            |(height, previous_block_fat_ptr, headers, slashforks, do_not_include_until_bc_height)| BftBlock { version: 2, height, previous_block_fat_ptr, headers, slashforks, do_not_include_until_bc_height },
+        )
+    }
+
+    /// `n` decisions in `1..max_n`, at consecutive heights from anywhere in u64 that leaves room
+    /// for them, each signed (one signature per chunk) or not.
+    fn any_decisions(max_n: usize, max_headers: usize) -> impl Strategy<Value = Vec<WireDecision>> {
+        let decision = (any_block(max_headers), any_fat_pointer(), any::<bool>(), any::<u8>());
+        proptest::collection::vec(decision, 1..max_n).prop_flat_map(|decisions| {
+            let n = decisions.len() as u64;
+            let from = prop_oneof![Just(0), Just(u64::MAX - (n - 1)), 0..=u64::MAX - (n - 1)];
+            (Just(decisions), from)
+        }).prop_map(|(decisions, from)| {
+            decisions
+                .into_iter()
+                .enumerate()
+                .map(|(i, (block, fat_pointer, signed, sig_seed))| {
+                    let sigs = if signed { chunks_n(&block) } else { 0 };
+                    WireDecision { height: from + i as u64, block, fat_pointer, proposal_sigs: (0..sigs).map(|j| TMSig([sig_seed.wrapping_add(j as u8); 64])).collect() }
+                })
+                .collect()
+        })
+    }
+
+    /// One change to a well-formed body, as in tx_relay's tests.
+    #[derive(Debug, Clone)]
+    enum Mutation {
+        Truncate(Index),
+        Append(Vec<u8>),
+        FlipBit(Index, u8),
+        SetCount(u16),
+    }
+
+    fn any_mutation() -> impl Strategy<Value = Mutation> {
+        prop_oneof![
+            any::<Index>().prop_map(Mutation::Truncate),
+            proptest::collection::vec(any::<u8>(), 1..70).prop_map(Mutation::Append),
+            (any::<Index>(), 0..8u8).prop_map(|(at, bit)| Mutation::FlipBit(at, bit)),
+            any::<u16>().prop_map(Mutation::SetCount),
+        ]
+    }
+
+    /// `body` (with its u16 count first) mutated, and whether a reader must refuse it: a cut, an
+    /// extra byte, or a count other than what follows always leaves it malformed.
+    fn mutated(body: &[u8], mutation: &Mutation) -> (Vec<u8>, bool) {
+        let mut out = body.to_vec();
+        match mutation {
+            Mutation::Truncate(at) => {
+                out.truncate(at.index(body.len()));
+                (out, true)
+            }
+            Mutation::Append(bytes) => {
+                out.extend_from_slice(bytes);
+                (out, true)
+            }
+            Mutation::FlipBit(at, bit) => {
+                out[at.index(body.len())] ^= 1 << bit;
+                (out, false)
+            }
+            Mutation::SetCount(count) => {
+                let refused = out[..2] != count.to_le_bytes();
+                out[..2].copy_from_slice(&count.to_le_bytes());
+                (out, refused)
+            }
+        }
+    }
+
+    /// A count from the edges of its range, then anything.
+    fn any_body() -> impl Strategy<Value = Vec<u8>> {
+        let count = prop_oneof![Just(0u16), Just(1), Just(2), Just(MAX_DECISIONS_PER_MESSAGE), Just(MAX_DECISIONS_PER_MESSAGE + 1), Just(u16::MAX), any::<u16>()];
+        let shaped = (count, proptest::collection::vec(any::<u8>(), 0..4096)).prop_map(|(count, rest)| {
+            let mut body = count.to_le_bytes().to_vec();
+            body.extend(rest);
+            body
+        });
+        prop_oneof![proptest::collection::vec(any::<u8>(), 0..32), proptest::collection::vec(any::<u8>(), 0..4096), shaped]
+    }
+
+    #[test]
+    fn a_count_alone_never_allocates_more_than_its_cap_allows() {
+        // The count is checked against the cap before `Vec::with_capacity(count)`; signatures
+        // are reserved only as far as the bytes left can hold them.
+        assert!(usize::from(MAX_DECISIONS_PER_MESSAGE) * std::mem::size_of::<WireDecision>() <= 32 << 10);
+        for count in [MAX_DECISIONS_PER_MESSAGE + 1, u16::MAX] {
+            assert_eq!(read_bft_decisions(&count.to_le_bytes()), None);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        #[test]
+        fn a_bft_status_reads_from_exactly_eight_bytes(body in proptest::collection::vec(any::<u8>(), 0..20)) {
+            let expected = <[u8; 8]>::try_from(&body[..]).ok().map(u64::from_le_bytes);
+            prop_assert_eq!(read_bft_status(&body), expected);
+        }
+
+        #[test]
+        fn a_bft_status_round_trips(decided_len: u64) {
+            let packet = bft_status_packet(decided_len);
+            prop_assert_eq!(packet[0], PACKET_TYPE_BFT_STATUS);
+            prop_assert_eq!(read_bft_status(&packet[1..]), Some(decided_len));
+        }
+
+        #[test]
+        fn a_bft_req_reads_from_exactly_ten_bytes_with_its_count_capped(body in proptest::collection::vec(any::<u8>(), 0..24)) {
+            let expected = (body.len() == 10).then(|| {
+                let count = u16::from_le_bytes([body[8], body[9]]);
+                (u64::from_le_bytes(body[..8].try_into().unwrap()), count.min(MAX_DECISIONS_PER_MESSAGE))
+            });
+            prop_assert_eq!(read_bft_req(&body), expected);
+        }
+
+        #[test]
+        fn a_bft_req_round_trips_with_its_count_capped(from: u64, count: u16) {
+            let packet = bft_req_packet(from, count);
+            prop_assert_eq!(packet[0], PACKET_TYPE_BFT_REQ);
+            prop_assert_eq!(read_bft_req(&packet[1..]), Some((from, count.min(MAX_DECISIONS_PER_MESSAGE))));
+        }
+
+        #[test]
+        fn arbitrary_bytes_never_read_as_decisions_that_are_not_exactly_them(body in any_body()) {
+            if let Some(decisions) = read_bft_decisions(&body) {
+                prop_assert!(decisions.len() <= usize::from(MAX_DECISIONS_PER_MESSAGE));
+                prop_assert_eq!(&encode(&decisions)[1..], &body[..]);
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn decisions_round_trip_at_any_heights(decisions in any_decisions(6, 5)) {
+            let packet = encode(&decisions);
+            prop_assert_eq!(packet[0], PACKET_TYPE_BFT_DECISIONS);
+            prop_assert_eq!(read_bft_decisions(&packet[1..]), Some(decisions));
+        }
+
+        #[test]
+        fn decisions_at_heights_that_do_not_follow_on_are_refused(decisions in any_decisions(4, 3), heights in proptest::collection::vec(prop_oneof![Just(0), Just(u64::MAX), any::<u64>()], 4)) {
+            let mut decisions = decisions;
+            for (decision, height) in decisions.iter_mut().zip(heights) {
+                decision.height = height;
+            }
+            let consecutive = decisions.windows(2).all(|w| w[0].height.checked_add(1) == Some(w[1].height));
+            let read = read_bft_decisions(&encode(&decisions)[1..]);
+            prop_assert_eq!(read.is_some(), consecutive);
+        }
+
+        #[test]
+        fn a_mutated_decisions_message_is_refused_or_reads_as_exactly_what_it_says(decisions in any_decisions(4, 3), mutation in any_mutation()) {
+            let packet = encode(&decisions);
+            let (body, refused) = mutated(&packet[1..], &mutation);
+            if let Some(read) = read_bft_decisions(&body) {
+                prop_assert!(!refused, "{mutation:?} read as {} decisions", read.len());
+                prop_assert!(read.iter().all(|d| !d.block.headers.is_empty()));
+                prop_assert_eq!(&encode(&read)[1..], &body[..]);
+            }
+        }
+
+        #[test]
+        fn proposal_signatures_must_be_absent_or_one_per_chunk(decision in any_decisions(2, 3), extra in 1..4usize, fewer in any::<bool>()) {
+            let mut decision = decision[0].clone();
+            let chunks = chunks_n(&decision.block);
+            let wrong = if fewer && chunks > 1 { chunks - 1 } else { chunks + extra };
+            decision.proposal_sigs = (0..wrong).map(|i| TMSig([i as u8; 64])).collect();
+            prop_assert_eq!(read_bft_decisions(&encode(&[decision])[1..]), None);
+        }
+    }
+
+    proptest! {
+        // Each case encodes up to a few MB of decisions.
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn a_decisions_message_passes_its_budget_only_to_carry_one_large_decision(count in 1..=MAX_DECISIONS_PER_MESSAGE as usize + 8, headers in prop_oneof![1..8usize, 1..720usize], signed: bool) {
+            // Large blocks, made by repeating real-sized headers, up to past the largest proposal.
+            let mut template = decision(0, false);
+            template.block.headers = vec![template.block.headers[0].clone(); headers];
+            let sigs = if signed { chunks_n(&template.block) } else { 0 };
+            template.proposal_sigs = (0..sigs).map(|i| TMSig([i as u8; 64])).collect();
+            let block_len = template.block.zcash_serialize_to_vec().unwrap().len();
+            let decisions: Vec<WireDecision> = (0..count as u64).map(|height| WireDecision { height, ..template.clone() }).collect();
+            let packet = encode(&decisions);
+            let read = read_bft_decisions(&packet[1..]);
+            if block_len > tenderlink::PROPOSAL_MAX_SIZE {
+                // Not a decision: the builder is never given one (tenderlink decides nothing
+                // larger), and the reader refuses it.
+                prop_assert_eq!(read, None);
+                return Ok(());
+            }
+            let read = read.unwrap();
+            prop_assert!(!read.is_empty() && read.len() <= usize::from(MAX_DECISIONS_PER_MESSAGE));
+            prop_assert!(read.len() == 1 || packet.len() <= DECISIONS_MESSAGE_BUDGET, "{} decisions in {} bytes", read.len(), packet.len());
+            prop_assert_eq!(&read[..], &decisions[..read.len()]);
+            // Full: the next would not have fit, or the count is at its cap.
+            if read.len() < decisions.len() && read.len() < usize::from(MAX_DECISIONS_PER_MESSAGE) {
+                let next_len = encode(&decisions[read.len()..read.len() + 1]).len() - 3;
+                prop_assert!(packet.len() + next_len > DECISIONS_MESSAGE_BUDGET);
+            }
+        }
+    }
 }
