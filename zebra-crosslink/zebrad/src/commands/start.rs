@@ -647,6 +647,11 @@ impl StartCmd {
                 // new_network::sync fills this in with the node's shared transport.
                 network: None,
             };
+            // Transactions relay over the node's own connections, through the mempool.
+            let tx_relay_launch = zebra_state::new_network::tx_relay::TxRelayLaunch {
+                mempool: mempool.clone(),
+                changes: mempool_transaction_subscriber.clone(),
+            };
             tokio::task::spawn_blocking(move || {
 
 
@@ -659,7 +664,7 @@ impl StartCmd {
                     check_cheap: zebra_consensus::sync_verify::block_check_cheap,
                     verify_expensive: zebra_consensus::sync_verify::block_verify_expensive,
                 };
-                zebra_state::new_network::sync(&config.state, sync_read_state, tokio::runtime::Handle::current(), verify_fns, Some(bft_launch), block_writer, genesis_block_for_new_network)
+                zebra_state::new_network::sync(&config.state, sync_read_state, tokio::runtime::Handle::current(), verify_fns, Some(bft_launch), block_writer, genesis_block_for_new_network, Some(tx_relay_launch))
             })
         };
 

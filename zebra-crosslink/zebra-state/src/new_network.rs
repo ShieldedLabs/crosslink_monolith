@@ -25,6 +25,7 @@ use tenderlink::{dbg_panic, dbg_verify};
 mod checkpoint;
 pub mod bft;
 mod bft_sync;
+pub mod tx_relay;
 pub mod fin;
 use checkpoint::Checkpoint;
 
@@ -49,7 +50,11 @@ const PACKET_TYPE_PEER_ADDRESS_LIST: u8 = 0x04;
 const PACKET_TYPE_WANT_HOLE_PUNCH:   u8 = 0x05;
 const PACKET_TYPE_TRY_HOLE_PUNCH:    u8 = 0x06;
 const PACKET_TYPE_HELLO:             u8 = 0x07;
-// 0x08..=0x0F reserved for transaction relay.
+// Transaction relay (`tx_relay`); 0x0C..=0x0F reserved for it too.
+const PACKET_TYPE_TX_STATUS:         u8 = 0x08;
+const PACKET_TYPE_TX_REQ:            u8 = 0x09;
+const PACKET_TYPE_TX:                u8 = 0x0A;
+const PACKET_TYPE_MEMPOOL_REQ:       u8 = 0x0B;
 
 /// This node's protocol version and capabilities, sent once per connection (`HELLO`), so a
 /// peer can tell a message from a newer protocol apart from a malformed one.
@@ -91,6 +96,10 @@ const PACKET_TYPE_NAMES: [&str; 256] = {
     names[PACKET_TYPE_WANT_HOLE_PUNCH   as usize] = "WANT_HOLE_PUNCH";
     names[PACKET_TYPE_TRY_HOLE_PUNCH    as usize] = "TRY_HOLE_PUNCH";
     names[PACKET_TYPE_HELLO             as usize] = "HELLO";
+    names[PACKET_TYPE_TX_STATUS         as usize] = "TX_STATUS";
+    names[PACKET_TYPE_TX_REQ            as usize] = "TX_REQ";
+    names[PACKET_TYPE_TX                as usize] = "TX";
+    names[PACKET_TYPE_MEMPOOL_REQ       as usize] = "MEMPOOL_REQ";
     names[PACKET_TYPE_BFT_STATUS        as usize] = "BFT_STATUS";
     names[PACKET_TYPE_BFT_REQ           as usize] = "BFT_REQ";
     names[PACKET_TYPE_BFT_DECISIONS     as usize] = "BFT_DECISIONS";
@@ -2094,7 +2103,10 @@ pub fn sync(
     // this thread, in a known order, with the result available synchronously.
     mut block_writer: crate::service::write::WriteBlockWorkerTask,
     genesis: std::sync::Arc<Block>,
+    // The mempool, for relaying transactions over our own connections; `None` relays none.
+    tx_relay: Option<tx_relay::TxRelayLaunch>,
 ) {
+    let _ = &tx_relay; // used once relay lands (Task C)
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::channel(BLOCK_SUBMISSION_QUEUE_LEN);
     let _ = BLOCK_SUBMISSION_SENDER.set(submit_tx);
 

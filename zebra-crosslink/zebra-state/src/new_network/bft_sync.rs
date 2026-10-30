@@ -83,10 +83,10 @@ pub fn bft_decisions_packet<'a>(decisions: impl IntoIterator<Item = (u64, &'a Bf
 }
 
 /// A cursor over a received message body (after the type byte). Every read is bounds-checked.
-struct Reader<'a>(&'a [u8]);
+pub(super) struct Reader<'a>(pub(super) &'a [u8]);
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+    pub(super) fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         if self.0.len() < n {
             return None;
         }
@@ -94,13 +94,13 @@ impl<'a> Reader<'a> {
         self.0 = rest;
         Some(head)
     }
-    fn u16(&mut self) -> Option<u16> {
+    pub(super) fn u16(&mut self) -> Option<u16> {
         Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
     }
-    fn u32(&mut self) -> Option<u32> {
+    pub(super) fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
-    fn u64(&mut self) -> Option<u64> {
+    pub(super) fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
 }
