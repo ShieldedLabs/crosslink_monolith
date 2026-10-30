@@ -26,6 +26,7 @@ mod checkpoint;
 pub mod bft;
 mod bft_sync;
 pub mod tx_relay;
+mod tx_relay_bridge;
 mod tx_relay_state;
 pub mod fin;
 use checkpoint::Checkpoint;
@@ -56,6 +57,11 @@ const PACKET_TYPE_TX_STATUS:         u8 = 0x08;
 const PACKET_TYPE_TX_REQ:            u8 = 0x09;
 const PACKET_TYPE_TX:                u8 = 0x0A;
 const PACKET_TYPE_MEMPOOL_REQ:       u8 = 0x0B;
+
+/// Transaction relay runs while our tip is within this many blocks of the best a peer reports.
+const TX_RELAY_NEAR_TIP: u32 = 2;
+/// Control-channel bytes a transaction status leaves free for PoW's status and requests.
+const TX_STATUS_CONTROL_HEADROOM: u64 = 32 << 10;
 
 /// This node's protocol version and capabilities, sent once per connection (`HELLO`), so a
 /// peer can tell a message from a newer protocol apart from a malformed one.
@@ -2107,7 +2113,13 @@ pub fn sync(
     // The mempool, for relaying transactions over our own connections; `None` relays none.
     tx_relay: Option<tx_relay::TxRelayLaunch>,
 ) {
-    let _ = &tx_relay; // used once relay lands (Task C)
+    // Transaction relay over our own connections: the mempool bridge, relay's bookkeeping,
+    // the connections it knows of, what it wants done, and whether it is active this tick.
+    let tx_bridge = tx_relay.map(|launch| tx_relay_bridge::spawn(&rt, launch));
+    let mut tx_state = tx_relay_state::TxRelay::default();
+    let mut tx_live: HashSet<ConnectionKey> = HashSet::new();
+    let mut tx_outs: Vec<tx_relay_state::Out> = Vec::new();
+    let mut tx_relay_active = false;
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::channel(BLOCK_SUBMISSION_QUEUE_LEN);
     let _ = BLOCK_SUBMISSION_SENDER.set(submit_tx);
 
@@ -3298,6 +3310,93 @@ pub fn sync(
             }
         }
 
+        // Transaction relay: the bridge's answers, then what relay wants done, carried out.
+        if let Some(bridge) = &tx_bridge {
+            let now = std::time::Instant::now();
+            let live_now: HashSet<ConnectionKey> = current_connections.iter().map(|(a, _)| a.connection_key()).collect();
+            let () = tx_relay_bridge::ASSUME_PEER_GONE_FOR_EVERY_KEY;
+            for gone in tx_live.difference(&live_now) {
+                tx_state.on_peer_gone(*gone);
+            }
+            tx_live = live_now;
+            // Near the PoW tip and not catching up on BFT: otherwise our mempool is judged
+            // against a stale chain, and so would everything peers send.
+            let our_tip = read_state.best_tip().map_or(0, |(height, _)| height.0);
+            let best_peer_tip = peers.values().map(|peer| peer.their_tree.tip_height).max().unwrap_or(0);
+            tx_relay_active = !catching_up && our_tip.saturating_add(TX_RELAY_NEAR_TIP) >= best_peer_tip;
+
+            for answer in bridge.answers() {
+                match answer {
+                    tx_relay_bridge::FromBridge::Added(entries) => tx_state.on_added(entries),
+                    tx_relay_bridge::FromBridge::Removed(ids) => tx_state.on_removed(ids),
+                    tx_relay_bridge::FromBridge::Reset(entries) => tx_state.on_reset(entries),
+                    tx_relay_bridge::FromBridge::Filtered { from, keep } => tx_outs.extend(tx_state.on_filtered(from, keep, now)),
+                    tx_relay_bridge::FromBridge::Decoded { from, txs } => {
+                        let delivered: Vec<(zebra_chain::transaction::UnminedTxId, u32)> = txs.iter().map(|(id, len, _)| (*id, *len)).collect();
+                        let take = tx_state.on_delivered(from, &delivered, now);
+                        if take.is_empty() {
+                            continue;
+                        }
+                        // The mempool knows an STP peer by its static key.
+                        let source: Option<[u8; 32]> = current_connections
+                            .iter()
+                            .find(|(address, _)| address.connection_key() == from)
+                            .and_then(|(address, _)| address.key.as_slice().try_into().ok());
+                        let submit = txs.into_iter().filter(|(id, _, _)| take.contains(id)).map(|(_, _, tx)| tx).collect();
+                        let submitted = source.is_some_and(|source| bridge.send(tx_relay_bridge::ToBridge::Submit { from, source, txs: submit }));
+                        if !submitted {
+                            let () = tx_relay_bridge::ASSUME_ONE_OUTCOME_PER_SUBMITTED;
+                            for id in take {
+                                tx_state.on_outcome(from, id, tx_relay_state::Outcome::NotTaken, now);
+                            }
+                        }
+                    }
+                    tx_relay_bridge::FromBridge::Malformed { from } => peers_to_kill.push((from, "sent a malformed TX".to_string())),
+                    tx_relay_bridge::FromBridge::Outcome { from, id, outcome } => tx_state.on_outcome(from, id, outcome, now),
+                    tx_relay_bridge::FromBridge::Bodies { to, txs } => {
+                        for packet in tx_relay::tx_packets(txs.iter().map(|tx| &*tx.transaction)) {
+                            tx_outs.push(tx_relay_state::Out::Send { to, packet, bulk: true });
+                        }
+                    }
+                }
+            }
+
+            if tx_relay_active {
+                let live: Vec<ConnectionKey> = tx_live.iter().copied().collect();
+                tx_outs.extend(tx_state.poll(&live, now));
+            }
+
+            // Relay sends only what each peer's channel takes now. A status leaves room on the
+            // control channel for PoW's own status and requests.
+            let mut reserved: HashMap<(ConnectionKey, bool), u64> = HashMap::new();
+            for out in tx_outs.drain(..) {
+                match out {
+                    tx_relay_state::Out::Send { to, packet, bulk } => {
+                        let is_synthetic = synthetic_peers.iter().any(|p| p.address.connection_key() == to);
+                        let channel = if bulk { Channel::Bulk } else { Channel::Control };
+                        let budget = if is_synthetic { u64::MAX } else { network_thread_handle.send_budget(to, channel) };
+                        let headroom = if packet[0] == PACKET_TYPE_TX_STATUS { TX_STATUS_CONTROL_HEADROOM } else { 0 };
+                        let used = reserved.entry((to, bulk)).or_insert(0);
+                        if budget < *used + packet.len() as u64 + headroom {
+                            continue;
+                        }
+                        *used += packet.len() as u64;
+                        if bulk {
+                            bulk_packets_to_send.push((to, packet));
+                        } else {
+                            packets_to_send.push((to, packet));
+                        }
+                    }
+                    tx_relay_state::Out::Filter { from, entries } => {
+                        bridge.send(tx_relay_bridge::ToBridge::Filter { from, entries });
+                    }
+                    tx_relay_state::Out::Fetch { to, ids } => {
+                        bridge.send(tx_relay_bridge::ToBridge::Fetch { to, ids });
+                    }
+                }
+            }
+        }
+
         // Every session hears our version and capabilities, once. (STP does not keep order, so
         // it is not necessarily the first message a peer gets from us.) Synthetic peers sit
         // above the transport, which would drop a message to them.
@@ -3829,6 +3928,38 @@ pub fn sync(
                 }
                 peer.protocol_version = Some(version);
                 peer.capabilities = capabilities;
+            } else if packet_type == PACKET_TYPE_TX_STATUS {
+                let Some((_total, entries)) = some_or_kill!(tx_relay::read_tx_status(msg), "Malformed TX_STATUS") else {
+                    continue 'process_packets;
+                };
+                // Heard only while relay is active: it is listed again within a heartbeat.
+                if tx_bridge.is_some() && tx_relay_active {
+                    tx_outs.extend(tx_state.on_status(connection_key, entries, std::time::Instant::now()));
+                }
+            } else if packet_type == PACKET_TYPE_TX_REQ {
+                let Some(ids) = some_or_kill!(tx_relay::read_tx_req(msg), "Malformed TX_REQ") else {
+                    continue 'process_packets;
+                };
+                if tx_bridge.is_some() {
+                    tx_outs.extend(tx_state.on_request(connection_key, ids, std::time::Instant::now()));
+                }
+            } else if packet_type == PACKET_TYPE_TX {
+                // Decoded on the bridge, and only if we are waiting on this peer; a malformed
+                // body comes back as Malformed and kills it.
+                if let Some(bridge) = &tx_bridge {
+                    if tx_state.has_requested(connection_key) {
+                        let () = tx_relay_bridge::ASSUME_UNASKED_TX_NOT_DECODED;
+                        bridge.send(tx_relay_bridge::ToBridge::Decode { from: connection_key, body: msg.to_vec() });
+                    }
+                }
+            } else if packet_type == PACKET_TYPE_MEMPOOL_REQ {
+                if !msg.is_empty() {
+                    kill!("Malformed MEMPOOL_REQ");
+                    continue 'process_packets;
+                }
+                if tx_bridge.is_some() {
+                    tx_outs.extend(tx_state.on_mempool_req(connection_key, std::time::Instant::now()));
+                }
             } else if packet_type == PACKET_TYPE_BFT_STATUS {
                 let Some(their_bft_len) = some_or_kill!(bft_sync::read_bft_status(msg), "Malformed BFT_STATUS") else {
                     continue 'process_packets;

@@ -462,6 +462,8 @@ impl TxRelay {
     /// no honest peer tells: the peer is struck and the body dropped. The rest were not asked
     /// of it (a late answer after a re-request) and are dropped.
     pub fn on_delivered(&mut self, from: ConnectionKey, delivered: &[(UnminedTxId, u32)], now: Instant) -> Vec<UnminedTxId> {
+        // What this returns is marked submitted until its outcome arrives.
+        let () = super::tx_relay_bridge::ASSUME_ONE_OUTCOME_PER_SUBMITTED;
         let Some(peer) = self.peers.get_mut(&from) else { return Vec::new() };
         let mut take = Vec::new();
         let mut lied = false;
@@ -493,6 +495,7 @@ impl TxRelay {
             Outcome::Accepted => {}
             Outcome::NotTaken => self.forget_wanted(id),
             Outcome::Invalid => {
+                let () = super::tx_relay_bridge::ASSUME_INVALID_IS_STATE_INDEPENDENT;
                 self.forget_wanted(id);
                 if let Some(peer) = self.peers.get_mut(&from) {
                     peer.strikes.strike(now);
@@ -570,6 +573,8 @@ impl TxRelay {
     /// nobody delivers, and a `MEMPOOL_REQ` to each peer once per session. `live` are the
     /// connected peers.
     pub fn poll(&mut self, live: &[ConnectionKey], now: Instant) -> Vec<Out> {
+        // Per-peer state is made for any key seen and freed only by `on_peer_gone`.
+        let () = super::tx_relay_bridge::ASSUME_PEER_GONE_FOR_EVERY_KEY;
         let mut out = Vec::new();
         for key in live {
             self.peers.entry(*key).or_insert_with(|| PeerTx::new(now));
@@ -678,7 +683,14 @@ impl TxRelay {
         out
     }
 
+    /// Whether we are waiting on `peer` for transactions: only then is a `TX` from it decoded.
+    pub fn has_requested(&self, peer: ConnectionKey) -> bool {
+        let () = super::tx_relay_bridge::ASSUME_UNASKED_TX_NOT_DECODED;
+        self.peers.get(&peer).is_some_and(|p| !p.requested.is_empty())
+    }
+
     /// Whether `peer` is backed off for relay (not asked for anything).
+    #[cfg(test)]
     pub fn backing_off(&self, peer: ConnectionKey, now: Instant) -> bool {
         self.peers.get(&peer).is_some_and(|p| p.strikes.backing_off(now))
     }

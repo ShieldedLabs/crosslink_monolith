@@ -182,7 +182,7 @@ pub fn tx_packets<'a>(txs: impl IntoIterator<Item = &'a Transaction>) -> Vec<Vec
 
 /// The transactions in a `TX` body. `None` if any is malformed: over [`MAX_TX_BYTES`], not a
 /// transaction, or not exactly filling its length.
-pub fn read_txs(body: &[u8]) -> Option<Vec<Arc<Transaction>>> {
+pub fn read_txs(body: &[u8]) -> Option<Vec<(Arc<Transaction>, u32)>> {
     let mut r = Reader(body);
     let n = usize::from(r.u16()?);
     if n > MAX_TXS_PER_MESSAGE {
@@ -200,7 +200,8 @@ pub fn read_txs(body: &[u8]) -> Option<Vec<Arc<Transaction>>> {
         if !bytes.is_empty() {
             return None;
         }
-        txs.push(Arc::new(tx));
+        // Bounded by MAX_TX_BYTES above.
+        txs.push((Arc::new(tx), len as u32));
     }
     r.0.is_empty().then_some(txs)
 }
@@ -239,7 +240,7 @@ mod tests {
         assert_eq!(read_tx_req(&req[1..]).unwrap(), ids.iter().take(MAX_TXS_PER_MESSAGE).copied().collect::<Vec<_>>());
 
         let packets = tx_packets(&txs);
-        let got: Vec<Transaction> = packets.iter().flat_map(|p| read_txs(&p[1..]).unwrap()).map(|tx| (*tx).clone()).collect();
+        let got: Vec<Transaction> = packets.iter().flat_map(|p| read_txs(&p[1..]).unwrap()).map(|(tx, _)| (*tx).clone()).collect();
         assert_eq!(got, txs);
         assert!(packets.iter().all(|p| p.len() <= TX_MESSAGE_BUDGET));
     }
