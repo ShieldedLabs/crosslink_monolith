@@ -26,6 +26,7 @@ mod checkpoint;
 pub mod bft;
 mod bft_sync;
 pub mod tx_relay;
+mod tx_relay_state;
 pub mod fin;
 use checkpoint::Checkpoint;
 
