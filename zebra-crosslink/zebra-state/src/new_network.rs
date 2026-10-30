@@ -48,7 +48,30 @@ const PACKET_TYPE_BLOCK_REQ:         u8 = 0x03;
 const PACKET_TYPE_PEER_ADDRESS_LIST: u8 = 0x04;
 const PACKET_TYPE_WANT_HOLE_PUNCH:   u8 = 0x05;
 const PACKET_TYPE_TRY_HOLE_PUNCH:    u8 = 0x06;
-// 0x07..=0x0F reserved for transaction relay.
+const PACKET_TYPE_HELLO:             u8 = 0x07;
+// 0x08..=0x0F reserved for transaction relay.
+
+/// This node's protocol version and capabilities, sent once per connection (`HELLO`), so a
+/// peer can tell a message from a newer protocol apart from a malformed one.
+const PROTOCOL_VERSION: u16 = 1;
+/// Speaks Crosslink's extensions to the base protocol (types 0x40..=0x7F).
+const CAPABILITY_CROSSLINK: u64 = 1 << 0;
+const OUR_CAPABILITIES: u64 = CAPABILITY_CROSSLINK;
+
+fn hello_packet() -> Vec<u8> {
+    let mut out = vec![PACKET_TYPE_HELLO];
+    out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    out.extend_from_slice(&OUR_CAPABILITIES.to_le_bytes());
+    out
+}
+
+/// A HELLO body: (version, capabilities). A newer version may append fields, so trailing
+/// bytes are allowed.
+fn read_hello(body: &[u8]) -> Option<(u16, u64)> {
+    let version = u16::from_le_bytes(body.get(0..2)?.try_into().ok()?);
+    let capabilities = u64::from_le_bytes(body.get(2..10)?.try_into().ok()?);
+    Some((version, capabilities))
+}
 
 const PACKET_TYPE_CROSSLINK_FIRST:   u8 = 0x40;
 const PACKET_TYPE_BFT_STATUS:        u8 = 0x40;
@@ -67,6 +90,7 @@ const PACKET_TYPE_NAMES: [&str; 256] = {
     names[PACKET_TYPE_PEER_ADDRESS_LIST as usize] = "PEER_ADDRESS_LIST";
     names[PACKET_TYPE_WANT_HOLE_PUNCH   as usize] = "WANT_HOLE_PUNCH";
     names[PACKET_TYPE_TRY_HOLE_PUNCH    as usize] = "TRY_HOLE_PUNCH";
+    names[PACKET_TYPE_HELLO             as usize] = "HELLO";
     names[PACKET_TYPE_BFT_STATUS        as usize] = "BFT_STATUS";
     names[PACKET_TYPE_BFT_REQ           as usize] = "BFT_REQ";
     names[PACKET_TYPE_BFT_DECISIONS     as usize] = "BFT_DECISIONS";
@@ -1551,6 +1575,12 @@ pub struct Peer {
     // how many decided BFT heights they hold, from their last BFT_STATUS
     their_bft_len: u64,
 
+    // from their HELLO: None until it arrives
+    protocol_version: Option<u16>,
+    capabilities: u64,
+    // message types of theirs we did not know and have logged, one bit per type byte
+    unknown_types_logged: [u64; 4],
+
     // when they last answered a BFT_REQ of ours: only then is their_bft_len evidence enough to
     // hold tenderlink back (`bft_catching_up`)
     bft_answered_at: Option<std::time::Instant>,
@@ -2126,6 +2156,8 @@ pub fn sync(
     // requests to the same peer are not queued behind them.
     let mut bulk_packets_to_send: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
     let mut synthetic_peers: Vec<SyntheticPeerLink> = Vec::new();
+    // Connections that have had our HELLO.
+    let mut hello_sent: HashSet<ConnectionKey> = HashSet::new();
 
     // Parse and connect to initial peers
     let mut initial_peer_addresses: Vec<STPAddress> = Vec::new();
@@ -3244,6 +3276,18 @@ pub fn sync(
             }
         }
 
+        // Every connection hears our version and capabilities, once. (STP does not keep order,
+        // so it is not necessarily the first message a peer gets from us.)
+        {
+            let live: HashSet<ConnectionKey> = current_connections.iter().map(|(a, _)| a.connection_key()).collect();
+            hello_sent.retain(|key| live.contains(key));
+            for key in live {
+                if hello_sent.insert(key) {
+                    packets_to_send.push((key, hello_packet()));
+                }
+            }
+        }
+
         let mut packets_received = match service_connections(&mut network_thread_handle, NetworkThreadPush {
             initiate_connections,
             wanted_connections: current_connections.iter().filter(|(addr, _)| !synthetic_peers.iter().any(|p| p.address == *addr)).cloned().collect(),
@@ -3749,6 +3793,15 @@ pub fn sync(
                 println!("Queueing for commit: {}", hash);
                 blocks_to_commit.push((hash, std::sync::Arc::new(block)));
                 fates.insert(hash, BlockFate { delivered_by: Some(connection_key), ..Default::default() });
+            } else if packet_type == PACKET_TYPE_HELLO {
+                let Some((version, capabilities)) = some_or_kill!(read_hello(msg), "Malformed HELLO") else {
+                    continue 'process_packets;
+                };
+                if version != PROTOCOL_VERSION {
+                    tracing::info!("NewNet: Peer {connection_address:?} speaks protocol version {version} (ours is {PROTOCOL_VERSION}), capabilities {capabilities:#x}");
+                }
+                peer.protocol_version = Some(version);
+                peer.capabilities = capabilities;
             } else if packet_type == PACKET_TYPE_BFT_STATUS {
                 let Some(their_bft_len) = some_or_kill!(bft_sync::read_bft_status(msg), "Malformed BFT_STATUS") else {
                     continue 'process_packets;
@@ -3814,7 +3867,13 @@ pub fn sync(
                 }
 
             } else {
-                warning!("NewNet: Got unknown msg type={} len={}, ignoring.", packet_type, msg.len());
+                // Logged once per peer and type: a newer peer sends what we do not know on
+                // every tick, and that is not news after the first time.
+                let (word, bit) = (usize::from(packet_type) / 64, 1u64 << (packet_type % 64));
+                if peer.unknown_types_logged[word] & bit == 0 {
+                    peer.unknown_types_logged[word] |= bit;
+                    warning!("NewNet: Got unknown msg type={packet_type:#04x} len={} from a peer of protocol version {:?}, ignoring it from them from now on.", msg.len(), peer.protocol_version);
+                }
                 continue 'process_packets;
             }
 
@@ -4220,6 +4279,17 @@ mod tests {
         let mut msg = &packet[1..];
         let hdr = PeerPowBlockResponseChunkHdr::read_from(&mut msg).unwrap();
         (hdr, msg)
+    }
+
+    #[test]
+    fn hello_round_trips_and_a_newer_longer_one_still_reads() {
+        let hello = hello_packet();
+        assert_eq!(hello[0], PACKET_TYPE_HELLO);
+        assert_eq!(read_hello(&hello[1..]), Some((PROTOCOL_VERSION, OUR_CAPABILITIES)));
+        let mut newer = hello.clone();
+        newer.extend_from_slice(&[9; 5]);
+        assert_eq!(read_hello(&newer[1..]), Some((PROTOCOL_VERSION, OUR_CAPABILITIES)));
+        assert_eq!(read_hello(&hello[1..hello.len() - 1]), None);
     }
 
     #[test]
