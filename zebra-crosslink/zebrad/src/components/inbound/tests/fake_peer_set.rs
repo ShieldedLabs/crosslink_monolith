@@ -307,7 +307,7 @@ async fn push_transaction_routing_enforces_per_peer_source() -> Result<(), crate
     let expected = mempool_service
         .expect_request(mempool::Request::QueueFromPeer {
             candidates: vec![mempool::Gossip::Tx(unmined_tx.clone())],
-            source: *peer,
+            source: mempool::PeerSource::Legacy(*peer),
         })
         .map(|responder| responder.respond(mempool::Response::Queued(vec![])));
     let (push_response, _) = futures::join!(request, expected);

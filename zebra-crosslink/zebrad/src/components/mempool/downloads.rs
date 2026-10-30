@@ -27,7 +27,6 @@
 //! [`Mempool::poll_ready`]: super::Mempool::poll_ready
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -53,7 +52,7 @@ use zebra_chain::{
 };
 use zebra_consensus::transaction as tx;
 use zebra_network::{self as zn, PeerSocketAddr};
-use zebra_node_services::mempool::Gossip;
+use zebra_node_services::mempool::{Gossip, PeerSource};
 use zebra_state::{self as zs, CloneError};
 
 use crate::components::{
@@ -107,14 +106,26 @@ pub(crate) const TRANSACTION_VERIFY_TIMEOUT: Duration = BLOCK_VERIFY_TIMEOUT;
 pub const MAX_INBOUND_CONCURRENCY: usize = 500;
 
 /// The maximum number of concurrent inbound download tasks attributable to a
-/// single advertising peer.
+/// single advertising legacy peer ([`PeerSource::Legacy`]).
 ///
 /// Caps how many slots of [`MAX_INBOUND_CONCURRENCY`] one peer's `Inv`
 /// advertisements can occupy, so a single peer cannot saturate the global
 /// queue with fake txids and deny gossip-path mempool admission for honest
 /// peers. See `GHSA-4fc2-h7jh-287c`. Crawler-driven and locally-pushed
 /// transactions have no source peer and are not counted against the cap.
+///
+/// The cap can be small because the legacy mempool crawler later fetches what a peer's
+/// refused candidates would have delivered.
 pub const MAX_INBOUND_CONCURRENCY_PER_PEER: usize = 5;
+
+/// The default maximum number of concurrent inbound download and verify tasks attributable to
+/// a single STP peer ([`PeerSource::Stp`]).
+///
+/// The STP relay has no crawler to backstop a refused candidate, so its cap is larger than the
+/// legacy one: it should cover the transactions an honest peer pushes between two of our
+/// verdicts. It is still far below [`MAX_INBOUND_CONCURRENCY`], so one peer cannot fill the
+/// queue.
+pub const DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER: usize = 32;
 
 /// A marker struct for the oneshot channels which cancel a pending download and verify.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -202,16 +213,19 @@ where
         (
             oneshot::Sender<CancelDownloadAndVerify>,
             Gossip,
-            Option<SocketAddr>,
+            Option<PeerSource>,
         ),
     >,
 
-    /// The number of currently in-flight download tasks per advertising peer.
+    /// The number of currently in-flight download tasks per source peer.
     ///
     /// Invariant: a peer is present here iff some entry in [`Self::cancel_handles`]
-    /// has it as the third tuple element. Enforces
-    /// [`MAX_INBOUND_CONCURRENCY_PER_PEER`]. See `GHSA-4fc2-h7jh-287c`.
-    pending_per_peer: HashMap<SocketAddr, usize>,
+    /// has it as the third tuple element. Enforces [`Self::max_in_flight`].
+    /// See `GHSA-4fc2-h7jh-287c`.
+    pending_per_peer: HashMap<PeerSource, usize>,
+
+    /// The maximum number of in-flight tasks for each [`PeerSource::Stp`] peer.
+    max_in_flight_per_stp_peer: usize,
 }
 
 impl<ZN, ZV, ZS> Stream for Downloads<ZN, ZV, ZS>
@@ -304,10 +318,14 @@ where
     /// `verifier` is used to verify transactions.
     /// `state` is used to check if transactions are already in the state.
     ///
+    /// `max_in_flight_per_stp_peer` caps each [`PeerSource::Stp`] peer's in-flight tasks,
+    /// usually [`DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER`]. Legacy peers are capped at
+    /// [`MAX_INBOUND_CONCURRENCY_PER_PEER`].
+    ///
     /// The [`Downloads`] stream is agnostic to the network policy, so retry and
     /// timeout limits should be applied to the `network` service passed into
     /// this constructor.
-    pub fn new(network: ZN, verifier: ZV, state: ZS) -> Self {
+    pub fn new(network: ZN, verifier: ZV, state: ZS, max_in_flight_per_stp_peer: usize) -> Self {
         Self {
             network,
             verifier,
@@ -315,6 +333,15 @@ where
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
             pending_per_peer: HashMap::new(),
+            max_in_flight_per_stp_peer,
+        }
+    }
+
+    /// The maximum number of in-flight download and verify tasks for `source`.
+    fn max_in_flight(&self, source: PeerSource) -> usize {
+        match source {
+            PeerSource::Legacy(_) => MAX_INBOUND_CONCURRENCY_PER_PEER,
+            PeerSource::Stp(_) => self.max_in_flight_per_stp_peer,
         }
     }
 
@@ -322,15 +349,15 @@ where
     ///
     /// Returns the action taken in response to the queue request.
     ///
-    /// When `source` is `Some`, the per-peer cap
-    /// [`MAX_INBOUND_CONCURRENCY_PER_PEER`] is enforced; crawler-driven and
-    /// locally-pushed transactions pass `None` and are not capped per peer.
+    /// When `source` is `Some`, its per-peer cap ([`Self::max_in_flight`]) is enforced;
+    /// crawler-driven and locally-pushed transactions pass `None` and are not capped per peer.
+    /// Only a [`PeerSource::Legacy`] source is attributed for misbehaviour reports.
     #[instrument(skip(self, gossiped_tx), fields(txid = %gossiped_tx.id()))]
     #[allow(clippy::unwrap_in_result)]
     pub fn download_if_needed_and_verify(
         &mut self,
         gossiped_tx: Gossip,
-        source: Option<SocketAddr>,
+        source: Option<PeerSource>,
         mut rsp_tx: Option<oneshot::Sender<Result<(), BoxError>>>,
     ) -> Result<(), MempoolError> {
         let txid = gossiped_tx.id();
@@ -365,11 +392,13 @@ where
         // with attacker-supplied fake txids. See `GHSA-4fc2-h7jh-287c`.
         if let Some(source) = source {
             let count = self.pending_per_peer.get(&source).copied().unwrap_or(0);
-            if count >= MAX_INBOUND_CONCURRENCY_PER_PEER {
+            let max_in_flight = self.max_in_flight(source);
+            if count >= max_in_flight {
                 debug!(
                     ?txid,
+                    ?source,
                     peer_queue_len = count,
-                    ?MAX_INBOUND_CONCURRENCY_PER_PEER,
+                    max_in_flight,
                     "too many transactions queued for this peer: ignored transaction"
                 );
                 metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
@@ -383,7 +412,12 @@ where
         let network = self.network.clone();
         let verifier = self.verifier.clone();
         let mut state = self.state.clone();
-        let pushed_advertiser_addr = source.map(PeerSocketAddr::from);
+        // Only legacy peers are reported to the address book. An STP peer's verdicts go to
+        // the relay, which decides what to do about the peer.
+        let pushed_advertiser_addr = match source {
+            Some(PeerSource::Legacy(addr)) => Some(PeerSocketAddr::from(addr)),
+            Some(PeerSource::Stp(_)) | None => None,
+        };
 
         let gossiped_tx_req = gossiped_tx.clone();
 
@@ -538,8 +572,7 @@ where
             "transactions are only queued once"
         );
         if let Some(source) = source {
-            // The per-peer cap check above ensures this can't exceed
-            // `MAX_INBOUND_CONCURRENCY_PER_PEER`.
+            // The per-peer cap check above ensures this can't exceed `max_in_flight(source)`.
             *self.pending_per_peer.entry(source).or_insert(0) += 1;
         }
 
@@ -596,7 +629,7 @@ where
 
     /// Decrement the per-peer pending count for `source`, removing the entry
     /// when it reaches zero.
-    fn release_peer_slot(pending_per_peer: &mut HashMap<SocketAddr, usize>, source: SocketAddr) {
+    fn release_peer_slot(pending_per_peer: &mut HashMap<PeerSource, usize>, source: PeerSource) {
         if let Some(count) = pending_per_peer.get_mut(&source) {
             *count = count.saturating_sub(1);
             if *count == 0 {

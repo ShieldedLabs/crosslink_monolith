@@ -25,6 +25,25 @@ pub use self::{
     transaction_dependencies::TransactionDependencies,
 };
 
+/// The peer a queued candidate transaction came from.
+///
+/// The mempool caps how many of each source's candidates it downloads and verifies at once, so
+/// one peer cannot crowd out the others.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum PeerSource {
+    /// A legacy `zebra-network` peer, by address.
+    ///
+    /// Capped at `MAX_INBOUND_CONCURRENCY_PER_PEER` candidates in flight. Transactions it
+    /// sent that fail verification are reported to the address book as misbehaviour.
+    Legacy(SocketAddr),
+
+    /// A peer on our own STP network, by its 32-byte static public key.
+    ///
+    /// Capped at the mempool's per-STP-peer limit. Never reported to the legacy address book:
+    /// the relay decides what to do about the peer from each candidate's verdict.
+    Stp([u8; 32]),
+}
+
 /// A mempool service request.
 ///
 /// Requests can query the current set of mempool transactions,
@@ -95,8 +114,8 @@ pub enum Request {
     QueueFromPeer {
         /// The candidate transactions received from the peer.
         candidates: Vec<Gossip>,
-        /// The address of the peer that sent them.
-        source: SocketAddr,
+        /// The peer that sent them.
+        source: PeerSource,
     },
 
     /// Check for newly verified transactions.

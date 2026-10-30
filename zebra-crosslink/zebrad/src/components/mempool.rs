@@ -74,7 +74,8 @@ pub use storage::{
 pub use self::tests::UnboxMempoolError;
 
 use downloads::{
-    Downloads as TxDownloads, TransactionDownloadVerifyError, TRANSACTION_DOWNLOAD_TIMEOUT,
+    Downloads as TxDownloads, TransactionDownloadVerifyError,
+    DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER, TRANSACTION_DOWNLOAD_TIMEOUT,
     TRANSACTION_VERIFY_TIMEOUT,
 };
 
@@ -402,6 +403,7 @@ impl Mempool {
             Timeout::new(self.outbound.clone(), TRANSACTION_DOWNLOAD_TIMEOUT),
             Timeout::new(self.tx_verifier.clone(), TRANSACTION_VERIFY_TIMEOUT),
             self.state.clone(),
+            DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER,
         ));
         self.active_state = ActiveState::Enabled {
             storage: storage::Storage::new(&self.config),

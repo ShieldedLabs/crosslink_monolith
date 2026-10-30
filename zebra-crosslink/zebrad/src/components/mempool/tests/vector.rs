@@ -2186,7 +2186,10 @@ async fn cancel_handles_drained_after_verification_timeout() {
 
     use crate::components::mempool::{
         crawler::RATE_LIMIT_DELAY,
-        downloads::{Downloads, TRANSACTION_DOWNLOAD_TIMEOUT, TRANSACTION_VERIFY_TIMEOUT},
+        downloads::{
+            Downloads, DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER, TRANSACTION_DOWNLOAD_TIMEOUT,
+            TRANSACTION_VERIFY_TIMEOUT,
+        },
     };
 
     let _init_guard = zebra_test::init();
@@ -2200,6 +2203,7 @@ async fn cancel_handles_drained_after_verification_timeout() {
         Timeout::new(peer_set, TRANSACTION_DOWNLOAD_TIMEOUT),
         Timeout::new(tx_verifier, TRANSACTION_VERIFY_TIMEOUT),
         state,
+        DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER,
     ));
 
     let mut iter = Network::Mainnet.unmined_transactions_in_blocks(1..=10);
