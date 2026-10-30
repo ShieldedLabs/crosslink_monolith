@@ -3253,6 +3253,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         net_stats.process_time += read_start.elapsed();
 
+        // Leaving them out of the next wanted list is how the shared transport hears of the kill.
+        let () = transport::ASSUME_WANTED_OMITS_ONLY_KILLS;
         current_connections.retain(|(address, _)| !connection_keys_to_disconnect.contains(&address.connection_key()));
         for synthetic in synthetic_bft_peers.iter().filter(|p| connection_keys_to_disconnect.contains(&p.address.connection_key())) {
             synthetic.alive.store(false, std::sync::atomic::Ordering::Relaxed);

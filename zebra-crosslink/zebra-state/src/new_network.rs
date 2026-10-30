@@ -925,15 +925,18 @@ impl SyncProfile {
         }
     }
 
-    fn report_if_due(&mut self, tip_height: u32, bft_height: usize, bft_waiting: usize, queued: usize, downloads: u32, peers: usize) {
+    /// `lock_times` is asked only when the report is due, and resets the transport's maxima.
+    fn report_if_due(&mut self, tip_height: u32, bft_height: usize, bft_waiting: usize, queued: usize, downloads: u32, peers: usize, lock_times: impl FnOnce() -> [tenderlink::transport::LockTimes; 2]) {
         let elapsed = self.since.elapsed();
         if elapsed < SYNC_PROFILE_INTERVAL {
             return;
         }
+        let [base, bft] = lock_times();
         tracing::info!(
             "NewNet: sync profile: seconds={:.1} tip={tip_height} bft_height={bft_height} committed={} blocks_per_s={:.2} \
              ticks={} committing={} queue_empty={} parent_missing={} bft_gate={} deferred_other={} failed={} \
-             bft_parked={} commit_ms={} queued={queued} downloads={downloads} peers={peers} bft_waiting={bft_waiting}",
+             bft_parked={} commit_ms={} queued={queued} downloads={downloads} peers={peers} bft_waiting={bft_waiting} \
+             lock_wait_us_base={} lock_hold_us_base={} lock_wait_us_bft={} lock_hold_us_bft={}",
             elapsed.as_secs_f64(),
             self.committed,
             self.committed as f64 / elapsed.as_secs_f64(),
@@ -946,6 +949,10 @@ impl SyncProfile {
             self.ticks_failed,
             self.ticks_bft_parked,
             self.commit_time.as_millis(),
+            base.wait_max.as_micros(),
+            base.hold_max.as_micros(),
+            bft.wait_max.as_micros(),
+            bft.hold_max.as_micros(),
         );
         *self = Self::new();
     }
@@ -2039,6 +2046,8 @@ fn kill_peer(
 ) {
     tracing::error!("NewNet: Killing peer {:?}: {}", address, reason);
     let key = address.connection_key();
+    // Leaving it out of the next wanted list is how the shared transport hears of the kill.
+    let () = tenderlink::transport::ASSUME_WANTED_OMITS_ONLY_KILLS;
     current_connections.retain(|(addr, _)| addr.connection_key() != key);
     let kill_bucket = address_bucket(local_addresses_secret, address) & (MAX_RECENT_BUCKETS - 1);
     if let Some(recents) = recent_peer_addresses.get_mut(&(kill_bucket as u16)) {
@@ -4170,6 +4179,7 @@ pub fn sync(
             blocks_to_commit.len(),
             peers.iter().map(|(_, peer)| peer.block_downloads.used_flags.count_ones()).sum(),
             current_connections.len(),
+            || network_thread_handle.take_lock_times(),
         );
 
         // Blocks at or below the finalized height can never commit, so holding them is pure

@@ -323,6 +323,13 @@ impl Consumer {
     }
 }
 
+/// Assumption the hub's kill detection rests on: a consumer leaves a connection out of its
+/// `wanted_connections` only to kill it. Both sync loops build that list from the connections
+/// the last service returned, and take a peer out of it only on a kill path. A removal for any
+/// other reason (idle, over a peer limit) would be read as a kill and close the connection for
+/// every consumer, so every site that removes a connection from that list names this.
+pub const ASSUME_WANTED_OMITS_ONLY_KILLS: () = ();
+
 /// A killed connection's key is not re-dialled for 1 s, doubling per kill up to 64 s; the
 /// strikes are forgotten once the backoff has lapsed for another `REDIAL_BACKOFF_MAX`.
 const REDIAL_BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -350,6 +357,15 @@ struct Hub {
     handle: NetworkThreadHandle,
     consumers: [ConsumerState; Consumer::COUNT],
     redial: HashMap<ConnectionKey, Redial>,
+    lock_times: [LockTimes; Consumer::COUNT],
+}
+
+/// The longest one consumer's `service` waited for the hub's lock, and held it, since these
+/// were last taken (`ConsumerHandle::take_lock_times`): the cost of sharing the transport.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LockTimes {
+    pub wait_max: Duration,
+    pub hold_max: Duration,
 }
 
 /// One STP endpoint, key and port, shared by a node's protocols. Cloning shares it; the
@@ -392,6 +408,7 @@ impl SharedTransport {
             handle: NetworkThreadHandle::new(keypairs, port, max_pps, send_buffer_params, limits),
             consumers: Default::default(),
             redial: HashMap::new(),
+            lock_times: Default::default(),
         })))
     }
 
@@ -430,11 +447,23 @@ impl ConsumerHandle {
     ///
     /// `None` if the network thread has stopped or this handle was replaced.
     pub fn service(&mut self, push: NetworkThreadPush) -> Option<NetworkThreadPull> {
+        let asked = Instant::now();
         let mut hub = lock(&self.hub);
+        let got = Instant::now();
         if hub.consumers[self.consumer as usize].generation != self.generation || hub.handle.is_finished() {
             return None;
         }
-        Some(hub.service(self.consumer, push))
+        let pull = hub.service(self.consumer, push);
+        let times = &mut hub.lock_times[self.consumer as usize];
+        times.wait_max = times.wait_max.max(got - asked);
+        times.hold_max = times.hold_max.max(got.elapsed());
+        Some(pull)
+    }
+
+    /// Each consumer's longest lock wait and hold in `service` since the last call, indexed by
+    /// [`Consumer`]; resets them.
+    pub fn take_lock_times(&self) -> [LockTimes; Consumer::COUNT] {
+        std::mem::take(&mut lock(&self.hub).lock_times)
     }
 
     pub fn limits(&self) -> TransportLimits {
@@ -468,6 +497,7 @@ impl Hub {
         let wanted: HashSet<ConnectionKey> = wanted_connections.iter().map(|(a, _)| a.connection_key()).collect();
         // Only the session the consumer was handed: if the key has since reconnected, the
         // consumer has not seen the new session and cannot have meant to kill it.
+        let () = ASSUME_WANTED_OMITS_ONLY_KILLS;
         let peers = &self.handle.peers;
         let killed: Vec<ConnectionKey> = self.consumers[me as usize]
             .offered
