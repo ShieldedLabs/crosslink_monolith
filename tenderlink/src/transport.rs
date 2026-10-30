@@ -200,6 +200,8 @@ pub struct TransportStats {
     pub kills: u64,
     /// Connects not made because their key was killed recently.
     pub redials_skipped: u64,
+    /// Dials of keys outside `SharedTransport::dial_only`, dropped.
+    pub dials_not_allowed: u64,
     /// Connections a peer opened past `max_inbound_connections`, closed at once.
     pub inbound_refused: u64,
 }
@@ -375,6 +377,8 @@ struct Hub {
     consumers: [ConsumerState; Consumer::COUNT],
     redial: HashMap<ConnectionKey, Redial>,
     lock_times: [LockTimes; Consumer::COUNT],
+    /// If set, the only keys dialled, whichever consumer asks (`SharedTransport::dial_only`).
+    dial_only: Option<HashSet<ConnectionKey>>,
 }
 
 /// The longest one consumer's `service` waited for the hub's lock, and held it, since these
@@ -426,7 +430,15 @@ impl SharedTransport {
             consumers: Default::default(),
             redial: HashMap::new(),
             lock_times: Default::default(),
+            dial_only: None,
         })))
+    }
+
+    /// Dial only `keys`, whichever consumer asks: addresses learned from peers, and hole-punch
+    /// requests, are not dialled. Peers may still dial us. For fixed topologies (test networks,
+    /// a node kept behind its own relays).
+    pub fn dial_only(&self, keys: HashSet<ConnectionKey>) {
+        lock(&self.0).dial_only = Some(keys);
     }
 
     /// Attach `consumer`. Attaching it again replaces the earlier handle, which from then on
@@ -539,6 +551,11 @@ impl Hub {
         let redial = &self.redial;
         initiate_connections.retain(|a| redial.get(&a.connection_key()).is_none_or(|r| now >= r.retry_at));
         self.handle.stats.redials_skipped += (asked - initiate_connections.len()) as u64;
+        if let Some(allowed) = &self.dial_only {
+            let asked = initiate_connections.len();
+            initiate_connections.retain(|a| allowed.contains(&a.connection_key()));
+            self.handle.stats.dials_not_allowed += (asked - initiate_connections.len()) as u64;
+        }
 
         let mut inner = NetworkThreadPush {
             initiate_connections,
@@ -1626,6 +1643,29 @@ mod tests {
         a_base.tick(NetworkThreadPush { initiate_connections: vec![b_addr.clone()], ..Default::default() });
         assert_eq!(a_base.handle.stats().redials_skipped, 1);
         assert!(a_base.connections.is_empty());
+    }
+
+    #[test]
+    fn with_dial_only_set_no_consumer_dials_another_key() {
+        let (a, _) = shared_node();
+        let (b, b_addr) = shared_node();
+        let (c, c_addr) = shared_node();
+        a.dial_only([b_addr.connection_key()].into_iter().collect());
+        let (mut a_base, mut a_bft) = (Loop::new(&a, Consumer::Base), Loop::new(&a, Consumer::Bft));
+        let (mut b_base, mut c_base) = (Loop::new(&b, Consumer::Base), Loop::new(&c, Consumer::Base));
+
+        a_base.tick(NetworkThreadPush { initiate_connections: vec![b_addr.clone(), c_addr.clone()], ..Default::default() });
+        a_bft.tick(NetworkThreadPush { initiate_connections: vec![c_addr.clone()], ..Default::default() });
+        assert_eq!(a_base.handle.stats().dials_not_allowed, 2);
+        until("the allowed connection", || {
+            a_base.tick(NetworkThreadPush::default());
+            b_base.tick(NetworkThreadPush::default());
+            !a_base.connections.is_empty() && !b_base.connections.is_empty()
+        });
+        c_base.tick(NetworkThreadPush::default());
+        assert!(c_base.connections.is_empty());
+        assert_eq!(a_base.connections.len(), 1);
+        assert_eq!(a_base.connections[0].0.connection_key(), b_addr.connection_key());
     }
 
     #[test]

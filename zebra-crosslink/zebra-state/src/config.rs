@@ -181,6 +181,14 @@ pub struct Config {
     pub network_local_port: u16,
     /// Addresses of peers to connect to on startup.
     pub network_initial_peers: Vec<String>,
+    /// Dial only `network_initial_peers`, for both protocols: addresses learned from peers, and
+    /// hole-punch requests, are not dialled. Peers may still dial us. For fixed test topologies,
+    /// and for a node kept behind its own relays.
+    ///
+    /// A finalizer set this way must list at least one other finalizer: tenderlink passes live
+    /// votes only between finalizers, so one whose every path to the others runs through
+    /// non-finalizers cannot vote, and can stall BFT if the rest are short of a quorum.
+    pub network_connect_only: bool,
 
     /// Lite checkpoint: the synced chain must contain `hash` at `height`
     /// see `new_network/checkpoint.rs`
@@ -319,6 +327,7 @@ impl Default for Config {
             network_identity_seed_string: None,
             network_local_port: 0,
             network_initial_peers: Vec::new(),
+            network_connect_only: false,
             network_checkpoint: Some((115014, "000068d97d552a99dbf1bc327e1a9be7a0aeeda45c1b537a5433e3c7fce8e320".parse().expect("valid checkpoint hash"))),
             slashfork_schedule: Default::default(),
         }

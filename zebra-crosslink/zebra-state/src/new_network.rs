@@ -2229,6 +2229,11 @@ pub fn sync(
         }
     }
 
+    if config.network_connect_only {
+        shared_transport.dial_only(initial_peer_addresses.iter().map(|address| address.connection_key()).collect());
+        tracing::info!("NewNet: Dialling only the {} initial peers (network_connect_only)", initial_peer_addresses.len());
+    }
+
     tracing::info!("NewNet: STP setup complete, port={}, peers={}", actual_network_local_port, initial_peer_addresses.len());
 
     // Tenderlink shares this node's transport, key and port, and starts from its initial peers.
