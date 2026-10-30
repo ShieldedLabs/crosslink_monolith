@@ -2625,3 +2625,74 @@ async fn verified_candidate_refused_by_storage_is_dropped() -> Result<(), Report
 
     Ok(())
 }
+
+/// A full transaction that spends an outpoint a mempool transaction already spends is refused
+/// as a spend conflict before it is verified, whether it comes from a peer or not. A
+/// transaction ID can't be checked until it is downloaded, so it is still queued.
+#[tokio::test(flavor = "multi_thread")]
+async fn conflicting_pushed_transaction_is_refused_before_verification() -> Result<(), Report> {
+    use zebra_chain::transaction::UnminedTx;
+
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+        _block_writer,
+    ) = setup(&network, u64::MAX, true).await;
+    mempool.enable(&mut recent_syncs).await;
+
+    let in_mempool = network
+        .unmined_transactions_in_blocks(..)
+        .find(|transaction| {
+            let transaction = &transaction.transaction.transaction;
+            !transaction.outputs().is_empty()
+                && transaction
+                    .inputs()
+                    .iter()
+                    .any(|input| matches!(input, transparent::Input::PrevOut { .. }))
+        })
+        .expect("a test transaction that spends an outpoint and has an output");
+    mempool
+        .storage()
+        .insert(in_mempool.clone(), Vec::new(), None)
+        .expect("the first spender is inserted");
+
+    // The same inputs, but a different output value, so a different transaction.
+    let mut conflicting = (*in_mempool.transaction.transaction).clone();
+    let new_value: i64 = if i64::from(conflicting.outputs()[0].value) == 1 {
+        2
+    } else {
+        1
+    };
+    conflicting.outputs_mut()[0].value = Amount::try_from(new_value)?;
+    let conflicting = UnminedTx::from(conflicting);
+    assert_ne!(conflicting.id, in_mempool.transaction.id);
+
+    for source in [Some(PeerSource::Stp([5; 32])), None] {
+        let results =
+            queue_candidates(&mut mempool, vec![conflicting.clone().into()], source).await;
+        assert!(
+            matches!(results[0], Err(QueueRefusal::SpendConflict)),
+            "a conflicting transaction is refused before verification"
+        );
+    }
+    tx_verifier.expect_no_requests().await;
+
+    let results = queue_candidates(
+        &mut mempool,
+        vec![Gossip::Id(conflicting.id)],
+        Some(PeerSource::Legacy("203.0.113.11:8233".parse()?)),
+    )
+    .await;
+    assert!(
+        results[0].is_ok(),
+        "a transaction ID is queued, and checked for conflicts on insertion"
+    );
+
+    Ok(())
+}

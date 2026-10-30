@@ -483,6 +483,13 @@ impl Mempool {
     ///
     /// `source` is the peer it came from, if any, which caps how many of that peer's
     /// candidates are in flight.
+    ///
+    /// # Security
+    ///
+    /// A full transaction that conflicts with a mempool transaction is refused before it is
+    /// verified. Otherwise anyone who can spend one real note could make us verify any number
+    /// of valid but conflicting transactions, only to refuse each at insertion. Transaction IDs
+    /// can't be checked until they are downloaded, so they are only checked at insertion.
     fn queue_candidate(
         storage: &mut Storage,
         tx_downloads: &mut Pin<Box<InboundTxDownloads>>,
@@ -490,6 +497,14 @@ impl Mempool {
         source: Option<PeerSource>,
     ) -> Result<oneshot::Receiver<Verdict>, QueueRefusal> {
         storage.should_download_or_verify(candidate.id())?;
+
+        if let Gossip::Tx(tx) = &candidate {
+            if let Some(conflict) = storage.conflict(tx) {
+                trace!(txid = ?tx.id, ?conflict, "refused a conflicting candidate before verifying it");
+                metrics::counter!("mempool.refused.conflict.total").increment(1);
+                return Err(QueueRefusal::SpendConflict);
+            }
+        }
 
         Ok(tx_downloads.download_if_needed_and_verify(candidate, source)?)
     }

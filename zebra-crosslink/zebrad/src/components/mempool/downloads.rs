@@ -523,6 +523,11 @@ where
 
             trace!(?txid, ?next_height, "got next height");
 
+            // A `Gossip::Tx` was checked for conflicts with mempool transactions before it was
+            // queued (`Mempool::queue_candidate`). A `Gossip::Id` can't be checked until it is
+            // downloaded, so it is only checked when the mempool inserts it, after verification.
+            // The legacy network that sends IDs caps each peer at
+            // `MAX_INBOUND_CONCURRENCY_PER_PEER`, which bounds that cost.
             let (tx, advertiser_addr) = match gossiped_tx {
                 Gossip::Id(txid) => {
                     let req = zn::Request::TransactionsById(std::iter::once(txid).collect());
