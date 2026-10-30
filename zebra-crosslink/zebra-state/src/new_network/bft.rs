@@ -1242,9 +1242,19 @@ impl BftRunner {
         metrics::gauge!("state.crosslink.bft_dropped").set(0.0);
         crate::new_network::fin::load(&block_writer.finalized_state.db);
         if runner.launch.is_some() {
+            // A chain-bootstrapped node restarting with a stored chain holds tenderlink back until
+            // the sync loop has heard from peers whether it is behind (`set_catching_up`); it is
+            // started by `tick` then. A supplied-BFT network starts it here, as it always has.
+            runner.catching_up = !runner.fetches_genesis();
             runner.restore(read_state, block_writer);
         }
         runner
+    }
+
+    /// Whether tenderlink is held back at startup: a chain was restored and is waiting for the
+    /// sync loop to say whether we are behind.
+    pub(super) fn held_at_startup(&self) -> bool {
+        self.spawn_deferred
     }
 
     /// Whether a decided block is waiting for its snapshot PoW block before it can be stored.
@@ -1331,8 +1341,15 @@ impl BftRunner {
     pub(super) fn tick(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
         // Tenderlink is not running but decisions are stored: held back while catching up, or the
         // genesis (or more) arrived from peers or an import before bootstrap could decide it, so
-        // bootstrap never starts it. Start it from everything stored once not catching up.
-        if self.launch.is_some() && !self.catching_up && self.pending_bootstrap.is_none() && decided_len() > 0 {
+        // bootstrap never starts it. Start it from everything stored once not catching up. Only
+        // on chain-bootstrapped networks: where BFT is supplied, tenderlink starts at
+        // construction, and starting it here would race later imports.
+        if self.launch.is_some()
+            && !self.fetches_genesis()
+            && !self.catching_up
+            && self.pending_bootstrap.is_none()
+            && decided_len() > 0
+        {
             self.spawn_deferred = false;
             self.restore(read_state, block_writer);
         }
@@ -2501,7 +2518,7 @@ impl BftRunner {
         }
         if self.catching_up {
             if !self.spawn_deferred {
-                tracing::info!("holding tenderlink back while the decided BFT chain is fetched from peers");
+                tracing::info!("holding tenderlink back until the decided BFT chain is caught up with peers");
             }
             self.spawn_deferred = true;
             return;

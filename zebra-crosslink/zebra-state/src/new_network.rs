@@ -805,6 +805,9 @@ const BFT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// A peer's advertised BFT length counts towards holding tenderlink back only if it answered a
 /// BFT_REQ of ours this recently: a length nobody serves holds nothing.
 const BFT_EVIDENCE_WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
+/// A node restarting with a stored BFT chain holds tenderlink back at most this long, waiting to
+/// hear from peers whether it is behind.
+const BFT_STARTUP_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The peers that hold decided height `want` and are not backing off, in a stable order for the
 /// round-robin that picks which one to ask.
@@ -828,6 +831,16 @@ fn bft_catching_up(peers: &HashMap<ConnectionKey, Peer>, rejections: &HashMap<Co
                 && !is_backing_off(rejections, **key)
         })
         .any(|(_, peer)| peer.their_bft_len > our_len + BFT_CATCH_UP_SLACK)
+}
+
+/// Whether a restarted node's startup hold on tenderlink still applies: until `until`, and only
+/// while no peer has answered a BFT_REQ of ours (then `bft_catching_up` decides) and no peer has
+/// reported a BFT length without being more than `BFT_CATCH_UP_SLACK` ahead of us.
+fn bft_startup_holding(peers: &HashMap<ConnectionKey, Peer>, our_len: u64, until: std::time::Instant, now: std::time::Instant) -> bool {
+    let reported: Vec<&Peer> = peers.values().filter(|peer| peer.their_bft_len > 0).collect();
+    now < until
+        && !peers.values().any(|peer| peer.bft_answered_at.is_some())
+        && !(!reported.is_empty() && reported.iter().all(|peer| peer.their_bft_len <= our_len + BFT_CATCH_UP_SLACK))
 }
 
 /// Store every fetched decision that is ready: the next height, its snapshot committed. Called
@@ -2230,6 +2243,7 @@ pub fn sync(
     }
     // BFT restores its persisted chain against the bc-chain, so this runs after genesis is in.
     let mut bft_runner = bft::BftRunner::new(bft, config, &read_state, &mut block_writer, rt.clone());
+    let mut bft_startup_hold_until = bft_runner.held_at_startup().then(|| std::time::Instant::now() + BFT_STARTUP_HOLD);
     let crosslink_params = read_state.network().crosslink_parameters();
 
     // Sync state
@@ -2309,8 +2323,12 @@ pub fn sync(
         let loop_start = std::time::Instant::now();
 
         bft_peer_rejections.retain(|_, rejection| std::time::Instant::now() < rejection.retry_at + REJECTED_BLOCK_BACKOFF_MAX);
+        if bft_startup_hold_until.is_some_and(|until| !bft_startup_holding(&peers, bft::decided_len(), until, std::time::Instant::now())) {
+            bft_startup_hold_until = None;
+        }
         let catching_up = !bft::bft_is_dropped()
-            && bft_catching_up(&peers, &bft_peer_rejections, bft::decided_len(), std::time::Instant::now());
+            && (bft_startup_hold_until.is_some()
+                || bft_catching_up(&peers, &bft_peer_rejections, bft::decided_len(), std::time::Instant::now()));
         bft_runner.set_catching_up(catching_up);
         bft_runner.tick(&read_state, &mut block_writer);
         feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer, &mut peers_to_kill, &mut bft_peer_rejections);
@@ -2682,7 +2700,7 @@ pub fn sync(
             }
             // Heights past u32 cannot be stored, so nothing is there to send.
             let Ok(from_u32) = u32::try_from(from) else { continue };
-            let decisions = block_writer.finalized_state.db.bft_decisions(from_u32, count.into());
+            let decisions = block_writer.finalized_state.db.bft_decisions(from_u32, count.into(), bft_sync::DECISIONS_MESSAGE_BUDGET);
             if decisions.is_empty() {
                 continue;
             }
@@ -4466,6 +4484,31 @@ mod tests {
         let mut rejections = HashMap::new();
         note_rejection(&mut rejections, server);
         assert!(!bft_catching_up(&peers, &rejections, 10, now), "a peer backing off holds nothing");
+    }
+
+    /// A restarted node holds tenderlink until a peer answers, every peer that reported is within
+    /// the slack, or the hold runs out.
+    #[test]
+    fn bft_startup_hold_ends_on_an_answer_on_peers_level_with_us_or_on_time() {
+        let now = std::time::Instant::now();
+        let until = now + BFT_STARTUP_HOLD;
+        let mut peers = HashMap::new();
+        assert!(bft_startup_holding(&peers, 10, until, now), "no peer heard from yet");
+        assert!(!bft_startup_holding(&peers, 10, until, until), "the hold runs out");
+
+        let (ahead, peer) = bft_peer(1, 100, None, now);
+        peers.insert(ahead, peer);
+        assert!(bft_startup_holding(&peers, 10, until, now), "a peer ahead that has not answered yet");
+
+        peers.get_mut(&ahead).unwrap().bft_answered_at = Some(now);
+        assert!(!bft_startup_holding(&peers, 10, until, now), "an answer hands over to bft_catching_up");
+
+        let mut peers = HashMap::new();
+        let (level, peer) = bft_peer(2, 10 + BFT_CATCH_UP_SLACK, None, now);
+        peers.insert(level, peer);
+        let (silent, peer) = bft_peer(3, 0, None, now);
+        peers.insert(silent, peer);
+        assert!(!bft_startup_holding(&peers, 10, until, now), "every peer that reported is level with us");
     }
 
     /// Requests go round all the peers that hold the wanted height, skipping those backing off.

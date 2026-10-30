@@ -13,7 +13,6 @@
 //! to carry a quorum of the height's roster.
 
 use zcash_primitives::bft::{BftBlock, FatPointerToBftBlock, TMSig};
-use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize};
 
 use super::{PACKET_TYPE_BFT_DECISIONS, PACKET_TYPE_BFT_REQ, PACKET_TYPE_BFT_STATUS};
 
