@@ -2120,6 +2120,8 @@ pub fn sync(
     let mut tx_live: HashSet<ConnectionKey> = HashSet::new();
     let mut tx_outs: Vec<tx_relay_state::Out> = Vec::new();
     let mut tx_relay_active = false;
+    // Bytes of each peer's TX bodies queued to the bridge to decode.
+    let mut tx_decoding: HashMap<ConnectionKey, u64> = HashMap::new();
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::channel(BLOCK_SUBMISSION_QUEUE_LEN);
     let _ = BLOCK_SUBMISSION_SENDER.set(submit_tx);
 
@@ -3309,13 +3311,18 @@ pub fn sync(
             let () = tx_relay_bridge::ASSUME_PEER_GONE_FOR_EVERY_KEY;
             for gone in tx_live.difference(&live_now) {
                 tx_state.on_peer_gone(*gone);
+                tx_decoding.remove(gone);
             }
             tx_live = live_now;
             // Near the PoW tip and not catching up on BFT: otherwise our mempool is judged
-            // against a stale chain, and so would everything peers send.
+            // against a stale chain, and so would everything peers send. Peers' tips are their
+            // unverified claims, so the lower median is used: a minority claiming a higher tip cannot
+            // turn relay off.
             let our_tip = read_state.best_tip().map_or(0, |(height, _)| height.0);
-            let best_peer_tip = peers.values().map(|peer| peer.their_tree.tip_height).max().unwrap_or(0);
-            tx_relay_active = !catching_up && our_tip.saturating_add(TX_RELAY_NEAR_TIP) >= best_peer_tip;
+            let mut peer_tips: Vec<u32> = peers.values().map(|peer| peer.their_tree.tip_height).collect();
+            let middle = peer_tips.len().saturating_sub(1) / 2;
+            let peer_tip = if peer_tips.is_empty() { 0 } else { *peer_tips.select_nth_unstable(middle).1 };
+            tx_relay_active = !catching_up && our_tip.saturating_add(TX_RELAY_NEAR_TIP) >= peer_tip;
 
             for answer in bridge.answers() {
                 match answer {
@@ -3323,7 +3330,10 @@ pub fn sync(
                     tx_relay_bridge::FromBridge::Removed(ids) => tx_state.on_removed(ids),
                     tx_relay_bridge::FromBridge::Reset(entries) => tx_state.on_reset(entries),
                     tx_relay_bridge::FromBridge::Filtered { from, keep } => tx_outs.extend(tx_state.on_filtered(from, keep, now)),
-                    tx_relay_bridge::FromBridge::Decoded { from, txs } => {
+                    tx_relay_bridge::FromBridge::Decoded { from, body_len, txs } => {
+                        if let Some(queued) = tx_decoding.get_mut(&from) {
+                            *queued = queued.saturating_sub(body_len as u64);
+                        }
                         let delivered: Vec<(zebra_chain::transaction::UnminedTxId, u32)> = txs.iter().map(|(id, len, _)| (*id, *len)).collect();
                         let take = tx_state.on_delivered(from, &delivered, now);
                         if take.is_empty() {
@@ -3343,7 +3353,12 @@ pub fn sync(
                             }
                         }
                     }
-                    tx_relay_bridge::FromBridge::Malformed { from } => peers_to_kill.push((from, "sent a malformed TX".to_string())),
+                    tx_relay_bridge::FromBridge::Malformed { from, body_len } => {
+                        if let Some(queued) = tx_decoding.get_mut(&from) {
+                            *queued = queued.saturating_sub(body_len as u64);
+                        }
+                        peers_to_kill.push((from, "sent a malformed TX".to_string()));
+                    }
                     tx_relay_bridge::FromBridge::Outcome { from, id, outcome } => tx_state.on_outcome(from, id, outcome, now),
                     tx_relay_bridge::FromBridge::Bodies { to, txs } => {
                         for packet in tx_relay::tx_packets(txs.iter().map(|tx| &*tx.transaction)) {
@@ -3359,24 +3374,39 @@ pub fn sync(
             }
 
             // Relay sends only what each peer's channel takes now. A status leaves room on the
-            // control channel for PoW's own status and requests.
+            // control channel for PoW's own status and requests. An ask or a MEMPOOL_REQ that
+            // does not fit is rolled back, so it is made again rather than waited on.
             let mut reserved: HashMap<(ConnectionKey, bool), u64> = HashMap::new();
+            let mut try_send = |to: ConnectionKey, packet: Vec<u8>, bulk: bool| -> bool {
+                let is_synthetic = synthetic_peers.iter().any(|p| p.address.connection_key() == to);
+                let channel = if bulk { Channel::Bulk } else { Channel::Control };
+                let budget = if is_synthetic { u64::MAX } else { network_thread_handle.send_budget(to, channel) };
+                let headroom = if packet[0] == PACKET_TYPE_TX_STATUS { TX_STATUS_CONTROL_HEADROOM } else { 0 };
+                let used = reserved.entry((to, bulk)).or_insert(0);
+                if budget < *used + packet.len() as u64 + headroom {
+                    return false;
+                }
+                *used += packet.len() as u64;
+                if bulk {
+                    bulk_packets_to_send.push((to, packet));
+                } else {
+                    packets_to_send.push((to, packet));
+                }
+                true
+            };
             for out in tx_outs.drain(..) {
                 match out {
                     tx_relay_state::Out::Send { to, packet, bulk } => {
-                        let is_synthetic = synthetic_peers.iter().any(|p| p.address.connection_key() == to);
-                        let channel = if bulk { Channel::Bulk } else { Channel::Control };
-                        let budget = if is_synthetic { u64::MAX } else { network_thread_handle.send_budget(to, channel) };
-                        let headroom = if packet[0] == PACKET_TYPE_TX_STATUS { TX_STATUS_CONTROL_HEADROOM } else { 0 };
-                        let used = reserved.entry((to, bulk)).or_insert(0);
-                        if budget < *used + packet.len() as u64 + headroom {
-                            continue;
+                        try_send(to, packet, bulk);
+                    }
+                    tx_relay_state::Out::Ask { to, ids, packet } => {
+                        if !try_send(to, packet, false) {
+                            tx_state.on_ask_unsent(to, &ids);
                         }
-                        *used += packet.len() as u64;
-                        if bulk {
-                            bulk_packets_to_send.push((to, packet));
-                        } else {
-                            packets_to_send.push((to, packet));
+                    }
+                    tx_relay_state::Out::MempoolReq { to } => {
+                        if !try_send(to, tx_relay::mempool_req_packet(), false) {
+                            tx_state.on_mempool_req_unsent(to);
                         }
                     }
                     tx_relay_state::Out::Filter { from, entries } => {
@@ -3950,10 +3980,17 @@ pub fn sync(
             } else if packet_type == PACKET_TYPE_TX {
                 // Decoded on the bridge, and only if we are waiting on this peer; a malformed
                 // body comes back as Malformed and kills it.
+                // A peer's undecoded bodies are capped at what it was asked for plus one message,
+                // so one peer cannot fill the bridge's queue; past it, bodies are dropped (the
+                // asks go unanswered and are re-made, or made of someone else).
                 if let Some(bridge) = &tx_bridge {
                     if tx_state.has_requested(connection_key) {
                         let () = tx_relay_bridge::ASSUME_UNASKED_TX_NOT_DECODED;
-                        bridge.send(tx_relay_bridge::ToBridge::Decode { from: connection_key, body: msg.to_vec() });
+                        let queued = tx_decoding.entry(connection_key).or_insert(0);
+                        let cap = tx_state.requested_bytes(connection_key) + tx_relay::TX_MESSAGE_BUDGET as u64;
+                        if *queued + msg.len() as u64 <= cap && bridge.send(tx_relay_bridge::ToBridge::Decode { from: connection_key, body: msg.to_vec() }) {
+                            *queued += msg.len() as u64;
+                        }
                     }
                 }
             } else if packet_type == PACKET_TYPE_MEMPOOL_REQ {

@@ -2286,6 +2286,64 @@ async fn cancel_handles_drained_after_verification_timeout() {
     );
 }
 
+/// STP peers together take at most `MAX_INBOUND_CONCURRENCY_ALL_STP_PEERS` download slots, so
+/// many STP peers at their own cap leave room for RPC submissions and legacy gossip.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn stp_peers_together_leave_room_in_the_download_queue() {
+    use tower::timeout::Timeout;
+    use zebra_chain::transaction::{self, UnminedTxId};
+    use zebra_node_services::mempool::Gossip;
+
+    use crate::components::mempool::downloads::{
+        Downloads, DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER,
+        MAX_INBOUND_CONCURRENCY_ALL_STP_PEERS, TRANSACTION_DOWNLOAD_TIMEOUT,
+        TRANSACTION_VERIFY_TIMEOUT,
+    };
+
+    let _init_guard = zebra_test::init();
+
+    let peer_set: MockPeerSet = MockService::build().for_unit_tests();
+    let state: MockService<zs::Request, zs::Response, PanicAssertion> =
+        MockService::build().for_unit_tests();
+    let tx_verifier: MockTxVerifier = MockService::build().for_unit_tests();
+    let mut downloads = Box::pin(Downloads::new(
+        Timeout::new(peer_set, TRANSACTION_DOWNLOAD_TIMEOUT),
+        Timeout::new(tx_verifier, TRANSACTION_VERIFY_TIMEOUT),
+        state,
+        DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER,
+    ));
+
+    let mut next_id = 0u32;
+    let mut candidate = || {
+        next_id += 1;
+        let mut hash = [0u8; 32];
+        hash[..4].copy_from_slice(&next_id.to_le_bytes());
+        Gossip::Id(UnminedTxId::Legacy(transaction::Hash(hash)))
+    };
+
+    let peers =
+        MAX_INBOUND_CONCURRENCY_ALL_STP_PEERS / DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER;
+    for peer in 0..peers {
+        for _ in 0..DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER {
+            downloads
+                .as_mut()
+                .download_if_needed_and_verify(candidate(), Some(PeerSource::Stp([peer as u8; 32])))
+                .expect("within both caps");
+        }
+    }
+    assert!(
+        downloads
+            .as_mut()
+            .download_if_needed_and_verify(candidate(), Some(PeerSource::Stp([0xff; 32])))
+            .is_err(),
+        "a further STP peer is refused once STP peers hold their share"
+    );
+    downloads
+        .as_mut()
+        .download_if_needed_and_verify(candidate(), None)
+        .expect("an RPC submission still has room");
+}
+
 /// Queues `candidates`, from `source` if it is `Some`, and returns the per-candidate results.
 async fn queue_candidates(
     mempool: &mut Mempool,

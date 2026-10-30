@@ -480,7 +480,6 @@ impl TransactionError {
             Groth16(_)
             | MalformedGroth16(_)
             | SmallOrder
-            | OrchardProofSize
             | IronwoodProofSize
             | StakingActionBondKeyInvalid { .. }
             // Signatures over standalone messages, not the sighash.
@@ -501,6 +500,10 @@ impl TransactionError {
             | StakingActionSignatureInvalid { .. } => sighash_failure,
 
             Halo2VerificationFailed => circuit_failure,
+
+            // Enforced only from a height (`orchard_canonical_proof_size_rule_active`): a peer
+            // below it accepts what we refuse.
+            OrchardProofSize => true,
 
             Script(script_error) => match script_error {
                 zebra_script::Error::ScriptInvalid => sighash_failure,

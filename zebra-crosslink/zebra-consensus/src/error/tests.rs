@@ -61,7 +61,6 @@ fn crypto_and_structural_failures_are_state_independent() {
         TransactionError::Halo2VerificationFailed,
         TransactionError::SaplingVerificationFailed,
         TransactionError::SmallOrder,
-        TransactionError::OrchardProofSize,
         TransactionError::IronwoodProofSize,
         TransactionError::Ed25519(zebra_chain::primitives::ed25519::Error::InvalidSignature),
         TransactionError::RedJubjub(zebra_chain::primitives::redjubjub::Error::InvalidSignature),
@@ -115,6 +114,8 @@ fn contextual_failures_are_state_dependent() {
     let outpoint = transparent::OutPoint::from_usize(hash, 0);
     for error in [
         TransactionError::LockedUntilAfterBlockHeight(height),
+        // Enforced only from a height.
+        TransactionError::OrchardProofSize,
         TransactionError::ExpiredTransaction {
             expiry_height: height,
             block_height: height,

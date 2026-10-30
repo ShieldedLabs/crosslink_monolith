@@ -2318,6 +2318,12 @@ fn crosslink_tx_relayed_over_stp_reaches_the_mempool() {
     tf.push_instr_expect_mempool_rejected(&forged, 0);
     tf.push_instr_expect_node_alive(0);
 
+    // The forger was backed off, not killed: once the backoff ends it is asked again, and an
+    // honest transaction from it is taken.
+    let honest = transparent_spend(gen.next_upgrade(), &key, mature(&mut gen, &mut tf));
+    tf.push_instr_recv_tx_stp(&honest, 1, 0);
+    tf.push_instr_expect_mempool_contains(&honest, 0);
+
     test_bytes(tf.write_to_bytes());
 }
 

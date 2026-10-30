@@ -29,7 +29,9 @@ pub(super) const ASSUME_ONE_OUTCOME_PER_SUBMITTED: () = ();
 pub(super) const ASSUME_INVALID_IS_STATE_INDEPENDENT: () = ();
 /// Assumption: a `TX` body is only decoded if its sender has asks outstanding
 /// (`TxRelay::has_requested`), and undecoded bodies queued here are bounded by
-/// [`MAX_QUEUED_BODY_BYTES`]; decoding is on the bridge, not the sync thread.
+/// [`MAX_QUEUED_BODY_BYTES`], and per sender by what it was asked for plus one message
+/// (the sync loop's count, decremented by the `Decoded`/`Malformed` answer); decoding is on
+/// the bridge, not the sync thread.
 pub(super) const ASSUME_UNASKED_TX_NOT_DECODED: () = ();
 /// Assumption: every connection key relay is told about gets `TxRelay::on_peer_gone` when it
 /// disconnects, and only live connections' keys are passed in, so per-peer state is bounded
@@ -66,10 +68,10 @@ pub(super) enum FromBridge {
     /// Our mempool, all of it (at start, and after the change stream lagged).
     Reset(Vec<(UnminedTxId, u32)>),
     Filtered { from: ConnectionKey, keep: Vec<(UnminedTxId, u32)> },
-    /// A decoded `TX` body: each transaction with its id and serialized length.
-    Decoded { from: ConnectionKey, txs: Vec<(UnminedTxId, u32, Arc<Transaction>)> },
-    /// A `TX` body that is not well formed: the sender is to be killed.
-    Malformed { from: ConnectionKey },
+    /// A decoded `TX` body of `body_len` bytes: each transaction with its id and serialized length.
+    Decoded { from: ConnectionKey, body_len: usize, txs: Vec<(UnminedTxId, u32, Arc<Transaction>)> },
+    /// A `TX` body of `body_len` bytes that is not well formed: the sender is to be killed.
+    Malformed { from: ConnectionKey, body_len: usize },
     Outcome { from: ConnectionKey, id: UnminedTxId, outcome: Outcome },
     Bodies { to: ConnectionKey, txs: Vec<UnminedTx> },
 }
@@ -211,10 +213,11 @@ async fn serve(request: ToBridge, mempool: &MempoolService, from_tx: &std::sync:
             let _ = from_tx.send(FromBridge::Filtered { from, keep });
         }
         ToBridge::Decode { from, body } => {
-            queued_body_bytes.fetch_sub(body.len(), Ordering::Relaxed);
+            let body_len = body.len();
+            queued_body_bytes.fetch_sub(body_len, Ordering::Relaxed);
             let answer = match read_txs(&body) {
-                Some(txs) => FromBridge::Decoded { from, txs: txs.into_iter().map(|(tx, len)| (UnminedTxId::from(&*tx), len, tx)).collect() },
-                None => FromBridge::Malformed { from },
+                Some(txs) => FromBridge::Decoded { from, body_len, txs: txs.into_iter().map(|(tx, len)| (UnminedTxId::from(&*tx), len, tx)).collect() },
+                None => FromBridge::Malformed { from, body_len },
             };
             let _ = from_tx.send(answer);
         }

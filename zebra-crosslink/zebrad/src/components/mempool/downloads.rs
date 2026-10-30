@@ -127,6 +127,13 @@ pub const MAX_INBOUND_CONCURRENCY_PER_PEER: usize = 5;
 /// queue.
 pub const DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER: usize = 32;
 
+/// The maximum number of concurrent inbound download and verify tasks attributable to all STP
+/// peers together.
+///
+/// Many STP peers at their per-peer cap would otherwise fill [`MAX_INBOUND_CONCURRENCY`], and
+/// RPC submissions and legacy gossip would be refused as a full queue.
+pub const MAX_INBOUND_CONCURRENCY_ALL_STP_PEERS: usize = 128;
+
 /// Sends a queued candidate's [`Verdict`] exactly once.
 ///
 /// If it is dropped unsent, because the mempool was reset or dropped a task's result, it sends
@@ -486,6 +493,25 @@ where
                 );
                 metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
                 return Err((MempoolError::FullQueue, rsp_tx));
+            }
+            if matches!(source, PeerSource::Stp(_)) {
+                // At most MAX_INBOUND_CONCURRENCY entries, so counting is cheap.
+                let all_stp: usize = self
+                    .pending_per_peer
+                    .iter()
+                    .filter(|(source, _)| matches!(source, PeerSource::Stp(_)))
+                    .map(|(_, count)| *count)
+                    .sum();
+                if all_stp >= MAX_INBOUND_CONCURRENCY_ALL_STP_PEERS {
+                    debug!(
+                        ?txid,
+                        all_stp,
+                        ?MAX_INBOUND_CONCURRENCY_ALL_STP_PEERS,
+                        "too many transactions queued for STP peers: ignored transaction"
+                    );
+                    metrics::counter!("mempool.full_queue.all_stp.total").increment(1);
+                    return Err((MempoolError::FullQueue, rsp_tx));
+                }
             }
         }
 
