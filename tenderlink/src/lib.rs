@@ -4062,6 +4062,7 @@ mod tests {
     #[ignore]
     #[test]
     #[allow(non_snake_case)]
+    #[cfg(target_arch = "x86_64")] // times with rdtsc
     fn dup_vote_bench() {
         use std::hint::black_box;
         use core::arch::x86_64::{_rdtsc, _mm_lfence};
