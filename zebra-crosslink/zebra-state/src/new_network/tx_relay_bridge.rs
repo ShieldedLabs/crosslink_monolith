@@ -112,7 +112,8 @@ impl TxBridge {
 fn outcome_of_refusal(refusal: &QueueRefusal) -> Outcome {
     match refusal {
         QueueRefusal::AlreadyKnown => Outcome::Accepted,
-        QueueRefusal::Rejected { .. } | QueueRefusal::Full | QueueRefusal::SpendConflict | QueueRefusal::Disabled => Outcome::NotTaken,
+        QueueRefusal::Full => Outcome::Busy,
+        QueueRefusal::Rejected { .. } | QueueRefusal::SpendConflict | QueueRefusal::Disabled => Outcome::NotTaken,
     }
 }
 

@@ -3316,10 +3316,19 @@ pub fn sync(
             tx_live = live_now;
             // Near the PoW tip and not catching up on BFT: otherwise our mempool is judged
             // against a stale chain, and so would everything peers send. Peers' tips are their
-            // unverified claims, so the lower median is used: a minority claiming a higher tip cannot
-            // turn relay off.
+            // unverified claims, so the lower median is used, of the peers we chose from our
+            // address map if there are any (inbound connections are cheap to multiply), and only
+            // of peers that have sent a status: a minority claiming a higher tip cannot turn
+            // relay off.
             let our_tip = read_state.best_tip().map_or(0, |(height, _)| height.0);
-            let mut peer_tips: Vec<u32> = peers.values().map(|peer| peer.their_tree.tip_height).collect();
+            let reported = |peer: &&Peer| peer.their_tree.tip_height > 0;
+            let any_selected = peers.values().filter(reported).any(|peer| peer.origin == PeerOrigin::Selected);
+            let mut peer_tips: Vec<u32> = peers
+                .values()
+                .filter(reported)
+                .filter(|peer| !any_selected || peer.origin == PeerOrigin::Selected)
+                .map(|peer| peer.their_tree.tip_height)
+                .collect();
             let middle = peer_tips.len().saturating_sub(1) / 2;
             let peer_tip = if peer_tips.is_empty() { 0 } else { *peer_tips.select_nth_unstable(middle).1 };
             tx_relay_active = !catching_up && our_tip.saturating_add(TX_RELAY_NEAR_TIP) >= peer_tip;
@@ -3349,7 +3358,7 @@ pub fn sync(
                         if !submitted {
                             let () = tx_relay_bridge::ASSUME_ONE_OUTCOME_PER_SUBMITTED;
                             for id in take {
-                                tx_state.on_outcome(from, id, tx_relay_state::Outcome::NotTaken, now);
+                                tx_state.on_outcome(from, id, tx_relay_state::Outcome::Busy, now);
                             }
                         }
                     }
@@ -3988,8 +3997,12 @@ pub fn sync(
                         let () = tx_relay_bridge::ASSUME_UNASKED_TX_NOT_DECODED;
                         let queued = tx_decoding.entry(connection_key).or_insert(0);
                         let cap = tx_state.requested_bytes(connection_key) + tx_relay::TX_MESSAGE_BUDGET as u64;
-                        if *queued + msg.len() as u64 <= cap && bridge.send(tx_relay_bridge::ToBridge::Decode { from: connection_key, body: msg.to_vec() }) {
-                            *queued += msg.len() as u64;
+                        if *queued + msg.len() as u64 <= cap {
+                            if bridge.send(tx_relay_bridge::ToBridge::Decode { from: connection_key, body: msg.to_vec() }) {
+                                *queued += msg.len() as u64;
+                            } else {
+                                tx_state.on_body_dropped(connection_key, std::time::Instant::now());
+                            }
                         }
                     }
                 }

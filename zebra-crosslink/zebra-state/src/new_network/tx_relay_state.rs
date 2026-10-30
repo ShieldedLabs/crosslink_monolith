@@ -7,8 +7,9 @@
 //! Relay is pull-based (no pushes, so nothing marks a transaction's origin). The bounds come
 //! from the relay's security reviews:
 //! - what we ask a peer for is budgeted by bytes ([`MAX_REQUESTED_BYTES_PER_PEER`]) and count
-//!   ([`MAX_IN_FLIGHT_PER_PEER`]), each id at the size *that* peer listed, so a peer lying about
-//!   sizes only ever affects its own asks; asks refill every poll;
+//!   ([`MAX_IN_FLIGHT_PER_PEER`], counting what awaits the mempool's verdict), each id at the
+//!   size *that* peer listed, so a peer lying about sizes only ever affects its own asks; asks
+//!   refill every poll;
 //! - one peer can make at most [`MAX_SOLE_LISTED_PER_PEER`] ids wanted that nobody else lists,
 //!   and its statuses are rate limited, so it cannot fill [`MAX_WANTED`] and crowd out everyone
 //!   else's transactions; ids nobody lists any more are forgotten;
@@ -16,7 +17,8 @@
 //!   the ask goes unanswered for [`REREQUEST_AFTER`]; once none are left it is forgotten (honest
 //!   holders list it again within a heartbeat). Not delivering is no fault (a transaction can be
 //!   mined or evicted meanwhile, and STP loses packets): it only demotes the peer, which is then
-//!   asked last and loses its place to a better lister. A peer is only ever asked for, and only
+//!   asked last and loses its place to a better lister (unless the body was dropped on our side,
+//!   for a full decode queue). A peer is only ever asked for, and only
 //!   ever demoted over, ids it listed itself; the same id is not asked of the same peer again
 //!   within [`ASK_COOLDOWN`] (meanwhile the peer does not count as listing it);
 //! - strikes back a peer off (it is not asked), 1 s doubling to 64 s, forgotten after
@@ -37,6 +39,9 @@ use zebra_chain::transaction::UnminedTxId;
 use super::tx_relay::{tx_req_packet, tx_status_packet, MAX_TXS_PER_MESSAGE, MAX_TX_IDS_PER_STATUS};
 
 pub(super) const MAX_REQUESTED_BYTES_PER_PEER: u64 = 2 << 20;
+/// Asked of one peer and not delivered, plus delivered and awaiting the mempool's verdict. At
+/// most the mempool's own cap per STP peer (zebrad's `DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER`),
+/// so one peer's deliveries are not refused as a full queue.
 pub(super) const MAX_IN_FLIGHT_PER_PEER: usize = 32;
 pub(super) const MAX_LISTERS: usize = 8;
 pub(super) const REREQUEST_AFTER: Duration = Duration::from_secs(4);
@@ -53,6 +58,8 @@ pub(super) const ASK_COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_TO_ASK_PER_PEER: usize = 8192;
 /// Recent asks remembered per peer for [`ASK_COOLDOWN`] at most; past it the oldest go.
 const MAX_ASKED_REMEMBERED: usize = 4096;
+/// After [`Outcome::Busy`] the delivering peer may be asked for the id again after this.
+const BUSY_RETRY_AFTER: Duration = REREQUEST_AFTER;
 pub(super) const STATUS_HEARTBEAT: Duration = Duration::from_secs(30);
 pub(super) const STATUS_MIN_GAP: Duration = Duration::from_millis(250);
 /// A change waits 100..500 ms before it is listed, so a burst goes out as one status.
@@ -98,9 +105,12 @@ pub(super) enum Out {
 pub(super) enum Outcome {
     /// Accepted, or already known: it will show up in (or is already in) our listing.
     Accepted,
-    /// Refused for a reason that may be ours (our tip, mempool contents, a full queue, a
-    /// timeout, the mempool disabled): no fault of the peer.
+    /// Refused for a reason that may be ours (our tip, mempool contents, a timeout, the
+    /// mempool disabled): no fault of the peer.
     NotTaken,
+    /// Not looked at: the mempool's queue was full. It stays wanted and is asked for again
+    /// shortly, of the same peer or another.
+    Busy,
     /// Fails verification whatever our state (a bad proof or signature): the peer is struck.
     Invalid,
 }
@@ -202,6 +212,13 @@ struct PeerTx {
     /// Ids asked of this peer and not yet delivered, with the size it listed.
     requested: HashMap<UnminedTxId, u32>,
     requested_bytes: u64,
+    /// Delivered by this peer and awaiting the mempool's verdict.
+    submitted: usize,
+    /// Wanted ids this peer is a lister of.
+    listing: HashSet<UnminedTxId>,
+    /// When a body from this peer was last dropped on our side (the bridge was full): asks made
+    /// before it that go unanswered are no fault of the peer.
+    local_drop: Option<Instant>,
     /// Wanted ids this peer listed and has not been asked for, oldest first. Stale entries
     /// (resolved, or asked of someone else) are skipped when popped.
     to_ask: VecDeque<UnminedTxId>,
@@ -231,6 +248,9 @@ impl PeerTx {
         Self {
             requested: HashMap::new(),
             requested_bytes: 0,
+            submitted: 0,
+            listing: HashSet::new(),
+            local_drop: None,
             to_ask: VecDeque::new(),
             asked_at: HashMap::new(),
             asked_order: VecDeque::new(),
@@ -376,12 +396,23 @@ impl TxRelay {
     /// a peer that has failed to deliver before.
     fn add_lister(&mut self, id: UnminedTxId, from: ConnectionKey, size: u32, now: Instant) {
         let Some(wanted) = self.wanted.get_mut(&id) else { return };
-        if wanted.listed_size(from).is_some() || self.peers.get(&from).is_some_and(|peer| peer.cooling_down(&id, now)) {
+        if self.peers.get(&from).is_some_and(|peer| peer.cooling_down(&id, now)) {
+            return;
+        }
+        if wanted.listed_size(from).is_some() {
+            // Listed again while nobody is asked for it (an ask ended without a delivery):
+            // ask this lister.
+            if wanted.asked.is_empty() && !wanted.submitted {
+                if let Some(peer) = self.peers.get_mut(&from) {
+                    peer.queue_ask(id);
+                }
+            }
             return;
         }
         let peers = &mut self.peers;
         let mut failures = |p: &ConnectionKey| peers.get_mut(p).map_or(u32::MAX, |peer| peer.delivery_failures.current(now));
         let newcomer_clean = failures(&from) == 0;
+        let mut displaced = None;
         if wanted.listers.len() >= MAX_LISTERS {
             if !newcomer_clean {
                 return;
@@ -395,9 +426,12 @@ impl TxRelay {
                 }
             }
             let Some((i, _)) = worst else { return };
-            wanted.listers.swap_remove(i);
+            displaced = Some(wanted.listers.swap_remove(i).0);
         }
         let jump = newcomer_clean && !wanted.asked.is_empty() && wanted.asked.iter().all(|(p, _)| failures(p) > 0);
+        if let Some(peer) = displaced.and_then(|displaced| self.peers.get_mut(&displaced)) {
+            peer.listing.remove(&id);
+        }
         wanted.listers.push((from, size));
         let sole = wanted.sole.take();
         if jump {
@@ -407,6 +441,7 @@ impl TxRelay {
             peer.sole_listed = peer.sole_listed.saturating_sub(1);
         }
         let peer = self.peers.get_mut(&from).expect("made by on_status");
+        peer.listing.insert(id);
         if jump {
             peer.to_ask.push_front(id);
         } else {
@@ -433,6 +468,7 @@ impl TxRelay {
                 continue;
             }
             peer.sole_listed += 1;
+            peer.listing.insert(id);
             peer.queue_ask(id);
             self.wanted_order.push_back((now, id));
             self.wanted.insert(id, Wanted { listers: vec![(from, size)], sole: Some(from), asked: Vec::new(), jump: None, first_seen: now, submitted: false });
@@ -449,7 +485,7 @@ impl TxRelay {
             return Vec::new();
         }
         let mut ids = Vec::new();
-        while peer.requested.len() < MAX_IN_FLIGHT_PER_PEER && ids.len() < MAX_TXS_PER_MESSAGE {
+        while peer.requested.len() + peer.submitted < MAX_IN_FLIGHT_PER_PEER && ids.len() < MAX_TXS_PER_MESSAGE {
             let Some(id) = peer.to_ask.pop_front() else { break };
             let Some(wanted) = self.wanted.get_mut(&id) else { continue };
             let Some(size) = wanted.listed_size(peer_key) else { continue };
@@ -503,10 +539,41 @@ impl TxRelay {
                 peer.unrequest(&id);
             }
         }
+        for (peer_key, _) in wanted.listers {
+            if let Some(peer) = self.peers.get_mut(&peer_key) {
+                peer.listing.remove(&id);
+            }
+        }
         if let Some(sole) = wanted.sole {
             if let Some(peer) = self.peers.get_mut(&sole) {
                 peer.sole_listed = peer.sole_listed.saturating_sub(1);
             }
+        }
+    }
+
+    /// A wanted id nobody is asked for or verifying goes back to its listers' queues, or is
+    /// forgotten if none are left. Called where an ask or a verification ends without it.
+    fn requeue_or_forget(&mut self, id: UnminedTxId) {
+        let Some(wanted) = self.wanted.get(&id) else { return };
+        if !wanted.asked.is_empty() || wanted.submitted {
+            return;
+        }
+        if wanted.listers.is_empty() {
+            self.forget_wanted(id);
+            return;
+        }
+        for (lister, _) in &wanted.listers {
+            if let Some(peer) = self.peers.get_mut(lister) {
+                peer.to_ask.push_front(id);
+            }
+        }
+    }
+
+    /// A `TX` body from `from` was dropped on our side (the bridge's queue was full), so the
+    /// asks it answered are not held against `from`.
+    pub fn on_body_dropped(&mut self, from: ConnectionKey, now: Instant) {
+        if let Some(peer) = self.peers.get_mut(&from) {
+            peer.local_drop = Some(now);
         }
     }
 
@@ -521,15 +588,16 @@ impl TxRelay {
         let () = super::tx_relay_bridge::ASSUME_ONE_OUTCOME_PER_SUBMITTED;
         let Some(peer) = self.peers.get_mut(&from) else { return Vec::new() };
         let mut take = Vec::new();
-        let mut lied = false;
+        let mut lied = Vec::new();
         for (id, len) in delivered {
             let Some(listed) = peer.requested.get(id).copied() else { continue };
             peer.unrequest(id);
             let Some(wanted) = self.wanted.get_mut(id) else { continue };
             wanted.asked.retain(|(p, _)| *p != from);
             if *len > listed {
-                lied = true;
                 wanted.listers.retain(|(p, _)| *p != from);
+                peer.listing.remove(id);
+                lied.push(*id);
                 continue;
             }
             if !wanted.submitted {
@@ -537,18 +605,40 @@ impl TxRelay {
                 take.push(*id);
             }
         }
-        if lied {
+        peer.submitted += take.len();
+        if !lied.is_empty() {
             peer.strikes.strike(now);
+        }
+        for id in lied {
+            self.requeue_or_forget(id);
         }
         take
     }
 
     /// The mempool's verdict on a transaction `from` delivered.
     pub fn on_outcome(&mut self, from: ConnectionKey, id: UnminedTxId, outcome: Outcome, now: Instant) {
+        if let Some(peer) = self.peers.get_mut(&from) {
+            peer.submitted = peer.submitted.saturating_sub(1);
+        }
         match outcome {
             // It reaches the mirror through the change stream, which forgets it as wanted.
             Outcome::Accepted => {}
             Outcome::NotTaken => self.forget_wanted(id),
+            Outcome::Busy => {
+                let Some(wanted) = self.wanted.get_mut(&id) else { return };
+                wanted.submitted = false;
+                // The other listers are asked now; `from` again after BUSY_RETRY_AFTER, when it
+                // lists it again (meanwhile it is not a lister).
+                wanted.listers.retain(|(p, _)| *p != from);
+                if let Some(peer) = self.peers.get_mut(&from) {
+                    peer.listing.remove(&id);
+                    let retry_at = now.checked_sub(ASK_COOLDOWN.saturating_sub(BUSY_RETRY_AFTER)).unwrap_or(now);
+                    if let Some(at) = peer.asked_at.get_mut(&id) {
+                        *at = retry_at;
+                    }
+                }
+                self.requeue_or_forget(id);
+            }
             Outcome::Invalid => {
                 let () = super::tx_relay_bridge::ASSUME_INVALID_IS_STATE_INDEPENDENT;
                 self.forget_wanted(id);
@@ -622,9 +712,11 @@ impl TxRelay {
     /// A peer disconnected. What only it listed, and nobody is asked for, is forgotten, so
     /// connection churn cannot leave ownerless entries filling the wanted set.
     pub fn on_peer_gone(&mut self, peer: ConnectionKey) {
-        self.peers.remove(&peer);
-        let mut orphaned = Vec::new();
-        for (id, wanted) in self.wanted.iter_mut() {
+        // Only listers are asked, and the sole and jump peers are listers, so the peer's own
+        // listing covers every wanted entry that names it.
+        let Some(gone) = self.peers.remove(&peer) else { return };
+        for id in gone.listing {
+            let Some(wanted) = self.wanted.get_mut(&id) else { continue };
             wanted.listers.retain(|(p, _)| *p != peer);
             wanted.asked.retain(|(p, _)| *p != peer);
             if wanted.sole == Some(peer) {
@@ -633,12 +725,7 @@ impl TxRelay {
             if wanted.jump == Some(peer) {
                 wanted.jump = None;
             }
-            if wanted.listers.is_empty() && wanted.asked.is_empty() && !wanted.submitted {
-                orphaned.push(*id);
-            }
-        }
-        for id in orphaned {
-            self.forget_wanted(id);
+            self.requeue_or_forget(id);
         }
     }
 
@@ -663,6 +750,15 @@ impl TxRelay {
                 self.forget_wanted(id);
             }
         }
+        // Entries for ids already resolved are dropped once they outnumber the live ones.
+        if self.wanted_order.len() > 2 * self.wanted.len() + 1024 {
+            let wanted = &self.wanted;
+            self.wanted_order.retain(|(since, id)| wanted.get(id).is_some_and(|w| w.first_seen == *since));
+        }
+        if self.asks.len() > 2 * self.wanted.len() + 1024 {
+            let wanted = &self.wanted;
+            self.asks.retain(|(at, id)| wanted.get(id).is_some_and(|w| w.asked.iter().any(|(_, asked_at)| asked_at == at)));
+        }
 
         // Overdue asks, oldest first. The peers asked (each a lister of it) are demoted and lose
         // their place as listers, and the other listers are asked; with none left the id is
@@ -681,14 +777,20 @@ impl TxRelay {
             if wanted.asked.iter().any(|(_, asked_at)| now.saturating_duration_since(*asked_at) < REREQUEST_AFTER) {
                 continue; // a more recent ask is still within its time
             }
-            let overdue: Vec<ConnectionKey> = wanted.asked.drain(..).map(|(p, _)| p).collect();
-            wanted.listers.retain(|(p, _)| !overdue.contains(p));
-            for peer_key in &overdue {
-                if let Some(peer) = self.peers.get_mut(peer_key) {
-                    peer.unrequest(&id);
-                    peer.delivery_failures.current(now);
-                    peer.delivery_failures.count = peer.delivery_failures.count.saturating_add(1);
+            let overdue: Vec<(ConnectionKey, Instant)> = wanted.asked.drain(..).collect();
+            for (peer_key, asked_at) in &overdue {
+                let Some(peer) = self.peers.get_mut(peer_key) else { continue };
+                peer.unrequest(&id);
+                // A body of theirs we dropped since the ask may have held it: no fault, and
+                // they stay a lister (asked again once their cooldown passes).
+                if peer.local_drop.is_some_and(|dropped| dropped >= *asked_at) {
+                    peer.asked_at.remove(&id);
+                    continue;
                 }
+                peer.delivery_failures.current(now);
+                peer.delivery_failures.count = peer.delivery_failures.count.saturating_add(1);
+                peer.listing.remove(&id);
+                wanted.listers.retain(|(p, _)| p != peer_key);
             }
             if wanted.listers.is_empty() {
                 forget.push(id);
@@ -821,14 +923,17 @@ mod tests {
         let outs = listed(&mut relay, peer(1), (0..100).map(|n| (id(n), 100_000)).collect(), now);
         assert_eq!(asked(&outs, peer(1)).len(), 20);
 
-        // 1 KB each: the in-flight cap binds first; delivering frees it for the next poll,
-        // without waiting for another status.
+        // 1 KB each: the in-flight cap binds first; verdicts on the deliveries free it for the
+        // next poll, without waiting for another status.
         let mut relay = TxRelay::default();
         relay.poll(&[peer(1)], now);
         let first = asked(&listed(&mut relay, peer(1), (0..100).map(|n| (id(n), 1_000)).collect(), now), peer(1));
         assert_eq!(first.len(), MAX_IN_FLIGHT_PER_PEER);
         let delivered: Vec<(UnminedTxId, u32)> = first.iter().map(|i| (*i, 1_000)).collect();
         assert_eq!(relay.on_delivered(peer(1), &delivered, now).len(), MAX_IN_FLIGHT_PER_PEER);
+        for id in &first {
+            relay.on_outcome(peer(1), *id, Outcome::Accepted, now);
+        }
         assert_eq!(asked(&relay.poll(&[peer(1)], now), peer(1)).len(), MAX_IN_FLIGHT_PER_PEER);
     }
 
@@ -1018,6 +1123,71 @@ mod tests {
         assert!(relay.poll(&[peer(2)], now).iter().any(|o| matches!(o, Out::MempoolReq { .. })));
         relay.on_mempool_req_unsent(peer(2));
         assert!(relay.poll(&[peer(2)], now).iter().any(|o| matches!(o, Out::MempoolReq { .. })));
+    }
+
+    /// Two peers list `id(7)`; peer 1 is asked first. Returns the relay at `now`.
+    fn two_listers(now: Instant) -> TxRelay {
+        let mut relay = TxRelay::default();
+        relay.poll(&[peer(1), peer(2)], now);
+        assert_eq!(asked(&listed(&mut relay, peer(1), vec![(id(7), 500)], now), peer(1)), vec![id(7)]);
+        assert!(asked(&listed(&mut relay, peer(2), vec![(id(7), 500)], now), peer(2)).is_empty());
+        relay
+    }
+
+    #[test]
+    fn when_the_asked_peer_lies_or_leaves_the_other_listers_are_asked_at_once() {
+        let now = Instant::now();
+        let mut relay = two_listers(now);
+        relay.on_delivered(peer(1), &[(id(7), 501)], now);
+        assert_eq!(asked(&relay.poll(&[peer(1), peer(2)], now), peer(2)), vec![id(7)]);
+
+        let mut relay = two_listers(now);
+        relay.on_peer_gone(peer(1));
+        assert_eq!(asked(&relay.poll(&[peer(2)], now), peer(2)), vec![id(7)]);
+        assert!(relay.peers.get(&peer(2)).unwrap().listing.contains(&id(7)));
+    }
+
+    #[test]
+    fn a_full_mempool_queue_keeps_it_wanted_and_retries_shortly() {
+        let now = Instant::now();
+        let mut relay = two_listers(now);
+        assert_eq!(relay.on_delivered(peer(1), &[(id(7), 500)], now), vec![id(7)]);
+        relay.on_outcome(peer(1), id(7), Outcome::Busy, now);
+        assert_eq!(asked(&relay.poll(&[peer(1), peer(2)], now), peer(2)), vec![id(7)], "the other lister now");
+
+        // With one lister, the same peer is asked again once it relists after the short retry.
+        let mut relay = TxRelay::default();
+        relay.poll(&[peer(1)], now);
+        listed(&mut relay, peer(1), vec![(id(7), 500)], now);
+        relay.on_delivered(peer(1), &[(id(7), 500)], now);
+        relay.on_outcome(peer(1), id(7), Outcome::Busy, now);
+        assert!(asked(&listed(&mut relay, peer(1), vec![(id(7), 500)], now), peer(1)).is_empty());
+        let retry = now + BUSY_RETRY_AFTER;
+        assert_eq!(asked(&listed(&mut relay, peer(1), vec![(id(7), 500)], retry), peer(1)), vec![id(7)]);
+    }
+
+    #[test]
+    fn an_ask_lost_to_our_own_full_decode_queue_does_not_demote() {
+        let now = Instant::now();
+        let mut relay = two_listers(now);
+        relay.on_body_dropped(peer(1), now);
+        let later = now + REREQUEST_AFTER;
+        let outs = relay.poll(&[peer(1), peer(2)], later);
+        assert_eq!(relay.peers.get_mut(&peer(1)).unwrap().delivery_failures.current(later), 0);
+        assert_eq!(asked(&outs, peer(1)), vec![id(7)], "still a lister, asked again");
+    }
+
+    #[test]
+    fn what_awaits_a_verdict_counts_against_a_peers_asks() {
+        let now = Instant::now();
+        let mut relay = TxRelay::default();
+        relay.poll(&[peer(1)], now);
+        let first = asked(&listed(&mut relay, peer(1), (0..100).map(|n| (id(n), 1_000)).collect(), now), peer(1));
+        let delivered: Vec<(UnminedTxId, u32)> = first.iter().map(|i| (*i, 1_000)).collect();
+        relay.on_delivered(peer(1), &delivered, now);
+        assert!(asked(&relay.poll(&[peer(1)], now), peer(1)).is_empty(), "all {MAX_IN_FLIGHT_PER_PEER} await verdicts");
+        relay.on_outcome(peer(1), first[0], Outcome::Accepted, now);
+        assert_eq!(asked(&relay.poll(&[peer(1)], now), peer(1)).len(), 1);
     }
 
     #[test]
