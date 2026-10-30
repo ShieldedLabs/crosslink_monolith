@@ -164,7 +164,8 @@ pub fn read_bft_decisions(body: &[u8]) -> Option<Vec<WireDecision>> {
             proposal_sigs.push(TMSig(r.take(64)?.try_into().ok()?));
         }
         if let Some(prev) = decisions.last().map(|d: &WireDecision| d.height) {
-            if height != prev + 1 {
+            // Both heights are the peer's: nothing follows u64::MAX.
+            if prev.checked_add(1) != Some(height) {
                 return None;
             }
         }
@@ -288,5 +289,19 @@ mod tests {
         assert!(read.len() <= MAX_DECISIONS_PER_MESSAGE as usize);
         assert!(packet.len() <= DECISIONS_MESSAGE_BUDGET);
         assert_eq!(read[0].height, 0);
+    }
+
+    #[test]
+    fn a_decision_after_the_last_u64_height_is_refused_not_a_panic() {
+        // Heights are the peer's. Checked as `prev + 1`, this overflowed: in a debug build
+        // (overflow checks on, panic = "abort") one message took the node down, and with
+        // wrapping arithmetic height 0 followed on from u64::MAX.
+        let wrapped = encode(&[decision(u64::MAX, true), decision(0, true)]);
+        assert_eq!(read_bft_decisions(&wrapped[1..]), None);
+        let repeated = encode(&[decision(u64::MAX, true), decision(u64::MAX, true)]);
+        assert_eq!(read_bft_decisions(&repeated[1..]), None);
+        // Alone, the last height is a well-formed decision; what it means is the caller's to judge.
+        let last = vec![decision(u64::MAX, true)];
+        assert_eq!(read_bft_decisions(&encode(&last)[1..]), Some(last));
     }
 }
