@@ -18,7 +18,7 @@ use zebra_chain::serialization::ZcashSerialize;
 
 use tenderlink::stp::*;
 use tenderlink::native_sockets::*;
-use tenderlink::transport::{new_network_thread, service_connections, Channel, NetworkThreadPush};
+use tenderlink::transport::{service_connections, Channel, Consumer, NetworkThreadPush, SharedTransport};
 use tenderlink::{SliceWrite, SliceRead};
 use tenderlink::{dbg_panic, dbg_verify};
 
@@ -2078,9 +2078,6 @@ pub fn sync(
         assert!(finalized_tip_height <= tip_height);
     }
 
-    // BFT restores its persisted chain against the bc-chain, so this runs after genesis is in.
-    let mut bft_runner = bft::BftRunner::new(bft, config, &read_state, &mut block_writer, rt.clone());
-    let crosslink_params = read_state.network().crosslink_parameters();
 
     // Keypair setup
     let network_keypair;
@@ -2109,8 +2106,11 @@ pub fn sync(
     };
 
     let my_keypairs = vec![network_keypair.clone()];
+    // One endpoint, key and port for the node: tenderlink attaches to the same transport when
+    // it starts (`bft::BftNetwork`).
     // small min keeps the send buffer rate-adaptive (clamp(1s * rate, 512KiB, 256MiB)) instead of a flat 256MiB/conn
-    let mut network_thread_handle = new_network_thread(my_keypairs.clone(), actual_network_local_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
+    let shared_transport = SharedTransport::new(my_keypairs.clone(), actual_network_local_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
+    let mut network_thread_handle = shared_transport.attach(Consumer::Base);
     // Sized from the per-(peer, channel) byte cap the transport actually enforces, which is
     // what bounds the responder's Bulk backlog ahead of our block (see `block_response_deadline`).
     let block_response_deadline = block_response_deadline(network_thread_handle.limits().peer_outbox_bytes as u64);
@@ -2149,6 +2149,20 @@ pub fn sync(
     }
 
     tracing::info!("NewNet: STP setup complete, port={}, peers={}", actual_network_local_port, initial_peer_addresses.len());
+
+    // Tenderlink shares this node's transport, key and port, and starts from its initial peers.
+    let mut bft = bft;
+    if let Some(launch) = bft.as_mut() {
+        launch.network = Some(bft::BftNetwork {
+            transport: shared_transport.clone(),
+            keypair: network_keypair.clone(),
+            port: actual_network_local_port,
+            seeds: initial_peer_addresses.clone(),
+        });
+    }
+    // BFT restores its persisted chain against the bc-chain, so this runs after genesis is in.
+    let mut bft_runner = bft::BftRunner::new(bft, config, &read_state, &mut block_writer, rt.clone());
+    let crosslink_params = read_state.network().crosslink_parameters();
 
     // Sync state
     let tick_duration = std::time::Duration::from_millis(IDLE_MS);
@@ -3235,6 +3249,7 @@ pub fn sync(
             wanted_connections: current_connections.iter().filter(|(addr, _)| !synthetic_peers.iter().any(|p| p.address == *addr)).cloned().collect(),
             send_unreliable: packets_to_send,
             send_bulk: std::mem::take(&mut bulk_packets_to_send),
+            ..Default::default()
         }) {
             Some(resp) => {
                 current_connections = resp.current_connections;

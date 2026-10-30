@@ -644,6 +644,8 @@ impl StartCmd {
                 signing_key: bft_signing_key,
                 public_address,
                 peer_addresses: config.crosslink.bft_peers.clone(),
+                // new_network::sync fills this in with the node's shared transport.
+                network: None,
             };
             tokio::task::spawn_blocking(move || {
 

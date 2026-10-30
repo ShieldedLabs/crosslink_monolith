@@ -1709,7 +1709,7 @@ async fn instance(
     let roster2 = roster.clone();
     let pub_key = PubKeyID(VerificationKeyBytes::from(&my_root_private_key.clone()).into());
 
-    entry_point(my_root_private_key, my_stp_keypair, my_endpoint, roster, zcash_primitives::bft::PROTOTYPE_PARAMETERS.active_roster_max_n, finalizer_peer_addresses, maybe_seed,
+    entry_point(my_root_private_key, None, my_stp_keypair, my_endpoint, roster, zcash_primitives::bft::PROTOTYPE_PARAMETERS.active_roster_max_n, finalizer_peer_addresses, maybe_seed,
         ClosureToProposeNewBlock(Arc::new(move || {
             let block_rng = Arc::clone(&block_rng);
             Box::pin(async move {
@@ -2119,6 +2119,10 @@ fn write_signed_proposal_chunk(round_data: &RoundData, chunk_i: usize,
 }
 
 pub async fn entry_point(my_root_private_key: SigningKey,
+                         // The node's transport, shared with its base protocol; `None` makes one
+                         // of tenderlink's own (standalone runs and tests). When shared,
+                         // `my_stp_keypair` and `my_endpoint` must be the node's.
+                         shared_transport: Option<transport::SharedTransport>,
                          my_stp_keypair: Option<IdentityKeyPair>,
                          my_endpoint: Option<STPAddress>,
                          roster: Vec<SortedRosterMember>,
@@ -2162,11 +2166,14 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     use crate::stp::*;
     use crate::native_sockets::*;
-    use crate::transport::{new_network_thread, service_connections, NetworkThreadPush};
+    use crate::transport::{service_connections, Consumer, NetworkThreadPush, SharedTransport};
 
     let my_port = my_endpoint.map(|e| e.port).unwrap_or(23485); // @Dev: .unwrap_or(0); // @Todo! Get local port after sock creation! @@@
-    // small min keeps the send buffer rate-adaptive (clamp(1s * rate, 512KiB, 256MiB)) instead of a flat 256MiB/conn
-    let mut network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
+    let shared_transport = shared_transport.unwrap_or_else(|| {
+        // small min keeps the send buffer rate-adaptive (clamp(1s * rate, 512KiB, 256MiB)) instead of a flat 256MiB/conn
+        SharedTransport::new(vec![my_stp_keypair.clone()], my_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024))
+    });
+    let mut network_thread_handle = shared_transport.attach(Consumer::Bft);
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
     let mut initiate_connections = Vec::<STPAddress>::new();
     let mut messages_to_send = Vec::new();

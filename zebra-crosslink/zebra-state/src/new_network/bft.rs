@@ -421,8 +421,22 @@ pub(super) fn bft_block_from_canonical_bytes(bytes: &[u8]) -> Option<BftBlock> {
 /// and who to connect to. The decided chain is persisted in the finalized database.
 pub struct BftLaunch {
     pub signing_key: ed25519_zebra::SigningKey,
+    /// `ip:port`. Only the IP is used once `network` is set: tenderlink then speaks with the
+    /// node's key, on the node's port.
     pub public_address: String,
+    /// `bft_peers`. Unused once `network` is set, whose seeds are the node's initial peers.
     pub peer_addresses: Vec<String>,
+    /// The node's own transport, key, port and initial peers, which tenderlink shares with the
+    /// base protocol. Filled in by `new_network::sync`; `None` gives tenderlink a transport of
+    /// its own, keyed by `public_address` as before.
+    pub network: Option<BftNetwork>,
+}
+
+pub struct BftNetwork {
+    pub transport: tenderlink::transport::SharedTransport,
+    pub keypair: tenderlink::stp::IdentityKeyPair,
+    pub port: u16,
+    pub seeds: Vec<tenderlink::stp::STPAddress>,
 }
 
 pub fn bc_hdr_to_lrz(header: &Header) -> BcBlockHeader {
@@ -2495,18 +2509,30 @@ impl BftRunner {
         tracing::info!("starting tenderlink at BFT height {} with {} finalizer(s)", ingest.len(), roster.len());
         BFT_CHAIN.write().unwrap().is_activated = true;
 
-        let (static_keypair, endpoint) = addr_string_to_stuff(&launch.public_address);
-        // `peer_addresses` is only a list of addresses to seed connections from. Keys are
-        // learned on connect (tenderlink verifies the peer's key and rewrites its address map),
-        // so the hint here is deliberately nil: the roster comes from the chain, never from
-        // this list.
-        let finalizer_peer_addresses: Vec<FinalizerPeerAddress> = launch
-            .peer_addresses
-            .iter()
-            .map(|peer| FinalizerPeerAddress { bft_pk: PubKeyID::NIL, address: addr_string_to_stuff(peer).1 })
-            .collect();
+        // The seeds are only addresses to start connections from. A finalizer's BFT key is
+        // learned on connect (tenderlink verifies it and rewrites its address map), so the hint
+        // here is deliberately nil: the roster comes from the chain, never from this list.
+        let (shared_transport, static_keypair, endpoint, seeds) = match launch.network {
+            Some(network) => {
+                // One key and port per node: tenderlink speaks as the node, at its public IP.
+                let ip = addr_string_to_stuff(&launch.public_address).1.ip;
+                if !launch.peer_addresses.is_empty() {
+                    tracing::warn!("bft_peers is ignored: BFT runs over the node's own connections, seeded from network_initial_peers");
+                }
+                let endpoint = tenderlink::stp::STPAddress::from(ip, network.port, &network.keypair);
+                (Some(network.transport), network.keypair, endpoint, network.seeds)
+            }
+            None => {
+                let (static_keypair, endpoint) = addr_string_to_stuff(&launch.public_address);
+                let seeds = launch.peer_addresses.iter().map(|peer| addr_string_to_stuff(peer).1).collect();
+                (None, static_keypair, endpoint, seeds)
+            }
+        };
+        let finalizer_peer_addresses: Vec<FinalizerPeerAddress> =
+            seeds.into_iter().map(|address| FinalizerPeerAddress { bft_pk: PubKeyID::NIL, address }).collect();
         let task = self.rt.spawn(tenderlink::entry_point(
             launch.signing_key,
+            shared_transport,
             Some(static_keypair),
             Some(endpoint),
             roster,
