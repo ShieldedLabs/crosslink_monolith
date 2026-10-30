@@ -1257,8 +1257,13 @@ impl BftRunner {
         if bft_is_dropped() || self.parked_decision.is_some() {
             return FeedOutcome::NotReady(decision);
         }
+        // A block's snapshot is its first header's parent, so a block with none is no block.
+        if decision.block.headers.is_empty() {
+            return FeedOutcome::Refused { why: format!("BFT height {} carries no headers", decision.height), peer_fault: true };
+        }
+        // Judged by our bootstrap config, so not the peer's fault.
         if decision.height == 0 && !self.fetches_genesis() {
-            return FeedOutcome::Refused { why: "genesis is derived from the chain, never fetched".to_string(), peer_fault: true };
+            return FeedOutcome::Refused { why: "genesis is derived from the chain, never fetched".to_string(), peer_fault: false };
         }
         let voting = {
             let chain = BFT_CHAIN.read().unwrap();
@@ -1443,6 +1448,11 @@ impl BftRunner {
     ) -> Result<ForceFed, FeedRefusal> {
         if bft_is_dropped() {
             return Err(FeedRefusal::not_yet("BFT is dropped on this node".to_string()));
+        }
+        // A block's snapshot is its first header's parent, so a block with none is no block, and
+        // `snapshot_block_hash` would panic on it.
+        if block.headers.is_empty() {
+            return Err(FeedRefusal::fault(format!("BFT height {} carries no headers", block.height)));
         }
         // Hashing re-serializes the block, so it is done once here.
         let block_hash = block.blake3_hash();

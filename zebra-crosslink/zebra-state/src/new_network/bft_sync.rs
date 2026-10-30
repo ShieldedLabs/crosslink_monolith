@@ -137,6 +137,10 @@ pub fn read_bft_decisions(body: &[u8]) -> Option<Vec<WireDecision>> {
             return None;
         }
         let block = super::bft::bft_block_from_canonical_bytes(r.take(block_len)?)?;
+        // A block's snapshot is its first header's parent, so a block with none is no block.
+        if block.headers.is_empty() {
+            return None;
+        }
         let fp_len = r.u32()? as usize;
         let mut fp_bytes = r.take(fp_len)?;
         let fat_pointer = FatPointerToBftBlock::zcash_deserialize(&mut fp_bytes).ok()?;
@@ -227,6 +231,13 @@ mod tests {
         // Heights that do not follow on from each other.
         let gap = encode(&[decision(5, 1), decision(7, 1)]);
         assert_eq!(read_bft_decisions(&gap[1..]), None);
+
+        // A block with no headers has no snapshot (asking for it panics). It encodes canonically,
+        // so only the explicit check refuses it.
+        let mut headerless = decision(5, 1);
+        headerless.block.headers.clear();
+        let headerless = encode(&[headerless]);
+        assert_eq!(read_bft_decisions(&headerless[1..]), None);
 
         // A count beyond the cap, before anything is allocated for it.
         let mut too_many = vec![0u8; 2];
