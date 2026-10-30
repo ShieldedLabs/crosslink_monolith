@@ -78,6 +78,24 @@ const MEMPOOL_OUTPUT_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::
 /// response from the transaction verifier.
 const POLL_MEMPOOL_DELAY: std::time::Duration = Duration::from_millis(50);
 
+/// A mempool transaction that embeds a consensus branch ID (v5 onward) reaches its signature,
+/// script and proof checks only once that branch ID equals the one our upgrade schedule has
+/// active at the verification height. So those checks run over the sighash and circuit the
+/// transaction's author chose, and their failures don't depend on our upgrade schedule.
+///
+/// Established in [`MempoolTxVerifier`]'s `call`, which runs
+/// [`check_structure_and_network_rules`] (and so [`check::consensus_branch_id`]) before
+/// building the sighasher. Relied on by [`TransactionError::is_state_dependent`].
+pub(crate) const ASSUME_EMBEDDED_BRANCH_ID_CHECKED_BEFORE_CRYPTO: () = ();
+
+/// The spent outputs a mempool transaction's sighash and scripts are checked against are in the
+/// order of its inputs, whether each came from the best chain or the mempool. An outpoint fixes
+/// its output, so those checks don't depend on where we found the outputs.
+///
+/// Established in `MempoolTxVerifier::mempool_spent_utxos`, which fills one slot per input.
+/// Relied on by [`TransactionError::is_state_dependent`].
+pub(crate) const ASSUME_SPENT_OUTPUTS_IN_INPUT_ORDER: () = ();
+
 /// Asynchronous verification of block transactions.
 ///
 /// # Correctness
@@ -470,6 +488,10 @@ where
             tracing::trace!(?tx_id, ?req, "got tx verify request");
 
             // Do quick checks first
+            //
+            // This includes the consensus branch ID check, which must stay ahead of the
+            // sighasher and the crypto checks below.
+            let () = ASSUME_EMBEDDED_BRANCH_ID_CHECKED_BEFORE_CRYPTO;
             check_structure_and_network_rules(tx.as_ref(), height, &network)?;
 
             // Validate the coinbase input consensus rules
@@ -561,11 +583,7 @@ where
 
             let sigops = tx.sigops().map_err(zebra_script::Error::from)?;
 
-            // TODO: `spent_outputs` may not align with `tx.inputs()` when a transaction
-            // spends both chain and mempool UTXOs (mempool outputs are appended last by
-            // `mempool_spent_utxos()`), causing policy checks to pair the wrong input with
-            // the wrong spent output.
-            // https://github.com/ZcashFoundation/zebra/issues/10346
+            // `spent_outputs` is in input order, see `ASSUME_SPENT_OUTPUTS_IN_INPUT_ORDER`.
             let spent_outputs = cached_ffi_transaction.all_previous_outputs().clone();
 
             let transaction = VerifiedUnminedTx::new(
@@ -739,6 +757,7 @@ where
         let mut spent_utxos = HashMap::new();
         // Pre-allocate with None so we can fill each slot by input index, preserving input order
         // even when chain and mempool UTXOs are fetched in separate passes.
+        let () = ASSUME_SPENT_OUTPUTS_IN_INPUT_ORDER;
         let mut spent_outputs: Vec<Option<transparent::Output>> = vec![None; inputs.len()];
         // Stores (input_idx, outpoint) for UTXOs not found in the best chain (fetched from mempool later).
         let mut spent_mempool_outpoints: Vec<(usize, transparent::OutPoint)> = Vec::new();

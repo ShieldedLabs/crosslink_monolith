@@ -23,8 +23,11 @@ use zebra_chain::{
 };
 
 /// An Error type representing the error codes returned from zcash_script.
+//
+// Deliberately exhaustive: `zebra_consensus::error::TransactionError::is_state_dependent`
+// matches every variant without a wildcard, so a new variant must be classified there before
+// it compiles.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Error {
     /// script verification failed
     ScriptInvalid,

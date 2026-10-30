@@ -27,7 +27,6 @@
 //! [`Mempool::poll_ready`]: super::Mempool::poll_ready
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -53,7 +52,7 @@ use zebra_chain::{
 };
 use zebra_consensus::transaction as tx;
 use zebra_network::{self as zn, PeerSocketAddr};
-use zebra_node_services::mempool::Gossip;
+use zebra_node_services::mempool::{Gossip, PeerSource, Verdict};
 use zebra_state::{self as zs, CloneError};
 
 use crate::components::{
@@ -107,14 +106,56 @@ pub(crate) const TRANSACTION_VERIFY_TIMEOUT: Duration = BLOCK_VERIFY_TIMEOUT;
 pub const MAX_INBOUND_CONCURRENCY: usize = 500;
 
 /// The maximum number of concurrent inbound download tasks attributable to a
-/// single advertising peer.
+/// single advertising legacy peer ([`PeerSource::Legacy`]).
 ///
 /// Caps how many slots of [`MAX_INBOUND_CONCURRENCY`] one peer's `Inv`
 /// advertisements can occupy, so a single peer cannot saturate the global
 /// queue with fake txids and deny gossip-path mempool admission for honest
 /// peers. See `GHSA-4fc2-h7jh-287c`. Crawler-driven and locally-pushed
 /// transactions have no source peer and are not counted against the cap.
+///
+/// The cap can be small because the legacy mempool crawler later fetches what a peer's
+/// refused candidates would have delivered.
 pub const MAX_INBOUND_CONCURRENCY_PER_PEER: usize = 5;
+
+/// The default maximum number of concurrent inbound download and verify tasks attributable to
+/// a single STP peer ([`PeerSource::Stp`]).
+///
+/// The STP relay has no crawler to backstop a refused candidate, so its cap is larger than the
+/// legacy one: it should cover the transactions an honest peer pushes between two of our
+/// verdicts. It is still far below [`MAX_INBOUND_CONCURRENCY`], so one peer cannot fill the
+/// queue.
+pub const DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER: usize = 32;
+
+/// Sends a queued candidate's [`Verdict`] exactly once.
+///
+/// If it is dropped unsent, because the mempool was reset or dropped a task's result, it sends
+/// [`Verdict::Cancelled`], so every queued candidate's caller gets a verdict.
+#[derive(Debug)]
+pub struct VerdictSender(Option<oneshot::Sender<Verdict>>);
+
+impl VerdictSender {
+    /// Returns a new sender, and the receiver its verdict goes to.
+    pub fn channel() -> (Self, oneshot::Receiver<Verdict>) {
+        let (sender, receiver) = oneshot::channel();
+        (Self(Some(sender)), receiver)
+    }
+
+    /// Sends `verdict`. A caller that dropped its receiver doesn't want it, so that is ignored.
+    pub fn send(mut self, verdict: Verdict) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(verdict);
+        }
+    }
+}
+
+impl Drop for VerdictSender {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(Verdict::Cancelled);
+        }
+    }
+}
 
 /// A marker struct for the oneshot channels which cancel a pending download and verify.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -145,6 +186,28 @@ pub enum TransactionDownloadVerifyError {
         /// The candidate block height used for mempool consensus verification.
         verification_height: Height,
     },
+}
+
+impl TransactionDownloadVerifyError {
+    /// The verdict a queued candidate gets for this failure.
+    pub fn verdict(&self) -> Verdict {
+        match self {
+            TransactionDownloadVerifyError::InState => Verdict::AlreadyKnown,
+            TransactionDownloadVerifyError::StateError(_)
+            | TransactionDownloadVerifyError::DownloadFailed(_) => Verdict::Dropped {
+                reason: self.to_string(),
+            },
+            TransactionDownloadVerifyError::Cancelled => Verdict::Cancelled,
+            TransactionDownloadVerifyError::Invalid {
+                error,
+                transaction_upgrade,
+                ..
+            } => Verdict::Invalid {
+                error: error.to_string(),
+                state_dependent: error.is_state_dependent(transaction_upgrade.is_some()),
+            },
+        }
+    }
 }
 
 /// Represents a [`Stream`] of download and verification tasks.
@@ -184,7 +247,7 @@ where
                         VerifiedUnminedTx,
                         Vec<transparent::OutPoint>,
                         Option<Height>,
-                        Option<oneshot::Sender<Result<(), BoxError>>>,
+                        VerdictSender,
                     ),
                     Box<(TransactionDownloadVerifyError, UnminedTxId)>,
                 >,
@@ -202,16 +265,19 @@ where
         (
             oneshot::Sender<CancelDownloadAndVerify>,
             Gossip,
-            Option<SocketAddr>,
+            Option<PeerSource>,
         ),
     >,
 
-    /// The number of currently in-flight download tasks per advertising peer.
+    /// The number of currently in-flight download tasks per source peer.
     ///
     /// Invariant: a peer is present here iff some entry in [`Self::cancel_handles`]
-    /// has it as the third tuple element. Enforces
-    /// [`MAX_INBOUND_CONCURRENCY_PER_PEER`]. See `GHSA-4fc2-h7jh-287c`.
-    pending_per_peer: HashMap<SocketAddr, usize>,
+    /// has it as the third tuple element. Enforces [`Self::max_in_flight`].
+    /// See `GHSA-4fc2-h7jh-287c`.
+    pending_per_peer: HashMap<PeerSource, usize>,
+
+    /// The maximum number of in-flight tasks for each [`PeerSource::Stp`] peer.
+    max_in_flight_per_stp_peer: usize,
 }
 
 impl<ZN, ZV, ZS> Stream for Downloads<ZN, ZV, ZS>
@@ -232,7 +298,7 @@ where
                 VerifiedUnminedTx,
                 Vec<transparent::OutPoint>,
                 Option<Height>,
-                Option<oneshot::Sender<Result<(), BoxError>>>,
+                VerdictSender,
             ),
             Box<(UnminedTxId, TransactionDownloadVerifyError)>,
         >,
@@ -257,27 +323,23 @@ where
                     let hash = tx.transaction.id;
                     (
                         Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))),
-                        Some(hash),
+                        hash,
                     )
                 }
                 Ok(Err(boxed_err)) => {
                     let (e, hash) = *boxed_err;
-                    (Ok(Err(Box::new((hash, e)))), Some(hash))
+                    (Ok(Err(Box::new((hash, e)))), hash)
                 }
-                Err((txid, elapsed)) => {
-                    // Remove the cancel handle so the spawned task's queued `Gossip`
-                    // doesn't stay resident in `cancel_handles` after a verification
-                    // timeout. Without this, a peer that gets each transaction to
-                    // hit `RATE_LIMIT_DELAY` can leak ~2 MB per tx until OOM.
-                    this.cancel_handles.remove(&txid);
-                    (Err((txid, elapsed)), None)
-                }
+                Err((txid, elapsed)) => (Err((txid, elapsed)), txid),
             };
 
-            if let Some(hash) = completed_txid {
-                if let Some((_, _gossip, Some(source))) = this.cancel_handles.remove(&hash) {
-                    Self::release_peer_slot(this.pending_per_peer, source);
-                }
+            // Remove the cancel handle, and release the source's slot, on every completion,
+            // including a verification timeout. Otherwise a timed-out task's queued `Gossip`
+            // stays resident in `cancel_handles` (a peer that gets each transaction to hit
+            // `RATE_LIMIT_DELAY` could leak ~2 MB per tx until OOM), and its source loses a
+            // slot of its per-peer cap until the mempool resets.
+            if let Some((_, _gossip, Some(source))) = this.cancel_handles.remove(&completed_txid) {
+                Self::release_peer_slot(this.pending_per_peer, source);
             }
 
             Some(result)
@@ -311,10 +373,14 @@ where
     /// `verifier` is used to verify transactions.
     /// `state` is used to check if transactions are already in the state.
     ///
+    /// `max_in_flight_per_stp_peer` caps each [`PeerSource::Stp`] peer's in-flight tasks,
+    /// usually [`DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER`]. Legacy peers are capped at
+    /// [`MAX_INBOUND_CONCURRENCY_PER_PEER`].
+    ///
     /// The [`Downloads`] stream is agnostic to the network policy, so retry and
     /// timeout limits should be applied to the `network` service passed into
     /// this constructor.
-    pub fn new(network: ZN, verifier: ZV, state: ZS) -> Self {
+    pub fn new(network: ZN, verifier: ZV, state: ZS, max_in_flight_per_stp_peer: usize) -> Self {
         Self {
             network,
             verifier,
@@ -322,24 +388,61 @@ where
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
             pending_per_peer: HashMap::new(),
+            max_in_flight_per_stp_peer,
+        }
+    }
+
+    /// The maximum number of in-flight download and verify tasks for `source`.
+    fn max_in_flight(&self, source: PeerSource) -> usize {
+        match source {
+            PeerSource::Legacy(_) => MAX_INBOUND_CONCURRENCY_PER_PEER,
+            PeerSource::Stp(_) => self.max_in_flight_per_stp_peer,
         }
     }
 
     /// Queue a transaction for download (if needed) and verification.
     ///
-    /// Returns the action taken in response to the queue request.
+    /// Returns a receiver for the transaction's [`Verdict`], or why it was not queued. Failures
+    /// are answered on the receiver by the download task; successes, and storage failures, by
+    /// the mempool once it tries to store the verified transaction.
     ///
-    /// When `source` is `Some`, the per-peer cap
-    /// [`MAX_INBOUND_CONCURRENCY_PER_PEER`] is enforced; crawler-driven and
-    /// locally-pushed transactions pass `None` and are not capped per peer.
-    #[instrument(skip(self, gossiped_tx), fields(txid = %gossiped_tx.id()))]
-    #[allow(clippy::unwrap_in_result)]
+    /// When `source` is `Some`, its per-peer cap ([`Self::max_in_flight`]) is enforced;
+    /// crawler-driven and locally-pushed transactions pass `None` and are not capped per peer.
+    /// Only a [`PeerSource::Legacy`] source is attributed for misbehaviour reports.
     pub fn download_if_needed_and_verify(
         &mut self,
         gossiped_tx: Gossip,
-        source: Option<SocketAddr>,
-        mut rsp_tx: Option<oneshot::Sender<Result<(), BoxError>>>,
-    ) -> Result<(), MempoolError> {
+        source: Option<PeerSource>,
+    ) -> Result<oneshot::Receiver<Verdict>, MempoolError> {
+        let (rsp_tx, rsp_rx) = VerdictSender::channel();
+        self.queue(gossiped_tx, source, rsp_tx)
+            .map_err(|(error, _rsp_tx)| error)?;
+        Ok(rsp_rx)
+    }
+
+    /// Queue an already-verified transaction for verification again, because the chain grew
+    /// while it was verified, sending its verdict to `rsp_tx`.
+    ///
+    /// The transaction is re-queued without its source, so it doesn't count against the
+    /// source's cap again. If it can't be queued, its verdict is [`Verdict::Dropped`].
+    pub fn requeue(&mut self, gossiped_tx: Gossip, rsp_tx: VerdictSender) {
+        if let Err((error, rsp_tx)) = self.queue(gossiped_tx, None, rsp_tx) {
+            rsp_tx.send(Verdict::Dropped {
+                reason: error.to_string(),
+            });
+        }
+    }
+
+    /// Queue a transaction for download (if needed) and verification, sending its verdict to
+    /// `rsp_tx`. If it can't be queued, returns why, along with `rsp_tx`.
+    #[instrument(skip(self, gossiped_tx, rsp_tx), fields(txid = %gossiped_tx.id()))]
+    #[allow(clippy::unwrap_in_result)]
+    fn queue(
+        &mut self,
+        gossiped_tx: Gossip,
+        source: Option<PeerSource>,
+        rsp_tx: VerdictSender,
+    ) -> Result<(), (MempoolError, VerdictSender)> {
         let txid = gossiped_tx.id();
 
         if self.cancel_handles.contains_key(&txid) {
@@ -352,7 +455,7 @@ where
             metrics::gauge!("mempool.currently.queued.transactions",)
                 .set(self.pending.len() as f64);
 
-            return Err(MempoolError::AlreadyQueued);
+            return Err((MempoolError::AlreadyQueued, rsp_tx));
         }
 
         if self.pending.len() >= MAX_INBOUND_CONCURRENCY {
@@ -365,22 +468,24 @@ where
             metrics::gauge!("mempool.currently.queued.transactions",)
                 .set(self.pending.len() as f64);
 
-            return Err(MempoolError::FullQueue);
+            return Err((MempoolError::FullQueue, rsp_tx));
         }
 
         // Per-peer cap: a single advertising peer cannot saturate the queue
         // with attacker-supplied fake txids. See `GHSA-4fc2-h7jh-287c`.
         if let Some(source) = source {
             let count = self.pending_per_peer.get(&source).copied().unwrap_or(0);
-            if count >= MAX_INBOUND_CONCURRENCY_PER_PEER {
+            let max_in_flight = self.max_in_flight(source);
+            if count >= max_in_flight {
                 debug!(
                     ?txid,
+                    ?source,
                     peer_queue_len = count,
-                    ?MAX_INBOUND_CONCURRENCY_PER_PEER,
+                    max_in_flight,
                     "too many transactions queued for this peer: ignored transaction"
                 );
                 metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
-                return Err(MempoolError::FullQueue);
+                return Err((MempoolError::FullQueue, rsp_tx));
             }
         }
 
@@ -390,7 +495,12 @@ where
         let network = self.network.clone();
         let verifier = self.verifier.clone();
         let mut state = self.state.clone();
-        let pushed_advertiser_addr = source.map(PeerSocketAddr::from);
+        // Only legacy peers are reported to the address book. An STP peer's verdicts go to
+        // the relay, which decides what to do about the peer.
+        let pushed_advertiser_addr = match source {
+            Some(PeerSource::Legacy(addr)) => Some(PeerSocketAddr::from(addr)),
+            Some(PeerSource::Stp(_)) | None => None,
+        };
 
         let gossiped_tx_req = gossiped_tx.clone();
 
@@ -413,6 +523,11 @@ where
 
             trace!(?txid, ?next_height, "got next height");
 
+            // A `Gossip::Tx` was checked for conflicts with mempool transactions before it was
+            // queued (`Mempool::queue_candidate`). A `Gossip::Id` can't be checked until it is
+            // downloaded, so it is only checked when the mempool inserts it, after verification.
+            // The legacy network that sends IDs caps each peer at
+            // `MAX_INBOUND_CONCURRENCY_PER_PEER`, which bounds that cost.
             let (tx, advertiser_addr) = match gossiped_tx {
                 Gossip::Id(txid) => {
                     let req = zn::Request::TransactionsById(std::iter::once(txid).collect());
@@ -496,45 +611,32 @@ where
             let fut = tokio::time::timeout(RATE_LIMIT_DELAY, fut);
 
             // Prefer the cancel handle if both are ready.
-            let result = tokio::select! {
+            //
+            // Failures are answered here. A verified transaction carries `rsp_tx` to the
+            // mempool, which answers once it tries to store it.
+            tokio::select! {
                 biased;
                 _ = &mut cancel_rx => {
                     trace!("task cancelled prior to completion");
                     metrics::counter!("mempool.cancelled.verify.tasks.total").increment(1);
-                    if let Some(rsp_tx) = rsp_tx.take() {
-                        let _ = rsp_tx.send(Err("verification cancelled".into()));
-                    }
+                    rsp_tx.send(Verdict::Cancelled);
 
                     Ok(Err(Box::new((TransactionDownloadVerifyError::Cancelled, txid))))
                 }
-                verification = fut => {
-                    verification
-                        .inspect_err(|_elapsed| {
-                            if let Some(rsp_tx) = rsp_tx.take() {
-                                let _ = rsp_tx.send(Err("timeout waiting for verification result".into()));
-                            }
-                        })
-                        .map_err(|elapsed| (txid, elapsed))
-                        .map(|inner_result| {
-                            match inner_result {
-                                Ok((transaction, spent_mempool_outpoints, tip_height)) => Ok((transaction, spent_mempool_outpoints, tip_height, rsp_tx)),
-                                Err(boxed_err) => {
-                                    let (tx_verifier_error, tx_id) = *boxed_err;
-                                    if let Some(rsp_tx) = rsp_tx.take() {
-                                        let error_msg = format!(
-                                            "failed to validate tx: {tx_id}, error: {tx_verifier_error}"
-                                        );
-                                        let _ = rsp_tx.send(Err(error_msg.into()));
-                                    };
-
-                                    Err(Box::new((tx_verifier_error, tx_id)))
-                                }
-                            }
-                        })
+                verification = fut => match verification {
+                    Err(elapsed) => {
+                        rsp_tx.send(Verdict::Timeout);
+                        Err((txid, elapsed))
+                    }
+                    Ok(Ok((transaction, spent_mempool_outpoints, tip_height))) => {
+                        Ok(Ok((transaction, spent_mempool_outpoints, tip_height, rsp_tx)))
+                    }
+                    Ok(Err(boxed_err)) => {
+                        rsp_tx.send(boxed_err.0.verdict());
+                        Ok(Err(boxed_err))
+                    }
                 },
-            };
-
-            result
+            }
         });
 
         self.pending.push(task);
@@ -545,8 +647,7 @@ where
             "transactions are only queued once"
         );
         if let Some(source) = source {
-            // The per-peer cap check above ensures this can't exceed
-            // `MAX_INBOUND_CONCURRENCY_PER_PEER`.
+            // The per-peer cap check above ensures this can't exceed `max_in_flight(source)`.
             *self.pending_per_peer.entry(source).or_insert(0) += 1;
         }
 
@@ -603,7 +704,7 @@ where
 
     /// Decrement the per-peer pending count for `source`, removing the entry
     /// when it reaches zero.
-    fn release_peer_slot(pending_per_peer: &mut HashMap<SocketAddr, usize>, source: SocketAddr) {
+    fn release_peer_slot(pending_per_peer: &mut HashMap<PeerSource, usize>, source: PeerSource) {
         if let Some(count) = pending_per_peer.get_mut(&source) {
             *count = count.saturating_sub(1);
             if *count == 0 {

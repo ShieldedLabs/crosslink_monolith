@@ -2516,7 +2516,7 @@ fn synthetic_peer(index: u64) -> std::net::SocketAddr {
 /// Submits `transaction` locally, as the wallet and RPC do, and returns the mempool's verdict:
 /// accepted, or rejected with its reason.
 async fn submit_tx(internal_handle: &TFLServiceHandle, transaction: Transaction) -> (bool, String) {
-    use zebra_node_services::mempool::{Gossip, Request, Response};
+    use zebra_node_services::mempool::{Gossip, Request, Response, Verdict};
 
     let txid = transaction.hash();
     let queued = tokio::time::timeout(
@@ -2534,8 +2534,8 @@ async fn submit_tx(internal_handle: &TFLServiceHandle, transaction: Transaction)
         Err(_) => return (false, format!("SUBMIT_TX {txid}: no answer from the mempool within {NODE_ANSWER_WAIT:?}")),
     };
     match tokio::time::timeout(NODE_ANSWER_WAIT, verdict).await {
-        Ok(Ok(Ok(()))) => (true, format!("SUBMIT_TX {txid}: accepted into the mempool")),
-        Ok(Ok(Err(err))) => (false, format!("SUBMIT_TX {txid}: rejected: {err}")),
+        Ok(Ok(Verdict::Accepted)) => (true, format!("SUBMIT_TX {txid}: accepted into the mempool")),
+        Ok(Ok(verdict)) => (false, format!("SUBMIT_TX {txid}: rejected: {verdict:?}")),
         Ok(Err(_)) => (false, format!("SUBMIT_TX {txid}: the mempool dropped the verdict")),
         Err(_) => (false, format!("SUBMIT_TX {txid}: no verdict within {NODE_ANSWER_WAIT:?}")),
     }

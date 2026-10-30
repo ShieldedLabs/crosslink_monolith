@@ -1,6 +1,6 @@
 //! Fixed test vectors for the mempool transaction downloader.
 
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 use futures::StreamExt as _;
 use tower::{service_fn, util::BoxCloneService};
@@ -21,7 +21,7 @@ async fn per_peer_cap_applies_to_pushed_transactions() {
     let _init_guard = zebra_test::init();
 
     let network = Network::Mainnet;
-    let source: SocketAddr = "192.168.0.1:8233".parse().expect("valid socket address");
+    let source = PeerSource::Legacy("192.168.0.1:8233".parse().expect("valid socket address"));
 
     // Distinct full transactions, as if pushed directly by a single peer.
     let pushed: Vec<Gossip> = network
@@ -44,12 +44,17 @@ async fn per_peer_cap_applies_to_pushed_transactions() {
     let state: MockService<zs::Request, zs::Response, PanicAssertion> =
         MockService::build().for_unit_tests();
 
-    let mut downloads = Downloads::new(peer_set, verifier, state);
+    let mut downloads = Downloads::new(
+        peer_set,
+        verifier,
+        state,
+        DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER,
+    );
 
     // The first `MAX_INBOUND_CONCURRENCY_PER_PEER` pushes from this peer are admitted.
     for gossip in pushed.iter().take(MAX_INBOUND_CONCURRENCY_PER_PEER) {
         downloads
-            .download_if_needed_and_verify(gossip.clone(), Some(source), None)
+            .download_if_needed_and_verify(gossip.clone(), Some(source))
             .expect("pushes below the per-peer cap are admitted");
     }
 
@@ -58,7 +63,6 @@ async fn per_peer_cap_applies_to_pushed_transactions() {
     let result = downloads.download_if_needed_and_verify(
         pushed[MAX_INBOUND_CONCURRENCY_PER_PEER].clone(),
         Some(source),
-        None,
     );
     assert!(
         matches!(result, Err(MempoolError::FullQueue)),
@@ -103,10 +107,11 @@ async fn pushed_transaction_attributes_invalid_error_to_peer() {
                 request => Err(format!("unexpected state request: {request:?}").into()),
             }
         })),
+        DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER,
     );
 
     downloads
-        .download_if_needed_and_verify(Gossip::Tx(transaction), Some(peer_addr), None)
+        .download_if_needed_and_verify(Gossip::Tx(transaction), Some(PeerSource::Legacy(peer_addr)))
         .expect("download is queued");
 
     let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
@@ -130,5 +135,327 @@ async fn pushed_transaction_attributes_invalid_error_to_peer() {
                 && actual_upgrade == transaction_upgrade
         ),
         "expected the pushed transaction failure to carry its peer, branch, and height, got {error:?}"
+    );
+}
+
+/// A verification timeout must release the source's per-peer slot, or a peer whose
+/// transactions time out loses its whole cap until the mempool resets.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn per_peer_slot_released_after_verification_timeout() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let source = PeerSource::Legacy("192.168.0.2:8233".parse().expect("valid socket address"));
+
+    let pushed: Vec<Gossip> = network
+        .unmined_transactions_in_blocks(1..=10)
+        .take(MAX_INBOUND_CONCURRENCY_PER_PEER + 1)
+        .map(|tx| Gossip::Tx(tx.transaction))
+        .collect();
+
+    // Nothing answers the state, so every task hits `RATE_LIMIT_DELAY`.
+    let peer_set: MockService<zn::Request, zn::Response, PanicAssertion> =
+        MockService::build().for_unit_tests();
+    let verifier: MockService<tx::MempoolRequest, tx::MempoolResponse, PanicAssertion> =
+        MockService::build().for_unit_tests();
+    let state: MockService<zs::Request, zs::Response, PanicAssertion> =
+        MockService::build().for_unit_tests();
+
+    let mut downloads = Box::pin(Downloads::new(
+        peer_set,
+        verifier,
+        state,
+        DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER,
+    ));
+
+    for gossip in pushed.iter().take(MAX_INBOUND_CONCURRENCY_PER_PEER) {
+        downloads
+            .as_mut()
+            .download_if_needed_and_verify(gossip.clone(), Some(source))
+            .expect("pushes below the per-peer cap are admitted");
+    }
+
+    tokio::time::advance(RATE_LIMIT_DELAY + Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+
+    for _ in 0..MAX_INBOUND_CONCURRENCY_PER_PEER {
+        assert!(
+            matches!(downloads.as_mut().next().await, Some(Err(_))),
+            "every task should time out",
+        );
+    }
+
+    downloads
+        .as_mut()
+        .download_if_needed_and_verify(
+            pushed[MAX_INBOUND_CONCURRENCY_PER_PEER].clone(),
+            Some(source),
+        )
+        .expect("timed-out tasks must release their source's slots");
+
+    downloads.cancel_all();
+}
+
+/// Builds a [`Downloads`] whose state says no transaction is mined, unless `in_state`, and
+/// whose verifier fails with `error`.
+fn downloads_with_verifier_error(
+    in_state: bool,
+    error: zebra_consensus::error::TransactionError,
+) -> Downloads<
+    BoxCloneService<zn::Request, zn::Response, BoxError>,
+    BoxCloneService<tx::MempoolRequest, tx::MempoolResponse, BoxError>,
+    BoxCloneService<zs::Request, zs::Response, BoxError>,
+> {
+    Downloads::new(
+        BoxCloneService::new(service_fn(|_request| async move {
+            panic!("pushed transactions must not be downloaded");
+        })),
+        BoxCloneService::new(service_fn(move |_request| {
+            let error = error.clone();
+            async move { Err(Box::new(error) as BoxError) }
+        })),
+        BoxCloneService::new(service_fn(move |request| async move {
+            match request {
+                zs::Request::Transaction(_) if in_state => {
+                    let tx = Network::Mainnet
+                        .unmined_transactions_in_blocks(1..=1)
+                        .next()
+                        .expect("test transaction")
+                        .transaction
+                        .transaction;
+                    Ok(zs::Response::Transaction(Some(zs::MinedTx::new(
+                        tx,
+                        Height(1),
+                        1,
+                        chrono::Utc::now(),
+                        zebra_chain::block::Hash([0; 32]),
+                    ))))
+                }
+                zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
+                zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                request => Err(format!("unexpected state request: {request:?}").into()),
+            }
+        })),
+        DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER,
+    )
+}
+
+/// Failures are answered by the download task: an invalid transaction with whether the failure
+/// is state-dependent, and a mined one as already known.
+#[tokio::test]
+async fn failed_candidates_get_typed_verdicts() {
+    use zebra_consensus::error::TransactionError;
+
+    let _init_guard = zebra_test::init();
+
+    let transaction = Network::Mainnet
+        .unmined_transactions_in_blocks(1..=1)
+        .next()
+        .expect("test transaction")
+        .transaction;
+    let source = Some(PeerSource::Stp([4; 32]));
+
+    for (in_state, error, expected) in [
+        (
+            false,
+            TransactionError::Groth16("bad".to_string()),
+            Some(false),
+        ),
+        (
+            false,
+            TransactionError::LockedUntilAfterBlockHeight(Height(10)),
+            Some(true),
+        ),
+        (true, TransactionError::WrongVersion, None),
+    ] {
+        let mut downloads = downloads_with_verifier_error(in_state, error);
+        let verdict = downloads
+            .download_if_needed_and_verify(Gossip::Tx(transaction.clone()), source)
+            .expect("queued");
+        let verdict = tokio::time::timeout(Duration::from_secs(1), verdict)
+            .await
+            .expect("a failure is answered by the task")
+            .expect("the sender is never dropped silently");
+
+        match expected {
+            Some(expected) => assert!(
+                matches!(verdict, Verdict::Invalid { state_dependent, .. } if state_dependent == expected),
+                "got {verdict:?}"
+            ),
+            None => assert_eq!(verdict, Verdict::AlreadyKnown),
+        }
+    }
+}
+
+/// Cancelled, reset and timed-out candidates get [`Verdict::Cancelled`] or
+/// [`Verdict::Timeout`], and a re-queue that can't be queued gets [`Verdict::Dropped`].
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cancelled_reset_timed_out_and_unrequeueable_candidates_get_verdicts() {
+    let _init_guard = zebra_test::init();
+
+    let mut transactions = Network::Mainnet
+        .unmined_transactions_in_blocks(1..=10)
+        .map(|tx| tx.transaction);
+    let cancelled = transactions.next().expect("test transaction");
+    let reset = transactions.next().expect("test transaction");
+    let timed_out = transactions.next().expect("test transaction");
+
+    // Nothing answers the state, so tasks wait until cancelled or timed out.
+    let peer_set: MockService<zn::Request, zn::Response, PanicAssertion> =
+        MockService::build().for_unit_tests();
+    let verifier: MockService<tx::MempoolRequest, tx::MempoolResponse, PanicAssertion> =
+        MockService::build().for_unit_tests();
+    let state: MockService<zs::Request, zs::Response, PanicAssertion> =
+        MockService::build().for_unit_tests();
+    let mut downloads = Box::pin(Downloads::new(
+        peer_set,
+        verifier,
+        state,
+        DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER,
+    ));
+
+    let cancelled_verdict = downloads
+        .as_mut()
+        .download_if_needed_and_verify(Gossip::Tx(cancelled.clone()), None)
+        .expect("queued");
+    downloads
+        .as_mut()
+        .cancel(&[cancelled.id.mined_id()].into_iter().collect());
+    assert_eq!(cancelled_verdict.await, Ok(Verdict::Cancelled));
+
+    // A re-queue of a transaction that is already queued is dropped.
+    let _queued = downloads
+        .as_mut()
+        .download_if_needed_and_verify(Gossip::Tx(timed_out.clone()), None)
+        .expect("queued");
+    let (requeued, requeued_verdict) = VerdictSender::channel();
+    downloads
+        .as_mut()
+        .requeue(Gossip::Tx(timed_out.clone()), requeued);
+    assert!(matches!(
+        requeued_verdict.await,
+        Ok(Verdict::Dropped { .. })
+    ));
+
+    tokio::time::advance(RATE_LIMIT_DELAY + Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(_queued.await, Ok(Verdict::Timeout));
+
+    let reset_verdict = downloads
+        .as_mut()
+        .download_if_needed_and_verify(Gossip::Tx(reset), None)
+        .expect("queued");
+    downloads.as_mut().cancel_all();
+    assert_eq!(reset_verdict.await, Ok(Verdict::Cancelled));
+}
+
+/// The per-peer cap counts each [`PeerSource`] separately: an STP peer has the constructor's
+/// cap, other STP peers and legacy peers have their own budgets, and the STP and legacy caps
+/// are independent.
+#[tokio::test]
+async fn per_source_cap_counts_each_peer_source() {
+    let _init_guard = zebra_test::init();
+
+    const STP_CAP: usize = 3;
+    let stp_a = PeerSource::Stp([0xA; 32]);
+    let stp_b = PeerSource::Stp([0xB; 32]);
+    let legacy = PeerSource::Legacy("192.168.0.3:8233".parse().expect("valid socket address"));
+
+    let mut pushed = Network::Mainnet
+        .unmined_transactions_in_blocks(1..=10)
+        .map(|tx| Gossip::Tx(tx.transaction));
+    let mut next = || pushed.next().expect("enough distinct test transactions");
+
+    let peer_set: MockService<zn::Request, zn::Response, PanicAssertion> =
+        MockService::build().for_unit_tests();
+    let verifier: MockService<tx::MempoolRequest, tx::MempoolResponse, PanicAssertion> =
+        MockService::build().for_unit_tests();
+    let state: MockService<zs::Request, zs::Response, PanicAssertion> =
+        MockService::build().for_unit_tests();
+    let mut downloads = Downloads::new(peer_set, verifier, state, STP_CAP);
+
+    for _ in 0..STP_CAP {
+        downloads
+            .download_if_needed_and_verify(next(), Some(stp_a))
+            .expect("pushes below the STP cap are admitted");
+    }
+
+    let refused = next();
+    assert!(
+        matches!(
+            downloads.download_if_needed_and_verify(refused.clone(), Some(stp_a)),
+            Err(MempoolError::FullQueue),
+        ),
+        "the STP peer's cap is the constructor's, not the legacy cap",
+    );
+
+    downloads
+        .download_if_needed_and_verify(refused, Some(stp_b))
+        .expect("another STP peer has its own budget");
+
+    downloads
+        .download_if_needed_and_verify(next(), Some(legacy))
+        .expect("a legacy peer has its own budget");
+
+    downloads
+        .download_if_needed_and_verify(next(), None)
+        .expect("source-less candidates are not capped per peer");
+
+    downloads.cancel_all();
+}
+
+/// An STP peer's invalid transaction carries no legacy address, so the mempool never reports
+/// the STP peer to the legacy address book.
+#[tokio::test]
+async fn stp_pushed_transaction_has_no_advertiser_addr() {
+    use zebra_consensus::error::TransactionError;
+
+    let _init_guard = zebra_test::init();
+
+    let transaction = Network::Mainnet
+        .unmined_transactions_in_blocks(1..=1)
+        .next()
+        .expect("at least one test transaction")
+        .transaction;
+
+    type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+    let mut downloads = Downloads::new(
+        BoxCloneService::new(service_fn(|_request| async move {
+            panic!("pushed transactions must not be downloaded");
+        })),
+        BoxCloneService::new(service_fn(|_request| async move {
+            Err(Box::new(TransactionError::WrongVersion) as BoxError)
+        })),
+        BoxCloneService::new(service_fn(|request| async move {
+            match request {
+                zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
+                zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                request => Err(format!("unexpected state request: {request:?}").into()),
+            }
+        })),
+        DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER,
+    );
+
+    downloads
+        .download_if_needed_and_verify(Gossip::Tx(transaction), Some(PeerSource::Stp([7; 32])))
+        .expect("download is queued");
+
+    let error = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+        .await
+        .expect("pushed transaction should complete")
+        .expect("download stream should yield an item")
+        .expect("pushed transaction should not time out")
+        .expect_err("invalid pushed transaction should fail verification")
+        .1;
+    assert!(
+        matches!(
+            error,
+            TransactionDownloadVerifyError::Invalid {
+                advertiser_addr: None,
+                ..
+            }
+        ),
+        "an STP peer must not be attributed a legacy address, got {error:?}"
     );
 }

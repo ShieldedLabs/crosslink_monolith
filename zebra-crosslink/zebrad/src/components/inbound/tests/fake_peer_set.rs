@@ -35,7 +35,7 @@ use crate::{
         inbound::{downloads::MAX_INBOUND_CONCURRENCY, Inbound, InboundSetupData},
         mempool::{
             gossip_mempool_transaction_id, Config as MempoolConfig, Mempool, MempoolError,
-            SameEffectsChainRejectionError, UnboxMempoolError,
+            SameEffectsChainRejectionError,
         },
         sync::{self, BlockGossipError, SyncStatus, PEER_GOSSIP_DELAY},
     },
@@ -307,7 +307,7 @@ async fn push_transaction_routing_enforces_per_peer_source() -> Result<(), crate
     let expected = mempool_service
         .expect_request(mempool::Request::QueueFromPeer {
             candidates: vec![mempool::Gossip::Tx(unmined_tx.clone())],
-            source: *peer,
+            source: mempool::PeerSource::Legacy(*peer),
         })
         .map(|responder| responder.respond(mempool::Response::Queued(vec![])));
     let (push_response, _) = futures::join!(request, expected);
@@ -666,8 +666,10 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
             .into_iter()
             .next()
             .unwrap()
-            .unbox_mempool_error(),
-        MempoolError::StorageEffectsChain(SameEffectsChainRejectionError::Expired)
+            .expect_err("expired transaction should be refused"),
+        mempool::QueueRefusal::from(MempoolError::StorageEffectsChain(
+            SameEffectsChainRejectionError::Expired
+        )),
     );
 
     // Test transaction 2 is gossiped, after waiting for the multi-gossip delay

@@ -1895,17 +1895,29 @@ where
             "mempool service returned more results than expected"
         );
 
-        let queue_result = queue_results
+        let verdict = match queue_results
             .pop()
             .expect("there should be exactly one item in Vec")
-            .inspect_err(|err| tracing::debug!("sent transaction to mempool: {:?}", &err))
-            .map_misc_error()?
-            .await
-            .map_misc_error()?;
+        {
+            Ok(verdict) => verdict,
+            Err(refusal) => {
+                tracing::debug!("sent transaction to mempool: {:?}", &refusal);
+                // A conflict is now found before verification, but it is still a verification
+                // failure to the caller, as it was when found on insertion.
+                let code = match refusal {
+                    mempool::QueueRefusal::SpendConflict => server::error::LegacyCode::Verify,
+                    _ => server::error::LegacyCode::Misc,
+                };
+                return Err(refusal).map_error(code);
+            }
+        }
+        .await
+        .map_misc_error()?;
 
-        tracing::debug!("sent transaction to mempool: {:?}", &queue_result);
+        tracing::debug!("sent transaction to mempool: {:?}", &verdict);
 
-        queue_result
+        verdict
+            .into_result()
             .map(|_| SendRawTransactionResponse(transaction_hash))
             // Reference for the legacy error code:
             // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/rawtransaction.cpp#L1290-L1301>
