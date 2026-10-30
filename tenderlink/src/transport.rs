@@ -63,6 +63,25 @@ impl Channel {
     }
 }
 
+/// The first byte of every message names its family, then its type within the family. Bit 7
+/// picks the family:
+/// - [`MESSAGE_FAMILY_BASE`] (0x00..=0x7F): the base protocol, PoW sync and transaction relay.
+///   It does not depend on BFT, so it can ship without it. Its types are new_network's
+///   `PACKET_TYPE_*`.
+/// - [`MESSAGE_FAMILY_BFT`] (0x80..=0xFF): tenderlink. Bit 6 flags a status block after the
+///   header, and bits 0..=5 are the type.
+///
+/// One byte routes any message to its consumer; STP cannot, since a received message does not
+/// say which send queue it travelled on.
+pub const MESSAGE_FAMILY_MASK: u8 = 0x80;
+pub const MESSAGE_FAMILY_BASE: u8 = 0x00;
+pub const MESSAGE_FAMILY_BFT: u8 = 0x80;
+
+/// The family of a message, from its first byte.
+pub fn message_family(first_byte: u8) -> u8 {
+    first_byte & MESSAGE_FAMILY_MASK
+}
+
 /// Largest message either sync loop sends. A whole Zcash block (2 MB at most) plus its
 /// header fits with room to spare; the receive side refuses anything bigger.
 pub const MAX_MESSAGE_SIZE: usize = 4 << 20;

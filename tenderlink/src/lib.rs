@@ -3285,11 +3285,14 @@ const PACKET_TYPE_PRECOMMIT_SIGNATURES: u8 =  9;
 const PACKET_TYPE_COUNT:                u8 = 11;
 
 
-const PACKET_TYPE_BITS:                 u8 =  7;
+// A tag is the BFT family bit (see `transport::MESSAGE_FAMILY_BFT`), the status flag, then the type.
+const PACKET_TYPE_BITS:                 u8 =  6;
 const PACKET_TYPE_MASK:                 u8 = (1 << PACKET_TYPE_BITS) - 1;
+const_assert!(PACKET_TYPE_COUNT <= PACKET_TYPE_MASK + 1);
 
 const PACKET_TAG_STATUS_SHIFT:          u8 = PACKET_TYPE_BITS;
 const PACKET_TAG_STATUS_FLAG:           u8 = 1 << PACKET_TAG_STATUS_SHIFT;
+const_assert!(PACKET_TAG_STATUS_FLAG & transport::MESSAGE_FAMILY_MASK == 0);
 
 const PACKET_TAG_BITS:                  u8 = 8;
 const PACKET_TAG_MASK:                  u8 = ((1 << PACKET_TAG_BITS as u64) - 1) as u8;
@@ -3395,7 +3398,7 @@ impl PacketHeader {
         Self::new_(TAG)
     }
     pub fn new_(tag: u8) -> PacketHeader {
-        PacketHeader { tag: tag as u64 }
+        PacketHeader { tag: (transport::MESSAGE_FAMILY_BFT | tag) as u64 }
     }
 
     pub fn has_status(&self) -> bool { (self.tag as u8) & PACKET_TAG_STATUS_FLAG != 0 }
@@ -3412,6 +3415,8 @@ impl PacketHeader {
     pub fn read_from(buf: &mut &[u8]) -> Option<Self> {
         let tag = u64::read_from(buf)?;
         let _   = u64::read_from(buf)?;
+        // Not a BFT message (a base-family message, or an older node's).
+        if transport::message_family(tag as u8) != transport::MESSAGE_FAMILY_BFT { return None; }
         Some(Self { tag })
     }
 }

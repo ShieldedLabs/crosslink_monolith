@@ -39,21 +39,28 @@ const JUMBO_FRAG_SIZE: usize = max_single_datagram_message_size(CRYPTO_MAGIC).un
 const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
 //const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
-// @Todo: more of these, merge with Tenderlink, etc.
-const PACKET_TYPE_STATUS:            u8 = 1;
-const PACKET_TYPE_BLOCK_CHUNK:       u8 = 2;
-const PACKET_TYPE_BLOCK_REQ:         u8 = 3;
-const PACKET_TYPE_PEER_ADDRESS_LIST: u8 = 4;
-const PACKET_TYPE_WANT_HOLE_PUNCH:   u8 = 5;
-const PACKET_TYPE_TRY_HOLE_PUNCH:    u8 = 6;
-const PACKET_TYPE_BFT_STATUS:        u8 = 7;
-const PACKET_TYPE_BFT_REQ:           u8 = 8;
-const PACKET_TYPE_BFT_DECISIONS:     u8 = 9;
-const PACKET_TYPE_COUNT:             u8 = 10;
+// Base-family message types (see `tenderlink::transport::MESSAGE_FAMILY_BASE`). 0x00..=0x3F
+// is the base protocol, which does not depend on BFT; 0x40..=0x7F holds Crosslink's extensions
+// to it, which a node without BFT ignores. Both are handled by this sync loop.
+const PACKET_TYPE_STATUS:            u8 = 0x01;
+const PACKET_TYPE_BLOCK_CHUNK:       u8 = 0x02;
+const PACKET_TYPE_BLOCK_REQ:         u8 = 0x03;
+const PACKET_TYPE_PEER_ADDRESS_LIST: u8 = 0x04;
+const PACKET_TYPE_WANT_HOLE_PUNCH:   u8 = 0x05;
+const PACKET_TYPE_TRY_HOLE_PUNCH:    u8 = 0x06;
+// 0x07..=0x0F reserved for transaction relay.
 
+const PACKET_TYPE_CROSSLINK_FIRST:   u8 = 0x40;
+const PACKET_TYPE_BFT_STATUS:        u8 = 0x40;
+const PACKET_TYPE_BFT_REQ:           u8 = 0x41;
+const PACKET_TYPE_BFT_DECISIONS:     u8 = 0x42;
+const_assert!(PACKET_TYPE_BFT_DECISIONS >= PACKET_TYPE_CROSSLINK_FIRST);
+const_assert!(PACKET_TYPE_BFT_DECISIONS & tenderlink::transport::MESSAGE_FAMILY_MASK == tenderlink::transport::MESSAGE_FAMILY_BASE);
+
+// Indexed by the whole type byte, so every byte has an entry.
 #[allow(dead_code)] // looked up by the commented packet-type log in the recv loop
-const PACKET_TYPE_NAMES: [&str; PACKET_TYPE_COUNT as usize] = {
-    let mut names = ["<UNKNOWN>"; PACKET_TYPE_COUNT as usize];
+const PACKET_TYPE_NAMES: [&str; 256] = {
+    let mut names = ["<UNKNOWN>"; 256];
     names[PACKET_TYPE_STATUS            as usize] = "STATUS";
     names[PACKET_TYPE_BLOCK_CHUNK       as usize] = "BLOCK_CHUNK";
     names[PACKET_TYPE_BLOCK_REQ         as usize] = "BLOCK_REQ";
@@ -63,14 +70,11 @@ const PACKET_TYPE_NAMES: [&str; PACKET_TYPE_COUNT as usize] = {
     names[PACKET_TYPE_BFT_STATUS        as usize] = "BFT_STATUS";
     names[PACKET_TYPE_BFT_REQ           as usize] = "BFT_REQ";
     names[PACKET_TYPE_BFT_DECISIONS     as usize] = "BFT_DECISIONS";
-    const_assert!(PACKET_TYPE_COUNT == 10); // keep names array updated when adding other types
     names
 };
 #[allow(dead_code)] // looked up by the commented packet-type log in the recv loop
 fn packet_name_from_type(packet_type: u8) -> &'static str {
-    let string_maybe = PACKET_TYPE_NAMES.get(packet_type as usize);
-    let string       = string_maybe.unwrap_or(&"<UNKNOWN>");
-    string
+    PACKET_TYPE_NAMES[packet_type as usize]
 }
 
 
