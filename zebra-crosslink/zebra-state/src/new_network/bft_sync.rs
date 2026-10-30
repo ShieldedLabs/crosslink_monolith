@@ -120,6 +120,12 @@ pub fn read_bft_req(body: &[u8]) -> Option<(u64, u16)> {
     r.0.is_empty().then_some((from, count.min(MAX_DECISIONS_PER_MESSAGE)))
 }
 
+/// Assumption, established at ingest: every BFT block a peer gives us has at least one header.
+/// `read_bft_decisions` refuses one with none, and nothing else turns peer bytes into a block.
+/// Code that relies on it (a block's snapshot is `headers[0]`'s parent) names this, so removing
+/// the check here means revisiting every such site.
+pub(crate) const ASSUME_BFT_BLOCK_HAS_HEADERS: () = ();
+
 /// The decisions in a `BFT_DECISIONS` body, which must be consecutive heights. Blocks must be
 /// canonically encoded, as tenderlink requires of proposals (`bft_block_from_canonical_bytes`).
 pub fn read_bft_decisions(body: &[u8]) -> Option<Vec<WireDecision>> {
@@ -137,7 +143,8 @@ pub fn read_bft_decisions(body: &[u8]) -> Option<Vec<WireDecision>> {
             return None;
         }
         let block = super::bft::bft_block_from_canonical_bytes(r.take(block_len)?)?;
-        // A block's snapshot is its first header's parent, so a block with none is no block.
+        // ASSUME_BFT_BLOCK_HAS_HEADERS: a block's snapshot is its first header's parent, so a
+        // block with none is no block.
         if block.headers.is_empty() {
             return None;
         }
