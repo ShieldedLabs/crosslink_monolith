@@ -754,6 +754,7 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                     receiver
                                                         .await
                                                         .map_err(internal)?
+                                                        .into_result()
                                                         .map_err(|e| (GRPC_UNKNOWN, e.to_string()))?;
 
                                                     // lightwalletd quirk: success carries the txid in error_message

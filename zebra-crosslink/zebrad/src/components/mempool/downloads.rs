@@ -52,7 +52,7 @@ use zebra_chain::{
 };
 use zebra_consensus::transaction as tx;
 use zebra_network::{self as zn, PeerSocketAddr};
-use zebra_node_services::mempool::{Gossip, PeerSource};
+use zebra_node_services::mempool::{Gossip, PeerSource, Verdict};
 use zebra_state::{self as zs, CloneError};
 
 use crate::components::{
@@ -127,6 +127,36 @@ pub const MAX_INBOUND_CONCURRENCY_PER_PEER: usize = 5;
 /// queue.
 pub const DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER: usize = 32;
 
+/// Sends a queued candidate's [`Verdict`] exactly once.
+///
+/// If it is dropped unsent, because the mempool was reset or dropped a task's result, it sends
+/// [`Verdict::Cancelled`], so every queued candidate's caller gets a verdict.
+#[derive(Debug)]
+pub struct VerdictSender(Option<oneshot::Sender<Verdict>>);
+
+impl VerdictSender {
+    /// Returns a new sender, and the receiver its verdict goes to.
+    pub fn channel() -> (Self, oneshot::Receiver<Verdict>) {
+        let (sender, receiver) = oneshot::channel();
+        (Self(Some(sender)), receiver)
+    }
+
+    /// Sends `verdict`. A caller that dropped its receiver doesn't want it, so that is ignored.
+    pub fn send(mut self, verdict: Verdict) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(verdict);
+        }
+    }
+}
+
+impl Drop for VerdictSender {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(Verdict::Cancelled);
+        }
+    }
+}
+
 /// A marker struct for the oneshot channels which cancel a pending download and verify.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct CancelDownloadAndVerify;
@@ -156,6 +186,28 @@ pub enum TransactionDownloadVerifyError {
         /// The candidate block height used for mempool consensus verification.
         verification_height: Height,
     },
+}
+
+impl TransactionDownloadVerifyError {
+    /// The verdict a queued candidate gets for this failure.
+    pub fn verdict(&self) -> Verdict {
+        match self {
+            TransactionDownloadVerifyError::InState => Verdict::AlreadyKnown,
+            TransactionDownloadVerifyError::StateError(_)
+            | TransactionDownloadVerifyError::DownloadFailed(_) => Verdict::Dropped {
+                reason: self.to_string(),
+            },
+            TransactionDownloadVerifyError::Cancelled => Verdict::Cancelled,
+            TransactionDownloadVerifyError::Invalid {
+                error,
+                transaction_upgrade,
+                ..
+            } => Verdict::Invalid {
+                error: error.to_string(),
+                state_dependent: error.is_state_dependent(transaction_upgrade.is_some()),
+            },
+        }
+    }
 }
 
 /// Represents a [`Stream`] of download and verification tasks.
@@ -195,7 +247,7 @@ where
                         VerifiedUnminedTx,
                         Vec<transparent::OutPoint>,
                         Option<Height>,
-                        Option<oneshot::Sender<Result<(), BoxError>>>,
+                        VerdictSender,
                     ),
                     Box<(TransactionDownloadVerifyError, UnminedTxId)>,
                 >,
@@ -246,7 +298,7 @@ where
                 VerifiedUnminedTx,
                 Vec<transparent::OutPoint>,
                 Option<Height>,
-                Option<oneshot::Sender<Result<(), BoxError>>>,
+                VerdictSender,
             ),
             Box<(UnminedTxId, TransactionDownloadVerifyError)>,
         >,
@@ -269,7 +321,10 @@ where
             let (result, completed_txid) = match result {
                 Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))) => {
                     let hash = tx.transaction.id;
-                    (Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))), hash)
+                    (
+                        Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))),
+                        hash,
+                    )
                 }
                 Ok(Err(boxed_err)) => {
                     let (e, hash) = *boxed_err;
@@ -347,19 +402,47 @@ where
 
     /// Queue a transaction for download (if needed) and verification.
     ///
-    /// Returns the action taken in response to the queue request.
+    /// Returns a receiver for the transaction's [`Verdict`], or why it was not queued. Failures
+    /// are answered on the receiver by the download task; successes, and storage failures, by
+    /// the mempool once it tries to store the verified transaction.
     ///
     /// When `source` is `Some`, its per-peer cap ([`Self::max_in_flight`]) is enforced;
     /// crawler-driven and locally-pushed transactions pass `None` and are not capped per peer.
     /// Only a [`PeerSource::Legacy`] source is attributed for misbehaviour reports.
-    #[instrument(skip(self, gossiped_tx), fields(txid = %gossiped_tx.id()))]
-    #[allow(clippy::unwrap_in_result)]
     pub fn download_if_needed_and_verify(
         &mut self,
         gossiped_tx: Gossip,
         source: Option<PeerSource>,
-        mut rsp_tx: Option<oneshot::Sender<Result<(), BoxError>>>,
-    ) -> Result<(), MempoolError> {
+    ) -> Result<oneshot::Receiver<Verdict>, MempoolError> {
+        let (rsp_tx, rsp_rx) = VerdictSender::channel();
+        self.queue(gossiped_tx, source, rsp_tx)
+            .map_err(|(error, _rsp_tx)| error)?;
+        Ok(rsp_rx)
+    }
+
+    /// Queue an already-verified transaction for verification again, because the chain grew
+    /// while it was verified, sending its verdict to `rsp_tx`.
+    ///
+    /// The transaction is re-queued without its source, so it doesn't count against the
+    /// source's cap again. If it can't be queued, its verdict is [`Verdict::Dropped`].
+    pub fn requeue(&mut self, gossiped_tx: Gossip, rsp_tx: VerdictSender) {
+        if let Err((error, rsp_tx)) = self.queue(gossiped_tx, None, rsp_tx) {
+            rsp_tx.send(Verdict::Dropped {
+                reason: error.to_string(),
+            });
+        }
+    }
+
+    /// Queue a transaction for download (if needed) and verification, sending its verdict to
+    /// `rsp_tx`. If it can't be queued, returns why, along with `rsp_tx`.
+    #[instrument(skip(self, gossiped_tx, rsp_tx), fields(txid = %gossiped_tx.id()))]
+    #[allow(clippy::unwrap_in_result)]
+    fn queue(
+        &mut self,
+        gossiped_tx: Gossip,
+        source: Option<PeerSource>,
+        rsp_tx: VerdictSender,
+    ) -> Result<(), (MempoolError, VerdictSender)> {
         let txid = gossiped_tx.id();
 
         if self.cancel_handles.contains_key(&txid) {
@@ -372,7 +455,7 @@ where
             metrics::gauge!("mempool.currently.queued.transactions",)
                 .set(self.pending.len() as f64);
 
-            return Err(MempoolError::AlreadyQueued);
+            return Err((MempoolError::AlreadyQueued, rsp_tx));
         }
 
         if self.pending.len() >= MAX_INBOUND_CONCURRENCY {
@@ -385,7 +468,7 @@ where
             metrics::gauge!("mempool.currently.queued.transactions",)
                 .set(self.pending.len() as f64);
 
-            return Err(MempoolError::FullQueue);
+            return Err((MempoolError::FullQueue, rsp_tx));
         }
 
         // Per-peer cap: a single advertising peer cannot saturate the queue
@@ -402,7 +485,7 @@ where
                     "too many transactions queued for this peer: ignored transaction"
                 );
                 metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
-                return Err(MempoolError::FullQueue);
+                return Err((MempoolError::FullQueue, rsp_tx));
             }
         }
 
@@ -523,45 +606,32 @@ where
             let fut = tokio::time::timeout(RATE_LIMIT_DELAY, fut);
 
             // Prefer the cancel handle if both are ready.
-            let result = tokio::select! {
+            //
+            // Failures are answered here. A verified transaction carries `rsp_tx` to the
+            // mempool, which answers once it tries to store it.
+            tokio::select! {
                 biased;
                 _ = &mut cancel_rx => {
                     trace!("task cancelled prior to completion");
                     metrics::counter!("mempool.cancelled.verify.tasks.total").increment(1);
-                    if let Some(rsp_tx) = rsp_tx.take() {
-                        let _ = rsp_tx.send(Err("verification cancelled".into()));
-                    }
+                    rsp_tx.send(Verdict::Cancelled);
 
                     Ok(Err(Box::new((TransactionDownloadVerifyError::Cancelled, txid))))
                 }
-                verification = fut => {
-                    verification
-                        .inspect_err(|_elapsed| {
-                            if let Some(rsp_tx) = rsp_tx.take() {
-                                let _ = rsp_tx.send(Err("timeout waiting for verification result".into()));
-                            }
-                        })
-                        .map_err(|elapsed| (txid, elapsed))
-                        .map(|inner_result| {
-                            match inner_result {
-                                Ok((transaction, spent_mempool_outpoints, tip_height)) => Ok((transaction, spent_mempool_outpoints, tip_height, rsp_tx)),
-                                Err(boxed_err) => {
-                                    let (tx_verifier_error, tx_id) = *boxed_err;
-                                    if let Some(rsp_tx) = rsp_tx.take() {
-                                        let error_msg = format!(
-                                            "failed to validate tx: {tx_id}, error: {tx_verifier_error}"
-                                        );
-                                        let _ = rsp_tx.send(Err(error_msg.into()));
-                                    };
-
-                                    Err(Box::new((tx_verifier_error, tx_id)))
-                                }
-                            }
-                        })
+                verification = fut => match verification {
+                    Err(elapsed) => {
+                        rsp_tx.send(Verdict::Timeout);
+                        Err((txid, elapsed))
+                    }
+                    Ok(Ok((transaction, spent_mempool_outpoints, tip_height))) => {
+                        Ok(Ok((transaction, spent_mempool_outpoints, tip_height, rsp_tx)))
+                    }
+                    Ok(Err(boxed_err)) => {
+                        rsp_tx.send(boxed_err.0.verdict());
+                        Ok(Err(boxed_err))
+                    }
                 },
-            };
-
-            result
+            }
         });
 
         self.pending.push(task);

@@ -1895,7 +1895,7 @@ where
             "mempool service returned more results than expected"
         );
 
-        let queue_result = queue_results
+        let verdict = queue_results
             .pop()
             .expect("there should be exactly one item in Vec")
             .inspect_err(|err| tracing::debug!("sent transaction to mempool: {:?}", &err))
@@ -1903,9 +1903,10 @@ where
             .await
             .map_misc_error()?;
 
-        tracing::debug!("sent transaction to mempool: {:?}", &queue_result);
+        tracing::debug!("sent transaction to mempool: {:?}", &verdict);
 
-        queue_result
+        verdict
+            .into_result()
             .map(|_| SendRawTransactionResponse(transaction_hash))
             // Reference for the legacy error code:
             // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/rawtransaction.cpp#L1290-L1301>

@@ -13,7 +13,7 @@ use zebra_chain::{
     serialization::ZcashDeserializeInto,
     transaction::{Transaction, UnminedTx},
 };
-use zebra_node_services::mempool::{Gossip, Request, Response};
+use zebra_node_services::mempool::{Gossip, Request, Response, Verdict};
 use zebra_state::{BoxError, ReadRequest, ReadResponse};
 use zebra_test::mock_service::MockService;
 
@@ -197,7 +197,7 @@ proptest! {
             let expected_request = Request::Queue(vec![Gossip::Tx(unmined_transaction.clone())]);
             let send_task = tokio::spawn(mempool.clone().oneshot(request));
             let (rsp_tx, rsp_rx) = oneshot::channel();
-            let _ = rsp_tx.send(Ok(()));
+            let _ = rsp_tx.send(Verdict::Accepted);
             let response = Response::Queued(vec![Ok(rsp_rx)]);
 
             mempool
@@ -340,7 +340,7 @@ proptest! {
             let gossip = Gossip::Tx(UnminedTx::from(transaction.clone()));
             let expected_request = Request::Queue(vec![gossip]);
             let (rsp_tx, rsp_rx) = oneshot::channel();
-            let _ = rsp_tx.send(Ok(()));
+            let _ = rsp_tx.send(Verdict::Accepted);
             let response = Response::Queued(vec![Ok(rsp_rx)]);
 
             mempool

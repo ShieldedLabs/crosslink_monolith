@@ -2,7 +2,7 @@
 //!
 //! A service that manages known unmined Zcash transactions.
 
-use std::{collections::HashSet, net::SocketAddr};
+use std::{collections::HashSet, fmt, net::SocketAddr};
 
 use tokio::sync::oneshot;
 use zebra_chain::{
@@ -42,6 +42,129 @@ pub enum PeerSource {
     /// Capped at the mempool's per-STP-peer limit. Never reported to the legacy address book:
     /// the relay decides what to do about the peer from each candidate's verdict.
     Stp([u8; 32]),
+}
+
+/// Why the mempool refused to queue a candidate transaction, before downloading or verifying
+/// it.
+///
+/// # Security
+///
+/// Every refusal depends on our local state: the mempool's contents, its queue, its cached
+/// rejections, and whether it is active. Callers must never penalise a peer for a refusal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueueRefusal {
+    /// The transaction is already in the mempool, or already queued for verification.
+    AlreadyKnown,
+
+    /// The mempool has a cached rejection of this transaction, or of one with the same
+    /// effects, at the current chain tip or chain. `reason` is for logs only: the cache is
+    /// local state, so it is not a verdict on the peer.
+    Rejected {
+        /// Why the transaction was rejected, for logs.
+        reason: String,
+    },
+
+    /// The download and verify queue, or this source's share of it, is full.
+    Full,
+
+    /// The transaction conflicts with one already in the mempool: it spends the same
+    /// transparent outpoint, reveals the same Sprout, Sapling, Orchard or Ironwood nullifier,
+    /// acts on the same bond, or converts the same finalizer's reward bank.
+    ///
+    /// Checked only for full transactions ([`Gossip::Tx`]), before any proof is verified, so a
+    /// spender of one real note can't make us verify many conflicting transactions. Whether
+    /// two transactions conflict depends on which one we saw first, so this is never grounds
+    /// to penalise a peer.
+    SpendConflict,
+
+    /// The mempool is not active yet, because the node is still syncing.
+    Disabled,
+}
+
+impl fmt::Display for QueueRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            QueueRefusal::AlreadyKnown => {
+                f.write_str("transaction is already in the mempool or queued for verification")
+            }
+            QueueRefusal::Rejected { reason } => {
+                write!(f, "transaction was already rejected: {reason}")
+            }
+            QueueRefusal::Full => f.write_str("transaction dropped because the queue is full"),
+            QueueRefusal::SpendConflict => f.write_str(
+                "transaction conflicts with a mempool transaction: it spends the same inputs, \
+                 reveals the same nullifiers, or acts on the same bond or reward bank",
+            ),
+            QueueRefusal::Disabled => {
+                f.write_str("mempool is disabled since synchronization is behind the chain tip")
+            }
+        }
+    }
+}
+
+impl std::error::Error for QueueRefusal {}
+
+/// The outcome of downloading, verifying and storing a queued candidate transaction.
+///
+/// Every queued candidate gets exactly one verdict. A closed channel, which the mempool avoids,
+/// means the same as [`Verdict::Cancelled`].
+///
+/// # Security
+///
+/// Only [`Verdict::Invalid`] with `state_dependent: false` says anything about the peer that
+/// sent the transaction. Every other verdict can happen to an honest peer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Verdict {
+    /// The transaction was verified and added to the mempool.
+    Accepted,
+
+    /// The transaction is already in the mempool, or already in the best chain.
+    AlreadyKnown,
+
+    /// The transaction was not added, for a reason that says nothing about its validity: it
+    /// conflicted with a transaction that reached the mempool first, it was evicted, it has a
+    /// cached rejection, it is non-standard, or we couldn't download it or read our state.
+    Dropped {
+        /// Why the transaction was dropped, for logs.
+        reason: String,
+    },
+
+    /// Downloading or verifying the transaction took too long, which can depend on our load.
+    Timeout,
+
+    /// Verification was cancelled, because the transaction was mined or the mempool was reset
+    /// (by a chain reorganisation or network upgrade). The mempool may retry the transaction
+    /// itself, without sending another verdict.
+    Cancelled,
+
+    /// The transaction failed consensus or policy verification.
+    Invalid {
+        /// The verification error, for logs.
+        error: String,
+
+        /// Whether the failure could depend on our local state: our chain tip, clock, mempool
+        /// contents, network upgrade schedule, or an internal failure. `false` only for
+        /// failures no honest peer can trigger whatever our state is, such as an invalid proof
+        /// or signature.
+        state_dependent: bool,
+    },
+}
+
+impl Verdict {
+    /// Converts this verdict into the success or error result callers that predate
+    /// [`Verdict`] expect: `Ok(())` only for [`Verdict::Accepted`].
+    pub fn into_result(self) -> Result<(), BoxError> {
+        match self {
+            Verdict::Accepted => Ok(()),
+            Verdict::AlreadyKnown => {
+                Err("transaction already exists in mempool or best chain".into())
+            }
+            Verdict::Dropped { reason } => Err(format!("transaction dropped: {reason}").into()),
+            Verdict::Timeout => Err("timeout waiting for verification result".into()),
+            Verdict::Cancelled => Err("verification cancelled".into()),
+            Verdict::Invalid { error, .. } => Err(format!("failed to validate tx: {error}").into()),
+        }
+    }
 }
 
 /// A mempool service request.
@@ -102,6 +225,9 @@ pub enum Request {
     /// crawled transaction IDs.
     ///
     /// The transaction downloader checks for duplicates across IDs and transactions.
+    ///
+    /// Answered with [`Response::Queued`]. Candidates have no source peer, so they are not
+    /// capped per peer and never reported as misbehaviour.
     Queue(Vec<Gossip>),
 
     /// Queue candidate transactions received from a specific peer — either
@@ -111,6 +237,8 @@ pub enum Request {
     /// peer-originated candidate through the same per-peer admission accounting,
     /// so a single peer cannot crowd out honest peers' transaction relay.
     /// See `GHSA-4fc2-h7jh-287c` and `GHSA-m9xx-8rcj-vmgp`.
+    ///
+    /// Answered with [`Response::Queued`], one result per candidate, in order.
     QueueFromPeer {
         /// The candidate transactions received from the peer.
         candidates: Vec<Gossip>,
@@ -193,11 +321,11 @@ pub enum Response {
     /// Returns matching cached rejected [`UnminedTxId`]s from the mempool,
     RejectedTransactionIds(HashSet<UnminedTxId>),
 
-    /// Returns a list of initial queue checks results and a oneshot receiver
-    /// for awaiting download and/or verification results.
+    /// The response to [`Request::Queue`] and [`Request::QueueFromPeer`]: for each candidate,
+    /// either why it was refused at queue time, or a receiver for its [`Verdict`].
     ///
     /// Each result matches the request at the corresponding vector index.
-    Queued(Vec<Result<oneshot::Receiver<Result<(), BoxError>>, BoxError>>),
+    Queued(Vec<Result<oneshot::Receiver<Verdict>, QueueRefusal>>),
 
     /// Confirms that the mempool has checked for recently verified transactions.
     CheckedForVerifiedTransactions,

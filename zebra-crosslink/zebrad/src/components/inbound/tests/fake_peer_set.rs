@@ -35,7 +35,7 @@ use crate::{
         inbound::{downloads::MAX_INBOUND_CONCURRENCY, Inbound, InboundSetupData},
         mempool::{
             gossip_mempool_transaction_id, Config as MempoolConfig, Mempool, MempoolError,
-            SameEffectsChainRejectionError, UnboxMempoolError,
+            SameEffectsChainRejectionError,
         },
         sync::{self, BlockGossipError, SyncStatus, PEER_GOSSIP_DELAY},
     },
@@ -666,8 +666,10 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
             .into_iter()
             .next()
             .unwrap()
-            .unbox_mempool_error(),
-        MempoolError::StorageEffectsChain(SameEffectsChainRejectionError::Expired)
+            .expect_err("expired transaction should be refused"),
+        mempool::QueueRefusal::from(MempoolError::StorageEffectsChain(
+            SameEffectsChainRejectionError::Expired
+        )),
     );
 
     // Test transaction 2 is gossiped, after waiting for the multi-gossip delay
