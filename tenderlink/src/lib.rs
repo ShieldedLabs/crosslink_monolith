@@ -2928,9 +2928,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     // @Todo: prune attesters to only BFT PKs on a current or imminently upcoming roster
 
                     let now: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
-                    if peer_attestation.expiry + 60 <= now {
-                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent peer attestation that will expire too soon (<60s). Current time is {now}, expiry is {}.", peer_attestation.expiry); }
-                        connection_keys_to_disconnect.push(connection_key);
+                    // Expiry is judged by our clock, and senders keep gossiping an attestation
+                    // until 120 s past its expiry, so a stale one is ignored, never a fault.
+                    if peer_attestation.expiry <= now {
+                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_YLW}PROTOCOL{ANSI_RST}: Ignoring expired peer attestation. Current time is {now}, expiry is {}.", peer_attestation.expiry); }
                         continue;
                     }
                     if peer_attestation.issued >= peer_attestation.expiry {
@@ -3115,9 +3116,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     continue;
                 }
                 let now: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
+                // Judged by our clock, which may be skewed: ignore the attestation, keep the peer.
                 if attestation.expiry <= now {
-                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID attestation: Attestation has already expired"); }
-                    connection_keys_to_disconnect.push(connection_key);
+                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_YLW}PROTOCOL{ANSI_RST}: Ignoring ID attestation that has already expired by our clock"); }
                     continue;
                 }
                 if attestation.issued >= attestation.expiry {
