@@ -68,9 +68,8 @@ fn read_id(r: &mut Reader) -> Option<UnminedTxId> {
     }
 }
 
-/// Up to [`MAX_TX_IDS_PER_STATUS`] ids `count` of; `total` is the mempool's size, which may be
-/// larger than what one message lists.
-fn ids_packet<'a>(packet_type: u8, prefix: &[u8], ids: impl IntoIterator<Item = &'a UnminedTxId>, cap: usize) -> Vec<u8> {
+/// `packet_type`, then up to `cap` ids.
+fn ids_packet<'a>(packet_type: u8, ids: impl IntoIterator<Item = &'a UnminedTxId>, cap: usize) -> Vec<u8> {
     let mut body = Vec::new();
     let mut n: u16 = 0;
     for id in ids.into_iter().take(cap) {
@@ -78,7 +77,6 @@ fn ids_packet<'a>(packet_type: u8, prefix: &[u8], ids: impl IntoIterator<Item = 
         n += 1;
     }
     let mut out = vec![packet_type];
-    out.extend_from_slice(prefix);
     out.extend_from_slice(&n.to_le_bytes());
     out.extend(body);
     out
@@ -96,22 +94,47 @@ fn read_ids(r: &mut Reader, cap: usize) -> Option<Vec<UnminedTxId>> {
     Some(ids)
 }
 
-/// `TX_STATUS`: the mempool's size, and up to [`MAX_TX_IDS_PER_STATUS`] of its ids.
-pub fn tx_status_packet<'a>(total: u32, ids: impl IntoIterator<Item = &'a UnminedTxId>) -> Vec<u8> {
-    ids_packet(PACKET_TYPE_TX_STATUS, &total.to_le_bytes(), ids, MAX_TX_IDS_PER_STATUS)
+/// `TX_STATUS`: the mempool's size, and up to [`MAX_TX_IDS_PER_STATUS`] of its ids, each with its
+/// transaction's size in bytes, so a requester can budget what it asks for by bytes.
+pub fn tx_status_packet<'a>(total: u32, entries: impl IntoIterator<Item = (&'a UnminedTxId, u32)>) -> Vec<u8> {
+    let mut body = Vec::new();
+    let mut n: u16 = 0;
+    for (id, size) in entries.into_iter().take(MAX_TX_IDS_PER_STATUS) {
+        write_id(&mut body, id);
+        body.extend_from_slice(&size.to_le_bytes());
+        n += 1;
+    }
+    let mut out = vec![PACKET_TYPE_TX_STATUS];
+    out.extend_from_slice(&total.to_le_bytes());
+    out.extend_from_slice(&n.to_le_bytes());
+    out.extend(body);
+    out
 }
 
-/// `body` is the message after its type byte: `(total, ids)`.
-pub fn read_tx_status(body: &[u8]) -> Option<(u32, Vec<UnminedTxId>)> {
+/// `body` is the message after its type byte: `(total, [(id, size)])`. A listed size over
+/// [`MAX_TX_BYTES`] is malformed: no such transaction can exist.
+pub fn read_tx_status(body: &[u8]) -> Option<(u32, Vec<(UnminedTxId, u32)>)> {
     let mut r = Reader(body);
     let total = r.u32()?;
-    let ids = read_ids(&mut r, MAX_TX_IDS_PER_STATUS)?;
-    r.0.is_empty().then_some((total, ids))
+    let n = usize::from(r.u16()?);
+    if n > MAX_TX_IDS_PER_STATUS {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(n);
+    for _ in 0..n {
+        let id = read_id(&mut r)?;
+        let size = r.u32()?;
+        if size as usize > MAX_TX_BYTES {
+            return None;
+        }
+        entries.push((id, size));
+    }
+    r.0.is_empty().then_some((total, entries))
 }
 
 /// `TX_REQ`: up to [`MAX_TXS_PER_MESSAGE`] ids.
 pub fn tx_req_packet<'a>(ids: impl IntoIterator<Item = &'a UnminedTxId>) -> Vec<u8> {
-    ids_packet(PACKET_TYPE_TX_REQ, &[], ids, MAX_TXS_PER_MESSAGE)
+    ids_packet(PACKET_TYPE_TX_REQ, ids, MAX_TXS_PER_MESSAGE)
 }
 
 pub fn read_tx_req(body: &[u8]) -> Option<Vec<UnminedTxId>> {
@@ -205,11 +228,12 @@ mod tests {
         // Witnessed (v5) ids too, whatever the vectors hold.
         ids.insert(0, UnminedTxId::Witnessed(WtxId { id: transaction::Hash([7; 32]), auth_digest: AuthDigest([8; 32]) }));
 
-        let status = tx_status_packet(9_000, &ids);
+        let entries: Vec<(UnminedTxId, u32)> = ids.iter().enumerate().map(|(i, id)| (*id, i as u32)).collect();
+        let status = tx_status_packet(9_000, entries.iter().map(|(id, size)| (id, *size)));
         assert_eq!(status[0], PACKET_TYPE_TX_STATUS);
         let (total, listed) = read_tx_status(&status[1..]).unwrap();
         assert_eq!(total, 9_000);
-        assert_eq!(listed, ids.iter().take(MAX_TX_IDS_PER_STATUS).copied().collect::<Vec<_>>());
+        assert_eq!(listed, entries.iter().take(MAX_TX_IDS_PER_STATUS).copied().collect::<Vec<_>>());
 
         let req = tx_req_packet(&ids);
         assert_eq!(read_tx_req(&req[1..]).unwrap(), ids.iter().take(MAX_TXS_PER_MESSAGE).copied().collect::<Vec<_>>());
@@ -236,11 +260,14 @@ mod tests {
         let mut bad_kind = tx_req_packet(&ids[..1]);
         bad_kind[3] = 2;
         assert_eq!(read_tx_req(&bad_kind[1..]), None);
-        let status = tx_status_packet(1, &ids[..3]);
+        let status = tx_status_packet(1, ids[..3].iter().map(|id| (id, 100)));
         assert_eq!(read_tx_status(&status[1..status.len() - 1]), None);
         let mut trailing = status.clone();
         trailing.push(0);
         assert_eq!(read_tx_status(&trailing[1..]), None);
+        // A listed size no transaction can have.
+        let oversize = tx_status_packet(1, ids[..1].iter().map(|id| (id, MAX_TX_BYTES as u32 + 1)));
+        assert_eq!(read_tx_status(&oversize[1..]), None);
 
         // A transaction longer than any block is refused (by our cap, and by zebra's decoder,
         // which reads at most MAX_BLOCK_BYTES)...
