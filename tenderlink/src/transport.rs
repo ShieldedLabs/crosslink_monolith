@@ -123,6 +123,13 @@ pub struct TransportLimits {
     pub consumer_inbox_messages: usize,
     /// Bytes one consumer's inbox may hold before new messages for it are dropped.
     pub consumer_inbox_bytes: usize,
+    /// Messages, and bytes, one peer may hold in one consumer's inbox: a peer sending faster
+    /// than the consumer drains loses its own messages, not other peers'.
+    pub consumer_inbox_peer_messages: usize,
+    pub consumer_inbox_peer_bytes: usize,
+    /// Connections a peer opened to us that we keep at once; more are closed as they arrive.
+    /// Connections we dial are not counted. Every per-peer bound is multiplied by this.
+    pub max_inbound_connections: usize,
 }
 
 impl Default for TransportLimits {
@@ -143,6 +150,10 @@ impl Default for TransportLimits {
             // Twice the receive ring, and room for a few whole blocks and decision batches.
             consumer_inbox_messages: 8192,
             consumer_inbox_bytes: 64 << 20,
+            // An eighth of the inbox: eight peers at their cap fill it.
+            consumer_inbox_peer_messages: 1024,
+            consumer_inbox_peer_bytes: 8 << 20,
+            max_inbound_connections: 64,
         }
     }
 }
@@ -189,6 +200,8 @@ pub struct TransportStats {
     pub kills: u64,
     /// Connects not made because their key was killed recently.
     pub redials_skipped: u64,
+    /// Connections a peer opened past `max_inbound_connections`, closed at once.
+    pub inbound_refused: u64,
 }
 
 #[derive(Default)]
@@ -213,6 +226,8 @@ struct PeerState {
     /// The caller no longer wants this session; a disconnect is owed to STP. The peer is
     /// hidden from callers meanwhile and leaves the table once STP accepts the disconnect.
     closing: bool,
+    /// Opened by the peer, not dialled by us; counted against `max_inbound_connections`.
+    inbound: bool,
 }
 
 struct PumpThread {
@@ -351,6 +366,8 @@ struct ConsumerState {
     offered: HashMap<ConnectionKey, [u8; 64]>,
     inbox: VecDeque<(ConnectionKey, Vec<u8>)>,
     inbox_bytes: usize,
+    /// Each peer's (messages, bytes) in `inbox`; emptied with it.
+    inbox_by_peer: HashMap<ConnectionKey, (usize, usize)>,
 }
 
 struct Hub {
@@ -540,21 +557,26 @@ impl Hub {
         for (peer, message) in pull.received_unreliable_messages {
             let Some(&first) = message.first() else { continue };
             let to = &mut self.consumers[Consumer::of_message(first) as usize];
+            let (peer_messages, peer_bytes) = to.inbox_by_peer.get(&peer).copied().unwrap_or_default();
             if !to.attached
                 || to.inbox.len() >= limits.consumer_inbox_messages
                 || to.inbox_bytes + message.len() > limits.consumer_inbox_bytes
+                || peer_messages >= limits.consumer_inbox_peer_messages
+                || peer_bytes + message.len() > limits.consumer_inbox_peer_bytes
             {
                 self.handle.stats.inbox_dropped_messages += 1;
                 self.handle.stats.inbox_dropped_bytes += message.len() as u64;
                 continue;
             }
             to.inbox_bytes += message.len();
+            to.inbox_by_peer.insert(peer, (peer_messages + 1, peer_bytes + message.len()));
             to.inbox.push_back((peer, message));
         }
 
         let mine = &mut self.consumers[me as usize];
         mine.offered = pull.current_connections.iter().map(|(a, hash)| (a.connection_key(), *hash)).collect();
         mine.inbox_bytes = 0;
+        mine.inbox_by_peer.clear();
         NetworkThreadPull {
             current_connections: pull.current_connections,
             received_unreliable_messages: std::mem::take(&mut mine.inbox),
@@ -721,13 +743,31 @@ impl NetworkThreadHandle {
                     address,
                     handshake_hash,
                 } => {
-                    self.connecting.remove(&peer);
+                    // A peer we did not dial opened it. A new key past the inbound cap is closed
+                    // at once (a reconnect of a key we hold is a new session, not a new peer).
+                    let inbound = self.connecting.remove(&peer).is_none();
+                    if inbound && !self.peers.contains_key(&peer) {
+                        let held = self.peers.values().filter(|s| s.inbound && !s.closing).count();
+                        if held >= self.limits.max_inbound_connections {
+                            self.stats.inbound_refused += 1;
+                            self.peers.insert(peer, PeerState {
+                                address,
+                                handshake_hash,
+                                connected_at: now,
+                                outboxes: Default::default(),
+                                closing: true,
+                                inbound,
+                            });
+                            continue;
+                        }
+                    }
                     let state = self.peers.entry(peer).or_insert_with(|| PeerState {
                         address: address.clone(),
                         handshake_hash,
                         connected_at: now,
                         outboxes: Default::default(),
                         closing: false,
+                        inbound,
                     });
                     if state.handshake_hash != handshake_hash {
                         // A new session to the same key: what was queued was for the old one.
@@ -1094,6 +1134,7 @@ mod tests {
                     connected_at: Instant::now(),
                     outboxes: Default::default(),
                     closing: false,
+                    inbound: false,
                 },
             );
         }
@@ -1645,6 +1686,75 @@ mod tests {
         b_bft.tick(NetworkThreadPush::default());
         assert_eq!(b_bft.received.len(), 2);
         assert!(b_base.received.is_empty());
+    }
+
+    fn shared_node_with(limits: TransportLimits) -> (SharedTransport, STPAddress) {
+        let key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b).unwrap();
+        let port = free_port();
+        let address = STPAddress::from(Ipv6Addr::LOCALHOST, port, &key);
+        (SharedTransport::with_limits(vec![key], port, None, (1_000_000, 512 * 1024, 32 << 20), limits), address)
+    }
+
+    #[test]
+    fn a_flooding_peer_fills_only_its_own_share_of_an_inbox() {
+        let limits = TransportLimits { consumer_inbox_peer_messages: 3, ..Default::default() };
+        let (b, b_addr) = shared_node_with(limits);
+        let (flooder, _) = shared_node();
+        let (honest, _) = shared_node();
+        let (mut f_base, mut f_bft) = (Loop::new(&flooder, Consumer::Base), Loop::new(&flooder, Consumer::Bft));
+        let (mut h_base, mut h_bft) = (Loop::new(&honest, Consumer::Base), Loop::new(&honest, Consumer::Bft));
+        let (mut b_base, mut b_bft) = (Loop::new(&b, Consumer::Base), Loop::new(&b, Consumer::Bft));
+        let to_b = b_addr.connection_key();
+
+        f_base.tick(NetworkThreadPush { initiate_connections: vec![b_addr.clone()], ..Default::default() });
+        h_base.tick(NetworkThreadPush { initiate_connections: vec![b_addr.clone()], ..Default::default() });
+        until("both connections", || {
+            for l in [&mut f_base, &mut f_bft, &mut h_base, &mut h_bft] {
+                l.tick(NetworkThreadPush::default());
+            }
+            b_base.tick(NetworkThreadPush::default());
+            !f_bft.connections.is_empty() && !h_bft.connections.is_empty() && b_base.connections.len() == 2
+        });
+        b_bft.tick(NetworkThreadPush::default());
+
+        // b's tenderlink stalls while its base loop drains STP for both.
+        f_bft.tick(NetworkThreadPush { send_unreliable: (0..10).map(|i| (to_b, vec![0x81, i])).collect(), ..Default::default() });
+        h_bft.tick(NetworkThreadPush { send_unreliable: vec![(to_b, vec![0x81, 100])], ..Default::default() });
+        until("the flood past the flooder's share to be dropped", || {
+            b_base.tick(NetworkThreadPush::default());
+            b_base.handle.stats().inbox_dropped_messages == 7
+        });
+        until("the honest message", || {
+            b_base.tick(NetworkThreadPush::default());
+            b_bft.tick(NetworkThreadPush::default());
+            b_bft.received.contains(&vec![0x81, 100])
+        });
+        assert_eq!(b_bft.received.len(), 4);
+    }
+
+    #[test]
+    fn inbound_connections_past_the_cap_are_closed() {
+        let limits = TransportLimits { max_inbound_connections: 1, ..Default::default() };
+        let (b, b_addr) = shared_node_with(limits);
+        let mut b_base = Loop::new(&b, Consumer::Base);
+        let (first, _) = shared_node();
+        let (second, _) = shared_node();
+        let mut first_base = Loop::new(&first, Consumer::Base);
+        let mut second_base = Loop::new(&second, Consumer::Base);
+
+        first_base.tick(NetworkThreadPush { initiate_connections: vec![b_addr.clone()], ..Default::default() });
+        until("the first connection", || {
+            first_base.tick(NetworkThreadPush::default());
+            b_base.tick(NetworkThreadPush::default());
+            b_base.connections.len() == 1
+        });
+        second_base.tick(NetworkThreadPush { initiate_connections: vec![b_addr.clone()], ..Default::default() });
+        until("the second to be refused", || {
+            second_base.tick(NetworkThreadPush::default());
+            b_base.tick(NetworkThreadPush::default());
+            b_base.handle.stats().inbound_refused == 1
+        });
+        assert_eq!(b_base.connections.len(), 1);
     }
 
     #[test]
