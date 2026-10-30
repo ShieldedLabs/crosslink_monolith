@@ -620,12 +620,20 @@ impl TxRelay {
         if let Some(peer) = self.peers.get_mut(&from) {
             peer.submitted = peer.submitted.saturating_sub(1);
         }
+        // A verdict is about the entry that was submitted. One given up on while it was verified
+        // (WANTED_GIVE_UP) may be wanted afresh, and asked for, by the time its verdict lands:
+        // that entry's listers and asks are not this verdict's to change.
+        let submitted = self.wanted.get(&id).is_some_and(|wanted| wanted.submitted);
         match outcome {
             // It reaches the mirror through the change stream, which forgets it as wanted.
             Outcome::Accepted => {}
-            Outcome::NotTaken => self.forget_wanted(id),
+            Outcome::NotTaken => {
+                if submitted {
+                    self.forget_wanted(id);
+                }
+            }
             Outcome::Busy => {
-                let Some(wanted) = self.wanted.get_mut(&id) else { return };
+                let Some(wanted) = self.wanted.get_mut(&id).filter(|_| submitted) else { return };
                 wanted.submitted = false;
                 // The other listers are asked now; `from` again after BUSY_RETRY_AFTER, when it
                 // lists it again (meanwhile it is not a lister).
@@ -1164,6 +1172,30 @@ mod tests {
         assert!(asked(&listed(&mut relay, peer(1), vec![(id(7), 500)], now), peer(1)).is_empty());
         let retry = now + BUSY_RETRY_AFTER;
         assert_eq!(asked(&listed(&mut relay, peer(1), vec![(id(7), 500)], retry), peer(1)), vec![id(7)]);
+    }
+
+    #[test]
+    fn a_late_verdict_on_an_entry_given_up_on_leaves_the_one_wanted_afresh_alone() {
+        for outcome in [Outcome::Busy, Outcome::NotTaken] {
+            let now = Instant::now();
+            let mut relay = TxRelay::default();
+            relay.poll(&[peer(1)], now);
+            listed(&mut relay, peer(1), vec![(id(7), 500)], now);
+            assert_eq!(relay.on_delivered(peer(1), &[(id(7), 500)], now), vec![id(7)]);
+            // Verified for longer than it had left: it is given up on meanwhile, then listed
+            // again and asked for afresh.
+            let later = now + WANTED_GIVE_UP;
+            relay.poll(&[peer(1)], later);
+            assert!(relay.wanted.is_empty());
+            assert_eq!(asked(&listed(&mut relay, peer(1), vec![(id(7), 500)], later), peer(1)), vec![id(7)]);
+            // The first submission's verdict lands: the new entry keeps its lister and its ask.
+            relay.on_outcome(peer(1), id(7), outcome, later);
+            let wanted = &relay.wanted[&id(7)];
+            assert_eq!((wanted.listers.clone(), wanted.sole), (vec![(peer(1), 500)], Some(peer(1))), "{outcome:?}");
+            assert!(wanted.asked.iter().any(|(p, _)| *p == peer(1)));
+            assert!(relay.peers[&peer(1)].listing.contains(&id(7)));
+            assert_eq!(relay.requested_bytes(peer(1)), 500);
+        }
     }
 
     #[test]
