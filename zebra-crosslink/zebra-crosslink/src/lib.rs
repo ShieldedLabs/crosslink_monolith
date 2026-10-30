@@ -182,7 +182,8 @@ pub mod config {
         pub public_address: Option<String>,
         /// Use the public IP instead of the generated seed
         pub explicit_bft_key_seed: Option<String>,
-        /// List of public IP addresses for peers, in the same format as `public_address`.
+        /// Ignored (a warning is logged if set). BFT runs over the node's own connections, on its
+        /// key and port, seeded from `state.network_initial_peers`. Kept so older configs load.
         pub bft_peers: Vec<String>,
         /// Disable the headless wallet.
         pub disable_the_headless_wallet: bool,

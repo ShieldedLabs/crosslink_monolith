@@ -339,9 +339,9 @@ struct ConsumerState {
     generation: u64,
     attached: bool,
     wanted: Vec<(STPAddress, [u8; 64])>,
-    /// The connections the last service handed this consumer. One it no longer wants is one
-    /// it killed.
-    offered: HashSet<ConnectionKey>,
+    /// The sessions (key, handshake hash) the last service handed this consumer. One it no
+    /// longer wants is one it killed.
+    offered: HashMap<ConnectionKey, [u8; 64]>,
     inbox: VecDeque<(ConnectionKey, Vec<u8>)>,
     inbox_bytes: usize,
 }
@@ -425,7 +425,8 @@ impl ConsumerHandle {
     ///   not enough to close it. Leaving out a connection this consumer was handed last time is
     ///   a kill, which is how both protocols drop a peer: it closes the connection for every
     ///   consumer, and our re-dials of that key back off (1 s doubling to 64 s), so a peer one
-    ///   protocol keeps killing is not re-dialled at once by the other.
+    ///   protocol keeps killing is not re-dialled at once by the other. The peer may still
+    ///   dial us again at once: the backoff covers only our own dials.
     ///
     /// `None` if the network thread has stopped or this handle was replaced.
     pub fn service(&mut self, push: NetworkThreadPush) -> Option<NetworkThreadPull> {
@@ -465,7 +466,15 @@ impl Hub {
         let NetworkThreadPush { mut initiate_connections, wanted_connections, send_unreliable, send_bulk, send_bft_live } = push;
 
         let wanted: HashSet<ConnectionKey> = wanted_connections.iter().map(|(a, _)| a.connection_key()).collect();
-        let killed: Vec<ConnectionKey> = self.consumers[me as usize].offered.iter().filter(|k| !wanted.contains(k)).copied().collect();
+        // Only the session the consumer was handed: if the key has since reconnected, the
+        // consumer has not seen the new session and cannot have meant to kill it.
+        let peers = &self.handle.peers;
+        let killed: Vec<ConnectionKey> = self.consumers[me as usize]
+            .offered
+            .iter()
+            .filter(|(key, hash)| !wanted.contains(key) && peers.get(key).is_some_and(|s| s.handshake_hash == **hash))
+            .map(|(key, _)| *key)
+            .collect();
         if !killed.is_empty() {
             // Bounded by the peers killed within the last two backoff maxima.
             self.redial.retain(|_, r| now < r.retry_at + REDIAL_BACKOFF_MAX);
@@ -514,7 +523,7 @@ impl Hub {
         }
 
         let mine = &mut self.consumers[me as usize];
-        mine.offered = pull.current_connections.iter().map(|(a, _)| a.connection_key()).collect();
+        mine.offered = pull.current_connections.iter().map(|(a, hash)| (a.connection_key(), *hash)).collect();
         mine.inbox_bytes = 0;
         NetworkThreadPull {
             current_connections: pull.current_connections,
@@ -1574,6 +1583,60 @@ mod tests {
             b_base.handle.stats().inbox_dropped_messages == 1
         });
         assert_eq!(b_base.received, vec![vec![0x01, 1]]);
+    }
+
+    #[test]
+    fn a_stalled_consumers_inbox_stays_bounded_while_the_other_services() {
+        let limits = TransportLimits { consumer_inbox_messages: 2, ..Default::default() };
+        let key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b).unwrap();
+        let port = free_port();
+        let b_addr = STPAddress::from(Ipv6Addr::LOCALHOST, port, &key);
+        let b = SharedTransport::with_limits(vec![key], port, None, (1_000_000, 512 * 1024, 32 << 20), limits);
+        let (a, _) = shared_node();
+        let (mut a_base, mut a_bft) = (Loop::new(&a, Consumer::Base), Loop::new(&a, Consumer::Bft));
+        let (mut b_base, mut b_bft) = (Loop::new(&b, Consumer::Base), Loop::new(&b, Consumer::Bft));
+        let to_b = b_addr.connection_key();
+
+        a_base.tick(NetworkThreadPush { initiate_connections: vec![b_addr.clone()], ..Default::default() });
+        until("the connection", || {
+            a_base.tick(NetworkThreadPush::default());
+            a_bft.tick(NetworkThreadPush::default());
+            b_base.tick(NetworkThreadPush::default());
+            !a_bft.connections.is_empty() && !b_base.connections.is_empty()
+        });
+        b_bft.tick(NetworkThreadPush::default());
+
+        // b's tenderlink stalls; its base loop keeps servicing, and so drains STP for both.
+        a_bft.tick(NetworkThreadPush { send_unreliable: (0..5).map(|i| (to_b, vec![0x81, i])).collect(), ..Default::default() });
+        until("the BFT messages beyond the inbox to be dropped", || {
+            b_base.tick(NetworkThreadPush::default());
+            b_base.handle.stats().inbox_dropped_messages == 3
+        });
+        b_bft.tick(NetworkThreadPush::default());
+        assert_eq!(b_bft.received.len(), 2);
+        assert!(b_base.received.is_empty());
+    }
+
+    #[test]
+    fn a_consumer_attached_late_does_not_kill_what_it_was_never_handed() {
+        let (a, _) = shared_node();
+        let (b, b_addr) = shared_node();
+        let mut a_base = Loop::new(&a, Consumer::Base);
+        let mut b_base = Loop::new(&b, Consumer::Base);
+        a_base.tick(NetworkThreadPush { initiate_connections: vec![b_addr.clone()], ..Default::default() });
+        until("the connection", || {
+            a_base.tick(NetworkThreadPush::default());
+            b_base.tick(NetworkThreadPush::default());
+            !a_base.connections.is_empty() && !b_base.connections.is_empty()
+        });
+
+        // Tenderlink starts later: its first service lists nothing, which is no kill.
+        let mut a_bft = Loop::new(&a, Consumer::Bft);
+        a_bft.tick(NetworkThreadPush::default());
+        a_base.tick(NetworkThreadPush::default());
+        assert_eq!(a_bft.connections.len(), 1);
+        assert_eq!(a_base.connections.len(), 1);
+        assert_eq!(a_base.handle.stats().kills, 0);
     }
 
     #[test]

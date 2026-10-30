@@ -2156,8 +2156,8 @@ pub fn sync(
     // requests to the same peer are not queued behind them.
     let mut bulk_packets_to_send: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
     let mut synthetic_peers: Vec<SyntheticPeerLink> = Vec::new();
-    // Connections that have had our HELLO.
-    let mut hello_sent: HashSet<ConnectionKey> = HashSet::new();
+    // Sessions (key, handshake hash) that have had our HELLO.
+    let mut hello_sent: HashSet<(ConnectionKey, [u8; 64])> = HashSet::new();
 
     // Parse and connect to initial peers
     let mut initial_peer_addresses: Vec<STPAddress> = Vec::new();
@@ -3276,14 +3276,19 @@ pub fn sync(
             }
         }
 
-        // Every connection hears our version and capabilities, once. (STP does not keep order,
-        // so it is not necessarily the first message a peer gets from us.)
+        // Every session hears our version and capabilities, once. (STP does not keep order, so
+        // it is not necessarily the first message a peer gets from us.) Synthetic peers sit
+        // above the transport, which would drop a message to them.
         {
-            let live: HashSet<ConnectionKey> = current_connections.iter().map(|(a, _)| a.connection_key()).collect();
-            hello_sent.retain(|key| live.contains(key));
-            for key in live {
-                if hello_sent.insert(key) {
-                    packets_to_send.push((key, hello_packet()));
+            let live: HashSet<(ConnectionKey, [u8; 64])> = current_connections
+                .iter()
+                .filter(|(addr, _)| !synthetic_peers.iter().any(|p| p.address == *addr))
+                .map(|(a, hash)| (a.connection_key(), *hash))
+                .collect();
+            hello_sent.retain(|session| live.contains(session));
+            for session in live {
+                if hello_sent.insert(session) {
+                    packets_to_send.push((session.0, hello_packet()));
                 }
             }
         }

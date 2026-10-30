@@ -9,7 +9,6 @@ checkpoint_sync = true
 [crosslink]
 public_address = "127.0.0.1:12301"
 explicit_bft_key_seed = "127.0.0.1:12301"
-bft_peers = ["127.0.0.1:12301", "127.0.0.1:12302"]
 disable_shipped_slashforks = true
 
 [mempool]

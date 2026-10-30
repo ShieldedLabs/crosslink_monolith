@@ -289,14 +289,9 @@ impl ZebradConfig {
         };
 
         Self {
-            crosslink: zebra_crosslink::config::Config {
-                bft_peers: vec![
-                    "45.63.75.9:12301".to_owned(),
-                    "70.34.220.94:12301".to_owned(),
-                    "64.177.44.176:12301".to_owned(),
-                ],
-                ..Default::default()
-            },
+            // No bft_peers: BFT runs over the node's own connections, seeded from
+            // state.network_initial_peers below.
+            crosslink: zebra_crosslink::config::Config::default(),
 
             state: zebra_state::config::Config {
                 network_initial_peers: vec![

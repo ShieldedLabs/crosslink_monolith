@@ -421,8 +421,9 @@ pub(super) fn bft_block_from_canonical_bytes(bytes: &[u8]) -> Option<BftBlock> {
 /// and who to connect to. The decided chain is persisted in the finalized database.
 pub struct BftLaunch {
     pub signing_key: ed25519_zebra::SigningKey,
-    /// `ip:port`. Only the IP is used once `network` is set: tenderlink then speaks with the
-    /// node's key, on the node's port.
+    /// `ip:port`. Once `network` is set, tenderlink speaks with the node's key on the node's
+    /// port, and this matters only in that it must parse: tenderlink uses its endpoint's port
+    /// alone.
     pub public_address: String,
     /// `bft_peers`. Unused once `network` is set, whose seeds are the node's initial peers.
     pub peer_addresses: Vec<String>,

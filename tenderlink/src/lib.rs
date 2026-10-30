@@ -2783,7 +2783,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             false
         });
         let wanted_connections = current_connections.iter().filter(|(address, _)| !synthetic_bft_peers.iter().any(|p| p.address == *address)).cloned().collect();
-        let resp = service_connections(&mut network_thread_handle, NetworkThreadPush { initiate_connections, wanted_connections, send_unreliable: messages_to_send, ..Default::default() }).unwrap_or_default();
+        // `None` (the transport stopped, or this handle was replaced): keep our connection list,
+        // as the transport asks. An empty one would be read, on a later answer, as killing them all.
+        let resp = service_connections(&mut network_thread_handle, NetworkThreadPush { initiate_connections, wanted_connections, send_unreliable: messages_to_send, ..Default::default() })
+            .unwrap_or_else(|| transport::NetworkThreadPull { current_connections: current_connections.clone(), ..Default::default() });
         current_connections = resp.current_connections;
         initiate_connections = Vec::new();
         let mut messages_received = resp.received_unreliable_messages;
