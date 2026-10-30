@@ -4,20 +4,26 @@
 //! bounds below can be tested without sockets or a mempool. The sync loop carries the [`Out`]s
 //! to the transport and to the mempool bridge, and feeds the answers back in.
 //!
-//! Relay is pull-based (no pushes, so nothing marks a transaction's origin). Every bound comes
+//! Relay is pull-based (no pushes, so nothing marks a transaction's origin). The bounds come
 //! from the relay's security review:
 //! - what we ask a peer for is budgeted by bytes ([`MAX_REQUESTED_BYTES_PER_PEER`]) and count
-//!   ([`MAX_IN_FLIGHT_PER_PEER`]);
-//! - a wanted transaction remembers up to [`MAX_LISTERS`] peers that listed it, and is asked
-//!   of all of them once the first ask goes unanswered for [`REREQUEST_AFTER`], so a peer
-//!   that lists ids it never delivers cannot hold a transaction back; it gets a strike;
-//! - a peer's strikes back it off (it is neither heard nor asked), 1 s doubling to 64 s. A
-//!   strike is only for what no honest peer does whatever our state: failing to deliver what
-//!   it listed, or sending a transaction that fails verification for a reason independent of
-//!   our state. Malformed bytes are the transport's to kill for, not ours.
-//! - what we serve a peer is limited by a token bucket ([`SERVE_BURST_BYTES`],
-//!   [`SERVE_BYTES_PER_SEC`]) and the same id is not served to it again within
-//!   [`SERVE_REPEAT_SUPPRESS`].
+//!   ([`MAX_IN_FLIGHT_PER_PEER`]), and asks refill every poll;
+//! - one peer can make at most [`MAX_SOLE_LISTED_PER_PEER`] ids wanted that nobody else lists,
+//!   and its statuses are rate limited, so it cannot fill [`MAX_WANTED`] and crowd out everyone
+//!   else's transactions;
+//! - a wanted transaction keeps up to [`MAX_LISTERS`] listers, and is asked of the others when
+//!   the ask goes unanswered for [`REREQUEST_AFTER`], and of every peer when none are left, so
+//!   listing ids and never delivering them cannot hold a transaction back. Not delivering is no
+//!   fault (a transaction can be mined or evicted meanwhile, and STP loses packets): it only
+//!   demotes the peer, which is then asked last and loses its place to a better lister;
+//! - strikes back a peer off (it is not asked), 1 s doubling to 64 s, forgotten after
+//!   [`STRIKES_FORGOTTEN_AFTER`] without one. A strike is only for what no honest peer does
+//!   whatever our state: a body larger than the size it listed, or a transaction that fails
+//!   verification for a state-independent reason. Malformed bytes are the transport's to kill
+//!   for, never ours;
+//! - what we serve is limited by a byte bucket per peer, reserved when a request is accepted,
+//!   requests themselves are rate limited, and an id is not served to the same peer again
+//!   within [`SERVE_REPEAT_SUPPRESS`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -31,33 +37,47 @@ pub(super) const MAX_REQUESTED_BYTES_PER_PEER: u64 = 2 << 20;
 pub(super) const MAX_IN_FLIGHT_PER_PEER: usize = 32;
 pub(super) const MAX_LISTERS: usize = 8;
 pub(super) const REREQUEST_AFTER: Duration = Duration::from_secs(4);
-/// A wanted transaction no lister delivers is forgotten after this; a later listing starts over.
+/// A wanted transaction nobody delivers is forgotten after this; a later listing starts over.
 pub(super) const WANTED_GIVE_UP: Duration = Duration::from_secs(60);
-/// Wanted transactions held at most: past it, new listings are ignored until some resolve.
-pub(super) const MAX_WANTED: usize = 8192;
-/// Ids queued to ask one peer at most; past it the oldest are dropped from its queue.
-const MAX_TO_ASK_PER_PEER: usize = 1024;
+/// Wanted transactions held at most (about 200 bytes each).
+pub(super) const MAX_WANTED: usize = 32768;
+/// Wanted ids one peer may be the only lister of.
+pub(super) const MAX_SOLE_LISTED_PER_PEER: usize = 512;
+/// Ids queued to ask one peer at most (a whole mempool's listing); past it the oldest go.
+const MAX_TO_ASK_PER_PEER: usize = 8192;
 pub(super) const STATUS_HEARTBEAT: Duration = Duration::from_secs(30);
 pub(super) const STATUS_MIN_GAP: Duration = Duration::from_millis(250);
 /// A change waits 100..500 ms before it is listed, so a burst goes out as one status.
 const STATUS_BATCH_MIN: Duration = Duration::from_millis(100);
 const STATUS_BATCH_SPREAD_MS: u64 = 400;
+/// Statuses heard from one peer: a burst big enough for a whole `MEMPOOL_REQ` answer, then
+/// as often as an honest peer sends them.
+const STATUSES_IN_BURST: u64 = 40;
+const STATUSES_IN_PER_SEC: u64 = 4;
+/// `TX_REQ`s heard from one peer.
+const TX_REQS_IN_BURST: u64 = 16;
+const TX_REQS_IN_PER_SEC: u64 = 4;
 pub(super) const MEMPOOL_REQ_ANSWER_INTERVAL: Duration = Duration::from_secs(600);
 pub(super) const SERVE_BURST_BYTES: u64 = 2 << 20;
 pub(super) const SERVE_BYTES_PER_SEC: u64 = 256 << 10;
 pub(super) const SERVE_REPEAT_SUPPRESS: Duration = Duration::from_secs(10);
+/// Ids remembered as served to one peer at most; past it the oldest are forgotten.
+const MAX_SERVED_REMEMBERED: usize = 4096;
 const STRIKE_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const STRIKE_BACKOFF_MAX: Duration = Duration::from_secs(64);
+pub(super) const STRIKES_FORGOTTEN_AFTER: Duration = Duration::from_secs(600);
+/// A peer's count of undelivered asks halves this often.
+const DELIVERY_FAILURES_HALVE_EVERY: Duration = Duration::from_secs(300);
 
 /// What the sync loop does for the relay.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Out {
     /// Send on the peer's control channel (`bulk: false`) or bulk channel.
     Send { to: ConnectionKey, packet: Vec<u8>, bulk: bool },
-    /// Ask the mempool which of `entries` it already holds or has rejected; answer with
-    /// [`TxRelay::on_filtered`].
+    /// Ask the mempool which of `entries` it neither holds, nor has rejected, nor is verifying;
+    /// answer with [`TxRelay::on_filtered`]. May be dropped if the bridge is busy.
     Filter { from: ConnectionKey, entries: Vec<(UnminedTxId, u32)> },
-    /// Fetch these from the mempool and serve them; answer with [`TxRelay::on_bodies`].
+    /// Fetch these from the mempool and send them; their bytes are already reserved.
     Fetch { to: ConnectionKey, ids: Vec<UnminedTxId> },
 }
 
@@ -67,32 +87,72 @@ pub(super) enum Outcome {
     /// Accepted, or already known: it will show up in (or is already in) our listing.
     Accepted,
     /// Refused for a reason that may be ours (our tip, mempool contents, a full queue, a
-    /// timeout): no fault of the peer; another lister may be asked later.
+    /// timeout, the mempool disabled): no fault of the peer.
     NotTaken,
     /// Fails verification whatever our state (a bad proof or signature): the peer is struck.
     Invalid,
+}
+
+/// A token bucket, in thousandths of a token.
+#[derive(Debug)]
+struct Bucket {
+    milli: u64,
+    at: Instant,
+}
+
+impl Bucket {
+    fn full(burst: u64, now: Instant) -> Self {
+        Self { milli: burst * 1000, at: now }
+    }
+    fn refill(&mut self, now: Instant, per_sec: u64, burst: u64) {
+        let ms = now.saturating_duration_since(self.at).as_millis() as u64;
+        // per_sec tokens a second is per_sec thousandths a millisecond.
+        self.milli = self.milli.saturating_add(ms.saturating_mul(per_sec)).min(burst * 1000);
+        self.at = now;
+    }
+    fn take(&mut self, cost: u64, now: Instant, per_sec: u64, burst: u64) -> bool {
+        self.refill(now, per_sec, burst);
+        if self.milli < cost * 1000 {
+            return false;
+        }
+        self.milli -= cost * 1000;
+        true
+    }
+    #[cfg(test)]
+    fn tokens(&self) -> u64 {
+        self.milli / 1000
+    }
 }
 
 #[derive(Debug)]
 struct Wanted {
     size: u32,
     listers: Vec<ConnectionKey>,
-    /// When we last asked each peer we asked.
+    /// The lister that made it wanted, while it is the only one (counted against its cap).
+    sole: Option<ConnectionKey>,
+    /// When we asked each peer we are waiting on.
     asked: Vec<(ConnectionKey, Instant)>,
     first_seen: Instant,
     /// Delivered and handed to the mempool; waiting for its verdict.
     submitted: bool,
+    /// Asked of every live peer, its listers having all failed to deliver.
+    asked_everyone: bool,
 }
 
 #[derive(Debug, Default)]
 struct Strikes {
     count: u32,
+    last: Option<Instant>,
     until: Option<Instant>,
 }
 
 impl Strikes {
     fn strike(&mut self, now: Instant) {
+        if self.last.is_some_and(|last| now.saturating_duration_since(last) >= STRIKES_FORGOTTEN_AFTER) {
+            self.count = 0;
+        }
         self.count = self.count.saturating_add(1);
+        self.last = Some(now);
         let backoff = STRIKE_BACKOFF_MIN.saturating_mul(1 << (self.count - 1).min(6)).min(STRIKE_BACKOFF_MAX);
         self.until = Some(now + backoff);
     }
@@ -101,23 +161,46 @@ impl Strikes {
     }
 }
 
+/// Undelivered asks, halving every [`DELIVERY_FAILURES_HALVE_EVERY`]: orders whom to ask.
+#[derive(Debug)]
+struct DeliveryFailures {
+    count: u32,
+    halved_at: Instant,
+}
+
+impl DeliveryFailures {
+    fn current(&mut self, now: Instant) -> u32 {
+        let halvings = now.saturating_duration_since(self.halved_at).as_secs() / DELIVERY_FAILURES_HALVE_EVERY.as_secs();
+        if halvings > 0 {
+            self.count >>= halvings.min(31);
+            self.halved_at = now;
+        }
+        self.count
+    }
+}
+
 #[derive(Debug)]
 struct PeerTx {
     /// Ids asked of this peer and not yet delivered, with their listed size.
     requested: HashMap<UnminedTxId, u32>,
-    /// Wanted ids this peer listed that it has not been asked for yet, oldest first. Stale
-    /// entries (resolved, or asked of someone else) are skipped when popped.
-    to_ask: VecDeque<UnminedTxId>,
     requested_bytes: u64,
+    /// Wanted ids this peer listed and has not been asked for, oldest first. Stale entries
+    /// (resolved, or asked of someone else) are skipped when popped.
+    to_ask: VecDeque<UnminedTxId>,
+    /// Wanted ids only this peer lists.
+    sole_listed: usize,
+    statuses_in: Bucket,
+    tx_reqs_in: Bucket,
     /// The listing generation last sent, and when; and when the next is due after a change.
     sent_generation: u64,
     last_status: Option<Instant>,
     status_due: Option<Instant>,
-    /// When we last served each id to this peer.
+    serve: Bucket,
+    /// What we served it, and when, oldest first.
     served: HashMap<UnminedTxId, Instant>,
-    serve_tokens: u64,
-    serve_refilled: Instant,
+    served_order: VecDeque<UnminedTxId>,
     strikes: Strikes,
+    delivery_failures: DeliveryFailures,
     mempool_req_sent: bool,
     mempool_req_answered: Option<Instant>,
 }
@@ -126,25 +209,36 @@ impl PeerTx {
     fn new(now: Instant) -> Self {
         Self {
             requested: HashMap::new(),
-            to_ask: VecDeque::new(),
             requested_bytes: 0,
+            to_ask: VecDeque::new(),
+            sole_listed: 0,
+            statuses_in: Bucket::full(STATUSES_IN_BURST, now),
+            tx_reqs_in: Bucket::full(TX_REQS_IN_BURST, now),
             sent_generation: 0,
             last_status: None,
             status_due: None,
+            serve: Bucket::full(SERVE_BURST_BYTES, now),
             served: HashMap::new(),
-            serve_tokens: SERVE_BURST_BYTES,
-            serve_refilled: now,
+            served_order: VecDeque::new(),
             strikes: Strikes::default(),
+            delivery_failures: DeliveryFailures { count: 0, halved_at: now },
             mempool_req_sent: false,
             mempool_req_answered: None,
         }
+    }
+
+    fn queue_ask(&mut self, id: UnminedTxId) {
+        if self.to_ask.len() >= MAX_TO_ASK_PER_PEER {
+            self.to_ask.pop_front();
+        }
+        self.to_ask.push_back(id);
     }
 }
 
 #[derive(Debug, Default)]
 pub(super) struct TxRelay {
-    /// Our mempool's ids and sizes (kept from its change stream), and the order they arrived
-    /// in, newest last, for listing the most recent ones.
+    /// Our mempool's ids and serialized sizes (kept from its change stream), and the order they
+    /// arrived in, newest last, for listing the most recent ones.
     mirror: HashMap<UnminedTxId, u32>,
     arrival: VecDeque<UnminedTxId>,
     generation: u64,
@@ -154,14 +248,9 @@ pub(super) struct TxRelay {
     /// Asks in the order they were made, to find the overdue ones in order. Stale entries
     /// (delivered, or re-asked) are skipped when popped.
     asks: VecDeque<(Instant, UnminedTxId)>,
+    /// (peer, id): a better lister to ask at once, alongside doubtful outstanding asks.
+    asks_jump: HashSet<(ConnectionKey, UnminedTxId)>,
     peers: HashMap<ConnectionKey, PeerTx>,
-}
-
-fn queue_ask(peer: &mut PeerTx, id: UnminedTxId) {
-    if peer.to_ask.len() >= MAX_TO_ASK_PER_PEER {
-        peer.to_ask.pop_front();
-    }
-    peer.to_ask.push_back(id);
 }
 
 /// 100..500 ms, spread by peer and generation so peers do not all hear a change at once.
@@ -174,13 +263,10 @@ fn batch_delay(peer: ConnectionKey, generation: u64) -> Duration {
 }
 
 impl TxRelay {
-    fn peer(&mut self, key: ConnectionKey, now: Instant) -> &mut PeerTx {
-        self.peers.entry(key).or_insert_with(|| PeerTx::new(now))
-    }
-
     // ---- our mempool ----
 
-    /// Transactions entered our mempool. Ones we wanted are no longer wanted.
+    /// Transactions entered our mempool, with their serialized sizes. Ones we wanted are no
+    /// longer wanted.
     pub fn on_added(&mut self, entries: impl IntoIterator<Item = (UnminedTxId, u32)>) {
         for (id, size) in entries {
             if self.mirror.insert(id, size).is_none() {
@@ -214,16 +300,14 @@ impl TxRelay {
         self.on_added(entries);
     }
 
-    fn listing(&self) -> impl Iterator<Item = (&UnminedTxId, u32)> {
-        self.arrival.iter().rev().filter_map(|id| self.mirror.get(id).map(|size| (id, *size)))
-    }
-
     // ---- what peers list ----
 
-    /// A peer's `TX_STATUS`. Ids we neither hold nor want are passed to the mempool to drop
-    /// what it holds or has rejected; ids we already want gain the peer as a lister.
+    /// A peer's `TX_STATUS`, if its rate allows. Ids we neither hold nor want go to the mempool
+    /// to drop what it holds, rejected or is verifying; ids we already want gain the peer as a
+    /// lister. A peer backing off is still heard, but not asked.
     pub fn on_status(&mut self, from: ConnectionKey, entries: Vec<(UnminedTxId, u32)>, now: Instant) -> Vec<Out> {
-        if self.peer(from, now).strikes.backing_off(now) {
+        let peer = self.peers.entry(from).or_insert_with(|| PeerTx::new(now));
+        if !peer.statuses_in.take(1, now, STATUSES_IN_PER_SEC, STATUSES_IN_BURST) {
             return Vec::new();
         }
         let mut new = Vec::new();
@@ -231,57 +315,91 @@ impl TxRelay {
             if self.mirror.contains_key(&id) {
                 continue;
             }
-            match self.wanted.get_mut(&id) {
-                Some(wanted) => {
-                    if wanted.listers.len() < MAX_LISTERS && !wanted.listers.contains(&from) {
-                        wanted.listers.push(from);
-                        queue_ask(self.peers.get_mut(&from).expect("made above"), id);
-                    }
-                }
-                None => new.push((id, size)),
+            if self.wanted.contains_key(&id) {
+                self.add_lister(id, from, now);
+            } else {
+                new.push((id, size));
             }
         }
         let mut out = Vec::new();
         if !new.is_empty() {
             out.push(Out::Filter { from, entries: new });
         }
-        out.extend(self.request_from(from, now));
+        out.extend(self.ask(from, false, now));
         out
     }
 
-    /// The mempool's answer to [`Out::Filter`]: `keep` are the entries it neither holds nor
-    /// has rejected. They become wanted, listed by `from`, and are asked of it.
+    /// `peer` lists `id`, which we want. A lister with no failed deliveries displaces the worst
+    /// one when the list is full, and is asked at once if every outstanding ask is to a peer
+    /// that has failed to deliver before.
+    fn add_lister(&mut self, id: UnminedTxId, from: ConnectionKey, now: Instant) {
+        let Some(wanted) = self.wanted.get_mut(&id) else { return };
+        if wanted.listers.contains(&from) {
+            return;
+        }
+        let peers = &mut self.peers;
+        let mut failures = |p: &ConnectionKey| peers.get_mut(p).map_or(u32::MAX, |peer| peer.delivery_failures.current(now));
+        let newcomer_clean = failures(&from) == 0;
+        if wanted.listers.len() >= MAX_LISTERS {
+            if !newcomer_clean {
+                return;
+            }
+            // Displace the lister with the most failed deliveries, unless it is being waited on.
+            let mut worst: Option<(usize, u32)> = None;
+            for (i, p) in wanted.listers.iter().enumerate() {
+                let f = failures(p);
+                if f > 0 && !wanted.asked.iter().any(|(asked, _)| asked == p) && worst.is_none_or(|(_, w)| f > w) {
+                    worst = Some((i, f));
+                }
+            }
+            let Some((i, _)) = worst else { return };
+            wanted.listers.swap_remove(i);
+        }
+        let jump_queue = newcomer_clean && !wanted.asked.is_empty() && wanted.asked.iter().all(|(p, _)| failures(p) > 0);
+        wanted.listers.push(from);
+        let sole = wanted.sole.take();
+        if let Some(peer) = sole.and_then(|sole| self.peers.get_mut(&sole)) {
+            peer.sole_listed = peer.sole_listed.saturating_sub(1);
+        }
+        let peer = self.peers.get_mut(&from).expect("made by on_status");
+        if jump_queue {
+            // Asked alongside the doubtful ones now, not after their asks run out.
+            peer.to_ask.push_front(id);
+            self.asks_jump.insert((from, id));
+        } else {
+            peer.queue_ask(id);
+        }
+    }
+
+    /// The mempool's answer to [`Out::Filter`]: `keep` are the entries it neither holds, nor
+    /// has rejected, nor is verifying. They become wanted, listed by `from`, within its cap.
     pub fn on_filtered(&mut self, from: ConnectionKey, keep: Vec<(UnminedTxId, u32)>, now: Instant) -> Vec<Out> {
         if !self.peers.contains_key(&from) {
             return Vec::new();
         }
         for (id, size) in keep {
-            if self.wanted.len() >= MAX_WANTED {
-                break;
-            }
             if self.mirror.contains_key(&id) {
                 continue;
             }
-            let order = &mut self.wanted_order;
-            let wanted = self.wanted.entry(id).or_insert_with(|| {
-                order.push_back((now, id));
-                Wanted { size, listers: Vec::new(), asked: Vec::new(), first_seen: now, submitted: false }
-            });
-            if wanted.listers.len() < MAX_LISTERS && !wanted.listers.contains(&from) {
-                wanted.listers.push(from);
-                queue_ask(self.peers.get_mut(&from).expect("checked above"), id);
+            if self.wanted.contains_key(&id) {
+                self.add_lister(id, from, now);
+                continue;
             }
+            let peer = self.peers.get_mut(&from).expect("checked above");
+            if self.wanted.len() >= MAX_WANTED || peer.sole_listed >= MAX_SOLE_LISTED_PER_PEER {
+                continue;
+            }
+            peer.sole_listed += 1;
+            peer.queue_ask(id);
+            self.wanted_order.push_back((now, id));
+            self.wanted.insert(id, Wanted { size, listers: vec![from], sole: Some(from), asked: Vec::new(), first_seen: now, submitted: false, asked_everyone: false });
         }
-        self.request_from(from, now)
+        self.ask(from, false, now)
     }
 
-    /// Ask `peer` for what it listed and nobody has been asked for, within its budgets. With
-    /// `re_request`, ids already asked of other listers in this round are asked of it too.
-    /// Only the peer's own queue is walked, and only as far as it asks.
-    fn request_from(&mut self, peer_key: ConnectionKey, now: Instant) -> Vec<Out> {
-        self.ask(peer_key, false, now)
-    }
-
+    /// Ask `peer` for what it listed, within its budgets. Unless `re_request`, an id already
+    /// asked of another peer waits (it comes back if that ask goes unanswered). Only the peer's
+    /// own queue is walked, and only as far as it asks.
     fn ask(&mut self, peer_key: ConnectionKey, re_request: bool, now: Instant) -> Vec<Out> {
         let Some(peer) = self.peers.get_mut(&peer_key) else { return Vec::new() };
         if peer.strikes.backing_off(now) {
@@ -294,13 +412,15 @@ impl TxRelay {
             if wanted.submitted || wanted.asked.iter().any(|(p, _)| *p == peer_key) || !wanted.listers.contains(&peer_key) {
                 continue;
             }
-            // Asked of another lister and not overdue: not ours to ask. It comes back to this
-            // queue if that ask goes unanswered.
-            if !re_request && !wanted.asked.is_empty() {
+            let jumped = self.asks_jump.remove(&(peer_key, id));
+            if !re_request && !jumped && !wanted.asked.is_empty() {
                 continue;
             }
             if peer.requested_bytes + u64::from(wanted.size) > MAX_REQUESTED_BYTES_PER_PEER {
                 peer.to_ask.push_front(id);
+                if jumped {
+                    self.asks_jump.insert((peer_key, id));
+                }
                 break;
             }
             wanted.asked.push((peer_key, now));
@@ -315,9 +435,12 @@ impl TxRelay {
         vec![Out::Send { to: peer_key, packet: tx_req_packet(&ask), bulk: false }]
     }
 
-    /// Forget a wanted id, and free the budget its asks hold.
+    /// Forget a wanted id: free the budget its asks hold, and its sole lister's count.
     fn forget_wanted(&mut self, id: UnminedTxId) {
         let Some(wanted) = self.wanted.remove(&id) else { return };
+        if !self.asks_jump.is_empty() {
+            self.asks_jump.retain(|(_, jumped)| *jumped != id);
+        }
         for (peer_key, _) in wanted.asked {
             if let Some(peer) = self.peers.get_mut(&peer_key) {
                 if let Some(size) = peer.requested.remove(&id) {
@@ -325,92 +448,104 @@ impl TxRelay {
                 }
             }
         }
+        if let Some(sole) = wanted.sole {
+            if let Some(peer) = self.peers.get_mut(&sole) {
+                peer.sole_listed = peer.sole_listed.saturating_sub(1);
+            }
+        }
     }
 
     // ---- what peers deliver ----
 
-    /// Of the transactions `from` sent, those we asked it for, which the caller then hands to
-    /// the mempool. The rest were not asked for (a late answer after a re-request, or unasked
-    /// pushes) and are dropped.
-    pub fn on_delivered(&mut self, from: ConnectionKey, ids: &[UnminedTxId]) -> Vec<UnminedTxId> {
+    /// Of the transactions `from` sent, with their serialized lengths, those we asked it for,
+    /// which the caller then hands to the mempool. One larger than the size it listed is a lie
+    /// no honest peer tells: the peer is struck and the body dropped. The rest were not asked
+    /// of it (a late answer after a re-request) and are dropped.
+    pub fn on_delivered(&mut self, from: ConnectionKey, delivered: &[(UnminedTxId, u32)], now: Instant) -> Vec<UnminedTxId> {
         let Some(peer) = self.peers.get_mut(&from) else { return Vec::new() };
         let mut take = Vec::new();
-        for id in ids {
-            let Some(size) = peer.requested.remove(id) else { continue };
-            peer.requested_bytes -= u64::from(size);
-            if let Some(wanted) = self.wanted.get_mut(id) {
-                if !wanted.submitted {
-                    wanted.submitted = true;
-                    take.push(*id);
-                }
+        let mut lied = false;
+        for (id, len) in delivered {
+            let Some(listed) = peer.requested.remove(id) else { continue };
+            peer.requested_bytes -= u64::from(listed);
+            let Some(wanted) = self.wanted.get_mut(id) else { continue };
+            wanted.asked.retain(|(p, _)| *p != from);
+            if *len > listed {
+                lied = true;
+                wanted.listers.retain(|p| *p != from);
+                continue;
             }
+            if !wanted.submitted {
+                wanted.submitted = true;
+                take.push(*id);
+            }
+        }
+        if lied {
+            peer.strikes.strike(now);
         }
         take
     }
 
     /// The mempool's verdict on a transaction `from` delivered.
-    pub fn on_outcome(&mut self, from: ConnectionKey, id: UnminedTxId, outcome: Outcome, now: Instant) -> Vec<Out> {
+    pub fn on_outcome(&mut self, from: ConnectionKey, id: UnminedTxId, outcome: Outcome, now: Instant) {
         match outcome {
             // It reaches the mirror through the change stream, which forgets it as wanted.
-            Outcome::Accepted => Vec::new(),
-            Outcome::NotTaken => {
-                self.forget_wanted(id);
-                Vec::new()
-            }
+            Outcome::Accepted => {}
+            Outcome::NotTaken => self.forget_wanted(id),
             Outcome::Invalid => {
                 self.forget_wanted(id);
-                self.peer(from, now).strikes.strike(now);
-                Vec::new()
+                if let Some(peer) = self.peers.get_mut(&from) {
+                    peer.strikes.strike(now);
+                }
             }
         }
     }
 
     // ---- what peers ask of us ----
 
-    /// A peer's `TX_REQ`: what we hold and have not just served it is fetched to be served.
+    /// A peer's `TX_REQ`, if its rate allows: of the ids we hold and have not just served it,
+    /// as many as its serving bucket covers are fetched to be sent, their bytes reserved now.
     pub fn on_request(&mut self, from: ConnectionKey, ids: Vec<UnminedTxId>, now: Instant) -> Vec<Out> {
-        let mirror = &self.mirror;
         let peer = self.peers.entry(from).or_insert_with(|| PeerTx::new(now));
-        peer.served.retain(|_, at| now.saturating_duration_since(*at) < SERVE_REPEAT_SUPPRESS);
-        let ids: Vec<UnminedTxId> = ids.into_iter().filter(|id| mirror.contains_key(id) && !peer.served.contains_key(id)).collect();
-        if ids.is_empty() {
+        if !peer.tx_reqs_in.take(1, now, TX_REQS_IN_PER_SEC, TX_REQS_IN_BURST) {
             return Vec::new();
         }
-        vec![Out::Fetch { to: from, ids }]
-    }
-
-    /// The bodies the mempool returned for [`Out::Fetch`], with their sizes: those the peer's
-    /// serving budget allows are served, in order.
-    pub fn on_bodies(&mut self, to: ConnectionKey, bodies: &[(UnminedTxId, u32)], now: Instant) -> Vec<UnminedTxId> {
-        let Some(peer) = self.peers.get_mut(&to) else { return Vec::new() };
-        let elapsed = now.saturating_duration_since(peer.serve_refilled);
-        let refill = (elapsed.as_millis() as u64).saturating_mul(SERVE_BYTES_PER_SEC) / 1000;
-        if refill > 0 {
-            peer.serve_tokens = (peer.serve_tokens + refill).min(SERVE_BURST_BYTES);
-            peer.serve_refilled = now;
-        }
-        let mut serve = Vec::new();
-        for (id, size) in bodies {
-            if u64::from(*size) > peer.serve_tokens {
+        peer.serve.refill(now, SERVE_BYTES_PER_SEC, SERVE_BURST_BYTES);
+        let mut fetch = Vec::new();
+        for id in ids {
+            let Some(size) = self.mirror.get(&id) else { continue };
+            if peer.served.get(&id).is_some_and(|at| now.saturating_duration_since(*at) < SERVE_REPEAT_SUPPRESS) {
+                continue;
+            }
+            if !peer.serve.take(u64::from(*size), now, SERVE_BYTES_PER_SEC, SERVE_BURST_BYTES) {
                 break;
             }
-            peer.serve_tokens -= u64::from(*size);
-            peer.served.insert(*id, now);
-            serve.push(*id);
+            if peer.served.insert(id, now).is_none() {
+                peer.served_order.push_back(id);
+                if peer.served_order.len() > MAX_SERVED_REMEMBERED {
+                    if let Some(oldest) = peer.served_order.pop_front() {
+                        peer.served.remove(&oldest);
+                    }
+                }
+            }
+            fetch.push(id);
         }
-        serve
+        if fetch.is_empty() {
+            return Vec::new();
+        }
+        vec![Out::Fetch { to: from, ids: fetch }]
     }
 
     /// A peer's `MEMPOOL_REQ`: our whole listing, at most once per
     /// [`MEMPOOL_REQ_ANSWER_INTERVAL`] per peer, on the bulk channel.
     pub fn on_mempool_req(&mut self, from: ConnectionKey, now: Instant) -> Vec<Out> {
-        let peer = self.peer(from, now);
+        let peer = self.peers.entry(from).or_insert_with(|| PeerTx::new(now));
         if peer.mempool_req_answered.is_some_and(|at| now.saturating_duration_since(at) < MEMPOOL_REQ_ANSWER_INTERVAL) {
             return Vec::new();
         }
         peer.mempool_req_answered = Some(now);
         let total = self.mirror.len() as u32;
-        let listing: Vec<(&UnminedTxId, u32)> = self.listing().collect();
+        let listing: Vec<(&UnminedTxId, u32)> = self.arrival.iter().rev().filter_map(|id| self.mirror.get(id).map(|size| (id, *size))).collect();
         listing
             .chunks(MAX_TX_IDS_PER_STATUS)
             .map(|chunk| Out::Send { to: from, packet: tx_status_packet(total, chunk.iter().copied()), bulk: true })
@@ -421,18 +556,23 @@ impl TxRelay {
 
     pub fn on_peer_gone(&mut self, peer: ConnectionKey) {
         self.peers.remove(&peer);
+        self.asks_jump.retain(|(p, _)| *p != peer);
         for wanted in self.wanted.values_mut() {
             wanted.listers.retain(|p| *p != peer);
             wanted.asked.retain(|(p, _)| *p != peer);
+            if wanted.sole == Some(peer) {
+                wanted.sole = None;
+            }
         }
     }
 
-    /// Statuses due, re-requests of what was not delivered, giving up on what nobody delivers,
-    /// and a `MEMPOOL_REQ` to each peer once per session. `live` are the connected peers.
+    /// Statuses due, asks refilled, re-requests of what was not delivered, giving up on what
+    /// nobody delivers, and a `MEMPOOL_REQ` to each peer once per session. `live` are the
+    /// connected peers.
     pub fn poll(&mut self, live: &[ConnectionKey], now: Instant) -> Vec<Out> {
         let mut out = Vec::new();
         for key in live {
-            self.peer(*key, now);
+            self.peers.entry(*key).or_insert_with(|| PeerTx::new(now));
         }
 
         // Give up, oldest first, on what nobody delivered in time.
@@ -446,10 +586,11 @@ impl TxRelay {
             }
         }
 
-        // Overdue asks, oldest first: the peers asked are struck (once each per poll) and lose
-        // their place as listers, and every other lister is asked at once.
-        let mut struck: HashSet<ConnectionKey> = HashSet::new();
-        let mut retry_from: HashSet<ConnectionKey> = HashSet::new();
+        // Overdue asks, oldest first. The peers asked are demoted and lose their place as
+        // listers; the other listers are asked, or, if none are left, every live peer once;
+        // after that, nobody is left to ask and the id is forgotten.
+        let mut re_ask: HashSet<ConnectionKey> = HashSet::new();
+        let mut forget = Vec::new();
         while let Some(&(at, id)) = self.asks.front() {
             if now.saturating_duration_since(at) < REREQUEST_AFTER {
                 break;
@@ -459,36 +600,50 @@ impl TxRelay {
             if wanted.submitted || !wanted.asked.iter().any(|(_, asked_at)| *asked_at == at) {
                 continue;
             }
-            let overdue: Vec<ConnectionKey> = wanted
-                .asked
-                .iter()
-                .filter(|(_, asked_at)| now.saturating_duration_since(*asked_at) >= REREQUEST_AFTER)
-                .map(|(p, _)| *p)
-                .collect();
-            if overdue.len() < wanted.asked.len() {
+            if wanted.asked.iter().any(|(_, asked_at)| now.saturating_duration_since(*asked_at) < REREQUEST_AFTER) {
                 continue; // a more recent ask is still within its time
             }
+            let overdue: Vec<ConnectionKey> = wanted.asked.drain(..).map(|(p, _)| p).collect();
             wanted.listers.retain(|p| !overdue.contains(p));
-            wanted.asked.clear();
-            for lister in &wanted.listers {
-                if let Some(peer) = self.peers.get_mut(lister) {
-                    peer.to_ask.push_front(id);
-                    retry_from.insert(*lister);
-                }
-            }
-            for peer_key in overdue {
-                if let Some(peer) = self.peers.get_mut(&peer_key) {
+            for peer_key in &overdue {
+                if let Some(peer) = self.peers.get_mut(peer_key) {
                     if let Some(size) = peer.requested.remove(&id) {
                         peer.requested_bytes -= u64::from(size);
                     }
-                    if struck.insert(peer_key) {
-                        peer.strikes.strike(now);
-                    }
+                    peer.delivery_failures.current(now);
+                    peer.delivery_failures.count = peer.delivery_failures.count.saturating_add(1);
+                }
+            }
+            if wanted.listers.is_empty() {
+                if wanted.asked_everyone {
+                    forget.push(id);
+                    continue;
+                }
+                wanted.asked_everyone = true;
+                wanted.listers = live.iter().copied().filter(|p| !overdue.contains(p)).collect();
+            }
+            for lister in &wanted.listers {
+                if let Some(peer) = self.peers.get_mut(lister) {
+                    peer.to_ask.push_front(id);
+                    re_ask.insert(*lister);
                 }
             }
         }
-        for peer_key in retry_from {
+        for id in forget {
+            self.forget_wanted(id);
+        }
+        for peer_key in re_ask {
             out.extend(self.ask(peer_key, true, now));
+        }
+
+        // Asks refill as deliveries free budget, peers with fewer failed deliveries first.
+        let mut order: Vec<(u32, ConnectionKey)> = live
+            .iter()
+            .filter_map(|key| self.peers.get_mut(key).map(|peer| (peer.delivery_failures.current(now), *key)))
+            .collect();
+        order.sort();
+        for (_, key) in order {
+            out.extend(self.ask(key, false, now));
         }
 
         let total = self.mirror.len() as u32;
@@ -523,9 +678,15 @@ impl TxRelay {
         out
     }
 
-    /// Whether `peer` is backed off for relay.
+    /// Whether `peer` is backed off for relay (not asked for anything).
     pub fn backing_off(&self, peer: ConnectionKey, now: Instant) -> bool {
         self.peers.get(&peer).is_some_and(|p| p.strikes.backing_off(now))
+    }
+
+    /// Serving bytes left for `peer` (for tests and diagnostics).
+    #[cfg(test)]
+    fn serve_tokens(&self, peer: ConnectionKey) -> u64 {
+        self.peers.get(&peer).map_or(0, |p| p.serve.tokens())
     }
 }
 
@@ -568,28 +729,32 @@ mod tests {
     }
 
     #[test]
-    fn asks_are_budgeted_by_bytes_and_count() {
+    fn asks_are_budgeted_by_bytes_and_count_and_refill_as_deliveries_land() {
         let now = Instant::now();
         let mut relay = TxRelay::default();
         relay.poll(&[peer(1)], now);
         // 100 KB each: 2 MiB holds 20 of them, fewer than the in-flight cap.
         let outs = listed(&mut relay, peer(1), (0..100).map(|n| (id(n), 100_000)).collect(), now);
         assert_eq!(asked(&outs, peer(1)).len(), 20);
-        // 1 KB each: the in-flight cap binds first.
+
+        // 1 KB each: the in-flight cap binds first; delivering frees it for the next poll,
+        // without waiting for another status.
         let mut relay = TxRelay::default();
         relay.poll(&[peer(1)], now);
-        let outs = listed(&mut relay, peer(1), (0..100).map(|n| (id(n), 1_000)).collect(), now);
-        assert_eq!(asked(&outs, peer(1)).len(), MAX_IN_FLIGHT_PER_PEER);
+        let first = asked(&listed(&mut relay, peer(1), (0..100).map(|n| (id(n), 1_000)).collect(), now), peer(1));
+        assert_eq!(first.len(), MAX_IN_FLIGHT_PER_PEER);
+        let delivered: Vec<(UnminedTxId, u32)> = first.iter().map(|i| (*i, 1_000)).collect();
+        assert_eq!(relay.on_delivered(peer(1), &delivered, now).len(), MAX_IN_FLIGHT_PER_PEER);
+        assert_eq!(asked(&relay.poll(&[peer(1)], now), peer(1)).len(), MAX_IN_FLIGHT_PER_PEER);
     }
 
     #[test]
-    fn an_undelivered_ask_strikes_its_peer_and_goes_to_every_other_lister() {
+    fn an_undelivered_ask_demotes_its_peer_and_goes_to_the_other_listers() {
         let now = Instant::now();
         let mut relay = TxRelay::default();
         let peers = [peer(1), peer(2), peer(3)];
         relay.poll(&peers, now);
-        let outs = listed(&mut relay, peer(1), vec![(id(7), 500)], now);
-        assert_eq!(asked(&outs, peer(1)), vec![id(7)]);
+        assert_eq!(asked(&listed(&mut relay, peer(1), vec![(id(7), 500)], now), peer(1)), vec![id(7)]);
         // Later listers wait while the first ask is within its time.
         for p in [peer(2), peer(3)] {
             assert!(asked(&listed(&mut relay, p, vec![(id(7), 500)], now), p).is_empty());
@@ -600,61 +765,107 @@ mod tests {
         let outs = relay.poll(&peers, later);
         assert_eq!(asked(&outs, peer(2)), vec![id(7)]);
         assert_eq!(asked(&outs, peer(3)), vec![id(7)]);
-        assert!(relay.backing_off(peer(1), later));
-        // A struck peer is neither heard nor asked while it backs off.
-        assert!(relay.on_status(peer(1), vec![(id(8), 500)], later).is_empty());
+        // Not delivering is no fault: the peer is still heard and still asked.
+        assert!(!relay.backing_off(peer(1), later));
+        assert!(!relay.on_status(peer(1), vec![(id(8), 500)], later).is_empty());
     }
 
     #[test]
-    fn a_delivery_is_taken_once_and_only_if_asked() {
+    fn when_every_lister_fails_every_peer_is_asked_once_then_it_is_forgotten() {
+        let now = Instant::now();
+        let mut relay = TxRelay::default();
+        let peers = [peer(1), peer(2), peer(3)];
+        relay.poll(&peers, now);
+        listed(&mut relay, peer(1), vec![(id(7), 500)], now);
+        let outs = relay.poll(&peers, now + REREQUEST_AFTER);
+        assert_eq!(asked(&outs, peer(2)), vec![id(7)]);
+        assert_eq!(asked(&outs, peer(3)), vec![id(7)]);
+        relay.poll(&peers, now + REREQUEST_AFTER * 2);
+        assert!(relay.wanted.is_empty());
+    }
+
+    #[test]
+    fn a_delivery_is_taken_once_only_if_asked_and_a_size_lie_strikes() {
         let now = Instant::now();
         let mut relay = TxRelay::default();
         relay.poll(&[peer(1), peer(2)], now);
-        listed(&mut relay, peer(1), vec![(id(1), 500)], now);
-        assert_eq!(relay.on_delivered(peer(2), &[id(1)]), vec![], "not asked of peer 2");
-        assert_eq!(relay.on_delivered(peer(1), &[id(1), id(9)]), vec![id(1)]);
-        assert_eq!(relay.on_delivered(peer(1), &[id(1)]), vec![], "already taken");
+        listed(&mut relay, peer(1), vec![(id(1), 500), (id(2), 500)], now);
+        assert_eq!(relay.on_delivered(peer(2), &[(id(1), 500)], now), vec![], "not asked of peer 2");
+        assert_eq!(relay.on_delivered(peer(1), &[(id(1), 500), (id(9), 500)], now), vec![id(1)]);
+        assert_eq!(relay.on_delivered(peer(1), &[(id(1), 500)], now), vec![], "already taken");
+        assert!(!relay.backing_off(peer(1), now));
+        assert_eq!(relay.on_delivered(peer(1), &[(id(2), 501)], now), vec![], "larger than listed");
+        assert!(relay.backing_off(peer(1), now));
     }
 
     #[test]
-    fn only_an_invalid_verdict_strikes() {
+    fn only_an_invalid_verdict_strikes_and_strikes_are_forgotten() {
         let now = Instant::now();
         let mut relay = TxRelay::default();
         relay.poll(&[peer(1), peer(2)], now);
         for (p, n) in [(peer(1), 1), (peer(2), 2)] {
             listed(&mut relay, p, vec![(id(n), 500)], now);
-            relay.on_delivered(p, &[id(n)]);
+            relay.on_delivered(p, &[(id(n), 500)], now);
         }
         relay.on_outcome(peer(1), id(1), Outcome::NotTaken, now);
         relay.on_outcome(peer(2), id(2), Outcome::Invalid, now);
         assert!(!relay.backing_off(peer(1), now));
         assert!(relay.backing_off(peer(2), now));
+        // A second strike long after the first starts the backoff over (1 s, not 2 s).
+        let much_later = now + STRIKES_FORGOTTEN_AFTER;
+        relay.on_outcome(peer(2), id(3), Outcome::Invalid, much_later);
+        assert!(relay.backing_off(peer(2), much_later + Duration::from_millis(999)));
+        assert!(!relay.backing_off(peer(2), much_later + STRIKE_BACKOFF_MIN));
     }
 
     #[test]
-    fn what_nobody_delivers_is_given_up_and_frees_the_budget() {
+    fn one_peer_cannot_fill_the_wanted_set() {
+        let now = Instant::now();
+        let mut relay = TxRelay::default();
+        relay.poll(&[peer(1), peer(2)], now);
+        for chunk in 0..8u32 {
+            listed(&mut relay, peer(1), (0..256).map(|n| (id(chunk * 256 + n), 10)).collect(), now);
+        }
+        assert_eq!(relay.wanted.len(), MAX_SOLE_LISTED_PER_PEER);
+        // Another peer's listings still get in.
+        listed(&mut relay, peer(2), vec![(id(100_000), 10)], now);
+        assert!(relay.wanted.contains_key(&id(100_000)));
+    }
+
+    #[test]
+    fn a_peers_statuses_are_rate_limited() {
         let now = Instant::now();
         let mut relay = TxRelay::default();
         relay.poll(&[peer(1)], now);
-        listed(&mut relay, peer(1), vec![(id(1), 100_000)], now);
-        relay.poll(&[peer(1)], now + WANTED_GIVE_UP);
-        assert!(relay.wanted.is_empty());
-        assert_eq!(relay.peers[&peer(1)].requested_bytes, 0);
+        let heard = (0..STATUSES_IN_BURST + 10).filter(|n| !relay.on_status(peer(1), vec![(id(*n as u32), 10)], now).is_empty()).count();
+        assert_eq!(heard as u64, STATUSES_IN_BURST);
+        assert!(!relay.on_status(peer(1), vec![(id(999), 10)], now + Duration::from_secs(1)).is_empty());
     }
 
     #[test]
-    fn serving_is_limited_by_a_byte_bucket_and_repeats_are_suppressed() {
+    fn serving_is_limited_by_bytes_reserved_up_front_and_by_request_rate() {
         let now = Instant::now();
         let mut relay = TxRelay::default();
         relay.on_added((0..40).map(|n| (id(n), 100_000)));
         let ids: Vec<UnminedTxId> = (0..40).map(id).collect();
-        assert!(matches!(&relay.on_request(peer(1), ids.clone(), now)[..], [Out::Fetch { .. }]));
-        let bodies: Vec<(UnminedTxId, u32)> = ids.iter().map(|i| (*i, 100_000)).collect();
-        let served = relay.on_bodies(peer(1), &bodies, now);
-        assert_eq!(served.len() as u64, SERVE_BURST_BYTES / 100_000);
+        let fetched = match &relay.on_request(peer(1), ids.clone(), now)[..] {
+            [Out::Fetch { ids, .. }] => ids.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(fetched.len() as u64, SERVE_BURST_BYTES / 100_000);
+        assert!(relay.serve_tokens(peer(1)) < 100_000);
         // What was just served is not served again, and ids we do not hold are not fetched.
-        assert!(relay.on_request(peer(1), served, now).is_empty());
+        assert!(relay.on_request(peer(1), fetched, now + Duration::from_secs(1)).is_empty());
         assert!(relay.on_request(peer(1), vec![id(999)], now).is_empty());
+        // Requests beyond the rate are dropped unread.
+        let mut relay = TxRelay::default();
+        relay.on_added([(id(1), 10)]);
+        let answered = (0..TX_REQS_IN_BURST + 5).filter(|_| {
+            let outs = relay.on_request(peer(1), vec![id(1)], now);
+            relay.peers.get_mut(&peer(1)).unwrap().served.clear();
+            !outs.is_empty()
+        });
+        assert_eq!(answered.count() as u64, TX_REQS_IN_BURST);
     }
 
     #[test]
