@@ -255,29 +255,22 @@ where
             let (result, completed_txid) = match result {
                 Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))) => {
                     let hash = tx.transaction.id;
-                    (
-                        Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))),
-                        Some(hash),
-                    )
+                    (Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))), hash)
                 }
                 Ok(Err(boxed_err)) => {
                     let (e, hash) = *boxed_err;
-                    (Ok(Err(Box::new((hash, e)))), Some(hash))
+                    (Ok(Err(Box::new((hash, e)))), hash)
                 }
-                Err((txid, elapsed)) => {
-                    // Remove the cancel handle so the spawned task's queued `Gossip`
-                    // doesn't stay resident in `cancel_handles` after a verification
-                    // timeout. Without this, a peer that gets each transaction to
-                    // hit `RATE_LIMIT_DELAY` can leak ~2 MB per tx until OOM.
-                    this.cancel_handles.remove(&txid);
-                    (Err((txid, elapsed)), None)
-                }
+                Err((txid, elapsed)) => (Err((txid, elapsed)), txid),
             };
 
-            if let Some(hash) = completed_txid {
-                if let Some((_, _gossip, Some(source))) = this.cancel_handles.remove(&hash) {
-                    Self::release_peer_slot(this.pending_per_peer, source);
-                }
+            // Remove the cancel handle, and release the source's slot, on every completion,
+            // including a verification timeout. Otherwise a timed-out task's queued `Gossip`
+            // stays resident in `cancel_handles` (a peer that gets each transaction to hit
+            // `RATE_LIMIT_DELAY` could leak ~2 MB per tx until OOM), and its source loses a
+            // slot of its per-peer cap until the mempool resets.
+            if let Some((_, _gossip, Some(source))) = this.cancel_handles.remove(&completed_txid) {
+                Self::release_peer_slot(this.pending_per_peer, source);
             }
 
             Some(result)

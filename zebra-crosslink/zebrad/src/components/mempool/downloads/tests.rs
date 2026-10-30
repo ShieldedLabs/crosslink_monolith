@@ -132,3 +132,57 @@ async fn pushed_transaction_attributes_invalid_error_to_peer() {
         "expected the pushed transaction failure to carry its peer, branch, and height, got {error:?}"
     );
 }
+
+/// A verification timeout must release the source's per-peer slot, or a peer whose
+/// transactions time out loses its whole cap until the mempool resets.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn per_peer_slot_released_after_verification_timeout() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let source: SocketAddr = "192.168.0.2:8233".parse().expect("valid socket address");
+
+    let pushed: Vec<Gossip> = network
+        .unmined_transactions_in_blocks(1..=10)
+        .take(MAX_INBOUND_CONCURRENCY_PER_PEER + 1)
+        .map(|tx| Gossip::Tx(tx.transaction))
+        .collect();
+
+    // Nothing answers the state, so every task hits `RATE_LIMIT_DELAY`.
+    let peer_set: MockService<zn::Request, zn::Response, PanicAssertion> =
+        MockService::build().for_unit_tests();
+    let verifier: MockService<tx::MempoolRequest, tx::MempoolResponse, PanicAssertion> =
+        MockService::build().for_unit_tests();
+    let state: MockService<zs::Request, zs::Response, PanicAssertion> =
+        MockService::build().for_unit_tests();
+
+    let mut downloads = Box::pin(Downloads::new(peer_set, verifier, state));
+
+    for gossip in pushed.iter().take(MAX_INBOUND_CONCURRENCY_PER_PEER) {
+        downloads
+            .as_mut()
+            .download_if_needed_and_verify(gossip.clone(), Some(source), None)
+            .expect("pushes below the per-peer cap are admitted");
+    }
+
+    tokio::time::advance(RATE_LIMIT_DELAY + Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+
+    for _ in 0..MAX_INBOUND_CONCURRENCY_PER_PEER {
+        assert!(
+            matches!(downloads.as_mut().next().await, Some(Err(_))),
+            "every task should time out",
+        );
+    }
+
+    downloads
+        .as_mut()
+        .download_if_needed_and_verify(
+            pushed[MAX_INBOUND_CONCURRENCY_PER_PEER].clone(),
+            Some(source),
+            None,
+        )
+        .expect("timed-out tasks must release their source's slots");
+
+    downloads.cancel_all();
+}
