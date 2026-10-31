@@ -1235,4 +1235,549 @@ mod tests {
         assert_eq!(statuses(&relay.poll(&[peer(1)], batched + STATUS_MIN_GAP)), 0, "nothing new");
         assert_eq!(statuses(&relay.poll(&[peer(1)], batched + STATUS_HEARTBEAT)), 1, "heartbeat");
     }
+
+    // ---- load: the relay runs on the PoW sync thread, so no call may stall PoW or BFT sync ----
+    //
+    // Each test drives the relay at its adversarial maxima, times every call, prints a table
+    // (run with --nocapture) and fails only past a bound that a complexity regression would
+    // cross, not a slow machine: debug builds included.
+
+    /// The slowest a call that handles one message or one tick may be, debug build included.
+    const WORST_CALL: Duration = Duration::from_millis(50);
+    /// The slowest a call that makes one pass over the mempool or the wanted set may be:
+    /// answering a `MEMPOOL_REQ`, taking in a whole mempool, a peer that lists every wanted id
+    /// leaving, and the poll that gives up on a whole wanted set that became wanted at once.
+    const WORST_BULK_CALL: Duration = Duration::from_secs(1);
+    /// A loaded machine preempts the odd call, and a growing map's resize makes a few calls in a
+    /// hundred slower (the wanted set's, at 57,344 entries, about 18 ms in a debug build), so a
+    /// bound is checked against the median, and the 95th percentile where there are 100 calls or
+    /// more; the worst call only against this many times the bound.
+    const PREEMPTED: u32 = 5;
+    const GIVE_UP_ALL: &str = "poll (gives up on all wanted)";
+    const LOAD_PEERS: u16 = 64;
+    /// Small enough that the in-flight count, not the byte budget, caps a peer's asks.
+    const LOAD_TX_SIZE: u32 = 2_000;
+
+    fn load_peers() -> Vec<ConnectionKey> {
+        (1..=LOAD_PEERS).map(peer).collect()
+    }
+
+    /// A full status's worth of ids, distinct for every `c`.
+    fn chunk(c: u32) -> Vec<(UnminedTxId, u32)> {
+        let n = MAX_TX_IDS_PER_STATUS as u32;
+        (c * n..(c + 1) * n).map(|i| (id(i), LOAD_TX_SIZE)).collect()
+    }
+
+    /// Wall-clock time of each call, by operation, with the operation's bound.
+    #[derive(Default)]
+    struct Timings(Vec<(&'static str, Duration, Vec<Duration>)>);
+
+    impl Timings {
+        fn time<T>(&mut self, op: &'static str, call: impl FnOnce() -> T) -> T {
+            let bound = if op == GIVE_UP_ALL { WORST_BULK_CALL } else { WORST_CALL };
+            self.time_within(op, bound, call)
+        }
+
+        fn time_bulk<T>(&mut self, op: &'static str, call: impl FnOnce() -> T) -> T {
+            self.time_within(op, WORST_BULK_CALL, call)
+        }
+
+        fn time_within<T>(&mut self, op: &'static str, bound: Duration, call: impl FnOnce() -> T) -> T {
+            let start = std::time::Instant::now();
+            let out = call();
+            let took = start.elapsed();
+            match self.0.iter_mut().find(|(name, ..)| *name == op) {
+                Some((.., all)) => all.push(took),
+                None => self.0.push((op, bound, vec![took])),
+            }
+            out
+        }
+
+        /// Print the table, then check each operation against its bound.
+        fn report(&self, scenario: &str, notes: &str) {
+            let build = if cfg!(debug_assertions) { "debug" } else { "release" };
+            let mut table = format!("\n{scenario} ({build} build)\n  {:<34} {:>7} {:>12} {:>12} {:>12} {:>8}\n", "operation", "calls", "worst", "p95", "mean", "bound");
+            let mut over = Vec::new();
+            for (op, bound, all) in &self.0 {
+                let mut sorted = all.clone();
+                sorted.sort();
+                let worst = sorted[sorted.len() - 1];
+                let p95 = if sorted.len() >= 100 { sorted[sorted.len() * 95 / 100] } else { worst };
+                let mean = all.iter().sum::<Duration>() / all.len() as u32;
+                table += &format!("  {op:<34} {:>7} {worst:>12.3?} {p95:>12.3?} {mean:>12.3?} {bound:>8?}\n", all.len());
+                let median = sorted[sorted.len() / 2];
+                if median >= *bound || (sorted.len() >= 100 && p95 >= *bound) || worst >= *bound * PREEMPTED {
+                    over.push(format!("{op}: worst {worst:?}, p95 {p95:?}, median {median:?}, bound {bound:?}"));
+                }
+            }
+            table += notes;
+            // One print, so parallel tests do not interleave their tables.
+            println!("{table}");
+            assert!(over.is_empty(), "{scenario}: {over:?}");
+        }
+    }
+
+    /// The asks made of each peer and not yet answered, as the transport would carry them.
+    type Asks = HashMap<ConnectionKey, Vec<UnminedTxId>>;
+
+    fn note_asks(asks: &mut Asks, outs: impl IntoIterator<Item = Out>) {
+        for out in outs {
+            if let Out::Ask { to, ids, .. } = out {
+                asks.entry(to).or_default().extend(ids);
+            }
+        }
+    }
+
+    /// A peer lists `entries`, and the mempool keeps them all (it holds none of them).
+    fn list_timed(relay: &mut TxRelay, timings: &mut Timings, asks: &mut Asks, from: ConnectionKey, entries: Vec<(UnminedTxId, u32)>, now: Instant) {
+        for out in timings.time("on_status (256 ids)", || relay.on_status(from, entries, now)) {
+            match out {
+                Out::Filter { from, entries } => {
+                    let more = timings.time("on_filtered (all kept)", || relay.on_filtered(from, entries, now));
+                    note_asks(asks, more);
+                }
+                other => note_asks(asks, [other]),
+            }
+        }
+    }
+
+    /// The bounds the design promises, and the books balancing, over the whole state.
+    fn check_bounds(relay: &TxRelay) {
+        assert!(relay.wanted.len() <= MAX_WANTED);
+        let mut sole_of: HashMap<ConnectionKey, usize> = HashMap::new();
+        for (id, wanted) in &relay.wanted {
+            assert!(wanted.listers.len() <= MAX_LISTERS);
+            if let Some(sole) = wanted.sole {
+                assert_eq!(wanted.listers.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![sole], "a sole lister is the only one");
+                *sole_of.entry(sole).or_default() += 1;
+            }
+            for (lister, _) in &wanted.listers {
+                assert!(relay.peers.get(lister).is_none_or(|peer| peer.listing.contains(id)), "a lister's listing names what it lists");
+            }
+        }
+        for (key, peer) in &relay.peers {
+            assert!(peer.sole_listed <= MAX_SOLE_LISTED_PER_PEER);
+            assert_eq!(peer.sole_listed, sole_of.get(key).copied().unwrap_or(0), "sole_listed counts exactly the ids only it lists");
+            assert_eq!(peer.requested_bytes, peer.requested.values().map(|size| u64::from(*size)).sum::<u64>(), "requested_bytes drifted");
+            assert!(peer.requested_bytes <= MAX_REQUESTED_BYTES_PER_PEER);
+            assert!(peer.requested.len() + peer.submitted <= MAX_IN_FLIGHT_PER_PEER);
+            for id in peer.requested.keys() {
+                assert!(relay.wanted.get(id).is_some_and(|w| w.asked.iter().any(|(p, _)| p == key)), "a request is an outstanding ask");
+            }
+            for id in &peer.listing {
+                assert!(relay.wanted.get(id).is_some_and(|w| w.listed_size(*key).is_some()), "a listing names only wanted ids it lists");
+            }
+            assert!(peer.asked_at.len() <= MAX_ASKED_REMEMBERED && peer.asked_order.len() <= MAX_ASKED_REMEMBERED);
+            assert!(peer.served.len() <= MAX_SERVED_REMEMBERED && peer.served_order.len() <= MAX_SERVED_REMEMBERED);
+        }
+    }
+
+    /// The compaction `poll` promises: its ordered queues hold at most twice what was wanted when
+    /// it compacted them (no more than `wanted_before`, what was wanted when it was called) plus
+    /// slack, and the asks it made after.
+    fn check_compacted(relay: &TxRelay, wanted_before: usize) {
+        let bound = 2 * wanted_before + 1024;
+        assert!(relay.wanted_order.len() <= bound, "wanted_order {} for {wanted_before} wanted", relay.wanted_order.len());
+        let asks_made = relay.peers.len() * MAX_IN_FLIGHT_PER_PEER;
+        assert!(relay.asks.len() <= bound + asks_made, "asks {} for {wanted_before} wanted", relay.asks.len());
+    }
+
+    /// Once everything is delivered or forgotten, nothing is held against anyone.
+    fn check_drained(relay: &TxRelay) {
+        assert!(relay.wanted.is_empty(), "{} still wanted", relay.wanted.len());
+        assert!(relay.wanted_order.is_empty());
+        assert!(relay.asks.len() <= 1024);
+        for peer in relay.peers.values() {
+            assert_eq!(peer.requested_bytes, 0);
+            assert!(peer.requested.is_empty() && peer.listing.is_empty());
+            assert_eq!(peer.sole_listed, 0);
+        }
+    }
+
+    /// The largest structures seen, for the notes under each table.
+    #[derive(Debug, Default)]
+    struct Peak {
+        wanted: usize,
+        wanted_order: usize,
+        asks: usize,
+        to_ask_one_peer: usize,
+        to_ask_all_peers: usize,
+        listing_one_peer: usize,
+    }
+
+    impl Peak {
+        fn see(&mut self, relay: &TxRelay) {
+            self.wanted = self.wanted.max(relay.wanted.len());
+            self.wanted_order = self.wanted_order.max(relay.wanted_order.len());
+            self.asks = self.asks.max(relay.asks.len());
+            self.to_ask_one_peer = self.to_ask_one_peer.max(relay.peers.values().map(|p| p.to_ask.len()).max().unwrap_or(0));
+            self.to_ask_all_peers = self.to_ask_all_peers.max(relay.peers.values().map(|p| p.to_ask.len()).sum());
+            self.listing_one_peer = self.listing_one_peer.max(relay.peers.values().map(|p| p.listing.len()).max().unwrap_or(0));
+        }
+    }
+
+    /// Every peer lists full statuses of new ids, each chunk then listed by the next peer too, so
+    /// the per-peer cap on sole listings never binds, until [`MAX_WANTED`] are wanted. Peer `p`
+    /// ends up listing its own chunks and peer `p - 1`'s.
+    fn fill_wanted(relay: &mut TxRelay, peers: &[ConnectionKey], now: &mut Instant, timings: &mut Timings, asks: &mut Asks, peak: &mut Peak) {
+        let mut round = 0;
+        while relay.wanted.len() < MAX_WANTED {
+            for (p, key) in peers.iter().enumerate() {
+                let c = (round * peers.len() + p) as u32;
+                list_timed(relay, timings, asks, *key, chunk(c), *now);
+                list_timed(relay, timings, asks, peers[(p + 1) % peers.len()], chunk(c), *now);
+            }
+            *now += Duration::from_millis(100);
+            let wanted_before = relay.wanted.len();
+            let outs = timings.time("poll", || relay.poll(peers, *now));
+            note_asks(asks, outs);
+            check_bounds(relay);
+            check_compacted(relay, wanted_before);
+            peak.see(relay);
+            round += 1;
+            assert!(round <= 8, "wanted stuck at {}", relay.wanted.len());
+        }
+        assert_eq!(relay.wanted.len(), MAX_WANTED);
+    }
+
+    #[test]
+    fn sixty_four_peers_listing_full_statuses_fill_the_wanted_set_without_stalling_sync() {
+        let peers = load_peers();
+        let mut relay = TxRelay::default();
+        let mut timings = Timings::default();
+        let mut asks = Asks::default();
+        let mut peak = Peak::default();
+        let mut now = Instant::now();
+        note_asks(&mut asks, timings.time("poll", || relay.poll(&peers, now)));
+        fill_wanted(&mut relay, &peers, &mut now, &mut timings, &mut asks, &mut peak);
+
+        // Then every peer keeps listing in full: half ids already wanted (each gains listers up
+        // to MAX_LISTERS), half new (refused while the set is full). Even peers deliver what
+        // they are asked and the mempool accepts it; odd peers never deliver, so their asks go
+        // overdue and are re-made of other listers.
+        let mut next_new = (MAX_WANTED / MAX_TX_IDS_PER_STATUS) as u32;
+        for round in 0..40u32 {
+            for (p, key) in peers.iter().enumerate() {
+                let mut entries = chunk((p as u32 * 5 + round) % next_new);
+                entries.truncate(MAX_TX_IDS_PER_STATUS / 2);
+                entries.extend(chunk(next_new).into_iter().take(MAX_TX_IDS_PER_STATUS / 2));
+                next_new += 1;
+                list_timed(&mut relay, &mut timings, &mut asks, *key, entries, now);
+            }
+            for key in peers.iter().step_by(2) {
+                let Some(ids) = asks.remove(key) else { continue };
+                let delivered: Vec<(UnminedTxId, u32)> = ids.iter().map(|id| (*id, LOAD_TX_SIZE)).collect();
+                let taken = timings.time("on_delivered", || relay.on_delivered(*key, &delivered, now));
+                for id in taken {
+                    timings.time("on_outcome (Accepted)", || relay.on_outcome(*key, id, Outcome::Accepted, now));
+                    timings.time("on_added (1)", || relay.on_added([(id, LOAD_TX_SIZE)]));
+                }
+            }
+            now += Duration::from_millis(250);
+            let wanted_before = relay.wanted.len();
+            let outs = timings.time("poll", || relay.poll(&peers, now));
+            note_asks(&mut asks, outs);
+            check_bounds(&relay);
+            check_compacted(&relay, wanted_before);
+            peak.see(&relay);
+        }
+
+        // Whatever is left is given up on; nothing stays held against anyone.
+        now += WANTED_GIVE_UP;
+        for _ in 0..2 {
+            now += REREQUEST_AFTER;
+            timings.time(GIVE_UP_ALL, || relay.poll(&peers, now));
+        }
+        check_bounds(&relay);
+        check_drained(&relay);
+        timings.report("64 peers listing full statuses", &format!("  peaks: {peak:?}\n  mirror at the end: {}", relay.mirror.len()));
+    }
+
+    #[test]
+    fn a_fifty_thousand_transaction_mempool_is_listed_and_answered_without_stalling_sync() {
+        const MIRROR: u32 = 50_000;
+        let peers = load_peers();
+        let mut relay = TxRelay::default();
+        let mut timings = Timings::default();
+        let mut now = Instant::now();
+        // Our own ids, apart from anything a peer lists.
+        let ours = |n: u32| id((1 << 31) | n);
+        timings.time_bulk("on_added (50,000 at once)", || relay.on_added((0..MIRROR).map(|n| (ours(n), LOAD_TX_SIZE))));
+
+        // Every peer asks for the whole listing at once.
+        for key in &peers {
+            let outs = timings.time_bulk("on_mempool_req (50,000 listed)", || relay.on_mempool_req(*key, now));
+            assert_eq!(outs.len(), (MIRROR as usize).div_ceil(MAX_TX_IDS_PER_STATUS));
+            let listed: usize = outs
+                .iter()
+                .map(|out| match out {
+                    Out::Send { packet, bulk: true, .. } => read_tx_status(&packet[1..]).unwrap().1.len(),
+                    other => panic!("{other:?}"),
+                })
+                .sum();
+            assert_eq!(listed, MIRROR as usize);
+        }
+
+        // The mempool churns while every peer is sent statuses: a hundred in, a hundred out.
+        let mut statuses = 0;
+        for round in 0..40u32 {
+            let gone: Vec<UnminedTxId> = (round * 100..(round + 1) * 100).map(ours).collect();
+            timings.time("on_removed (100)", || relay.on_removed(gone));
+            let added: Vec<(UnminedTxId, u32)> = (MIRROR + round * 100..MIRROR + (round + 1) * 100).map(|n| (ours(n), LOAD_TX_SIZE)).collect();
+            timings.time("on_added (100)", || relay.on_added(added));
+            now += STATUS_BATCH_MIN + Duration::from_millis(STATUS_BATCH_SPREAD_MS);
+            let outs = timings.time("poll (statuses to 64 peers)", || relay.poll(&peers, now));
+            statuses += outs.iter().filter(|o| matches!(o, Out::Send { packet, .. } if packet[0] == PACKET_TYPE_TX_STATUS)).count();
+            // Arrival order is pruned once it is twice the mirror.
+            assert!(relay.arrival.len() <= 2 * relay.mirror.len() + 64 + 100);
+        }
+        assert!(statuses >= peers.len() * 20, "{statuses} statuses");
+
+        // Every peer asks for a full TX_REQ of what we hold.
+        for (p, key) in peers.iter().enumerate() {
+            let ids: Vec<UnminedTxId> = (0..MAX_TXS_PER_MESSAGE as u32).map(|n| ours(10_000 + p as u32 * 64 + n)).collect();
+            let outs = timings.time("on_request (64 ids)", || relay.on_request(*key, ids, now));
+            assert!(matches!(&outs[..], [Out::Fetch { ids, .. }] if ids.len() == MAX_TXS_PER_MESSAGE));
+        }
+        timings.time_bulk("on_reset (50,000)", || relay.on_reset((0..MIRROR).map(|n| (ours(n), LOAD_TX_SIZE))));
+        assert_eq!(relay.mirror.len(), MIRROR as usize);
+        assert_eq!(relay.arrival.len(), MIRROR as usize);
+        timings.report("a 50,000-transaction mempool", &format!("  statuses sent: {statuses}"));
+    }
+
+    #[test]
+    fn peers_with_full_listings_coming_and_going_do_not_stall_sync_or_grow_the_relay() {
+        let peers = load_peers();
+        let mut relay = TxRelay::default();
+        let mut timings = Timings::default();
+        let mut asks = Asks::default();
+        let mut peak = Peak::default();
+        let mut now = Instant::now();
+        relay.poll(&peers, now);
+        fill_wanted(&mut relay, &peers, &mut now, &mut timings, &mut asks, &mut peak);
+        let chunks_per_peer = MAX_WANTED / MAX_TX_IDS_PER_STATUS / peers.len();
+
+        // Half the peers leave (each listing 2048 ids, every one also listed by a peer that
+        // stays), come back and list it all again; then the other half. Nobody delivers.
+        let mut to_ask_by_round = Vec::new();
+        for round in 0..16 {
+            let leaving: Vec<usize> = (0..peers.len()).filter(|p| p % 2 == round % 2).collect();
+            for &p in &leaving {
+                timings.time("on_peer_gone (2048 listed)", || relay.on_peer_gone(peers[p]));
+            }
+            now += Duration::from_millis(500);
+            note_asks(&mut asks, timings.time("poll", || relay.poll(&peers, now)));
+            for &p in &leaving {
+                // Its own chunks, and its predecessor's.
+                let prev = (p + peers.len() - 1) % peers.len();
+                for r in 0..chunks_per_peer {
+                    for owner in [p, prev] {
+                        list_timed(&mut relay, &mut timings, &mut asks, peers[p], chunk((r * peers.len() + owner) as u32), now);
+                    }
+                }
+            }
+            now += Duration::from_millis(500);
+            let wanted_before = relay.wanted.len();
+            note_asks(&mut asks, timings.time("poll", || relay.poll(&peers, now)));
+            check_bounds(&relay);
+            check_compacted(&relay, wanted_before);
+            peak.see(&relay);
+            to_ask_by_round.push((relay.wanted.len(), relay.peers.values().map(|p| p.to_ask.len()).max().unwrap_or(0)));
+        }
+
+        // Churn does not grow what is queued to ask: each round leaves it where the first did.
+        assert!(to_ask_by_round.iter().all(|(_, to_ask)| *to_ask <= to_ask_by_round[0].1), "{to_ask_by_round:?}");
+
+        now += WANTED_GIVE_UP;
+        for _ in 0..2 {
+            now += REREQUEST_AFTER;
+            timings.time(GIVE_UP_ALL, || relay.poll(&peers, now));
+        }
+        check_bounds(&relay);
+        check_drained(&relay);
+        timings.report("64 peers with full listings coming and going", &format!("  peaks: {peak:?}\n  (wanted, largest to_ask) after each round: {to_ask_by_round:?}"));
+    }
+
+    #[test]
+    fn a_peer_listing_every_wanted_id_can_leave_without_stalling_sync() {
+        // Joining ids someone else made wanted has no per-peer cap, so one peer's listing is
+        // bounded by its status rate and WANTED_GIVE_UP: (40 + 4/s * 60 s) statuses of 256 ids
+        // is more than MAX_WANTED. Its leaving then touches every wanted id.
+        let peers = load_peers();
+        let everywhere = peer(1000);
+        let all: Vec<ConnectionKey> = peers.iter().copied().chain([everywhere]).collect();
+        let mut relay = TxRelay::default();
+        let mut timings = Timings::default();
+        let mut asks = Asks::default();
+        let mut peak = Peak::default();
+        let mut now = Instant::now();
+        relay.poll(&all, now);
+        let start = now;
+        fill_wanted(&mut relay, &peers, &mut now, &mut timings, &mut asks, &mut peak);
+        // A status every 225 ms stays within its rate and lists everything inside the minute
+        // before the first ids are given up on. Nobody delivers.
+        for c in 0..(MAX_WANTED / MAX_TX_IDS_PER_STATUS) as u32 {
+            list_timed(&mut relay, &mut timings, &mut asks, everywhere, chunk(c), now);
+            now += Duration::from_millis(225);
+            if c % 4 == 3 {
+                let wanted_before = relay.wanted.len();
+                note_asks(&mut asks, timings.time("poll", || relay.poll(&all, now)));
+                check_bounds(&relay);
+                check_compacted(&relay, wanted_before);
+                peak.see(&relay);
+            }
+        }
+        assert!(now < start + WANTED_GIVE_UP);
+        let listed = relay.peers[&everywhere].listing.len();
+        let wanted = relay.wanted.len();
+        assert!(listed >= MAX_WANTED / 2, "listed {listed} of {wanted} wanted");
+        let to_ask_before = relay.peers.values().map(|p| p.to_ask.len()).sum::<usize>();
+        timings.time_bulk("on_peer_gone (every wanted id)", || relay.on_peer_gone(everywhere));
+        let to_ask_after = relay.peers.values().map(|p| p.to_ask.len()).sum::<usize>();
+        check_bounds(&relay);
+        peak.see(&relay);
+
+        now += WANTED_GIVE_UP;
+        for _ in 0..2 {
+            now += REREQUEST_AFTER;
+            timings.time(GIVE_UP_ALL, || relay.poll(&peers, now));
+        }
+        check_bounds(&relay);
+        check_drained(&relay);
+        timings.report(
+            "a peer listing every wanted id leaves",
+            &format!("  it listed {listed} of {wanted} wanted\n  to_ask, all peers: {to_ask_before} before it left, {to_ask_after} after\n  peaks: {peak:?}"),
+        );
+    }
+
+    #[test]
+    fn many_overdue_asks_are_re_made_and_given_up_on_without_stalling_sync() {
+        let peers = load_peers();
+        let mut relay = TxRelay::default();
+        let mut timings = Timings::default();
+        let mut asks = Asks::default();
+        let mut peak = Peak::default();
+        let mut now = Instant::now();
+        relay.poll(&peers, now);
+        fill_wanted(&mut relay, &peers, &mut now, &mut timings, &mut asks, &mut peak);
+        let in_flight: usize = relay.peers.values().map(|p| p.requested.len()).sum();
+        assert_eq!(in_flight, peers.len() * MAX_IN_FLIGHT_PER_PEER);
+
+        // Nobody ever delivers: every REREQUEST_AFTER, every peer's asks are overdue at once,
+        // demote it, and go to the other lister, until both have failed and it is forgotten.
+        let mut overdue_polls = 0;
+        let mut asks_by_poll = Vec::new();
+        let give_up_at = now + WANTED_GIVE_UP;
+        for _ in 0..(WANTED_GIVE_UP.as_secs() + 10) {
+            now += Duration::from_secs(1);
+            let op = if now >= give_up_at && !relay.wanted.is_empty() { GIVE_UP_ALL } else { "poll (asks overdue)" };
+            let wanted_before = relay.wanted.len();
+            let outs = timings.time(op, || relay.poll(&peers, now));
+            overdue_polls += usize::from(outs.iter().any(|o| matches!(o, Out::Ask { .. })));
+            check_bounds(&relay);
+            check_compacted(&relay, wanted_before);
+            peak.see(&relay);
+            asks_by_poll.push(relay.asks.len());
+        }
+        assert!(overdue_polls > 0);
+        check_drained(&relay);
+        timings.report("2048 asks overdue at once, nobody delivering", &format!("  peaks: {peak:?}\n  asks deque after each poll: {asks_by_poll:?}"));
+    }
+
+    /// A small xorshift generator: the random traffic test is the same on every run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    #[test]
+    fn random_relay_traffic_keeps_the_books_balanced_and_drains_to_nothing() {
+        let peers: Vec<ConnectionKey> = (1..=8).map(peer).collect();
+        let mut relay = TxRelay::default();
+        let mut rng = Rng(0x5eed_1234_abcd_0001);
+        let mut now = Instant::now();
+        let mut asks = Asks::default();
+        // Delivered and handed to the mempool: each gets exactly one outcome.
+        let mut submitted: Vec<(ConnectionKey, UnminedTxId)> = Vec::new();
+        let mut live = peers.clone();
+        relay.poll(&live, now);
+        for step in 0..20_000 {
+            let key = peers[rng.below(peers.len() as u64) as usize];
+            match rng.below(12) {
+                0..=2 => {
+                    // A listing: sizes differ by peer, so some deliveries are lies.
+                    let entries: Vec<(UnminedTxId, u32)> = (0..rng.below(40)).map(|_| (id(rng.below(3000) as u32), 500 + rng.below(3) as u32 * 100)).collect();
+                    for out in relay.on_status(key, entries, now) {
+                        match out {
+                            Out::Filter { from, entries } => {
+                                let keep: Vec<(UnminedTxId, u32)> = entries.into_iter().filter(|_| rng.below(4) != 0).collect();
+                                note_asks(&mut asks, relay.on_filtered(from, keep, now));
+                            }
+                            other => note_asks(&mut asks, [other]),
+                        }
+                    }
+                }
+                3..=4 => {
+                    // Some of what it was asked, at sizes that are sometimes larger than listed.
+                    let ids = asks.remove(&key).unwrap_or_default();
+                    let delivered: Vec<(UnminedTxId, u32)> = ids.iter().filter_map(|id| (rng.below(3) != 0).then(|| (*id, 500 + rng.below(4) as u32 * 100))).collect();
+                    submitted.extend(relay.on_delivered(key, &delivered, now).into_iter().map(|id| (key, id)));
+                }
+                5..=6 if !submitted.is_empty() => {
+                    let (from, id) = submitted.swap_remove(rng.below(submitted.len() as u64) as usize);
+                    let outcome = [Outcome::Accepted, Outcome::NotTaken, Outcome::Busy, Outcome::Invalid][rng.below(4) as usize];
+                    relay.on_outcome(from, id, outcome, now);
+                    if outcome == Outcome::Accepted {
+                        relay.on_added([(id, 500)]);
+                    }
+                }
+                7 => {
+                    // An ask that could not be sent.
+                    if let Some(ids) = asks.remove(&key) {
+                        relay.on_ask_unsent(key, &ids);
+                    }
+                }
+                8 => relay.on_body_dropped(key, now),
+                9 => {
+                    if live.contains(&key) && rng.below(4) == 0 {
+                        relay.on_peer_gone(key);
+                        asks.remove(&key);
+                        live.retain(|p| *p != key);
+                    } else if !live.contains(&key) {
+                        live.push(key);
+                    }
+                }
+                10 => relay.on_removed((0..rng.below(20)).map(|_| id(rng.below(3000) as u32))),
+                _ => {
+                    now += Duration::from_millis(rng.below(3000));
+                    let wanted_before = relay.wanted.len();
+                    note_asks(&mut asks, relay.poll(&live, now));
+                    check_bounds(&relay);
+                    check_compacted(&relay, wanted_before);
+                }
+            }
+            if step % 64 == 0 {
+                check_bounds(&relay);
+            }
+        }
+
+        // Every verdict arrives, every peer leaves or every ask is given up on.
+        for (from, id) in submitted.drain(..) {
+            relay.on_outcome(from, id, Outcome::NotTaken, now);
+        }
+        now += WANTED_GIVE_UP;
+        for _ in 0..2 {
+            now += REREQUEST_AFTER;
+            relay.poll(&live, now);
+        }
+        check_bounds(&relay);
+        check_drained(&relay);
+        assert!(relay.peers.values().all(|peer| peer.submitted == 0));
+    }
 }
