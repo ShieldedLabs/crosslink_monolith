@@ -2811,7 +2811,15 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             let peer = &mut peers.entry(key).or_insert_with(|| { new = true; Peer::default() });
 
             if !new {
-                continue;
+                if peer.stp_handshake_hash == handshake_hash {
+                    continue;
+                }
+                // Same key, new handshake hash: a new STP session (STP replaces a restarted peer's
+                // session in place, so the key never leaves the connection list). Start the peer
+                // over: the old hash fails the peer's ID verification, and we would kill it.
+                let () = transport::ASSUME_WANTED_OMITS_ONLY_KILLS;
+                println!("{:05}: Peer {:?} has a new STP session; verifying it again.", my_port, key);
+                **peer = Peer::default();
             }
 
             peer.stp_handshake_hash = handshake_hash;

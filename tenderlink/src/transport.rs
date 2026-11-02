@@ -354,6 +354,10 @@ impl Consumer {
 /// the last service returned, and take a peer out of it only on a kill path. A removal for any
 /// other reason (idle, over a peer limit) would be read as a kill and close the connection for
 /// every consumer, so every site that removes a connection from that list names this.
+///
+/// A key whose handshake hash changes is a new session (STP replaces a restarted peer's session
+/// in place, so the key never leaves the list). A consumer must treat it as one: per-session
+/// state kept by key alone (tenderlink's ID verification) is stale and would kill the new one.
 pub const ASSUME_WANTED_OMITS_ONLY_KILLS: () = ();
 
 /// A killed connection's key is not re-dialled for 1 s, doubling per kill up to 64 s; the
