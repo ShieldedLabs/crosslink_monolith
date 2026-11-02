@@ -38,6 +38,8 @@ pub fn default_test_config(net: &Network) -> ZebradConfig {
         // The OS automatically chooses an unused port.
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         crawl_new_peer_interval: TEST_DURATION,
+        // These tests run the legacy network: listening and connecting are what many check.
+        legacy_network: true,
         ..zebra_network::Config::default()
     };
 

@@ -369,6 +369,12 @@ impl StartCmd {
             &config.network.network,
         );
 
+        if config.zcashd_compat.enabled && !config.network.legacy_network {
+            warn!(
+                "zcashd_compat is enabled but the legacy network is off: the zcashd sidecar connects \
+                 over it, so set network.legacy_network = true"
+            );
+        }
         let zcashd_compat_block_gossip_peer_ips = if config.zcashd_compat.enabled {
             if config.zcashd_compat.block_gossip_peer_ips.is_empty() {
                 // The sidecar privileges (pinned gossip, reserved slot, stall
