@@ -4666,6 +4666,9 @@ fn crosslink_bft_node_locked_on_a_value_proposes_it_again() {
 #[path = "crosslink/fuzz.rs"]
 mod fuzz;
 
+#[path = "crosslink/stale_race.rs"]
+mod stale_race;
+
 /// Crosslink parameters for twelve seats, the deployed roster cap: a dozen funded bonds land by
 /// the roster height, 20, and BFT starts at 121, the first height more than
 /// MAX_BLOCK_REORG_HEIGHT above it.
