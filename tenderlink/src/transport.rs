@@ -1594,7 +1594,7 @@ mod tests {
         for (source, count) in [
             (
                 include_str!("../../zebra-crosslink/zebrad/src/config.rs"),
-                3,
+                2, // @Nightly @Todo: The featurenet build has 3.
             ),
             (
                 include_str!("../../zebra-crosslink/dilated_regtest/node0.toml.in"),
@@ -1607,6 +1607,7 @@ mod tests {
         ] {
             let peers: Vec<_> = source
                 .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
                 .filter(|line| line.contains("]:12001:") || line.contains("]:12002:"))
                 .map(|line| line.split('"').nth(1).expect("quoted peer address"))
                 .collect();
