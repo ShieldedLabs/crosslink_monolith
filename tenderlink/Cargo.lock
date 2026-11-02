@@ -1504,7 +1504,7 @@ dependencies = [
 [[package]]
 name = "shielded_transport_pigeon"
 version = "2.0.0"
-source = "git+https://github.com/ShieldedLabs/shielded_transport_pigeon?rev=1747e547672e49604e209c2315640846a961b1c3#1747e547672e49604e209c2315640846a961b1c3"
+source = "git+https://github.com/ShieldedLabs/shielded_transport_pigeon?rev=8abba44ac001a0230bd08d50ec322950840dfa8e#8abba44ac001a0230bd08d50ec322950840dfa8e"
 dependencies = [
  "blake3",
  "curve25519-dalek",
