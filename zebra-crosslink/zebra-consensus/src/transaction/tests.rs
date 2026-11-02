@@ -4891,6 +4891,54 @@ mod staking_signature {
         assert!(matches!(err, TransactionError::StakingActionSignatureInvalid { .. }));
     }
 
+    fn coinbase_with(staking_action: Option<StakingAction>) -> Transaction {
+        Transaction::VCrosslink {
+            network_upgrade: NU,
+            lock_time: LockTime::Height(block::Height(0)),
+            expiry_height: block::Height(1),
+            inputs: vec![zebra_chain::transparent::Input::Coinbase {
+                height: block::Height(1),
+                data: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+            staking_action,
+        }
+    }
+
+    /// The coinbase balance leaves staking value out, so any staking action in a coinbase is
+    /// refused: a bond created there would be paid for by nothing. The rule comes first in
+    /// `check_block_transaction`, so a coinbase outside the staking window gets this error too.
+    #[test]
+    fn coinbase_with_a_staking_action_is_rejected() {
+        let network = zebra_chain::parameters::Network::new_regtest(Default::default());
+        let (create, key) = create_action([0xa1; 32]);
+        let unique_pubkey = create.unique_pubkey();
+        let actions = [
+            create,
+            StakingAction::BeginDelegationUnbonding { unique_pubkey, signature: [0; 64] },
+            StakingAction::WithdrawDelegationBond { amount_zats: AMOUNT, unique_pubkey, signature: [0; 64] },
+        ];
+
+        for action in actions {
+            let coinbase = coinbase_with(Some(action));
+            assert!(matches!(
+                check::coinbase_has_no_staking_action(&coinbase),
+                Err(TransactionError::CoinbaseHasStakingAction)
+            ));
+            assert!(matches!(
+                crate::transaction::check_block_transaction(&coinbase, block::Height(1), chrono::Utc::now(), &network),
+                Err(TransactionError::CoinbaseHasStakingAction)
+            ));
+        }
+
+        assert!(check::coinbase_has_no_staking_action(&coinbase_with(None)).is_ok());
+        assert!(check::coinbase_has_no_staking_action(&signed_with(create, &key)).is_ok());
+    }
+
     /// The mempool admits a staking action only if the bond at the tip allows it, which is what
     /// keeps a second unbonding of the same bond out of the mempool and out of block templates.
     #[test]

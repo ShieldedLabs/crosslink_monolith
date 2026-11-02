@@ -1012,6 +1012,8 @@ pub fn check_block_transaction(
     time: DateTime<Utc>,
     network: &Network,
 ) -> Result<(), TransactionError> {
+    check::coinbase_has_no_staking_action(tx)?;
+
     // Staking actions are only allowed during specific block ranges.
     check_staking_day_window(tx, height, &network.crosslink_parameters())?;
 
