@@ -247,9 +247,12 @@ impl ZebradConfig {
         // not a default value, so it is deliberately NOT serialized by `crosslink_default`
         // / `generate` — load always appends it, which keeps generate-then-load equivalent
         // to running with no config file.
+        // @Nightly @Todo: Nightly builds keep their chain apart from the featurenet's. Restore the
+        // featurenet's directory when dev goes back to the featurenet.
         config.state
             .cache_dir
-            .push("crosslink_featurenet_20260929_staking3d");
+            // .push("crosslink_featurenet_20260929_staking3d");
+            .push("crosslink_nightly_20261102");
 
         // Merge user-led slashforks with the ones shipped in the executable, validate
         // them, and store the canonical (sorted, deduplicated) list back. Building
@@ -294,10 +297,14 @@ impl ZebradConfig {
             crosslink: zebra_crosslink::config::Config::default(),
 
             state: zebra_state::config::Config {
+                // @Nightly @Todo: Nightly builds reach the nightly nodes and use the nightly network magic
+                // below. Restore the featurenet's peers and magic when dev goes back to the featurenet.
                 network_initial_peers: vec![
-                    "[::ffff:45.63.75.9]:12001:-fCmrBqp:-w4ArAa4esTUBjgig6xIQJ4N8DlwL5aufGMcDPGzPE4".to_owned(),
-                    "[::ffff:70.34.220.94]:12001:-fCmrBqp:CgjQzIjxFknQOJfxKP4H5adl3uzGfAN1D0219Q3JSyw".to_owned(),
-                    "[::ffff:64.177.44.176]:12001:-fCmrBqp:jY7963HX-GzMkOhi1c7kxmeKXC4juGhwY2l4NlQheBs".to_owned(),
+                    // "[::ffff:45.63.75.9]:12001:-fCmrBqp:-w4ArAa4esTUBjgig6xIQJ4N8DlwL5aufGMcDPGzPE4".to_owned(),
+                    // "[::ffff:70.34.220.94]:12001:-fCmrBqp:CgjQzIjxFknQOJfxKP4H5adl3uzGfAN1D0219Q3JSyw".to_owned(),
+                    // "[::ffff:64.177.44.176]:12001:-fCmrBqp:jY7963HX-GzMkOhi1c7kxmeKXC4juGhwY2l4NlQheBs".to_owned(),
+                    "[::ffff:45.32.186.234]:12001:-fCmrBqp:dUhGUdCw0vhbhDOKINxDDkk93RHBRRuJuW2EY0zJHyU".to_owned(),
+                    "[::ffff:64.177.122.73]:12001:-fCmrBqp:_DrOHtqUAEtbYadBv2Dt5OzNqbtT07tDZ9iyddSqFgw".to_owned(),
                 ],
                 ..Default::default()
             },
@@ -305,15 +312,18 @@ impl ZebradConfig {
             network: zebra_network::config::Config {
                 initial_testnet_peers: {
                     let mut peers = indexmap::IndexSet::new();
-                    peers.insert("45.63.75.9:8233".to_owned());
-                    peers.insert("70.34.220.94:8233".to_owned());
-                    peers.insert("64.177.44.176:8233".to_owned());
+                    // peers.insert("45.63.75.9:8233".to_owned());
+                    // peers.insert("70.34.220.94:8233".to_owned());
+                    // peers.insert("64.177.44.176:8233".to_owned());
+                    peers.insert("45.32.186.234:8233".to_owned());
+                    peers.insert("64.177.122.73:8233".to_owned());
                     peers
                 },
 
                 network: testnet::Parameters::build()
                     // .with_network_name("Crosslink_Nightly_0")
-                    .with_network_magic(magics::CROSSLINK_FEATURENET)
+                    // .with_network_magic(magics::CROSSLINK_FEATURENET)
+                    .with_network_magic(magics::CROSSLINK_NIGHTLYNET)
                     .expect("Crosslink testnet magic is not a reserved value")
                     .with_slow_start_interval(Height(0))
                     // Tail Confirmation checks carried headers against ThresholdBits, which a

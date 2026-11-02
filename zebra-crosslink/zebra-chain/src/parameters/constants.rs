@@ -41,6 +41,8 @@ pub mod magics {
     pub const REGTEST: Magic = Magic([0xaa, 0xe8, 0x3f, 0x5f]);
     /// The Crosslink featurenet ("ClT1"), a configured testnet (zebrad's default config).
     pub const CROSSLINK_FEATURENET: Magic = Magic(*b"ClT1");
+    /// The Crosslink nightly network ("CNi1"), a configured testnet (zebrad's default config on nightly builds).
+    pub const CROSSLINK_NIGHTLYNET: Magic = Magic(*b"CNi1");
 }
 
 /// The block heights at which network upgrades activate.
