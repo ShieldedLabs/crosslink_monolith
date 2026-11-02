@@ -68,6 +68,9 @@ pub fn test_start() {
         *CROSSLINK_TEST_CONFIG_OVERRIDE.lock().unwrap() = {
             let mut base = ZebradConfig::default();
             base.network.network = test_network(&crosslink, &node_config);
+            // The built-in lite checkpoint is the featurenet's; on a test chain no peer can prove it
+            // holds that block, so nothing would ever be downloaded. A test file may set its own.
+            base.state.network_checkpoint = None;
             if !node_config.is_empty() {
                 let file: ZebradConfig = toml::from_str(&node_config).expect("a test file's node config parses as zebrad.toml");
                 base.crosslink.slashforks = file.crosslink.slashforks;
