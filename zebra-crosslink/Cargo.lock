@@ -1515,7 +1515,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.3",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -6135,7 +6135,7 @@ dependencies = [
 [[package]]
 name = "shielded_transport_pigeon"
 version = "2.0.0"
-source = "git+https://github.com/ShieldedLabs/shielded_transport_pigeon?rev=1747e547672e49604e209c2315640846a961b1c3#1747e547672e49604e209c2315640846a961b1c3"
+source = "git+https://github.com/ShieldedLabs/shielded_transport_pigeon?rev=8abba44ac001a0230bd08d50ec322950840dfa8e#8abba44ac001a0230bd08d50ec322950840dfa8e"
 dependencies = [
  "blake3",
  "curve25519-dalek",
