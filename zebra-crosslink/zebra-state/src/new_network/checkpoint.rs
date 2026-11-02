@@ -26,6 +26,36 @@ mod tests {
 
     const HASH_HEX: &str = "02fc9aa7652b2a9a9f6196a446265fed6012227373ed34e0b17c7a3298db005e";
 
+    /// The built-in checkpoint is the featurenet's: it holds only there. A configured one, or an
+    /// explicit disable, applies on any network.
+    #[test]
+    fn the_built_in_checkpoint_applies_only_on_the_featurenet() {
+        use crate::config::{featurenet_checkpoint, Config};
+        use zebra_chain::parameters::{constants::magics, testnet, Network};
+
+        let featurenet = testnet::Parameters::build()
+            .with_network_magic(magics::CROSSLINK_FEATURENET)
+            .unwrap()
+            .to_network()
+            .unwrap();
+        let regtest = Network::new_regtest(Default::default());
+        let others = [Network::Mainnet, Network::new_default_testnet(), regtest];
+
+        let default = Config::default();
+        assert_eq!(default.network_checkpoint, Some(featurenet_checkpoint()));
+        assert_eq!(default.network_checkpoint_for(&featurenet), Some(featurenet_checkpoint()));
+        for network in &others {
+            assert_eq!(default.network_checkpoint_for(network), None, "{network}");
+        }
+
+        let pinned = Config { network_checkpoint: Some((100, HASH_HEX.parse().unwrap())), ..Config::default() };
+        let disabled = Config { network_checkpoint: None, ..Config::default() };
+        for network in others.iter().chain([&featurenet]) {
+            assert_eq!(pinned.network_checkpoint_for(network), pinned.network_checkpoint, "{network}");
+            assert_eq!(disabled.network_checkpoint_for(network), None, "{network}");
+        }
+    }
+
     fn cp() -> Checkpoint {
         Checkpoint { height: 100, hash: HASH_HEX.parse().unwrap() }
     }

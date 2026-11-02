@@ -192,7 +192,8 @@ pub struct Config {
 
     /// Lite checkpoint: the synced chain must contain `hash` at `height`
     /// see `new_network/checkpoint.rs`
-    /// see `Default for Config`
+    /// defaults to the featurenet's [`featurenet_checkpoint`], which applies only on the
+    /// featurenet (see [`Config::network_checkpoint_for`])
     /// disable by specifying `height = 0` with `hash = ""` (exactly that pair)
     #[serde(with = "network_checkpoint_toml")]
     pub network_checkpoint: Option<NetworkCheckpoint>,
@@ -204,6 +205,11 @@ pub struct Config {
 
 /// Lite checkpoint pin: `(height, hash)`. `None` means disabled.
 pub type NetworkCheckpoint = (u32, block::Hash);
+
+/// The built-in lite checkpoint: a featurenet block, the default for `network_checkpoint`.
+pub fn featurenet_checkpoint() -> NetworkCheckpoint {
+    (115014, "000068d97d552a99dbf1bc327e1a9be7a0aeeda45c1b537a5433e3c7fce8e320".parse().expect("valid checkpoint hash"))
+}
 
 // the on-disk shape; `height = 0, hash = ""` (exactly that pair) means disabled.
 // `hash` is hex, display order. anything else invalid rejects the whole config.
@@ -248,6 +254,18 @@ fn gen_temp_path(prefix: &str) -> PathBuf {
 }
 
 impl Config {
+    /// The lite checkpoint to enforce on `network`. The built-in [`featurenet_checkpoint`] names
+    /// a featurenet block, so it can only hold there: on any other network it is ignored, or no
+    /// peer could prove it holds the block and nothing would be downloaded. A checkpoint set in
+    /// the config applies on any network, and an explicit disable everywhere.
+    pub fn network_checkpoint_for(&self, network: &Network) -> Option<NetworkCheckpoint> {
+        use zebra_chain::parameters::constants::magics;
+        match self.network_checkpoint {
+            Some(checkpoint) if checkpoint == featurenet_checkpoint() && network.magic() != magics::CROSSLINK_FEATURENET => None,
+            other => other,
+        }
+    }
+
     /// Returns the path for the database, based on the kind, major version and network.
     /// Each incompatible database format or network gets its own unique path.
     pub fn db_path(
@@ -328,7 +346,7 @@ impl Default for Config {
             network_local_port: 0,
             network_initial_peers: Vec::new(),
             network_connect_only: false,
-            network_checkpoint: Some((115014, "000068d97d552a99dbf1bc327e1a9be7a0aeeda45c1b537a5433e3c7fce8e320".parse().expect("valid checkpoint hash"))),
+            network_checkpoint: Some(featurenet_checkpoint()),
             slashfork_schedule: Default::default(),
         }
     }

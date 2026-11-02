@@ -285,7 +285,7 @@ impl ZebradConfig {
     pub fn crosslink_default() -> Self {
         use zebra_chain::{
             block::Height,
-            parameters::{subsidy::FundingStreamReceiver, testnet, Magic},
+            parameters::{constants::magics, subsidy::FundingStreamReceiver, testnet},
         };
 
         Self {
@@ -313,7 +313,7 @@ impl ZebradConfig {
 
                 network: testnet::Parameters::build()
                     // .with_network_name("Crosslink_Nightly_0")
-                    .with_network_magic(Magic([b'C', b'l', b'T', b'1']))
+                    .with_network_magic(magics::CROSSLINK_FEATURENET)
                     .expect("Crosslink testnet magic is not a reserved value")
                     .with_slow_start_interval(Height(0))
                     // Tail Confirmation checks carried headers against ThresholdBits, which a

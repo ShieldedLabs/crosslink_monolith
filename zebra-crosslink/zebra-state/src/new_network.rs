@@ -2288,7 +2288,7 @@ pub fn sync(
 
 
     // Lite checkpoint: enforced at the commit-queue push, and stays armed forever.
-    let checkpoint = Checkpoint::from_config(&config.network_checkpoint);
+    let checkpoint = Checkpoint::from_config(&config.network_checkpoint_for(&read_state.network()));
     // while false we need to filter out peers who do not have the checkpoint
     let mut checkpoint_committed_locally = match &checkpoint {
         None => true,

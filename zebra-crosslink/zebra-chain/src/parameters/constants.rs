@@ -39,6 +39,8 @@ pub mod magics {
     pub const TESTNET: Magic = Magic([0xfa, 0x1a, 0xf9, 0xbf]);
     /// The regtest, see <https://github.com/zcash/zcash/blob/master/src/chainparams.cpp#L716-L719>
     pub const REGTEST: Magic = Magic([0xaa, 0xe8, 0x3f, 0x5f]);
+    /// The Crosslink featurenet ("ClT1"), a configured testnet (zebrad's default config).
+    pub const CROSSLINK_FEATURENET: Magic = Magic(*b"ClT1");
 }
 
 /// The block heights at which network upgrades activate.
