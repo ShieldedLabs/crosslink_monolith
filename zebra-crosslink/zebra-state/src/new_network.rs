@@ -4548,6 +4548,8 @@ mod tests {
         assert_eq!(read_hello(&hello[1..hello.len() - 1]), None);
     }
 
+    // This module is compiled outside tests too, and proptest is a dev-dependency.
+    #[cfg(test)]
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2048))]
 
