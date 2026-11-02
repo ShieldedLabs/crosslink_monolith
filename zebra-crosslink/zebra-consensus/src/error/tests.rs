@@ -74,6 +74,7 @@ fn crypto_and_structural_failures_are_state_independent() {
         TransactionError::NoInputs,
         TransactionError::NoOutputs,
         TransactionError::WrongVersion,
+        TransactionError::CoinbaseHasStakingAction,
     ] {
         assert!(!error.is_state_dependent(true), "{error:?}");
     }

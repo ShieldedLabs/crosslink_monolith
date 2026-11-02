@@ -492,7 +492,8 @@ impl TransactionError {
             | WrongVersion
             | NoInputs
             | NoOutputs
-            | BadBalance => false,
+            | BadBalance
+            | CoinbaseHasStakingAction => false,
 
             // Signatures over the sighash. `SaplingVerificationFailed` batches proofs with the
             // spend-auth and binding signatures, so it is classified as a signature failure.
