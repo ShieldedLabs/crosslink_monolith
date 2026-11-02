@@ -1895,6 +1895,26 @@ impl BlockGen {
         }
     }
 
+    /// `block`, which must be this generator's tip, with its coinbase replaced and its merkle root
+    /// and commitment rebuilt, so the header stays consistent with the new transaction.
+    fn tip_with_coinbase(&self, block: &Block, coinbase: Transaction) -> Arc<Block> {
+        let mut block = block.clone();
+        block.transactions[0] = Arc::new(coinbase);
+
+        let height = block.coinbase_height().expect("generated blocks have a height");
+        let mut header = block.header.as_ref().clone();
+        header.merkle_root = block.transactions.iter().collect();
+        header.commitment_bytes = HexDebug(BlockGen::commitment_bytes(
+            &self.network,
+            height,
+            &self.history_tree,
+            &block.transactions,
+            &header.fat_pointer_to_bft_block,
+        ));
+        block.header = Arc::new(header);
+        Arc::new(block)
+    }
+
     pub fn next_block(&mut self, miner_addr: &Address) -> Arc<zebra_chain::block::Block> {
         self.next_block_with_txs(miner_addr, &[])
     }
@@ -3800,6 +3820,76 @@ fn crosslink_reject_pow_block_with_oversized_staking_amount() {
 
     // Answering this needs the node still running, with its chain unchanged.
     tf.push_instr_expect_pow_chain_length(2, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// `coinbase` rebuilt as a VCrosslink transaction that also creates a bond of `amount_zats`, signed
+/// by the bond key. Its outputs are unchanged, so nothing pays for the bond.
+fn coinbase_creating_bond(
+    coinbase: &Transaction,
+    upgrade: NetworkUpgrade,
+    bond_seed: &[u8],
+    target_finalizer: zcash_primitives::bft::FinalizerAddress,
+    amount_zats: u64,
+) -> Transaction {
+    use zebra_chain::transaction::HashType;
+    use zcash_primitives::transaction::StakingAction;
+
+    let (_, bond_signing_key, bond_pub_key) = zebra_crosslink::rng_private_public_key_from_address(bond_seed);
+    let build = |signature: [u8; 64]| Transaction::VCrosslink {
+        network_upgrade: upgrade,
+        lock_time: LockTime::unlocked(),
+        expiry_height: coinbase.expiry_height().expect("a coinbase expires at its own height"),
+        inputs: coinbase.inputs().to_vec(),
+        outputs: coinbase.outputs().to_vec(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+        staking_action: Some(StakingAction::CreateNewDelegationBond {
+            amount_zats,
+            unique_pubkey: bond_pub_key.0,
+            bond_salt: [0; 32],
+            target_finalizer,
+            signature,
+        }),
+    };
+
+    let sighash = build([0; 64])
+        .sighash(upgrade, HashType::ALL, Arc::new(Vec::new()), None)
+        .expect("a VCrosslink transaction has a sighash");
+    build(bond_signing_key.sign(sighash.as_ref()).into())
+}
+
+/// A coinbase that creates a bond, with its outputs still paying the full subsidy, is rejected.
+/// Coinbase balance leaves staking value out, so this used to mint the bond from nothing. The bad
+/// block is built on a copy of the generator, so the good block at the same height follows it.
+#[test]
+fn crosslink_reject_pow_block_with_staking_action_in_coinbase() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+
+    let network = regtest_network(&HARNESS_PARAMETERS);
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    tf.push_instr_load_pow(&gen.tip, 0);
+
+    let target = zcash_primitives::bft::FinalizerAddress::create(
+        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").1,
+    );
+    const BOND_ZATS: u64 = 1_000_000_000_000;
+    let upgrade = gen.next_upgrade();
+    let mut bad_gen = gen.clone();
+    let honest = bad_gen.next_block(&miner_addr);
+    let coinbase = coinbase_creating_bond(&honest.transactions[0], upgrade, b"coinbase-bond", target, BOND_ZATS);
+    tf.push_instr_load_pow(&bad_gen.tip_with_coinbase(&honest, coinbase), SHOULD_FAIL);
+
+    // Answering this needs the node still running, with its chain unchanged.
+    tf.push_instr_expect_pow_chain_length(2, 0);
+
+    tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
+    tf.push_instr_expect_pow_chain_length(3, 0);
 
     test_bytes(tf.write_to_bytes());
 }
