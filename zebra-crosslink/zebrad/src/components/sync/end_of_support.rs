@@ -13,7 +13,7 @@ use zebra_chain::{
 use crate::application::release_version;
 
 /// The estimated height that this release will be published.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 93_545;
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 115_800;
 
 /// The number of blocks per day on the featurenet, with its 25-second block time.
 pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET_SPACING;
