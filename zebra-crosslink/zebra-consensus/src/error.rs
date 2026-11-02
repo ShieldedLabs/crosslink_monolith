@@ -335,6 +335,9 @@ pub enum TransactionError {
         staking_height: u32,
     },
 
+    #[error("coinbase transaction MUST NOT have a staking action")]
+    CoinbaseHasStakingAction,
+
     #[error("staking action bond key is not usable as a bond key (undecodable or small order): {bond_key:?}")]
     StakingActionBondKeyInvalid { bond_key: [u8; 32] },
 
@@ -602,6 +605,7 @@ impl TransactionError {
             | CoinbaseHasEnableSpendsOrchard
             | CoinbaseHasEnableSpendsIronwood
             | CoinbaseHasOrchardActions
+            | CoinbaseHasStakingAction
             | OrchardHasEnableCrossAddress
             | CoinbaseOutputsNotDecryptable
             | CoinbaseInMempool
