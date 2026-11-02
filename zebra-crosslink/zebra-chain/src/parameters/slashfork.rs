@@ -24,20 +24,24 @@ pub use zcash_primitives::bft::SlashForkConfig;
 /// User-led slashforks (from the config file) are merged with these, since over
 /// time user-led slashforks become assumed by the software.
 pub fn shipped_slashforks() -> Vec<SlashForkConfig> {
-    // flip hex from config toml order to PubKeyID correct order
-    let finalizer_from_hex = |hex_str: &str| {
-        let mut bytes = [0u8; 32];
-        hex::decode_to_slice(hex_str, &mut bytes).expect("valid 64-char hex");
-        bytes.reverse();
-        zcash_primitives::bft::PubKeyID(bytes)
-    };
-
-    vec![SlashForkConfig {
-        // Slash activations must start a staking day; this is 22 prototype staking periods.
-        pow_activation_height: 228_096,
-        bft_certificate_height: 2158,
-        terminated_finalizers: vec![finalizer_from_hex("b8c5272fe6d34980ba6e8aa88d65a6cbf3daabaabea80bdd51a5a5d3bce30c9e")],
-    }]
+    // @Nightly @Todo: A slashing slashfork must start a staking day, and 228,096 does not on the
+    // nightly calendar (period 150), so a node would refuse to start. Nightly builds ship no
+    // slashforks. Restore the rule below when dev goes back to the featurenet.
+    // // flip hex from config toml order to PubKeyID correct order
+    // let finalizer_from_hex = |hex_str: &str| {
+    //     let mut bytes = [0u8; 32];
+    //     hex::decode_to_slice(hex_str, &mut bytes).expect("valid 64-char hex");
+    //     bytes.reverse();
+    //     zcash_primitives::bft::PubKeyID(bytes)
+    // };
+    //
+    // vec![SlashForkConfig {
+    //     // Slash activations must start a staking day; this is 22 prototype staking periods.
+    //     pow_activation_height: 228_096,
+    //     bft_certificate_height: 2158,
+    //     terminated_finalizers: vec![finalizer_from_hex("b8c5272fe6d34980ba6e8aa88d65a6cbf3daabaabea80bdd51a5a5d3bce30c9e")],
+    // }]
+    Vec::new()
 }
 
 /// The canonical, ordered set of slashfork rules in effect for a node.
