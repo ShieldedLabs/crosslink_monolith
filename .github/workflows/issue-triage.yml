@@ -308,7 +308,7 @@ jobs:
             item=$(gh api graphql -f project="$PROJECT_ID" -f content="$(jq -r .id <<<"$info")" \
               -f query='mutation($project: ID!, $content: ID!) { addProjectV2ItemById(input: { projectId: $project, contentId: $content }) { item { id } } }' \
               --jq '.data.addProjectV2ItemById.item.id')
-            set_option Status "new uncategorized"
+            set_option Status "Uncategorized"
           fi
           if [ -z "$OUT" ]; then exit 0; fi
           # Triage only fills in an empty Area or Urgency, so it never overwrites what people set. An Urgency
