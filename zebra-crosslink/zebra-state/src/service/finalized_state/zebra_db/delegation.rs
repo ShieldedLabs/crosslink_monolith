@@ -350,6 +350,16 @@ impl DiskWriteBatch {
                     }
                     StakingActionKind::Null => {}
                 }
+
+                if staking_action.spends().is_some() {
+                    let mut bond = overlay.bonds.get(&bond_key).cloned()
+                        .or_else(|| db.delegation_bond(&bond_key))
+                        .ok_or_else(|| format!("bond {:?} not found for a spent version", bond_key))?;
+                    bond.version = Some(transaction.hash().0);
+                    overlay.bonds.insert(bond_key, bond);
+                    let delegation_bond_by_key_cf = db.db.cf_handle(DELEGATION_BOND_BY_KEY).unwrap();
+                    self.zs_insert(&delegation_bond_by_key_cf, bond_key, bond);
+                }
             }
         }
 
@@ -637,6 +647,7 @@ mod finalizer_address_tests {
             signature: [0; 64],
             from_finalizer,
             to_finalizer,
+            spends: None,
         }
     }
 
@@ -696,7 +707,7 @@ mod finalizer_address_tests {
         batch.prepare_finalizer_addresses_batch(
             db,
             &[
-                StakingAction::BeginDelegationUnbonding { unique_pubkey: [1; 32], signature: [0; 64] },
+                StakingAction::BeginDelegationUnbonding { unique_pubkey: [1; 32], signature: [0; 64], spends: None },
                 StakingAction::ConvertFinalizerRewardToDelegationBond {
                     this_finalizer: address(b"raw").pub_key.0,
                     amount_zats: 1,

@@ -1908,7 +1908,7 @@ pub fn update_chain_tip_with_delegation_bond(
     bond_retargets: &mut Vec<HashMap<finalized_state::disk_format::BondKey, [u8; 32]>>,
     finalizer_rewards: &mut HashMap<[u8; 32], u64>,
     staking_action: &zcash_primitives::transaction::StakingAction,
-    _transaction_hash: &zebra_chain::transaction::Hash,
+    transaction_hash: &zebra_chain::transaction::Hash,
     transaction_location: finalized_state::disk_format::TransactionLocation,
 ) -> Result<(), ValidateContextError> {
     use zcash_primitives::transaction::StakingActionKind;
@@ -2021,6 +2021,12 @@ pub fn update_chain_tip_with_delegation_bond(
             );
         }
         StakingActionKind::Null => {}
+    }
+
+    if staking_action.spends().is_some() {
+        let (bond, _status) = delegation_bonds.get_mut(&bond_key)
+            .expect("a spent bond must exist in chain (should have been validated)");
+        bond.version = Some(transaction_hash.0);
     }
 
     Ok(())

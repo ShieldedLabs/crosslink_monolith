@@ -2301,7 +2301,8 @@ impl ManualWallet {
             src_pools: &[TxPool::Ironwood(orchard_tree), TxPool::Transparent],
             staking_action: Some(StakingAction::BeginDelegationUnbonding {
                 unique_pubkey: bond_key,
-                signature: [0u8; 64]
+                signature: [0u8; 64],
+                spends: self.bond_spends(&network, bond_key),
             }),
             staking_signing_key: Some(signing_key),
         };
@@ -2327,6 +2328,29 @@ impl ManualWallet {
         target
     }
 
+    /// The bond version this wallet's next action on `bond_key` must spend, or `None` before
+    /// FeaturenetUpgrade3, when actions carry none. The version starts as the bond key, and each
+    /// mined action that spends it moves it to that action's txid, so it is found by following
+    /// those spends from the bond key through this wallet's own mined transactions.
+    pub fn bond_spends<P: Parameters>(&self, network: &P, bond_key: [u8; 32]) -> Option<[u8; 32]> {
+        let next_h = LRZBlockHeight::from_u32(self.chain_tip_h.0 + 1);
+        if !network.is_nu_active(zcash_protocol::consensus::NetworkUpgrade::FeaturenetUpgrade3, next_h) {
+            return None;
+        }
+        let mut version = bond_key;
+        'follow: loop {
+            for tx in &self.txs {
+                if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
+                let Some(action) = tx.staking_action.as_ref() else { continue };
+                if action.bond_key() == bond_key && action.spends() == Some(version) {
+                    version = *tx.txid.as_ref();
+                    continue 'follow;
+                }
+            }
+            return Some(version);
+        }
+    }
+
     pub fn retarget_bond_using_ironwood<P: Parameters>(
         &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
         src_usk: &UnifiedSpendingKey, orchard_tree: &OrchardShardTree, bond_key: [u8; 32], new_target: bft::FinalizerAddress,
@@ -2350,6 +2374,7 @@ impl ManualWallet {
                 signature: [0u8; 64],
                 from_finalizer,
                 to_finalizer: new_target,
+                spends: self.bond_spends(&network, bond_key),
             }),
             staking_signing_key: Some(signing_key),
         };
@@ -2388,7 +2413,8 @@ impl ManualWallet {
                 staking_action: Some(StakingAction::WithdrawDelegationBond {
                     amount_zats,
                     unique_pubkey: bond_key,
-                    signature: [0u8; 64]
+                    signature: [0u8; 64],
+                    spends: self.bond_spends(&network, bond_key),
                 }),
                 staking_signing_key: Some(signing_key),
             };

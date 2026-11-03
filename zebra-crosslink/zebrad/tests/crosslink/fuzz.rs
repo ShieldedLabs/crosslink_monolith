@@ -136,7 +136,9 @@ pub(crate) enum FuzzBondState {
 /// A bond and what the generator believes the node holds for it: `state`, entered at `at`
 /// (height and block hash on `main`), and the index of the `fuzz_finalizer` it targets, which
 /// its last retarget, if any, set at `target_at`. A retarget does not move `at`, since the
-/// staking action delay counts from the bond's creation and its unbonding only.
+/// staking action delay counts from the bond's creation and its unbonding only. `version` is
+/// the bond version its next action spends under FeaturenetUpgrade3: its key, then the txid of
+/// the last action that spent it, which also moved `at` or `target_at`.
 #[derive(Clone)]
 pub(crate) struct FuzzBond {
     pub seed: Vec<u8>,
@@ -146,6 +148,7 @@ pub(crate) struct FuzzBond {
     pub known: bool,
     pub target: usize,
     pub target_at: (u32, BlockHash),
+    pub version: [u8; 32],
 }
 
 /// A staking action on bond `bond_i`, mined on `main` at `height` in the block with hash
@@ -580,15 +583,15 @@ fn fuzz_finalizer(i: usize) -> zcash_primitives::bft::FinalizerAddress {
 const RETARGET_EXPIRY_FROM: u32 = 1_000_000;
 
 /// A retarget of the bond `bond_seed` names, from `fuzz_finalizer(from)` to `fuzz_finalizer(to)`,
-/// for the next block of `main`. Each call makes a distinct transaction.
-fn fuzz_retarget(g: &mut FuzzGen, bond_seed: &[u8], from: usize, to: usize) -> Arc<Transaction> {
+/// spending `spends`, for the next block of `main`. Each call makes a distinct transaction.
+fn fuzz_retarget(g: &mut FuzzGen, bond_seed: &[u8], from: usize, to: usize, spends: Option<[u8; 32]>) -> Arc<Transaction> {
     use zcash_primitives::transaction::StakingAction;
 
     g.txs_made += 1;
     let expiry_height = RETARGET_EXPIRY_FROM + g.txs_made as u32;
     let (from_finalizer, to_finalizer) = (fuzz_finalizer(from), fuzz_finalizer(to));
     signed_staking_tx(g.tip().next_upgrade(), bond_seed, expiry_height, |unique_pubkey, signature| {
-        StakingAction::RetargetDelegationBond { unique_pubkey, signature, from_finalizer, to_finalizer }
+        StakingAction::RetargetDelegationBond { unique_pubkey, signature, from_finalizer, to_finalizer, spends }
     })
 }
 
@@ -615,7 +618,52 @@ fn mine_staking(
         bond.at = at;
     }
     bond.known = known;
+    if tx.staking_action().and_then(|action| action.spends()).is_some() {
+        bond.version = tx.hash().0;
+    }
     g.mined_staking.push(FuzzMinedStaking { tx, bond_i, height: at.0, block: at.1, retarget });
+}
+
+/// Whether the next block of `main` is under FeaturenetUpgrade3, where an action on a bond must
+/// spend the bond's version.
+fn spends_versions(g: &FuzzGen) -> bool {
+    NetworkUpgrade::FeaturenetUpgrade3
+        .activation_height(&g.network)
+        .is_some_and(|activation_height| BlockHeight(g.height() + 1) >= activation_height)
+}
+
+/// The version an action on `bond` in the next block spends, and whether that is the one the
+/// node requires: mostly the bond's version under FeaturenetUpgrade3 and none before it, and
+/// sometimes the wrong one, for the refusal: none, a stale or made-up version, or one too early.
+fn fuzz_spends(g: &FuzzGen, c: &mut Choices, bond: &FuzzBond) -> (Option<[u8; 32]>, bool) {
+    let required = spends_versions(g).then_some(bond.version);
+    if !c.unusual(32) {
+        return (required, true);
+    }
+    let wrong = match (required, c.below(2)) {
+        (Some(_), 0) => None,
+        (Some(_), _) if bond.version != bond.key => Some(bond.key),
+        _ => Some([0xee; 32]),
+    };
+    (wrong, wrong == required)
+}
+
+/// An unbond of the bond `bond_seed` names, spending `spends`.
+fn fuzz_unbond(g: &FuzzGen, bond_seed: &[u8], spends: Option<[u8; 32]>) -> Arc<Transaction> {
+    use zcash_primitives::transaction::StakingAction;
+
+    signed_staking_tx(g.tip().next_upgrade(), bond_seed, 0, |unique_pubkey, signature| {
+        StakingAction::BeginDelegationUnbonding { unique_pubkey, signature, spends }
+    })
+}
+
+/// A withdrawal of `amount_zats` from the bond `bond_seed` names, spending `spends`.
+fn fuzz_withdraw(g: &FuzzGen, bond_seed: &[u8], amount_zats: u64, spends: Option<[u8; 32]>) -> Arc<Transaction> {
+    use zcash_primitives::transaction::StakingAction;
+
+    signed_staking_tx(g.tip().next_upgrade(), bond_seed, 0, |unique_pubkey, signature| {
+        StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey, signature, spends }
+    })
 }
 
 /// A bond action in the next block: create, unbond, withdraw or retarget, on a new bond or one
@@ -658,7 +706,7 @@ fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
             .expect("a staking transaction")
             .bond_key();
         let none = (0, BlockHash([0; 32]));
-        g.bonds.push(FuzzBond { seed, key, state: FuzzBondState::Absent, at: none, known: true, target: 0, target_at: none });
+        g.bonds.push(FuzzBond { seed, key, state: FuzzBondState::Absent, at: none, known: true, target: 0, target_at: none, version: key });
         g.bonds.len() - 1
     };
 
@@ -675,6 +723,7 @@ fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
     let h = g.height() + 1;
     let upgrade = g.tip().next_upgrade();
     let wrong_amount = action == 2 && c.unusual(32);
+    let (spends, spends_right) = fuzz_spends(g, c, &bond);
     let mut retarget = None;
     let (tx, valid, after, target) = match action {
         0 => {
@@ -686,10 +735,10 @@ fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
                 target,
             )
         }
-        1 => (staking_tx_unbond(upgrade, &bond.seed), bond.state == FuzzBondState::Active, FuzzBondState::Unbonding, bond.target),
+        1 => (fuzz_unbond(g, &bond.seed, spends), bond.state == FuzzBondState::Active && spends_right, FuzzBondState::Unbonding, bond.target),
         2 => (
-            staking_tx_withdraw(upgrade, &bond.seed, u64::from(wrong_amount), 0),
-            bond.state == FuzzBondState::Unbonding && !wrong_amount,
+            fuzz_withdraw(g, &bond.seed, u64::from(wrong_amount), spends),
+            bond.state == FuzzBondState::Unbonding && !wrong_amount && spends_right,
             FuzzBondState::Withdrawn,
             bond.target,
         ),
@@ -699,8 +748,8 @@ fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
             let from = if c.unusual(32) { (bond.target + 1 + c.below(2)) % 3 } else { bond.target };
             retarget = Some((from, to));
             (
-                fuzz_retarget(g, &bond.seed, from, to),
-                bond.state == FuzzBondState::Active && from == bond.target,
+                fuzz_retarget(g, &bond.seed, from, to, spends),
+                bond.state == FuzzBondState::Active && from == bond.target && spends_right,
                 FuzzBondState::Active,
                 to,
             )
@@ -747,7 +796,8 @@ fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
 
 /// The deepest a replayed transaction's first copy sits below the tip. It stays in the
 /// non-finalized chain, where a replay is refused under any network upgrade; once finalized, it
-/// is refused only from FeaturenetUpgrade2, which these runs leave unscheduled.
+/// is refused only from FeaturenetUpgrade2, which these runs leave unscheduled, or from
+/// FeaturenetUpgrade3, where its spent version is gone.
 const REPLAY_DEPTH_MAX: u32 = zebra_state::MAX_BLOCK_REORG_HEIGHT / 2;
 
 /// A staking action mined on `main`, mined again in the next block, which the node must refuse.
@@ -773,7 +823,8 @@ fn move_replay(g: &mut FuzzGen, c: &mut Choices) {
         let (bond_i, (from, _)) = (g.mined_staking[i].bond_i, g.mined_staking[i].retarget.expect("a retarget"));
         let bond = g.bonds[bond_i].clone();
         if g.tip_known && bond.target != from && !c.unusual(32) {
-            let back = fuzz_retarget(g, &bond.seed, bond.target, from);
+            let spends = spends_versions(g).then_some(bond.version);
+            let back = fuzz_retarget(g, &bond.seed, bond.target, from, spends);
             mine_staking(g, c, bond_i, back, FuzzBondState::Active, from, Some((bond.target, from)));
         }
         i
@@ -892,6 +943,11 @@ fn generate_bft(c: &mut Choices) -> Vec<u8> {
 
 type Move = fn(&mut FuzzGen, &mut Choices);
 
+/// The lowest height an input schedules FeaturenetUpgrade3 at, and the span above it it may
+/// pick from: a run's staking moves reach a few staking periods.
+const FUZZ_UTXO_UPGRADE_FROM: u32 = 4;
+const FUZZ_UTXO_UPGRADE_SPAN: usize = 60;
+
 /// The moves, most ordinary first: choice 0 picks extend.
 const MOVES: &[Move] = &[move_extend, move_fork, move_invalid_block, move_mangled_block, move_spend, move_mine_pending, move_double_spend, move_staking, move_replay];
 
@@ -903,7 +959,17 @@ pub(crate) fn generate(c: &mut Choices) -> Vec<u8> {
     }
     // The short staking calendar, so bonds can unbond and withdraw within one input.
     let params = zcash_primitives::bft::ZcashCrosslinkParameters { staking: short_staking(&HARNESS_PARAMETERS), ..HARNESS_PARAMETERS };
-    let mut g = FuzzGen::new(&params);
+    // Half the inputs bond under FeaturenetUpgrade3's spent versions, from early in the run or
+    // after some bonds act without them.
+    let node_config = if c.below(2) == 0 {
+        String::new()
+    } else {
+        node_config_with_activation_heights(zebra_chain::parameters::testnet::ConfiguredActivationHeights {
+            featurenet_upgrade_3: Some(FUZZ_UTXO_UPGRADE_FROM + c.below(FUZZ_UTXO_UPGRADE_SPAN) as u32),
+            ..Default::default()
+        })
+    };
+    let mut g = FuzzGen::new_with_node_config(&params, &node_config);
     let enabled: Vec<Move> = MOVES.iter().enumerate().filter(|(i, _)| *i == 0 || !c.unusual(64)).map(|(_, m)| *m).collect();
     let moves_n = 4 + c.below(28);
     for _ in 0..moves_n {
@@ -1229,16 +1295,24 @@ fn crosslink_fuzz_directed_repeated_coinbase_does_not_condemn_the_real_block() {
 // retargeted to 1, `blocks_between` empty blocks, retargeted back to 0, and the first retarget
 // mined again.
 
-fn replayed_retarget(featurenet_upgrade_2: Option<u32>, blocks_between: u32, refused: bool) -> Vec<u8> {
+fn replayed_retarget(
+    featurenet_upgrade_2: Option<u32>,
+    featurenet_upgrade_3: Option<u32>,
+    blocks_between: u32,
+    refused: bool,
+) -> Vec<u8> {
     use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
 
-    let node_config = match featurenet_upgrade_2 {
-        Some(height) => node_config_with_activation_heights(ConfiguredActivationHeights {
-            featurenet_upgrade_2: Some(height),
+    let node_config = if featurenet_upgrade_2.is_some() || featurenet_upgrade_3.is_some() {
+        node_config_with_activation_heights(ConfiguredActivationHeights {
+            featurenet_upgrade_2,
+            featurenet_upgrade_3,
             ..Default::default()
-        }),
-        None => String::new(),
+        })
+    } else {
+        String::new()
     };
+    let upgrade_height = featurenet_upgrade_2.max(featurenet_upgrade_3);
     let params = zcash_primitives::bft::ZcashCrosslinkParameters { staking: short_staking(&HARNESS_PARAMETERS), ..HARNESS_PARAMETERS };
     let mut c = Choices::from_seed(0, 0);
     let mut g = FuzzGen::new_with_node_config(&params, &node_config);
@@ -1248,18 +1322,23 @@ fn replayed_retarget(featurenet_upgrade_2: Option<u32>, blocks_between: u32, ref
     }
     let seed = b"crosslink fuzz replayed retarget".to_vec();
     let create = staking_tx_create_bond(g.tip().next_upgrade(), &seed, fuzz_finalizer(0), 0);
+    let key = create.staking_action().expect("a staking transaction").bond_key();
     assert!(mine(&mut g, &mut c, &[create]));
     // The replay must carry the network upgrade of the height it is mined at, or it is refused for that.
-    while g.height() + 1 < featurenet_upgrade_2.unwrap_or(0) {
+    while g.height() + 1 < upgrade_height.unwrap_or(0) {
         mine(&mut g, &mut c, &[]);
     }
 
-    let away = fuzz_retarget(&mut g, &seed, 0, 1);
+    // Under FeaturenetUpgrade3 the first retarget spends the bond's first version, its key, and
+    // the second spends the first's txid.
+    let away_spends = spends_versions(&g).then_some(key);
+    let away = fuzz_retarget(&mut g, &seed, 0, 1, away_spends);
     assert!(mine(&mut g, &mut c, &[away.clone()]));
     for _ in 0..blocks_between {
         mine(&mut g, &mut c, &[]);
     }
-    let back = fuzz_retarget(&mut g, &seed, 1, 0);
+    let back_spends = spends_versions(&g).then_some(away.hash().0);
+    let back = fuzz_retarget(&mut g, &seed, 1, 0, back_spends);
     assert!(mine(&mut g, &mut c, &[back]));
 
     if refused {
@@ -1278,27 +1357,43 @@ fn replayed_retarget(featurenet_upgrade_2: Option<u32>, blocks_between: u32, ref
 #[test]
 fn crosslink_fuzz_directed_replayed_retarget_is_refused() {
     set_test_name(function_name!());
-    test_bytes(replayed_retarget(None, 0, true));
+    test_bytes(replayed_retarget(None, None, 0, true));
+}
+
+/// Under FeaturenetUpgrade3 the replay spends a bond version the retarget back already spent.
+#[test]
+fn crosslink_fuzz_directed_replayed_retarget_is_refused_under_featurenet_upgrade_3() {
+    set_test_name(function_name!());
+    test_bytes(replayed_retarget(None, Some(REPLAY_UPGRADE), 0, true));
 }
 
 /// Blocks enough for the first copy to be finalized before the replay.
 const FINALIZED_BETWEEN: u32 = zebra_state::MAX_BLOCK_REORG_HEIGHT + 10;
 
-/// Where the finalized replay scenarios schedule FeaturenetUpgrade2: below the first retarget.
+/// Where the replay scenarios schedule FeaturenetUpgrade2 or FeaturenetUpgrade3: below the first
+/// retarget.
 const REPLAY_UPGRADE: u32 = 4;
 
 #[test]
 fn crosslink_fuzz_directed_replayed_finalized_retarget_is_refused_from_featurenet_upgrade_2() {
     set_test_name(function_name!());
-    test_bytes(replayed_retarget(Some(REPLAY_UPGRADE), FINALIZED_BETWEEN, true));
+    test_bytes(replayed_retarget(Some(REPLAY_UPGRADE), None, FINALIZED_BETWEEN, true));
 }
 
-/// The control: without FeaturenetUpgrade2 a replay of a finalized transaction is valid, as it is
-/// on the deployed chain, so refusing it is that upgrade's rule.
+/// FeaturenetUpgrade3 refuses a finalized replay without FeaturenetUpgrade2's duplicate check:
+/// the replay is invalid by construction, since the version it spends is spent.
+#[test]
+fn crosslink_fuzz_directed_replayed_finalized_retarget_is_refused_from_featurenet_upgrade_3() {
+    set_test_name(function_name!());
+    test_bytes(replayed_retarget(None, Some(REPLAY_UPGRADE), FINALIZED_BETWEEN, true));
+}
+
+/// The control: without FeaturenetUpgrade2 or FeaturenetUpgrade3 a replay of a finalized
+/// transaction is valid, as it is on the deployed chain, so refusing it is those upgrades' rule.
 #[test]
 fn crosslink_fuzz_directed_replayed_finalized_retarget_is_accepted_without_featurenet_upgrade_2() {
     set_test_name(function_name!());
-    test_bytes(replayed_retarget(None, FINALIZED_BETWEEN, false));
+    test_bytes(replayed_retarget(None, None, FINALIZED_BETWEEN, false));
 }
 
 /// How often the generator emits each kind of instruction, with which outcome flag, over

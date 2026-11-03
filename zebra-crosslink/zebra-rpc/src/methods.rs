@@ -3839,8 +3839,9 @@ where
             .iter()
             .enumerate()
             .filter_map(|(i, selected)| {
-                let staking_action = selected_transaction(selected).transaction.transaction.staking_action()?;
-                Some((i, *staking_action))
+                let unmined = &selected_transaction(selected).transaction;
+                let staking_action = unmined.transaction.staking_action()?;
+                Some((i, (*staking_action, unmined.id.mined_id())))
             })
             .unzip();
         let mempool_txs = if staking_actions.is_empty() {

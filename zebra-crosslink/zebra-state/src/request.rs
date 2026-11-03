@@ -1652,8 +1652,8 @@ pub enum ReadRequest {
     InvalidStakingActions {
         /// The height of the block the actions would be in.
         height: block::Height,
-        /// The actions, in block order.
-        staking_actions: Vec<zcash_primitives::transaction::StakingAction>,
+        /// The actions with the hashes of their transactions, in block order.
+        staking_actions: Vec<(zcash_primitives::transaction::StakingAction, transaction::Hash)>,
     },
 
     /// Returns the tip of every non-finalized chain other than the best chain, with the height

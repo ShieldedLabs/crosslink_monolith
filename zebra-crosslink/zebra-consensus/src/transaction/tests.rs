@@ -4919,8 +4919,8 @@ mod staking_signature {
         let unique_pubkey = create.unique_pubkey();
         let actions = [
             create,
-            StakingAction::BeginDelegationUnbonding { unique_pubkey, signature: [0; 64] },
-            StakingAction::WithdrawDelegationBond { amount_zats: AMOUNT, unique_pubkey, signature: [0; 64] },
+            StakingAction::BeginDelegationUnbonding { unique_pubkey, signature: [0; 64], spends: None },
+            StakingAction::WithdrawDelegationBond { amount_zats: AMOUNT, unique_pubkey, signature: [0; 64], spends: None },
         ];
 
         for action in actions {

@@ -3036,6 +3036,7 @@ fn staking_tx_unbond(upgrade: NetworkUpgrade, bond_seed: &[u8]) -> Arc<Transacti
     signed_staking_tx(upgrade, bond_seed, 0, |unique_pubkey, signature| StakingAction::BeginDelegationUnbonding {
         unique_pubkey,
         signature,
+        spends: None,
     })
 }
 
@@ -3046,6 +3047,7 @@ fn staking_tx_withdraw(upgrade: NetworkUpgrade, bond_seed: &[u8], amount_zats: u
         amount_zats,
         unique_pubkey,
         signature,
+        spends: None,
     })
 }
 
@@ -3062,6 +3064,7 @@ fn staking_tx_retarget(
         signature,
         from_finalizer,
         to_finalizer,
+        spends: None,
     })
 }
 

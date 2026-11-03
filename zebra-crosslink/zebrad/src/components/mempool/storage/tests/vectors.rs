@@ -339,6 +339,7 @@ fn unbonding(bond_key: [u8; 32]) -> zcash_primitives::transaction::StakingAction
     zcash_primitives::transaction::StakingAction::BeginDelegationUnbonding {
         unique_pubkey: bond_key,
         signature: [0; 64],
+        spends: None,
     }
 }
 

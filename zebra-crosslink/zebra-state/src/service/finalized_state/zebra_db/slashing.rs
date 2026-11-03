@@ -169,7 +169,7 @@ mod tests {
             &mut bonds,
             &mut vec![HashMap::new()],
             &mut HashMap::new(),
-            &StakingAction::BeginDelegationUnbonding { unique_pubkey: key, signature: [0; 64] },
+            &StakingAction::BeginDelegationUnbonding { unique_pubkey: key, signature: [0; 64], spends: None },
             &transaction::Hash([0; 32]),
             loc(900),
         )

@@ -342,6 +342,7 @@ mod finalizer_address_tests {
             signature: [0; 64],
             from_finalizer,
             to_finalizer,
+            spends: None,
         }
     }
 

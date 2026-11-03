@@ -5627,8 +5627,8 @@ mod claim_lookup_tests {
         let f = wallet::bft::FinalizerAddress::create(&key);
         let (a, b) = ([0xaa; 32], [0xbb; 32]);
         let stake    = |k, amount_zats, h| tx(StakingAction::CreateNewDelegationBond { amount_zats, unique_pubkey: k, bond_salt: [0; 32], target_finalizer: f, signature: [0; 64] }, h);
-        let unstake  = |k, h| tx(StakingAction::BeginDelegationUnbonding { unique_pubkey: k, signature: [0; 64] }, h);
-        let withdraw = |k, amount_zats, h| tx(StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey: k, signature: [0; 64] }, h);
+        let unstake  = |k, h| tx(StakingAction::BeginDelegationUnbonding { unique_pubkey: k, signature: [0; 64], spends: None }, h);
+        let withdraw = |k, amount_zats, h| tx(StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey: k, signature: [0; 64], spends: None }, h);
 
         // Newest first, as the history shows it: bond A's whole life, then bond B's.
         let mut txs = vec![

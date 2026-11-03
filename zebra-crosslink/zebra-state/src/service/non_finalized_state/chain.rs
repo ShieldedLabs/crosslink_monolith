@@ -2372,6 +2372,17 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                 bond.target_finalizer = old_target;
             }
 
+            // Each action that spent a bond's version names the version before it. A block can
+            // spend one bond several times, each spending the last, so they unwind last first.
+            for transaction in contextually_valid.block.transactions.iter().rev() {
+                let Some(staking_action) = transaction.staking_action() else { continue };
+                let Some(spends) = staking_action.spends() else { continue };
+                let bond_key = staking_action.bond_key();
+                let (bond, _status) = self.delegation_bonds.get_mut(&bond_key)
+                    .expect("bond must exist if its version was spent");
+                bond.version = (spends != bond_key).then_some(spends);
+            }
+
             // Revert slash burns - restore each bond's pre-burn status
             let burns = self.bond_burns.pop().expect("burns must exist for tip block");
             for (bond_key, prev_status) in burns {
@@ -3176,8 +3187,8 @@ mod bond_status_tests {
             std::iter::empty(),
         );
 
-        let unbond = StakingAction::BeginDelegationUnbonding { unique_pubkey: key, signature: [0; 64] };
-        let withdraw = StakingAction::WithdrawDelegationBond { amount_zats: 1000, unique_pubkey: key, signature: [0; 64] };
+        let unbond = StakingAction::BeginDelegationUnbonding { unique_pubkey: key, signature: [0; 64], spends: None };
+        let withdraw = StakingAction::WithdrawDelegationBond { amount_zats: 1000, unique_pubkey: key, signature: [0; 64], spends: None };
         let hash = transaction::Hash([0; 32]);
 
         chain.update_chain_tip_with_delegation_bond(&unbond, &hash, loc(200)).unwrap();
