@@ -1917,6 +1917,55 @@ mod tests {
         assert_eq!(a_base.handle.stats().kills, 0);
     }
 
+    /// A peer that dies without closing (STP has no close frame) and comes back on the same key
+    /// and port is a new session under the same key: the survivor's consumers see a new hash
+    /// (the restarted side's), nobody is killed, and messages flow both ways at once. Regression
+    /// cover for restarts: before STP's session replacement a restarted peer was ignored for
+    /// 120 s, and tenderlink, keeping the old hash, then killed the new session.
+    #[test]
+    fn a_peer_restarted_on_the_same_key_and_port_is_a_new_session_not_a_kill() {
+        let (a, a_addr) = shared_node();
+        let b_key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b).unwrap();
+        let b_port = free_port();
+        let to_b = STPAddress::from(Ipv6Addr::LOCALHOST, b_port, &b_key).connection_key();
+        let new_b = || SharedTransport::new(vec![b_key.clone()], b_port, None, (1_000_000, 512 * 1024, 32 << 20));
+        let mut a_base = Loop::new(&a, Consumer::Base);
+        let hash_at_a = |a_base: &Loop| a_base.connections.iter().find(|(addr, _)| addr.connection_key() == to_b).map(|(_, hash)| *hash);
+
+        let b = new_b();
+        let mut b_base = Loop::new(&b, Consumer::Base);
+        b_base.tick(NetworkThreadPush { initiate_connections: vec![a_addr.clone()], ..Default::default() });
+        until("the first session", || {
+            a_base.tick(NetworkThreadPush::default());
+            b_base.tick(NetworkThreadPush::default());
+            hash_at_a(&a_base).is_some() && !b_base.connections.is_empty()
+        });
+        let first = hash_at_a(&a_base).unwrap();
+
+        // B dies without a word, and restarts on the same key and port.
+        drop(b_base);
+        drop(b);
+        let b = new_b();
+        let mut b_base = Loop::new(&b, Consumer::Base);
+        b_base.tick(NetworkThreadPush { initiate_connections: vec![a_addr.clone()], ..Default::default() });
+        until("A to see B's new session", || {
+            a_base.tick(NetworkThreadPush::default());
+            b_base.tick(NetworkThreadPush::default());
+            let b_hash = b_base.connections.first().map(|(_, hash)| *hash);
+            hash_at_a(&a_base).is_some_and(|hash| hash != first && Some(hash) == b_hash)
+        });
+        assert_eq!(a_base.handle.stats().kills, 0);
+        assert_eq!(b_base.handle.stats().kills, 0);
+
+        a_base.tick(NetworkThreadPush { send_unreliable: vec![(to_b, vec![0x01, 1])], ..Default::default() });
+        b_base.tick(NetworkThreadPush { send_unreliable: vec![(a_addr.connection_key(), vec![0x01, 2])], ..Default::default() });
+        until("a message each way over the new session", || {
+            a_base.tick(NetworkThreadPush::default());
+            b_base.tick(NetworkThreadPush::default());
+            a_base.received.contains(&vec![0x01, 2]) && b_base.received.contains(&vec![0x01, 1])
+        });
+    }
+
     #[test]
     fn a_replaced_handle_services_nothing_and_does_not_detach_its_successor() {
         let (a, _) = shared_node();
