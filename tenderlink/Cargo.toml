@@ -15,7 +15,7 @@ lto = false
 
 [dependencies]
 # Wire-compatible send-error recovery, confirmed restart replacement, and network-change reconnection.
-shielded_transport_pigeon = { git = "https://github.com/ShieldedLabs/shielded_transport_pigeon", rev = "8abba44ac001a0230bd08d50ec322950840dfa8e" }
+shielded_transport_pigeon = { git = "https://github.com/ShieldedLabs/shielded_transport_pigeon", rev = "1ab691a7c7c0b1c8bc641ca2a61fead5ca18589c" }
 blake3 = "1.8.2"
 byteorder = "1.5.0"
 ed25519-zebra = "4.1.0"

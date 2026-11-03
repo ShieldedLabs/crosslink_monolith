@@ -237,13 +237,13 @@ struct PeerState {
     /// Opened by the peer, not dialled by us; counted against `max_inbound_connections`.
     inbound: bool,
     /// STP is replacing this association; retain its admission/close intent, not its sends.
-    /// The entry stays hidden and is cancelled after `connect_timeout` if no session returns.
-    reconnecting_since: Option<Instant>,
+    /// Hidden until Connected or ConnectFailed; requests coalesce locally while STP owns progress.
+    reconnecting: bool,
 }
 
 impl PeerState {
     fn is_connected(&self) -> bool {
-        !self.closing && self.reconnecting_since.is_none()
+        !self.closing && !self.reconnecting
     }
 }
 
@@ -847,6 +847,7 @@ impl NetworkThreadHandle {
                 // A peer we did not dial opened it. Retained reconnects keep their original
                 // admission and inbound slot, even though STP now initiates the handshake.
                 let inbound = self.connecting.remove(&peer).is_none();
+                self.pending_connects.retain(|a| a.connection_key() != peer);
                 if inbound && !self.peers.contains_key(&peer) {
                     let held = self.peers.values().filter(|s| s.inbound && !s.closing).count();
                     if held >= self.limits.max_inbound_connections {
@@ -858,7 +859,7 @@ impl NetworkThreadHandle {
                             outboxes: Default::default(),
                             closing: true,
                             inbound,
-                            reconnecting_since: None,
+                            reconnecting: false,
                         });
                         return;
                     }
@@ -870,24 +871,31 @@ impl NetworkThreadHandle {
                     outboxes: Default::default(),
                     closing: false,
                     inbound,
-                    reconnecting_since: None,
+                    reconnecting: false,
                 });
-                if state.handshake_hash != handshake_hash || state.reconnecting_since.is_some() {
+                if state.handshake_hash != handshake_hash || state.reconnecting {
                     // A new session never inherits old sends or cancels a pending local close.
                     state.address = address;
                     state.handshake_hash = handshake_hash;
                     state.connected_at = now;
                     state.outboxes.iter_mut().for_each(Outbox::clear);
-                    state.reconnecting_since = None;
+                    state.reconnecting = false;
                 }
             }
             Event::ConnectFailed { address, .. } => {
-                self.connecting.remove(&address.connection_key());
+                let peer = address.connection_key();
+                self.connecting.remove(&peer);
+                self.pending_connects.retain(|a| a.connection_key() != peer);
+                // Release a failed automatic reconnect immediately. A late failure must not
+                // remove a fresh session that has already reported Connected for this key.
+                if self.peers.get(&peer).is_some_and(|s| s.reconnecting) {
+                    self.peers.remove(&peer);
+                }
                 self.stats.connects_failed += 1;
             }
             Event::Disconnected { peer, reason: DisconnectReason::NetworkChanged | DisconnectReason::Replaced } => {
                 if let Some(state) = self.peers.get_mut(&peer) {
-                    state.reconnecting_since.get_or_insert(now);
+                    state.reconnecting = true;
                     state.outboxes.iter_mut().for_each(Outbox::clear);
                 }
             }
@@ -907,11 +915,10 @@ impl NetworkThreadHandle {
             wanted.iter().map(|(a, _)| a.connection_key()).collect();
         let grace = self.limits.unwanted_grace;
         for (peer, state) in self.peers.iter_mut() {
-            let reconnect_expired = state.reconnecting_since.is_some_and(|started|
-                now.duration_since(started) >= self.limits.connect_timeout);
-            if !state.closing
-                && (reconnect_expired || (state.reconnecting_since.is_none()
-                    && !wanted.contains(peer) && now.duration_since(state.connected_at) >= grace))
+            // STP owns the reconnect's total deadline and reports its terminal outcome.
+            // Hidden peers are not unwanted merely because consumers cannot list them.
+            if !state.closing && !state.reconnecting
+                && !wanted.contains(peer) && now.duration_since(state.connected_at) >= grace
             {
                 // Idempotent intent: flagged once, delivered by flush_controls when the
                 // control ring has room. What was still queued for it is abandoned.
@@ -934,7 +941,9 @@ impl NetworkThreadHandle {
             return;
         }
         let peer = address.connection_key();
-        // A closing peer is not reconnected until its disconnect has gone out.
+        // Coalesce locally while STP owns an automatic reconnect. Queuing a duplicate
+        // Connect could cross its timeout event and accidentally start an unrequested retry.
+        // Connected and closing peers likewise need no new command.
         if self.peers.contains_key(&peer) || self.connecting.contains_key(&peer) {
             return;
         }
@@ -955,6 +964,10 @@ impl NetworkThreadHandle {
             .map(|(k, _)| *k)
             .collect();
         for peer in closing {
+            // Cancel local request state too. STP cancellation before Connected is silent,
+            // so no failure event will clear it for us.
+            self.connecting.remove(&peer);
+            self.pending_connects.retain(|a| a.connection_key() != peer);
             if !self.endpoint.try_disconnect(peer) {
                 return; // ring full: the flags stay set, retried next service
             }
@@ -1080,6 +1093,222 @@ mod tests {
         (handle, address)
     }
 
+    fn reconnecting_node() -> (NetworkThreadHandle, Pump, STPAddress) {
+        use shielded_transport_pigeon::pump::DisconnectReason;
+
+        let local = new_keypair_from_connect_magic1(
+            CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b,
+        ).unwrap();
+        let remote = new_keypair_from_connect_magic1(
+            CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b,
+        ).unwrap();
+        let address = STPAddress::from(Ipv6Addr::LOCALHOST, free_port(), &remote);
+        let peer = address.connection_key();
+        let (mut handle, pump) = NetworkThreadHandle::new_unstarted(
+            vec![local], free_port(), None, (1_000_000, 512 * 1024, 32 << 20),
+            TransportLimits { max_inbound_connections: 1, ..Default::default() },
+        );
+        let now = Instant::now();
+        let mut received = VecDeque::new();
+        handle.handle_event(Event::Connected {
+            peer, address: address.clone(), handshake_hash: [1; 64],
+        }, &mut received, now);
+        handle.handle_event(Event::Disconnected {
+            peer, reason: DisconnectReason::NetworkChanged,
+        }, &mut received, now);
+        assert!(!handle.is_connected(peer));
+        (handle, pump, address)
+    }
+
+    #[test]
+    fn reconnecting_peer_coalesces_requests_without_losing_inbound_admission() {
+        let (mut a, _pump, address) = reconnecting_node();
+        let peer = address.connection_key();
+        let now = Instant::now();
+        for _ in 0..100 {
+            let pull = a.service(NetworkThreadPush {
+                initiate_connections: vec![address.clone()],
+                ..Default::default()
+            });
+            assert!(pull.current_connections.is_empty());
+            assert!(a.connecting.is_empty() && a.pending_connects.is_empty());
+        }
+        assert!(a.peers[&peer].inbound);
+        // All control slots are still available: not even one duplicate native Connect
+        // can cross an automatic timeout boundary and resurrect an unrequested attempt.
+        for _ in 0..a.limits.rings.control {
+            assert!(a.endpoint.try_disconnect(peer));
+        }
+        assert!(!a.endpoint.try_disconnect(peer));
+
+        a.handle_event(Event::Connected {
+            peer, address: address.clone(), handshake_hash: [2; 64],
+        }, &mut VecDeque::new(), now);
+        assert!(a.is_connected(peer));
+        assert!(a.peers[&peer].inbound);
+        assert!(a.connecting.is_empty() && a.pending_connects.is_empty());
+        assert_eq!(a.stats.inbound_refused, 0);
+        a.initiate(address, now);
+        assert!(a.connecting.is_empty() && a.pending_connects.is_empty());
+    }
+
+    #[test]
+    fn failed_reconnect_clears_hold_and_retries_only_when_requested() {
+        use shielded_transport_pigeon::pump::ConnectFailure;
+
+        for requested in [false, true] {
+            let (mut a, _pump, address) = reconnecting_node();
+            let peer = address.connection_key();
+            let now = Instant::now();
+            if requested {
+                a.service(NetworkThreadPush {
+                    initiate_connections: vec![address.clone()],
+                    ..Default::default()
+                });
+            }
+            a.handle_event(Event::ConnectFailed {
+                address: address.clone(), reason: ConnectFailure::TimedOut,
+            }, &mut VecDeque::new(), now);
+            assert!(!a.peers.contains_key(&peer));
+            assert!(a.connecting.is_empty() && a.pending_connects.is_empty());
+            for _ in 0..3 {
+                assert!(a.service(NetworkThreadPush::default()).current_connections.is_empty());
+                assert!(a.connecting.is_empty() && a.pending_connects.is_empty());
+            }
+            // Neither the earlier request nor the failure handler queued a native dial.
+            for _ in 0..a.limits.rings.control {
+                assert!(a.endpoint.try_disconnect(peer));
+            }
+            assert!(!a.endpoint.try_disconnect(peer));
+
+            // Only a NEW normal selection request starts a fresh dial, immediately.
+            a.service(NetworkThreadPush {
+                initiate_connections: vec![address.clone(), address.clone()],
+                ..Default::default()
+            });
+            assert!(a.connecting.contains_key(&peer));
+            assert_eq!(a.pending_connects.len(), 1);
+            a.handle_event(Event::ConnectFailed {
+                address, reason: ConnectFailure::TimedOut,
+            }, &mut VecDeque::new(), now);
+            assert!(a.connecting.is_empty() && a.pending_connects.is_empty());
+            assert_eq!(a.stats.connects_failed, 2);
+        }
+    }
+
+    #[test]
+    fn late_connect_failure_does_not_remove_a_live_replacement_session() {
+        use shielded_transport_pigeon::pump::ConnectFailure;
+
+        let (mut a, _pump, address) = reconnecting_node();
+        let peer = address.connection_key();
+        let now = Instant::now();
+        a.initiate(address.clone(), now);
+        a.handle_event(Event::Connected {
+            peer, address: address.clone(), handshake_hash: [2; 64],
+        }, &mut VecDeque::new(), now);
+        a.enqueue(peer, Channel::BftLive, vec![1, 2, 3]);
+        a.handle_event(Event::ConnectFailed {
+            address, reason: ConnectFailure::TimedOut,
+        }, &mut VecDeque::new(), now);
+        assert!(a.is_connected(peer));
+        assert_eq!(a.peers[&peer].handshake_hash, [2; 64]);
+        assert_eq!(a.peers[&peer].outboxes[Channel::BftLive as usize].bytes, 3);
+        assert!(a.connecting.is_empty() && a.pending_connects.is_empty());
+    }
+
+    #[test]
+    fn silent_close_cleans_reconnect_even_with_full_control_ring() {
+        for completed in [false, true] {
+            let (mut a, mut pump, address) = reconnecting_node();
+            let peer = address.connection_key();
+            let now = Instant::now();
+            while a.endpoint.try_disconnect(peer) {}
+            a.initiate(address.clone(), now);
+            assert!(a.connecting.is_empty() && a.pending_connects.is_empty());
+            a.close_now(peer);
+            a.flush_controls();
+            assert!(a.peers[&peer].closing, "disconnect must wait for ring space");
+
+            if completed {
+                // A real Connected already queued before cancellation remains valid,
+                // but cannot erase the still-backpressured local close intent.
+                a.handle_event(Event::Connected {
+                    peer, address: address.clone(), handshake_hash: [2; 64],
+                }, &mut VecDeque::new(), now);
+                assert!(a.peers[&peer].closing);
+            }
+            a.initiate(address, now);
+            assert!(a.connecting.is_empty() && a.pending_connects.is_empty());
+            pump.run_for(Duration::from_millis(1));
+            a.flush_controls();
+            // Accepted local cancellation is enough; no Cancelled event exists.
+            assert!(!a.peers.contains_key(&peer));
+            assert!(a.connecting.is_empty() && a.pending_connects.is_empty());
+            pump.run_for(Duration::from_millis(1));
+            for _ in 0..3 {
+                assert!(a.service(NetworkThreadPush::default()).current_connections.is_empty());
+                assert!(a.peers.is_empty());
+                assert!(a.connecting.is_empty() && a.pending_connects.is_empty());
+            }
+            assert_eq!(a.stats.connects_failed, 0);
+        }
+    }
+
+    #[test]
+    fn completed_connected_event_remains_valid_after_accepted_local_cancellation() {
+        use shielded_transport_pigeon::pump::DisconnectReason;
+
+        let (mut a, _pump, address) = reconnecting_node();
+        let peer = address.connection_key();
+        let now = Instant::now();
+        a.close_now(peer);
+        a.flush_controls();
+        assert!(a.peers.is_empty());
+        // STP may have committed Connected just before consuming the Disconnect. Local
+        // enqueue success must not turn that real event into a cancelled-attempt failure.
+        a.handle_event(Event::Connected {
+            peer, address, handshake_hash: [2; 64],
+        }, &mut VecDeque::new(), now);
+        assert!(a.is_connected(peer));
+        a.handle_event(Event::Disconnected {
+            peer, reason: DisconnectReason::Local,
+        }, &mut VecDeque::new(), now);
+        assert!(a.peers.is_empty());
+        assert!(a.connecting.is_empty() && a.pending_connects.is_empty());
+        assert_eq!(a.stats.connects_failed, 0);
+    }
+
+    #[test]
+    fn terminal_events_clear_an_ordinary_queued_request() {
+        use shielded_transport_pigeon::pump::ConnectFailure;
+
+        for connected in [false, true] {
+            let (mut a, _pump, address) = reconnecting_node();
+            let peer = address.connection_key();
+            let now = Instant::now();
+            a.peers.clear();
+            a.initiate(address.clone(), now);
+            assert_eq!(a.pending_connects.len(), 1);
+            let event = if connected {
+                Event::Connected { peer, address, handshake_hash: [2; 64] }
+            } else {
+                Event::ConnectFailed { address, reason: ConnectFailure::TimedOut }
+            };
+            a.handle_event(event, &mut VecDeque::new(), now);
+            assert!(a.connecting.is_empty() && a.pending_connects.is_empty());
+            assert_eq!(a.is_connected(peer), connected);
+            if connected {
+                assert!(!a.peers[&peer].inbound);
+            }
+            a.flush_controls();
+            for _ in 0..a.limits.rings.control {
+                assert!(a.endpoint.try_disconnect(peer));
+            }
+            assert!(!a.endpoint.try_disconnect(peer));
+        }
+    }
+
     #[test]
     fn automatic_reconnect_preserves_outbound_intent_and_drops_old_outbox() {
         use shielded_transport_pigeon::pump::DisconnectReason;
@@ -1117,22 +1346,24 @@ mod tests {
             assert!(a.peers[&peer].outboxes.iter().all(|q| q.messages.is_empty() && q.bytes == 0));
             assert_eq!(a.stats.inbound_refused, 0);
 
-            // A reconnect is hidden, not unwanted. Its reservation expires even if a
-            // stalled consumer keeps wanting the old session; a full control ring may
-            // delay cancellation, but a fresh Connected must not erase that intent.
+            // A reconnect is hidden, not unwanted. Only STP's terminal outcome or an
+            // explicit close releases its reservation, even past the old 60 s guard.
             let later = now + Duration::from_secs(1);
             a.handle_event(Event::Disconnected { peer, reason }, &mut received, later);
-            a.close_unwanted(&[], later);
+            let past_old_guard = later + a.limits.connect_timeout + Duration::from_secs(1);
+            a.close_unwanted(&[], past_old_guard);
+            a.close_unwanted(&[(a.peers[&peer].address.clone(), [2; 64])], past_old_guard);
             assert!(!a.peers[&peer].closing);
+            assert!(a.peers[&peer].reconnecting);
             assert!(a.service(NetworkThreadPush::default()).current_connections.is_empty());
             for _ in 0..a.limits.rings.control {
                 assert!(a.endpoint.try_disconnect(peer));
             }
-            a.close_unwanted(&[(a.peers[&peer].address.clone(), [2; 64])], later + a.limits.connect_timeout);
+            a.close_now(peer);
             assert!(a.peers[&peer].closing);
             a.handle_event(Event::Connected {
                 peer, address: a.peers[&peer].address.clone(), handshake_hash: [3; 64],
-            }, &mut received, later + a.limits.connect_timeout);
+            }, &mut received, past_old_guard);
             for _ in 0..10 {
                 let pull = a.service(NetworkThreadPush {
                     initiate_connections: vec![a.peers[&peer].address.clone()],
@@ -1311,7 +1542,7 @@ mod tests {
                     outboxes: Default::default(),
                     closing: false,
                     inbound: false,
-                    reconnecting_since: None,
+                    reconnecting: false,
                 },
             );
         }
