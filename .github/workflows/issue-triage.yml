@@ -355,7 +355,24 @@ jobs:
           done
 
           declare -A color=([sev:critical]=b60205 [sev:high]=d93f0b [sev:medium]=fbca04 [sev:low]=0e8a16 [duplicate]=cfd3d7 ["BFT stall"]=b60205)
-          labels=("$sev")
+          # A sev: label belongs to triage only if github-actions added it last. One a person added is
+          # never removed, and while it is there triage drops its own and adds none.
+          mine=$(gh api "repos/$GH_REPO/issues/$ISSUE/events" --paginate \
+            --jq '.[] | select(.event == "labeled" and (.label.name | startswith("sev:"))) | [.label.name, .actor.login] | @tsv' \
+            | awk -F'\t' '{ last[$1] = $2 } END { for (l in last) if (last[l] == "github-actions[bot]") print l }')
+          kept_sev=""
+          own=()
+          while IFS= read -r l; do
+            [ -n "$l" ] || continue
+            if grep -qxF -- "$l" <<<"$mine"; then own+=("$l"); else kept_sev="$l"; fi
+          done < <(gh issue view "$ISSUE" --json labels --jq '.labels[].name | select(startswith("sev:"))')
+          remove=()
+          for l in "${own[@]}"; do
+            if [ -n "$kept_sev" ] || [ "$l" != "$sev" ]; then remove+=("$l"); fi
+          done
+
+          labels=()
+          if [ -z "$kept_sev" ]; then labels+=("$sev"); fi
           if [ "$dup" != 0 ]; then labels+=(duplicate); fi
           if [ "$(jq -r '.bft_stall // false' <<<"$OUT")" = true ]; then labels+=("BFT stall"); fi
           args=()
@@ -363,12 +380,11 @@ jobs:
             gh label create "$l" --color "${color[$l]}" > /dev/null 2>&1 || true
             args+=(--add-label "$l")
           done
-          for l in $(gh issue view "$ISSUE" --json labels --jq '.labels[].name | select(startswith("sev:"))'); do
-            if [ "$l" != "$sev" ]; then args+=(--remove-label "$l"); fi
-          done
+          for l in "${remove[@]}"; do args+=(--remove-label "$l"); done
           if [ ${#args[@]} -gt 0 ]; then gh issue edit "$ISSUE" "${args[@]}"; fi
 
           rating="**$sev**"
+          if [ -n "$kept_sev" ]; then rating="$rating (kept **$kept_sev**, set by a maintainer)"; fi
           if [ -z "$KEPT_AREA" ]; then rating="$rating, area **$area**"; fi
           {
             echo "Automated triage by $ENGINE: $rating. $reason"
