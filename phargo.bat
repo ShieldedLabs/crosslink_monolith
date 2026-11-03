@@ -14,6 +14,7 @@ if "%project%"=="Release" ( echo No project specified! && exit /b 1 )
 set "config=%2"
 set "platform=%3"
 set "flags=-j 5"
+if defined CARGO_BUILD_JOBS set "flags=-j %CARGO_BUILD_JOBS%"
 
 if "%platform%"=="" set "platform=Win64"
 
