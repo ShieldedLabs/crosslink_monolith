@@ -1533,6 +1533,27 @@ pub struct Peer {
     pub stp_address: STPAddress,      // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
     pub stp_handshake_hash: [u8; 64], // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
 }
+/// The Peer for a connection's session, when that session is new to us: a key we have no Peer
+/// for, or a known key whose STP handshake hash changed. STP replaces a restarted peer's session
+/// in place, so its key never leaves the connection list; the old Peer's hash would fail the new
+/// session's ID verification, and we would kill it. The returned Peer is fresh, holds the session's
+/// address and hash, and still needs our ID_HELLO. `true` alongside it when it replaced an old one.
+/// `None` when the session is the one we already have.
+fn peer_for_new_session<'a>(
+    peers: &'a mut HashMap<ConnectionKey, Peer>,
+    stp_address: &STPAddress,
+    handshake_hash: [u8; 64],
+) -> Option<(&'a mut Peer, bool)> {
+    let () = transport::ASSUME_WANTED_OMITS_ONLY_KILLS;
+    let mut new = false;
+    let peer = peers.entry(stp_address.connection_key()).or_insert_with(|| { new = true; Peer::default() });
+    if !new && peer.stp_handshake_hash == handshake_hash {
+        return None;
+    }
+    *peer = Peer { stp_handshake_hash: handshake_hash, stp_address: stp_address.clone(), ..Peer::default() };
+    Some((peer, !new))
+}
+
 impl Default for Peer {
     fn default() -> Self { Self {
         latest_status_request_height: Default::default(),
@@ -2802,28 +2823,15 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         }
         LOOP_PASSES.fetch_add(1, std::sync::atomic::Ordering::Release);
 
-        // Ensure a Peer entry exists for every active connection
+        // Ensure a Peer entry exists for every active connection's session
         for &(ref stp_address, handshake_hash) in &current_connections {
-            let mut new = false;
-
             let key = stp_address.connection_key();
-
-            let peer = &mut peers.entry(key).or_insert_with(|| { new = true; Peer::default() });
-
-            if !new {
-                if peer.stp_handshake_hash == handshake_hash {
-                    continue;
-                }
-                // Same key, new handshake hash: a new STP session (STP replaces a restarted peer's
-                // session in place, so the key never leaves the connection list). Start the peer
-                // over: the old hash fails the peer's ID verification, and we would kill it.
-                let () = transport::ASSUME_WANTED_OMITS_ONLY_KILLS;
+            let Some((peer, replaced)) = peer_for_new_session(&mut peers, stp_address, handshake_hash) else {
+                continue;
+            };
+            if replaced {
                 println!("{:05}: Peer {:?} has a new STP session; verifying it again.", my_port, key);
-                **peer = Peer::default();
             }
-
-            peer.stp_handshake_hash = handshake_hash;
-            peer.stp_address = stp_address.clone();
 
             let verification = { // almost @Duplicate
                 let pk_bytes = my_root_public_bft_key.as_ref();
@@ -3835,6 +3843,32 @@ mod tests {
     /// The roster cap these tests run under: the prototype's, as every network uses unless it says
     /// otherwise.
     const ROSTER_MAX_N: usize = zcash_primitives::bft::PROTOTYPE_PARAMETERS.active_roster_max_n;
+
+    /// A known key whose STP session hash changes (STP replacing a restarted peer's session in
+    /// place) gets a fresh Peer, verified again; the same session gets nothing. Regression: the
+    /// Peer kept the dead session's hash, failed the new session's ID verification and killed it,
+    /// so a restarted node never rejoined.
+    #[test]
+    fn a_new_stp_session_on_a_known_key_starts_the_peer_over() {
+        let key = crate::stp::new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+        let address = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, 13001, &key);
+        let mut peers = HashMap::new();
+
+        let (peer, replaced) = peer_for_new_session(&mut peers, &address, [1; 64]).expect("a new key is a new session");
+        assert!(!replaced);
+        assert_eq!(peer.stp_handshake_hash, [1; 64]);
+        peer.index_counter = 7;
+        peer.latest_status_request_height = Some(3);
+
+        assert!(peer_for_new_session(&mut peers, &address, [1; 64]).is_none(), "the same session is left alone");
+        assert_eq!(peers[&address.connection_key()].index_counter, 7);
+
+        let (peer, replaced) = peer_for_new_session(&mut peers, &address, [2; 64]).expect("a new hash is a new session");
+        assert!(replaced);
+        assert_eq!(peer.stp_handshake_hash, [2; 64]);
+        assert_eq!((peer.index_counter, peer.latest_status_request_height), (0, None), "nothing kept from the old session");
+        assert_eq!(peers.len(), 1);
+    }
 
     /// Restored signatures are over the legacy application format, not the active STP MTU.
     /// Exercise the production sender serializer and receiver authentication through real Pumps.
