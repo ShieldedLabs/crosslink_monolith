@@ -74,8 +74,9 @@ pub enum NetworkUpgrade {
     /// The Zcash protocol after the third Crosslink featurenet upgrade.
     ///
     /// Carries non-urgent rule changes, starting with staking actions spending
-    /// the bond's version. Its rules only take effect while FeaturenetUpgrade2
-    /// is also scheduled, at or below this upgrade's height.
+    /// the bond's version. FeaturenetUpgrade2's fixes switch on only at its own
+    /// height, so a network that schedules this upgrade should schedule
+    /// FeaturenetUpgrade2 at or below it.
     FeaturenetUpgrade3,
     /// The Zcash protocol after the NU7 upgrade.
     #[serde(rename = "NU7")]
