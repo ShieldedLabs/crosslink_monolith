@@ -163,7 +163,7 @@ for k in 0 1; do
   L=$(logs $k)
   echo "$L" | grep -q "panicked" && fail "node$k panicked"
   echo "$L" | grep -q "empty roster" && fail "node$k has an empty bootstrap roster"
-  bad=$(echo "$L" | grep ' ERROR ' | grep -vc 'not yet implemented: all the documented validations')
+  bad=$(echo "$L" | grep -c ' ERROR ')
   [ "$bad" = 0 ] || fail "node$k logged $bad unexpected ERROR lines"
   dec=$(echo "$L" | grep -c 'Successfully decided BFT block'); need=$(( (TARGET - ACTIVATION_HEIGHT) / 4 ))
   [ "$dec" -ge "$need" ] || fail "node$k decided $dec BFT blocks, expected at least $need"

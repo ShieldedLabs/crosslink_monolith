@@ -1728,24 +1728,16 @@ impl BftRunner {
             .cloned()
             .collect();
 
-        match BftBlock::try_from(params, bft_height as u32, fat_ptr, headers) {
-            Ok(mut block) => {
-                // Always propose the latest version: existing v1 blocks remain v1 (so their
-                // hashes and signatures are untouched), and `validate` caps every block at the
-                // latest version, so it is >= any parent's.
-                block.version = BFT_BLOCK_VERSION_LATEST;
-                // A slashfork block sets do_not_include to the greatest activation height it
-                // carries (pointing at this block commits to every certificate in it, so the
-                // strictest one governs); otherwise the parent's carries forward so it never
-                // regresses (both as `validate` requires).
-                if let Some(last) = scheduled_slashforks.last() {
-                    block.do_not_include_until_bc_height = last.pow_activation_height;
-                    block.slashforks = scheduled_slashforks;
-                } else {
-                    block.do_not_include_until_bc_height = parent_do_not_include;
-                }
-                Some(block)
-            }
+        // A slashfork block sets do_not_include to the greatest activation height it carries
+        // (pointing at this block commits to every certificate in it, so the strictest one
+        // governs); otherwise the parent's carries forward so it never regresses (both as
+        // `validate` requires).
+        let do_not_include = scheduled_slashforks.last().map_or(parent_do_not_include, |last| last.pow_activation_height);
+        // Always propose the latest version: existing v1 blocks remain v1 (so their hashes and
+        // signatures are untouched), and `validate` caps every block at the latest version, so
+        // it is >= any parent's.
+        match BftBlock::new(params, BFT_BLOCK_VERSION_LATEST, bft_height as u32, fat_ptr, headers, scheduled_slashforks, do_not_include) {
+            Ok(block) => Some(block),
             Err(e) => {
                 tracing::warn!("Unable to create BftBlock to propose, Error={:?}", e);
                 None
@@ -2122,20 +2114,7 @@ impl BftRunner {
         // `height` is the 0-based canonical height, i.e. the chain index directly.
         let insert_i = new_block.height as usize;
 
-        // @Hack: Ensure there are enough blocks to overwrite this at the correct index.
-        for i in chain.blocks.len()..=insert_i {
-            chain.blocks.push(BftBlock {
-                version: 0,
-                height: i as u32,
-                previous_block_fat_ptr: FatPointerToBftBlock {
-                    vote_for_block_without_finalizer_public_key: [0u8; 76 - 32],
-                    signatures: Vec::new(),
-                },
-                headers: Vec::new(),
-                slashforks: Vec::new(),
-                do_not_include_until_bc_height: 0,
-            });
-        }
+        assert_eq!(insert_i, chain.blocks.len(), "validate passed, so the block extends the tip");
         if insert_i > 0 {
             assert_eq!(
                 chain.blocks[insert_i - 1].blake3_hash(),
@@ -2143,12 +2122,11 @@ impl BftRunner {
             );
         }
         assert!(insert_i == 0 || new_block.previous_block_hash() != Blake3Hash([0u8; 32]));
-        assert!(chain.blocks[insert_i].headers.is_empty(), "{:?}", chain.blocks[insert_i]);
         assert!(!new_block.headers.is_empty());
         assert_eq!(chain.voting_rosters.len(), insert_i, "voting_rosters is indexed like blocks");
         push_voting_roster(&mut chain.voting_rosters, voting);
         chain.hash_to_height.insert(new_block_hash, insert_i as u64);
-        chain.blocks[insert_i] = new_block.clone();
+        chain.blocks.push(new_block.clone());
         chain.fat_pointer_to_tip = fat_pointer.clone();
         chain.bft_final_snapshot = Some((new_final_height, new_final_hash));
         drop(chain);
@@ -2437,14 +2415,6 @@ impl BftRunner {
             let (header, ..) = read_state.block_header(Height(h).into())?;
             headers.push(bc_hdr_to_lrz(&header));
         }
-        let mut block = match BftBlock::try_from(params, 0, FatPointerToBftBlock::null(), headers) {
-            Ok(block) => block,
-            Err(e) => {
-                tracing::error!("Unable to build the bootstrap genesis BFT block: {:?}", e);
-                return None;
-            }
-        };
-        block.version = BFT_BLOCK_VERSION_LATEST;
         let scheduled_slashforks: Vec<SlashForkConfig> = self
             .slashforks
             .rules()
@@ -2452,10 +2422,14 @@ impl BftRunner {
             .filter(|hf| hf.bft_certificate_height == 0)
             .cloned()
             .collect();
-        if let Some(last) = scheduled_slashforks.last() {
-            block.do_not_include_until_bc_height = last.pow_activation_height;
-            block.slashforks = scheduled_slashforks;
-        }
+        let do_not_include = scheduled_slashforks.last().map_or(0, |last| last.pow_activation_height);
+        let block = match BftBlock::new(params, BFT_BLOCK_VERSION_LATEST, 0, FatPointerToBftBlock::null(), headers, scheduled_slashforks, do_not_include) {
+            Ok(block) => block,
+            Err(e) => {
+                tracing::error!("Unable to build the bootstrap genesis BFT block: {:?}", e);
+                return None;
+            }
+        };
         let fat_pointer = FatPointerToBftBlock::from_parts(block.blake3_hash(), 0, 0, &[]);
         Some((block, fat_pointer))
     }

@@ -980,9 +980,8 @@ it departs from.
   `headers[0]` carries the snapshot's hash in its parent field, and a validator must hold the
   snapshot block to validate the certificate anyway. `BftRunner::validate` enforces that order
   as part of Tail Confirmation, rejecting a block whose headers do not each name the one below
-  as parent (§6.2). The type does not: `BftBlock::try_from` checks only the header count and
-  logs that its documented validations are unimplemented, and the deserialization path used
-  for network and stored blocks does not call `try_from` at all. The snapshot is named by hash only; a consumer that needs
+  as parent (§6.2). The type does not: `BftBlock::new` checks only the header count, and
+  deserialization of network and stored blocks checks nothing. The snapshot is named by hash only; a consumer that needs
   its height asks the chain, and the fat-pointer check is handed a height lookup for that
   purpose (§6.2).
 - **The candidate height is clamped, and the clamp is not `prune_σ`.** The proposal path
@@ -1333,9 +1332,9 @@ stored, or consumed.
 - **Reward logic has three copies.** `Chain::push` with `update_bonds_with_pos_issuance`,
   `fixup_aggregated_stakes` in `stake_fixup.rs`, and the wallet projection in `lib.rs` must
   change together (§5.4).
-- **Header order is a property of the honest producer.** `BftBlock::try_from` checks only the
-  header count, and the network and stored-block deserialization path does not call it. Code that
-  reads `headers[0]` as the deepest header relies on the producer, not on validation.
+- **Header order is enforced by validation, not by the type.** `BftBlock::new` checks only the
+  header count, and deserialization checks nothing. Code that reads `headers[0]` as the deepest
+  header is sound only for a block that `BftRunner::validate` has passed.
 - **`NonFinalizedState` holds less than the finalized chain needs.** It lives in memory, it drops
   the lowest-work chain past `MAX_NON_FINALIZED_CHAIN_FORKS` (10), and it drops chains that do
   not contain the finalized tip, including those forking below a reorg-depth commit. The chain to

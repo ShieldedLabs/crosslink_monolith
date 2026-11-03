@@ -45,8 +45,7 @@ clock stops its nodes and fails.
 - Both nodes reach `TARGET` and agree on the tip within two blocks.
 - Node 0 logged the bootstrap at the activation height (450) and neither node reported an
   empty roster.
-- No panic, and no `ERROR` line other than the known placeholder
-  `not yet implemented: all the documented validations`, which `BftBlock::try_from` logs for
+- No panic, and no `ERROR` line.
   every BFT block it builds.
 - At least one BFT decision per four PoW blocks after activation, on both nodes.
 - The final height is within 40 blocks of the tip on both nodes.

@@ -9,7 +9,6 @@ use ed25519_zebra::{Signature, SigningKey, VerificationKeyBytes, VerificationKey
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::vec::Vec;
-use tracing::error;
 use crate::block::{ BlockHeaderData as BcBlockHeader, BlockHeader as BcBlockHeaderWrap };
 
 // use zebra_chain::serialization::{
@@ -116,30 +115,13 @@ impl SlashForkConfig {
 ///
 /// # Constructing [BftBlock]s
 ///
-/// A [BftBlock] may be constructed from a node's local view in order to create a new BFT proposal, or they may be constructed from unknown sources across a network protocol.
+/// A proposer builds one with [BftBlock::new] from exactly `bc_confirmation_depth_sigma` consecutive [BcBlockHeader] values in ascending height order, so that element zero is the deepest. The carried headers are the σ confirmations above the block being finalized (the `snapshot`): the snapshot is element zero's parent and is not carried, it is named by that parent hash. The specification requires these to be the tail of a bc-valid chain. The Zebra prototype does not always satisfy that: it clamps how far the snapshot may advance in a single step, and under that clamp it carries a mid-chain window instead of a tail.
 ///
-/// To construct a [BftBlock] for a new BFT proposal, build a [Vec] of exactly `bc_confirmation_depth_sigma` consecutive [BcBlockHeader] values in ascending height order, so that element zero is the deepest, then pass this to [BftBlock::try_from]. The carried headers are the σ confirmations above the block being finalized (the `snapshot`): the snapshot is element zero's parent and is not carried, it is named by that parent hash. The specification requires these to be the tail of a bc-valid chain. The Zebra prototype does not always satisfy that: it clamps how far the snapshot may advance in a single step, and under that clamp it carries a mid-chain window instead of a tail.
+/// A block from an unknown source comes from [BftBlock::zcash_deserialize], which checks only that it parses.
 ///
-/// To construct from an untrusted source, call the same [BftBlock::try_from].
+/// ## Validity
 ///
-/// ## Validation and Limitations
-///
-/// The [BftBlock::try_from] method is the only way to construct [BftBlock] values and performs the following validation internally:
-///
-/// 1. The number of headers matches the expected protocol confirmation depth, `bc_confirmation_depth_sigma`; see [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma).
-/// 2. The [version](BcBlockHeader::version) field is a known expected value.
-/// 3. The headers are in the correct order given the [previous_block_hash](BcBlockHeader::previous_block_hash) fields.
-/// 4. The PoW solutions validate.
-///
-/// These validations use *immediate data* and are *stateless*, and in particular the following stateful validations are **NOT** performed:
-///
-/// 1. The [difficulty_threshold](BcBlockHeader::difficulty_threshold) is within correct bounds for the Difficulty Adjustment Algorithm.
-/// 2. The [time](BcBlockHeader::time) field is within correct bounds.
-/// 3. The [merkle_root](BcBlockHeader::merkle_root) field is sensible.
-///
-/// No other validations are performed.
-///
-/// **TODO:** Ensure deserialization delegates to [BftBlock::try_from].
+/// This type holds no validity invariant: its fields are public, and neither [BftBlock::new] nor deserialization checks the headers. Validity is decided by the node's BFT validation (`validate_with_hash` in `zebra-state`'s `new_network::bft`), which every proposal and decided block passes before it is voted on or committed.
 ///
 /// ## Versioning
 ///
@@ -159,9 +141,7 @@ impl SlashForkConfig {
 ///
 /// > Each bft‑proposal has, in addition to origbft‑proposal fields, a headers_bc field containing a sequence of exactly σ bc‑headers (zero‑indexed, deepest first).
 ///
-/// That order is a property of the honest producer, not of this type. Nothing establishes it for a block from an unknown source: [BftBlock::try_from] checks only the header count, and the deserialization path does not call it.
-///
-/// The [TryFrom] impl performs internal validations and is intended to be the only way to construct a [BftBlock], whether locally generated or from an unknown source. This is the safest design, though potentially less efficient.
+/// That order is a property of the honest producer, not of this type; BFT validation checks it for every received block.
 ///
 /// # References
 ///
@@ -315,28 +295,37 @@ impl BftBlock {
         self.headers.first().expect("Vec should never be empty").prev_block
     }
 
-    /// Attempt to construct a [BftBlock] from headers while performing immediate validations; see [BftBlock] type docs
-    pub fn try_from(
+    /// Builds a [BftBlock], checking only that it carries exactly
+    /// [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma) headers.
+    ///
+    /// For `version < 2`, `slashforks` must be empty and `do_not_include_until_bc_height` must be
+    /// `0`, since those versions do not serialize them.
+    ///
+    /// # Errors
+    ///
+    /// [InvalidBftBlock::IncorrectConfirmationDepth] if the header count is not σ.
+    pub fn new(
         params: &ZcashCrosslinkParameters,
+        version: u32,
         height: u32,
         previous_block_fat_ptr: FatPointerToBftBlock,
         headers: Vec<BcBlockHeader>,
+        slashforks: Vec<SlashForkConfig>,
+        do_not_include_until_bc_height: u64,
     ) -> Result<Self, InvalidBftBlock> {
         let expected = params.bc_confirmation_depth_sigma;
         let actual = headers.len() as u64;
         if actual != expected {
             return Err(InvalidBftBlock::IncorrectConfirmationDepth { expected, actual });
         }
-
-        error!("not yet implemented: all the documented validations");
-
+        assert!(version >= 2 || (slashforks.is_empty() && do_not_include_until_bc_height == 0));
         Ok(BftBlock {
-            version: 1,
+            version,
             height,
             previous_block_fat_ptr,
             headers,
-            slashforks: Vec::new(),
-            do_not_include_until_bc_height: 0,
+            slashforks,
+            do_not_include_until_bc_height,
         })
     }
 

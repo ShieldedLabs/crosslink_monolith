@@ -1078,7 +1078,7 @@ fn crosslink_test_basic_finality() {
     test_bytes(tf.write_to_bytes());
 }
 
-/// A BFT block assembled straight from PoW blocks, bypassing `BftBlock::try_from` and the header
+/// A BFT block assembled straight from PoW blocks, bypassing `BftBlock::new` and the header
 /// count it enforces, with the fat pointer recomputed from the result so that the only thing wrong
 /// with the block is what the test made wrong. The Tail Confirmation tests need blocks
 /// `create_pos_and_ptr_to_finalize_pow` will not build.
@@ -1598,8 +1598,7 @@ fn pos_on_a_snapshot_nobody_holds(tail: &[Arc<Block>], snapshot: [u8; 32], bits:
         }
         headers[i].prev_block = if i == 0 { BcBlockHash(snapshot) } else { BcBlockHash::from_header_data(&headers[i - 1]) };
     }
-    let mut block = BftBlock::try_from(&HARNESS_PARAMETERS, 0, FatPointerToBftBlock::null(), headers).expect("sigma linked headers");
-    block.version = 2;
+    let block = BftBlock::new(&HARNESS_PARAMETERS, 2, 0, FatPointerToBftBlock::null(), headers, Vec::new(), 0).expect("sigma linked headers");
     BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt::from_parts(block, 0, 0, &[]))
 }
 
@@ -3138,7 +3137,7 @@ fn create_pos_and_ptr_to_finalize_pow_at_round(
 
     let mut hdrs = Vec::with_capacity(pow_blocks.len());
     for pow_block in pow_blocks {
-        // BftBlock::try_from takes BcBlockHeader (zcash_primitives), not zebra's
+        // BftBlock::new takes BcBlockHeader (zcash_primitives), not zebra's
         // Header; convert via the same helper production code uses (lib.rs).
         hdrs.push(zebra_crosslink::bc_hdr_to_lrz(pow_block.header.as_ref()));
     }
@@ -3147,11 +3146,14 @@ fn create_pos_and_ptr_to_finalize_pow_at_round(
     // carried header: the sigma carried headers are the confirmations built on top of it, and
     // the snapshot is not carried. The PoW-side fat-pointer check resolves its height from the
     // chain to enforce `pow_height >= snapshot + sigma + 1`.
-    let block = BftBlock::try_from(
+    let block = BftBlock::new(
         &HARNESS_PARAMETERS,
+        1,
         bft_height,
         parent_fat_ptr,
         hdrs,
+        Vec::new(),
+        0,
     )
     .expect("valid PoS block");
 
@@ -3203,10 +3205,7 @@ fn bft_proposal(
     tail: &[Arc<Block>],
 ) -> BftBlock {
     let headers = tail.iter().map(|b| zebra_crosslink::bc_hdr_to_lrz(b.header.as_ref())).collect();
-    let mut block = BftBlock::try_from(params, bft_height, parent, headers).expect("a proposal over sigma linked headers");
-    block.version = 2;
-    block.do_not_include_until_bc_height = parent_do_not_include;
-    block
+    BftBlock::new(params, 2, bft_height, parent, headers, Vec::new(), parent_do_not_include).expect("a proposal over sigma linked headers")
 }
 
 /// The bytes a proposer sends for `block`: what tenderlink carries as the proposal value.
