@@ -503,7 +503,8 @@ impl NonFinalizedState {
     ) -> Result<Arc<Chain>, ValidateContextError> {
         let height = prepared.height;
 
-        check::transactions_are_new_to_chain(&prepared, &new_chain)?;
+        // Reads from disk
+        check::transactions_are_new_to_chain(&prepared, &self.network, &new_chain, finalized_state)?;
 
         // Reads from disk
         //
