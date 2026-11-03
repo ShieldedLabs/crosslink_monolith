@@ -469,6 +469,15 @@ pub fn get_tfl_recency_status_str() -> Option<String> {
     closure.0()
 }
 
+// A lightwallet server can accept a streaming request and then never send the next message, which would
+// park the sync loop forever with no error. A timeout turns that into an error the loop already handles.
+async fn next_stream_message<T>(stream: &mut tonic::Streaming<T>) -> Result<Option<T>, tonic::Status> {
+    match tokio::time::timeout(std::time::Duration::from_secs(30), stream.message()).await {
+        Ok(res) => res,
+        Err(_) => Err(tonic::Status::deadline_exceeded("no stream message in 30 s")),
+    }
+}
+
 async fn wait_for_lightwalletd() {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
     for _ in 0..10 {
@@ -4089,7 +4098,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 Ok(blocks) => {
                     let mut block_stream = blocks.into_inner();
                     loop {
-                        match block_stream.message().await { // TODO: bulk await these?
+                        match next_stream_message(&mut block_stream).await { // TODO: bulk await these?
                             Ok(Some(block)) => {
                                 new_blocks.push(block)
                             }
@@ -4246,7 +4255,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             println!("Downloading t txs in {}-{} for {wallet_i}.{strm_i}/{t_addr_str}", t_req_rng.0, t_req_rng.1);
                             let mut tx_stream = t_txs.into_inner();
                             loop {
-                                match tx_stream.message().await { // TODO: bulk await these?
+                                match next_stream_message(&mut tx_stream).await { // TODO: bulk await these?
                                     Ok(Some(tx)) => {
                                         min_t_h = min_t_h.min(tx.height);
                                         max_t_h = max_t_h.max(tx.height);
