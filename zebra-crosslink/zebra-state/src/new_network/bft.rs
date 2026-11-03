@@ -1105,12 +1105,14 @@ impl BftRunner {
             }
         }
 
-        // do_not_include_until_bc_height must be monotonic non-decreasing. (v1 blocks use the
-        // implicit value 0, so this holds for existing history.) In the hardfork case the checks
-        // above already guarantee this passes.
-        if new_block.do_not_include_until_bc_height < parent_do_not_include {
+        // Without a scheduled hardfork, do_not_include_until_bc_height must equal the parent's,
+        // as honest proposers set it. Allowing it only to rise would let one proposer raise it
+        // to u64::MAX, after which no PoW block could point at BFT again and the next hardfork
+        // block would fail as a regression. (v1 blocks use the implicit value 0, so this holds
+        // for existing history.)
+        if scheduled_hardforks.is_empty() && new_block.do_not_include_until_bc_height != parent_do_not_include {
             tracing::warn!(
-                "BFT block do_not_include_until_bc_height {} is below its parent's {}",
+                "BFT block do_not_include_until_bc_height {} differs from its parent's {} with no hardfork scheduled",
                 new_block.do_not_include_until_bc_height, parent_do_not_include,
             );
             return fail;

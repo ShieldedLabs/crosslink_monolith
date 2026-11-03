@@ -907,6 +907,38 @@ fn crosslink_reject_pos_block_above_the_latest_version() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// With no hardfork scheduled, a BFT block's `do_not_include_until_bc_height` must equal its
+/// parent's. Were a raised one decided, every honest block after it would inherit the value, and
+/// at `u64::MAX` no PoW block could point at BFT again. The same block with the parent's value is
+/// accepted, so the raise is the only thing wrong with it.
+#[test]
+fn crosslink_reject_pos_block_that_raises_do_not_include_without_a_hardfork() {
+    use zebra_state::new_network::bft::BFT_BLOCK_VERSION_LATEST as LATEST;
+
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let (_gen, _miner_addr, pow) = pow_chain_for(&mut tf, 8);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+    let bft0 = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
+    tf.push_instr_load_pos(&bft0, 0);
+
+    let with_do_not_include = |do_not_include: u64| {
+        let mut block = create_pos_and_ptr_to_finalize_pow(*pos_h, fat_ptr.clone(), &pow[5..8], &[]).0.block;
+        block.version = LATEST;
+        block.do_not_include_until_bc_height = do_not_include;
+        BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt::from_parts(block, (*pos_h).into(), 1, &[]))
+    };
+    for raised in [1, u64::MAX] {
+        tf.push_instr_load_pos(&with_do_not_include(raised), SHOULD_FAIL);
+        tf.push_instr_expect_pos_chain_length(1, 0);
+    }
+    tf.push_instr_load_pos(&with_do_not_include(0), 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 /// With BFT bootstrapped from the chain, a PoW block at or below the activation height may not point
 /// at a BFT block. Every other scenario supplies BFT directly (`HARNESS_PARAMETERS`) and so never
 /// meets this rule; this one runs the prototype's bootstrap so the rule itself stays tested.
