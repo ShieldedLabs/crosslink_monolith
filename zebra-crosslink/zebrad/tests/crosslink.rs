@@ -1157,6 +1157,34 @@ fn crosslink_reject_pos_block_that_regresses_the_snapshot() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// A BFT block above the latest version is refused. Were one decided, every honest proposal after
+/// it would be below its parent's version, and only its proposer could extend BFT. The same block
+/// at the latest version is accepted, so the version is the only thing wrong with it.
+#[test]
+fn crosslink_reject_pos_block_above_the_latest_version() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let (_gen, _miner_addr, pow) = bonded_pow_chain_for(&mut tf, 8);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+    let bft0 = next_signed_pos(pos_h, fat_ptr, &pow[4..7]);
+    push_decided_pos(&mut tf, &bft0, 0);
+
+    let at_version = |version: u32| {
+        let mut block = create_pos_and_ptr_to_finalize_pow_at_round(*pos_h, fat_ptr.clone(), &pow[5..8], 1, &[]).0.block;
+        block.version = version;
+        let seed = synthetic_finalizer_seed(SUPPLIED_FINALIZER);
+        let fat_ptr = signed_fat_pointer(&block, u64::from(*pos_h), 1, &[seed.as_bytes()], &[0; 32]);
+        BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr })
+    };
+    push_decided_pos(&mut tf, &at_version(3), SHOULD_FAIL);
+    tf.push_instr_expect_pos_chain_length(1, 0);
+    push_decided_pos(&mut tf, &at_version(2), 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 /// With BFT bootstrapped from the chain, a PoW block at or below the activation height may not point
 /// at a BFT block. Every other scenario supplies BFT directly (`HARNESS_PARAMETERS`) and so never
 /// meets this rule; this one runs the prototype's bootstrap so the rule itself stays tested.

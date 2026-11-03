@@ -660,14 +660,117 @@ fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
 }
 // ---- End of transaction and staking moves ----
 
+// ---- BFT ----
+// A generator of its own: a supplied-BFT chain, SUPPLIED_FINALIZER signing everything as
+// `bonded_start` arranges, over a PoW chain that only grows. Each step may first offer a block wrong
+// in one field `validate` checks against the parent, which must be refused, and then offers a
+// valid one, which must be decided: a proposal one finalizer gets refused, or would have got
+// decided, must never keep a later honest one out.
+
+struct BftFuzz {
+    tf: TF,
+    gen: BlockGen,
+    miner: Address,
+    /// `pow[i]` is the PoW block at height `i + 1 + BONDED_SHIFT`.
+    pow: Vec<Arc<Block>>,
+    /// The decided chain's length, and its tip's certificate, version and first header's index.
+    decided: u32,
+    tip_ptr: FatPointerToBftBlock,
+    tip_version: u32,
+    tip_from: usize,
+}
+
+/// The BFT block at `height` on `parent` carrying `headers`, at `version`, with SUPPLIED_FINALIZER's
+/// certificate; the genesis's is empty.
+fn bft_fuzz_block(parent: &FatPointerToBftBlock, height: u32, headers: &[Arc<Block>], version: u32) -> BftBlockAndFatPointerToItWrap {
+    let mut block = create_pos_and_ptr_to_finalize_pow_at_round(height, parent.clone(), headers, 1, &[]).0.block;
+    block.version = version;
+    if height == 0 {
+        return BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt::from_parts(block, 0, 1, &[]));
+    }
+    let seed = synthetic_finalizer_seed(SUPPLIED_FINALIZER);
+    let fat_ptr = signed_fat_pointer(&block, u64::from(height), 1, &[seed.as_bytes()], &[0; 32]);
+    BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr })
+}
+
+fn bft_fuzz_grow_pow(f: &mut BftFuzz, c: &mut Choices) {
+    for _ in 0..1 + c.below(3) {
+        f.pow.push(f.gen.next_block(&f.miner));
+        f.tf.push_instr_load_pow(&f.gen.tip, 0);
+    }
+}
+
+fn bft_fuzz_step(f: &mut BftFuzz, c: &mut Choices) {
+    use zebra_state::new_network::bft::BFT_BLOCK_VERSION_LATEST as LATEST;
+
+    let sigma = HARNESS_PARAMETERS.bc_confirmation_depth_sigma as usize;
+    // Linearity lets the snapshot stay where the parent's is, but not go below it.
+    let (lo, hi) = (if f.decided == 0 { 0 } else { f.tip_from }, f.pow.len() - sigma);
+    let from = lo + c.below(hi - lo + 1);
+    let headers = f.pow[from..from + sigma].to_vec();
+    let lowest_version = f.tip_version.max(1);
+    let version = lowest_version + c.below((LATEST - lowest_version + 1) as usize) as u32;
+
+    if c.unusual(128) {
+        let above_latest = |c: &mut Choices| match c.below(3) {
+            0 => LATEST + 1,
+            1 => u32::MAX,
+            _ => LATEST + 1 + c.below(1000) as u32,
+        };
+        let (parent, h) = (&f.tip_ptr, f.decided);
+        let bad = match c.below(4) {
+            1 if h > 0 => bft_fuzz_block(parent, h, &headers, c.below(f.tip_version as usize) as u32),
+            2 => {
+                let claimed = if h > 0 && c.unusual(128) { h - 1 } else { h + 1 + c.below(3) as u32 };
+                bft_fuzz_block(parent, claimed, &headers, version)
+            }
+            3 if h > 0 && f.tip_from > 0 => {
+                let below = c.below(f.tip_from);
+                bft_fuzz_block(parent, h, &f.pow[below..below + sigma], version)
+            }
+            _ => bft_fuzz_block(parent, h, &headers, above_latest(c)),
+        };
+        push_decided_pos(&mut f.tf, &bad, SHOULD_FAIL);
+        f.tf.push_instr_expect_node_alive(0);
+        f.tf.push_instr_expect_pos_chain_length(f.decided as usize, 0);
+    }
+
+    let good = bft_fuzz_block(&f.tip_ptr, f.decided, &headers, version);
+    push_decided_pos(&mut f.tf, &good, 0);
+    f.decided += 1;
+    f.tip_ptr = good.0.fat_ptr.clone();
+    f.tip_version = version;
+    f.tip_from = from;
+    f.tf.push_instr_expect_pos_chain_length(f.decided as usize, 0);
+}
+
+fn generate_bft(c: &mut Choices) -> Vec<u8> {
+    let sigma = HARNESS_PARAMETERS.bc_confirmation_depth_sigma as usize;
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let (gen, miner, pow) = bonded_pow_chain_for(&mut tf, sigma + c.below(4));
+    let mut f = BftFuzz { tf, gen, miner, pow, decided: 0, tip_ptr: FatPointerToBftBlock::null(), tip_version: 0, tip_from: 0 };
+    for _ in 0..2 + c.below(14) {
+        if f.tip_from + HARNESS_PARAMETERS.bc_confirmation_depth_sigma as usize == f.pow.len() || c.unusual(96) {
+            bft_fuzz_grow_pow(&mut f, c);
+        }
+        bft_fuzz_step(&mut f, c);
+    }
+    f.tf.push_instr_expect_node_alive(0);
+    f.tf.write_to_bytes()
+}
+// ---- End of BFT ----
+
 type Move = fn(&mut FuzzGen, &mut Choices);
 
 /// The moves, most ordinary first: choice 0 picks extend.
 const MOVES: &[Move] = &[move_extend, move_fork, move_invalid_block, move_mangled_block, move_spend, move_mine_pending, move_double_spend, move_staking];
 
 /// The test file for `c`. Each input enables a subset of the moves, so rare combinations are not
-/// drowned out by common ones.
+/// drowned out by common ones. Some inputs are BFT chains instead (`generate_bft`).
 pub(crate) fn generate(c: &mut Choices) -> Vec<u8> {
+    if c.unusual(48) {
+        return generate_bft(c);
+    }
     // The short staking calendar, so bonds can unbond and withdraw within one input.
     let params = zcash_primitives::bft::ZcashCrosslinkParameters { staking: short_staking(&HARNESS_PARAMETERS), ..HARNESS_PARAMETERS };
     let mut g = FuzzGen::new(&params);
