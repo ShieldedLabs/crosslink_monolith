@@ -1822,6 +1822,11 @@ pub struct BftAddressMap {
     pub by_key:  HashMap<PubKeyID, HashMap<STPAddress, Option<PeerAttestation>>>,
     pub by_addr: HashMap<STPAddress, PubKeyID>,
     pub last_packet_utcs: HashMap<PubKeyID, i64>,
+    // #261: the address each roster key last proved itself on at ID_HELLO / ID_HELLO_ACK. Kept apart
+    // from the attestations and never pruned with them, so a roster key dropped from by_key can still
+    // be re-dialed. Only roster keys are stored. @Todo: drop entries for keys no longer on any roster,
+    // so this cannot grow across roster rotations.
+    pub hello_addrs: HashMap<PubKeyID, STPAddress>,
 }
 impl BftAddressMap {
     pub fn new() -> Self { Self::default() }
@@ -1837,6 +1842,22 @@ impl BftAddressMap {
     /// `by_addr` only before the handshake has named a key for this connection (`bft_pk` is NIL).
     pub fn key_for_connection(&self, verified_bft_pk: PubKeyID, addr: &STPAddress) -> Option<PubKeyID> {
         if verified_bft_pk != PubKeyID::NIL { Some(verified_bft_pk) } else { self.get_key(addr).copied() }
+    }
+    /// Remember where a roster key last proved itself at ID_HELLO / ID_HELLO_ACK, so it can be
+    /// re-dialed after its address attestation is pruned. Only roster keys are kept.
+    pub fn remember_hello_addr(&mut self, roster: &[SortedRosterMember], key: PubKeyID, addr: &STPAddress) {
+        if key != PubKeyID::NIL && roster.iter().any(|m| m.pub_key == key) {
+            self.hello_addrs.insert(key, addr.clone());
+        }
+    }
+    /// Active-roster finalizers we hold a last-HELLO address for but have no live link to. The connect
+    /// loop otherwise re-dials only keys still in `by_key` (and seeds), so a finalizer pruned from
+    /// `by_key` stayed unreachable until one side restarted.
+    pub fn roster_redial_addrs(&self, active_roster: &[SortedRosterMember], my_bft_pk: PubKeyID, connected_bft_pks: &[PubKeyID]) -> Vec<STPAddress> {
+        active_roster.iter()
+            .filter(|m| m.pub_key != my_bft_pk && !connected_bft_pks.contains(&m.pub_key))
+            .filter_map(|m| self.hello_addrs.get(&m.pub_key).cloned())
+            .collect()
     }
     pub fn get_addrs(&self, key: &PubKeyID) -> impl Iterator<Item = (&STPAddress, &Option<PeerAttestation>)> { self.by_key.get(key).map(|v| v.iter()).unwrap_or_default() }
     pub fn contains_key(&self, key: &PubKeyID) -> bool { self.by_key.contains_key(key) }
@@ -2718,11 +2739,16 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     const PEERS_TO_ASK_PUNCH:               usize = 2;
 
                     let mut all_addresses: Vec<(&PubKeyID, &HashMap<STPAddress, Option<PeerAttestation>>)> = bft_address_map.by_key.iter().collect(); all_addresses.shuffle(rng);
-                    for (_, map) in &all_addresses {
-                        // Grab a random address associated with this BFT key. @Todo: prioritize by trustworthiness and expiry time.
-                        let Some((address, _)) = map.iter().choose(rng) else {
-                            continue;
-                        };
+                    // One random known address per BFT key, as before. @Todo: prioritize by trustworthiness and expiry time.
+                    let mut dial_addresses: Vec<STPAddress> = all_addresses.iter().filter_map(|(_, map)| map.keys().choose(&mut *rng).cloned()).collect();
+                    // #261: also re-dial active-roster finalizers whose link is down, at the
+                    // address they last proved themselves on. The per-key list above only re-dials keys
+                    // still in by_key, so a finalizer pruned from by_key stayed unreachable until a restart.
+                    let connected_bft_pks: Vec<PubKeyID> = peers.values().map(|p| p.bft_pk).filter(|pk| *pk != PubKeyID::NIL).collect();
+                    for address in bft_address_map.roster_redial_addrs(&roster[..active_roster_len(&roster, bft_state.active_roster_max_n)], bft_state.my_pub_key, &connected_bft_pks) {
+                        if !dial_addresses.contains(&address) { dial_addresses.push(address); }
+                    }
+                    for address in &dial_addresses {
                         // Don't connect to myself.
                         if address.key == my_stp_keypair.public {
                             continue;
@@ -3081,6 +3107,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 bft_address_map.insert(&their_verification.pk, &peer.stp_address, None);
                 peer.bft_pk = their_verification.pk;
+                bft_address_map.remember_hello_addr(&roster, their_verification.pk, &peer.stp_address); // #261: remember this roster key's address for re-dial
 
                 let my_verification = { // almost @Duplicate
                     let pk_bytes = my_root_public_bft_key.as_ref();
@@ -3159,11 +3186,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 }
 
                 // On a re-HELLO's ACK the link is already verified with this key; keep any attestation
-                // we hold for it rather than overwriting it with None (votefix).
+                // we hold for it rather than overwriting it with None (#261).
                 if peer.bft_pk != their_verification.pk {
                     bft_address_map.insert(&their_verification.pk, &peer.stp_address, None);
                 }
                 peer.bft_pk = their_verification.pk;
+                bft_address_map.remember_hello_addr(&roster, their_verification.pk, &peer.stp_address); // #261: remember this roster key's address for re-dial
 
                 let Some(attestation) = PacketIdAttestation::read_from(msg) else {
                     if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID verification: Failed to read ID Hello Ack packet: Failed to read attestation"); }
@@ -3956,6 +3984,31 @@ mod tests {
         }
         assert!(2 * ID_HELLO_REFRESH_SECS < PEER_ATTESTATION_LIFETIME_SECS,
                 "the latest refresh still precedes the attestation's expiry");
+    }
+
+    /// Active-roster finalizers with no live link are re-dialed at their last HELLO address; a
+    /// connected one, this node itself, and a key never seen on the roster are not. Bug G: the connect
+    /// loop re-dialed only keys still in `by_key`, so a finalizer pruned from it stayed gone.
+    #[test]
+    fn roster_finalizers_without_a_live_link_are_re_dialed_at_their_last_hello_address() {
+        let addr = |b: u8| {
+            let key = crate::stp::new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+            STPAddress::from(std::net::Ipv6Addr::LOCALHOST, 14000 + b as u16, &key)
+        };
+        let (me, up, down, off_roster) = (PubKeyID([1; 32]), PubKeyID([2; 32]), PubKeyID([3; 32]), PubKeyID([4; 32]));
+        let (up_addr, down_addr, off_addr) = (addr(2), addr(3), addr(4));
+        let roster: Vec<SortedRosterMember> = [me, up, down].iter()
+            .map(|&pk| SortedRosterMember { pub_key: pk, stake: 1, cumulative_stake: 1 }).collect();
+
+        let mut map = BftAddressMap::new();
+        map.remember_hello_addr(&roster, up, &up_addr);
+        map.remember_hello_addr(&roster, down, &down_addr);
+        map.remember_hello_addr(&roster, off_roster, &off_addr); // ignored: not on the roster
+        assert!(!map.hello_addrs.contains_key(&off_roster), "a non-roster key is not remembered");
+
+        // Only `up` has a live link; `me` is this node.
+        let redial = map.roster_redial_addrs(&roster, me, &[up]);
+        assert_eq!(redial, vec![down_addr], "re-dial only the roster finalizer with no live link");
     }
 
     /// Restored signatures are over the legacy application format, not the active STP MTU.
