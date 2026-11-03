@@ -138,6 +138,12 @@ impl Version {
                 170_166
             }
             (Mainnet, FeaturenetUpgrade2) => 170_166,
+            (Testnet(params), FeaturenetUpgrade3)
+                if params.is_default_testnet() || params.is_regtest() =>
+            {
+                170_167
+            }
+            (Mainnet, FeaturenetUpgrade3) => 170_167,
             (Testnet(params), Nu7) if params.is_default_testnet() || params.is_regtest() => 170_170,
             (Mainnet, Nu7) => 170_180,
 
@@ -145,6 +151,7 @@ impl Version {
             // upgrade until that upgrade activates, so nodes can be upgraded ahead of the fork.
             (Testnet(_), upgrade) if upgrade < FeaturenetUpgrade1 => 170_160,
             (Testnet(_), FeaturenetUpgrade1) => 170_165,
+            (Testnet(_), FeaturenetUpgrade2) => 170_166,
             // It should be fine to reject peers with earlier network protocol versions on custom testnets for now.
             (Testnet(_), _) => CURRENT_NETWORK_PROTOCOL_VERSION.0,
 
@@ -290,6 +297,35 @@ mod test {
         );
         assert_eq!(
             Version::min_remote_for_height(&network, block::Height(activation)),
+            Version(170_166)
+        );
+    }
+
+    #[test]
+    fn custom_testnet_keeps_older_peers_until_featurenet_upgrade_3() {
+        let _init_guard = zebra_test::init();
+
+        let activation = 100;
+        let network = zebra_chain::parameters::testnet::Parameters::build()
+            .with_network_magic(zebra_chain::parameters::Magic([b'C', b'l', b'T', b'1']))
+            .expect("magic is not reserved")
+            .with_activation_heights(zebra_chain::parameters::testnet::ConfiguredActivationHeights {
+                nu6_3: Some(1),
+                featurenet_upgrade_1: Some(activation - 50),
+                featurenet_upgrade_2: Some(activation - 25),
+                featurenet_upgrade_3: Some(activation),
+                ..Default::default()
+            })
+            .expect("activation heights are in order")
+            .to_network()
+            .expect("parameters are valid");
+
+        assert_eq!(
+            Version::min_remote_for_height(&network, block::Height(activation - 1)),
+            Version(170_166)
+        );
+        assert_eq!(
+            Version::min_remote_for_height(&network, block::Height(activation)),
             CURRENT_NETWORK_PROTOCOL_VERSION
         );
     }
@@ -303,7 +339,8 @@ mod test {
         assert!(
             matches!(
                 highest_network_upgrade,
-                Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | Nu7
+                Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2
+                    | FeaturenetUpgrade3 | Nu7
             ),
             "expected coverage of all network upgrades: \
             add the new network upgrade to the list in this test"
@@ -323,6 +360,7 @@ mod test {
             Nu6_3,
             FeaturenetUpgrade1,
             FeaturenetUpgrade2,
+            FeaturenetUpgrade3,
             Nu7,
         ] {
             let height = network_upgrade.activation_height(network);

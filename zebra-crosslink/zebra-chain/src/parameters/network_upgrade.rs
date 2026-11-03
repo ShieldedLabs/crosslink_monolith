@@ -68,6 +68,8 @@ pub enum NetworkUpgrade {
     FeaturenetUpgrade1,
     /// The Zcash protocol after the second Crosslink featurenet upgrade.
     FeaturenetUpgrade2,
+    /// The Zcash protocol after the third Crosslink featurenet upgrade.
+    FeaturenetUpgrade3,
     /// The Zcash protocol after the NU7 upgrade.
     #[serde(rename = "NU7")]
     Nu7,
@@ -145,18 +147,35 @@ pub(super) const MAINNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] 
 pub(super) const TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] = {
     use zcash_protocol::consensus::{
         TESTNET_FEATURENET_UPGRADE_1_HEIGHT, TESTNET_FEATURENET_UPGRADE_2_HEIGHT,
+        TESTNET_FEATURENET_UPGRADE_3_HEIGHT,
     };
-    match TESTNET_FEATURENET_UPGRADE_2_HEIGHT {
-        None => &[
+    match (
+        TESTNET_FEATURENET_UPGRADE_2_HEIGHT,
+        TESTNET_FEATURENET_UPGRADE_3_HEIGHT,
+    ) {
+        (None, None) => &[
             (block::Height(0), Genesis),
             (block::Height(1), Nu6_3),
             (block::Height(TESTNET_FEATURENET_UPGRADE_1_HEIGHT), FeaturenetUpgrade1),
         ],
-        Some(featurenet_upgrade_2) => &[
+        (Some(featurenet_upgrade_2), None) => &[
             (block::Height(0), Genesis),
             (block::Height(1), Nu6_3),
             (block::Height(TESTNET_FEATURENET_UPGRADE_1_HEIGHT), FeaturenetUpgrade1),
             (block::Height(featurenet_upgrade_2), FeaturenetUpgrade2),
+        ],
+        (None, Some(featurenet_upgrade_3)) => &[
+            (block::Height(0), Genesis),
+            (block::Height(1), Nu6_3),
+            (block::Height(TESTNET_FEATURENET_UPGRADE_1_HEIGHT), FeaturenetUpgrade1),
+            (block::Height(featurenet_upgrade_3), FeaturenetUpgrade3),
+        ],
+        (Some(featurenet_upgrade_2), Some(featurenet_upgrade_3)) => &[
+            (block::Height(0), Genesis),
+            (block::Height(1), Nu6_3),
+            (block::Height(TESTNET_FEATURENET_UPGRADE_1_HEIGHT), FeaturenetUpgrade1),
+            (block::Height(featurenet_upgrade_2), FeaturenetUpgrade2),
+            (block::Height(featurenet_upgrade_3), FeaturenetUpgrade3),
         ],
     }
 };
@@ -258,6 +277,8 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (FeaturenetUpgrade1, ConsensusBranchId(0x46545531)),
     // Matches zcash_protocol's `BranchId::FeaturenetUpgrade2`.
     (FeaturenetUpgrade2, ConsensusBranchId(0x46545532)),
+    // Matches zcash_protocol's `BranchId::FeaturenetUpgrade3`.
+    (FeaturenetUpgrade3, ConsensusBranchId(0x464e5533)),
     // TODO: set below to (Nu7, ConsensusBranchId(0x77190ad8)), once the same value is set in librustzcash
     #[cfg(any(test, feature = "zebra-test"))]
     (Nu7, ConsensusBranchId(0xfffffffe)),
@@ -432,7 +453,7 @@ impl NetworkUpgrade {
         let spacing_seconds = match self {
             Genesis | BeforeOverwinter | Overwinter | Sapling => PRE_BLOSSOM_POW_TARGET_SPACING,
             Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1
-            | FeaturenetUpgrade2 | Nu7 => {
+            | FeaturenetUpgrade2 | FeaturenetUpgrade3 | Nu7 => {
                 POST_BLOSSOM_POW_TARGET_SPACING.into()
             }
 
@@ -567,6 +588,9 @@ impl From<zcash_protocol::consensus::NetworkUpgrade> for NetworkUpgrade {
             }
             zcash_protocol::consensus::NetworkUpgrade::FeaturenetUpgrade2 => {
                 Self::FeaturenetUpgrade2
+            }
+            zcash_protocol::consensus::NetworkUpgrade::FeaturenetUpgrade3 => {
+                Self::FeaturenetUpgrade3
             }
             #[cfg(zcash_unstable = "nu7")]
             zcash_protocol::consensus::NetworkUpgrade::Nu7 => Self::Nu7,

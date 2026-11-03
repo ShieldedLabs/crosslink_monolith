@@ -74,6 +74,7 @@ impl Parameters for LocalNetwork {
             NetworkUpgrade::Nu7 => self.nu7,
             NetworkUpgrade::FeaturenetUpgrade1 => None,
             NetworkUpgrade::FeaturenetUpgrade2 => None,
+            NetworkUpgrade::FeaturenetUpgrade3 => None,
         }
     }
 }

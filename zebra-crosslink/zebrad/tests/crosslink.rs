@@ -397,6 +397,54 @@ fn crosslink_featurenet_upgrade_2_height_set_by_the_test_file() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// FeaturenetUpgrade3 is unscheduled by default; a test file's node config schedules it at height
+/// 4, and the node switches to it at exactly that height, as for FeaturenetUpgrade2 above: a block
+/// there built for the default schedule, whose coinbase is still the older upgrade's, is refused,
+/// and one built for the moved schedule is accepted, as is the node's own next block.
+#[test]
+fn crosslink_featurenet_upgrade_3_height_set_by_the_test_file() {
+    use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
+
+    set_test_name(function_name!());
+    let params = HARNESS_PARAMETERS;
+    let activation = 4;
+    let node_config = node_config_with_activation_heights(ConfiguredActivationHeights {
+        featurenet_upgrade_3: Some(activation),
+        ..Default::default()
+    });
+    let mut tf = TF::new_with_node_config(&params, &node_config);
+
+    let network = test_network(&params, &node_config);
+    let default_schedule = regtest_network(&params);
+    assert_ne!(NetworkUpgrade::current(&network, BlockHeight(activation - 1)), NetworkUpgrade::FeaturenetUpgrade3);
+    assert_eq!(NetworkUpgrade::current(&network, BlockHeight(activation)), NetworkUpgrade::FeaturenetUpgrade3);
+    assert_eq!(NetworkUpgrade::FeaturenetUpgrade3.activation_height(&default_schedule), None);
+    assert_ne!(NetworkUpgrade::current(&default_schedule, BlockHeight::MAX), NetworkUpgrade::FeaturenetUpgrade3);
+
+    let key = TestKey::new(b"crosslink test miner");
+    let miner = key.address();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    for _ in 2..activation {
+        tf.push_instr_load_pow(&gen.next_block(&miner), 0);
+    }
+
+    // the same chain, continued by a generator that does not know the upgrade
+    let mut default_gen = gen.clone();
+    default_gen.network = default_schedule;
+    tf.push_instr_load_pow(&default_gen.next_block(&miner), SHOULD_FAIL);
+
+    let first_after = gen.next_block(&miner);
+    tf.push_instr_load_pow(&first_after, 0);
+    tf.push_instr_expect_pow_tip(&first_after.hash(), 0);
+    tf.push_instr_mine_from_template_into(1, 0);
+    tf.push_instr_expect_pow_tip_slot(1, 0);
+    tf.push_instr_expect_pow_chain_length(activation as usize + 2, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 /// The node and the network for a fat pointer binding scenario: FeaturenetUpgrade2 at
 /// `activation`, or unscheduled as by default.
 fn fat_pointer_binding_node(activation: Option<u32>) -> (TF, Network) {

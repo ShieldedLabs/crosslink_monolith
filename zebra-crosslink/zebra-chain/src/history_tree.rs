@@ -121,6 +121,7 @@ impl NonEmptyHistoryTree {
             NetworkUpgrade::Nu6_3
             | NetworkUpgrade::FeaturenetUpgrade1
             | NetworkUpgrade::FeaturenetUpgrade2
+            | NetworkUpgrade::FeaturenetUpgrade3
             | NetworkUpgrade::Nu7 => {
                 let tree = Tree::<IronwoodOnward>::new_from_cache(
                     network,
@@ -190,6 +191,7 @@ impl NonEmptyHistoryTree {
             NetworkUpgrade::Nu6_3
             | NetworkUpgrade::FeaturenetUpgrade1
             | NetworkUpgrade::FeaturenetUpgrade2
+            | NetworkUpgrade::FeaturenetUpgrade3
             | NetworkUpgrade::Nu7 => {
                 let (tree, entry) = Tree::<IronwoodOnward>::new_from_block(network, block, roots)?;
                 (InnerHistoryTree::IronwoodOnward(tree), entry)

@@ -198,6 +198,9 @@ impl From<&BTreeMap<Height, NetworkUpgrade>> for ConfiguredActivationHeights {
                 NetworkUpgrade::FeaturenetUpgrade2 => {
                     &mut configured_activation_heights.featurenet_upgrade_2
                 }
+                NetworkUpgrade::FeaturenetUpgrade3 => {
+                    &mut configured_activation_heights.featurenet_upgrade_3
+                }
                 NetworkUpgrade::Nu7 => &mut configured_activation_heights.nu7,
                 #[cfg(zcash_unstable = "zfuture")]
                 NetworkUpgrade::ZFuture => &mut configured_activation_heights.zfuture,
@@ -387,6 +390,9 @@ pub struct ConfiguredActivationHeights {
     /// Activation height for the `FeaturenetUpgrade2` network upgrade.
     #[serde(rename = "FeaturenetUpgrade2")]
     pub featurenet_upgrade_2: Option<u32>,
+    /// Activation height for the `FeaturenetUpgrade3` network upgrade.
+    #[serde(rename = "FeaturenetUpgrade3")]
+    pub featurenet_upgrade_3: Option<u32>,
     /// Activation height for `NU7` network upgrade.
     #[serde(rename = "NU7")]
     pub nu7: Option<u32>,
@@ -414,6 +420,7 @@ impl ConfiguredActivationHeights {
             nu6_3,
             featurenet_upgrade_1,
             featurenet_upgrade_2,
+            featurenet_upgrade_3,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -447,6 +454,7 @@ impl ConfiguredActivationHeights {
             nu6_3,
             featurenet_upgrade_1,
             featurenet_upgrade_2,
+            featurenet_upgrade_3,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -458,11 +466,13 @@ impl ConfiguredActivationHeights {
     /// unless these heights name one already or leave it no room.
     ///
     /// A config file written before an upgrade existed lists every height but its own, and
-    /// without the default its node would never activate the upgrade. `FeaturenetUpgrade2` stays
-    /// unscheduled until `TESTNET_FEATURENET_UPGRADE_2_HEIGHT` names a height.
+    /// without the default its node would never activate the upgrade. `FeaturenetUpgrade2` and
+    /// `FeaturenetUpgrade3` stay unscheduled until `TESTNET_FEATURENET_UPGRADE_2_HEIGHT` and
+    /// `TESTNET_FEATURENET_UPGRADE_3_HEIGHT` name a height.
     pub fn with_default_featurenet_upgrade(mut self) -> Self {
         use zcash_protocol::consensus::{
             TESTNET_FEATURENET_UPGRADE_1_HEIGHT, TESTNET_FEATURENET_UPGRADE_2_HEIGHT,
+            TESTNET_FEATURENET_UPGRADE_3_HEIGHT,
         };
         let fits_between = |height: u32, before: Option<u32>, after: Option<u32>| {
             before.is_some_and(|n| n < height) && after.map_or(true, |n| n > height)
@@ -473,16 +483,35 @@ impl ConfiguredActivationHeights {
             && fits_between(
                 TESTNET_FEATURENET_UPGRADE_1_HEIGHT,
                 nu6_3,
-                self.featurenet_upgrade_2.or(nu7),
+                self.featurenet_upgrade_2
+                    .or(self.featurenet_upgrade_3)
+                    .or(nu7),
             )
         {
             self.featurenet_upgrade_1 = Some(TESTNET_FEATURENET_UPGRADE_1_HEIGHT);
         }
         if let Some(height) = TESTNET_FEATURENET_UPGRADE_2_HEIGHT {
             if self.featurenet_upgrade_2.is_none()
-                && fits_between(height, self.featurenet_upgrade_1.or(nu6_3), nu7)
+                && fits_between(
+                    height,
+                    self.featurenet_upgrade_1.or(nu6_3),
+                    self.featurenet_upgrade_3.or(nu7),
+                )
             {
                 self.featurenet_upgrade_2 = Some(height);
+            }
+        }
+        if let Some(height) = TESTNET_FEATURENET_UPGRADE_3_HEIGHT {
+            if self.featurenet_upgrade_3.is_none()
+                && fits_between(
+                    height,
+                    self.featurenet_upgrade_2
+                        .or(self.featurenet_upgrade_1)
+                        .or(nu6_3),
+                    nu7,
+                )
+            {
+                self.featurenet_upgrade_3 = Some(height);
             }
         }
         self
@@ -682,6 +711,7 @@ impl ParametersBuilder {
             nu6_3,
             featurenet_upgrade_1,
             featurenet_upgrade_2,
+            featurenet_upgrade_3,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -713,6 +743,7 @@ impl ParametersBuilder {
                 .chain(nu6_3.into_iter().map(|h| (h, Nu6_3)))
                 .chain(featurenet_upgrade_1.into_iter().map(|h| (h, FeaturenetUpgrade1)))
                 .chain(featurenet_upgrade_2.into_iter().map(|h| (h, FeaturenetUpgrade2)))
+                .chain(featurenet_upgrade_3.into_iter().map(|h| (h, FeaturenetUpgrade3)))
                 .chain(nu7.into_iter().map(|h| (h, Nu7)));
 
             #[cfg(zcash_unstable = "zfuture")]

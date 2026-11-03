@@ -302,6 +302,7 @@ impl Version for zcash_history::V1 {
             | NetworkUpgrade::Nu6_3
             | NetworkUpgrade::FeaturenetUpgrade1
             | NetworkUpgrade::FeaturenetUpgrade2
+            | NetworkUpgrade::FeaturenetUpgrade3
             | NetworkUpgrade::Nu7 => {}
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => {}
