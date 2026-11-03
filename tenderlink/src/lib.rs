@@ -1831,6 +1831,13 @@ impl BftAddressMap {
     pub fn get_addrs(&self, key: &PubKeyID) -> impl Iterator<Item = (&STPAddress, &Option<PeerAttestation>)> { self.by_key.get(key).map(|v| v.iter()).unwrap_or_default() }
     pub fn contains_key(&self, key: &PubKeyID) -> bool { self.by_key.contains_key(key) }
     pub fn all_addrs(&self) -> impl Iterator<Item = (&STPAddress, &PubKeyID)> { self.by_addr.iter() }
+    /// Attestations worth gossiping: ones a receiver will still accept. Relaying one that is about to
+    /// expire only wastes bandwidth (the receiver skips it), and against an unpatched peer it got the
+    /// relaying link dropped (#272). The 120s margin covers clock skew between peers.
+    pub fn gossipable_attestations(&self, now: u64) -> Vec<&PeerAttestation> {
+        self.by_key.values().flat_map(|a| a.values()).filter_map(|o| o.as_ref())
+            .filter(|a| a.expiry > now.saturating_add(120)).collect()
+    }
 }
 
 /// A finalizer played by a test. What it sends the node arrives as from a connected peer, after
@@ -2657,7 +2664,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 });
 
                 if zebra_debug_time::instant_now() >= next_peer_gossip {
-                    let mut peer_attestations: Vec<&PeerAttestation> = bft_address_map.by_key.values().flat_map(|a| a.values()).filter_map(|o| o.as_ref()).collect();
+                    // #272: relay only attestations a receiver will still accept, not ones about to expire.
+                    let mut peer_attestations: Vec<&PeerAttestation> = bft_address_map.gossipable_attestations(now);
                     peer_attestations.shuffle(&mut rand::thread_rng());
                     peer_attestations.truncate(1191 / PEER_ATTESTATION_SERIALIZED_SIZE);
                     for (connection_key, peer) in &mut peers {
@@ -3843,6 +3851,31 @@ mod tests {
     /// The roster cap these tests run under: the prototype's, as every network uses unless it says
     /// otherwise.
     const ROSTER_MAX_N: usize = zcash_primitives::bft::PROTOTYPE_PARAMETERS.active_roster_max_n;
+
+    /// #272: only attestations a receiver will still accept are gossiped. Relaying one about to expire
+    /// wastes bandwidth and, against an unpatched peer, dropped the relaying link. 120s covers skew.
+    #[test]
+    fn only_attestations_with_comfortable_remaining_life_are_gossiped() {
+        let now = 1_700_000_000u64;
+        let addr = |b: u8| {
+            let key = crate::stp::new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+            STPAddress::from(std::net::Ipv6Addr::LOCALHOST, 15000 + b as u16, &key)
+        };
+        let att = |expiry: u64| PeerAttestation {
+            stp_address: addr(0), issued: now - 1000, expiry,
+            attester_bft_pk: PubKeyID([1; 32]), attestee_bft_pk: PubKeyID([2; 32]),
+            attester_sig: TMSig::NIL, attestee_sig: TMSig::NIL,
+        };
+        let mut map = BftAddressMap::new();
+        map.insert(&PubKeyID([10; 32]), &addr(1), Some(att(now + 3600))); // comfortably fresh -> gossiped
+        map.insert(&PubKeyID([11; 32]), &addr(2), Some(att(now + 60)));   // expiring within 120s -> not
+        map.insert(&PubKeyID([12; 32]), &addr(3), Some(att(now - 10)));   // already expired -> not
+        map.insert(&PubKeyID([13; 32]), &addr(4), None);                  // no attestation held -> not
+
+        let gossiped = map.gossipable_attestations(now);
+        assert_eq!(gossiped.len(), 1, "only the comfortably-fresh attestation is gossiped");
+        assert_eq!(gossiped[0].expiry, now + 3600);
+    }
 
     /// A known key whose STP session hash changes (STP replacing a restarted peer's session in
     /// place) gets a fresh Peer, verified again; the same session gets nothing. Regression: the
