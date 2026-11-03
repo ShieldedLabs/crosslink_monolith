@@ -503,6 +503,8 @@ impl NonFinalizedState {
     ) -> Result<Arc<Chain>, ValidateContextError> {
         let height = prepared.height;
 
+        check::transactions_are_new_to_chain(&prepared, &new_chain)?;
+
         // Reads from disk
         //
         // TODO: if these disk reads show up in profiles, run them in parallel, using std::thread::spawn()

@@ -324,6 +324,34 @@ fn difficulty_threshold_and_time_are_valid(
     Ok(())
 }
 
+/// Rejects a block that carries a transaction already in the non-finalized chain it extends.
+///
+/// Zcash makes a repeated transaction invalid through its spends: the second copy reuses a
+/// nullifier or an outpoint. A transaction with no spends escapes that, such as a VCrosslink
+/// transaction carrying only a staking action, whose signature does not pin it to a height. A
+/// retarget from A to B, mined again after its bond is moved back to A, passes every staking
+/// rule. `Chain::push` asserts that no repeat reaches it, so this check has to come first.
+///
+/// A repeat of a finalized transaction is still accepted, since refusing it would split upgraded
+/// nodes from the rest. A repeat within the non-finalized chain is refused at every height:
+/// before this check, it aborted every node, so no chain holds one.
+pub(crate) fn transactions_are_new_to_chain(
+    semantically_verified: &SemanticallyVerifiedBlock,
+    chain: &Chain,
+) -> Result<(), ValidateContextError> {
+    for &transaction_hash in semantically_verified.transaction_hashes.iter() {
+        if let Some(prior) = chain.tx_loc_by_hash.get(&transaction_hash) {
+            return Err(ValidateContextError::DuplicateTransaction {
+                transaction_hash,
+                prior_height: prior.height,
+                in_finalized_state: false,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Check if zebra is following a legacy chain and return an error if so.
 ///
 /// `nu5_activation_height` should be `NetworkUpgrade::Nu5.activation_height(network)`, and
