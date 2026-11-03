@@ -33,6 +33,9 @@ use crate::service::finalized_state::bft::StoredDecision;
 use crate::service::write::WriteBlockWorkerTask;
 use crate::CrosslinkVerdict;
 
+/// The highest BFT block version this node understands, and the one it proposes.
+pub const BFT_BLOCK_VERSION_LATEST: u32 = 2;
+
 /// While set, this node proposes no new BFT blocks.
 pub static BFT_PAUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -985,10 +988,10 @@ impl BftRunner {
 
         match BftBlock::try_from(params, bft_height as u32, fat_ptr, headers) {
             Ok(mut block) => {
-                // Always propose v2 blocks: existing v1 blocks remain v1 (so their hashes and
-                // signatures are untouched), and v2 >= any parent's version satisfies the
-                // monotonic-version check.
-                block.version = 2;
+                // Always propose the latest version: existing v1 blocks remain v1 (so their
+                // hashes and signatures are untouched), and `validate` caps every block at the
+                // latest version, so it is >= any parent's.
+                block.version = BFT_BLOCK_VERSION_LATEST;
                 // A hardfork block sets do_not_include to the greatest activation height it
                 // carries (pointing at this block commits to every certificate in it, so the
                 // strictest one governs); otherwise the parent's carries forward so it never
@@ -1036,6 +1039,13 @@ impl BftRunner {
         // version 1, so this holds trivially for existing history.)
         if new_block.version < parent_version {
             tracing::warn!("BFT block version {} is below its parent's version {}", new_block.version, parent_version);
+            return fail;
+        }
+
+        // Without this cap one proposer could get a block above the version honest nodes
+        // propose decided, after which every honest proposal fails the check above.
+        if new_block.version > BFT_BLOCK_VERSION_LATEST {
+            tracing::warn!("BFT block version {} is above the latest known version {}", new_block.version, BFT_BLOCK_VERSION_LATEST);
             return fail;
         }
 
@@ -1505,7 +1515,7 @@ impl BftRunner {
                 return None;
             }
         };
-        block.version = 2;
+        block.version = BFT_BLOCK_VERSION_LATEST;
         let scheduled_hardforks: Vec<HardForkConfig> = self
             .hardforks
             .rules()
