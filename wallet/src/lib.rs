@@ -1570,6 +1570,9 @@ pub struct ManualWallet {
     // - finalized block
 
     pub seen_bond_values: HashMap<[u8; 32], u64>,
+    /// The bond versions the node last reported, so an action spends the right version even
+    /// when another wallet holding the bond's key acted on it.
+    pub seen_bond_versions: HashMap<[u8; 32], [u8; 32]>,
     pub care_about_bonds: Vec<[u8; 32]>,
 }
 // N.B. using some of the same API as WalletDb to allow smooth transition/comparison
@@ -2330,14 +2333,15 @@ impl ManualWallet {
 
     /// The bond version this wallet's next action on `bond_key` must spend, or `None` before
     /// FeaturenetUpgrade3, when actions carry none. The version starts as the bond key, and each
-    /// mined action that spends it moves it to that action's txid, so it is found by following
-    /// those spends from the bond key through this wallet's own mined transactions.
+    /// mined action that spends it moves it to that action's txid. The search starts from the
+    /// version the node last reported, which covers actions other wallets mined, and follows
+    /// this wallet's own mined actions from there, which covers ones the node reported before.
     pub fn bond_spends<P: Parameters>(&self, network: &P, bond_key: [u8; 32]) -> Option<[u8; 32]> {
         let next_h = LRZBlockHeight::from_u32(self.chain_tip_h.0 + 1);
         if !network.is_nu_active(zcash_protocol::consensus::NetworkUpgrade::FeaturenetUpgrade3, next_h) {
             return None;
         }
-        let mut version = bond_key;
+        let mut version = self.seen_bond_versions.get(&bond_key).copied().unwrap_or(bond_key);
         'follow: loop {
             for tx in &self.txs {
                 if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
@@ -2396,6 +2400,9 @@ impl ManualWallet {
             let amount_zats = match client.get_bond_info(zcash_client_backend::proto::service::BondInfoRequest { bond_key: bond_key.to_vec(), }).await {
                 Ok(response) => {
                     let info = response.into_inner();
+                    if let Ok(version) = <[u8; 32]>::try_from(info.version.as_slice()) {
+                        self.seen_bond_versions.insert(bond_key, version);
+                    }
                     info.amount
                 }
                 Err(e) => {
@@ -3350,6 +3357,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             txs: Vec::new(),
             tx_h_map: HashMap::new(),
             seen_bond_values: HashMap::new(),
+            seen_bond_versions: HashMap::new(),
             care_about_bonds: Vec::new(),
         };
 
@@ -4987,6 +4995,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     Ok(response) => {
                         let info = response.into_inner();
                         user_wallet.seen_bond_values.insert(*bond_key, info.amount);
+                        if let Ok(version) = <[u8; 32]>::try_from(info.version.as_slice()) {
+                            user_wallet.seen_bond_versions.insert(*bond_key, version);
+                        }
                     }
                     Err(e) => {
                         println!("Failed to get bond info: {:?}", e);
@@ -5497,7 +5508,7 @@ mod tests {
         let wallet = ManualWallet {
             name: "note-position-test", accounts: vec![account], strms: vec![],
             chain_tip_h: BlockHeight(100), sync_h: BlockHeight(100), branch_mismatch: None,
-            txs: vec![], tx_h_map: HashMap::new(), seen_bond_values: HashMap::new(), care_about_bonds: vec![],
+            txs: vec![], tx_h_map: HashMap::new(), seen_bond_values: HashMap::new(), seen_bond_versions: HashMap::new(), care_about_bonds: vec![],
         };
         (wallet, keys, note, recipient)
     }

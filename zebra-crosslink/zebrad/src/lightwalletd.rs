@@ -1016,6 +1016,7 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                                 amount: u64::from(info.amount),
                                                                 status: info.status as u32,
                                                                 last_action_height: info.last_action_height,
+                                                                version: info.version.to_vec(),
                                                             })]
                                                             .into(),
                                                         )),
