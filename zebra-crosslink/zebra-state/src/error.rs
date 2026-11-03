@@ -302,6 +302,14 @@ pub enum ValidateContextError {
         in_finalized_state: bool,
     },
 
+    #[error("duplicate transaction: {transaction_hash:?} is already in the chain at height {prior_height:?}, in finalized state: {in_finalized_state:?}")]
+    #[non_exhaustive]
+    DuplicateTransaction {
+        transaction_hash: transaction::Hash,
+        prior_height: block::Height,
+        in_finalized_state: bool,
+    },
+
     #[error(
         "the remaining value in the transparent transaction value pool MUST be nonnegative:\n\
          {amount_error:?},\n\
