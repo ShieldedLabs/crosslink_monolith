@@ -193,6 +193,9 @@ pub struct TransportStats {
     pub ring_send_head_blocked: u64,
     pub ring_send_dropped_unknown: u64,
     pub ring_send_dropped_oversized: u64,
+    /// Received messages dropped because the session they arrived on was replaced before their
+    /// consumer took them: they belong to a session the consumer no longer has.
+    pub stale_session_messages: u64,
     /// Received messages dropped because their consumer's inbox was full or it was not attached.
     pub inbox_dropped_messages: u64,
     pub inbox_dropped_bytes: u64,
@@ -379,11 +382,17 @@ struct ConsumerState {
     /// The sessions (key, handshake hash) the last service handed this consumer. One it no
     /// longer wants is one it killed.
     offered: HashMap<ConnectionKey, [u8; 64]>,
-    inbox: VecDeque<(ConnectionKey, Vec<u8>)>,
+    /// Each message with the session (handshake hash) it arrived on.
+    inbox: SessionMessages,
     inbox_bytes: usize,
     /// Each peer's (messages, bytes) in `inbox`; emptied with it.
     inbox_by_peer: HashMap<ConnectionKey, (usize, usize)>,
 }
+
+/// Received messages, each with the session (handshake hash) it arrived on. A key's session can
+/// change between a message's arrival and its consumer taking it (STP replaces a restarted peer's
+/// session in place), so a message is only handed over if its session is still the key's.
+type SessionMessages = VecDeque<(ConnectionKey, [u8; 64], Vec<u8>)>;
 
 struct Hub {
     handle: NetworkThreadHandle,
@@ -581,10 +590,10 @@ impl Hub {
             Consumer::Base => inner.send_unreliable = send_unreliable,
             Consumer::Bft => inner.send_bft_live.extend(send_unreliable),
         }
-        let pull = self.handle.service(inner);
+        let (current_connections, received) = self.handle.service_sessions(inner);
 
         let limits = &self.handle.limits;
-        for (peer, message) in pull.received_unreliable_messages {
+        for (peer, session, message) in received {
             let Some(&first) = message.first() else { continue };
             let to = &mut self.consumers[Consumer::of_message(first) as usize];
             let (peer_messages, peer_bytes) = to.inbox_by_peer.get(&peer).copied().unwrap_or_default();
@@ -600,16 +609,17 @@ impl Hub {
             }
             to.inbox_bytes += message.len();
             to.inbox_by_peer.insert(peer, (peer_messages + 1, peer_bytes + message.len()));
-            to.inbox.push_back((peer, message));
+            to.inbox.push_back((peer, session, message));
         }
 
         let mine = &mut self.consumers[me as usize];
-        mine.offered = pull.current_connections.iter().map(|(a, hash)| (a.connection_key(), *hash)).collect();
+        mine.offered = current_connections.iter().map(|(a, hash)| (a.connection_key(), *hash)).collect();
         mine.inbox_bytes = 0;
         mine.inbox_by_peer.clear();
+        let inbox = std::mem::take(&mut mine.inbox);
         NetworkThreadPull {
-            current_connections: pull.current_connections,
-            received_unreliable_messages: std::mem::take(&mut mine.inbox),
+            received_unreliable_messages: self.handle.current_session_messages(&current_connections, inbox),
+            current_connections,
         }
     }
 }
@@ -722,10 +732,44 @@ impl NetworkThreadHandle {
     }
 
     pub fn service(&mut self, push: NetworkThreadPush) -> NetworkThreadPull {
-        let now = Instant::now();
-        let mut pull = NetworkThreadPull::default();
+        let (current_connections, received) = self.service_sessions(push);
+        NetworkThreadPull {
+            received_unreliable_messages: self.current_session_messages(&current_connections, received),
+            current_connections,
+        }
+    }
 
-        self.drain_events(&mut pull.received_unreliable_messages, now);
+    /// Of `received`, the messages whose session is still their key's in `current`, untagged.
+    /// The rest arrived on a session since replaced or closed, which the consumer no longer has
+    /// (tenderlink would check an old session's ID hello against the new hash, and kill it).
+    fn current_session_messages(
+        &mut self,
+        current: &[(STPAddress, [u8; 64])],
+        received: SessionMessages,
+    ) -> VecDeque<(ConnectionKey, Vec<u8>)> {
+        let sessions: HashMap<ConnectionKey, [u8; 64]> = current.iter().map(|(a, hash)| (a.connection_key(), *hash)).collect();
+        let mut stale = 0;
+        let kept = received
+            .into_iter()
+            .filter_map(|(peer, session, message)| {
+                if sessions.get(&peer) == Some(&session) {
+                    Some((peer, message))
+                } else {
+                    stale += 1;
+                    None
+                }
+            })
+            .collect();
+        self.stats.stale_session_messages += stale;
+        kept
+    }
+
+    /// [`Self::service`], with each received message still tagged with its session.
+    fn service_sessions(&mut self, push: NetworkThreadPush) -> (Vec<(STPAddress, [u8; 64])>, SessionMessages) {
+        let now = Instant::now();
+        let mut received = SessionMessages::new();
+
+        self.drain_events(&mut received, now);
         self.close_unwanted(&push.wanted_connections, now);
         self.connecting
             .retain(|_, started| now.duration_since(*started) < self.limits.connect_timeout);
@@ -750,16 +794,16 @@ impl NetworkThreadHandle {
         }
         self.flush_outboxes();
 
-        pull.current_connections = self
+        let current_connections = self
             .peers
             .values()
             .filter(|state| state.is_connected())
             .map(|state| (state.address.clone(), state.handshake_hash))
             .collect();
-        pull
+        (current_connections, received)
     }
 
-    fn drain_events(&mut self, received: &mut VecDeque<(ConnectionKey, Vec<u8>)>, now: Instant) {
+    fn drain_events(&mut self, received: &mut SessionMessages, now: Instant) {
         // Bounded: about one ring's worth plus what lands while we drain. The pump keeps
         // running on its own thread regardless of how often this is called.
         let max_events = self.limits.rings.receive.saturating_mul(2).max(64);
@@ -774,7 +818,7 @@ impl NetworkThreadHandle {
     fn handle_event(
         &mut self,
         event: Event,
-        received: &mut VecDeque<(ConnectionKey, Vec<u8>)>,
+        received: &mut SessionMessages,
         now: Instant,
     ) {
         use shielded_transport_pigeon::pump::DisconnectReason;
@@ -832,8 +876,8 @@ impl NetworkThreadHandle {
                 self.peers.remove(&peer);
             }
             Event::Message { peer, data } => {
-                if self.is_connected(peer) {
-                    received.push_back((peer, data));
+                if let Some(state) = self.peers.get(&peer).filter(|state| state.is_connected()) {
+                    received.push_back((peer, state.handshake_hash, data));
                 }
             }
         }
@@ -1915,6 +1959,56 @@ mod tests {
         assert_eq!(a_bft.connections.len(), 1);
         assert_eq!(a_base.connections.len(), 1);
         assert_eq!(a_base.handle.stats().kills, 0);
+    }
+
+    /// A message that arrived on a session since replaced never reaches a consumer, whether it
+    /// came in the same drain as the replacement or sat in another consumer's inbox meanwhile.
+    /// Regression: STP replaces every session at once when the host network changes, and
+    /// tenderlink checked an old session's ID hello against the new hash and killed the peer.
+    #[test]
+    fn messages_from_a_replaced_session_never_reach_a_consumer() {
+        use shielded_transport_pigeon::pump::DisconnectReason;
+
+        let key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b).unwrap();
+        let address = STPAddress::from(Ipv6Addr::LOCALHOST, free_port(), &key);
+        let peer = address.connection_key();
+        let (mut a, _pump) = NetworkThreadHandle::new_unstarted(
+            vec![key], free_port(), None, (1_000_000, 512 * 1024, 32 << 20), TransportLimits::default(),
+        );
+        let now = Instant::now();
+        let connected = |hash| Event::Connected { peer, address: address.clone(), handshake_hash: hash };
+        let replaced = || Event::Disconnected { peer, reason: DisconnectReason::Replaced };
+
+        // One drain: a message on the old session, the replacement, a message on the new one.
+        let mut received = SessionMessages::new();
+        a.connecting.insert(peer, now);
+        a.handle_event(connected([1; 64]), &mut received, now);
+        a.handle_event(Event::Message { peer, data: vec![0x81, 1] }, &mut received, now);
+        a.handle_event(replaced(), &mut received, now);
+        a.handle_event(connected([2; 64]), &mut received, now);
+        a.handle_event(Event::Message { peer, data: vec![0x81, 2] }, &mut received, now);
+        let current = vec![(address.clone(), [2; 64])];
+        assert_eq!(a.current_session_messages(&current, received), VecDeque::from([(peer, vec![0x81, 2])]));
+        assert_eq!(a.stats.stale_session_messages, 1);
+
+        // Across consumers: a BFT message queued on session 2 while the base consumer serviced,
+        // then session 2 is replaced before tenderlink services.
+        let mut hub = Hub {
+            handle: a,
+            consumers: Default::default(),
+            redial: HashMap::new(),
+            lock_times: Default::default(),
+            dial_only: None,
+        };
+        hub.consumers[Consumer::Bft as usize].attached = true;
+        hub.consumers[Consumer::Bft as usize].inbox.push_back((peer, [2; 64], vec![0x81, 3]));
+        let mut ignored = SessionMessages::new();
+        hub.handle.handle_event(replaced(), &mut ignored, now);
+        hub.handle.handle_event(connected([3; 64]), &mut ignored, now);
+        let pull = hub.service(Consumer::Bft, NetworkThreadPush::default());
+        assert_eq!(pull.current_connections, vec![(address, [3; 64])]);
+        assert!(pull.received_unreliable_messages.is_empty());
+        assert_eq!(hub.handle.stats.stale_session_messages, 2);
     }
 
     /// A peer that dies without closing (STP has no close frame) and comes back on the same key
