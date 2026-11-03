@@ -58,3 +58,16 @@ For individual operations, the canonical commands are:
 bash subtree pull crosslink_book code
 bash subtree push crosslink_book code
 ```
+
+## Chain directory names
+
+`ZebradConfig::load_with_env` in `zebra-crosslink/zebrad/src/config.rs` appends
+the chain's directory name, such as `crosslink_nightly_20261102`, to the state
+cache directory. To start a new chain, change only the date in that name, to
+the day the chain starts, as well as either `nightly` or `featurenet`. Never
+append anything else to it: no suffix naming a parameter, a feature or a reason.
+
+Changing the name starts a new chain, and the old chain's state stays behind
+under the old name. The featurenet's `crosslink_featurenet_20260929_staking3d`
+predates this rule; keep it as it is, since renaming it would strand the
+featurenet's state.
