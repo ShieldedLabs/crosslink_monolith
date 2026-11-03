@@ -1532,6 +1532,7 @@ pub struct Peer {
     pub bft_pk: PubKeyID,             // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
     pub stp_address: STPAddress,      // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
     pub stp_handshake_hash: [u8; 64], // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
+    pub id_hello_refresh_utc: u64,    // when to re-send ID_HELLO on this link (see next_id_hello_refresh_utc)
 }
 /// The Peer for a connection's session, when that session is new to us: a key we have no Peer
 /// for, or a known key whose STP handshake hash changed. STP replaces a restarted peer's session
@@ -1562,6 +1563,7 @@ impl Default for Peer {
         bft_pk:                       Default::default(),
         stp_address:                  Default::default(),
         stp_handshake_hash:           [0u8; 64],
+        id_hello_refresh_utc:         0,
     } }
 }
 impl Peer {
@@ -1839,6 +1841,25 @@ impl BftAddressMap {
     pub fn get_addrs(&self, key: &PubKeyID) -> impl Iterator<Item = (&STPAddress, &Option<PeerAttestation>)> { self.by_key.get(key).map(|v| v.iter()).unwrap_or_default() }
     pub fn contains_key(&self, key: &PubKeyID) -> bool { self.by_key.contains_key(key) }
     pub fn all_addrs(&self) -> impl Iterator<Item = (&STPAddress, &PubKeyID)> { self.by_addr.iter() }
+}
+
+// #261: a node's address attestation lives this long (`expiry = issued + lifetime`). Until the
+// verified-key routing above reaches every peer, a peer still tells one finalizer from another by
+// holding a fresh attestation of its address, and a long-lived link mints one only at its handshake.
+// So re-send ID_HELLO on every live link well within the lifetime: the peer answers any ID_HELLO with
+// an ID_HELLO_ACK carrying a fresh attestation of our address, which we countersign and gossip as on
+// first contact -- no new packet types or fields. Transitional, needed only while peers still route
+// by these attestations.
+pub const PEER_ATTESTATION_LIFETIME_SECS: u64 = 24 * 60 * 60;
+pub const ID_HELLO_REFRESH_SECS: u64 = PEER_ATTESTATION_LIFETIME_SECS / 4;
+// The last refresh before an attestation would expire falls 2 * ID_HELLO_REFRESH_SECS after the
+// handshake that minted it; that stays before the attestation expires. This is the lossless bound --
+// a run of lost ID_HELLOs can still delay a refresh, which only matters to peers not yet routing by
+// the verified key (#261).
+const _: () = assert!(2 * ID_HELLO_REFRESH_SECS < PEER_ATTESTATION_LIFETIME_SECS);
+// Jittered so a roster's links do not all refresh in lockstep; the result is in [REFRESH, 2*REFRESH).
+pub fn next_id_hello_refresh_utc(now: u64, jitter: u64) -> u64 {
+    now.saturating_add(ID_HELLO_REFRESH_SECS + jitter % ID_HELLO_REFRESH_SECS)
 }
 
 /// A finalizer played by a test. What it sends the node arrives as from a connected peer, after
@@ -2832,15 +2853,29 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         }
         LOOP_PASSES.fetch_add(1, std::sync::atomic::Ordering::Release);
 
-        // Ensure a Peer entry exists for every active connection's session
+        // Ensure a Peer entry exists for every active connection's session, and (re)send ID_HELLO:
+        // on a new session, and on an already-verified live link once its refresh falls due (#261).
+        let now_utc: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
         for &(ref stp_address, handshake_hash) in &current_connections {
             let key = stp_address.connection_key();
-            let Some((peer, replaced)) = peer_for_new_session(&mut peers, stp_address, handshake_hash) else {
-                continue;
-            };
-            if replaced {
-                println!("{:05}: Peer {:?} has a new STP session; verifying it again.", my_port, key);
+            match peer_for_new_session(&mut peers, stp_address, handshake_hash) {
+                Some((peer, replaced)) => {
+                    if replaced {
+                        println!("{:05}: Peer {:?} has a new STP session; verifying it again.", my_port, key);
+                    }
+                    peer.id_hello_refresh_utc = next_id_hello_refresh_utc(now_utc, rand::random::<u64>());
+                }
+                None => {
+                    // An already-verified live link: re-send ID_HELLO only when its refresh falls
+                    // due, and without resetting the Peer; otherwise leave it be.
+                    let peer = peers.get_mut(&key).expect("a known session has a Peer");
+                    if now_utc < peer.id_hello_refresh_utc {
+                        continue;
+                    }
+                    peer.id_hello_refresh_utc = next_id_hello_refresh_utc(now_utc, rand::random::<u64>());
+                }
             }
+            let peer = peers.get_mut(&key).expect("a session has a Peer");
 
             let verification = { // almost @Duplicate
                 let pk_bytes = my_root_public_bft_key.as_ref();
@@ -3020,6 +3055,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
 
             else if packet_type == PACKET_TYPE_ID_HELLO {
+                // A repeated ID_HELLO on an already-verified link is expected (a refresh, see
+                // next_id_hello_refresh_utc) and is answered with a fresh ID_HELLO_ACK as on first
+                // contact: that is how a long-lived link's attestation of the sender's address is
+                // renewed. It must not be rejected or disconnected on that account.
 
                 let Some(their_verification) = PacketIdVerification::read_from(&mut &msg[read_o..]) else {
                     if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID verification: Failed to read ID Hello packet"); }
@@ -3062,14 +3101,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 let attestation = { // @Duplicate
                     let addr = peer.stp_address.clone();
                     let issued: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
-                    let expiry = {
-                        let seconds_per_minute = 60;
-                        let minutes_per_hour   = 60;
-                        let hours_per_day      = 24;
-                        let days_expiry        =  1;
-
-                        issued + (seconds_per_minute * minutes_per_hour * hours_per_day * days_expiry)
-                    };
+                    // Single-sourced with the refresh cadence and the far-future cap, which are all
+                    // derived from PEER_ATTESTATION_LIFETIME_SECS; the compile-time assert on the refresh
+                    // interval only holds if the minted lifetime is this same constant.
+                    let expiry = issued + PEER_ATTESTATION_LIFETIME_SECS;
                     let sig = {
                         let hash_key_for_attestation = HashKey(blake3::Hasher::new_derive_key("Tenderlink One Party Signed Peer Attestation").finalize().into());
 
@@ -3123,7 +3158,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     } };
                 }
 
-                bft_address_map.insert(&their_verification.pk, &peer.stp_address, None);
+                // On a re-HELLO's ACK the link is already verified with this key; keep any attestation
+                // we hold for it rather than overwriting it with None (votefix).
+                if peer.bft_pk != their_verification.pk {
+                    bft_address_map.insert(&their_verification.pk, &peer.stp_address, None);
+                }
                 peer.bft_pk = their_verification.pk;
 
                 let Some(attestation) = PacketIdAttestation::read_from(msg) else {
@@ -3903,6 +3942,20 @@ mod tests {
         assert_eq!(map.get_key(&address), None, "by_addr no longer resolves the key");
         assert_eq!(map.key_for_connection(verified, &address), Some(verified),
                    "a live link routes by its verified HELLO key");
+    }
+
+    /// Every ID_HELLO refresh is due in [REFRESH, 2*REFRESH) and, for any jitter, strictly before the
+    /// attestation minted at the handshake would expire -- so a live link is never left without a
+    /// fresh attestation of its address. The cadence-vs-lifetime bound is also a compile-time assert.
+    #[test]
+    fn id_hello_refresh_is_due_well_before_its_attestation_expires() {
+        for jitter in [0u64, 1, ID_HELLO_REFRESH_SECS - 1, ID_HELLO_REFRESH_SECS, u64::MAX] {
+            let due = next_id_hello_refresh_utc(1_000, jitter);
+            assert!(due >= 1_000 + ID_HELLO_REFRESH_SECS, "refresh no sooner than one interval");
+            assert!(due <  1_000 + 2 * ID_HELLO_REFRESH_SECS, "refresh within two intervals");
+        }
+        assert!(2 * ID_HELLO_REFRESH_SECS < PEER_ATTESTATION_LIFETIME_SECS,
+                "the latest refresh still precedes the attestation's expiry");
     }
 
     /// Restored signatures are over the legacy application format, not the active STP MTU.
