@@ -196,6 +196,9 @@ pub struct TransportStats {
     /// Received messages dropped because the session they arrived on was replaced before their
     /// consumer took them: they belong to a session the consumer no longer has.
     pub stale_session_messages: u64,
+    /// Messages a consumer sent for a session that was replaced before they were queued: the
+    /// consumer had not yet seen the new session, so they were meant for the old one.
+    pub stale_session_sends: u64,
     /// Received messages dropped because their consumer's inbox was full or it was not attached.
     pub inbox_dropped_messages: u64,
     pub inbox_dropped_bytes: u64,
@@ -590,7 +593,7 @@ impl Hub {
             Consumer::Base => inner.send_unreliable = send_unreliable,
             Consumer::Bft => inner.send_bft_live.extend(send_unreliable),
         }
-        let (current_connections, received) = self.handle.service_sessions(inner);
+        let (current_connections, received) = self.handle.service_sessions(inner, &self.consumers[me as usize].offered);
 
         let limits = &self.handle.limits;
         for (peer, session, message) in received {
@@ -732,7 +735,7 @@ impl NetworkThreadHandle {
     }
 
     pub fn service(&mut self, push: NetworkThreadPush) -> NetworkThreadPull {
-        let (current_connections, received) = self.service_sessions(push);
+        let (current_connections, received) = self.service_sessions(push, &HashMap::new());
         NetworkThreadPull {
             received_unreliable_messages: self.current_session_messages(&current_connections, received),
             current_connections,
@@ -764,8 +767,16 @@ impl NetworkThreadHandle {
         kept
     }
 
-    /// [`Self::service`], with each received message still tagged with its session.
-    fn service_sessions(&mut self, push: NetworkThreadPush) -> (Vec<(STPAddress, [u8; 64])>, SessionMessages) {
+    /// [`Self::service`], with each received message still tagged with its session. `sent_for`
+    /// is the session the sender last saw for each key: a message is only queued if that is still
+    /// the key's session. Draining events can replace a session just before the sends are
+    /// queued, and a send made for the old one (tenderlink's ID hello is signed over its hash)
+    /// would fail on the new one.
+    fn service_sessions(
+        &mut self,
+        push: NetworkThreadPush,
+        sent_for: &HashMap<ConnectionKey, [u8; 64]>,
+    ) -> (Vec<(STPAddress, [u8; 64])>, SessionMessages) {
         let now = Instant::now();
         let mut received = SessionMessages::new();
 
@@ -783,14 +794,22 @@ impl NetworkThreadHandle {
             self.initiate(address, now);
         }
         self.flush_controls();
-        for (peer, message) in push.send_bft_live {
-            self.enqueue(peer, Channel::BftLive, message);
-        }
-        for (peer, message) in push.send_unreliable {
-            self.enqueue(peer, Channel::Control, message);
-        }
-        for (peer, message) in push.send_bulk {
-            self.enqueue(peer, Channel::Bulk, message);
+        let sends = [
+            (Channel::BftLive, push.send_bft_live),
+            (Channel::Control, push.send_unreliable),
+            (Channel::Bulk, push.send_bulk),
+        ];
+        for (channel, messages) in sends {
+            for (peer, message) in messages {
+                let replaced = sent_for
+                    .get(&peer)
+                    .is_some_and(|session| self.peers.get(&peer).is_some_and(|state| state.handshake_hash != *session));
+                if replaced {
+                    self.stats.stale_session_sends += 1;
+                    continue;
+                }
+                self.enqueue(peer, channel, message);
+            }
         }
         self.flush_outboxes();
 
@@ -2009,6 +2028,57 @@ mod tests {
         assert_eq!(pull.current_connections, vec![(address, [3; 64])]);
         assert!(pull.received_unreliable_messages.is_empty());
         assert_eq!(hub.handle.stats.stale_session_messages, 2);
+    }
+
+    /// A consumer's sends are for the sessions it was last handed: one made before it saw a
+    /// replacement is not queued on the new session. Regression: tenderlink's ID hello, signed
+    /// over the old hash, went out on the new session and failed there, and the peer killed us.
+    #[test]
+    fn sends_made_for_a_replaced_session_are_not_queued_on_its_successor() {
+        use shielded_transport_pigeon::pump::DisconnectReason;
+
+        let key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b).unwrap();
+        let address = STPAddress::from(Ipv6Addr::LOCALHOST, free_port(), &key);
+        let peer = address.connection_key();
+        let (mut a, _pump) = NetworkThreadHandle::new_unstarted(
+            vec![key], free_port(), None, (1_000_000, 512 * 1024, 32 << 20), TransportLimits::default(),
+        );
+        let now = Instant::now();
+        let connected = |hash| Event::Connected { peer, address: address.clone(), handshake_hash: hash };
+        let mut ignored = SessionMessages::new();
+        a.connecting.insert(peer, now);
+        a.handle_event(connected([1; 64]), &mut ignored, now);
+        let mut hub = Hub {
+            handle: a,
+            consumers: Default::default(),
+            redial: HashMap::new(),
+            lock_times: Default::default(),
+            dial_only: None,
+        };
+        hub.consumers[Consumer::Base as usize].attached = true;
+        hub.consumers[Consumer::Base as usize].offered.insert(peer, [1; 64]);
+
+        // Replaced while the consumer still knows only session 1; its send is for session 1.
+        hub.handle.handle_event(Event::Disconnected { peer, reason: DisconnectReason::Replaced }, &mut ignored, now);
+        hub.handle.handle_event(connected([2; 64]), &mut ignored, now);
+        let pull = hub.service(Consumer::Base, NetworkThreadPush {
+            wanted_connections: vec![(address.clone(), [1; 64])],
+            send_unreliable: vec![(peer, vec![0x01, 1])],
+            ..Default::default()
+        });
+        assert_eq!(pull.current_connections, vec![(address.clone(), [2; 64])]);
+        assert_eq!(hub.handle.stats.stale_session_sends, 1);
+        assert_eq!(hub.handle.peers[&peer].outboxes[Channel::Control as usize].messages.len(), 0);
+
+        // Having been handed session 2, its sends go out.
+        hub.service(Consumer::Base, NetworkThreadPush {
+            wanted_connections: vec![(address, [2; 64])],
+            send_unreliable: vec![(peer, vec![0x01, 2])],
+            ..Default::default()
+        });
+        assert_eq!(hub.handle.stats.stale_session_sends, 1);
+        assert_eq!(hub.handle.stats.send_to_unknown_peer_dropped, 0);
+        assert_eq!(hub.handle.stats.kills, 0);
     }
 
     /// A peer that dies without closing (STP has no close frame) and comes back on the same key
