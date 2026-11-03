@@ -1828,6 +1828,14 @@ impl BftAddressMap {
         self.by_addr.insert(addr.clone(), *key);
     }
     pub fn get_key(&self, addr: &STPAddress) -> Option<&PubKeyID> { self.by_addr.get(addr) }
+    /// The BFT key of a live connection. Prefer the key the peer proved at ID_HELLO / ID_HELLO_ACK
+    /// and that we keep on its `Peer` as `bft_pk`. `by_addr` is last-write-wins and is pruned
+    /// together with the address attestation, so a link that is still up can lose its `by_addr`
+    /// entry at expiry + 120 and then be sent no more of our votes (issue #261). Fall back to
+    /// `by_addr` only before the handshake has named a key for this connection (`bft_pk` is NIL).
+    pub fn key_for_connection(&self, verified_bft_pk: PubKeyID, addr: &STPAddress) -> Option<PubKeyID> {
+        if verified_bft_pk != PubKeyID::NIL { Some(verified_bft_pk) } else { self.get_key(addr).copied() }
+    }
     pub fn get_addrs(&self, key: &PubKeyID) -> impl Iterator<Item = (&STPAddress, &Option<PeerAttestation>)> { self.by_key.get(key).map(|v| v.iter()).unwrap_or_default() }
     pub fn contains_key(&self, key: &PubKeyID) -> bool { self.by_key.contains_key(key) }
     pub fn all_addrs(&self) -> impl Iterator<Item = (&STPAddress, &PubKeyID)> { self.by_addr.iter() }
@@ -2269,8 +2277,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 let mut bft_key = PubKeyID::NIL;
                 for (c, _) in &current_connections {
                     if c.connection_key() == *ck {
-                        if let Some(k) = bft_address_map.get_key(c) {
-                            bft_key = *k;
+                        if let Some(k) = bft_address_map.key_for_connection(p.bft_pk, c) {
+                            bft_key = k;
                         }
                         break;
                     }
@@ -2571,8 +2579,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     let mut bft_key = PubKeyID::NIL;
                     for (c, _) in &current_connections {
                         if c.connection_key() == *ck {
-                            if let Some(k) = bft_address_map.get_key(&c) {
-                                bft_key = *k;
+                            if let Some(k) = bft_address_map.key_for_connection(p.bft_pk, &c) {
+                                bft_key = k;
                             }
                             break;
                         }
@@ -2584,8 +2592,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     let mut peer_bft_key = PubKeyID::NIL;
                     for (c, _) in &current_connections {
                         if c.connection_key() == *connection_key {
-                            if let Some(k) = bft_address_map.get_key(&c) {
-                                peer_bft_key = *k;
+                            // #261: route current-height votes by the key the peer proved at HELLO.
+                            if let Some(k) = bft_address_map.key_for_connection(peer.bft_pk, &c) {
+                                peer_bft_key = k;
                             }
                             break;
                         }
@@ -3270,8 +3279,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             else {
             }
 
-            if let Some(pk) = bft_address_map.get_key(&peer.stp_address) {
-                bft_address_map.last_packet_utcs.insert(*pk, chrono::Utc::now().timestamp());
+            // #261: recency follows the verified HELLO key too, not the prunable by_addr entry.
+            if let Some(pk) = bft_address_map.key_for_connection(peer.bft_pk, &peer.stp_address) {
+                bft_address_map.last_packet_utcs.insert(pk, chrono::Utc::now().timestamp());
             }
         }
 
@@ -3901,6 +3911,31 @@ mod tests {
         assert_eq!(peer.stp_handshake_hash, [2; 64]);
         assert_eq!((peer.index_counter, peer.latest_status_request_height), (0, None), "nothing kept from the old session");
         assert_eq!(peers.len(), 1);
+    }
+
+    /// A connected finalizer's votes are routed by the key it proved at ID_HELLO, not by its
+    /// `by_addr` entry. Regression for #261: `by_addr` is pruned together with the finalizer's
+    /// address attestation at expiry + 120, so while the link was still up its votes stopped
+    /// until one side restarted and a fresh handshake re-created the entry.
+    #[test]
+    fn a_live_links_key_survives_its_address_attestation_being_pruned() {
+        let key = crate::stp::new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+        let address = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, 13101, &key);
+        let verified = PubKeyID([7; 32]);
+        let mut map = BftAddressMap::new();
+
+        // Before the handshake names a key for the connection, we can only route by its address.
+        assert_eq!(map.key_for_connection(PubKeyID::NIL, &address), None);
+        map.insert(&verified, &address, None);
+        assert_eq!(map.key_for_connection(PubKeyID::NIL, &address), Some(verified));
+
+        // The address attestation ages out and `by_addr` / `by_key` are pruned, but the link is up
+        // and still verified with `verified`: its votes must keep flowing.
+        map.by_addr.clear();
+        map.by_key.clear();
+        assert_eq!(map.get_key(&address), None, "by_addr no longer resolves the key");
+        assert_eq!(map.key_for_connection(verified, &address), Some(verified),
+                   "a live link routes by its verified HELLO key");
     }
 
     /// Restored signatures are over the legacy application format, not the active STP MTU.
