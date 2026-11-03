@@ -5294,6 +5294,44 @@ impl ServerCertVerifier for DerVerifier {
 mod tests {
     use super::*;
 
+    struct StalledBody;
+
+    impl http_body::Body for StalledBody {
+        type Data = tonic::codegen::Bytes;
+        type Error = tonic::Status;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    struct UnitDecoder;
+
+    impl tonic::codec::Decoder for UnitDecoder {
+        type Item = ();
+        type Error = tonic::Status;
+
+        fn decode(&mut self, _: &mut tonic::codec::DecodeBuf<'_>) -> Result<Option<()>, tonic::Status> {
+            Ok(Some(()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_stream_read_times_out() {
+        let mut stream = tonic::Streaming::new_response(
+            UnitDecoder,
+            StalledBody,
+            tonic::codegen::http::StatusCode::OK,
+            None,
+            None,
+        );
+        let err = next_stream_message(&mut stream).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
+    }
+
     #[test]
     fn wallet_proof_cancellation_does_not_wait_for_worker() {
         let (sender, receiver) = tokio::sync::oneshot::channel();
