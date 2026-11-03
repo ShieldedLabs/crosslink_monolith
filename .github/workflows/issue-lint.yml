@@ -1,0 +1,55 @@
+name: Issue lint
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+# Reads every open issue and lists drift from tracking_plan.txt's rule in the run summary. It writes nothing,
+# so a list that grows is the only sign; nobody is notified.
+jobs:
+  lint:
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      issues: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          owner=${GH_REPO%/*} name=${GH_REPO#*/}
+          # One line per open issue: its number, then a word for each rule it breaks. gh's --jq runs per page,
+          # so the grouping is done by awk.
+          gh api graphql --paginate -f owner="$owner" -f name="$name" -f query='
+            query($owner: String!, $name: String!, $endCursor: String) { repository(owner: $owner, name: $name) {
+              issues(states: OPEN, first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor }
+                nodes { number issueType { name } milestone { closed } labels(first: 50) { nodes { name } } } } } }' \
+            --jq '.data.repository.issues.nodes[] | .number as $n | [.labels.nodes[].name] as $l
+              | [ (if .issueType == null then "type" else empty end),
+                  (if ($l | map(startswith("bot-prio:")) | any) then empty else "prio" end),
+                  (if ($l | map(startswith("area: ")) | any) then empty else "area" end),
+                  (if ($l | map(select(startswith("bot-prio:"))) | length) > 1 then "prio2" else empty end),
+                  (if ($l | map(select(startswith("status: "))) | length) > 1 then "status2" else empty end),
+                  (if .milestone.closed == true then "milestone" else empty end) ]
+              | "\($n) \(join(" "))"' > issues.txt
+
+          awk '
+            BEGIN {
+              split("type prio area prio2 status2 milestone", order, " ")
+              title["type"] = "No issue type"; title["prio"] = "No bot-prio: label"; title["area"] = "No area: label"
+              title["prio2"] = "More than one bot-prio: label"; title["status2"] = "More than one status: label"
+              title["milestone"] = "In a closed milestone"
+            }
+            { open++; for (i = 2; i <= NF; i++) { count[$i]++; nums[$i] = nums[$i] " #" $1 } }
+            END {
+              print "## Open issues: " open "\n"
+              for (k = 1; k <= 6; k++) {
+                r = order[k]
+                print "### " title[r] ": " count[r] + 0 "\n"
+                if (count[r]) print substr(nums[r], 2) "\n"
+              }
+            }' issues.txt >> "$GITHUB_STEP_SUMMARY"
