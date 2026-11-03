@@ -3954,6 +3954,72 @@ mod tests {
         assert_eq!(gossiped[0].expiry, now + 3600);
     }
 
+    /// #261 at the engine level: boot a real node (one instance, ephemeral loopback port so there is
+    /// no socket collision like single_rt's), connect a synthetic finalizer, complete the ID_HELLO
+    /// handshake, and confirm the running loop resolves that peer's BFT key on the live connection
+    /// (via key_for_connection / peer.bft_pk) and reports it connected. Exercises the full loop with
+    /// the vote-routing, re-HELLO and gossip-filter changes end to end -- no panic, no regression, and
+    /// the #261 resolution path working live. The by_addr-pruned fallback is wall-clock driven and is
+    /// covered by a_live_links_key_survives_its_address_attestation_being_pruned.
+    #[test]
+    fn a_connected_finalizers_key_is_resolved_from_its_verified_hello_in_the_running_engine() {
+        use std::sync::{Arc, Mutex};
+
+        let node_bft = SigningKey::from([3u8; 32]);
+        let synth_bft = SigningKey::from([7u8; 32]);
+        let node_pk = PubKeyID(VerificationKeyBytes::from(&node_bft).into());
+        let synth_pk = PubKeyID(VerificationKeyBytes::from(&synth_bft).into());
+
+        let roster = vec![
+            SortedRosterMember { pub_key: node_pk,  stake: 2, cumulative_stake: 2 },
+            SortedRosterMember { pub_key: synth_pk, stake: 1, cumulative_stake: 3 },
+        ];
+
+        let node_stp = crate::stp::new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+        let endpoint = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, 0, &node_stp); // port 0 -> ephemeral
+
+        let synth = attach_synthetic_bft_peer(1);
+        let hello = id_hello_packet(&synth_bft, &synth.handshake_hash);
+
+        // The key the engine reports for the (only) connected peer each tick, via its peer-update closure.
+        let observed: Arc<Mutex<Option<PubKeyID>>> = Arc::new(Mutex::new(None));
+        let observed2 = observed.clone();
+        let peer_cmd = ClosureToUpdatePeers(Arc::new(move |peers: Vec<PeerInfo>| {
+            let observed = observed2.clone();
+            Box::pin(async move {
+                if let Some(k) = peers.iter()
+                    .filter(|p| p.connected)
+                    .find_map(|p| p.root_public_bft_key.filter(|k| *k != PubKeyID::NIL))
+                {
+                    *observed.lock().unwrap() = Some(k);
+                }
+            })
+        }));
+
+        let propose  = ClosureToProposeNewBlock(Arc::new(move || Box::pin(async move { None::<BlockValue> })));
+        let validate = ClosureToValidateProposedBlock(Arc::new(move |_b| Box::pin(async move { (TMStatus::Pass, TMStatusReason::None) })));
+        let push     = ClosureToPushDecidedBlock(Arc::new(move |_b, _f, _s| Box::pin(async move { (Vec::<SortedRosterMember>::new(), [0u8; 32], false) })));
+        let access   = ClosureToAccessBft(Arc::new(move |_bft, _map| Box::pin(async move {})));
+
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        rt.spawn(async move {
+            let _ = entry_point(node_bft, None, Some(node_stp), Some(endpoint), roster, ROSTER_MAX_N,
+                Vec::new(), Some(0), propose, validate, push, peer_cmd, access, Vec::new(), [0u8; 32], false).await;
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut got = None;
+        while std::time::Instant::now() < deadline {
+            let _ = synth.inbound.send(hello.clone()); // resend until a tick picks it up
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Some(k) = *observed.lock().unwrap() { got = Some(k); break; }
+        }
+        rt.shutdown_background();
+
+        assert_eq!(got, Some(synth_pk),
+                   "the running engine resolved the connected finalizer's key from its verified ID_HELLO");
+    }
+
     /// A known key whose STP session hash changes (STP replacing a restarted peer's session in
     /// place) gets a fresh Peer, verified again; the same session gets nothing. Regression: the
     /// Peer kept the dead session's hash, failed the new session's ID verification and killed it,
