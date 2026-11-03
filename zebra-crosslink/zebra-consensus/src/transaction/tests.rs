@@ -4959,6 +4959,7 @@ mod staking_signature {
                 status,
                 last_action_height: LAST_ACTION,
                 target_finalizer: TARGET,
+                version: KEY,
             })
         };
         let ready = Height(LAST_ACTION + STAKING.action_delay);
@@ -4996,6 +4997,47 @@ mod staking_signature {
         assert!(convert(501, 500, None).is_err());
         assert!(convert(0, 500, None).is_err());
         assert!(convert(500, 500, bond(0)).is_err());
+    }
+
+    /// Sweeps every combination of upgrade state, spent version and bond: the mempool admits an
+    /// action on a bond only in the form the upgrade asks for, and from FeaturenetUpgrade3 only
+    /// when it spends the bond's current version, so a replayed or stale action stays out.
+    #[test]
+    fn mempool_staking_action_spends_rules() {
+        use zebra_chain::amount::Amount;
+        use zebra_state::BondInfoResponse;
+
+        use crate::transaction::check_staking_action_spends;
+
+        const KEY: [u8; 32] = [1; 32];
+        let versions = [KEY, [2; 32], [3; 32]];
+
+        for version in versions {
+            let info = BondInfoResponse {
+                amount: Amount::try_from(500u64).unwrap(),
+                status: 0,
+                last_action_height: 0,
+                target_finalizer: [7; 32],
+                version,
+            };
+            for bond_info in [None, Some(&info)] {
+                for spends in std::iter::once(None).chain(versions.map(Some)) {
+                    for spends_versions in [false, true] {
+                        let accepted = check_staking_action_spends(KEY, spends, spends_versions, bond_info).is_ok();
+                        let expected = match (spends_versions, spends) {
+                            (false, spends) => spends.is_none(),
+                            (true, None) => false,
+                            (true, Some(spends)) => bond_info.is_none_or(|info| info.version == spends),
+                        };
+                        assert_eq!(
+                            accepted, expected,
+                            "spends_versions {spends_versions}, spends {spends:?}, bond version {:?}",
+                            bond_info.map(|info| info.version)
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// ZIP 215 accepts small-order keys, and under one the all-zero signature verifies over

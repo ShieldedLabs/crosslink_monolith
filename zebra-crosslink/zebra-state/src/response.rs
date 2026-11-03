@@ -683,6 +683,9 @@ pub struct BondInfoResponse {
     pub last_action_height: u32,
     /// The finalizer the bond's stake currently points at.
     pub target_finalizer: [u8; 32],
+    /// The version an action on this bond must spend from FeaturenetUpgrade3: the txid of the
+    /// last action that spent the bond, or the bond key if none has.
+    pub version: [u8; 32],
 }
 
 /// A structure with the information needed from the state to build a `getblocktemplate` RPC response.

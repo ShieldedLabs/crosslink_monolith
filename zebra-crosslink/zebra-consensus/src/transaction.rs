@@ -517,7 +517,10 @@ where
 
             tracing::trace!(?tx_id, "passed quick checks");
 
-            Self::check_mempool_staking_action_bond_state(&tx, height, staking, state.clone()).await?;
+            let spends_versions = NetworkUpgrade::FeaturenetUpgrade3
+                .activation_height(&network)
+                .is_some_and(|activation_height| height >= activation_height);
+            Self::check_mempool_staking_action_bond_state(&tx, height, staking, spends_versions, state.clone()).await?;
 
             // Mempool transactions are checked against the next median-time-past from state.
             Self::verify_mempool_lock_time(tx.as_ref(), height, state.clone()).await?;
@@ -637,6 +640,7 @@ where
         tx: &Transaction,
         height: block::Height,
         staking: StakingParameters,
+        spends_versions: bool,
         state: Timeout<ZS>,
     ) -> Result<(), TransactionError> {
         use zcash_primitives::transaction::StakingActionKind;
@@ -670,6 +674,10 @@ where
         } else {
             0
         };
+
+        if staking_action.acts_on_existing_bond() {
+            check_staking_action_spends(bond_key, staking_action.spends(), spends_versions, bond_info.as_ref())?;
+        }
 
         check_staking_action_bond_state(
             staking_action.kind(),
@@ -897,6 +905,26 @@ fn check_staking_action_bond_state(
             }
             Ok(())
         }
+    }
+}
+
+/// From FeaturenetUpgrade3 an action on an existing bond must spend the bond's current version,
+/// so a replayed or stale action never enters the mempool; before it, the spending form is
+/// refused. Blocks get the same rule from contextual validation in the state. A missing bond is
+/// left to `check_staking_action_bond_state`, which reports it.
+fn check_staking_action_spends(
+    bond_key: [u8; 32],
+    spends: Option<[u8; 32]>,
+    spends_versions: bool,
+    bond_info: Option<&zs::BondInfoResponse>,
+) -> Result<(), TransactionError> {
+    let invalid = |reason: &str| Err(TransactionError::StakingActionBondStateInvalid { bond_key, reason: reason.to_string() });
+    match (spends_versions, spends, bond_info) {
+        (false, None, _) => Ok(()),
+        (false, Some(_), _) => invalid("an action cannot spend a bond version before FeaturenetUpgrade3"),
+        (true, None, _) => invalid("from FeaturenetUpgrade3 an action on a bond must spend its version"),
+        (true, Some(spends), Some(info)) if spends != info.version => invalid("the action spends a stale bond version"),
+        (true, Some(_), _) => Ok(()),
     }
 }
 
