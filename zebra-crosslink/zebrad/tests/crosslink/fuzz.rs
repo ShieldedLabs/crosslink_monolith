@@ -632,6 +632,15 @@ fn spends_versions(g: &FuzzGen) -> bool {
         .is_some_and(|activation_height| BlockHeight(g.height() + 1) >= activation_height)
 }
 
+/// Whether the next block of `main` still allows the fuzzer's unfunded zero-zat create. From
+/// FeaturenetUpgrade1 a create must bond a power of 10 zats, and an upgrade left unscheduled
+/// activates with the next one, so scheduling FeaturenetUpgrade3 alone also activates it.
+fn zero_create_allowed(g: &FuzzGen) -> bool {
+    NetworkUpgrade::FeaturenetUpgrade1
+        .activation_height(&g.network)
+        .map_or(true, |activation_height| BlockHeight(g.height() + 1) < activation_height)
+}
+
 /// The version an action on `bond` in the next block spends, and whether that is the one the
 /// node requires: mostly the bond's version under FeaturenetUpgrade3 and none before it, and
 /// sometimes the wrong one, for the refusal: none, a stale or made-up version, or one too early.
@@ -730,7 +739,7 @@ fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
             let target = c.below(3);
             (
                 staking_tx_create_bond(upgrade, &bond.seed, fuzz_finalizer(target), 0),
-                bond.state == FuzzBondState::Absent,
+                bond.state == FuzzBondState::Absent && zero_create_allowed(g),
                 FuzzBondState::Active,
                 target,
             )
@@ -837,6 +846,42 @@ fn move_replay(g: &mut FuzzGen, c: &mut Choices) {
     refuse(g, c, &block);
     if !g.tip_known {
         g.bonds[replay.bond_i].known = false;
+    }
+}
+
+/// Two retargets of one active bond in one block under FeaturenetUpgrade3, which single-action
+/// moves never make: mostly the second spends the first's txid, so the block is valid and leaves
+/// the bond at the second's version; sometimes it spends the version both started from, so the
+/// node must refuse the block.
+fn move_retarget_twice(g: &mut FuzzGen, c: &mut Choices) {
+    refresh_model(g);
+    let active: Vec<usize> =
+        (0..g.bonds.len()).filter(|&i| g.bonds[i].known && g.bonds[i].state == FuzzBondState::Active).collect();
+    if !spends_versions(g) || active.is_empty() || !g.tip_known {
+        return move_staking(g, c);
+    }
+    let bond_i = active[c.below(active.len())];
+    let bond = g.bonds[bond_i].clone();
+    let mid = (bond.target + 1 + c.below(2)) % 3;
+    let to = (mid + 1 + c.below(2)) % 3;
+    let first = fuzz_retarget(g, &bond.seed, bond.target, mid, Some(bond.version));
+    let chained = !c.unusual(8);
+    let second_spends = if chained { first.hash().0 } else { bond.version };
+    let second = fuzz_retarget(g, &bond.seed, mid, to, Some(second_spends));
+
+    if !chained {
+        let block = g.tip().clone().next_block_with_txs(&g.miner.clone(), &[first, second]);
+        refuse(g, c, &block);
+        return;
+    }
+    let h = g.height() + 1;
+    let known = mine(g, c, &[first.clone(), second.clone()]);
+    let at = (h, g.main[h as usize - 1].tip.hash());
+    g.bonds[bond_i] = FuzzBond { target: to, target_at: at, known, version: second.hash().0, ..bond.clone() };
+    g.mined_staking.push(FuzzMinedStaking { tx: first, bond_i, height: h, block: at.1, retarget: Some((bond.target, mid)) });
+    g.mined_staking.push(FuzzMinedStaking { tx: second, bond_i, height: h, block: at.1, retarget: Some((mid, to)) });
+    if known {
+        g.tf.push_instr_expect_bond(bond.key, TF_BOND_ACTIVE, TEST_STAKE_IGNORED, 0);
     }
 }
 // ---- End of transaction and staking moves ----
@@ -949,7 +994,7 @@ const FUZZ_UTXO_UPGRADE_FROM: u32 = 4;
 const FUZZ_UTXO_UPGRADE_SPAN: usize = 60;
 
 /// The moves, most ordinary first: choice 0 picks extend.
-const MOVES: &[Move] = &[move_extend, move_fork, move_invalid_block, move_mangled_block, move_spend, move_mine_pending, move_double_spend, move_staking, move_replay];
+const MOVES: &[Move] = &[move_extend, move_fork, move_invalid_block, move_mangled_block, move_spend, move_mine_pending, move_double_spend, move_staking, move_replay, move_retarget_twice];
 
 /// The test file for `c`. Each input enables a subset of the moves, so rare combinations are not
 /// drowned out by common ones. Some inputs are BFT chains instead (`generate_bft`).
