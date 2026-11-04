@@ -3748,16 +3748,17 @@ mod tests {
 
     #[test]
     fn line28_inactive_roster_members_ignored() {
-        // The first ROSTER_MAX_N members are active with stake 1 each (f = 33, threshold 67); one more,
-        // inactive, carries enough stake to outvote them all and has a vote slot anyway.
+        // The first ROSTER_MAX_N members are active with stake 1 each; one more, inactive, carries enough
+        // stake to outvote them all and has a vote slot anyway.
         let mut stakes = vec![1u64; ROSTER_MAX_N];
         stakes.push(1000);
         let mut rounds = vec![line28_round(1, &stakes)];
         rounds[0].msg_val_sigs.push([(LINE28_V, LINE28_SIG), (ValueId::NIL, TMSig::NIL)]);
-        let voters: Vec<usize> = (0..66).collect();
+        let threshold = 2 * TMState::f_from_n(ROSTER_MAX_N as u64) as usize + 1;
+        let voters: Vec<usize> = (0..threshold - 1).collect();
         line28_prevote(&mut rounds[0], &voters, LINE28_V);
         assert!(!has_prevote_certificate(&rounds, 0, 2, 1, LINE28_V));
-        line28_prevote(&mut rounds[0], &[66], LINE28_V);
+        line28_prevote(&mut rounds[0], &[threshold - 1], LINE28_V);
         assert!( has_prevote_certificate(&rounds, 0, 2, 1, LINE28_V));
     }
 
