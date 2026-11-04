@@ -3420,6 +3420,7 @@ name = "wallet"
 version = "1.0.0-beta.1"
 dependencies = [
  "bip39",
+ "http-body",
  "incrementalmerkletree",
  "orchard",
  "prost",

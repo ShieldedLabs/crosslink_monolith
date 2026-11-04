@@ -52,3 +52,7 @@ sapling-crypto = "0.7"
 orchard = "0.15.0"
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
 shardtree = "0.6.1"
+
+[dev-dependencies]
+http-body = "1"
+tokio = { version = "1.44", features = ["test-util"] }
