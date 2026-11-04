@@ -571,7 +571,7 @@ fn move_double_spend(g: &mut FuzzGen, c: &mut Choices) {
 /// The finalizers bonds are made to: a few, so retargets and shared targets happen.
 fn fuzz_finalizer(i: usize) -> zcash_primitives::bft::FinalizerAddress {
     zcash_primitives::bft::FinalizerAddress::create(
-        &zebra_crosslink::rng_private_public_key_from_address(format!("crosslink fuzz finalizer {i}").as_bytes()).1,
+        &zebra_crosslink::rng_private_public_key_from_address(format!("crosslink fuzz finalizer {i}").as_bytes()).0,
     )
 }
 

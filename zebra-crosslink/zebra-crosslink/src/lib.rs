@@ -180,7 +180,8 @@ pub mod config {
         /// Public address for this node, e.g. "/ip4/127.0.0.1/udp/24834/quic-v1" if testing
         /// internally, or the public IP address if using externally.
         pub public_address: Option<String>,
-        /// Use the public IP instead of the generated seed
+        /// Development only, due for removal: derive the finalizer key from this string instead
+        /// of `secret.seed`.
         pub explicit_bft_key_seed: Option<String>,
         /// Ignored (a warning is logged if set). BFT runs over the node's own connections, on its
         /// key and port, seeded from `state.network_initial_peers`. Kept so older configs load.
@@ -333,7 +334,7 @@ async fn _block_prev_hash_from_hash(call: &TFLServiceCalls, hash: ZebBlockHash) 
 // which needs the same key to authorize finalizer reward conversions.
 pub fn rng_private_public_key_from_address(
     addr: &[u8],
-) -> (rand::rngs::StdRng, ed25519_zebra::SigningKey, PubKeyID) {
+) -> (ed25519_zebra::SigningKey, PubKeyID) {
     zcash_primitives::bft::finalizer_key_from_seed(addr)
 }
 

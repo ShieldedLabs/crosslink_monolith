@@ -2493,7 +2493,7 @@ fn crosslink_mempool_and_staking_state_instructions() {
     // before any bond the staking pools and the target's bank are empty; a funded bond makes
     // the bonded pool non-empty. The amounts after it depend on the issuance rules, which pay a
     // new bond in its own block, so this checks only that the pool moved.
-    let target_key = zebra_crosslink::rng_private_public_key_from_address(b"staking-target").1;
+    let target_key = zebra_crosslink::rng_private_public_key_from_address(b"staking-target").0;
     let target = zcash_primitives::bft::FinalizerAddress::create(&target_key);
     let target_pub_key = target.pub_key.0;
     let input = mature(&mut gen, &mut tf);
@@ -2942,7 +2942,7 @@ fn signed_tx(
             })
             .collect();
         let staking_action = staking.map(|(bond_seed, action)| {
-            let bond_pub_key = zebra_crosslink::rng_private_public_key_from_address(bond_seed).2;
+            let bond_pub_key = zebra_crosslink::rng_private_public_key_from_address(bond_seed).1;
             action(bond_pub_key.0, staking_signature)
         });
         Arc::new(Transaction::VCrosslink {
@@ -2965,7 +2965,7 @@ fn signed_tx(
     // sighash.rs), so signing what the unsigned transaction hashes to leaves that hash unchanged.
     let staking_signature = match staking {
         Some((bond_seed, _)) => {
-            let bond_signing_key = zebra_crosslink::rng_private_public_key_from_address(bond_seed).1;
+            let bond_signing_key = zebra_crosslink::rng_private_public_key_from_address(bond_seed).0;
             let sighash = build(&blank_scripts, [0; 64])
                 .sighash(network_upgrade, HashType::ALL, previous_outputs.clone(), None)
                 .expect("a VCrosslink transaction has a sighash");
@@ -3112,7 +3112,7 @@ fn crosslink_pow_block_with_staking_tx() {
 
     // A validly-minted finalizer target (its embedded signature must verify in consensus).
     let target = zcash_primitives::bft::FinalizerAddress::create(
-        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").1,
+        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").0,
     );
 
     // height 2 is the first height whose commitment is the ZIP-244 hashBlockCommitments
@@ -3268,7 +3268,7 @@ fn certificate_over(template: [u8; 44], finalizer_seeds: &[&[u8]], vote_namespac
     let signatures: Vec<FatPointerSignature> = finalizer_seeds
         .iter()
         .map(|seed| {
-            let (_, key, pub_key) = zebra_crosslink::rng_private_public_key_from_address(seed);
+            let (key, pub_key) = zebra_crosslink::rng_private_public_key_from_address(seed);
             let mut signed = pub_key.0.to_vec();
             signed.extend_from_slice(&template);
             if *vote_namespace != [0; 32] {
@@ -3377,7 +3377,7 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
     let network = regtest_network(&HARNESS_PARAMETERS);
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
 
-    let (_, prv_key, pub_key) =
+    let (prv_key, pub_key) =
         zebra_crosslink::rng_private_public_key_from_address("some_pub_key".as_bytes());
     // The roster is keyed on the finalizer address's pub_key (target_finalizer_pk), which is
     // pub_key here, so EXPECT_ROSTER_INCLUDES(pub_key) below matches.
@@ -3919,7 +3919,7 @@ fn crosslink_reject_pow_block_with_oversized_staking_amount() {
     tf.push_instr_load_pow(&gen.tip, 0);
 
     let target = zcash_primitives::bft::FinalizerAddress::create(
-        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").1,
+        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").0,
     );
     let oversized = zebra_chain::amount::MAX_MONEY as u64 + 1;
     let block = gen.next_block_with_txs(
@@ -3946,7 +3946,7 @@ fn coinbase_creating_bond(
     use zebra_chain::transaction::HashType;
     use zcash_primitives::transaction::StakingAction;
 
-    let (_, bond_signing_key, bond_pub_key) = zebra_crosslink::rng_private_public_key_from_address(bond_seed);
+    let (bond_signing_key, bond_pub_key) = zebra_crosslink::rng_private_public_key_from_address(bond_seed);
     let build = |signature: [u8; 64]| Transaction::VCrosslink {
         network_upgrade: upgrade,
         lock_time: LockTime::unlocked(),
@@ -3986,7 +3986,7 @@ fn crosslink_reject_pow_block_with_staking_action_in_coinbase() {
     tf.push_instr_load_pow(&gen.tip, 0);
 
     let target = zcash_primitives::bft::FinalizerAddress::create(
-        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").1,
+        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").0,
     );
     const BOND_ZATS: u64 = 1_000_000_000_000;
     let upgrade = gen.next_upgrade();
@@ -4022,7 +4022,7 @@ fn crosslink_reject_action_on_a_bond_after_it_unbonds_or_withdraws_in_the_block(
     let network = regtest_network(&params);
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
     let finalizer = |seed: &[u8]| {
-        zcash_primitives::bft::FinalizerAddress::create(&zebra_crosslink::rng_private_public_key_from_address(seed).1)
+        zcash_primitives::bft::FinalizerAddress::create(&zebra_crosslink::rng_private_public_key_from_address(seed).0)
     };
     let (target, other) = (finalizer(b"finalizer-a"), finalizer(b"finalizer-b"));
 
@@ -4119,7 +4119,7 @@ fn crosslink_spend_matured_coinbase_with_a_fee() {
         tf.push_instr_load_pow(&gen.next_block(&miner), 0);
     }
     let target = zcash_primitives::bft::FinalizerAddress::create(
-        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").1,
+        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").0,
     );
     let bond_seed = b"funded-bond";
     let bond = staking_tx_create_bond_funded(
@@ -4138,7 +4138,7 @@ fn crosslink_spend_matured_coinbase_with_a_fee() {
     tf.push_instr_expect_mempool_absent(&bond, 0);
     // Stakers are paid every block, so the bond's amount moves on from the one bonded; the block
     // being accepted is what shows the value balanced.
-    let bond_key = zebra_crosslink::rng_private_public_key_from_address(bond_seed).2 .0;
+    let bond_key = zebra_crosslink::rng_private_public_key_from_address(bond_seed).1 .0;
     tf.push_instr_expect_bond(bond_key, TF_BOND_ACTIVE, TEST_STAKE_IGNORED, 0);
 
     test_bytes(tf.write_to_bytes());
@@ -4339,7 +4339,7 @@ fn crosslink_payout_changes_rule_at_featurenet_upgrade_1() {
     let mut bonds = Vec::new();
     for (index, input) in inputs.into_iter().enumerate() {
         let finalizer = zcash_primitives::bft::FinalizerAddress::create(
-            &zebra_crosslink::rng_private_public_key_from_address(format!("payout-finalizer-{index}").as_bytes()).1,
+            &zebra_crosslink::rng_private_public_key_from_address(format!("payout-finalizer-{index}").as_bytes()).0,
         );
         let amount = if index + 1 == FINALIZERS { 10_000_000 } else { 100_000_000 };
         let bond = staking_tx_create_bond_funded(
@@ -4394,7 +4394,7 @@ fn crosslink_new_bonds_must_be_a_power_of_10_from_featurenet_upgrade_1() {
         tf.push_instr_load_pow(&gen.next_block(&miner), 0);
     }
     let target = zcash_primitives::bft::FinalizerAddress::create(
-        &zebra_crosslink::rng_private_public_key_from_address(b"power-of-10-target").1,
+        &zebra_crosslink::rng_private_public_key_from_address(b"power-of-10-target").0,
     );
     let mut bond = |gen: &BlockGen, seed: &[u8], amount: u64| {
         staking_tx_create_bond_funded(gen.next_upgrade(), seed, target, amount, &key, inputs.next().expect("three inputs matured"))
@@ -4447,15 +4447,15 @@ fn bft_rounds_scene(tf: &mut TF, node_proposes: &[bool]) -> BftRoundsScene {
             (0..n).flat_map(move |a| (a + 1..n).flat_map(move |b| (b + 1..n).map(move |c| (factor * STAKE, [a, b, c]))))
         })
         .find(|(node_stake, finalizers)| {
-            let members: Vec<([u8; 32], u64)> = std::iter::once((node.2 .0, *node_stake))
+            let members: Vec<([u8; 32], u64)> = std::iter::once((node.1 .0, *node_stake))
                 .chain(finalizers.iter().map(|&k| (pub_keys[usize::from(k)], STAKE)))
                 .collect();
-            node_proposes.iter().enumerate().all(|(round, &is_node)| (bft_proposer(&members, BFT_ROUNDS_PARAMETERS.active_roster_max_n, 1, round as u32) == Some(node.2 .0)) == is_node)
+            node_proposes.iter().enumerate().all(|(round, &is_node)| (bft_proposer(&members, BFT_ROUNDS_PARAMETERS.active_roster_max_n, 1, round as u32) == Some(node.1 .0)) == is_node)
         })
         .expect("some stakes and three synthetic finalizers put the proposer where asked");
 
-    let members = std::iter::once((node.1, node_stake)).chain(finalizers.iter().map(|&k| {
-        (zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k.into()).as_bytes()).1, STAKE)
+    let members = std::iter::once((node.0, node_stake)).chain(finalizers.iter().map(|&k| {
+        (zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k.into()).as_bytes()).0, STAKE)
     }));
     let inputs = matured_coinbases(tf, &mut gen, &key, 4);
     let bonds: Vec<Arc<Transaction>> = inputs
@@ -4476,7 +4476,7 @@ fn bft_rounds_scene(tf: &mut TF, node_proposes: &[bool]) -> BftRoundsScene {
         tf.push_instr_load_pow(&block, 0);
         pow.push(block);
     }
-    let member_pub_keys: Vec<([u8; 32], u64)> = std::iter::once((node.2 .0, node_stake))
+    let member_pub_keys: Vec<([u8; 32], u64)> = std::iter::once((node.1 .0, node_stake))
         .chain(finalizers.iter().map(|&k| (pub_keys[usize::from(k)], STAKE)))
         .collect();
     BftRoundsScene { finalizers, node_stake, total_stake: node_stake + 3 * STAKE, member_pub_keys, active_roster_max_n: BFT_ROUNDS_PARAMETERS.active_roster_max_n, pow, gen, miner }
@@ -4840,7 +4840,7 @@ fn twelve_seats_scene(tf: &mut TF, network: Network, node_proposes: &[((u64, u32
 
     let node = zebra_crosslink::rng_private_public_key_from_address(TEST_NODE_FINALIZER_SEED.as_bytes());
     let members_with = |finalizers: &[u16]| -> Vec<([u8; 32], u64)> {
-        std::iter::once((node.2 .0, SEAT_STAKE))
+        std::iter::once((node.1 .0, SEAT_STAKE))
             .chain(finalizers.iter().map(|&k| (synthetic_finalizer_pub_key(k.into()), SEAT_STAKE)))
             .collect()
     };
@@ -4859,7 +4859,7 @@ fn twelve_seats_scene(tf: &mut TF, network: Network, node_proposes: &[((u64, u32
             let members = members_with(&picked);
             node_proposes
                 .iter()
-                .all(|&((height, round), is_node)| (bft_proposer(&members, active_roster_max_n, height, round) == Some(node.2 .0)) == is_node)
+                .all(|&((height, round), is_node)| (bft_proposer(&members, active_roster_max_n, height, round) == Some(node.1 .0)) == is_node)
                 .then_some(picked)
         })
         .expect("some eleven synthetic finalizers put the proposer where asked");
@@ -4868,8 +4868,8 @@ fn twelve_seats_scene(tf: &mut TF, network: Network, node_proposes: &[((u64, u32
     let mut finalizers = finalizers;
     finalizers.sort_by_key(|&k| roster_order.iter().position(|pub_key| *pub_key == synthetic_finalizer_pub_key(k.into())));
 
-    let signing_keys = std::iter::once(node.1).chain(finalizers.iter().map(|&k| {
-        zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k.into()).as_bytes()).1
+    let signing_keys = std::iter::once(node.0).chain(finalizers.iter().map(|&k| {
+        zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k.into()).as_bytes()).0
     }));
     let inputs = matured_coinbases(tf, &mut gen, &key, 12);
     let bonds: Vec<Arc<Transaction>> = inputs
@@ -5273,7 +5273,7 @@ fn signed_decision_scene(signer: Option<SignerOf>, signed_valid_round: i64, vali
                 SignerOf::Proposer => proposer,
                 SignerOf::Another => scene.finalizers.iter().map(|&k| u64::from(k)).find(|&k| k != proposer).unwrap(),
             };
-            let key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k).as_bytes()).1;
+            let key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k).as_bytes()).0;
             bft_proposal_sigs(&key, &block, 0, signed_valid_round, &[0; 32])
         }
     };
@@ -5341,7 +5341,7 @@ fn crosslink_load_pos_refuses_a_certificate_with_a_bad_signature() {
     let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
     let mut fat_ptr = signed_fat_pointer(&block, 1, 0, &seeds, &[0; 32]);
     fat_ptr.signatures[0].vote_signature[0] ^= 1;
-    let key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(proposer).as_bytes()).1;
+    let key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(proposer).as_bytes()).0;
     let sigs = bft_proposal_sigs(&key, &block, 0, -1, &[0; 32]);
 
     let data = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr });
@@ -5365,7 +5365,7 @@ fn crosslink_load_pos_of_an_already_decided_height_is_refused_as_decided() {
     let seeds: Vec<String> = scene.finalizers.iter().map(|&k| synthetic_finalizer_seed(k.into())).collect();
     let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
     let fat_ptr = signed_fat_pointer(&block, 1, 0, &seeds, &[0; 32]);
-    let key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(proposer).as_bytes()).1;
+    let key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(proposer).as_bytes()).0;
     let sigs = bft_proposal_sigs(&key, &block, 0, -1, &[0; 32]);
     let data = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr });
 
@@ -5442,7 +5442,7 @@ fn bonded_start(tf: &mut TF, network: Network) -> BlockGen {
     let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
     tf.push_instr_load_pow(&gen.tip, 0);
     let [input] = <[_; 1]>::try_from(matured_coinbases(tf, &mut gen, &key, 1)).expect("one matured coinbase");
-    let signing_key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(SUPPLIED_FINALIZER).as_bytes()).1;
+    let signing_key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(SUPPLIED_FINALIZER).as_bytes()).0;
     let finalizer = zcash_primitives::bft::FinalizerAddress::create(&signing_key);
     let bond = staking_tx_create_bond_funded(gen.next_upgrade(), b"supplied-bond", finalizer, SUPPLIED_STAKE, &key, input);
     tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &[bond]), 0);
@@ -5485,7 +5485,7 @@ fn push_decided_pos(tf: &mut TF, bft: &BftBlockAndFatPointerToItWrap, flags: u32
         0 => Vec::new(),
         _ => {
             let round = u32::try_from(bft.0.fat_ptr.get_vote_template().round).expect("a decided round is not negative");
-            let signing_key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(SUPPLIED_FINALIZER).as_bytes()).1;
+            let signing_key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(SUPPLIED_FINALIZER).as_bytes()).0;
             bft_proposal_sigs(&signing_key, &bft.0.block, round, -1, &[0; 32])
         }
     };

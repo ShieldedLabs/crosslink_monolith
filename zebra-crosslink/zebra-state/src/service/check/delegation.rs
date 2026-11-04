@@ -640,8 +640,8 @@ mod tests {
             featurenet_upgrade_3: Some(ACTIVATION),
             ..Default::default()
         }));
-        let a = FinalizerAddress::create(&finalizer_key_from_seed(b"a").1);
-        let b = FinalizerAddress::create(&finalizer_key_from_seed(b"b").1);
+        let a = FinalizerAddress::create(&finalizer_key_from_seed(b"a").0);
+        let b = FinalizerAddress::create(&finalizer_key_from_seed(b"b").0);
         let bond = DelegationBond::new(Amount::try_from(1000u64).unwrap(), a.pub_key.0, loc(CREATED));
         let mut chain = Chain::new(
             &network,
@@ -759,8 +759,8 @@ mod tests {
     fn retarget_after_unbonding_in_the_same_block_is_rejected() {
         use zcash_primitives::{bft::{finalizer_key_from_seed, FinalizerAddress}, transaction::StakingAction};
 
-        let from = FinalizerAddress::create(&finalizer_key_from_seed(b"from").1);
-        let to = FinalizerAddress::create(&finalizer_key_from_seed(b"to").1);
+        let from = FinalizerAddress::create(&finalizer_key_from_seed(b"from").0);
+        let to = FinalizerAddress::create(&finalizer_key_from_seed(b"to").0);
         let bond = DelegationBond::new(Amount::try_from(1000u64).unwrap(), from.pub_key.0, loc(CREATED));
         let chain = Chain::new(
             &Network::Mainnet,
@@ -806,7 +806,7 @@ mod tests {
             [(KEY, bond(), BondStatus::Active)],
             std::iter::empty(),
         );
-        let target_finalizer = FinalizerAddress::create(&finalizer_key_from_seed(b"target").1);
+        let target_finalizer = FinalizerAddress::create(&finalizer_key_from_seed(b"target").0);
         let create = |amount_zats| StakingAction::CreateNewDelegationBond {
             amount_zats, unique_pubkey: [2; 32], bond_salt: [0; 32], target_finalizer, signature: [0; 64],
         };

@@ -506,9 +506,9 @@ async fn mempool_rejects_oversized_staking_amount() {
         ironwood_shielded_data: None,
         staking_action: Some(StakingAction::CreateNewDelegationBond {
             amount_zats: zebra_chain::amount::MAX_MONEY as u64 + 1,
-            unique_pubkey: finalizer_key_from_seed(b"bond").2 .0,
+            unique_pubkey: finalizer_key_from_seed(b"bond").1 .0,
             bond_salt: [0; 32],
-            target_finalizer: FinalizerAddress::create(&finalizer_key_from_seed(b"target").1),
+            target_finalizer: FinalizerAddress::create(&finalizer_key_from_seed(b"target").0),
             signature: [0; 64],
         }),
     };

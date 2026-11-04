@@ -923,19 +923,90 @@ pub fn verify_finalizer_reward_conversion(finalizer: PubKeyID, bond_key: &[u8; 3
     TMSig(*sig).verify(finalizer, &finalizer_reward_conversion_msg(bond_key, amount_zats)).is_ok()
 }
 
-/// The node's finalizer key from its `explicit_bft_key_seed` string (or a bootstrap
-/// peer address). Lives here rather than in the node so a wallet holding the same
-/// seed derives the same key. `DefaultHasher::new()` is SipHash-1-3 with fixed zero
-/// keys, so this is stable across processes and builds.
-pub fn finalizer_key_from_seed(seed: &[u8]) -> (rand::rngs::StdRng, SigningKey, PubKeyID) {
-    use rand::SeedableRng;
-    use std::hash::Hasher;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hasher.write(seed);
-    let mut rng = rand::rngs::StdRng::seed_from_u64(hasher.finish());
-    let private_key = SigningKey::new(&mut rng);
+/// A finalizer key from an `explicit_bft_key_seed` string, the node's default identity string,
+/// or a test fixture name. Lives here rather than in the node so a wallet holding the same seed
+/// derives the same key.
+///
+/// The seed is squeezed through one u64, so these keys have only 64 bits of entropy (#254).
+/// Explicit seeds are a development feature due for removal; default identities move to
+/// [finalizer_key_from_node_secret] on the next featurenet's new chain.
+///
+/// This was once `DefaultHasher::new()` feeding `rand` 0.8's `StdRng::seed_from_u64`, then
+/// `SigningKey::new`. Neither std nor rand promises those outputs across versions, and a change
+/// would silently move every existing finalizer to a key nobody holds, so the three steps are
+/// copied here: SipHash-1-3 with zero keys, PCG32 expanding the u64 into a ChaCha12 key, and the
+/// first 32 bytes of ChaCha12 keystream (block 0, zero nonce) as the signing key.
+pub fn finalizer_key_from_seed(seed: &[u8]) -> (SigningKey, PubKeyID) {
+    let mut state = siphash13_zero_keys(seed);
+    let mut chacha_key = [0u32; 8];
+    for word in chacha_key.iter_mut() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(11634580027462260723);
+        let xorshifted = (((state >> 18) ^ state) >> 27) as u32;
+        *word = xorshifted.rotate_right((state >> 59) as u32);
+    }
+    let block = chacha12_block_zero(&chacha_key);
+    let mut secret = [0u8; 32];
+    for (dst, word) in secret.chunks_exact_mut(4).zip(block.iter()) {
+        dst.copy_from_slice(&word.to_le_bytes());
+    }
+    finalizer_key_from_bytes(secret)
+}
+
+/// The default finalizer identity from the next featurenet's chain on: the 256-bit node secret
+/// (`secret.seed`) through BLAKE2b-256, personalized so the key is unrelated to anything else
+/// derived from the same secret.
+pub fn finalizer_key_from_node_secret(secret: &[u8; 32]) -> (SigningKey, PubKeyID) {
+    let hash = blake2b_simd::Params::new().hash_length(32).personal(b"Crosslink_FinKey").hash(secret);
+    finalizer_key_from_bytes(hash.as_bytes().try_into().expect("hash_length is 32"))
+}
+
+fn finalizer_key_from_bytes(secret: [u8; 32]) -> (SigningKey, PubKeyID) {
+    let private_key = SigningKey::from(secret);
     let pub_key = PubKeyID(<[u8; 32]>::from(VerificationKeyBytes::from(&private_key)));
-    (rng, private_key, pub_key)
+    (private_key, pub_key)
+}
+
+fn siphash13_zero_keys(data: &[u8]) -> u64 {
+    let mut v = [0x736f6d6570736575u64, 0x646f72616e646f6d, 0x6c7967656e657261, 0x7465646279746573];
+    fn round(v: &mut [u64; 4]) {
+        v[0] = v[0].wrapping_add(v[1]); v[1] = v[1].rotate_left(13); v[1] ^= v[0]; v[0] = v[0].rotate_left(32);
+        v[2] = v[2].wrapping_add(v[3]); v[3] = v[3].rotate_left(16); v[3] ^= v[2];
+        v[0] = v[0].wrapping_add(v[3]); v[3] = v[3].rotate_left(21); v[3] ^= v[0];
+        v[2] = v[2].wrapping_add(v[1]); v[1] = v[1].rotate_left(17); v[1] ^= v[2]; v[2] = v[2].rotate_left(32);
+    }
+    let mut blocks = data.chunks_exact(8);
+    for block in &mut blocks {
+        let m = u64::from_le_bytes(block.try_into().unwrap());
+        v[3] ^= m; round(&mut v); v[0] ^= m;
+    }
+    let mut tail = [0u8; 8];
+    tail[..blocks.remainder().len()].copy_from_slice(blocks.remainder());
+    let b = ((data.len() as u64) << 56) | u64::from_le_bytes(tail);
+    v[3] ^= b; round(&mut v); v[0] ^= b;
+    v[2] ^= 0xff;
+    round(&mut v); round(&mut v); round(&mut v);
+    v[0] ^ v[1] ^ v[2] ^ v[3]
+}
+
+fn chacha12_block_zero(key: &[u32; 8]) -> [u32; 16] {
+    let mut s = [0u32; 16];
+    s[..4].copy_from_slice(&[0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]);
+    s[4..12].copy_from_slice(key);
+    let mut x = s;
+    fn quarter(x: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+        x[a] = x[a].wrapping_add(x[b]); x[d] = (x[d] ^ x[a]).rotate_left(16);
+        x[c] = x[c].wrapping_add(x[d]); x[b] = (x[b] ^ x[c]).rotate_left(12);
+        x[a] = x[a].wrapping_add(x[b]); x[d] = (x[d] ^ x[a]).rotate_left(8);
+        x[c] = x[c].wrapping_add(x[d]); x[b] = (x[b] ^ x[c]).rotate_left(7);
+    }
+    for _ in 0..6 {
+        quarter(&mut x, 0, 4, 8, 12); quarter(&mut x, 1, 5, 9, 13); quarter(&mut x, 2, 6, 10, 14); quarter(&mut x, 3, 7, 11, 15);
+        quarter(&mut x, 0, 5, 10, 15); quarter(&mut x, 1, 6, 11, 12); quarter(&mut x, 2, 7, 8, 13); quarter(&mut x, 3, 4, 9, 14);
+    }
+    for (xi, si) in x.iter_mut().zip(s.iter()) {
+        *xi = xi.wrapping_add(*si);
+    }
+    x
 }
 
 // Serde uses the zfin string form, so JSON carrying a finalizer address (e.g. a
@@ -1346,6 +1417,39 @@ pub struct ScanInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The Nightly network's live finalizers, from their `explicit_bft_key_seed` strings.
+    #[test]
+    fn finalizer_key_from_seed_keeps_live_identities() {
+        for (seed, address) in [
+            ("64.177.122.73:12301", "zfinv13U71PPf2nfFvxajjRIbWoq7Cdn5lqOopH_CbP-hJCZTVX5seDeXU-SroOi2arJQ3IMiGkFq00vg-_fw6C5DdMdsbbGD5yrP7o9Yz3RpJsc6uzh9DP1u1jY1Ro2nDFVwJ"),
+            ("45.32.186.234:12301", "zfinv1XyBqy7TI36OmthAnK2sgFNjuSOEqTMkUziDbyY_p_-sONTrwkIetPKETwa3c8Xhkbg2ej_ToChbjEDl8cHuwX5mdQKCIdMCXx1bFhLWonMWyo12nOFxq3QYutz5M84UM"),
+        ] {
+            assert_eq!(FinalizerAddress::create(&finalizer_key_from_seed(seed.as_bytes()).0).encode(), address);
+        }
+    }
+
+    // Holds only while the toolchain's std and rand 0.8 still compute what the copied steps
+    // were taken from. If it fails while the pinned vectors above pass, std or rand changed.
+    proptest::proptest! {
+        #[test]
+        fn finalizer_key_from_seed_matches_its_std_rand_origin(seed in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..80)) {
+            use rand::SeedableRng;
+            use std::hash::Hasher;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hasher.write(&seed);
+            let original = SigningKey::new(rand::rngs::StdRng::seed_from_u64(hasher.finish()));
+            proptest::prop_assert_eq!(finalizer_key_from_seed(&seed).0, original);
+        }
+    }
+
+    #[test]
+    fn finalizer_key_from_node_secret_is_personalized_blake2b() {
+        assert_eq!(
+            hex::encode(finalizer_key_from_node_secret(&[7; 32]).1 .0),
+            "cd73fdc2dd5a7a359c663a999c66a977b4af46c3698e2522325933d6f692a954"
+        );
+    }
 
     fn signed_fat_pointer(typ: bool) -> FatPointerToBftBlock {
         let template = Vote {

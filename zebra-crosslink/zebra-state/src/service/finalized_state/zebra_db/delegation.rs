@@ -623,7 +623,7 @@ mod finalizer_address_tests {
     };
 
     fn address(seed: &[u8]) -> FinalizerAddress {
-        let (_, key, _) = finalizer_key_from_seed(seed);
+        let (key, _) = finalizer_key_from_seed(seed);
         FinalizerAddress::create(&key)
     }
 

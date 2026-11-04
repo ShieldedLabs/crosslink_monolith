@@ -122,7 +122,7 @@ pub fn bft_proposer(members: &[([u8; 32], u64)], active_roster_max_n: usize, hei
 
 /// The public key of synthetic finalizer `k`.
 pub fn synthetic_finalizer_pub_key(k: u64) -> [u8; 32] {
-    finalizer_key_from_seed(synthetic_finalizer_seed(k).as_bytes()).2 .0
+    finalizer_key_from_seed(synthetic_finalizer_seed(k).as_bytes()).1 .0
 }
 
 /// `height << 32 | round`, as the BFT instructions take them.
@@ -2282,7 +2282,7 @@ static TEST_BFT_PEERS: Mutex<Vec<HarnessBftPeer>> = Mutex::new(Vec::new());
 static TEST_BFT_SENT: Mutex<Vec<tenderlink::SentConsensus>> = Mutex::new(Vec::new());
 
 fn synthetic_finalizer_key(k: u64) -> ed25519_zebra::SigningKey {
-    finalizer_key_from_seed(synthetic_finalizer_seed(k).as_bytes()).1
+    finalizer_key_from_seed(synthetic_finalizer_seed(k).as_bytes()).0
 }
 
 fn roster_index(roster: &[tenderlink::SortedRosterMember], key: &ed25519_zebra::SigningKey) -> Option<usize> {
@@ -2292,7 +2292,7 @@ fn roster_index(roster: &[tenderlink::SortedRosterMember], key: &ed25519_zebra::
 
 fn node_roster_index(internal_handle: &TFLServiceHandle, view: &tenderlink::EngineView) -> Option<usize> {
     let seed = internal_handle.config.explicit_bft_key_seed.as_deref().unwrap_or(TEST_NODE_FINALIZER_SEED);
-    roster_index(&view.roster, &finalizer_key_from_seed(seed.as_bytes()).1)
+    roster_index(&view.roster, &finalizer_key_from_seed(seed.as_bytes()).0)
 }
 
 fn view_proposer(view: &tenderlink::EngineView, height: u64, round: u32) -> Option<usize> {

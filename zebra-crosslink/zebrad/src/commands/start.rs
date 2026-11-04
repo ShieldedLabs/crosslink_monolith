@@ -634,8 +634,11 @@ impl StartCmd {
             let _sync_block_verifier = block_verifier_router.clone();
 
             // The finalizer identity: derived from the node seed unless the config names one.
+            // @Todo: On the next featurenet's new chain, derive the default identity with
+            // `finalizer_key_from_node_secret(&global_seed)` (#254). Doing it on a live chain
+            // moves every default-identity finalizer to a new address.
             let bft_key_seed = config.crosslink.explicit_bft_key_seed.clone().unwrap_or_else(|| format!("Crosslink default finalizer identity seed {:?}", global_seed));
-            let (_, bft_signing_key, bft_public_key) = wallet::bft::finalizer_key_from_seed(bft_key_seed.as_bytes());
+            let (bft_signing_key, bft_public_key) = wallet::bft::finalizer_key_from_seed(bft_key_seed.as_bytes());
             *wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap() = bft_public_key;
             let finalizer_address = wallet::bft::FinalizerAddress::create(&bft_signing_key);
             info!("finalizer address: {}", finalizer_address.encode());

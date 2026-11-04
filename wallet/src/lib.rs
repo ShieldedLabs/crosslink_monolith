@@ -5041,7 +5041,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     StakingActionRequest::WithdrawDelegationBond{ bond_key  } =>
                         user_wallet.claim_bond_using_ironwood(network, &mut tx, &mut client, &user_usk, &orchard_tree, bond_key.0).await,
                     StakingActionRequest::ConvertFinalizerRewardToDelegationBond{ amount_zats, finalizer_key_seed } => {
-                        let (_, finalizer_key, _) = bft::finalizer_key_from_seed(finalizer_key_seed.as_bytes());
+                        let (finalizer_key, _) = bft::finalizer_key_from_seed(finalizer_key_seed.as_bytes());
                         user_wallet.convert_finalizer_reward_using_ironwood(network, &mut tx, &mut client, &user_usk, &orchard_tree, amount_zats, &finalizer_key)
                     }
                 };
@@ -5519,7 +5519,7 @@ mod tests {
 
     #[test]
     fn roster_client_downgrades_invalid_addresses_and_rejects_bad_tags() {
-        let (_, key, pk) = bft::finalizer_key_from_seed(b"wallet-roster-codec");
+        let (key, pk) = bft::finalizer_key_from_seed(b"wallet-roster-codec");
         let address = bft::FinalizerAddress::create(&key);
         let member = RosterMember { pub_key: pk.0, voting_power: 42, txids: vec![StakeTxId { txid: [7; 32], zats: 42 }], finalizer_address: Some(address) };
         let mut bytes = Vec::new();
@@ -5672,7 +5672,7 @@ mod tests {
             reason(&Address::Tex([3; 20]).encode(&TEST_NETWORK)),
             reason(&full_ua.encode(&MAIN_NETWORK)),
             reason(&full_ua.to_zcash_address(NetworkType::Regtest).to_string()),
-            reason(&bft::FinalizerAddress::create(&bft::finalizer_key_from_seed(b"send-address").1).encode()),
+            reason(&bft::FinalizerAddress::create(&bft::finalizer_key_from_seed(b"send-address").0).encode()),
             reason(&orchard_ua[..orchard_ua.len() - 1]),
             reason("send it to my friend please"),
             reason(&UnifiedAddress::from_receivers(None, Some(sapling), Some(transparent)).unwrap().encode(&TEST_NETWORK)),

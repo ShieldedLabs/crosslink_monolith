@@ -1513,7 +1513,7 @@ mod roster_codec_tests {
 
     #[test]
     fn tagged_addresses_round_trip_and_invalid_signatures_are_downgraded() {
-        let (_, key, pk) = crate::bft::finalizer_key_from_seed(b"roster-codec");
+        let (key, pk) = crate::bft::finalizer_key_from_seed(b"roster-codec");
         let address = FinalizerAddress::create(&key);
         assert_eq!(address.pub_key, pk);
         let member = RosterMember { pub_key: pk.0, voting_power: 7, txids: vec![StakeTxId { txid: [3; 32], zats: 7 }], finalizer_address: Some(address) };
