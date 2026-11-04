@@ -151,6 +151,17 @@ impl RpcServer {
                 .expect("Zebra must be able to write the auth cookie to the disk");
             HttpRequestMiddlewareLayer::new(Some(cookie), max_request_body_size)
         } else {
+            let warning = format!(
+                "\n\
+                 ************************************************************************\n\
+                 *  WARNING: RPC COOKIE AUTH IS DISABLED (rpc.enable_cookie_auth = false)\n\
+                 *  Any local process, or any web page open in a browser on this\n\
+                 *  machine, can call {listen_addr} and spend this node's funds.\n\
+                 *  Set rpc.enable_cookie_auth = true unless you need it off.\n\
+                 ************************************************************************"
+            );
+            eprintln!("{warning}");
+            warn!("{warning}");
             HttpRequestMiddlewareLayer::new(None, max_request_body_size)
         };
 

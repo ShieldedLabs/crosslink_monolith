@@ -349,7 +349,7 @@ impl ZebradConfig {
 
             rpc: zebra_rpc::config::rpc::Config {
                 listen_addr: Some("127.0.0.1:8232".parse().unwrap()),
-                enable_cookie_auth: false,
+                enable_cookie_auth: true,
                 ..Default::default()
             },
 
