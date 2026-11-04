@@ -906,11 +906,12 @@ struct BftFuzz {
     tip_from: usize,
 }
 
-/// The BFT block at `height` on `parent` carrying `headers`, at `version`, with SUPPLIED_FINALIZER's
-/// certificate; the genesis's is empty.
-fn bft_fuzz_block(parent: &FatPointerToBftBlock, height: u32, headers: &[Arc<Block>], version: u32) -> BftBlockAndFatPointerToItWrap {
+/// The BFT block at `height` on `parent` carrying `headers`, at `version` and `do_not_include`, with
+/// SUPPLIED_FINALIZER's certificate; the genesis's is empty.
+fn bft_fuzz_block(parent: &FatPointerToBftBlock, height: u32, headers: &[Arc<Block>], version: u32, do_not_include: u64) -> BftBlockAndFatPointerToItWrap {
     let mut block = create_pos_and_ptr_to_finalize_pow_at_round(height, parent.clone(), headers, 1, &[]).0.block;
     block.version = version;
+    block.do_not_include_until_bc_height = do_not_include;
     if height == 0 {
         return BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt::from_parts(block, 0, 1, &[]));
     }
@@ -944,24 +945,34 @@ fn bft_fuzz_step(f: &mut BftFuzz, c: &mut Choices) {
             _ => LATEST + 1 + c.below(1000) as u32,
         };
         let (parent, h) = (&f.tip_ptr, f.decided);
-        let bad = match c.below(4) {
-            1 if h > 0 => bft_fuzz_block(parent, h, &headers, c.below(f.tip_version as usize) as u32),
+        let bad = match c.below(5) {
+            1 if h > 0 => bft_fuzz_block(parent, h, &headers, c.below(f.tip_version as usize) as u32, 0),
             2 => {
                 let claimed = if h > 0 && c.unusual(128) { h - 1 } else { h + 1 + c.below(3) as u32 };
-                bft_fuzz_block(parent, claimed, &headers, version)
+                bft_fuzz_block(parent, claimed, &headers, version, 0)
             }
             3 if h > 0 && f.tip_from > 0 => {
                 let below = c.below(f.tip_from);
-                bft_fuzz_block(parent, h, &f.pow[below..below + sigma], version)
+                bft_fuzz_block(parent, h, &f.pow[below..below + sigma], version, 0)
             }
-            _ => bft_fuzz_block(parent, h, &headers, above_latest(c)),
+            // No slashfork is scheduled, so the parent's value, 0, is the only one allowed. A v1
+            // block doesn't serialize the field, so only the latest version can carry a raise.
+            4 => {
+                let raised = match c.below(3) {
+                    0 => 1,
+                    1 => u64::MAX,
+                    _ => 1 + c.below(1 << 20) as u64,
+                };
+                bft_fuzz_block(parent, h, &headers, LATEST, raised)
+            }
+            _ => bft_fuzz_block(parent, h, &headers, above_latest(c), 0),
         };
         push_decided_pos(&mut f.tf, &bad, SHOULD_FAIL);
         f.tf.push_instr_expect_node_alive(0);
         f.tf.push_instr_expect_pos_chain_length(f.decided as usize, 0);
     }
 
-    let good = bft_fuzz_block(&f.tip_ptr, f.decided, &headers, version);
+    let good = bft_fuzz_block(&f.tip_ptr, f.decided, &headers, version, 0);
     push_decided_pos(&mut f.tf, &good, 0);
     f.decided += 1;
     f.tip_ptr = good.0.fat_ptr.clone();

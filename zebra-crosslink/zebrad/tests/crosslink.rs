@@ -1243,23 +1243,25 @@ fn crosslink_reject_pos_block_that_raises_do_not_include_without_a_slashfork() {
 
     set_test_name(function_name!());
     let mut tf = TF::new(&HARNESS_PARAMETERS);
-    let (_gen, _miner_addr, pow) = pow_chain_for(&mut tf, 8);
+    let (_gen, _miner_addr, pow) = bonded_pow_chain_for(&mut tf, 8);
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
-    let bft0 = next_pos(pos_h, fat_ptr, &pow[4..7], &[]);
-    tf.push_instr_load_pos(&bft0, 0);
+    let bft0 = next_signed_pos(pos_h, fat_ptr, &pow[4..7]);
+    push_decided_pos(&mut tf, &bft0, 0);
 
     let with_do_not_include = |do_not_include: u64| {
-        let mut block = create_pos_and_ptr_to_finalize_pow(*pos_h, fat_ptr.clone(), &pow[5..8], &[]).0.block;
+        let mut block = create_pos_and_ptr_to_finalize_pow_at_round(*pos_h, fat_ptr.clone(), &pow[5..8], 1, &[]).0.block;
         block.version = LATEST;
         block.do_not_include_until_bc_height = do_not_include;
-        BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt::from_parts(block, (*pos_h).into(), 1, &[]))
+        let seed = synthetic_finalizer_seed(SUPPLIED_FINALIZER);
+        let fat_ptr = signed_fat_pointer(&block, u64::from(*pos_h), 1, &[seed.as_bytes()], &[0; 32]);
+        BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr })
     };
     for raised in [1, u64::MAX] {
-        tf.push_instr_load_pos(&with_do_not_include(raised), SHOULD_FAIL);
+        push_decided_pos(&mut tf, &with_do_not_include(raised), SHOULD_FAIL);
         tf.push_instr_expect_pos_chain_length(1, 0);
     }
-    tf.push_instr_load_pos(&with_do_not_include(0), 0);
+    push_decided_pos(&mut tf, &with_do_not_include(0), 0);
     tf.push_instr_expect_pos_chain_length(2, 0);
 
     test_bytes(tf.write_to_bytes());
