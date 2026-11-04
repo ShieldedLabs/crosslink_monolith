@@ -249,6 +249,21 @@ opt-level = 3
 [profile.dev.package.orchard]
 opt-level = 3
 
+[profile.dev.package.jubjub]
+opt-level = 3
+
+[profile.dev.package.pasta_curves]
+opt-level = 3
+
+[profile.dev.package.sapling-crypto]
+opt-level = 3
+
+[profile.dev.package.sinsemilla]
+opt-level = 3
+
+[profile.dev.package.ff]
+opt-level = 3
+
 [profile.dev.package.swash]
 opt-level = 3
 

@@ -2772,7 +2772,8 @@ pub(crate) async fn instr_reader(internal_handle: TFLServiceHandle) {
             if before_time.elapsed().as_secs() > 30 {
                 panic!("Timeout waiting for test to start.");
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            // Short, since every test waits here once: the node is usually up within milliseconds.
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
     println!("Starting test!");
