@@ -399,6 +399,11 @@ impl WriteBlockWorkerTask {
             return result;
         }
 
+        // A hash commits only to the header, so an error stored under this one may be a copy's
+        // that was refused for its body. This block committed, so its header is good and its
+        // children must be judged on their own.
+        self.parent_error_map.shift_remove(&child_hash);
+
         // Committing blocks to the finalized state keeps the same chain, so we can update the
         // chain seen by the rest of the application now.
         let tip_block_height = update_latest_chain_channels(

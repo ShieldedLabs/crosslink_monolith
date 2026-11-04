@@ -1250,7 +1250,7 @@ fn crosslink_fuzz_minimize() {
 //
 // Each is a minimized fuzz input under crosslink-test-data/fuzz/. One still open is #[ignore]d
 // with its reason, so the suite stays green until it is fixed; its control shows the input means
-// what the finding says.
+// what the finding says. A fixed one stays as a regression test.
 
 fn finding(name: &str) -> Vec<u8> {
     let path = format!("{}/../crosslink-test-data/fuzz/{name}.zeccltf", env!("CARGO_MANIFEST_DIR"));
@@ -1274,11 +1274,9 @@ const POISON_INSTR: usize = 4;
 /// stored under block 4's hash. The real block 4 still commits, since only its parent's hash is
 /// looked up, but block 5's parent is block 4's hash, so block 5 gets the copy's error. A hash
 /// commits only to the header, and the copy failed for its body, so the error says nothing about
-/// block 4's children. Removing the hash from the map when a block with it commits makes this
-/// pass with the suite otherwise unchanged; not storing errors that only show a body does not
-/// match its header would also work.
+/// block 4's children. Fixed by removing the hash from the map when a block with it commits. A
+/// copy that arrives after the real block never reaches the map: ingest answers it as known.
 #[test]
-#[ignore = "open finding: a refused block body poisons the next block's commit; ingest code, needs a human look before a fix"]
 fn crosslink_fuzz_finding_refused_body_poisons_the_next_block() {
     set_test_name(function_name!());
     test_bytes(finding("refused_body_poisons_the_next_block"));
