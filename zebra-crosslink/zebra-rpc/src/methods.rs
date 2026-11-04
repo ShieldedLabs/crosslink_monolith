@@ -708,7 +708,7 @@ pub trait Rpc {
     /// # Parameters
     ///
     /// - `ufvk_strs`: (array of strings, required) Unified full viewing keys to scan.
-    /// - `first_height`: (numeric, required) The first block height to scan, inclusive.
+    /// - `first_height`: (numeric, required) The first block height to scan, inclusive. Must be 0 for now (#292).
     /// - `last_height`: (numeric, required) The last block height to scan, inclusive.
     #[method(name = "get_total_issuance")]
     async fn get_total_issuance(&self, ufvk_strs: UfvkList, first_height: u32, last_height: u32) -> Result<Vec<ScanInfo>>;
@@ -2779,6 +2779,11 @@ where
     }
 
     async fn get_total_issuance(&self, ufvk_strs: UfvkList, first_height: u32, last_height: u32) -> Result<Vec<ScanInfo>> {
+        // The staking replay starts with no bonds, so a later start meets actions on bonds it
+        // never saw and panics (#292).
+        if first_height != 0 {
+            return Err("first_height must be 0").map_error(server::error::LegacyCode::InvalidParameter);
+        }
         let ufvk_strs = ufvk_strs.0;
         // TODO: @Prod @Testnet
         let network = &zcash_protocol::consensus::TEST_NETWORK;
