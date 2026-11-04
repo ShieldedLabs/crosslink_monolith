@@ -2210,7 +2210,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         // small min keeps the send buffer rate-adaptive (clamp(1s * rate, 512KiB, 256MiB)) instead of a flat 256MiB/conn
         SharedTransport::new(vec![my_stp_keypair.clone()], my_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024))
     });
-    let mut network_thread_handle = shared_transport.attach(Consumer::Bft);
+    // BFT packets that arrive between passes start the next pass (WOKEN_PASS_MIN apart), rather
+    // than waiting out the pass's idle sleep.
+    let mut network_thread_handle = shared_transport.attach_with_waker(Consumer::Bft, std::sync::Arc::new(wake_engine));
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
     let mut initiate_connections = Vec::<STPAddress>::new();
     let mut messages_to_send = Vec::new();

@@ -2193,7 +2193,9 @@ pub fn sync(
     // it starts (`bft::BftNetwork`).
     // small min keeps the send buffer rate-adaptive (clamp(1s * rate, 512KiB, 256MiB)) instead of a flat 256MiB/conn
     let shared_transport = SharedTransport::new(my_keypairs.clone(), actual_network_local_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
-    let mut network_thread_handle = shared_transport.attach(Consumer::Base);
+    // Packets that arrive between ticks start the next tick (WOKEN_TICK_MIN_MS apart), rather
+    // than waiting out the tick's idle part.
+    let mut network_thread_handle = shared_transport.attach_with_waker(Consumer::Base, std::sync::Arc::new(bft::wake_sync_thread));
     // Sized from the per-(peer, channel) byte cap the transport actually enforces, which is
     // what bounds the responder's Bulk backlog ahead of our block (see `block_response_deadline`).
     let block_response_deadline = block_response_deadline(network_thread_handle.limits().peer_outbox_bytes as u64);

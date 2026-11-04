@@ -376,8 +376,16 @@ struct Redial {
     retry_at: Instant,
 }
 
+/// Called when messages for a consumer arrive between its services, so it can service sooner
+/// than its own idle wait would. It must be cheap and must not block: the dispatch thread calls
+/// it, and wakes that arrive together should share one service (tenderlink's `wake_engine`, the
+/// sync loop's `wake_sync_thread`).
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Default)]
 struct ConsumerState {
+    /// See [`Waker`]; `None` for a consumer that only services on its own schedule.
+    waker: Option<Waker>,
     /// Bumped on every attach, so a replaced handle neither services nor detaches its successor.
     generation: u64,
     attached: bool,
@@ -450,13 +458,45 @@ impl SharedTransport {
         send_buffer_params: (u32, u32, u32),
         limits: TransportLimits,
     ) -> Self {
-        Self(Arc::new(Mutex::new(Hub {
+        let hub = Arc::new(Mutex::new(Hub {
             handle: NetworkThreadHandle::new(keypairs, port, max_pps, send_buffer_params, limits),
             consumers: Default::default(),
             redial: HashMap::new(),
             lock_times: Default::default(),
             dial_only: None,
-        })))
+        }));
+        Self::spawn_dispatcher(&hub, port);
+        Self(hub)
+    }
+
+    /// The dispatch thread: when STP has events, it drains them into the consumers' inboxes and
+    /// wakes those that received messages, so a consumer hears of them now rather than at the end
+    /// of its idle wait. Nothing else moves messages between services. It holds the hub only
+    /// weakly: dropping the last clone and handle closes the endpoint, whose readiness wakes the
+    /// thread to find the hub gone and exit.
+    fn spawn_dispatcher(hub: &Arc<Mutex<Hub>>, port: u16) {
+        let ready = lock(hub).handle.endpoint.readiness();
+        let hub = Arc::downgrade(hub);
+        std::thread::Builder::new()
+            .name(format!("stp-dispatch-{port}"))
+            .spawn(move || {
+                let mut observed = 0u64;
+                loop {
+                    ready.wait(&mut observed);
+                    let Some(hub) = hub.upgrade() else { return };
+                    let wakers = {
+                        let mut hub = lock(&hub);
+                        if hub.handle.is_finished() {
+                            return;
+                        }
+                        hub.dispatch()
+                    };
+                    for wake in wakers {
+                        wake();
+                    }
+                }
+            })
+            .expect("failed to spawn the STP dispatch thread");
     }
 
     /// Dial only `keys`, whichever consumer asks: addresses learned from peers, and hole-punch
@@ -469,10 +509,20 @@ impl SharedTransport {
     /// Attach `consumer`. Attaching it again replaces the earlier handle, which from then on
     /// services nothing: a restarted tenderlink takes over from the one it replaces.
     pub fn attach(&self, consumer: Consumer) -> ConsumerHandle {
+        self.attach_waking(consumer, None)
+    }
+
+    /// [`Self::attach`], with `waker` called when messages for `consumer` arrive between its
+    /// services (see [`Waker`]).
+    pub fn attach_with_waker(&self, consumer: Consumer, waker: Waker) -> ConsumerHandle {
+        self.attach_waking(consumer, Some(waker))
+    }
+
+    fn attach_waking(&self, consumer: Consumer, waker: Option<Waker>) -> ConsumerHandle {
         let mut hub = lock(&self.0);
         let state = &mut hub.consumers[consumer as usize];
         let generation = state.generation.wrapping_add(1);
-        *state = ConsumerState { generation, attached: true, ..Default::default() };
+        *state = ConsumerState { generation, attached: true, waker, ..Default::default() };
         ConsumerHandle { hub: Arc::clone(&self.0), consumer, generation }
     }
 }
@@ -594,7 +644,37 @@ impl Hub {
             Consumer::Bft => inner.send_bft_live.extend(send_unreliable),
         }
         let (current_connections, received) = self.handle.service_sessions(inner, &self.consumers[me as usize].offered);
+        self.route(received);
 
+        let mine = &mut self.consumers[me as usize];
+        mine.offered = current_connections.iter().map(|(a, hash)| (a.connection_key(), *hash)).collect();
+        mine.inbox_bytes = 0;
+        mine.inbox_by_peer.clear();
+        let inbox = std::mem::take(&mut mine.inbox);
+        NetworkThreadPull {
+            received_unreliable_messages: self.handle.current_session_messages(&current_connections, inbox),
+            current_connections,
+        }
+    }
+
+    /// Drain STP's events now and route what arrived, for the dispatch thread: the wakers of the
+    /// consumers that received messages, to call once the hub is unlocked.
+    fn dispatch(&mut self) -> Vec<Waker> {
+        let mut received = SessionMessages::new();
+        self.handle.drain_events(&mut received, Instant::now());
+        let got = self.route(received);
+        self.consumers
+            .iter()
+            .zip(got)
+            .filter(|(consumer, got)| *got && consumer.attached)
+            .filter_map(|(consumer, _)| consumer.waker.clone())
+            .collect()
+    }
+
+    /// Put each received message in its consumer's inbox, within the inbox bounds; which
+    /// consumers received any.
+    fn route(&mut self, received: SessionMessages) -> [bool; Consumer::COUNT] {
+        let mut got = [false; Consumer::COUNT];
         let limits = &self.handle.limits;
         for (peer, session, message) in received {
             let Some(&first) = message.first() else { continue };
@@ -613,17 +693,9 @@ impl Hub {
             to.inbox_bytes += message.len();
             to.inbox_by_peer.insert(peer, (peer_messages + 1, peer_bytes + message.len()));
             to.inbox.push_back((peer, session, message));
+            got[Consumer::of_message(first) as usize] = true;
         }
-
-        let mine = &mut self.consumers[me as usize];
-        mine.offered = current_connections.iter().map(|(a, hash)| (a.connection_key(), *hash)).collect();
-        mine.inbox_bytes = 0;
-        mine.inbox_by_peer.clear();
-        let inbox = std::mem::take(&mut mine.inbox);
-        NetworkThreadPull {
-            received_unreliable_messages: self.handle.current_session_messages(&current_connections, inbox),
-            current_connections,
-        }
+        got
     }
 }
 
@@ -2310,6 +2382,60 @@ mod tests {
         assert_eq!(hub.handle.stats.stale_session_sends, 1);
         assert_eq!(hub.handle.stats.send_to_unknown_peer_dropped, 0);
         assert_eq!(hub.handle.stats.kills, 0);
+    }
+
+    /// A message that arrives while its consumer is not servicing wakes that consumer, and only
+    /// it; the message is then in what its next service returns.
+    #[test]
+    fn a_message_arriving_between_services_wakes_its_consumer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (a, a_addr) = shared_node();
+        let (b, _) = shared_node();
+        let base_wakes = Arc::new(AtomicUsize::new(0));
+        let bft_wakes = Arc::new(AtomicUsize::new(0));
+        let counter = |n: &Arc<AtomicUsize>| -> Waker {
+            let n = Arc::clone(n);
+            Arc::new(move || {
+                n.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let mut a_base = Loop {
+            handle: a.attach_with_waker(Consumer::Base, counter(&base_wakes)),
+            connections: Vec::new(),
+            received: Vec::new(),
+        };
+        let _a_bft = a.attach_with_waker(Consumer::Bft, counter(&bft_wakes));
+        let mut b_base = Loop::new(&b, Consumer::Base);
+        b_base.tick(NetworkThreadPush { initiate_connections: vec![a_addr.clone()], ..Default::default() });
+        until("the connection", || {
+            a_base.tick(NetworkThreadPush::default());
+            b_base.tick(NetworkThreadPush::default());
+            !a_base.connections.is_empty() && !b_base.connections.is_empty()
+        });
+
+        let before = base_wakes.load(Ordering::SeqCst);
+        b_base.tick(NetworkThreadPush { send_unreliable: vec![(a_addr.connection_key(), vec![0x01, 7])], ..Default::default() });
+        until("A's base consumer to be woken, without servicing", || {
+            b_base.tick(NetworkThreadPush::default());
+            base_wakes.load(Ordering::SeqCst) > before
+        });
+        assert_eq!(bft_wakes.load(Ordering::SeqCst), 0, "the message was not the BFT consumer's");
+        a_base.tick(NetworkThreadPush::default());
+        assert_eq!(a_base.received, vec![vec![0x01, 7]], "the woken service has the message");
+    }
+
+    /// The dispatch thread holds the hub only weakly: dropping the transport and its handles frees
+    /// it (and the consumers' wakers with it) at once.
+    #[test]
+    fn dropping_a_shared_transport_frees_it_despite_its_dispatch_thread() {
+        let (a, _) = shared_node();
+        let waker: Waker = Arc::new(|| {});
+        let handle = a.attach_with_waker(Consumer::Base, Arc::clone(&waker));
+        assert_eq!(Arc::strong_count(&waker), 2);
+        drop(handle);
+        drop(a);
+        assert_eq!(Arc::strong_count(&waker), 1, "the hub was freed");
     }
 
     /// A peer that dies without closing (STP has no close frame) and comes back on the same key
