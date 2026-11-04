@@ -371,14 +371,30 @@ pub enum BftRequest {
     },
 }
 
+/// What reaches the sync thread while it waits out the idle part of its tick.
+pub(super) enum SyncWake {
+    /// Served where it arrives, without ending the wait.
+    Bft(BftRequest),
+    /// Work the next tick takes up, such as a submitted block: the wait ends early for it.
+    Work,
+}
+
 // A std channel rather than a tokio one: the receiver blocks the sync thread in the idle part of
 // its tick (`BftRunner::wait`), which a tokio receiver cannot do.
-static BFT_REQUEST_SENDER: OnceLock<std::sync::mpsc::Sender<BftRequest>> = OnceLock::new();
+static SYNC_WAKE_SENDER: OnceLock<std::sync::mpsc::Sender<SyncWake>> = OnceLock::new();
 
 fn send_request(request: BftRequest) -> bool {
-    match BFT_REQUEST_SENDER.get() {
-        Some(tx) => tx.send(request).is_ok(),
+    match SYNC_WAKE_SENDER.get() {
+        Some(tx) => tx.send(SyncWake::Bft(request)).is_ok(),
         None => false,
+    }
+}
+
+/// Start the sync thread's next tick now rather than at the end of its idle wait, for work it
+/// takes up only at the top of a tick. Wakes that arrive together share one tick.
+pub(super) fn wake_sync_thread() {
+    if let Some(tx) = SYNC_WAKE_SENDER.get() {
+        let _ = tx.send(SyncWake::Work);
     }
 }
 
@@ -1170,7 +1186,9 @@ pub(super) fn decided_len() -> u64 {
 }
 
 pub(super) struct BftRunner {
-    rx: std::sync::mpsc::Receiver<BftRequest>,
+    rx: std::sync::mpsc::Receiver<SyncWake>,
+    /// A `SyncWake::Work` arrived and the tick it asks for has not started yet.
+    woken: bool,
     rt: tokio::runtime::Handle,
     network: Network,
     params: ZcashCrosslinkParameters,
@@ -1226,9 +1244,10 @@ impl BftRunner {
         rt: tokio::runtime::Handle,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
-        let _ = BFT_REQUEST_SENDER.set(tx);
+        let _ = SYNC_WAKE_SENDER.set(tx);
         let mut runner = BftRunner {
             rx,
+            woken: false,
             rt,
             network: read_state.network().clone(),
             params: read_state.network().crosslink_parameters(),
@@ -1399,29 +1418,42 @@ impl BftRunner {
     }
 
     /// Serve requests until `deadline`: the idle part of the tick, so a BFT round does not wait
-    /// out the whole tick for its answer.
-    pub(super) fn wait(&mut self, deadline: std::time::Instant, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
+    /// out the whole tick for its answer. A wake for other work ends it sooner, at `earliest`
+    /// or once it arrives, whichever is later, so a stream of wakes cannot spin the tick.
+    pub(super) fn wait(
+        &mut self,
+        earliest: std::time::Instant,
+        deadline: std::time::Instant,
+        read_state: &ReadState,
+        block_writer: &mut WriteBlockWorkerTask,
+    ) {
         loop {
             let now = std::time::Instant::now();
-            if now >= deadline {
+            let until = if self.woken { earliest.min(deadline) } else { deadline };
+            if now >= until {
+                self.woken = false;
                 return;
             }
-            match self.rx.recv_timeout(deadline - now) {
-                Ok(request) => self.handle(request, read_state, block_writer),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return,
+            match self.rx.recv_timeout(until - now) {
+                Ok(SyncWake::Bft(request)) => self.handle(request, read_state, block_writer),
+                Ok(SyncWake::Work) => self.woken = true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    std::thread::sleep(deadline - now);
+                    std::thread::sleep(until - now);
+                    self.woken = false;
                     return;
                 }
             }
         }
     }
 
-    /// Serve every request already waiting, without blocking.
+    /// Serve every request already waiting, without blocking. A wake met here is kept for the
+    /// next `wait`, since the work it announces may have arrived after the tick looked for it.
     pub(super) fn drain(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
         loop {
             match self.rx.try_recv() {
-                Ok(request) => self.handle(request, read_state, block_writer),
+                Ok(SyncWake::Bft(request)) => self.handle(request, read_state, block_writer),
+                Ok(SyncWake::Work) => self.woken = true,
                 Err(_) => break,
             }
         }

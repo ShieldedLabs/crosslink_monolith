@@ -788,6 +788,9 @@ const PEER_RESPOND_MS: u64 = 300;
 
 
 const IDLE_MS: u64 = 100;
+// The least time from one tick's start to the next when wakes (bft::wake_sync_thread) end the idle
+// wait early, so a stream of them shares ticks instead of spinning the loop.
+const WOKEN_TICK_MIN_MS: u64 = 2;
 
 const SYNC_PROFILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -1989,6 +1992,7 @@ async fn submit_to_new_network(
 
     let (reply, rx) = tokio::sync::oneshot::channel();
     permit.send(BlockSubmission { block, reply, trusted });
+    bft::wake_sync_thread();
 
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(outcome)) => Ok(outcome),
@@ -2253,6 +2257,7 @@ pub fn sync(
 
     // Sync state
     let tick_duration = std::time::Duration::from_millis(IDLE_MS);
+    let woken_tick_min = std::time::Duration::from_millis(WOKEN_TICK_MIN_MS);
     let status_interval = std::time::Duration::from_millis(STATUS_MS);
     let dl_init_interval = std::time::Duration::from_millis(BLOCK_SEND_MS);
     let peer_gossip_interval = std::time::Duration::from_millis(PEER_GOSSIP_MS);
@@ -4444,8 +4449,9 @@ pub fn sync(
         let _ = any_blocks_in_the_queue_can_make_progress;
 
         // The remainder of the tick goes to BFT requests, so a round does not wait out the tick.
+        // Work that arrives in it, such as a submitted block, starts the next tick early.
         if !zebra_chain::shutdown::is_shutting_down() {
-            bft_runner.wait(loop_start + tick_duration, &read_state, &mut block_writer);
+            bft_runner.wait(loop_start + woken_tick_min, loop_start + tick_duration, &read_state, &mut block_writer);
         }
     }
     rt.block_on(block_writer.finish_backup());
