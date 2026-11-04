@@ -1267,6 +1267,11 @@ pub struct TFLRecencyStatus {
 
     // TODO: pub proposal_parts: Vec<bool>,
     pub finalizer_statuses: Vec<(PubKeyID, FinalizerRecencyStatus)>,
+    /// A decided BFT height this node holds back, and BFT with it, until the PoW block its next
+    /// roster comes from is back: that block was dropped from the non-finalized state after this
+    /// node validated the proposal.
+    #[serde(default)]
+    pub parked_decision_height: Option<u64>,
     // pub round_step_utc_rngs: Vec<[(u32, u32); 3]>,
 }
 

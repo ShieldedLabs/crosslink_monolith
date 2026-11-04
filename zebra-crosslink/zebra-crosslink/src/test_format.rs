@@ -301,7 +301,8 @@ impl TFInstr {
     /// first sends the node a status that needs everything at the engine's height and round, and
     /// the instruction returns once the engine has acted on the new time and everything it sent
     /// is recorded. With SHOULD_FAIL, that the engine does not catch up: it is waiting on the
-    /// node, as it does on a decision the node has not answered.
+    /// node, as it does on a decision the node has parked (shown at once, by the node's status) or
+    /// otherwise not answered (shown by no pass within the bound).
     pub const ADVANCE_TIME: TFInstrKind = 31;
     /// The engine is at height `val[0]`, round `val[1] >> 8`, step `val[1] & 0xff` (0 propose,
     /// 1 prevote, 2 precommit, 0xff any).
@@ -2387,19 +2388,36 @@ async fn bft_deliver(k: u64, packets: Vec<Vec<u8>>) -> (bool, String) {
 /// it before the call, then records what the node sent. The bound is for an engine that has
 /// stopped; a running one passes in milliseconds. The passes are woken rather than waited for:
 /// the engine ticks by the test's clock, so an early pass only moves packets sooner.
+///
+/// A decision the node has parked (its status names the height) ends the wait at once: the engine
+/// waits on the node's answer to it, which the node gives only once the decision's snapshot is
+/// back, so no pass will come until a later instruction brings it.
 async fn bft_settle() -> Result<(), String> {
     use std::sync::atomic::Ordering;
     let start = tenderlink::LOOP_PASSES.load(Ordering::Acquire);
     let waited = tokio::time::timeout(NODE_ANSWER_WAIT, async {
-        while tenderlink::LOOP_PASSES.load(Ordering::Acquire) < start + 3 {
+        loop {
+            if let Some(height) = zebra_state::new_network::bft::bft_recency_status().parked_decision_height {
+                return Err(format!("the BFT engine waits on the node, which holds back its decision at height {height} until that decision's snapshot is back"));
+            }
+            if tenderlink::LOOP_PASSES.load(Ordering::Acquire) >= start + 3 {
+                return Ok(());
+            }
             tenderlink::wake_engine();
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
     .await;
-    if waited.is_err() {
-        return Err(format!("the BFT engine ran no loop passes within {NODE_ANSWER_WAIT:?}"));
-    }
+    let settled = match waited {
+        Ok(settled) => settled,
+        Err(_) => Err(format!("the BFT engine ran no loop passes within {NODE_ANSWER_WAIT:?}")),
+    };
+    record_bft_sent();
+    settled
+}
+
+/// Records what the node has sent the synthetic finalizers since the last call.
+fn record_bft_sent() {
     let mut sent = TEST_BFT_SENT.lock().unwrap();
     for peer in TEST_BFT_PEERS.lock().unwrap().iter() {
         while let Ok(packet) = peer.link.outbound.try_recv() {
@@ -2410,7 +2428,6 @@ async fn bft_settle() -> Result<(), String> {
             }
         }
     }
-    Ok(())
 }
 
 fn take_stp_peer(index: u64) -> Result<HarnessStpPeer, String> {

@@ -4684,12 +4684,14 @@ fn crosslink_bft_decision_whose_snapshot_was_dropped_is_parked_not_aborted() {
     }
     tf.push_instr_expect_pow_chain_length(213, 0);
 
-    // The rest of the roster precommits it, which decides it on the engine's next tick. The
-    // engine then waits on the node's answer, so from there it never settles.
+    // The rest of the roster precommits it, which decides it on the engine's next tick. The node
+    // parks the decision, and its status says so, and the engine waits on the node's answer, so
+    // from there it never settles. The reason pins that it is the park, not a stopped engine.
     for k in scene.finalizers {
         tf.push_instr_bft_recv_vote(k, TF_BFT_PRECOMMIT, 1, 0, &id, 0);
     }
     tf.push_instr_advance_time(BFT_TICK_MILLIS, SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("holds back its decision at height 1", 0);
     tf.push_instr_expect_node_alive(0);
     tf.push_instr_expect_bft_dropped(false, None, 0);
 

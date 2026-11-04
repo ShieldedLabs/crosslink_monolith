@@ -338,6 +338,15 @@ pub fn bft_recency_status() -> TFLRecencyStatus {
     RECENCY_STATUS.borrow().clone()
 }
 
+// The sync thread parks a decision while tenderlink waits on its answer, so the engine cannot
+// republish the status then: the sync thread publishes this part itself, and the engine copies it.
+static PARKED_DECISION_HEIGHT: Mutex<Option<u64>> = Mutex::new(None);
+
+fn publish_parked_decision_height(height: Option<u64>) {
+    *PARKED_DECISION_HEIGHT.lock().unwrap() = height;
+    RECENCY_STATUS.send_modify(|status| status.parked_decision_height = height);
+}
+
 /// What tenderlink (and the test harness) ask the sync thread.
 pub enum BftRequest {
     Propose {
@@ -1400,6 +1409,7 @@ impl BftRunner {
                 self.decide(block, fat_pointer, proposal_sigs, reply, read_state, block_writer);
                 self.retrying_parked_decision = false;
             }
+            publish_parked_decision_height(self.parked_decision.as_ref().map(|parked| u64::from(parked.block.height)));
         }
 
         if self.next_diagnostic.elapsed() >= DIAGNOSTIC_INTERVAL {
@@ -2128,6 +2138,7 @@ impl BftRunner {
                     // dropped if it turns out to conflict with a committed block.
                     DECIDED_MISSING_POW_BLOCKS.lock().unwrap().insert(Hash(*hash));
                 }
+                publish_parked_decision_height(Some(u64::from(new_block.height)));
                 self.parked_decision = Some(ParkedDecision { block: new_block, fat_pointer, proposal_sigs, reply });
                 return;
             }
@@ -2692,6 +2703,7 @@ fn recency_status_from(bft_state: &TMState, bft_key_address_map: &BftAddressMap)
         my_locked_round: bft_state.locked_value_round.1,
         my_valid_round: bft_state.valid_value_round.1,
         finalizer_statuses,
+        parked_decision_height: *PARKED_DECISION_HEIGHT.lock().unwrap(),
     }
 }
 
