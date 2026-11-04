@@ -1397,6 +1397,8 @@ impl BftRunner {
         // block's own height jailed and unjailed finalizers one cert early at a hardfork
         // activation boundary.
         let mut prev_finalized_bc_height: u64 = 0;
+        // The snapshot of the last replayed block, when this state holds it.
+        let mut last_final: Option<(Height, Hash)> = None;
 
         for decision in stored {
             let StoredDecision { block, fat_pointer, proposal_sigs } = decision;
@@ -1412,13 +1414,29 @@ impl BftRunner {
 
             // The roster the next height votes with, and the watermark that filters it, both
             // come from this block's snapshot -- the same two reads `finish_decision` makes
-            // live. An unresolvable snapshot keeps the last known values: monotone, and correct
-            // whenever the database is intact.
+            // live.
             if !block.headers.is_empty() {
                 let snapshot = Hash(block.snapshot_block_hash().0);
-                if let Some(known) = read_state.known_block(snapshot) {
-                    prev_finalized_bc_height = known.height.0 as u64;
-                }
+                let Some(known) = read_state.known_block(snapshot) else {
+                    // A decision's row is written before its snapshot is durable: the snapshot
+                    // can still be only in the non-finalized state, which a crash, a lost backup
+                    // or a disabled one does not bring back. The decision is still final, so BFT
+                    // resumes at this height and catch-up decides it again once PoW sync has the
+                    // snapshot. Replay cannot go past it, because the next height's roster is the
+                    // stake at this snapshot. A snapshot that conflicts with the committed chain
+                    // drops BFT when it arrives.
+                    tracing::warn!(
+                        "crosslink restore: BFT height {} finalizes {}, which this state does not hold; \
+                         resuming BFT at that height",
+                        this_bft_height, snapshot,
+                    );
+                    // This node stored the decision, so the snapshot is on the decided chain:
+                    // fetched whatever height a peer alleges, and never expired.
+                    DECIDED_MISSING_POW_BLOCKS.lock().unwrap().insert(snapshot);
+                    break;
+                };
+                prev_finalized_bc_height = u64::from(known.height.0);
+                last_final = Some((known.height, snapshot));
                 let stakes = block_writer
                     .non_finalized_state
                     .aggregated_stakes_at(snapshot)
@@ -1439,29 +1457,12 @@ impl BftRunner {
             fat_pointer_to_tip = fat_pointer;
         }
 
-        let mut new_final_hash = Hash([0; 32]);
-        let mut new_final_height = Height(0);
-        if let Some(new_block) = blocks.last() {
-            new_final_hash.0 = new_block.snapshot_block_hash().0;
-            match read_state.known_block(new_final_hash) {
-                Some(known) => new_final_height = known.height,
-                None => {
-                    // The node committed past a fork from this block before it stopped, or the
-                    // database is damaged. Either way the decided chain cannot be followed from
-                    // here. The stored chain is still loaded, because bc-blocks cite it.
-                    drop_bft(
-                        format!("The decided BFT chain finalizes block {new_final_hash}, which this database does not hold."),
-                        block_writer.finalized_state.db.path(),
-                    );
-                    new_final_hash = Hash([0; 32]);
-                }
-            }
-        }
-
         // Startup roster is for the next height to decide (the loaded chain length), with the
-        // terminated finalizers excluded inclusively at that height.
+        // terminated finalizers excluded inclusively at that height. A watermark of 0 means
+        // nothing is finalized yet, the value replay starts from.
         let startup_bft_height = blocks.len() as u64;
-        let terminated = terminated_finalizers_at(hardforks, startup_bft_height, new_final_height.0 as u64);
+        let finalized_watermark = last_final.map_or(0, |(height, _)| u64::from(height.0));
+        let terminated = terminated_finalizers_at(hardforks, startup_bft_height, finalized_watermark);
         let roster = tenderlink_roster_from_internal(&unsorted_roster, &terminated);
 
         let loaded_any = !blocks.is_empty();
@@ -1471,15 +1472,15 @@ impl BftRunner {
             chain.hash_to_height = blocks.iter().enumerate().map(|(i, b)| (b.blake3_hash(), i as u64)).collect();
             chain.blocks = blocks;
             chain.fat_pointer_to_tip = fat_pointer_to_tip;
-            if new_final_hash != Hash([0; 32]) {
-                chain.bft_final_snapshot = Some((new_final_height, new_final_hash));
+            if last_final.is_some() {
+                chain.bft_final_snapshot = last_final;
             }
         }
 
         if loaded_any {
             tracing::info!(
                 "crosslink restore: resuming BFT at height {}, finalizing bc height {}",
-                startup_bft_height, new_final_height.0,
+                startup_bft_height, finalized_watermark,
             );
             self.spawn_tenderlink(roster, ingest);
         }
