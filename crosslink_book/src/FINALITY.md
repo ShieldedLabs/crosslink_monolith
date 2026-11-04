@@ -798,10 +798,12 @@ The state behavior depends on whether the hash is known:
 - a hash the state does not know never reaches the finalize call: `candidate` answers `None`
   while the snapshot is a block this node does not hold, and the bft-block naming it is refused
   by `validate` for the same reason.
-- the restore path makes a `KnownBlock` lookup for the last decided BFT block. A database that
-  cannot resolve that block either committed past a fork from it before the node stopped, or is
-  damaged. Restore loads the stored chain, because bc-blocks cite it, and drops BFT (§4.3). The
-  replay-watermark loop just above it tolerates the case.
+- the restore path makes a `KnownBlock` lookup for each stored decision's snapshot. A decision's
+  row can outlive its snapshot, which may have been only in the non-finalized state when the
+  node stopped. Restore replays the stored chain up to the first decision whose snapshot it
+  cannot resolve, resumes BFT at that height, and fetches the snapshot as a decided-chain block.
+  If that block conflicts with a committed one, BFT is dropped when it arrives (§4.3). A database
+  that records an earlier drop starts with BFT dropped, whatever its stored chain holds.
 
 The stored `fin` row is therefore both a `fin` implementation and a lower bound on the finalized
 database's tip: it is written only after the commit it names has succeeded, so a crash leaves it
@@ -956,8 +958,9 @@ again on the next run. `BftRunner::restore` reads them back at startup to rebuil
 `tenderlink`'s `ingest_startup_data`, recomputing each height's roster from the bonds at its
 snapshot and the watermark `prev_finalized_bc_height` from the same lookup. A database past the
 activation height holding no decided chain ends the process with a message rather than being
-migrated or re-bootstrapped. A decided chain whose snapshot the database does not hold starts
-the node with BFT dropped (§5.2).
+migrated or re-bootstrapped. A decision whose snapshot the database does not hold is where
+replay stops: BFT resumes at that height and decides it again once PoW sync has the snapshot. A
+recorded drop starts the node with BFT dropped (§5.2).
 
 `force_feed_bft_block` injects a decided bft-block without `Π_bft`, as a message to the `sync`
 thread. Its only caller is `test_format.rs`, through `TFLServiceCalls::force_feed_pos`.
