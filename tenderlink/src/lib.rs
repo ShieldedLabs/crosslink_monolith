@@ -1937,6 +1937,16 @@ static ENGINE_VIEW: Mutex<Option<EngineView>> = Mutex::new(None);
 /// has taken it in, read it and, if a tick was due, acted on it and handed out what it sent.
 pub static LOOP_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+static ENGINE_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Start the engine loop's next pass now rather than at the end of its idle sleep, for input that
+/// reaches it around the transport, such as a synthetic peer's packets. Ticks still follow the
+/// clock, so an early pass only takes in and hands out packets sooner. Wakes that arrive together
+/// share one pass.
+pub fn wake_engine() {
+    ENGINE_WAKE.notify_one();
+}
+
 fn publish_engine_view(bft_state: &TMState, roster: &[SortedRosterMember]) {
     if !PUBLISH_ENGINE_VIEW.load(std::sync::atomic::Ordering::Relaxed) {
         return;
@@ -3281,7 +3291,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         // other await in it completes at once, so a thread sleep here never hands its worker back.
         // A task woken onto that worker's next-task slot, which other workers cannot steal, then
         // waits forever; that is how a test whose clock stood still hung with nothing blocked.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // wake_engine() ends it early.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), ENGINE_WAKE.notified()).await;
     }
 }
 

@@ -2368,12 +2368,14 @@ async fn bft_deliver(k: u64, packets: Vec<Vec<u8>>) -> (bool, String) {
 
 /// Returns once the engine has run the loop passes that take in, read and act on whatever reached
 /// it before the call, then records what the node sent. The bound is for an engine that has
-/// stopped; a running one passes in milliseconds.
+/// stopped; a running one passes in milliseconds. The passes are woken rather than waited for:
+/// the engine ticks by the test's clock, so an early pass only moves packets sooner.
 async fn bft_settle() -> Result<(), String> {
     use std::sync::atomic::Ordering;
     let start = tenderlink::LOOP_PASSES.load(Ordering::Acquire);
     let waited = tokio::time::timeout(NODE_ANSWER_WAIT, async {
         while tenderlink::LOOP_PASSES.load(Ordering::Acquire) < start + 3 {
+            tenderlink::wake_engine();
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
