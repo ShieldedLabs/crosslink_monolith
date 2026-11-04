@@ -81,7 +81,7 @@ pub fn test_start() {
                 base.crosslink.explicit_bft_key_seed = Some(zebra_crosslink::test_format::TEST_NODE_FINALIZER_SEED.to_string());
             }
             base.state.ephemeral = true;
-            // getblocktemplate refuses to build a coinbase without one (MINE_FROM_TEMPLATE). The
+            // getblocktemplate refuses to build a coinbase without one (LOAD_POW from the template). The
             // test miner's key, so scenarios can spend what the node's templates pay out.
             base.mining.miner_address = Some(
                 TestKey::new(b"crosslink test miner")
@@ -2443,7 +2443,7 @@ fn crosslink_tx_relayed_over_stp_reaches_the_mempool() {
     tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &[spend.clone()]), 0);
 
     let forged = forged_signature(&transparent_spend(gen.next_upgrade(), &key, mature(&mut gen, &mut tf)));
-    tf.push_instr_recv_tx_stp(&forged, 1, 0);
+    tf.push_instr_recv_tx_stp(&forged, 1, SHOULD_FAIL);
     tf.push_instr_expect_mempool_rejected(&forged, 0);
     tf.push_instr_expect_node_alive(0);
 
@@ -2456,9 +2456,9 @@ fn crosslink_tx_relayed_over_stp_reaches_the_mempool() {
     test_bytes(tf.write_to_bytes());
 }
 
-/// The instructions no scenario used before: RECV_TX, EXPECT_MEMPOOL_REJECTED (including that a
-/// mined transaction is not "rejected"), EXPECT_POOL_TOTALS, EXPECT_FINALIZER_BANK, and the
-/// load-rejected helper.
+/// The instructions no scenario used before: SUBMIT_TX via the wire, EXPECT_MEMPOOL_REJECTED
+/// (including that a mined transaction is not "rejected"), EXPECT_POOL_TOTALS,
+/// EXPECT_FINALIZER_BANK, and the load-rejected helper.
 #[test]
 fn crosslink_mempool_and_staking_state_instructions() {
     set_test_name(function_name!());
@@ -2479,9 +2479,7 @@ fn crosslink_mempool_and_staking_state_instructions() {
     // a spend arriving from a peer reaches the mempool and leaves it when mined, and a mined
     // transaction is not a rejected one
     let spend = transparent_spend(gen.next_upgrade(), &key, mature(&mut gen, &mut tf));
-    let wire = zebra_network::wire::tx_message_bytes(&network, zebra_chain::transaction::UnminedTx::from(spend.clone()))
-        .expect("a transaction frames");
-    tf.push_instr_recv_tx_wire(&wire, 0, 0);
+    tf.push_instr_recv_tx_wire(&spend, 0, 0);
     tf.push_instr_expect_mempool_contains(&spend, 0);
     tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &[spend.clone()]), 0);
     tf.push_instr_expect_mempool_absent(&spend, 0);
