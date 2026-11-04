@@ -245,22 +245,24 @@ impl Drop for Conn {
 // -------------------------------------------------------------------------
 // Server loop
 
-/// Spawn the server thread. Binds the wildcard address on `port`, dual-stack
-/// IPv6 + IPv4 (h2c plaintext). Also answers any HTTP/1.1 POST on `ready_port`
-/// (lightwallet_server's legacy JSON-RPC port) with a 200, which is what the wallet's
-/// `wait_for_lightwalletd()` readiness probe needs.
-pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::JoinHandle<()> {
+/// Spawn the server thread. Binds loopback on `port`, IPv6 + IPv4 (h2c plaintext), or
+/// every interface when `public`. Also answers any HTTP/1.1 POST on `ready_port`
+/// (lightwallet_server's legacy JSON-RPC port, always loopback) with a 200, which is what
+/// the wallet's `wait_for_lightwalletd()` readiness probe needs.
+pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("lightwallet_server-grpc".into())
         .spawn(move || {
             // serve
             //
-            // "[::]" first: on Linux/macOS it is dual-stack by default (v4 peers
-            // arrive v4-mapped) and the following v4 bind fails harmlessly with
-            // AddrInUse. On Windows "[::]" is v6-only, so the v4 bind succeeds
-            // and both stacks are served from two sockets.
+            // The server has no auth or limits (#293), so it stays on loopback unless the
+            // operator opts in. "[::]" first: on Linux/macOS it is dual-stack by default
+            // (v4 peers arrive v4-mapped) and the following v4 bind fails harmlessly with
+            // AddrInUse. On Windows "[::]" is v6-only, so the v4 bind succeeds and both
+            // stacks are served from two sockets. "[::1]" is v6-only everywhere.
+            let (v6, v4) = if public { ("[::]", "0.0.0.0") } else { ("[::1]", "127.0.0.1") };
             let mut listeners: Vec<TcpListener> = Vec::new();
-            for addr in [format!("[::]:{port}"), format!("0.0.0.0:{port}")] {
+            for addr in [format!("{v6}:{port}"), format!("{v4}:{port}")] {
                 if let Ok(l) = TcpListener::bind(&*addr) {
                     l.set_nonblocking(true).expect("nonblocking listener");
                     tracing::info!("lightwallet_server gRPC serving on {addr}");
@@ -273,7 +275,7 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
             }
 
             let mut ready_listeners: Vec<TcpListener> = Vec::new();
-            for addr in [format!("[::]:{ready_port}"), format!("0.0.0.0:{ready_port}")] {
+            for addr in [format!("[::1]:{ready_port}"), format!("127.0.0.1:{ready_port}")] {
                 if let Ok(l) = TcpListener::bind(&*addr) {
                     l.set_nonblocking(true).expect("nonblocking listener");
                     ready_listeners.push(l);

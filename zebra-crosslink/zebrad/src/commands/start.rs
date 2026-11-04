@@ -1003,7 +1003,7 @@ impl StartCmd {
                 mempool_events: mempool_transaction_subscriber.clone(),
                 network: config.network.network.clone(),
             };
-            let thread = crate::lightwalletd::lightwalletd_spawn(lwd_ctx, lwd_port, zebra_port_base + 10000);
+            let thread = crate::lightwalletd::lightwalletd_spawn(lwd_ctx, lwd_port, zebra_port_base + 10000, config.crosslink.public_lightwallet_server);
             *zebra_crosslink::wallet::wallet_main_lightwalletd_port.lock().unwrap() = lwd_port;
             thread
         };

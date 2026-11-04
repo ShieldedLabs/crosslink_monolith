@@ -190,6 +190,9 @@ pub mod config {
         pub disable_the_headless_wallet: bool,
         /// Disable lightwallet_server.
         pub disable_zaino: bool,
+        /// Serve lightwallet_server's gRPC port on every interface instead of loopback only.
+        /// It has no authentication or limits, so only enable this behind a firewall or proxy.
+        pub public_lightwallet_server: bool,
         /// User-led slashfork rules, as supplied in the config file. These are
         /// merged with [`shipped_slashforks`] and validated by building a
         /// [`SlashForkSchedule`]; after loading, this holds the canonical, merged
@@ -211,6 +214,7 @@ pub mod config {
                 explicit_bft_key_seed: None,
                 disable_the_headless_wallet: false,
                 disable_zaino: false,
+                public_lightwallet_server: false,
                 slashforks: Vec::new(),
                 disable_shipped_slashforks: false,
             }
