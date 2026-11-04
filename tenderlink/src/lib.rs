@@ -1937,12 +1937,18 @@ static ENGINE_VIEW: Mutex<Option<EngineView>> = Mutex::new(None);
 /// has taken it in, read it and, if a tick was due, acted on it and handed out what it sent.
 pub static LOOP_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// One per process: a process runs one engine. Where a test runs several, each wake gives the
+// others a spurious pass, which only takes in and hands out packets.
 static ENGINE_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// The least time from one engine pass's start to the next when a wake ends the idle sleep early,
+/// so a stream of wakes (a busy peer set) shares passes instead of spinning the loop.
+const WOKEN_PASS_MIN: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Start the engine loop's next pass now rather than at the end of its idle sleep, for input that
 /// reaches it around the transport, such as a synthetic peer's packets. Ticks still follow the
 /// clock, so an early pass only takes in and hands out packets sooner. Wakes that arrive together
-/// share one pass.
+/// share one pass, and woken passes start at least WOKEN_PASS_MIN apart. Callable from any thread.
 pub fn wake_engine() {
     ENGINE_WAKE.notify_one();
 }
@@ -2265,6 +2271,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let mut send_buf1 = [0u8; 2048];
     let mut next_tick_time = zebra_debug_time::instant_now();
     loop {
+        let pass_start = std::time::Instant::now();
         let ctx_str = bft_state.ctx_str(&roster);
 
         {
@@ -3291,8 +3298,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         // other await in it completes at once, so a thread sleep here never hands its worker back.
         // A task woken onto that worker's next-task slot, which other workers cannot steal, then
         // waits forever; that is how a test whose clock stood still hung with nothing blocked.
-        // wake_engine() ends it early.
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), ENGINE_WAKE.notified()).await;
+        // wake_engine() ends it early, though no sooner than WOKEN_PASS_MIN after this pass began.
+        let woken = tokio::time::timeout(std::time::Duration::from_millis(100), ENGINE_WAKE.notified()).await.is_ok();
+        if woken {
+            if let Some(rest) = WOKEN_PASS_MIN.checked_sub(pass_start.elapsed()) {
+                tokio::time::sleep(rest).await;
+            }
+        }
     }
 }
 
