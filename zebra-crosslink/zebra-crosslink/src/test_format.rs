@@ -1,7 +1,7 @@
 use static_assertions::*;
 use std::{io::Write, mem::align_of, mem::size_of};
 use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize, SerializationError};
-use zebra_chain::transaction::{Transaction, UnminedTxId};
+use zebra_chain::transaction::{Transaction, UnminedTx, UnminedTxId};
 use zerocopy::*;
 use zerocopy_derive::*;
 
@@ -142,7 +142,6 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::EXPECT_ROSTER_INCLUDES as usize] = "EXPECT_ROSTER_INCLUDES";
     strs[TFInstr::EXPECT_REJECTION_REASON as usize] = "EXPECT_REJECTION_REASON";
     strs[TFInstr::EXPECT_NODE_ALIVE as usize] = "EXPECT_NODE_ALIVE";
-    strs[TFInstr::RECV_TX as usize] = "RECV_TX";
     strs[TFInstr::SUBMIT_TX as usize] = "SUBMIT_TX";
     strs[TFInstr::EXPECT_MEMPOOL_CONTAINS as usize] = "EXPECT_MEMPOOL_CONTAINS";
     strs[TFInstr::EXPECT_MEMPOOL_ABSENT as usize] = "EXPECT_MEMPOOL_ABSENT";
@@ -150,13 +149,9 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::EXPECT_BOND as usize] = "EXPECT_BOND";
     strs[TFInstr::EXPECT_FINALIZER_BANK as usize] = "EXPECT_FINALIZER_BANK";
     strs[TFInstr::EXPECT_POOL_TOTALS as usize] = "EXPECT_POOL_TOTALS";
-    strs[TFInstr::RECV_POW as usize] = "RECV_POW";
     strs[TFInstr::RECV_STP_PACKET as usize] = "RECV_STP_PACKET";
-    strs[TFInstr::RECV_TX_STP as usize] = "RECV_TX_STP";
-    strs[TFInstr::MINE_FROM_TEMPLATE as usize] = "MINE_FROM_TEMPLATE";
     strs[TFInstr::EXPECT_POW_TIP as usize] = "EXPECT_POW_TIP";
     strs[TFInstr::EXPECT_FINALIZED_TIP as usize] = "EXPECT_FINALIZED_TIP";
-    strs[TFInstr::CHECK_POW as usize] = "CHECK_POW";
     strs[TFInstr::CHECK_POS as usize] = "CHECK_POS";
     strs[TFInstr::SET_TIME as usize] = "SET_TIME";
     strs[TFInstr::CALL_RPC as usize] = "CALL_RPC";
@@ -170,6 +165,12 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::EXPECT_BFT_PROPOSER as usize] = "EXPECT_BFT_PROPOSER";
     strs[TFInstr::EXPECT_BFT_DROPPED as usize] = "EXPECT_BFT_DROPPED";
 
+    let mut retired_i = 0;
+    while retired_i < TFInstr::RETIRED.len() {
+        strs[TFInstr::RETIRED[retired_i] as usize] = "<retired>";
+        retired_i += 1;
+    }
+
     const_assert!(TFInstr::COUNT == 37);
     strs
 };
@@ -178,6 +179,23 @@ impl TFInstr {
     // NOTE: we want to deal with unknown values at the *application* layer, not the
     // (de)serialization layer.
     // TODO: there may be a crate that makes an enum feasible here
+
+    /// A PoW block (the data, serialized) reaching the node through the doorway in `val[1]`:
+    /// - `TF_POW_DIRECT`: the ingest queue submitblock and the miner use. Accepted, rejected or
+    ///   pending (SHOULD_DEFER) as the node answers.
+    /// - `TF_POW_STP_PEER`: served by synthetic STP peer `val[0]` the way a real peer serves one:
+    ///   it advertises the block in a STATUS, waits for the node's BLOCK_REQ, and answers with
+    ///   BLOCK_CHUNK packets from the requested offset. Judged as the direct doorway, and rejected
+    ///   too when the node kills the peer or never asks for the block. The bytes are served as
+    ///   they are, parseable or not.
+    /// - `TF_POW_TEMPLATE`: no data; the node builds the block from its own getblocktemplate
+    ///   response, as its miner does, and submits it directly. Also rejected when no template or
+    ///   block could be made. A non-zero `val[0]` names a slot that remembers the block's hash,
+    ///   for instructions that take a slot in place of a hash.
+    /// - `TF_POW_CHECK`: only the node's header and body checks, run at once with the current
+    ///   time taken to be `val[0]` (UNIX seconds). Nothing is queued or stored, so it covers the
+    ///   rules a block can break by itself (its timestamp against the clock, its merkle root, its
+    ///   coinbase), not the ones that need its ancestors. The message says which stage refused.
     pub const LOAD_POW: TFInstrKind = 0;
     /// A decided BFT height, force-fed as tenderlink would have decided it. The data is the
     /// block and its fat pointer, then the proposer's chunk signatures, 64 bytes each in chunk
@@ -199,14 +217,17 @@ impl TFInstr {
     /// The node still answers: the state service returns its tip within a bound, and
     /// re-submitting the tip block through the ingest path answers `Known`.
     pub const EXPECT_NODE_ALIVE: TFInstrKind = 9;
-    /// A wire message (the data, header included) arriving from synthetic peer `val[0]`: decoded
-    /// with the peer codec and routed through the inbound service exactly as a connection routes
-    /// an unsolicited message. A `tx` message reaches the mempool as that peer's transaction.
-    /// Checks only that it was delivered; verification is asynchronous, so follow it with an
-    /// EXPECT_MEMPOOL_* instruction.
-    pub const RECV_TX: TFInstrKind = 10;
-    /// A transaction (the data) submitted locally, the doorway the wallet and RPC use. Checks the
-    /// mempool's verdict, and its message is the rejection reason when rejected.
+    /// A transaction (the data, serialized) reaching the mempool through the doorway in
+    /// `val[1]`, judged by the mempool's verdict through every doorway: accepted once it is
+    /// resident (or mined), rejected once it is in the rejected set or could not be delivered.
+    /// - `TF_TX_LOCAL`: submitted locally, the doorway the wallet and RPC use; the message is
+    ///   the mempool's rejection reason when rejected.
+    /// - `TF_TX_WIRE`: a `tx` wire message from synthetic peer `val[0]`, framed and decoded with
+    ///   the peer codec and routed through the inbound service exactly as a connection routes an
+    ///   unsolicited message.
+    /// - `TF_TX_STP_PEER`: relayed over STP by synthetic peer `val[0]`: the peer lists it
+    ///   (TX_STATUS) and answers the node's TX_REQ for it with a TX. Also rejected when the node
+    ///   kills the peer or never asks.
     pub const SUBMIT_TX: TFInstrKind = 11;
     /// The transaction (the data) becomes resident in the mempool within a bound. Fails early if
     /// it is rejected instead.
@@ -226,32 +247,15 @@ impl TFInstr {
     /// The best chain tip's staking pools: the data is bonded, unbonded and finalizer rewards,
     /// three little-endian u64 zatoshi amounts, each skipped when `TEST_STAKE_IGNORED`.
     pub const EXPECT_POOL_TOTALS: TFInstrKind = 17;
-    /// A PoW block (the data, serialized) served by synthetic STP peer `val[0]` the way a real
-    /// peer serves one: the peer advertises it in a STATUS, waits for the node's BLOCK_REQ, and
-    /// answers with BLOCK_CHUNK packets from the requested offset. Accepted and rejected as
-    /// LOAD_POW is, and rejected too when the node kills the peer or never asks for the block.
-    pub const RECV_POW: TFInstrKind = 18;
     /// An STP application packet (the data, type byte first) arriving from synthetic peer
     /// `val[0]`. Fails when the node kills the peer for it; any other handling passes.
     pub const RECV_STP_PACKET: TFInstrKind = 19;
-    /// The node builds a block from its own getblocktemplate response, as its miner does, and
-    /// the block is submitted through the LOAD_POW doorway. Accepted and rejected as LOAD_POW is;
-    /// also rejected when no template or block could be made. A non-zero `val[0]` names a slot
-    /// that remembers the block's hash, for instructions that take a slot in place of a hash:
-    /// the hash of a block the node builds is not known when the file is written.
-    pub const MINE_FROM_TEMPLATE: TFInstrKind = 20;
     /// The best chain's tip is the block whose hash is the data, or, with no data, the block
     /// remembered in slot `val[0]`. Says which of two equally long branches the node is on.
     pub const EXPECT_POW_TIP: TFInstrKind = 21;
     /// `fin`, the finalized tip, is the block named as for EXPECT_POW_TIP. With no data and
     /// slot 0, nothing is finalized yet.
     pub const EXPECT_FINALIZED_TIP: TFInstrKind = 22;
-    /// The node's header and body checks, run on the PoW block in the data at once, with the
-    /// current time taken to be `val[0]` (UNIX seconds). Nothing is queued or stored, so the
-    /// answer needs no wait and no chain context: it covers the rules a block can break by
-    /// itself (its timestamp against the clock, its merkle root, its coinbase), not the ones
-    /// that need its ancestors. The message says which stage refused.
-    pub const CHECK_POW: TFInstrKind = 23;
     /// Whether the PoS block in the data (a LOAD_POS payload) is valid on the node's current BFT
     /// chain: the check a proposal gets, answered at once, with nothing stored or decided. An
     /// indeterminate answer (a PoW block it needs is missing) is pending, as for SHOULD_DEFER.
@@ -312,11 +316,10 @@ impl TFInstr {
     /// The node has stopped taking part in BFT (`val[0]` 1) or has not (0), and its database
     /// records it the same way: with the data a block hash, the record names that block.
     pub const EXPECT_BFT_DROPPED: TFInstrKind = 35;
-    /// A transaction relayed over STP by synthetic peer `val[0]`: the peer lists it
-    /// (TX_STATUS), and answers the node's TX_REQ for it with a TX. Passes once the node asked
-    /// for it and was sent it; whether the mempool took it is for EXPECT_MEMPOOL_*. Fails when
-    /// the node kills the peer or never asks.
-    pub const RECV_TX_STP: TFInstrKind = 36;
+    /// Kinds folded into LOAD_POW and SUBMIT_TX as doorways: RECV_TX (10), RECV_POW (18),
+    /// MINE_FROM_TEMPLATE (20), CHECK_POW (23) and RECV_TX_STP (36). Never reused, so an old file
+    /// holding one fails to parse rather than meaning something else.
+    pub const RETIRED: [TFInstrKind; 5] = [10, 18, 20, 23, 36];
     pub const COUNT: TFInstrKind = 37;
 
     pub fn str_from_kind(kind: TFInstrKind) -> &'static str {
@@ -376,9 +379,7 @@ impl TFInstr {
             }
             Some(TestInstr::ExpectRejectionReason(reason)) => str += &format!("{reason:?}"),
             Some(TestInstr::ExpectNodeAlive) => {}
-            Some(TestInstr::RecvTx { wire, peer }) => {
-                str += &format!("{} bytes from peer {peer}", wire.len())
-            }
+            Some(TestInstr::RecvTx { tx, peer }) => str += &format!("{} via wire peer {peer}", tx.hash()),
             Some(TestInstr::SubmitTx(tx))
             | Some(TestInstr::ExpectMempoolContains(tx))
             | Some(TestInstr::ExpectMempoolAbsent(tx))
@@ -392,16 +393,17 @@ impl TFInstr {
             Some(TestInstr::ExpectPoolTotals(pools)) => str += &format!("{pools:?}"),
             Some(TestInstr::RecvPoW { block, peer }) => {
                 str += &match Block::zcash_deserialize(&block[..]) {
-                    Ok(parsed) => format!("{} from peer {peer}", parsed.hash()),
-                    Err(_) => format!("{} unparseable bytes from peer {peer}", block.len()),
+                    Ok(parsed) => format!("{} via STP peer {peer}", parsed.hash()),
+                    Err(_) => format!("{} unparseable bytes via STP peer {peer}", block.len()),
                 }
             }
             Some(TestInstr::MineFromTemplate { slot }) => {
+                str += "from the node's template";
                 if slot != 0 {
-                    str += &format!("into slot {slot}")
+                    str += &format!(", into slot {slot}")
                 }
             }
-            Some(TestInstr::CheckPoW { block, now }) => str += &format!("{} at time {now}", block.hash()),
+            Some(TestInstr::CheckPoW { block, now }) => str += &format!("{}, checks only, at time {now}", block.hash()),
             Some(TestInstr::CheckPoS(block)) => str += &block.blake3_hash().to_string(),
             Some(TestInstr::SetTime(unix_time)) => str += &unix_time.to_string(),
             Some(TestInstr::CallRpc { method, params }) => str += &format!("{method} {params}"),
@@ -448,9 +450,7 @@ impl TFInstr {
             Some(TestInstr::RecvStpPacket { packet, peer }) => {
                 str += &format!("type {:?}, {} bytes from peer {peer}", packet.first(), packet.len())
             }
-            Some(TestInstr::RecvTxStp { tx, peer }) => {
-                str += &format!("{} bytes from peer {peer}", tx.len())
-            }
+            Some(TestInstr::RecvTxStp { tx, peer }) => str += &format!("{} via STP peer {peer}", tx.hash()),
             Some(TestInstr::ExpectBftDropped { dropped, hash }) => {
                 str += &format!("{dropped}");
                 if let Some(hash) = hash {
@@ -483,6 +483,17 @@ impl TFInstr {
         self.data.as_byte_slice_in(bytes)
     }
 }
+
+/// LOAD_POW's doorways, in `val[1]`.
+pub const TF_POW_DIRECT: u64 = 0;
+pub const TF_POW_STP_PEER: u64 = 1;
+pub const TF_POW_TEMPLATE: u64 = 2;
+pub const TF_POW_CHECK: u64 = 3;
+
+/// SUBMIT_TX's doorways, in `val[1]`.
+pub const TF_TX_LOCAL: u64 = 0;
+pub const TF_TX_WIRE: u64 = 1;
+pub const TF_TX_STP_PEER: u64 = 2;
 
 // Flags
 pub const SHOULD_FAIL: u32 = 1 << 0;
@@ -634,10 +645,10 @@ impl TF {
     }
 
     pub fn push_instr_load_pow(&mut self, data: &Block, flags: u32) {
-        self.push_instr_serialize_ex(TFInstr::LOAD_POW, flags, data, [0; 2])
+        self.push_instr_serialize_ex(TFInstr::LOAD_POW, flags, data, [0, TF_POW_DIRECT])
     }
     pub fn push_instr_load_pow_bytes(&mut self, data: &[u8], flags: u32) {
-        self.push_instr_ex(TFInstr::LOAD_POW, flags, data, [0; 2])
+        self.push_instr_ex(TFInstr::LOAD_POW, flags, data, [0, TF_POW_DIRECT])
     }
 
     /// A decision with no proposal signatures, for a round with no proposer. See `push_instr_load_pos_signed`.
@@ -706,14 +717,13 @@ impl TF {
         self.push_instr_ex(TFInstr::EXPECT_NODE_ALIVE, flags, &[0; 0], [0; 2])
     }
 
-    /// A wire message delivered as if synthetic peer `peer` sent it. For a transaction, frame it
-    /// with `zebra_network::wire::tx_message_bytes`.
-    pub fn push_instr_recv_tx_wire(&mut self, wire: &[u8], peer: u64, flags: u32) {
-        self.push_instr_ex(TFInstr::RECV_TX, flags, wire, [peer, 0])
+    /// `tx` in a `tx` wire message from synthetic peer `peer`.
+    pub fn push_instr_recv_tx_wire(&mut self, tx: &Transaction, peer: u64, flags: u32) {
+        self.push_instr_serialize_ex(TFInstr::SUBMIT_TX, flags, tx, [peer, TF_TX_WIRE])
     }
 
     pub fn push_instr_submit_tx(&mut self, tx: &Transaction, flags: u32) {
-        self.push_instr_serialize_ex(TFInstr::SUBMIT_TX, flags, tx, [0; 2])
+        self.push_instr_serialize_ex(TFInstr::SUBMIT_TX, flags, tx, [0, TF_TX_LOCAL])
     }
 
     pub fn push_instr_expect_mempool_contains(&mut self, tx: &Transaction, flags: u32) {
@@ -748,12 +758,12 @@ impl TF {
 
     /// A block served over the STP block-sync exchange by synthetic peer `peer`.
     pub fn push_instr_recv_pow(&mut self, block: &Block, peer: u64, flags: u32) {
-        self.push_instr_serialize_ex(TFInstr::RECV_POW, flags, block, [peer, 0])
+        self.push_instr_serialize_ex(TFInstr::LOAD_POW, flags, block, [peer, TF_POW_STP_PEER])
     }
 
     /// Block bytes served as-is, for encodings `Block` would not produce.
     pub fn push_instr_recv_pow_bytes(&mut self, block: &[u8], peer: u64, flags: u32) {
-        self.push_instr_ex(TFInstr::RECV_POW, flags, block, [peer, 0])
+        self.push_instr_ex(TFInstr::LOAD_POW, flags, block, [peer, TF_POW_STP_PEER])
     }
 
     pub fn push_instr_recv_stp_packet(&mut self, packet: &[u8], peer: u64, flags: u32) {
@@ -761,16 +771,16 @@ impl TF {
     }
 
     pub fn push_instr_recv_tx_stp(&mut self, tx: &Transaction, peer: u64, flags: u32) {
-        self.push_instr_serialize_ex(TFInstr::RECV_TX_STP, flags, tx, [peer, 0])
+        self.push_instr_serialize_ex(TFInstr::SUBMIT_TX, flags, tx, [peer, TF_TX_STP_PEER])
     }
 
     pub fn push_instr_mine_from_template(&mut self, flags: u32) {
-        self.push_instr_ex(TFInstr::MINE_FROM_TEMPLATE, flags, &[0; 0], [0; 2])
+        self.push_instr_ex(TFInstr::LOAD_POW, flags, &[0; 0], [0, TF_POW_TEMPLATE])
     }
 
     /// As push_instr_mine_from_template, remembering the mined block's hash in `slot` (non-zero).
     pub fn push_instr_mine_from_template_into(&mut self, slot: u64, flags: u32) {
-        self.push_instr_ex(TFInstr::MINE_FROM_TEMPLATE, flags, &[0; 0], [slot, 0])
+        self.push_instr_ex(TFInstr::LOAD_POW, flags, &[0; 0], [slot, TF_POW_TEMPLATE])
     }
 
     pub fn push_instr_expect_pow_tip(&mut self, hash: &ZebBlockHash, flags: u32) {
@@ -795,7 +805,7 @@ impl TF {
 
     /// The header and body checks on `block`, taking the current time to be `now_unix_time`.
     pub fn push_instr_check_pow(&mut self, block: &Block, now_unix_time: u64, flags: u32) {
-        self.push_instr_serialize_ex(TFInstr::CHECK_POW, flags, block, [now_unix_time, 0])
+        self.push_instr_serialize_ex(TFInstr::LOAD_POW, flags, block, [now_unix_time, TF_POW_CHECK])
     }
 
     /// Whether the node would accept this PoS block as a proposal now, without storing it.
@@ -1221,8 +1231,14 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
     const_assert!(TFInstr::COUNT == 37);
     match instr.kind {
         TFInstr::LOAD_POW => {
-            let block = Block::zcash_deserialize(instr.data_slice(bytes)).ok()?;
-            Some(TestInstr::LoadPoW(block))
+            let data = instr.data_slice(bytes);
+            match instr.val[1] {
+                TF_POW_DIRECT => Some(TestInstr::LoadPoW(Block::zcash_deserialize(data).ok()?)),
+                TF_POW_STP_PEER => Some(TestInstr::RecvPoW { block: data.to_vec(), peer: instr.val[0] }),
+                TF_POW_TEMPLATE => Some(TestInstr::MineFromTemplate { slot: instr.val[0] }),
+                TF_POW_CHECK => Some(TestInstr::CheckPoW { block: Block::zcash_deserialize(data).ok()?, now: instr.val[0] }),
+                _ => None,
+            }
         }
 
         TFInstr::LOAD_POS => {
@@ -1286,13 +1302,15 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
             String::from_utf8(instr.data_slice(bytes).to_vec()).ok()?,
         )),
         TFInstr::EXPECT_NODE_ALIVE => Some(TestInstr::ExpectNodeAlive),
-        TFInstr::RECV_TX => Some(TestInstr::RecvTx {
-            wire: instr.data_slice(bytes).to_vec(),
-            peer: instr.val[0],
-        }),
-        TFInstr::SUBMIT_TX => Some(TestInstr::SubmitTx(
-            Transaction::zcash_deserialize(instr.data_slice(bytes)).ok()?,
-        )),
+        TFInstr::SUBMIT_TX => {
+            let tx = Transaction::zcash_deserialize(instr.data_slice(bytes)).ok()?;
+            match instr.val[1] {
+                TF_TX_LOCAL => Some(TestInstr::SubmitTx(tx)),
+                TF_TX_WIRE => Some(TestInstr::RecvTx { tx, peer: instr.val[0] }),
+                TF_TX_STP_PEER => Some(TestInstr::RecvTxStp { tx, peer: instr.val[0] }),
+                _ => None,
+            }
+        }
         TFInstr::EXPECT_MEMPOOL_CONTAINS => Some(TestInstr::ExpectMempoolContains(
             Transaction::zcash_deserialize(instr.data_slice(bytes)).ok()?,
         )),
@@ -1316,15 +1334,6 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
             let amount = |i: usize| u64::from_le_bytes(data[8 * i..8 * i + 8].try_into().expect("eight bytes"));
             Some(TestInstr::ExpectPoolTotals([amount(0), amount(1), amount(2)]))
         }
-        TFInstr::RECV_POW => Some(TestInstr::RecvPoW {
-            block: instr.data_slice(bytes).to_vec(),
-            peer: instr.val[0],
-        }),
-        TFInstr::MINE_FROM_TEMPLATE => Some(TestInstr::MineFromTemplate { slot: instr.val[0] }),
-        TFInstr::CHECK_POW => Some(TestInstr::CheckPoW {
-            block: Block::zcash_deserialize(instr.data_slice(bytes)).ok()?,
-            now: instr.val[0],
-        }),
         TFInstr::CHECK_POS => {
             let block_and_fat_ptr = BftBlockAndFatPointerToItWrap::zcash_deserialize(instr.data_slice(bytes)).ok()?;
             Some(TestInstr::CheckPoS(block_and_fat_ptr.0.block))
@@ -1389,10 +1398,6 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
             packet: instr.data_slice(bytes).to_vec(),
             peer: instr.val[0],
         }),
-        TFInstr::RECV_TX_STP => Some(TestInstr::RecvTxStp {
-            tx: instr.data_slice(bytes).to_vec(),
-            peer: instr.val[0],
-        }),
         TFInstr::EXPECT_BFT_DROPPED => {
             let data = instr.data_slice(bytes);
             let hash = if data.is_empty() { None } else { Some(ZebBlockHash(data.try_into().ok()?)) };
@@ -1416,7 +1421,9 @@ pub(crate) enum TestInstr {
     ExpectPoWBlockFinality(ZebBlockHash, Option<TFLBlockFinality>),
     ExpectRejectionReason(String),
     ExpectNodeAlive,
-    RecvTx { wire: Vec<u8>, peer: u64 },
+    // The doorways of LOAD_POW and SUBMIT_TX stay separate variants: each drives the node its
+    // own way.
+    RecvTx { tx: Transaction, peer: u64 },
     SubmitTx(Transaction),
     ExpectMempoolContains(Transaction),
     ExpectMempoolAbsent(Transaction),
@@ -1429,7 +1436,7 @@ pub(crate) enum TestInstr {
     /// Raw bytes: the peer serves exactly what the file holds, parseable or not.
     RecvPoW { block: Vec<u8>, peer: u64 },
     RecvStpPacket { packet: Vec<u8>, peer: u64 },
-    RecvTxStp { tx: Vec<u8>, peer: u64 },
+    RecvTxStp { tx: Transaction, peer: u64 },
     MineFromTemplate { slot: u64 },
     /// The block named by `hash`, or by `slot` when there is no hash.
     ExpectPoWTip { hash: Option<ZebBlockHash>, slot: u64 },
@@ -1493,14 +1500,14 @@ pub(crate) async fn handle_instr(
         TestInstr::MineFromTemplate { slot } => match internal_handle.call.block_from_template.get() {
             None => check_ingest(
                 flags,
-                "MINE_FROM_TEMPLATE: ",
+                "LOAD_POW from the template: ",
                 Err("the node has no RPC implementation to take a template from".to_string()),
             ),
             Some(block_from_template) => match block_from_template().await {
-                Err(err) => check_ingest(flags, "MINE_FROM_TEMPLATE: ", Err(err)),
+                Err(err) => check_ingest(flags, "LOAD_POW from the template: ", Err(err)),
                 Ok(block) => {
                     let label = format!(
-                        "MINE_FROM_TEMPLATE {} @ {:?}, {} transaction(s): ",
+                        "LOAD_POW from the template {} @ {:?}, {} transaction(s): ",
                         block.hash(),
                         block.coinbase_height().map(|height| height.0),
                         block.transactions.len()
@@ -1519,7 +1526,7 @@ pub(crate) async fn handle_instr(
         TestInstr::CheckPoW { block, now } => {
             use zebra_consensus::sync_verify::{block_check_body, block_check_header};
             let network = &internal_handle.network;
-            let label = format!("CHECK_POW {} at time {now}", block.hash());
+            let label = format!("LOAD_POW checks only {} at time {now}", block.hash());
             let (Some(height), Some(time)) = (block.coinbase_height(), chrono::DateTime::from_timestamp(now as i64, 0)) else {
                 test_check(flags, false, &format!("{label}: rejected: no coinbase height, or a time out of range"));
                 return;
@@ -1873,15 +1880,18 @@ pub(crate) async fn handle_instr(
             );
         }
 
-        TestInstr::RecvTx { wire, peer } => {
+        TestInstr::RecvTx { tx, peer } => {
             let sender = synthetic_peer(peer);
-            let delivery = tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.inbound_wire)(sender, wire)).await;
-            let (delivered, message) = match delivery {
-                Ok(Ok(())) => (true, format!("RECV_TX: delivered from peer {sender}")),
-                Ok(Err(err)) => (false, format!("RECV_TX: the message from peer {sender} was refused: {err}")),
-                Err(_) => (false, format!("RECV_TX: no answer delivering from peer {sender} within {NODE_ANSWER_WAIT:?}")),
+            let label = format!("SUBMIT_TX {} via wire peer {sender}", tx.hash());
+            let (accepted, message) = match zebra_network::wire::tx_message_bytes(&internal_handle.network, UnminedTx::from(tx.clone())) {
+                Err(err) => (false, format!("{label}: does not frame: {err}")),
+                Ok(wire) => match tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.inbound_wire)(sender, wire)).await {
+                    Ok(Ok(())) => await_tx_verdict(internal_handle, &tx, &label).await,
+                    Ok(Err(err)) => (false, format!("{label}: rejected: the message was refused: {err}")),
+                    Err(_) => (false, format!("{label}: no answer delivering it within {NODE_ANSWER_WAIT:?}")),
+                },
             };
-            test_check(flags, delivered, &message);
+            test_check(flags, accepted, &message);
         }
 
         TestInstr::SubmitTx(transaction) => {
@@ -1890,11 +1900,11 @@ pub(crate) async fn handle_instr(
         }
 
         TestInstr::RecvPoW { block, peer } => match take_stp_peer(peer) {
-            Err(err) => check_ingest(flags, "RECV_POW: ", Err(err)),
+            Err(err) => check_ingest(flags, "LOAD_POW via STP: ", Err(err)),
             Ok(mut stp) => {
                 let outcome = serve_block(internal_handle, &mut stp, &block).await;
                 put_stp_peer(stp);
-                check_ingest(flags, "RECV_POW: ", outcome);
+                check_ingest(flags, &format!("LOAD_POW via STP peer {peer}: "), outcome);
             }
         },
 
@@ -1908,11 +1918,18 @@ pub(crate) async fn handle_instr(
         },
 
         TestInstr::RecvTxStp { tx, peer } => match take_stp_peer(peer) {
-            Err(err) => test_check_outcome(false, false, &format!("RECV_TX_STP: {err}")),
+            Err(err) => test_check_outcome(false, false, &format!("SUBMIT_TX via STP: {err}")),
             Ok(mut stp) => {
-                let (served, message) = serve_tx(&mut stp, &tx).await;
+                let label = format!("SUBMIT_TX {} via STP peer {peer}", tx.hash());
+                let wire_tx = tx.zcash_serialize_to_vec().expect("a parsed transaction serializes");
+                let (served, message) = serve_tx(&mut stp, &wire_tx).await;
                 put_stp_peer(stp);
-                test_check(flags, served, &message);
+                let (accepted, message) = if served {
+                    await_tx_verdict(internal_handle, &tx, &label).await
+                } else {
+                    (false, format!("{label}: rejected: {message}"))
+                };
+                test_check(flags, accepted, &message);
             }
         },
 
@@ -2238,7 +2255,7 @@ async fn staking_replay_matches(internal_handle: &TFLServiceHandle) -> (bool, St
     }
 }
 
-/// Hashes of blocks the node built during the test, by the slot MINE_FROM_TEMPLATE put them in.
+/// Hashes of blocks the node built during the test, by the slot LOAD_POW from the template put them in.
 static TEST_BLOCK_SLOTS: Mutex<Vec<(u64, ZebBlockHash)>> = Mutex::new(Vec::new());
 
 /// The block an instruction names: its hash, else the one remembered in its slot, else none.
@@ -2248,7 +2265,7 @@ fn named_block(hash: Option<ZebBlockHash>, slot: u64) -> Result<Option<ZebBlockH
     }
     match TEST_BLOCK_SLOTS.lock().unwrap().iter().find(|(taken, _)| *taken == slot) {
         Some((_, hash)) => Ok(Some(*hash)),
-        None => Err(format!("slot {slot} holds no block; MINE_FROM_TEMPLATE fills slots")),
+        None => Err(format!("slot {slot} holds no block; LOAD_POW from the template fills slots")),
     }
 }
 
@@ -2540,12 +2557,12 @@ async fn serve_tx(stp: &mut HarnessStpPeer, wire_tx: &[u8]) -> (bool, String) {
     use zebra_state::new_network::SyntheticPeerEvent;
     let index = stp.index;
     let Ok(tx) = Transaction::zcash_deserialize(wire_tx) else {
-        return (false, "RECV_TX_STP: the transaction does not parse; send its packets with RECV_STP_PACKET".to_string());
+        return (false, "the transaction does not parse; send its packets with RECV_STP_PACKET".to_string());
     };
     let id = UnminedTxId::from(&tx);
     drain_stp_peer(stp);
     if let Some(reason) = &stp.killed {
-        return (false, format!("RECV_TX_STP: peer {index} was already killed: {reason}"));
+        return (false, format!("peer {index} was already killed: {reason}"));
     }
     // Wire sizes fit u32: a transaction is at most MAX_BLOCK_BYTES.
     let _ = stp.link.inbound.send(tx_status_packet(1, [(&id, wire_tx.len() as u32)]));
@@ -2555,26 +2572,26 @@ async fn serve_tx(stp: &mut HarnessStpPeer, wire_tx: &[u8]) -> (bool, String) {
         tokio::select! {
             packet = stp.link.outbound.recv() => {
                 let Some(packet) = packet else {
-                    return (false, "RECV_TX_STP: the sync loop is gone".to_string());
+                    return (false, "the sync loop is gone".to_string());
                 };
                 // HELLO, STATUS, TX_STATUS, MEMPOOL_REQ: not this exchange.
                 if parse_tx_req(&packet).is_some_and(|ids| ids.contains(&id)) {
                     for packet in tx_packets([&tx]) {
                         let _ = stp.link.inbound.send(packet);
                     }
-                    return (true, format!("RECV_TX_STP: peer {index} was asked for {id} and sent it"));
+                    return (true, format!("peer {index} was asked for {id} and sent it"));
                 }
             }
             event = stp.link.events.recv() => match event {
                 Some(SyntheticPeerEvent::Killed(reason)) => {
                     stp.killed = Some(reason.clone());
-                    return (false, format!("RECV_TX_STP: the node killed peer {index}: {reason}"));
+                    return (false, format!("the node killed peer {index}: {reason}"));
                 }
                 Some(_) => {}
-                None => return (false, "RECV_TX_STP: the sync loop is gone".to_string()),
+                None => return (false, "the sync loop is gone".to_string()),
             },
             _ = tokio::time::sleep_until(deadline) => {
-                return (false, format!("RECV_TX_STP: the node never asked peer {index} for {id} within {NODE_ANSWER_WAIT:?}"));
+                return (false, format!("the node never asked peer {index} for {id} within {NODE_ANSWER_WAIT:?}"));
             }
         }
     }
@@ -2633,30 +2650,13 @@ async fn await_mempool(
     transaction: &Transaction,
     expect: MempoolExpect,
 ) -> (bool, String) {
-    use zebra_node_services::mempool::{Request, Response};
-
-    let id = UnminedTxId::from(transaction);
     let txid = transaction.hash();
-    let ask = |request: Request| {
-        tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.mempool)(request))
-    };
     let deadline = tokio::time::Instant::now() + NODE_ANSWER_WAIT;
     loop {
-        let resident = match ask(Request::TransactionIds).await {
-            Ok(Ok(Response::TransactionIds(ids))) => ids.contains(&id),
-            other => return (false, format!("mempool {txid}: the transaction ids request answered {other:?}")),
+        let (resident, rejected, mined) = match mempool_tx_state(internal_handle, transaction).await {
+            Ok(state) => state,
+            Err(err) => return (false, err),
         };
-        let in_rejected_set = match ask(Request::RejectedTransactionIds([id].into_iter().collect())).await {
-            Ok(Ok(Response::RejectedTransactionIds(ids))) => !ids.is_empty(),
-            other => return (false, format!("mempool {txid}: the rejected ids request answered {other:?}")),
-        };
-        // The mempool files a mined transaction under its rejected ids too (as Mined), and does
-        // not say which reason applies, so the best chain decides: mined is not rejected.
-        let mined = match tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.state)(StateRequest::Transaction(txid))).await {
-            Ok(Ok(StateResponse::Transaction(found))) => found.is_some(),
-            other => return (false, format!("mempool {txid}: the mined transaction request answered {other:?}")),
-        };
-        let rejected = in_rejected_set && !mined;
         let state = format!("resident {resident}, rejected {rejected}, mined {mined}");
         let reached = match expect {
             MempoolExpect::Resident => resident,
@@ -2686,6 +2686,51 @@ async fn await_mempool(
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Whether `transaction` is resident in the mempool, rejected by it, and mined on the best chain.
+async fn mempool_tx_state(internal_handle: &TFLServiceHandle, transaction: &Transaction) -> Result<(bool, bool, bool), String> {
+    use zebra_node_services::mempool::{Request, Response};
+
+    let id = UnminedTxId::from(transaction);
+    let txid = transaction.hash();
+    let ask = |request: Request| {
+        tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.mempool)(request))
+    };
+    let resident = match ask(Request::TransactionIds).await {
+        Ok(Ok(Response::TransactionIds(ids))) => ids.contains(&id),
+        other => return Err(format!("mempool {txid}: the transaction ids request answered {other:?}")),
+    };
+    let in_rejected_set = match ask(Request::RejectedTransactionIds([id].into_iter().collect())).await {
+        Ok(Ok(Response::RejectedTransactionIds(ids))) => !ids.is_empty(),
+        other => return Err(format!("mempool {txid}: the rejected ids request answered {other:?}")),
+    };
+    // The mempool files a mined transaction under its rejected ids too (as Mined), and does not
+    // say which reason applies, so the best chain decides: mined is not rejected.
+    let mined = match tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.state)(StateRequest::Transaction(txid))).await {
+        Ok(Ok(StateResponse::Transaction(found))) => found.is_some(),
+        other => return Err(format!("mempool {txid}: the mined transaction request answered {other:?}")),
+    };
+    Ok((resident, in_rejected_set && !mined, mined))
+}
+
+/// Waits, within a bound, for the mempool's verdict on a transaction that reached it from a peer:
+/// accepted once it is resident or mined, rejected once it is in the rejected set. Peer-sent
+/// transactions are downloaded and verified asynchronously, so the delivery alone says nothing.
+async fn await_tx_verdict(internal_handle: &TFLServiceHandle, transaction: &Transaction, label: &str) -> (bool, String) {
+    let deadline = tokio::time::Instant::now() + NODE_ANSWER_WAIT;
+    loop {
+        match mempool_tx_state(internal_handle, transaction).await {
+            Err(err) => return (false, format!("{label}: {err}")),
+            Ok((true, _, _)) => return (true, format!("{label}: accepted into the mempool")),
+            Ok((_, _, true)) => return (true, format!("{label}: accepted: already mined")),
+            Ok((_, true, _)) => return (false, format!("{label}: rejected: in the mempool's rejected set")),
+            Ok(_) if tokio::time::Instant::now() >= deadline => {
+                return (false, format!("{label}: no mempool verdict within {NODE_ANSWER_WAIT:?}"))
+            }
+            Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
     }
 }
 

@@ -59,7 +59,7 @@ impl Choices {
     }
 }
 
-/// A peer index RECV_POW has not used yet. A peer that served a bad block may have been
+/// A peer index LOAD_POW via STP has not used yet. A peer that served a bad block may have been
 /// disconnected, so each such delivery gets its own.
 const FRESH_PEERS_FROM: u64 = 100;
 
@@ -435,9 +435,7 @@ fn refuse(g: &mut FuzzGen, c: &mut Choices, block: &Block) {
 /// Hands the node a transaction it must take, through SUBMIT_TX or a peer's relay.
 fn offer_tx(g: &mut FuzzGen, c: &mut Choices, tx: &Arc<Transaction>) {
     if c.unusual(96) {
-        let wire = zebra_network::wire::tx_message_bytes(&g.network, zebra_chain::transaction::UnminedTx::from(tx.clone()))
-            .expect("a transaction frames");
-        g.tf.push_instr_recv_tx_wire(&wire, 0, 0);
+        g.tf.push_instr_recv_tx_wire(tx, 0, 0);
     } else {
         g.tf.push_instr_submit_tx(tx, 0);
     }
@@ -1450,17 +1448,17 @@ fn crosslink_fuzz_directed_replayed_finalized_retarget_is_accepted_without_featu
     test_bytes(replayed_retarget(None, None, FINALIZED_BETWEEN, false));
 }
 
-/// How often the generator emits each kind of instruction, with which outcome flag, over
-/// CROSSLINK_FUZZ_SEEDS (default 0..200), and how often a bond is expected in each status. Runs
-/// no node: it shows whether a move's paths come up at all, and whether its hard expectations are
-/// drowned out by ANY_OUTCOME.
+/// How often the generator emits each kind of instruction (LOAD_POW and SUBMIT_TX by doorway), with
+/// which outcome flag, over CROSSLINK_FUZZ_SEEDS (default 0..200), and how often a bond is
+/// expected in each status. Runs no node: it shows whether a move's paths come up at all, and
+/// whether its hard expectations are drowned out by ANY_OUTCOME.
 #[test]
 #[ignore]
 fn crosslink_fuzz_census() {
     let seeds = std::env::var("CROSSLINK_FUZZ_SEEDS").unwrap_or_else(|_| "0..200".to_string());
     let (a, b) = seeds.split_once("..").expect("CROSSLINK_FUZZ_SEEDS is a..b");
     let (a, b): (u64, u64) = (a.parse().expect("seed range start"), b.parse().expect("seed range end"));
-    let mut counts: std::collections::BTreeMap<(u8, &str), usize> = Default::default();
+    let mut counts: std::collections::BTreeMap<(u8, u64, &str), usize> = Default::default();
     let mut bonds: std::collections::BTreeMap<u64, usize> = Default::default();
     let mut instrs_n = 0;
     for seed in a..b {
@@ -1474,15 +1472,16 @@ fn crosslink_fuzz_census() {
             } else {
                 "pass"
             };
-            *counts.entry((instr.kind as u8, outcome)).or_default() += 1;
+            let doorway = if matches!(instr.kind, TFInstr::LOAD_POW | TFInstr::SUBMIT_TX) { instr.val[1] } else { 0 };
+            *counts.entry((instr.kind as u8, doorway, outcome)).or_default() += 1;
             if instr.kind == TFInstr::EXPECT_BOND {
                 *bonds.entry(instr.val[1]).or_default() += 1;
             }
         }
     }
     eprintln!("census over seeds {a}..{b}: {instrs_n} instructions");
-    for ((kind, outcome), n) in &counts {
-        eprintln!("  kind {kind:>3} {outcome:<4} {n}");
+    for ((kind, doorway, outcome), n) in &counts {
+        eprintln!("  {:<32} {outcome:<4} {n}", format!("{} ({kind}.{doorway})", TFInstr::str_from_kind(u32::from(*kind))));
     }
     eprintln!("  EXPECT_BOND by status (0 active, 1 unbonding, 2 withdrawn, 255 absent): {bonds:?}");
 }
