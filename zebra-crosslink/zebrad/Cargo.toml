@@ -316,7 +316,6 @@ derive-new.workspace = true
 cosmo-compat = "9"
 
 [build-dependencies]
-vergen-git2 = { workspace = true, features = ["cargo", "rustc"] }
 # Only fetched, compiled or run when -F ape is on.
 cosmo-build = { version = "9", optional = true }
 # test feature lightwalletd-grpc-tests
