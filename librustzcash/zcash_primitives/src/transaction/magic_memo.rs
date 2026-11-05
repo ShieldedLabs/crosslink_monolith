@@ -10,36 +10,36 @@
 //! outputs that the builder has already constructed and will prove, before that digest
 //! is taken (see [`crate::transaction::builder::Builder::add_ironwood_magic_memo`]).
 //!
-//! # Chunks
+//! # Layout
 //!
 //! A compact action carries `nf`, `cmx`, `epk` and the first [`COMPACT_NOTE_SIZE`] bytes
-//! of `enc_ciphertext`. A memo is split into chunks, one per action. A chunk's data is
-//! those ciphertext bytes followed by `epk[..31]`: [`MAGIC_MEMO_PREFIX`], the chunk
-//! index, the chunk count, the chunk's payload length, then up to
-//! [`MAGIC_MEMO_CHUNK_LEN`] payload bytes. `epk[31]` is the smallest value below 2^6 that
-//! makes `epk` a valid non-identity point; that keeps the encoded x-coordinate below
-//! 2^254 < p, and about half of all x-coordinates are on the curve.
+//! of `enc_ciphertext`. A memo occupies a run of consecutive actions, in action order;
+//! the builder retries its shuffle until the memo's outputs land consecutively. An
+//! action's data is its compact ciphertext followed by `epk[..31]`; `epk[31]` is then the
+//! smallest value below 2^6 that makes `epk` a valid non-identity point (keeping the
+//! encoded x-coordinate below 2^254 < p; about half of all x-coordinates are on the
+//! curve).
 //!
-//! # Public and encrypted memos
+//! Only the first action has a header, the payload's length as a little-endian `u16`,
+//! which also gives the number of actions. Every later action's data is all payload.
 //!
-//! A public memo ([`MagicMemo::from_payload`]) stores chunk data as is, so anyone can
-//! read it, which is useful for debugging and exploration.
+//! - Public: the first action's data is the length, [`MAGIC_MEMO_PLAINTEXT_PREFIX`] (the
+//!   start of its content, and what identifies it), then payload.
+//! - Encrypted: the first action keeps the `epk` the builder made for its zero-value note
+//!   to the recipient, so the recipient derives the note encryption key `K` from it with
+//!   their incoming viewing key as usual, and from that the memo key. Its compact
+//!   ciphertext is the length, that note's `rseed`, then payload, and every action's data
+//!   is XORed with a keystream under the memo key and the action's position in the memo.
+//!   The recipient rebuilds the note from `rseed`, their own address and the action's
+//!   `nf` (the note's `rho`), and accepts only if it reproduces the action's `epk` and
+//!   `cmx`: that holds only for a memo to them, so no magic bytes are needed. Ordinary
+//!   decryption with `K` yields garbage, so wallets that do not know magic memos ignore
+//!   it. The sender recovers it with their outgoing viewing key from the first action's
+//!   `out_ciphertext`, which the builder wrote and which is left as is (full transaction
+//!   only).
 //!
-//! An encrypted memo ([`MagicMemo::encrypted`]) uses Ironwood's note encryption key
-//! agreement. Chunk 0's `epk` is a genuine ephemeral key `[esk] g_d` for the recipient's
-//! address, so it carries no payload; the recipient derives the shared key from it with
-//! their incoming viewing key, exactly as for a note ([`decrypt_with_ivk`]). Every
-//! chunk's data is XORed with a keystream under that key and the chunk index, so the
-//! chunks are indistinguishable from other actions to anyone else. Optionally, chunk 0's
-//! `out_ciphertext` is a standard outgoing ciphertext under the sender's outgoing viewing
-//! key, from which the sender can recover the key later ([`recover_with_ovk`]); unlike
-//! everything else, that needs the full transaction. There is no authentication tag
-//! beyond the prefix check: the transaction's signatures already prevent changes after
-//! signing, and as with note memos the recipient learns nothing about who sent it.
-//!
-//! The rest of each action is left as the builder made it. The outputs' notes can never
-//! be decrypted by anyone, including their recipient; they have zero value so that
-//! nothing is lost.
+//! The rest of each action is left as the builder made it. The outputs' notes cannot be
+//! decrypted as notes by anyone; they have zero value so that nothing is lost.
 
 use alloc::vec::Vec;
 
@@ -50,23 +50,23 @@ use orchard::{
     keys::{OutgoingViewingKey, PreparedIncomingViewingKey},
     note::{ExtractedNoteCommitment, NoteVersion, RandomSeed, Rho},
     note_encryption::IronwoodDomain,
-    value::{NoteValue, ValueCommitment},
+    value::NoteValue,
 };
 use pasta_curves::pallas;
-use rand_core::{CryptoRng, RngCore};
+use subtle::ConstantTimeEq;
 use zcash_note_encryption::{
-    COMPACT_NOTE_SIZE, Domain, EphemeralKeyBytes, NoteEncryption, OUT_CIPHERTEXT_SIZE,
-    OUT_PLAINTEXT_SIZE, OutPlaintextBytes,
+    COMPACT_NOTE_SIZE, Domain, EphemeralKeyBytes, OUT_PLAINTEXT_SIZE, OutPlaintextBytes,
+    try_output_recovery_with_ovk,
 };
 
-/// The bytes that open every chunk's data.
-pub const MAGIC_MEMO_PREFIX: [u8; 4] = *b"MEMO";
+/// The bytes that open a public memo's content in its first action, after the length.
+pub const MAGIC_MEMO_PLAINTEXT_PREFIX: [u8; 4] = *b"MEMO";
 
-/// The prefix, then one byte each for the chunk index, chunk count and chunk length.
-const HEADER_LEN: usize = MAGIC_MEMO_PREFIX.len() + 3;
+/// The first action's header: the payload length.
+const LEN_LEN: usize = 2;
 
-/// Payload bytes carried in the compact ciphertext after the header.
-const CIPHERTEXT_PAYLOAD_LEN: usize = COMPACT_NOTE_SIZE - HEADER_LEN;
+/// The length of a note's `rseed`.
+const RSEED_LEN: usize = 32;
 
 /// The length of an `epk` encoding.
 const EPK_LEN: usize = 32;
@@ -74,30 +74,32 @@ const EPK_LEN: usize = 32;
 /// Payload bytes carried in `epk`; its last byte selects a valid point.
 const EPK_PAYLOAD_LEN: usize = EPK_LEN - 1;
 
-/// A chunk's data: the compact ciphertext, then `epk[..EPK_PAYLOAD_LEN]`.
+/// An action's data: the compact ciphertext, then `epk[..EPK_PAYLOAD_LEN]`.
 const DATA_LEN: usize = COMPACT_NOTE_SIZE + EPK_PAYLOAD_LEN;
 
 /// `epk[31]` takes values below this: they leave bits 6 (keeping x below 2^254) and 7
 /// (the sign of y) clear.
 const EPK_TWEAK_LIMIT: u8 = 1 << 6;
 
-/// The number of payload bytes one action carries, except chunk 0 of an encrypted memo,
-/// which carries [`MAGIC_MEMO_ENCRYPTED_FIRST_CHUNK_LEN`].
-pub const MAGIC_MEMO_CHUNK_LEN: usize = DATA_LEN - HEADER_LEN;
+/// Payload bytes in a public memo's first action.
+pub const MAGIC_MEMO_PUBLIC_FIRST_LEN: usize = DATA_LEN - LEN_LEN - MAGIC_MEMO_PLAINTEXT_PREFIX.len();
 
-/// The number of payload bytes chunk 0 of an encrypted memo carries; its `epk` is the
-/// key agreement's ephemeral key.
-pub const MAGIC_MEMO_ENCRYPTED_FIRST_CHUNK_LEN: usize = CIPHERTEXT_PAYLOAD_LEN;
+/// Payload bytes in an encrypted memo's first action, whose `epk` is the key agreement's.
+pub const MAGIC_MEMO_ENCRYPTED_FIRST_LEN: usize = COMPACT_NOTE_SIZE - LEN_LEN - RSEED_LEN;
 
-/// The largest number of actions, and so chunks, one magic memo occupies.
-pub const MAGIC_MEMO_MAX_CHUNKS: usize = u8::MAX as usize;
+/// Payload bytes in each action after the first.
+pub const MAGIC_MEMO_NEXT_LEN: usize = DATA_LEN;
+
+/// The largest number of actions one magic memo occupies.
+pub const MAGIC_MEMO_MAX_ACTIONS: usize = u8::MAX as usize;
 
 /// The largest payload, in bytes, that a public magic memo can carry.
-pub const MAGIC_MEMO_MAX_LEN: usize = MAGIC_MEMO_CHUNK_LEN * MAGIC_MEMO_MAX_CHUNKS;
+pub const MAGIC_MEMO_PUBLIC_MAX_LEN: usize =
+    MAGIC_MEMO_PUBLIC_FIRST_LEN + MAGIC_MEMO_NEXT_LEN * (MAGIC_MEMO_MAX_ACTIONS - 1);
 
 /// The largest payload, in bytes, that an encrypted magic memo can carry.
 pub const MAGIC_MEMO_ENCRYPTED_MAX_LEN: usize =
-    MAGIC_MEMO_ENCRYPTED_FIRST_CHUNK_LEN + MAGIC_MEMO_CHUNK_LEN * (MAGIC_MEMO_MAX_CHUNKS - 1);
+    MAGIC_MEMO_ENCRYPTED_FIRST_LEN + MAGIC_MEMO_NEXT_LEN * (MAGIC_MEMO_MAX_ACTIONS - 1);
 
 /// BLAKE2b personalization deriving the memo key from the note encryption key.
 const KEY_PERSONALIZATION: &[u8; 16] = b"Zcash_MagicMemoK";
@@ -108,31 +110,15 @@ const KEYSTREAM_PERSONALIZATION: &[u8; 16] = b"Zcash_MagicMemoS";
 /// The length of a BLAKE2b keystream block.
 const KEYSTREAM_BLOCK_LEN: usize = 64;
 
-/// What the builder needs to write chunk 0's `out_ciphertext` once it knows the action's
-/// `cv_net` and `cmx`.
-#[derive(Clone, Debug)]
-struct OutRecovery {
-    ovk: OutgoingViewingKey,
-    note: orchard::Note,
-}
-
-/// The bytes one action carrying a magic memo chunk is given.
-#[derive(Clone, Debug)]
+/// The compact-visible bytes one action of a magic memo is given.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MagicMemoChunk {
     epk: [u8; EPK_LEN],
     compact_ciphertext: [u8; COMPACT_NOTE_SIZE],
-    out: Option<OutRecovery>,
 }
-
-impl PartialEq for MagicMemoChunk {
-    fn eq(&self, other: &Self) -> bool {
-        self.epk == other.epk && self.compact_ciphertext == other.compact_ciphertext
-    }
-}
-impl Eq for MagicMemoChunk {}
 
 impl MagicMemoChunk {
-    /// The `epk` encoding the action carries; a valid non-identity Pallas point.
+    /// The action's `epk`; a valid non-identity Pallas point.
     pub fn epk_bytes(&self) -> &[u8; EPK_LEN] {
         &self.epk
     }
@@ -141,195 +127,159 @@ impl MagicMemoChunk {
     pub fn compact_ciphertext(&self) -> &[u8; COMPACT_NOTE_SIZE] {
         &self.compact_ciphertext
     }
-
-    /// The `out_ciphertext` the action must carry for the sender to recover an encrypted
-    /// memo with their outgoing viewing key, given the action's `cv_net` and `cmx`, or
-    /// `None` if this chunk has none to carry.
-    pub fn out_ciphertext<R: RngCore>(
-        &self,
-        cv_net: &ValueCommitment,
-        cmx: &ExtractedNoteCommitment,
-        rng: &mut R,
-    ) -> Option<[u8; OUT_CIPHERTEXT_SIZE]> {
-        let out = self.out.as_ref()?;
-        let esk = IronwoodDomain::derive_esk(&out.note).expect("Ironwood notes derive esk");
-        let encryption = NoteEncryption::<IronwoodDomain>::new_with_esk(
-            esk,
-            Some(out.ovk.clone()),
-            out.note,
-            [0; 512],
-        );
-        Some(encryption.encrypt_outgoing_plaintext(cv_net, cmx, rng))
-    }
 }
 
-/// A magic memo, encoded as the chunks that carry it, in order.
-#[derive(Clone, PartialEq, Eq)]
+/// A magic memo to publish: its payload and where its zero-value outputs go.
+#[derive(Clone, Debug)]
 pub struct MagicMemo {
-    chunks: Vec<MagicMemoChunk>,
-    encrypted: bool,
-}
-
-impl core::fmt::Debug for MagicMemo {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let mut s = f.debug_struct("MagicMemo");
-        s.field("chunks", &self.chunks.len())
-            .field("encrypted", &self.encrypted);
-        if !self.encrypted {
-            s.field("payload", &self.payload());
-        }
-        s.finish()
-    }
+    payload: Vec<u8>,
+    recipient: orchard::Address,
+    /// The sender's outgoing viewing key, present exactly when the memo is encrypted.
+    ovk: Option<OutgoingViewingKey>,
 }
 
 impl MagicMemo {
-    /// Encodes `payload` as a public magic memo of one chunk per [`MAGIC_MEMO_CHUNK_LEN`]
-    /// bytes (one chunk if `payload` is empty).
+    /// A public magic memo carrying `payload`, whose zero-value outputs go to `outputs_to`
+    /// (which gains nothing from them).
     ///
-    /// Returns `None` if `payload` is longer than [`MAGIC_MEMO_MAX_LEN`] bytes, or, with
-    /// negligible probability, if a chunk's `epk` bytes admit no valid point.
-    pub fn from_payload(payload: &[u8]) -> Option<Self> {
-        if payload.len() > MAGIC_MEMO_MAX_LEN {
-            return None;
-        }
-        let count = payload.len().div_ceil(MAGIC_MEMO_CHUNK_LEN).max(1);
-        let chunks = (0..count)
-            .map(|index| {
-                let start = index * MAGIC_MEMO_CHUNK_LEN;
-                let bytes = &payload[start..payload.len().min(start + MAGIC_MEMO_CHUNK_LEN)];
-                seal_data(chunk_data(index as u8, count as u8, bytes), None)
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(MagicMemo {
-            chunks,
-            encrypted: false,
+    /// Returns `None` if `payload` is longer than [`MAGIC_MEMO_PUBLIC_MAX_LEN`] bytes.
+    pub fn public(payload: &[u8], outputs_to: orchard::Address) -> Option<Self> {
+        (payload.len() <= MAGIC_MEMO_PUBLIC_MAX_LEN).then(|| MagicMemo {
+            payload: payload.to_vec(),
+            recipient: outputs_to,
+            ovk: None,
         })
     }
 
-    /// Encodes `payload` as a magic memo that only the holder of `recipient`'s incoming
-    /// viewing key can read ([`decrypt_with_ivk`]) and, if `ovk` is given, the holder of
-    /// `ovk` too, from the full transaction ([`recover_with_ovk`]).
+    /// A magic memo carrying `payload` that only `recipient`'s incoming viewing key can
+    /// read ([`decrypt_with_ivk`]), and `ovk` from the full transaction
+    /// ([`recover_with_ovk`]).
     ///
-    /// Chunk 0 carries [`MAGIC_MEMO_ENCRYPTED_FIRST_CHUNK_LEN`] payload bytes and each
-    /// further chunk [`MAGIC_MEMO_CHUNK_LEN`].
-    ///
-    /// Returns `None` if `payload` is longer than [`MAGIC_MEMO_ENCRYPTED_MAX_LEN`] bytes,
-    /// or, with negligible probability, if a chunk's `epk` bytes admit no valid point.
-    pub fn encrypted<R: RngCore + CryptoRng>(
-        recipient: orchard::Address,
-        ovk: Option<OutgoingViewingKey>,
-        payload: &[u8],
-        rng: &mut R,
-    ) -> Option<Self> {
-        if payload.len() > MAGIC_MEMO_ENCRYPTED_MAX_LEN {
-            return None;
-        }
-
-        // The key agreement goes through a note to `recipient` only because that is how
-        // the note encryption API derives `esk` and `[esk] g_d`; the note goes nowhere.
-        let note = random_note(recipient, rng);
-        let esk = IronwoodDomain::derive_esk(&note).expect("Ironwood notes derive esk");
-        let epk = IronwoodDomain::epk_bytes(&IronwoodDomain::ka_derive_public(&note, &esk));
-        let shared = IronwoodDomain::ka_agree_enc(&esk, &IronwoodDomain::get_pk_d(&note));
-        let key = memo_key(IronwoodDomain::kdf(shared, &epk).as_ref());
-
-        let first_len = payload.len().min(MAGIC_MEMO_ENCRYPTED_FIRST_CHUNK_LEN);
-        let (first, rest) = payload.split_at(first_len);
-        let count = 1 + rest.len().div_ceil(MAGIC_MEMO_CHUNK_LEN);
-
-        let mut ciphertext = [0u8; COMPACT_NOTE_SIZE];
-        let mut data = chunk_data(0, count as u8, first);
-        apply_keystream(&key, 0, &mut data[..COMPACT_NOTE_SIZE]);
-        ciphertext.copy_from_slice(&data[..COMPACT_NOTE_SIZE]);
-        let mut chunks = alloc::vec![MagicMemoChunk {
-            epk: epk.0,
-            compact_ciphertext: ciphertext,
-            out: ovk.map(|ovk| OutRecovery { ovk, note }),
-        }];
-
-        for index in 1..count {
-            let start = (index - 1) * MAGIC_MEMO_CHUNK_LEN;
-            let bytes = &rest[start..rest.len().min(start + MAGIC_MEMO_CHUNK_LEN)];
-            let mut data = chunk_data(index as u8, count as u8, bytes);
-            apply_keystream(&key, index as u8, &mut data);
-            chunks.push(seal_data(data, None)?);
-        }
-        Some(MagicMemo {
-            chunks,
-            encrypted: true,
+    /// Returns `None` if `payload` is longer than [`MAGIC_MEMO_ENCRYPTED_MAX_LEN`] bytes.
+    pub fn encrypted(payload: &[u8], recipient: orchard::Address, ovk: OutgoingViewingKey) -> Option<Self> {
+        (payload.len() <= MAGIC_MEMO_ENCRYPTED_MAX_LEN).then(|| MagicMemo {
+            payload: payload.to_vec(),
+            recipient,
+            ovk: Some(ovk),
         })
     }
 
-    /// The chunks, in order; each is carried by one action.
-    pub fn chunks(&self) -> &[MagicMemoChunk] {
-        &self.chunks
+    /// The payload.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
     }
 
     /// Whether this memo is encrypted.
     pub fn is_encrypted(&self) -> bool {
-        self.encrypted
+        self.ovk.is_some()
     }
 
-    /// Returns the payload of a public memo, or `None` for an encrypted one.
-    pub fn payload(&self) -> Option<Vec<u8>> {
-        if self.encrypted {
+    /// The address the memo's zero-value outputs go to: its recipient, if encrypted.
+    pub fn recipient(&self) -> orchard::Address {
+        self.recipient
+    }
+
+    /// The outgoing viewing key the memo's outputs must be built with, if encrypted.
+    pub fn ovk(&self) -> Option<&OutgoingViewingKey> {
+        self.ovk.as_ref()
+    }
+
+    /// The number of consecutive actions, and so zero-value outputs, the memo occupies.
+    pub fn actions_n(&self) -> usize {
+        let first_len = if self.is_encrypted() {
+            MAGIC_MEMO_ENCRYPTED_FIRST_LEN
+        } else {
+            MAGIC_MEMO_PUBLIC_FIRST_LEN
+        };
+        actions_for(self.payload.len(), first_len)
+    }
+
+    /// The bytes for the memo's [`Self::actions_n`] consecutive actions, given the first
+    /// of them as the builder made it (an output to [`Self::recipient`] built with
+    /// [`Self::ovk`]).
+    ///
+    /// Returns `None` if the first action is not such an output, or, with negligible
+    /// probability, if an action's `epk` bytes admit no valid point.
+    pub fn chunks_for<A>(&self, first: &orchard::Action<A>) -> Option<Vec<MagicMemoChunk>> {
+        let Some(ovk) = &self.ovk else {
+            return self.public_chunks();
+        };
+        let len = (self.payload.len() as u16).to_le_bytes();
+
+        // The note the builder made for the first output, recovered as its sender would.
+        let encrypted_note = first.encrypted_note();
+        let (note, to, _) = try_output_recovery_with_ovk(
+            &IronwoodDomain::for_action(first),
+            ovk,
+            first,
+            first.cv_net(),
+            &encrypted_note.out_ciphertext,
+        )?;
+        if to != self.recipient || note.value() != NoteValue::from_raw(0) {
             return None;
         }
-        reassemble(self.chunks.iter().map(|chunk| {
-            decode_chunk(&chunk.compact_ciphertext, &chunk.epk).expect("encoded above")
-        }))
-    }
-}
+        let epk = EphemeralKeyBytes(encrypted_note.epk_bytes);
+        let esk = IronwoodDomain::derive_esk(&note)?;
+        let shared = IronwoodDomain::ka_agree_enc(&esk, &IronwoodDomain::get_pk_d(&note));
+        let key = memo_key(IronwoodDomain::kdf(shared, &epk).as_ref());
 
-/// A note to `recipient` with random `rho` and `rseed`, retried until both are valid.
-fn random_note<R: RngCore + CryptoRng>(recipient: orchard::Address, rng: &mut R) -> orchard::Note {
-    loop {
-        let mut bytes = [0u8; 32];
-        rng.fill_bytes(&mut bytes);
-        let Some(rho) = Rho::from_bytes(&bytes).into_option() else {
-            continue;
-        };
-        rng.fill_bytes(&mut bytes);
-        let Some(rseed) = RandomSeed::from_bytes(bytes, &rho).into_option() else {
-            continue;
-        };
-        if let Some(note) = orchard::Note::from_parts(
-            recipient,
-            NoteValue::from_raw(0),
-            rho,
-            rseed,
-            NoteVersion::V3,
-        )
-        .into_option()
-        {
-            return note;
+        let mut ciphertext = [0u8; COMPACT_NOTE_SIZE];
+        ciphertext[..LEN_LEN].copy_from_slice(&len);
+        ciphertext[LEN_LEN..][..RSEED_LEN].copy_from_slice(note.rseed().as_bytes());
+        let (first_bytes, rest) = split_first(&self.payload, MAGIC_MEMO_ENCRYPTED_FIRST_LEN);
+        ciphertext[LEN_LEN + RSEED_LEN..][..first_bytes.len()].copy_from_slice(first_bytes);
+        apply_keystream(&key, 0, &mut ciphertext);
+        let mut chunks = alloc::vec![MagicMemoChunk {
+            epk: epk.0,
+            compact_ciphertext: ciphertext,
+        }];
+        for (i, bytes) in rest.chunks(MAGIC_MEMO_NEXT_LEN).enumerate() {
+            let mut data = [0u8; DATA_LEN];
+            data[..bytes.len()].copy_from_slice(bytes);
+            apply_keystream(&key, (i + 1) as u8, &mut data);
+            chunks.push(seal(data)?);
         }
+        Some(chunks)
+    }
+
+    fn public_chunks(&self) -> Option<Vec<MagicMemoChunk>> {
+        let mut data = [0u8; DATA_LEN];
+        data[..LEN_LEN].copy_from_slice(&(self.payload.len() as u16).to_le_bytes());
+        data[LEN_LEN..][..MAGIC_MEMO_PLAINTEXT_PREFIX.len()].copy_from_slice(&MAGIC_MEMO_PLAINTEXT_PREFIX);
+        let (first_bytes, rest) = split_first(&self.payload, MAGIC_MEMO_PUBLIC_FIRST_LEN);
+        data[LEN_LEN + MAGIC_MEMO_PLAINTEXT_PREFIX.len()..][..first_bytes.len()].copy_from_slice(first_bytes);
+        let mut chunks = alloc::vec![seal(data)?];
+        for bytes in rest.chunks(MAGIC_MEMO_NEXT_LEN) {
+            let mut data = [0u8; DATA_LEN];
+            data[..bytes.len()].copy_from_slice(bytes);
+            chunks.push(seal(data)?);
+        }
+        Some(chunks)
     }
 }
 
-fn chunk_data(index: u8, count: u8, bytes: &[u8]) -> [u8; DATA_LEN] {
-    let mut data = [0u8; DATA_LEN];
-    data[..MAGIC_MEMO_PREFIX.len()].copy_from_slice(&MAGIC_MEMO_PREFIX);
-    data[MAGIC_MEMO_PREFIX.len()] = index;
-    data[MAGIC_MEMO_PREFIX.len() + 1] = count;
-    data[MAGIC_MEMO_PREFIX.len() + 2] = bytes.len() as u8;
-    data[HEADER_LEN..][..bytes.len()].copy_from_slice(bytes);
-    data
+/// The number of actions a payload of `len` bytes occupies when its first action holds
+/// `first_len`.
+fn actions_for(len: usize, first_len: usize) -> usize {
+    1 + len.saturating_sub(first_len).div_ceil(MAGIC_MEMO_NEXT_LEN)
 }
 
-/// Splits chunk data into its compact ciphertext and `epk`, choosing `epk[31]` so that
+fn split_first(payload: &[u8], first_len: usize) -> (&[u8], &[u8]) {
+    payload.split_at(payload.len().min(first_len))
+}
+
+/// Splits action data into its compact ciphertext and `epk`, choosing `epk[31]` so that
 /// `epk` is a valid point.
-fn seal_data(data: [u8; DATA_LEN], out: Option<OutRecovery>) -> Option<MagicMemoChunk> {
+fn seal(data: [u8; DATA_LEN]) -> Option<MagicMemoChunk> {
     let mut compact_ciphertext = [0u8; COMPACT_NOTE_SIZE];
     compact_ciphertext.copy_from_slice(&data[..COMPACT_NOTE_SIZE]);
     let mut epk = [0u8; EPK_LEN];
     epk[..EPK_PAYLOAD_LEN].copy_from_slice(&data[COMPACT_NOTE_SIZE..]);
     (0..EPK_TWEAK_LIMIT).find_map(|tweak| {
         epk[EPK_PAYLOAD_LEN] = tweak;
-        is_valid_epk(&epk).then(|| MagicMemoChunk {
+        is_valid_epk(&epk).then_some(MagicMemoChunk {
             epk,
             compact_ciphertext,
-            out: out.clone(),
         })
     })
 }
@@ -351,180 +301,200 @@ fn memo_key(symmetric_key: &[u8]) -> [u8; 32] {
     key
 }
 
-/// XORs `data` with the keystream for chunk `index` under `key`: keyed BLAKE2b over
-/// `(index, block number)`.
-fn apply_keystream(key: &[u8; 32], index: u8, data: &mut [u8]) {
+/// XORs `data` with the keystream for the memo's action `position` under `key`: keyed
+/// BLAKE2b over `(position, block number)`.
+fn apply_keystream(key: &[u8; 32], position: u8, data: &mut [u8]) {
     for (block_i, block) in data.chunks_mut(KEYSTREAM_BLOCK_LEN).enumerate() {
         let stream = Params::new()
             .hash_length(KEYSTREAM_BLOCK_LEN)
             .key(key)
             .personal(KEYSTREAM_PERSONALIZATION)
-            .hash(&[index, block_i as u8]);
+            .hash(&[position, block_i as u8]);
         for (byte, k) in block.iter_mut().zip(stream.as_bytes()) {
             *byte ^= k;
         }
     }
 }
 
-/// One magic memo chunk, as read back from an action.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DecodedChunk {
-    index: u8,
-    count: u8,
-    len: u8,
-    bytes: [u8; MAGIC_MEMO_CHUNK_LEN],
+/// One action, as a compact block shows it.
+#[derive(Clone, Copy, Debug)]
+pub struct ActionView<'a> {
+    nf: &'a [u8],
+    cmx: &'a [u8],
+    epk: &'a [u8],
+    ciphertext: &'a [u8],
 }
 
-impl DecodedChunk {
-    /// The chunk's position in its memo, from 0.
-    pub fn index(&self) -> u8 {
-        self.index
+impl<'a> ActionView<'a> {
+    /// A compact action's nullifier, `cmx`, `epk` and (at least [`COMPACT_NOTE_SIZE`]
+    /// bytes of) ciphertext.
+    pub fn new(nf: &'a [u8], cmx: &'a [u8], epk: &'a [u8], ciphertext: &'a [u8]) -> Self {
+        ActionView {
+            nf,
+            cmx,
+            epk,
+            ciphertext,
+        }
     }
 
-    /// The number of chunks in the memo this chunk belongs to.
-    pub fn count(&self) -> u8 {
-        self.count
+    /// The view of one of a bundle's actions.
+    pub fn of<A>(action: &'a orchard::Action<A>, nf: &'a [u8; 32], cmx: &'a [u8; 32]) -> Self {
+        let note = action.encrypted_note();
+        ActionView::new(nf, cmx, &note.epk_bytes, &note.enc_ciphertext[..COMPACT_NOTE_SIZE])
     }
 
-    /// The payload bytes this chunk carries.
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes[..usize::from(self.len)]
+    fn epk(&self) -> Option<EphemeralKeyBytes> {
+        Some(EphemeralKeyBytes(self.epk.try_into().ok()?))
+    }
+
+    fn compact_ciphertext(&self) -> Option<[u8; COMPACT_NOTE_SIZE]> {
+        self.ciphertext.get(..COMPACT_NOTE_SIZE)?.try_into().ok()
+    }
+
+    fn data(&self) -> Option<[u8; DATA_LEN]> {
+        let mut data = [0u8; DATA_LEN];
+        data[..COMPACT_NOTE_SIZE].copy_from_slice(&self.compact_ciphertext()?);
+        data[COMPACT_NOTE_SIZE..].copy_from_slice(self.epk.get(..EPK_PAYLOAD_LEN)?);
+        Some(data)
     }
 }
 
-fn decode_data(data: &[u8; DATA_LEN], max_len: usize) -> Option<DecodedChunk> {
-    let header = data.strip_prefix(&MAGIC_MEMO_PREFIX[..])?;
-    let (index, count, len) = (header[0], header[1], header[2]);
-    if index >= count || usize::from(len) > max_len {
-        return None;
+/// Reads the payload of `len` bytes whose first `first.len()` bytes are `first`, continuing
+/// in the actions after it, each XORed with `keystream(position)` if given.
+fn read_rest(
+    first: &[u8],
+    len: usize,
+    rest: &[ActionView<'_>],
+    keystream: Option<&[u8; 32]>,
+) -> Option<Vec<u8>> {
+    let mut payload = Vec::with_capacity(len);
+    payload.extend_from_slice(&first[..first.len().min(len)]);
+    for (i, action) in rest.iter().enumerate() {
+        if payload.len() >= len {
+            break;
+        }
+        let mut data = action.data()?;
+        if let Some(key) = keystream {
+            apply_keystream(key, (i + 1) as u8, &mut data);
+        }
+        let take = (len - payload.len()).min(DATA_LEN);
+        payload.extend_from_slice(&data[..take]);
     }
-    let mut bytes = [0u8; MAGIC_MEMO_CHUNK_LEN];
-    bytes.copy_from_slice(&data[HEADER_LEN..]);
-    Some(DecodedChunk {
-        index,
-        count,
-        len,
-        bytes,
+    (payload.len() == len).then_some(payload)
+}
+
+/// Reads the public magic memo carried by a transaction's Ironwood actions, in action
+/// order, if there is one.
+///
+/// [`MAGIC_MEMO_PLAINTEXT_PREFIX`] opens an ordinary note ciphertext's third to sixth
+/// bytes with probability 2^-32, so callers that act on a payload should also check that
+/// it has the shape they expect (for example, UTF-8).
+pub fn decode_public(actions: &[ActionView<'_>]) -> Option<Vec<u8>> {
+    actions.iter().enumerate().find_map(|(j, action)| {
+        let data = action.data()?;
+        let (len, content) = data.split_at(LEN_LEN);
+        let first = content.strip_prefix(&MAGIC_MEMO_PLAINTEXT_PREFIX[..])?;
+        let len = usize::from(u16::from_le_bytes(<[u8; LEN_LEN]>::try_from(len).ok()?));
+        let actions_n = actions_for(len, MAGIC_MEMO_PUBLIC_FIRST_LEN);
+        if len > MAGIC_MEMO_PUBLIC_MAX_LEN || j + actions_n > actions.len() {
+            return None;
+        }
+        read_rest(first, len, &actions[j + 1..j + actions_n], None)
     })
 }
 
-/// Gathers an action's chunk data from its compact ciphertext and `epk`.
-fn action_data(compact_ciphertext: &[u8], epk: &[u8]) -> Option<[u8; DATA_LEN]> {
-    let compact_ciphertext = compact_ciphertext.get(..COMPACT_NOTE_SIZE)?;
-    let epk = epk.get(..EPK_PAYLOAD_LEN)?;
-    let mut data = [0u8; DATA_LEN];
-    data[..COMPACT_NOTE_SIZE].copy_from_slice(compact_ciphertext);
-    data[COMPACT_NOTE_SIZE..].copy_from_slice(epk);
-    Some(data)
-}
-
-/// Reads the public magic memo chunk an action carries, from the first
-/// [`COMPACT_NOTE_SIZE`] bytes of its `enc_ciphertext` (a compact action's `ciphertext`)
-/// and its `epk`.
-///
-/// Returns `None` if the action carries no well-formed public chunk. An ordinary note
-/// ciphertext opens with [`MAGIC_MEMO_PREFIX`] with probability 2^-32, so callers that
-/// act on a reassembled payload should also check that it has the shape they expect
-/// (for example, UTF-8).
-pub fn decode_chunk(compact_ciphertext: &[u8], epk: &[u8]) -> Option<DecodedChunk> {
-    decode_data(&action_data(compact_ciphertext, epk)?, MAGIC_MEMO_CHUNK_LEN)
-}
-
-/// Reassembles a payload from the chunks of one magic memo, in any order.
-///
-/// Returns `None` unless the chunks agree on their count and each index below it
-/// appears exactly once.
-pub fn reassemble(chunks: impl IntoIterator<Item = DecodedChunk>) -> Option<Vec<u8>> {
-    let mut slots: Vec<Option<DecodedChunk>> = Vec::new();
-    for chunk in chunks {
-        if slots.is_empty() {
-            slots.resize(usize::from(chunk.count), None);
-        }
-        if usize::from(chunk.count) != slots.len() {
-            return None;
-        }
-        let slot = &mut slots[usize::from(chunk.index)];
-        if slot.is_some() {
-            return None;
-        }
-        *slot = Some(chunk);
-    }
-    if slots.is_empty() {
+/// Opens the encrypted memo whose first action is `actions[j]`, under `key` derived from
+/// that action, given a check that its note is genuine.
+fn open_encrypted(
+    key: &[u8; 32],
+    j: usize,
+    actions: &[ActionView<'_>],
+    is_note: impl FnOnce(&[u8; RSEED_LEN]) -> bool,
+) -> Option<Vec<u8>> {
+    let mut first = actions[j].compact_ciphertext()?;
+    apply_keystream(key, 0, &mut first);
+    let len = usize::from(u16::from_le_bytes(<[u8; LEN_LEN]>::try_from(&first[..LEN_LEN]).ok()?));
+    let actions_n = actions_for(len, MAGIC_MEMO_ENCRYPTED_FIRST_LEN);
+    if len > MAGIC_MEMO_ENCRYPTED_MAX_LEN || j + actions_n > actions.len() {
         return None;
     }
-
-    let mut payload = Vec::new();
-    for slot in slots {
-        payload.extend_from_slice(slot?.bytes());
-    }
-    Some(payload)
-}
-
-/// One action, as seen in a compact block: its compact `ciphertext` and its `epk`.
-pub type CompactView<'a> = (&'a [u8], &'a [u8]);
-
-/// Decrypts the encrypted magic memo whose chunk 0 is `actions[first_i]`, under `key`.
-fn decrypt_with_key(key: &[u8; 32], first_i: usize, actions: &[CompactView<'_>]) -> Option<Vec<u8>> {
-    let (ciphertext, _) = actions[first_i];
-    let mut data = [0u8; DATA_LEN];
-    data[..COMPACT_NOTE_SIZE].copy_from_slice(ciphertext.get(..COMPACT_NOTE_SIZE)?);
-    apply_keystream(key, 0, &mut data[..COMPACT_NOTE_SIZE]);
-    let first = decode_data(&data, MAGIC_MEMO_ENCRYPTED_FIRST_CHUNK_LEN)?;
-    if first.index != 0 {
+    let rseed: &[u8; RSEED_LEN] = first[LEN_LEN..][..RSEED_LEN].try_into().ok()?;
+    if !is_note(rseed) {
         return None;
     }
+    read_rest(&first[LEN_LEN + RSEED_LEN..], len, &actions[j + 1..j + actions_n], Some(key))
+}
 
-    // The builder shuffles actions, so each further chunk is looked for among them all.
-    let mut chunks = alloc::vec![first.clone()];
-    for index in 1..first.count {
-        let chunk = actions.iter().enumerate().find_map(|(i, (ciphertext, epk))| {
-            if i == first_i {
-                return None;
-            }
-            let mut data = action_data(ciphertext, epk)?;
-            apply_keystream(key, index, &mut data);
-            decode_data(&data, MAGIC_MEMO_CHUNK_LEN).filter(|chunk| chunk.index == index && chunk.count == first.count)
-        })?;
-        chunks.push(chunk);
-    }
-    reassemble(chunks)
+/// The zero-value Ironwood note to `recipient` that a memo action with nullifier `nf`
+/// and seed `rseed` carries.
+fn memo_note(recipient: orchard::Address, nf: &[u8], rseed: &[u8; RSEED_LEN]) -> Option<orchard::Note> {
+    // An action's output note takes the action's nullifier as its rho.
+    let rho = Rho::from_bytes(<&[u8; 32]>::try_from(nf).ok()?).into_option()?;
+    let rseed = RandomSeed::from_bytes(*rseed, &rho).into_option()?;
+    orchard::Note::from_parts(recipient, NoteValue::from_raw(0), rho, rseed, NoteVersion::V3).into_option()
 }
 
 /// Decrypts the encrypted magic memo carried by a transaction's Ironwood actions that is
-/// addressed to `ivk`, if there is one, using only what compact actions show.
+/// addressed to `recipient`, whose incoming viewing key is `ivk`, if there is one, using
+/// only what compact actions show.
 ///
-/// This costs one key agreement per action, as trial decryption of the actions' notes
-/// does.
-pub fn decrypt_with_ivk(ivk: &PreparedIncomingViewingKey, actions: &[CompactView<'_>]) -> Option<Vec<u8>> {
-    actions.iter().enumerate().find_map(|(i, (_, epk))| {
-        let epk = EphemeralKeyBytes(<[u8; EPK_LEN]>::try_from(*epk).ok()?);
+/// An action opens only if the note it carries, rebuilt from the decrypted `rseed`,
+/// reproduces the action's `epk` and `cmx`. This costs one key agreement per action, as
+/// trial decryption of the actions' notes does, and a scalar multiplication more when
+/// the decrypted length is plausible.
+pub fn decrypt_with_ivk(
+    ivk: &PreparedIncomingViewingKey,
+    recipient: orchard::Address,
+    actions: &[ActionView<'_>],
+) -> Option<Vec<u8>> {
+    actions.iter().enumerate().find_map(|(j, action)| {
+        let epk = action.epk()?;
         let point = IronwoodDomain::epk(&epk)?;
         let shared = IronwoodDomain::ka_agree_dec(ivk, &IronwoodDomain::prepare_epk(point));
         let key = memo_key(IronwoodDomain::kdf(shared, &epk).as_ref());
-        decrypt_with_key(&key, i, actions)
+        open_encrypted(&key, j, actions, |rseed| {
+            let Some(note) = memo_note(recipient, action.nf, rseed) else {
+                return false;
+            };
+            let Some(esk) = IronwoodDomain::derive_esk(&note) else {
+                return false;
+            };
+            // The cheaper check first: almost every candidate fails it.
+            IronwoodDomain::epk_bytes(&IronwoodDomain::ka_derive_public(&note, &esk)).0 == epk.0
+                && ExtractedNoteCommitment::from(note.commitment()).to_bytes()[..] == *action.cmx
+        })
     })
 }
 
 /// Recovers the encrypted magic memo carried by `bundle` that was sent with `ovk`, if
-/// there is one. Unlike [`decrypt_with_ivk`], this needs the full transaction, for
-/// chunk 0's `out_ciphertext`.
+/// there is one. Unlike [`decrypt_with_ivk`], this needs the full transaction, for the
+/// first action's `out_ciphertext`.
+///
+/// An action opens only if its `out_ciphertext` decrypts under `ovk` and the decrypted
+/// `rseed` derives the `esk` that ciphertext holds.
 pub fn recover_with_ovk<A: orchard::bundle::Authorization, V>(
     ovk: &OutgoingViewingKey,
     bundle: &orchard::Bundle<A, V>,
 ) -> Option<Vec<u8>> {
-    let views: Vec<([u8; COMPACT_NOTE_SIZE], [u8; EPK_LEN])> = bundle
+    let ids: Vec<([u8; 32], [u8; 32])> = bundle
         .actions()
         .iter()
-        .map(|action| {
-            let note = action.encrypted_note();
-            let mut ciphertext = [0u8; COMPACT_NOTE_SIZE];
-            ciphertext.copy_from_slice(&note.enc_ciphertext[..COMPACT_NOTE_SIZE]);
-            (ciphertext, note.epk_bytes)
-        })
+        .map(|action| (action.nullifier().to_bytes(), action.cmx().to_bytes()))
         .collect();
-    let views: Vec<CompactView<'_>> = views.iter().map(|(c, e)| (&c[..], &e[..])).collect();
+    let views: Vec<ActionView<'_>> = bundle
+        .actions()
+        .iter()
+        .zip(&ids)
+        .map(|(action, (nf, cmx))| ActionView::of(action, nf, cmx))
+        .collect();
+    // Any valid address will do: the check below compares esk, which depends only on
+    // the note's rseed and rho.
+    let any_address = orchard::keys::FullViewingKey::from(
+        &orchard::keys::SpendingKey::from_bytes([0; 32]).expect("a valid spending key"),
+    )
+    .address_at(0u32, orchard::keys::Scope::External);
 
-    bundle.actions().iter().enumerate().find_map(|(i, action)| {
+    bundle.actions().iter().enumerate().find_map(|(j, action)| {
         let epk = EphemeralKeyBytes(action.encrypted_note().epk_bytes);
         let ock = IronwoodDomain::derive_ock(ovk, action.cv_net(), &action.cmx().to_bytes(), &epk);
         let out_ciphertext = &action.encrypted_note().out_ciphertext;
@@ -541,116 +511,77 @@ pub fn recover_with_ovk<A: orchard::bundle::Authorization, V>(
         let pk_d = IronwoodDomain::extract_pk_d(&plaintext)?;
         let esk = IronwoodDomain::extract_esk(&plaintext)?;
         let key = memo_key(IronwoodDomain::kdf(IronwoodDomain::ka_agree_enc(&esk, &pk_d), &epk).as_ref());
-        decrypt_with_key(&key, i, &views)
+        open_encrypted(&key, j, &views, |rseed| {
+            memo_note(any_address, &ids[j].0, rseed)
+                .and_then(|note| IronwoodDomain::derive_esk(&note))
+                .is_some_and(|derived| bool::from(derived.ct_eq(&esk)))
+        })
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand_core::OsRng;
 
-    fn decode_all(memo: &MagicMemo) -> Vec<DecodedChunk> {
-        memo.chunks()
+    fn address() -> orchard::Address {
+        orchard::keys::FullViewingKey::from(&orchard::keys::SpendingKey::from_bytes([3; 32]).unwrap())
+            .address_at(0u32, orchard::keys::Scope::External)
+    }
+
+    /// Views of public chunks, which need no action to build; `nf` and `cmx` are unused.
+    fn views(chunks: &[MagicMemoChunk]) -> Vec<ActionView<'_>> {
+        chunks
             .iter()
-            .map(|c| decode_chunk(c.compact_ciphertext(), c.epk_bytes()).unwrap())
+            .map(|c| ActionView::new(&[0; 32], &[0; 32], &c.epk[..], &c.compact_ciphertext[..]))
             .collect()
     }
 
-    fn views(memo: &MagicMemo) -> Vec<CompactView<'_>> {
-        memo.chunks()
-            .iter()
-            .map(|c| (&c.compact_ciphertext()[..], &c.epk_bytes()[..]))
-            .collect()
+    fn public_chunks(payload: &[u8]) -> Vec<MagicMemoChunk> {
+        let memo = MagicMemo::public(payload, address()).unwrap();
+        let chunks = memo.public_chunks().unwrap();
+        assert_eq!(chunks.len(), memo.actions_n());
+        chunks
     }
 
-    fn keys(seed: u8) -> (orchard::Address, PreparedIncomingViewingKey) {
-        let sk = orchard::keys::SpendingKey::from_bytes([seed; 32]).unwrap();
-        let fvk = orchard::keys::FullViewingKey::from(&sk);
-        let ivk = fvk.to_ivk(orchard::keys::Scope::External);
-        (ivk.address_at(0u32), PreparedIncomingViewingKey::new(&ivk))
+    /// An action that is not part of any memo.
+    fn junk(valid_epk: &MagicMemoChunk) -> MagicMemoChunk {
+        MagicMemoChunk {
+            epk: valid_epk.epk,
+            compact_ciphertext: [0x55; COMPACT_NOTE_SIZE],
+        }
     }
 
     #[test]
-    fn round_trips_single_and_multi_chunk_payloads() {
+    fn public_round_trips_and_needs_consecutive_actions() {
         for len in [
             0,
             1,
-            CIPHERTEXT_PAYLOAD_LEN,
-            CIPHERTEXT_PAYLOAD_LEN + 1,
-            MAGIC_MEMO_CHUNK_LEN,
-            MAGIC_MEMO_CHUNK_LEN + 1,
-            3 * MAGIC_MEMO_CHUNK_LEN + 5,
-            MAGIC_MEMO_MAX_LEN,
+            MAGIC_MEMO_PUBLIC_FIRST_LEN,
+            MAGIC_MEMO_PUBLIC_FIRST_LEN + 1,
+            MAGIC_MEMO_PUBLIC_FIRST_LEN + 3 * MAGIC_MEMO_NEXT_LEN + 5,
+            MAGIC_MEMO_PUBLIC_MAX_LEN,
         ] {
             let payload: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
-            let memo = MagicMemo::from_payload(&payload).unwrap();
-            assert_eq!(
-                memo.chunks().len(),
-                len.div_ceil(MAGIC_MEMO_CHUNK_LEN).max(1)
-            );
-            assert_eq!(memo.payload(), Some(payload.clone()));
-
-            for chunk in memo.chunks() {
+            let chunks = public_chunks(&payload);
+            assert_eq!(chunks.len(), actions_for(len, MAGIC_MEMO_PUBLIC_FIRST_LEN));
+            for chunk in &chunks {
                 assert!(is_valid_epk(chunk.epk_bytes()));
             }
-            let mut chunks = decode_all(&memo);
-            chunks.reverse();
-            assert_eq!(reassemble(chunks), Some(payload));
+            assert_eq!(decode_public(&views(&chunks)), Some(payload.clone()));
+
+            // Unrelated actions before and after are skipped.
+            let mut wrapped = chunks.clone();
+            wrapped.insert(0, junk(&chunks[0]));
+            wrapped.push(junk(&chunks[0]));
+            assert_eq!(decode_public(&views(&wrapped)), Some(payload.clone()));
         }
+        assert!(MagicMemo::public(&[0; MAGIC_MEMO_PUBLIC_MAX_LEN + 1], address()).is_none());
     }
 
     #[test]
-    fn zero_payload_still_has_a_valid_epk() {
-        // The all-zero encoding is the identity, so the tweak must move off it.
-        let memo = MagicMemo::from_payload(&[]).unwrap();
-        assert_ne!(memo.chunks()[0].epk_bytes(), &[0u8; EPK_LEN]);
-        assert!(is_valid_epk(memo.chunks()[0].epk_bytes()));
-    }
-
-    #[test]
-    fn rejects_bad_inputs() {
-        assert!(MagicMemo::from_payload(&[1; MAGIC_MEMO_MAX_LEN + 1]).is_none());
-        assert_eq!(decode_chunk(&[0u8; COMPACT_NOTE_SIZE], &[0u8; EPK_LEN]), None);
-
-        let memo = MagicMemo::from_payload(&[9; 2 * MAGIC_MEMO_CHUNK_LEN]).unwrap();
-        let chunks = decode_all(&memo);
-        assert_eq!(reassemble(chunks[..1].to_vec()), None, "missing chunk");
-        assert_eq!(
-            reassemble([chunks[0].clone(), chunks[0].clone()]),
-            None,
-            "repeated chunk"
-        );
-        assert_eq!(reassemble([]), None);
-    }
-
-    #[test]
-    fn encrypted_memo_opens_only_for_its_recipient() {
-        let (recipient, ivk) = keys(1);
-        let (_, other_ivk) = keys(2);
-        for len in [
-            0,
-            MAGIC_MEMO_ENCRYPTED_FIRST_CHUNK_LEN,
-            MAGIC_MEMO_ENCRYPTED_FIRST_CHUNK_LEN + 1,
-            MAGIC_MEMO_ENCRYPTED_FIRST_CHUNK_LEN + 2 * MAGIC_MEMO_CHUNK_LEN + 3,
-        ] {
-            let payload: Vec<u8> = (0..len).map(|i| (i * 5 + 1) as u8).collect();
-            let memo = MagicMemo::encrypted(recipient, None, &payload, &mut OsRng).unwrap();
-            assert!(memo.is_encrypted());
-            assert_eq!(memo.payload(), None);
-            for chunk in memo.chunks() {
-                assert!(is_valid_epk(chunk.epk_bytes()));
-                assert_eq!(decode_chunk(chunk.compact_ciphertext(), chunk.epk_bytes()), None, "not public");
-            }
-
-            // Shuffled among unrelated actions, as the builder would.
-            let decoy = MagicMemo::from_payload(b"decoy").unwrap();
-            let mut actions = views(&memo);
-            actions.reverse();
-            actions.insert(1, views(&decoy)[0]);
-            assert_eq!(decrypt_with_ivk(&ivk, &actions), Some(payload));
-            assert_eq!(decrypt_with_ivk(&other_ivk, &actions), None);
-        }
-        assert!(MagicMemo::encrypted(recipient, None, &[0; MAGIC_MEMO_ENCRYPTED_MAX_LEN + 1], &mut OsRng).is_none());
+    fn public_memo_cut_short_is_not_read() {
+        let payload = [7u8; MAGIC_MEMO_PUBLIC_FIRST_LEN + MAGIC_MEMO_NEXT_LEN];
+        let chunks = public_chunks(&payload);
+        assert_eq!(decode_public(&views(&chunks[..1])), None);
     }
 }

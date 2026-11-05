@@ -398,7 +398,7 @@ struct BuildPrep {
     o_inputs: Vec<ProposedOrchardSpend>,
     o_outputs: Vec<ProposedOrchardOutput>,
     #[cfg(feature = "magic-memo")]
-    o_magic_memos: Vec<(orchard::Address, MagicMemo)>, // each adds one Ironwood output per chunk
+    o_magic_memos: Vec<MagicMemo>, // each adds `actions_n()` Ironwood outputs
 
     staking_action: Option<StakingAction>,
     staking_signing_key: Option<SigningKey>,
@@ -407,7 +407,7 @@ impl BuildPrep {
     /// Ironwood outputs, counting each magic memo chunk as one.
     fn o_outputs_n(&self) -> usize {
         #[cfg(feature = "magic-memo")]
-        let magic_n: usize = self.o_magic_memos.iter().map(|(_, memo)| memo.chunks().len()).sum();
+        let magic_n: usize = self.o_magic_memos.iter().map(|memo| memo.actions_n()).sum();
         #[cfg(not(feature = "magic-memo"))]
         let magic_n = 0;
         self.o_outputs.len() + magic_n
@@ -1270,11 +1270,9 @@ enum TxOutput {
         zats: Zatoshis,
         memo: MemoBytes,
     },
-    /// Experimental: one zero-value Ironwood output to `dst` per chunk of `memo`, publishing it unencrypted;
-    /// `dst` can never decrypt them.
+    /// Experimental: `memo.actions_n()` zero-value Ironwood outputs to `memo.recipient()`, carrying `memo`.
     #[cfg(feature = "magic-memo")]
     IronwoodMagicMemo {
-        dst: orchard::Address,
         memo: MagicMemo,
     },
 }
@@ -1763,8 +1761,8 @@ impl ManualWallet {
         }
 
         #[cfg(feature = "magic-memo")]
-        for (dst, memo) in o_magic_memos {
-            if let Err(err) = txb.add_ironwood_magic_memo::<zip317::FeeError>(dst, memo) {
+        for memo in o_magic_memos {
+            if let Err(err) = txb.add_ironwood_magic_memo::<zip317::FeeError>(memo) {
                 if DUMP_TX_BUILD { println!("constructing magic memo output: {err:?}"); }
                 return None;
             }
@@ -2015,14 +2013,14 @@ impl ManualWallet {
                     if DUMP_TX_BUILD { println!("  added orchard output: {}", zats.into_u64()); }
                 }
                 #[cfg(feature = "magic-memo")]
-                &TxOutput::IronwoodMagicMemo{ dst, ref memo } => {
-                    // Zero value: nothing sent or received, but each chunk's action can raise the fee.
-                    if let Err(err) = txb.add_ironwood_magic_memo::<zip317::FeeError>(dst, memo.clone()) {
+                &TxOutput::IronwoodMagicMemo{ ref memo } => {
+                    // Zero value: nothing sent or received, but each of its actions can raise the fee.
+                    if let Err(err) = txb.add_ironwood_magic_memo::<zip317::FeeError>(memo.clone()) {
                         println!("tx build error: {err:?}");
                         return None;
                     }
-                    prep.o_magic_memos.push((dst, memo.clone()));
-                    if DUMP_TX_BUILD { println!("  added magic memo output: {:?}", memo); }
+                    prep.o_magic_memos.push(memo.clone());
+                    if DUMP_TX_BUILD { println!("  added magic memo outputs: {}", memo.actions_n()); }
                 }
             }
         }
@@ -2266,7 +2264,7 @@ impl ManualWallet {
 
     /// Experimental: proposes a transaction whose only outputs carry `staged.payload` as a magic memo: in plaintext,
     /// or encrypted to `staged.to` (which our outgoing viewing key can also recover from the full tx).
-    /// It costs only the fee, which grows with the memo's chunk count.
+    /// It costs only the fee, which grows with the number of actions the memo takes.
     #[cfg(feature = "magic-memo")]
     pub fn publish_magic_memo<P: Parameters>(
         &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
@@ -2276,19 +2274,22 @@ impl ManualWallet {
         let tz = Timer::scope("publish_magic_memo");
         let account = &self.accounts[0];
         let (_t_addr, _p2sh, ua) = addrs_from_account(account, 0).unwrap(); // @Hack
-        let (dst, memo) = match staged.to {
+        let memo = match staged.to {
             Some(to) => {
-                let ovk = PreparedKeys::from_ufvk_all(&account.ufvk).orchard_ovk;
-                (to, MagicMemo::encrypted(to, ovk, &staged.payload, &mut OsRng))
+                let Some(ovk) = PreparedKeys::from_ufvk_all(&account.ufvk).orchard_ovk else {
+                    println!("an encrypted magic memo needs the wallet's outgoing viewing key");
+                    return None;
+                };
+                MagicMemo::encrypted(&staged.payload, to, ovk)
             }
-            // The outputs are undecryptable whoever receives them, so our own address is as good as any.
-            None => (*ua.orchard()?, MagicMemo::from_payload(&staged.payload)),
+            // The outputs are useless to whoever receives them, so our own address is as good as any.
+            None => MagicMemo::public(&staged.payload, *ua.orchard()?),
         };
         let Some(memo) = memo else {
             println!("magic memo of {} bytes is too long to publish", staged.payload.len());
             return None;
         };
-        let out = &[TxOutput::IronwoodMagicMemo{ dst, memo }];
+        let out = &[TxOutput::IronwoodMagicMemo{ memo }];
         let opts = &TxOptions{ src_pools: &[TxPool::Ironwood(orchard_tree), TxPool::Transparent], ..TxOptions::default() };
         self.send_zats(network, tx, client, out, src_usk, opts)
     }
@@ -3297,34 +3298,28 @@ pub fn string_from_t_addr<P: Parameters>(params: P, t_addr: TransparentAddress) 
 }
 
 /// Experimental: records the magic memo carried by a compact tx's Ironwood actions, if they carry a public one or
-/// one encrypted to `ivk` (the scanning wallet `wallet_name`'s). Everything comes from the compact actions; the full
-/// transaction is never fetched.
+/// one encrypted to the scanning wallet `wallet_name`'s default Orchard address. Everything comes from the compact
+/// actions; the full transaction is never fetched.
 #[cfg(feature = "magic-memo")]
-fn note_magic_memo(block_h: BlockHeight, txid: &TxId, tx: &CompactTx, ivk: Option<&orchard::keys::PreparedIncomingViewingKey>, wallet_name: &'static str) {
+fn note_magic_memo(block_h: BlockHeight, txid: &TxId, tx: &CompactTx, keys: &PreparedKeys, wallet_name: &'static str) {
     if tx.ironwood_actions.is_empty() { return; }
-    let chunks: Vec<magic_memo::DecodedChunk> = tx.ironwood_actions.iter()
-        .filter_map(|action| magic_memo::decode_chunk(&action.ciphertext, &action.ephemeral_key))
+    let views: Vec<magic_memo::ActionView<'_>> = tx.ironwood_actions.iter()
+        .map(|action| magic_memo::ActionView::new(&action.nullifier, &action.cmx, &action.ephemeral_key, &action.ciphertext))
         .collect();
 
-    let (payload, decrypted_by) = if !chunks.is_empty() {
-        // Public: every wallet sees it; record it once.
+    // Public: every wallet sees it; record it once. MEMO at a fixed place in a random ciphertext has
+    // probability 2^-32 per action, and random bytes are almost never UTF-8.
+    let public = magic_memo::decode_public(&views).filter(|payload| std::str::from_utf8(payload).is_ok());
+    let (payload, decrypted_by) = if let Some(payload) = public {
         if MAGIC_MEMOS_SEEN.lock().unwrap().iter().any(|m| m.txid == *txid) { return; }
-        let chunks_n = chunks.len();
-        let Some(payload) = magic_memo::reassemble(chunks) else {
-            println!("magic memo in {txid} at {block_h:?} has missing or repeated chunks ({chunks_n} seen); ignoring it");
-            return;
-        };
-        // An ordinary ciphertext opens with the prefix with probability 2^-32; random bytes are almost never UTF-8.
-        if std::str::from_utf8(&payload).is_err() { return; }
         (payload, None)
     } else {
-        // Encrypted: one key agreement per action, the same cost as the note trial decryption that follows.
-        let Some(ivk) = ivk else { return; };
+        // Encrypted: about one key agreement per action, as the note trial decryption that follows costs. Only
+        // memos to the wallet's default address (diversifier index 0, the one it hands out) are found.
+        let (Some(ivk), Some(fvk)) = (&keys.orchard_ivk, &keys.orchard_fvk) else { return; };
         if MAGIC_MEMOS_SEEN.lock().unwrap().iter().any(|m| m.txid == *txid && m.decrypted_by == Some(wallet_name)) { return; }
-        let views: Vec<magic_memo::CompactView<'_>> = tx.ironwood_actions.iter()
-            .map(|action| (&action.ciphertext[..], &action.ephemeral_key[..]))
-            .collect();
-        let Some(payload) = magic_memo::decrypt_with_ivk(ivk, &views) else { return; };
+        let address = fvk.address_at(0u32, orchard::keys::Scope::External);
+        let Some(payload) = magic_memo::decrypt_with_ivk(ivk, address, &views) else { return; };
         (payload, Some(wallet_name))
     };
 
@@ -3341,7 +3336,7 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
 
     // Ironwood-native: our notes live in the Ironwood bundle (see the build config).
     #[cfg(feature = "magic-memo")]
-    note_magic_memo(block_h, &txid, tx, keys.orchard_ivk.as_ref(), wallet.name);
+    note_magic_memo(block_h, &txid, tx, keys, wallet.name);
 
     for orchard_action in &tx.ironwood_actions {
         let action = match OrchardCompactAction::try_from(orchard_action) {
@@ -5197,7 +5192,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             .map(|ua| Some(*ua.orchard().expect("decode_send_address only accepts addresses with an Orchard receiver")))
                             .map_err(|reason| format!("{reason}: {address}")),
                     };
-                    let max_len = if address.is_some() { magic_memo::MAGIC_MEMO_ENCRYPTED_MAX_LEN } else { magic_memo::MAGIC_MEMO_MAX_LEN };
+                    let max_len = if address.is_some() { magic_memo::MAGIC_MEMO_ENCRYPTED_MAX_LEN } else { magic_memo::MAGIC_MEMO_PUBLIC_MAX_LEN };
                     match to {
                         Err(reason) => { let _ = sender.send(Err(reason)); }
                         Ok(_) if text.len() > max_len => {

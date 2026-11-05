@@ -82,6 +82,7 @@ redjubjub.workspace = true
 chacha20poly1305 = { version = "0.10", default-features = false, optional = true }
 group = { workspace = true, optional = true }
 pasta_curves = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
 
 # No-std support
 corez.workspace = true
@@ -154,7 +155,7 @@ no-expensive-tests = []
 
 ## Experimental: magic memos, public payloads carried in the compact-block view of
 ## zero-value Ironwood outputs (`transaction::magic_memo`). Unstable; off by default.
-unstable-magic-memo = ["dep:chacha20poly1305", "dep:group", "dep:pasta_curves"]
+unstable-magic-memo = ["dep:chacha20poly1305", "dep:group", "dep:pasta_curves", "dep:subtle"]
 
 ## A feature that provides `FeeRule` implementations and constructors for
 ## non-standard fees.

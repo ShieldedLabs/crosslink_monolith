@@ -119,6 +119,11 @@ pub enum Error<FE> {
     /// for PCZT construction, which does not support them.
     #[cfg(feature = "unstable-magic-memo")]
     MagicMemoUnsupported,
+    /// The builder could not place a magic memo's outputs in consecutive actions within
+    /// [`MAGIC_MEMO_PLACEMENT_TRIES`] shuffles; the bundle has too many other outputs for
+    /// a memo that long.
+    #[cfg(feature = "unstable-magic-memo")]
+    MagicMemoPlacement,
     /// Anchors can be deferred to proving time only under a transaction version whose
     /// txid and sighash exclude shielded anchors (V6, NU6.3 onward); this version commits
     /// its signatures to the anchors, so they must be supplied at build time (use
@@ -179,6 +184,11 @@ impl<FE: fmt::Display> fmt::Display for Error<FE> {
             Error::IronwoodBuilderNotAvailable => write!(
                 f,
                 "Cannot create Ironwood transactions without an Ironwood anchor, or before NU6.3 activation"
+            ),
+            #[cfg(feature = "unstable-magic-memo")]
+            Error::MagicMemoPlacement => write!(
+                f,
+                "Could not place the magic memo's outputs in consecutive actions"
             ),
             #[cfg(feature = "unstable-magic-memo")]
             Error::MagicMemoUnsupported => write!(
@@ -829,9 +839,13 @@ pub struct Builder<P, U> {
     orchard_bundle_version: Option<orchard::bundle::BundleVersion>,
     ironwood_builder: Option<orchard::builder::Builder>,
     /// The index, among `ironwood_builder`'s plain outputs, of the first of the
-    /// consecutive zero-value outputs that carry the memo's chunks, and the memo.
+    /// zero-value outputs that carry the memo, and the memo.
     #[cfg(feature = "unstable-magic-memo")]
     ironwood_magic_memo: Option<(usize, MagicMemo)>,
+    /// Everything added to `ironwood_builder`, so that a fresh one can be built again
+    /// until a magic memo's outputs land in consecutive actions.
+    #[cfg(feature = "unstable-magic-memo")]
+    ironwood_replay: alloc::vec::Vec<IronwoodOp>,
     staking_action: Option<StakingAction>,
     // NOTE: upstream removed `tze_builder` from `Builder` along with the `'a` lifetime it
     // required. The zfuture TZE experiment is not used by Crosslink, so the field is dropped
@@ -1033,6 +1047,8 @@ impl<P: consensus::Parameters> Builder<P, ()> {
             ironwood_builder,
             #[cfg(feature = "unstable-magic-memo")]
             ironwood_magic_memo: None,
+            #[cfg(feature = "unstable-magic-memo")]
+            ironwood_replay: alloc::vec::Vec::new(),
             staking_action: None,
             _progress_notifier: (),
         }
@@ -1065,6 +1081,8 @@ impl<P: consensus::Parameters> Builder<P, ()> {
             ironwood_builder: self.ironwood_builder,
             #[cfg(feature = "unstable-magic-memo")]
             ironwood_magic_memo: self.ironwood_magic_memo,
+            #[cfg(feature = "unstable-magic-memo")]
+            ironwood_replay: self.ironwood_replay,
             staking_action: self.staking_action,
             _progress_notifier,
         }
@@ -1188,9 +1206,13 @@ impl<P: consensus::Parameters, U> Builder<P, U> {
             return Err(Error::IronwoodSpendUnsupportedNoteVersion(note.version()));
         }
 
+        #[cfg(feature = "unstable-magic-memo")]
+        let replay = IronwoodOp::Spend(fvk.clone(), note, merkle_path.clone());
         builder
             .add_spend(fvk, note, merkle_path)
             .map_err(Error::IronwoodSpend)?;
+        #[cfg(feature = "unstable-magic-memo")]
+        self.ironwood_replay.push(replay);
         Ok(())
     }
 
@@ -1205,23 +1227,25 @@ impl<P: consensus::Parameters, U> Builder<P, U> {
         value: Zatoshis,
         memo: MemoBytes,
     ) -> Result<(), Error<FE>> {
+        let value = orchard::value::NoteValue::from_raw(value.into());
+        let memo = memo.into_bytes();
+        #[cfg(feature = "unstable-magic-memo")]
+        let replay = IronwoodOp::Output(ovk.clone(), recipient, value, memo);
         self.ironwood_builder
             .as_mut()
             .ok_or(Error::IronwoodBuilderNotAvailable)?
-            .add_output(
-                ovk,
-                recipient,
-                orchard::value::NoteValue::from_raw(value.into()),
-                memo.into_bytes(),
-            )
-            .map_err(Error::IronwoodRecipient)
+            .add_output(ovk, recipient, value, memo)
+            .map_err(Error::IronwoodRecipient)?;
+        #[cfg(feature = "unstable-magic-memo")]
+        self.ironwood_replay.push(replay);
+        Ok(())
     }
 
-    /// Experimental: adds one zero-value Ironwood output to `recipient` per chunk of
-    /// `memo`, whose compact-visible `epk` and ciphertext bytes are replaced by that
-    /// chunk, publishing the memo's payload unencrypted.
+    /// Experimental: adds [`MagicMemo::actions_n`] zero-value Ironwood outputs to the
+    /// memo's [`MagicMemo::recipient`], which [`Self::build`] places in consecutive
+    /// actions and rewrites to carry the memo.
     ///
-    /// The outputs' notes are undecryptable, including by `recipient`. The outputs are
+    /// The outputs' notes cannot be decrypted as notes by anyone. The outputs are
     /// ordinary plain outputs for fee and padding purposes.
     ///
     /// Returns [`Error::IronwoodBuilderNotAvailable`] if this builder has no Ironwood
@@ -1230,31 +1254,23 @@ impl<P: consensus::Parameters, U> Builder<P, U> {
     ///
     /// See [`crate::transaction::magic_memo`].
     #[cfg(feature = "unstable-magic-memo")]
-    pub fn add_ironwood_magic_memo<FE>(
-        &mut self,
-        recipient: orchard::Address,
-        memo: MagicMemo,
-    ) -> Result<(), Error<FE>> {
+    pub fn add_ironwood_magic_memo<FE>(&mut self, memo: MagicMemo) -> Result<(), Error<FE>> {
         if self.build_config.is_coinbase() || self.ironwood_magic_memo.is_some() {
             return Err(Error::MagicMemoUnsupported);
         }
-        let builder = self
+        let first_output_i = self
             .ironwood_builder
-            .as_mut()
-            .ok_or(Error::IronwoodBuilderNotAvailable)?;
-
-        // Plain outputs are numbered in the order they were added; see
-        // `orchard::builder::BundleMetadata::output_action_index`.
-        let first_output_i = builder.outputs().len();
-        for _ in memo.chunks() {
-            builder
-                .add_output(
-                    None,
-                    recipient,
-                    orchard::value::NoteValue::from_raw(0),
-                    MemoBytes::empty().into_bytes(),
-                )
-                .map_err(Error::IronwoodRecipient)?;
+            .as_ref()
+            .ok_or(Error::IronwoodBuilderNotAvailable)?
+            .outputs()
+            .len();
+        for _ in 0..memo.actions_n() {
+            self.add_ironwood_output(
+                memo.ovk().cloned(),
+                memo.recipient(),
+                Zatoshis::ZERO,
+                MemoBytes::empty(),
+            )?;
         }
         self.ironwood_magic_memo = Some((first_output_i, memo));
         Ok(())
@@ -1649,8 +1665,15 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
             None => (None, orchard::builder::BundleMetadata::empty()),
         };
 
-        let (ironwood_bundle, ironwood_meta) = match self
-            .ironwood_builder
+        // A magic memo's bundle is built below instead, from `ironwood_replay`.
+        #[cfg(feature = "unstable-magic-memo")]
+        let magic_memo = self.ironwood_magic_memo.take();
+        #[cfg(feature = "unstable-magic-memo")]
+        let ironwood_builder = self.ironwood_builder.filter(|_| magic_memo.is_none());
+        #[cfg(not(feature = "unstable-magic-memo"))]
+        let ironwood_builder = self.ironwood_builder;
+
+        let (ironwood_bundle, ironwood_meta) = match ironwood_builder
             .and_then(|builder| {
                 builder
                     .build(&mut rng)
@@ -1666,17 +1689,18 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
         // Before the digest below, which the signatures commit to; the proof does not
         // cover `epk` or ciphertexts, so proving is unaffected.
         #[cfg(feature = "unstable-magic-memo")]
-        let ironwood_bundle = match (&self.ironwood_magic_memo, ironwood_bundle) {
-            (Some((first_output_i, memo)), Some(bundle)) => {
-                let chunk_action_is = memo.chunks().iter().enumerate().map(|(chunk_i, chunk)| {
-                    let action_i = ironwood_meta
-                        .output_action_index(first_output_i + chunk_i)
-                        .expect("every magic memo output was added to this builder");
-                    (action_i, chunk)
-                });
-                Some(with_magic_memo_chunks(bundle, chunk_action_is.collect(), &mut rng))
+        let (ironwood_bundle, ironwood_meta) = match magic_memo {
+            None => (ironwood_bundle, ironwood_meta),
+            Some((first_output_i, memo)) => {
+                let (bundle, meta) = build_ironwood_with_magic_memo(
+                    &self.build_config,
+                    &self.ironwood_replay,
+                    first_output_i,
+                    &memo,
+                    &mut rng,
+                )?;
+                (Some(bundle), meta)
             }
-            (_, bundle) => bundle,
         };
 
         let unauthed_tx: TransactionData<A> = TransactionData {
@@ -1840,8 +1864,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
 
 /// Returns `bundle` with, for each `(action_i, chunk)`, the `epk` and the first
 /// [`zcash_note_encryption::COMPACT_NOTE_SIZE`] bytes of the `enc_ciphertext` of its
-/// action at `action_i` replaced by `chunk`'s, and its `out_ciphertext` too if `chunk`
-/// has one to carry (which depends on the action's `cv_net` and `cmx`).
+/// action at `action_i` replaced by `chunk`'s.
 ///
 /// Every other part of every action is kept, in particular the proof-bound `nf`, `rk`,
 /// `cmx` and `cv_net`, as is all authorizing data. This is sound only before the
@@ -1852,10 +1875,9 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
 /// moved out, the actions are rebuilt with `Action::from_parts`, and the authorizing
 /// data is moved back in, in action order.
 #[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
-fn with_magic_memo_chunks<A: orchard::bundle::Authorization, R: RngCore>(
+fn with_magic_memo_chunks<A: orchard::bundle::Authorization>(
     bundle: orchard::Bundle<A, ZatBalance>,
     chunks: Vec<(usize, &crate::transaction::magic_memo::MagicMemoChunk)>,
-    rng: &mut R,
 ) -> orchard::Bundle<A, ZatBalance> {
     let flags = *bundle.flags();
     let value_balance = *bundle.value_balance();
@@ -1883,9 +1905,6 @@ fn with_magic_memo_chunks<A: orchard::bundle::Authorization, R: RngCore>(
             encrypted_note.epk_bytes = *chunk.epk_bytes();
             encrypted_note.enc_ciphertext[..zcash_note_encryption::COMPACT_NOTE_SIZE]
                 .copy_from_slice(chunk.compact_ciphertext());
-            if let Some(out_ciphertext) = chunk.out_ciphertext(action.cv_net(), action.cmx(), rng) {
-                encrypted_note.out_ciphertext = out_ciphertext;
-            }
         }
         i += 1;
         orchard::Action::from_parts(
@@ -1916,6 +1935,87 @@ fn with_magic_memo_chunks<A: orchard::bundle::Authorization, R: RngCore>(
         |restore, _, ()| restore.0.next().expect("one authorization per action"),
         |restore, _| restore.1.take().expect("the bundle authorization was stashed"),
     )
+}
+
+/// One addition to an Ironwood builder, kept so that it can be replayed into a fresh one.
+#[cfg(feature = "unstable-magic-memo")]
+enum IronwoodOp {
+    Spend(
+        orchard::keys::FullViewingKey,
+        orchard::Note,
+        orchard::tree::MerklePath,
+    ),
+    Output(
+        Option<orchard::keys::OutgoingViewingKey>,
+        orchard::Address,
+        orchard::value::NoteValue,
+        [u8; 512],
+    ),
+}
+
+/// How many shuffles [`build_ironwood_with_magic_memo`] tries before giving up. With one
+/// other output (the usual change) an `n`-action memo lands consecutively with
+/// probability `2 / (n + 1)` per try.
+#[cfg(feature = "unstable-magic-memo")]
+pub const MAGIC_MEMO_PLACEMENT_TRIES: usize = 1000;
+
+/// Builds the Ironwood bundle from `replay` again and again, until the memo's outputs
+/// (the plain outputs from `first_output_i` on) land in consecutive actions, then writes
+/// the memo into those actions, in action order.
+///
+/// Returns [`Error::MagicMemoPlacement`] if no shuffle within
+/// [`MAGIC_MEMO_PLACEMENT_TRIES`] places them consecutively.
+#[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
+fn build_ironwood_with_magic_memo<FE, R: RngCore>(
+    build_config: &BuildConfig,
+    replay: &[IronwoodOp],
+    first_output_i: usize,
+    memo: &MagicMemo,
+    rng: &mut R,
+) -> Result<
+    (
+        orchard::builder::UnauthorizedBundle<ZatBalance>,
+        orchard::builder::BundleMetadata,
+    ),
+    Error<FE>,
+> {
+    let actions_n = memo.actions_n();
+    for _ in 0..MAGIC_MEMO_PLACEMENT_TRIES {
+        let mut builder = build_config
+            .ironwood_builder()
+            .ok_or(Error::IronwoodBuilderNotAvailable)?;
+        for op in replay {
+            match op {
+                IronwoodOp::Spend(fvk, note, merkle_path) => builder
+                    .add_spend(fvk.clone(), *note, merkle_path.clone())
+                    .map_err(Error::IronwoodSpend)?,
+                IronwoodOp::Output(ovk, recipient, value, memo_bytes) => builder
+                    .add_output(ovk.clone(), *recipient, *value, *memo_bytes)
+                    .map_err(Error::IronwoodRecipient)?,
+            }
+        }
+        let (bundle, meta) = builder
+            .build::<ZatBalance>(&mut *rng)
+            .map_err(Error::IronwoodBuild)?
+            .expect("the memo's outputs make the bundle non-empty");
+
+        let action_is: alloc::vec::Vec<usize> = (first_output_i..first_output_i + actions_n)
+            .map(|output_i| {
+                meta.output_action_index(output_i)
+                    .expect("every magic memo output was added to this builder")
+            })
+            .collect();
+        let first = *action_is.iter().min().expect("a memo has at least one action");
+        // The indices are distinct, so they are consecutive iff they all fit in the run.
+        if action_is.iter().all(|&i| i < first + actions_n) {
+            let chunks = memo
+                .chunks_for(&bundle.actions()[first])
+                .expect("the first memo action is an output built for this memo");
+            let bundle = with_magic_memo_chunks(bundle, (first..).zip(chunks.iter()).collect());
+            return Ok((bundle, meta));
+        }
+    }
+    Err(Error::MagicMemoPlacement)
 }
 
 impl<P: consensus::Parameters, U> Builder<P, U> {
@@ -2550,10 +2650,8 @@ mod tests {
             )
             .unwrap();
         let memo = memo_for(&fvk, recipient);
-        let chunks_n = memo.chunks().len();
-        builder
-            .add_ironwood_magic_memo::<Infallible>(recipient, memo)
-            .unwrap();
+        let chunks_n = memo.actions_n();
+        builder.add_ironwood_magic_memo::<Infallible>(memo).unwrap();
 
         let res = builder
             .mock_build(
@@ -2605,84 +2703,123 @@ mod tests {
         (res, fvk, chunks_n)
     }
 
-    /// What a compact action shows of each of `bundle`'s actions: its ciphertext prefix
-    /// and `epk`.
+    /// Each of `bundle`'s actions' nullifier and `cmx`, for building compact views.
     #[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
-    fn compact_views<A: orchard::bundle::Authorization>(
+    fn action_ids<A: orchard::bundle::Authorization>(
         bundle: &orchard::Bundle<A, ZatBalance>,
-    ) -> alloc::vec::Vec<(&[u8], &[u8])> {
+    ) -> alloc::vec::Vec<([u8; 32], [u8; 32])> {
         bundle
             .actions()
             .iter()
-            .map(|action| {
-                let note = action.encrypted_note();
-                (
-                    &note.enc_ciphertext[..zcash_note_encryption::COMPACT_NOTE_SIZE],
-                    &note.epk_bytes[..],
-                )
-            })
+            .map(|action| (action.nullifier().to_bytes(), action.cmx().to_bytes()))
             .collect()
+    }
+
+    /// What a compact block shows of each of `bundle`'s actions.
+    #[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
+    fn compact_views<'a, A: orchard::bundle::Authorization>(
+        bundle: &'a orchard::Bundle<A, ZatBalance>,
+        ids: &'a [([u8; 32], [u8; 32])],
+    ) -> alloc::vec::Vec<magic_memo::ActionView<'a>> {
+        bundle
+            .actions()
+            .iter()
+            .zip(ids)
+            .map(|(action, (nf, cmx))| magic_memo::ActionView::of(action, nf, cmx))
+            .collect()
+    }
+
+    /// The memo's actions must be consecutive, as receivers read them in action order.
+    #[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
+    fn assert_memo_actions_consecutive(res: &super::BuildResult, chunks_n: usize) {
+        // The ordinary output is plain output 0; the memo's are 1..=chunks_n.
+        let mut action_is: alloc::vec::Vec<usize> = (1..=chunks_n)
+            .map(|output_i| res.ironwood_meta().output_action_index(output_i).unwrap())
+            .collect();
+        action_is.sort();
+        assert_eq!(action_is.last().unwrap() - action_is[0] + 1, chunks_n);
     }
 
     #[test]
     #[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
     fn public_magic_memo_is_published_and_bundle_still_verifies() {
-        // Spans three chunks, so three actions.
-        let payload: alloc::vec::Vec<u8> = (0..2 * magic_memo::MAGIC_MEMO_CHUNK_LEN + 10)
+        // Spans three actions.
+        let payload: alloc::vec::Vec<u8> = (0..magic_memo::MAGIC_MEMO_PUBLIC_FIRST_LEN
+            + magic_memo::MAGIC_MEMO_NEXT_LEN
+            + 10)
             .map(|i| b'a' + (i % 26) as u8)
             .collect();
-        let (res, _, chunks_n) =
-            build_and_verify_with_magic_memo(|_, _| MagicMemo::from_payload(&payload).unwrap());
+        let (res, _, chunks_n) = build_and_verify_with_magic_memo(|_, recipient| {
+            MagicMemo::public(&payload, recipient).unwrap()
+        });
         assert_eq!(chunks_n, 3);
+        assert_memo_actions_consecutive(&res, chunks_n);
         let bundle = res.transaction().ironwood_bundle().unwrap();
-
-        let memo_action_is: alloc::vec::Vec<usize> = (1..=chunks_n)
-            .map(|output_i| res.ironwood_meta().output_action_index(output_i).unwrap())
-            .collect();
-        let mut chunks = alloc::vec::Vec::new();
-        for (action_i, (ciphertext, epk)) in compact_views(bundle).into_iter().enumerate() {
-            let chunk = magic_memo::decode_chunk(ciphertext, epk);
-            assert_eq!(chunk.is_some(), memo_action_is.contains(&action_i));
-            chunks.extend(chunk);
-        }
-        assert_eq!(magic_memo::reassemble(chunks), Some(payload));
+        let ids = action_ids(bundle);
+        assert_eq!(
+            magic_memo::decode_public(&compact_views(bundle, &ids)),
+            Some(payload)
+        );
     }
 
     #[test]
     #[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
     fn encrypted_magic_memo_opens_with_ivk_and_ovk_only() {
-        // Spans three chunks: the first carries fewer bytes, its epk being a real key.
-        let payload: alloc::vec::Vec<u8> = (0..magic_memo::MAGIC_MEMO_ENCRYPTED_FIRST_CHUNK_LEN
-            + magic_memo::MAGIC_MEMO_CHUNK_LEN
+        // Spans three actions.
+        let payload: alloc::vec::Vec<u8> = (0..magic_memo::MAGIC_MEMO_ENCRYPTED_FIRST_LEN
+            + magic_memo::MAGIC_MEMO_NEXT_LEN
             + 10)
             .map(|i| b'A' + (i % 26) as u8)
             .collect();
         let (res, fvk, chunks_n) = build_and_verify_with_magic_memo(|fvk, recipient| {
             let ovk = fvk.to_ovk(orchard::keys::Scope::External);
-            MagicMemo::encrypted(recipient, Some(ovk), &payload, &mut OsRng).unwrap()
+            MagicMemo::encrypted(&payload, recipient, ovk).unwrap()
         });
         assert_eq!(chunks_n, 3);
+        assert_memo_actions_consecutive(&res, chunks_n);
         let bundle = res.transaction().ironwood_bundle().unwrap();
-        let views = compact_views(bundle);
+        let ids = action_ids(bundle);
+        let views = compact_views(bundle, &ids);
+        assert_eq!(magic_memo::decode_public(&views), None, "nothing public");
 
-        for (ciphertext, epk) in &views {
-            assert_eq!(magic_memo::decode_chunk(ciphertext, epk), None, "nothing public");
-        }
-
-        let ivk = orchard::keys::PreparedIncomingViewingKey::new(
-            &fvk.to_ivk(orchard::keys::Scope::External),
+        let ivk = fvk.to_ivk(orchard::keys::Scope::External);
+        let recipient = ivk.address_at(0u32);
+        let prepared_ivk = orchard::keys::PreparedIncomingViewingKey::new(&ivk);
+        assert_eq!(
+            magic_memo::decrypt_with_ivk(&prepared_ivk, recipient, &views),
+            Some(payload.clone())
         );
-        assert_eq!(magic_memo::decrypt_with_ivk(&ivk, &views), Some(payload.clone()));
         let ovk = fvk.to_ovk(orchard::keys::Scope::External);
         assert_eq!(magic_memo::recover_with_ovk(&ovk, bundle), Some(payload));
 
+        // A wallet that does not know magic memos sees only the ordinary output's note.
+        let ordinary_notes = bundle
+            .actions()
+            .iter()
+            .filter(|action| {
+                let domain = orchard::note_encryption::IronwoodDomain::for_action(action);
+                zcash_note_encryption::try_note_decryption(&domain, &prepared_ivk, *action).is_some()
+            })
+            .count();
+        assert_eq!(ordinary_notes, 1);
+
+        // Another address of the same key, and another key, open nothing.
+        assert_eq!(
+            magic_memo::decrypt_with_ivk(&prepared_ivk, ivk.address_at(1u32), &views),
+            None
+        );
         let other = orchard::keys::FullViewingKey::from(
             &orchard::keys::SpendingKey::from_bytes([8; 32]).unwrap(),
         );
-        let other_ivk = orchard::keys::PreparedIncomingViewingKey::new(
-            &other.to_ivk(orchard::keys::Scope::External),
+        let other_ivk = other.to_ivk(orchard::keys::Scope::External);
+        assert_eq!(
+            magic_memo::decrypt_with_ivk(
+                &orchard::keys::PreparedIncomingViewingKey::new(&other_ivk),
+                other_ivk.address_at(0u32),
+                &views
+            ),
+            None
         );
-        assert_eq!(magic_memo::decrypt_with_ivk(&other_ivk, &views), None);
         assert_eq!(
             magic_memo::recover_with_ovk(&other.to_ovk(orchard::keys::Scope::External), bundle),
             None
@@ -2709,8 +2846,7 @@ mod tests {
         .address_at(0u32, orchard::keys::Scope::External);
         builder
             .add_ironwood_magic_memo::<Infallible>(
-                recipient,
-                crate::transaction::magic_memo::MagicMemo::from_payload(b"pczt").unwrap(),
+                crate::transaction::magic_memo::MagicMemo::public(b"pczt", recipient).unwrap(),
             )
             .unwrap();
 
@@ -3079,6 +3215,8 @@ mod tests {
             ironwood_builder: None,
             #[cfg(feature = "unstable-magic-memo")]
             ironwood_magic_memo: None,
+            #[cfg(feature = "unstable-magic-memo")]
+            ironwood_replay: alloc::vec::Vec::new(),
             _progress_notifier: (),
             staking_action: None,
         };
