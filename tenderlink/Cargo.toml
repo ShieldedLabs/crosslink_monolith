@@ -13,6 +13,16 @@ codegen-units = 1        # easier to debug single unit
 split-debuginfo = "unpacked"  # produce separate .pdb files
 lto = false
 
+[features]
+default = ["p2p-terminal"]
+# The interactive p2p test terminal (src/p2p_test.rs) and the binary that runs it.
+p2p-terminal = ["dep:crossterm"]
+
+[[bin]]
+name = "tenderlink"
+path = "src/main.rs"
+required-features = ["p2p-terminal"]
+
 [dependencies]
 # Wire-compatible send-error recovery, confirmed restart replacement, and network-change reconnection.
 shielded_transport_pigeon = { git = "https://github.com/ShieldedLabs/shielded_transport_pigeon", rev = "1ab691a7c7c0b1c8bc641ca2a61fead5ca18589c" }
@@ -20,7 +30,7 @@ blake3 = "1.8.2"
 byteorder = "1.5.0"
 ed25519-zebra = "4.1.0"
 hex = "0.4.3"
-crossterm = "0.27" # Only for p2p terminal
+crossterm = { version = "0.27", optional = true } # Only for the p2p terminal binary
 tracing = "0.1.41"
 base64 = "0.22"
 libc = "0.2.182"

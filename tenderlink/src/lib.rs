@@ -3858,6 +3858,7 @@ pub fn run_instances(i: usize) {
     rt.block_on(std::future::pending::<()>())
 }
 
+#[cfg(feature = "p2p-terminal")]
 pub mod p2p_test;
 pub use shielded_transport_pigeon::{stp, native_sockets};
 pub mod transport;
