@@ -380,10 +380,16 @@ fn fat_pointer_binding_node(activation: Option<u32>) -> (TF, Network) {
 }
 
 /// Loads six blocks and two BFT blocks over them, bft0 finalizing P1 and bft1 finalizing P2, and
-/// builds P7 citing bft1: the honest block. Then three copies of P7 with the pointer changed and
-/// the commitment left as it was: one height byte flipped, one more signature, and bft0 cited in
-/// place of bft1. Each copy is a valid block apart from the commitment, which is what the two
-/// sides of the upgrade disagree on.
+/// builds P7 citing bft1: the honest block. Then one copy of P7 with the pointer changed and the
+/// commitment left as it was: bft0 cited in place of bft1. The copy is a valid block apart from
+/// the commitment, which is what the two sides of the upgrade disagree on.
+///
+/// The scene runs on the nil roster of `HARNESS_PARAMETERS`, under which the node admits exactly
+/// one certificate for a BFT block from FeaturenetUpgrade2: no signatures, round 0
+/// (`certificate_is_valid`). So the BFT blocks are decided at round 0 with no signatures, and a
+/// pointer with a changed height byte or an added signature is not a variant this scene can
+/// offer: the certificate check would refuse it before the commitment check ran, proving nothing
+/// about the binding.
 fn fat_pointer_binding_scene(tf: &mut TF, network: Network) -> (Arc<Block>, Vec<Arc<Block>>) {
     let miner = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
     let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
@@ -396,9 +402,9 @@ fn fat_pointer_binding_scene(tf: &mut TF, network: Network) -> (Arc<Block>, Vec<
     }
 
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
-    let bft0 = next_pos(pos_h, fat_ptr, &pow[1..4], &[]);
+    let bft0 = next_pos_at_round(pos_h, fat_ptr, &pow[1..4], 0, &[]);
     tf.push_instr_load_pos(&bft0, 0);
-    let bft1 = next_pos(pos_h, fat_ptr, &pow[2..5], &[]);
+    let bft1 = next_pos_at_round(pos_h, fat_ptr, &pow[2..5], 0, &[]);
     tf.push_instr_load_pos(&bft1, 0);
 
     gen.next_block(&miner);
@@ -411,23 +417,16 @@ fn fat_pointer_binding_scene(tf: &mut TF, network: Network) -> (Arc<Block>, Vec<
             ..honest.as_ref().clone()
         })
     };
-    let mut height_changed = bft1.0.fat_ptr.clone();
-    height_changed.vote_for_block_without_finalizer_public_key[32] ^= 1;
-    let mut signatures_changed = bft1.0.fat_ptr.clone();
-    signatures_changed.signatures.push(FatPointerSignature { pub_key: PubKeyID([0xcd; 32]), vote_signature: [0xbc; 64] });
-    let tampered = vec![
-        with_pointer(height_changed),
-        with_pointer(signatures_changed),
-        with_pointer(bft0.0.fat_ptr.clone()),
-    ];
+    let tampered = vec![with_pointer(bft0.0.fat_ptr.clone())];
     (honest, tampered)
 }
 
 /// From FeaturenetUpgrade2 the block commitment binds the fat pointer, so a block whose pointer
-/// was changed after its commitment was computed is refused, whichever part changed: the height
-/// bytes, the signature list, or the BFT block it names. Without the binding each of these is a
-/// free re-roll of the block hash after one Equihash solve. The honest block commits, and the
-/// chain neither grows nor moves for any copy.
+/// was changed after its commitment was computed is refused. Here the pointer names another
+/// admissible BFT block, bft0 in place of bft1, so the copy passes the certificate check and every
+/// other rule and fails only the commitment. Without the binding this is a free re-roll of the
+/// block hash after one Equihash solve. The honest block commits, and the chain neither grows nor
+/// moves for the copy.
 #[test]
 fn crosslink_fat_pointer_changed_after_the_commitment_is_refused_from_featurenet_upgrade_2() {
     set_test_name(function_name!());
@@ -448,9 +447,9 @@ fn crosslink_fat_pointer_changed_after_the_commitment_is_refused_from_featurenet
     test_bytes(tf.write_to_bytes());
 }
 
-/// The other side of the upgrade boundary: below FeaturenetUpgrade2 the commitment
-/// binds no pointer, so the same three changed copies are valid siblings of the honest block,
-/// accepted as they are today.
+/// The other side of the upgrade boundary: below FeaturenetUpgrade2 the commitment binds no
+/// pointer, so the same changed copy is a valid sibling of the honest block, accepted as it is
+/// today.
 #[test]
 fn crosslink_fat_pointer_changed_after_the_commitment_is_accepted_without_featurenet_upgrade_2() {
     set_test_name(function_name!());
@@ -500,7 +499,8 @@ fn crosslink_block_hashes_without_featurenet_upgrade_2_are_unchanged() {
 
 /// From FeaturenetUpgrade2 the node's own template carries a commitment over its pointer: the
 /// template's `blockcommitmentshash` is built with the pointer's digest, so the block mined from
-/// it unchanged commits. Its parent cites a BFT block, so the mined block must too (a pointer
+/// it unchanged commits. Its parent cites a BFT block with the one certificate the nil roster
+/// admits (see `fat_pointer_binding_scene`), so the mined block must cite one too (a pointer
 /// cannot revert to null), and its commitment therefore binds a real digest.
 #[test]
 fn crosslink_template_commits_to_its_fat_pointer_from_featurenet_upgrade_2() {
@@ -2605,10 +2605,26 @@ fn crosslink_pow_block_with_staking_tx() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// `create_pos_and_ptr_to_finalize_pow_at_round` at round 1, as the scenes were built: the
+/// pointer is header bytes of every PoW block citing it, so the recorded block hashes
+/// (`crosslink_block_hashes_without_featurenet_upgrade_2_are_unchanged`) depend on the round.
 fn create_pos_and_ptr_to_finalize_pow(
     bft_height: u32,
     parent_fat_ptr: FatPointerToBftBlock,
     pow_blocks: &[Arc<Block>],
+    sigs: &[FatPointerSignature],
+) -> BftBlockAndFatPointerToItWrap {
+    create_pos_and_ptr_to_finalize_pow_at_round(bft_height, parent_fat_ptr, pow_blocks, 1, sigs)
+}
+
+/// A BFT block at `bft_height` over `pow_blocks`, with the fat pointer to it decided at `round`
+/// with `sigs`. Under the nil roster of `HARNESS_PARAMETERS` the only certificate the node admits
+/// from FeaturenetUpgrade2 is an empty one at round 0 (`certificate_is_valid`).
+fn create_pos_and_ptr_to_finalize_pow_at_round(
+    bft_height: u32,
+    parent_fat_ptr: FatPointerToBftBlock,
+    pow_blocks: &[Arc<Block>],
+    round: u32,
     sigs: &[FatPointerSignature],
 ) -> BftBlockAndFatPointerToItWrap {
     assert_eq!(
@@ -2641,20 +2657,31 @@ fn create_pos_and_ptr_to_finalize_pow(
         vote_signature: [0xbcu8; 64],
     };
 
-    BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt::from_parts(block, bft_height.into(), 1, sigs))
+    BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt::from_parts(block, bft_height.into(), round, sigs))
 }
 
+/// `next_pos_at_round` at round 1; see `create_pos_and_ptr_to_finalize_pow`.
 fn next_pos(
     cur_bft_height: &mut u32,
     cur_fat_ptr: &mut FatPointerToBftBlock,
     pow_blocks: &[Arc<Block>],
     sigs: &[FatPointerSignature],
 ) -> BftBlockAndFatPointerToItWrap {
+    next_pos_at_round(cur_bft_height, cur_fat_ptr, pow_blocks, 1, sigs)
+}
+
+fn next_pos_at_round(
+    cur_bft_height: &mut u32,
+    cur_fat_ptr: &mut FatPointerToBftBlock,
+    pow_blocks: &[Arc<Block>],
+    round: u32,
+    sigs: &[FatPointerSignature],
+) -> BftBlockAndFatPointerToItWrap {
     // NOTE: BFT heights are 0-based: a block's height is the chain position it will
     // occupy (validate_bft_block), so the first block is at height 0. Incrementing
     // *after* keeps the counter equal to the resulting chain *length*, which is what
     // EXPECT_POS_CHAIN_LENGTH callers pass it in as.
-    let bft = create_pos_and_ptr_to_finalize_pow(*cur_bft_height, cur_fat_ptr.clone(), pow_blocks, sigs);
+    let bft = create_pos_and_ptr_to_finalize_pow_at_round(*cur_bft_height, cur_fat_ptr.clone(), pow_blocks, round, sigs);
     *cur_bft_height += 1;
     *cur_fat_ptr = bft.0.fat_ptr.clone();
     bft
