@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 
 use crate::{block, parameters::Network, transaction, BoxError};
 
+mod boxed;
 mod network_chain_tip_height_estimator;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -13,6 +14,7 @@ pub mod mock;
 #[cfg(test)]
 mod tests;
 
+pub use boxed::BoxChainTip;
 pub use network_chain_tip_height_estimator::NetworkChainTipHeightEstimator;
 
 /// The maximum estimated distance to the network chain tip that is considered "at or near tip".
