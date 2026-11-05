@@ -301,8 +301,8 @@ fn test_format_node_config_round_trips_the_network() {
     assert_eq!(crosslink_parameters_for_test(&bytes), HARNESS_PARAMETERS);
 }
 
-/// FeaturenetUpgrade2 is unscheduled by default; a test file's node config schedules it at height
-/// 4, and the node switches to it at exactly that height, as for FeaturenetUpgrade1 above: a block
+/// FeaturenetUpgrade2 activates far beyond any scenario by default; a test file's node config moves
+/// it to height 4, and the node switches to it at exactly that height: a block
 /// there built for the default schedule, whose coinbase is still the older upgrade's, is refused,
 /// and one built for the moved schedule is accepted, as is the node's own next block.
 #[test]
@@ -322,8 +322,7 @@ fn crosslink_featurenet_upgrade_2_height_set_by_the_test_file() {
     let default_schedule = regtest_network(&params);
     assert_ne!(NetworkUpgrade::current(&network, BlockHeight(activation - 1)), NetworkUpgrade::FeaturenetUpgrade2);
     assert_eq!(NetworkUpgrade::current(&network, BlockHeight(activation)), NetworkUpgrade::FeaturenetUpgrade2);
-    assert_eq!(NetworkUpgrade::FeaturenetUpgrade2.activation_height(&default_schedule), None);
-    assert_ne!(NetworkUpgrade::current(&default_schedule, BlockHeight::MAX), NetworkUpgrade::FeaturenetUpgrade2);
+    assert_featurenet_upgrade_2_beyond_scenarios(&default_schedule);
 
     let key = TestKey::new(b"crosslink test miner");
     let miner = key.address();
@@ -349,15 +348,22 @@ fn crosslink_featurenet_upgrade_2_height_set_by_the_test_file() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// FeaturenetUpgrade2's default height is above every scenario, so a scenario on the default
+/// schedule runs entirely before it.
+fn assert_featurenet_upgrade_2_beyond_scenarios(network: &Network) {
+    let height = NetworkUpgrade::FeaturenetUpgrade2.activation_height(network);
+    assert!(height.map_or(true, |height| height.0 > 1_000), "FeaturenetUpgrade2 at {height:?}");
+}
+
 /// The node and the network for a fat pointer binding scenario: FeaturenetUpgrade2 at
-/// `activation`, or unscheduled as by default.
+/// `activation`, or at its default height beyond the scenario.
 fn fat_pointer_binding_node(activation: Option<u32>) -> (TF, Network) {
     use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
 
     let params = HARNESS_PARAMETERS;
     let Some(activation) = activation else {
         let network = regtest_network(&params);
-        assert_eq!(NetworkUpgrade::FeaturenetUpgrade2.activation_height(&network), None);
+        assert_featurenet_upgrade_2_beyond_scenarios(&network);
         return (TF::new(&params), network);
     };
     let node_config = node_config_with_activation_heights(ConfiguredActivationHeights {
@@ -442,7 +448,7 @@ fn crosslink_fat_pointer_changed_after_the_commitment_is_refused_from_featurenet
     test_bytes(tf.write_to_bytes());
 }
 
-/// The other side of the upgrade boundary: with FeaturenetUpgrade2 unscheduled the commitment
+/// The other side of the upgrade boundary: below FeaturenetUpgrade2 the commitment
 /// binds no pointer, so the same three changed copies are valid siblings of the honest block,
 /// accepted as they are today.
 #[test]
@@ -462,16 +468,13 @@ fn crosslink_fat_pointer_changed_after_the_commitment_is_accepted_without_featur
     test_bytes(tf.write_to_bytes());
 }
 
-/// With FeaturenetUpgrade2 unscheduled a block's hash is what it was before the pointer was bound:
+/// Below FeaturenetUpgrade2 a block's hash is what it was before the pointer was bound:
 /// the regtest genesis, and the ten blocks of finality diagram scene 1, the last four of which
 /// cite BFT blocks. The hashes were recorded from the scene as the node loaded it before the
 /// binding existed (commit 32a059c6). Needs no node.
 #[test]
 fn crosslink_block_hashes_without_featurenet_upgrade_2_are_unchanged() {
-    assert_eq!(
-        NetworkUpgrade::FeaturenetUpgrade2.activation_height(&regtest_network(&HARNESS_PARAMETERS)),
-        None
-    );
+    assert_featurenet_upgrade_2_beyond_scenarios(&regtest_network(&HARNESS_PARAMETERS));
     assert_eq!(zebra_chain::block::genesis::regtest_genesis_block().hash(), BlockGen::REGTEST_GENESIS_HASH);
     assert_eq!(
         BlockGen::REGTEST_GENESIS_HASH.to_string(),
