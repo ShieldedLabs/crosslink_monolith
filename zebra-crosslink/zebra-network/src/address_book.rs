@@ -26,6 +26,8 @@ use crate::{
     AddressBookPeers, PeerAddrState, PeerSocketAddr,
 };
 
+mod ordered_map;
+
 #[cfg(test)]
 mod tests;
 
