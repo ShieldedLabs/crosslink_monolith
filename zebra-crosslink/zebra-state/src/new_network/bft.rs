@@ -341,14 +341,19 @@ pub fn bc_hdr_to_lrz(header: &Header) -> BcBlockHeader {
 }
 
 /// The context-free proof-of-work checks for a carried bc-header: a well-formed difficulty
-/// threshold within the network's PoWLimit, a block hash under that threshold, and a valid
+/// threshold within the network's PoWLimit, a proof-of-work hash under that threshold, and a valid
 /// Equihash solution. These are the same checks Zebra's block verifier applies to a header before
 /// it has the block's ancestry, including its exemption: on a network with PoW disabled it checks
-/// only the threshold, so a header here must not have to meet more than its block did.
-fn header_pow_is_valid(header: &BcBlockHeader, network: &zebra_chain::parameters::Network) -> Result<(), String> {
+/// only the threshold, so a header here must not have to meet more than its block did. `height`
+/// is the header's position on its chain, which picks the hash the filter compares.
+fn header_pow_is_valid(
+    header: &BcBlockHeader,
+    network: &zebra_chain::parameters::Network,
+    height: Height,
+) -> Result<(), String> {
     use zebra_chain::work::difficulty::ParameterDifficulty as _;
     let header = header_from_lrz(header)?;
-    let hash = header.hash();
+    let hash = header.proof_of_work_hash(network, height);
     let threshold = header
         .difficulty_threshold
         .to_expanded()
@@ -1441,7 +1446,8 @@ impl BftRunner {
         // pointer names that bft-block would stay deferred.
         let network = read_state.network();
         for (i, header) in new_block.headers.iter().enumerate() {
-            if let Err(reason) = header_pow_is_valid(header, network) {
+            let height = Height(snapshot.height.0 + 1 + i as u32);
+            if let Err(reason) = header_pow_is_valid(header, network, height) {
                 tracing::warn!("BFT block header {i} fails proof of work: {reason}");
                 return fail;
             }
