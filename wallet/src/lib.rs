@@ -19,7 +19,6 @@ const AUDIT_TXS:      bool = false;
 
 const TEST_P2SH:      bool = true;
 
-use rand::seq::SliceRandom;
 use zcash_client_backend::data_api::WalletCommitmentTrees;
 // Ironwood notes use their own note-encryption domain: the plaintext lead byte is 0x03
 // (NoteVersion::V3), and `OrchardDomain` accepts only 0x02, so decrypting an Ironwood
@@ -182,6 +181,21 @@ impl BlockHeight {
 /// Confirmations (see [`BlockHeight::confirmations`]) a note needs before the wallet spends it or
 /// reports it as spendable, and a transaction needs before the GUI shows it as confirmed.
 pub const SPENDABLE_CONFIRMATIONS: u32 = 3;
+
+/// The most inputs a transaction spends from each pool. An Ironwood action is about 3,156 bytes,
+/// so 20 Ironwood spends plus 100 transparent inputs stay well under the 100,000-byte block limit.
+pub const MAX_IRONWOOD_SPENDS: usize = 20;
+pub const MAX_TRANSPARENT_SPENDS: usize = 100;
+
+/// The order to try spending `values` in: largest first, so a payment uses as few inputs as it
+/// can, and without any worth no more than the ZIP-317 marginal fee. Past the two grace actions,
+/// each input adds an action costing that fee, so such an input can't pay its own way, and anyone
+/// can send a wallet as many of them as they like.
+pub fn spend_order(values: &[u64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..values.len()).filter(|&i| values[i] > zip317::MARGINAL_FEE.into_u64()).collect();
+    order.sort_by(|&a, &b| values[b].cmp(&values[a]));
+    order
+}
 
 impl ManualWallet {
     /// The tip that confirmations are counted against. The wallet can only witness notes in blocks
@@ -1955,8 +1969,10 @@ impl ManualWallet {
 
                 TxPool::Transparent => {
                     let t_pubkey = t_pubkey.expect("checked above");
-                    // "greedy strategy"
-                    for utxo in &account.utxos {
+                    let values: Vec<u64> = account.utxos.iter().map(|utxo| utxo.value.into_u64()).collect();
+                    for i in spend_order(&values) {
+                        if txb.transparent_inputs().len() >= MAX_TRANSPARENT_SPENDS { break; }
+                        let utxo = &account.utxos[i];
                         let res = match utxo.t_addr {
                             TransparentAddress::PublicKeyHash(_) => {
                                 TransparentInputInfo::from_parts(
@@ -2009,10 +2025,10 @@ impl ManualWallet {
                         //     }
                         // }
 
-                        let mut shuffled_notes = account.unspent_orchard_notes.clone();
-                        shuffled_notes.shuffle(&mut OsRng);
-
-                        for &note in &shuffled_notes {
+                        let values: Vec<u64> = account.unspent_orchard_notes.iter().map(|note| note.note.value().inner()).collect();
+                        for i in spend_order(&values) {
+                            if prep.o_inputs.len() >= MAX_IRONWOOD_SPENDS { break; }
+                            let note = account.unspent_orchard_notes[i];
                             if note.recv_h.confirmations(self.confirmations_tip()) < SPENDABLE_CONFIRMATIONS { continue; }
 
                             let witness = match tree.witness_at_checkpoint_id(note.position, &orchard_anchor_h) {
@@ -2053,7 +2069,11 @@ impl ManualWallet {
         let min_spend = target_send + calc_fee::<P>(&txb, &prep)?;
         let change = match total_spend.cmp(&min_spend) {
             std::cmp::Ordering::Less => {
-                println!("tx build error: can't afford {min_spend}; only {total_spend} available from given sources");
+                if prep.o_inputs.len() >= MAX_IRONWOOD_SPENDS || txb.transparent_inputs().len() >= MAX_TRANSPARENT_SPENDS {
+                    println!("tx build error: can't afford {min_spend} within {MAX_IRONWOOD_SPENDS} Ironwood and {MAX_TRANSPARENT_SPENDS} transparent inputs; only {total_spend} available from the largest; send a smaller amount to yourself first to merge notes");
+                } else {
+                    println!("tx build error: can't afford {min_spend}; only {total_spend} available from given sources");
+                }
                 return None
             }, // can't afford
             std::cmp::Ordering::Equal => Zatoshis::const_from_u64(0),
@@ -5430,5 +5450,67 @@ mod tests {
         assert!(decode_roster_bytes(&bytes).is_err());
         bytes[last - 64] = 2;
         assert!(decode_roster_bytes(&bytes).is_err());
+    }
+
+    /// Random wallets salted with dust: notes worth 1 zat, exactly the marginal fee, just above
+    /// it, and ordinary amounts, with duplicates. Selection runs the way `send_zats_no_insert`
+    /// spends Ironwood notes, under the ZIP-317 fee for a payment plus change.
+    #[test]
+    fn spend_order_resists_dust() {
+        use rand_chacha::ChaCha20Rng;
+        let fee_unit = zip317::MARGINAL_FEE.into_u64();
+        let fee = |spends: usize| fee_unit * spends.max(2) as u64;
+        let mut rng = ChaCha20Rng::seed_from_u64(290);
+        let mut hit_cap = 0;
+        let mut paid = 0;
+        for _ in 0..20_000 {
+            let n = rng.gen_range(0..400);
+            let values: Vec<u64> = (0..n).map(|_| match rng.gen_range(0..6) {
+                0 => 1,
+                1 => fee_unit,
+                2 => rng.gen_range(0..=fee_unit),
+                3 => fee_unit + rng.gen_range(1..100),
+                4 => rng.gen_range(fee_unit + 1..10 * fee_unit),
+                _ => rng.gen_range(1..1_000_000_000),
+            }).collect();
+
+            let order = spend_order(&values);
+            let mut eligible: Vec<usize> = (0..n).filter(|&i| values[i] > fee_unit).collect();
+            assert_eq!(order.len(), eligible.len());
+            let mut sorted = order.clone();
+            sorted.sort();
+            eligible.sort();
+            assert_eq!(sorted, eligible);
+            assert!(order.windows(2).all(|w| values[w[0]] >= values[w[1]]));
+
+            let top: Vec<u64> = order.iter().map(|&i| values[i]).collect();
+            let best = |k: usize| top[..k].iter().sum::<u64>();
+            let max_k = top.len().min(MAX_IRONWOOD_SPENDS);
+            let target = match rng.gen_range(0..3) {
+                0 if max_k > 0 => best(rng.gen_range(1..=max_k)),
+                1 => best(top.len()),
+                _ => rng.gen_range(0..2_000_000_000),
+            };
+
+            let mut spent = 0;
+            let mut total = 0;
+            for &i in &order {
+                if spent >= MAX_IRONWOOD_SPENDS { break; }
+                spent += 1;
+                total += values[i];
+                if total >= target + fee(spent) { break; }
+            }
+
+            assert!(spent <= MAX_IRONWOOD_SPENDS);
+            assert!(spent * 3_156 < 100_000 - 10_000);
+            if total >= target + fee(spent) {
+                paid += 1;
+            } else {
+                // Fee depends only on the input count, so the largest k notes are the best k.
+                assert!((1..=max_k).all(|k| best(k) < target + fee(k)));
+                hit_cap += (spent == MAX_IRONWOOD_SPENDS) as usize;
+            }
+        }
+        assert!(paid > 1_000 && hit_cap > 1_000, "paid {paid}, hit the cap {hit_cap}");
     }
 }
