@@ -32,10 +32,15 @@ use tower::{
 };
 use tracing_futures::Instrument;
 
-use zebra_chain::{chain_tip::ChainTip, diagnostic::task::WaitForPanics, parameters::Network};
+use zebra_chain::{
+    chain_tip::{BoxChainTip, ChainTip},
+    diagnostic::task::WaitForPanics,
+    parameters::Network,
+};
 
 use crate::{
     address_book_updater::{AddressBookUpdater, MIN_CHANNEL_SIZE},
+    boxed_service::BoxCloneSyncService,
     connection_metrics::{
         network_kind_label, record_connection_attempt_finished, record_connection_attempt_started,
         record_inbound_connection_rejected, ConnectionDirection,
@@ -114,10 +119,10 @@ where
     S::Future: Send + 'static,
     C: ChainTip + Clone + Send + Sync + 'static,
 {
-    init_with_block_gossip_peer_ips(
+    init_boxed(
         config,
-        inbound_service,
-        latest_chain_tip,
+        BoxCloneSyncService::new(inbound_service),
+        BoxChainTip::new(latest_chain_tip),
         user_agent,
         Vec::new(),
     )
@@ -147,6 +152,32 @@ where
     S::Future: Send + 'static,
     C: ChainTip + Clone + Send + Sync + 'static,
 {
+    init_boxed(
+        config,
+        BoxCloneSyncService::new(inbound_service),
+        BoxChainTip::new(latest_chain_tip),
+        user_agent,
+        block_gossip_peer_ips,
+    )
+    .await
+}
+
+/// The body of [`init`] and [`init_with_block_gossip_peer_ips`].
+///
+/// Those two only box their service and chain tip and call this, so the whole peer stack
+/// (handshakes, connections, the peer set, the crawler and listener tasks) is compiled once,
+/// here, rather than in every crate and test binary that starts a peer set.
+async fn init_boxed(
+    config: Config,
+    inbound_service: BoxCloneSyncService<Request, Response, BoxError>,
+    latest_chain_tip: BoxChainTip,
+    user_agent: String,
+    block_gossip_peer_ips: Vec<IpAddr>,
+) -> (
+    Buffer<BoxService<Request, Response, BoxError>, Request>,
+    Arc<std::sync::Mutex<AddressBook>>,
+    mpsc::Sender<(PeerSocketAddr, u32)>,
+) {
     let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
 
     let (
