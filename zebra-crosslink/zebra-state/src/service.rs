@@ -26,7 +26,6 @@ use std::{
 use futures::future::FutureExt;
 use tower::{util::BoxService, Service, ServiceExt};
 use tracing::{instrument, Instrument, Span};
-use derivative::Derivative;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use tower::buffer::Buffer;
@@ -104,8 +103,7 @@ pub use self::traits::{ReadState, State};
 ///
 /// To quickly get the latest block, use [`LatestChainTip`] or [`ChainTipChange`].
 /// They can read the latest block directly, without queueing any requests.
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 pub(crate) struct StateService {
     // Configuration
     //
