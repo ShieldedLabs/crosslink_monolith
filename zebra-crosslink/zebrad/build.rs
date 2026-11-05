@@ -1,6 +1,6 @@
 //! Build script for zebrad.
 
-use vergen_git2::{CargoBuilder, Emitter, Git2Builder, RustcBuilder};
+use std::{env, process::Command};
 
 /// Process entry point for `zebrad`'s build script
 #[allow(clippy::print_stderr)]
@@ -15,55 +15,7 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         embed_icon_resource();
     }
-    let mut emitter = Emitter::default();
-    // Dependency instructions run nested `cargo metadata`, which cannot resolve
-    // unpublished workspace versions during a multi-package publish.
-    let cargo = CargoBuilder::default()
-        .debug(true)
-        .features(true)
-        .opt_level(true)
-        .target_triple(true)
-        .build()
-        .expect("requested cargo instructions should build successfully");
-
-    // Configures an [`Emitter`] for everything except for `git` env vars.
-    // This builder fails the build on error.
-    emitter
-        .fail_on_error()
-        .add_instructions(&cargo)
-        .expect("adding cargo instructions should succeed")
-        .add_instructions(
-            &RustcBuilder::all_rustc().expect("all_rustc() should build successfully"),
-        )
-        .expect("adding all_rustc() instructions should succeed");
-
-    // Get git information. This is used by e.g. ZebradApp::register_components()
-    // to log the commit hash
-    let all_git = Git2Builder::default()
-        .branch(true)
-        .commit_author_email(true)
-        .commit_author_name(true)
-        .commit_count(true)
-        .commit_date(true)
-        .commit_message(true)
-        .commit_timestamp(true)
-        .describe(false, false, None)
-        .sha(true)
-        .dirty(false)
-        .describe(true, true, Some("v*.*.*"))
-        .build()
-        .expect("all_git + describe + sha should build successfully");
-
-    if let Err(e) = emitter.add_instructions(&all_git) {
-        // The most common failure here is due to a missing `.git` directory,
-        // e.g., when building from `cargo install zebrad`. We simply
-        // proceed with the build.
-        // Note that this won't be printed unless in cargo very verbose mode (-vv).
-        // We could emit a build warning, but that might scare users.
-        println!("git error in vergen build script: skipping git env vars: {e:?}",);
-    }
-
-    emitter.emit().expect("base emit should succeed");
+    emit_build_info();
 
     #[cfg(feature = "lightwalletd-grpc-tests")]
     tonic_prost_build::configure()
@@ -218,4 +170,87 @@ fn append_env(key: &str, value: &str) {
     // Safety: build scripts are single-threaded here; nothing else in this
     // process reads the environment concurrently.
     unsafe { std::env::set_var(key, format!("{old} {value}").trim()) };
+}
+
+/// Emits the `VERGEN_*` variables `application.rs` reads, which `vergen-git2` used to emit.
+///
+/// Calling `git` and `rustc` directly keeps libgit2 and libz, both C builds, out of the
+/// build. Every value is read with `option_env!`, so anything that cannot be found, such as
+/// git information in a source tarball, is left out rather than failing the build.
+fn emit_build_info() {
+    let mut features: Vec<String> = env::vars()
+        .filter_map(|(k, _)| k.strip_prefix("CARGO_FEATURE_").map(str::to_lowercase))
+        .collect();
+    features.sort();
+    println!("cargo:rustc-env=VERGEN_CARGO_FEATURES={}", features.join(","));
+    for (var, from) in [("VERGEN_CARGO_TARGET_TRIPLE", "TARGET"), ("VERGEN_CARGO_OPT_LEVEL", "OPT_LEVEL"), ("VERGEN_CARGO_DEBUG", "DEBUG")] {
+        if let Ok(value) = env::var(from) {
+            println!("cargo:rustc-env={var}={value}");
+        }
+    }
+
+    let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    if let Some(version) = run(&rustc, &["-vV"]) {
+        for line in version.lines() {
+            if let Some(v) = line.strip_prefix("release: ") {
+                println!("cargo:rustc-env=VERGEN_RUSTC_SEMVER={v}");
+            } else if let Some(v) = line.strip_prefix("commit-date: ") {
+                println!("cargo:rustc-env=VERGEN_RUSTC_COMMIT_DATE={v}");
+            }
+        }
+    }
+
+    // Like vergen, emit no rerun-if-changed for git: the script reruns when a file in this
+    // package changes, so a commit alone does not rebuild zebrad.
+    for (var, args) in [
+        // With no matching tag, vergen fell back to the short SHA, as --always does.
+        ("VERGEN_GIT_DESCRIBE", &["describe", "--tags", "--dirty", "--always", "--match", "v*.*.*"][..]),
+        ("VERGEN_GIT_SHA", &["rev-parse", "--short=7", "HEAD"][..]),
+        ("VERGEN_GIT_BRANCH", &["rev-parse", "--abbrev-ref", "HEAD"][..]),
+    ] {
+        if let Some(value) = run("git", args) {
+            println!("cargo:rustc-env={var}={value}");
+        }
+    }
+
+    // vergen took the timestamp from SOURCE_DATE_EPOCH when it was set (phargo sets it to 0).
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    let epoch = env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .or_else(|| run("git", &["log", "-1", "--format=%ct"])?.parse().ok());
+    if let Some(epoch) = epoch {
+        println!("cargo:rustc-env=VERGEN_GIT_COMMIT_TIMESTAMP={}", rfc3339_utc(epoch));
+    }
+}
+
+/// Formats Unix time `secs` as vergen did: `1970-01-01T00:00:00.000000000Z`.
+fn rfc3339_utc(secs: i64) -> String {
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.000000000Z",
+        rem / 3_600,
+        rem / 60 % 60,
+        rem % 60
+    )
+}
+
+/// Runs a command and returns its trimmed stdout, or `None` if it could not run or failed.
+fn run(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let out = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!out.is_empty()).then_some(out)
 }
