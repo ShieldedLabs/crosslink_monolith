@@ -58,3 +58,14 @@ For individual operations, the canonical commands are:
 bash subtree pull crosslink_book code
 bash subtree push crosslink_book code
 ```
+
+## Commit titles
+
+A commit that fixes a GitHub issue, even partly, has `Fix #N` in its title, so
+reaching `main` closes the issue: `Wallet: Fix #47 by resending transactions a
+reorg drops`. Never write `for #N` or `(#N)` in its place, and never drop `Fix`
+to keep an issue open; say which parts stay open in your report instead. A port
+of a fix already done on another branch needs `Fix #N` too.
+
+A semicolon in a title joins two unrelated changes only. Two parts of one fix
+join with "and".
