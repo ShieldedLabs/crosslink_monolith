@@ -156,6 +156,7 @@ pub mod wire;
 
 mod address_book;
 mod address_book_updater;
+mod boxed_service;
 mod connection_metrics;
 mod isolated;
 mod meta_addr;
@@ -185,6 +186,7 @@ pub use crate::{
 pub use crate::{
     address_book::AddressBook,
     address_book_peers::AddressBookPeers,
+    boxed_service::BoxCloneSyncService,
     config::{CacheDir, Config},
     isolated::{connect_isolated, connect_isolated_tcp_direct},
     meta_addr::{PeerAddrState, PeerSocketAddr},
