@@ -243,11 +243,11 @@ where
 /// so that out-of-order and invalid requests do not hang indefinitely.
 /// See the [`router`](`crate::router`) module documentation for details.
 #[instrument(skip(state_service, mempool))]
-pub async fn init<S, Mempool>(
+pub async fn init(
     config: Config,
     network: &Network,
-    mut state_service: S,
-    mempool: oneshot::Receiver<Mempool>,
+    mut state_service: BoxStateService,
+    mempool: oneshot::Receiver<BoxMempoolService>,
 ) -> (
     Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
     Buffer<
@@ -257,14 +257,6 @@ pub async fn init<S, Mempool>(
     BackgroundTaskHandles,
     Height,
 )
-where
-    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
-    S::Future: Send + 'static,
-    Mempool: Service<mempool::Request, Response = mempool::Response, Error = BoxError>
-        + Send
-        + Clone
-        + 'static,
-    Mempool::Future: Send + 'static,
 {
     // Give other tasks priority before spawning the checkpoint task.
     tokio::task::yield_now().await;
@@ -419,6 +411,16 @@ pub fn init_checkpoint_list(config: Config, network: &Network) -> (Arc<Checkpoin
     (list, max_checkpoint_height)
 }
 
+/// The state service the verifiers are built on.
+///
+/// [`init`] takes this concrete type rather than any `Service`, so the verifier stack is
+/// compiled once, here, instead of in every crate and test binary that calls `init`.
+pub type BoxStateService = Buffer<BoxService<zs::Request, zs::Response, BoxError>, zs::Request>;
+
+/// The mempool service the transaction verifier is handed once the mempool exists.
+pub type BoxMempoolService =
+    Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>;
+
 /// The background task handles for `zebra-consensus` verifier initialization.
 #[derive(Debug)]
 pub struct BackgroundTaskHandles {
@@ -431,10 +433,10 @@ pub struct BackgroundTaskHandles {
 ///
 /// See [`init`] for more details.
 #[cfg(any(test, feature = "proptest-impl"))]
-pub async fn init_test<S>(
+pub async fn init_test(
     config: Config,
     network: &Network,
-    state_service: S,
+    state_service: BoxStateService,
 ) -> (
     Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
     Buffer<
@@ -443,19 +445,12 @@ pub async fn init_test<S>(
     >,
     BackgroundTaskHandles,
     Height,
-)
-where
-    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
-    S::Future: Send + 'static,
-{
+) {
     init(
         config.clone(),
         network,
         state_service.clone(),
-        oneshot::channel::<
-            Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
-        >()
-        .1,
+        oneshot::channel::<BoxMempoolService>().1,
     )
     .await
 }
