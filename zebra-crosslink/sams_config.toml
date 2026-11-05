@@ -46,6 +46,12 @@ checkpoint_sync = true
 [crosslink]
 do_not_manipulate_config = false
 i_am_the_unstaker = true
+# Set to true to skip starting the internal wallet task.
+disable_the_headless_wallet = false
+# Set to true to skip starting zaino. The internal wallet requires zaino.
+disable_zaino = false
+# Set to true to delete the zaino cache under state.cache_dir on startup.
+reset_zaino_on_startup = false
 bft_peers = []
 
 [mempool]

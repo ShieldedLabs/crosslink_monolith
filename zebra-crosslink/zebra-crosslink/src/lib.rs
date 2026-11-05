@@ -143,6 +143,8 @@ pub mod config {
         /// operator specify the entire hardfork schedule manually instead of
         /// inheriting the built-in (mainnet) assumed past. Defaults to `false`.
         pub disable_shipped_hardforks: bool,
+        /// Reset the zaino database on startup.
+        pub reset_zaino_on_startup: bool,
     }
     impl Default for Config {
         fn default() -> Self {
@@ -154,6 +156,7 @@ pub mod config {
                 disable_zaino: false,
                 hardforks: Vec::new(),
                 disable_shipped_hardforks: false,
+                reset_zaino_on_startup: false,
             }
         }
     }

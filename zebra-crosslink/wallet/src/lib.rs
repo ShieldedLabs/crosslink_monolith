@@ -29,7 +29,9 @@ use secrecy::{ExposeSecret,SecretVec,Secret};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::{identity, Infallible};
 use std::future::Future;
+use std::io::{self, Cursor, Read, Write};
 use std::mem;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_rustls::rustls;
@@ -390,6 +392,8 @@ impl ProposedTx {
 const CHEAT_UNSTAKING: bool = false;
 
 pub static GLOBAL_SEED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
+
+pub static WALLET_SNAPSHOT_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 pub static TENDERLINK_PUBLIC_KEY: Mutex<bft::PubKeyID> = Mutex::new(bft::PubKeyID([0;32]));
 
@@ -2701,6 +2705,1012 @@ type OrchardShardTree = shardtree::ShardTree::<
     SHARD_HEIGHT
 >;
 
+struct ManualWalletSnapshot {
+    miner_wallet: ManualWallet,
+    user_wallet: ManualWallet,
+    pow_cache: PoWCache,
+    orchard_tree: OrchardShardTree,
+}
+
+const WALLET_SNAPSHOT_MAGIC: &[u8; 8] = b"ZWALLET\0";
+const WALLET_SNAPSHOT_VERSION: u32 = 1;
+const MAX_WALLET_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_WALLET_SNAPSHOT_ITEMS: usize = 1_000_000;
+
+fn snapshot_invalid(msg: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.into())
+}
+
+fn write_u8(w: &mut impl Write, v: u8) -> io::Result<()> { w.write_all(&[v]) }
+fn read_u8(r: &mut impl Read) -> io::Result<u8> {
+    let mut buf = [0u8; 1];
+    r.read_exact(&mut buf)?;
+    Ok(buf[0])
+}
+fn write_bool(w: &mut impl Write, v: bool) -> io::Result<()> { write_u8(w, v as u8) }
+fn read_bool(r: &mut impl Read) -> io::Result<bool> {
+    match read_u8(r)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        v => Err(snapshot_invalid(format!("invalid bool tag {v}"))),
+    }
+}
+fn write_u32(w: &mut impl Write, v: u32) -> io::Result<()> { w.write_all(&v.to_le_bytes()) }
+fn read_u32(r: &mut impl Read) -> io::Result<u32> {
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+fn write_u64(w: &mut impl Write, v: u64) -> io::Result<()> { w.write_all(&v.to_le_bytes()) }
+fn read_u64(r: &mut impl Read) -> io::Result<u64> {
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+fn write_len(w: &mut impl Write, len: usize) -> io::Result<()> { write_u64(w, len as u64) }
+fn read_len(r: &mut impl Read) -> io::Result<usize> {
+    usize::try_from(read_u64(r)?).map_err(|_| snapshot_invalid("snapshot length does not fit usize"))
+}
+fn read_bounded_len(r: &mut impl Read, max_len: usize, what: &str) -> io::Result<usize> {
+    let len = read_len(r)?;
+    if len > max_len {
+        return Err(snapshot_invalid(format!("{what} length {len} exceeds limit {max_len}")));
+    }
+    Ok(len)
+}
+fn write_bytes(w: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    write_len(w, bytes.len())?;
+    w.write_all(bytes)
+}
+fn read_bytes(r: &mut impl Read) -> io::Result<Vec<u8>> {
+    let len = read_bounded_len(r, MAX_WALLET_SNAPSHOT_BYTES, "byte field")?;
+    let mut bytes = vec![0u8; len];
+    r.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+fn read_array<const N: usize>(r: &mut impl Read) -> io::Result<[u8; N]> {
+    let mut buf = [0u8; N];
+    r.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn write_block_height(w: &mut impl Write, h: BlockHeight) -> io::Result<()> { write_u32(w, h.0) }
+fn read_block_height(r: &mut impl Read) -> io::Result<BlockHeight> { Ok(BlockHeight(read_u32(r)?)) }
+
+fn write_optional_block_height(w: &mut impl Write, h: Option<BlockHeight>) -> io::Result<()> {
+    write_bool(w, h.is_some())?;
+    if let Some(h) = h { write_block_height(w, h)?; }
+    Ok(())
+}
+fn read_optional_block_height(r: &mut impl Read) -> io::Result<Option<BlockHeight>> {
+    if read_bool(r)? { Ok(Some(read_block_height(r)?)) } else { Ok(None) }
+}
+
+fn write_zatoshis(w: &mut impl Write, zats: Zatoshis) -> io::Result<()> {
+    write_u64(w, zats.into_u64())
+}
+fn read_zatoshis(r: &mut impl Read) -> io::Result<Zatoshis> {
+    Zatoshis::from_u64(read_u64(r)?)
+        .map_err(|err| snapshot_invalid(format!("invalid zatoshi amount in wallet snapshot: {err:?}")))
+}
+
+fn write_balance(w: &mut impl Write, balance: &data_api::Balance) -> io::Result<()> {
+    write_zatoshis(w, balance.spendable_value())?;
+    write_zatoshis(w, balance.change_pending_confirmation())?;
+    write_zatoshis(w, balance.value_pending_spendability())?;
+    write_zatoshis(w, balance.uneconomic_value())
+}
+fn read_balance(r: &mut impl Read) -> io::Result<data_api::Balance> {
+    let mut balance = data_api::Balance::ZERO;
+    balance.add_spendable_value(read_zatoshis(r)?)
+        .map_err(|err| snapshot_invalid(format!("invalid spendable balance in wallet snapshot: {err:?}")))?;
+    balance.add_pending_change_value(read_zatoshis(r)?)
+        .map_err(|err| snapshot_invalid(format!("invalid pending change balance in wallet snapshot: {err:?}")))?;
+    balance.add_pending_spendable_value(read_zatoshis(r)?)
+        .map_err(|err| snapshot_invalid(format!("invalid pending spendability balance in wallet snapshot: {err:?}")))?;
+    balance.add_uneconomic_value(read_zatoshis(r)?)
+        .map_err(|err| snapshot_invalid(format!("invalid uneconomic balance in wallet snapshot: {err:?}")))?;
+    Ok(balance)
+}
+
+fn write_account_balance(w: &mut impl Write, balance: &data_api::AccountBalance) -> io::Result<()> {
+    write_balance(w, balance.sapling_balance())?;
+    write_balance(w, balance.orchard_balance())?;
+    write_balance(w, balance.unshielded_balance())
+}
+fn read_account_balance(r: &mut impl Read) -> io::Result<data_api::AccountBalance> {
+    let sapling_balance = read_balance(r)?;
+    let orchard_balance = read_balance(r)?;
+    let unshielded_balance = read_balance(r)?;
+    let mut balance = data_api::AccountBalance::ZERO;
+    balance.with_sapling_balance_mut(|b| {
+        *b = sapling_balance;
+        Ok::<(), zcash_protocol::value::BalanceError>(())
+    }).map_err(|err| snapshot_invalid(format!("invalid sapling account balance in wallet snapshot: {err:?}")))?;
+    balance.with_orchard_balance_mut(|b| {
+        *b = orchard_balance;
+        Ok::<(), zcash_protocol::value::BalanceError>(())
+    }).map_err(|err| snapshot_invalid(format!("invalid orchard account balance in wallet snapshot: {err:?}")))?;
+    balance.with_unshielded_balance_mut(|b| {
+        *b = unshielded_balance;
+        Ok::<(), zcash_protocol::value::BalanceError>(())
+    }).map_err(|err| snapshot_invalid(format!("invalid unshielded account balance in wallet snapshot: {err:?}")))?;
+    Ok(balance)
+}
+
+fn write_txid(w: &mut impl Write, txid: TxId) -> io::Result<()> { w.write_all(txid.as_ref()) }
+fn read_txid(r: &mut impl Read) -> io::Result<TxId> { Ok(TxId::from_bytes(read_array::<32>(r)?)) }
+
+fn write_transparent_address(w: &mut impl Write, addr: &TransparentAddress) -> io::Result<()> {
+    match addr {
+        TransparentAddress::PublicKeyHash(hash) => {
+            write_u8(w, 0)?;
+            w.write_all(hash)
+        }
+        TransparentAddress::ScriptHash(hash) => {
+            write_u8(w, 1)?;
+            w.write_all(hash)
+        }
+    }
+}
+fn read_transparent_address(r: &mut impl Read) -> io::Result<TransparentAddress> {
+    let tag = read_u8(r)?;
+    let hash = read_array::<20>(r)?;
+    match tag {
+        0 => Ok(TransparentAddress::PublicKeyHash(hash)),
+        1 => Ok(TransparentAddress::ScriptHash(hash)),
+        _ => Err(snapshot_invalid(format!("invalid transparent address tag {tag}"))),
+    }
+}
+
+fn write_txo(w: &mut impl Write, txo: &Txo) -> io::Result<()> {
+    write_block_height(w, txo.recv_h)?;
+    write_block_height(w, txo.spent_h)?;
+    txo.id.write(&mut *w)?;
+    write_zatoshis(w, txo.value)?;
+    write_transparent_address(w, &txo.t_addr)
+}
+fn read_txo(r: &mut impl Read) -> io::Result<Txo> {
+    Ok(Txo {
+        recv_h: read_block_height(r)?,
+        spent_h: read_block_height(r)?,
+        id: OutPoint::read(&mut *r)?,
+        value: read_zatoshis(r)?,
+        t_addr: read_transparent_address(r)?,
+    })
+}
+
+fn write_orchard_note(w: &mut impl Write, note: &OrchardNote) -> io::Result<()> {
+    write_block_height(w, note.recv_h)?;
+    write_block_height(w, note.spent_h)?;
+    w.write_all(&note.nf.to_bytes())?;
+    write_txid(w, note.txid)?;
+    w.write_all(&note.note.recipient().to_raw_address_bytes())?;
+    write_u64(w, note.note.value().inner())?;
+    w.write_all(&note.note.rho().to_bytes())?;
+    w.write_all(note.note.rseed().as_bytes())?;
+    write_u64(w, note.position.into())
+}
+fn read_orchard_note(r: &mut impl Read) -> io::Result<OrchardNote> {
+    let recv_h = read_block_height(r)?;
+    let spent_h = read_block_height(r)?;
+    let nf = Option::from(orchard::note::Nullifier::from_bytes(&read_array::<32>(r)?))
+        .ok_or_else(|| snapshot_invalid("invalid orchard nullifier in wallet snapshot"))?;
+    let txid = read_txid(r)?;
+    let recipient = Option::from(orchard::Address::from_raw_address_bytes(&read_array::<43>(r)?))
+        .ok_or_else(|| snapshot_invalid("invalid orchard recipient in wallet snapshot"))?;
+    let value = orchard::value::NoteValue::from_raw(read_u64(r)?);
+    let rho = Option::from(orchard::note::Rho::from_bytes(&read_array::<32>(r)?))
+        .ok_or_else(|| snapshot_invalid("invalid orchard rho in wallet snapshot"))?;
+    let rseed = Option::from(orchard::note::RandomSeed::from_bytes(read_array::<32>(r)?, &rho))
+        .ok_or_else(|| snapshot_invalid("invalid orchard rseed in wallet snapshot"))?;
+    let position = incrementalmerkletree::Position::from(read_u64(r)?);
+    let note = Option::from(orchard::note::Note::from_parts(recipient, value, rho, rseed))
+        .ok_or_else(|| snapshot_invalid("invalid orchard note parts in wallet snapshot"))?;
+
+    Ok(OrchardNote { recv_h, spent_h, nf, txid, note, position })
+}
+
+fn write_wallet_tx_part(w: &mut impl Write, part: &WalletTxPart) -> io::Result<()> {
+    write_u64(w, part.spent_note_count as u64)?;
+    write_zatoshis(w, part.spent_zats)?;
+    write_u64(w, part.sent_note_count as u64)?;
+    write_zatoshis(w, part.sent_zats)?;
+    write_u64(w, part.recv_note_count as u64)?;
+    write_zatoshis(w, part.recv_zats)
+}
+fn read_wallet_tx_part(r: &mut impl Read) -> io::Result<WalletTxPart> {
+    Ok(WalletTxPart {
+        spent_note_count: usize::try_from(read_u64(r)?).map_err(|_| snapshot_invalid("spent note count too large"))?,
+        spent_zats: read_zatoshis(r)?,
+        sent_note_count: usize::try_from(read_u64(r)?).map_err(|_| snapshot_invalid("sent note count too large"))?,
+        sent_zats: read_zatoshis(r)?,
+        recv_note_count: usize::try_from(read_u64(r)?).map_err(|_| snapshot_invalid("recv note count too large"))?,
+        recv_zats: read_zatoshis(r)?,
+    })
+}
+
+fn write_tx_status(w: &mut impl Write, status: TxStatus) -> io::Result<()> {
+    match status {
+        TxStatus::OnBc => write_u8(w, 0),
+        TxStatus::SoftFail(h) => {
+            write_u8(w, 1)?;
+            write_block_height(w, h)
+        }
+        TxStatus::HardFail(h, err) => {
+            write_u8(w, 2)?;
+            write_block_height(w, h)?;
+            w.write_all(&err.0)
+        }
+    }
+}
+fn read_tx_status(r: &mut impl Read) -> io::Result<TxStatus> {
+    match read_u8(r)? {
+        0 => Ok(TxStatus::OnBc),
+        1 => Ok(TxStatus::SoftFail(read_block_height(r)?)),
+        2 => Ok(TxStatus::HardFail(read_block_height(r)?, ErrBuf(read_array::<128>(r)?))),
+        tag => Err(snapshot_invalid(format!("invalid tx status tag {tag}"))),
+    }
+}
+
+fn write_wallet_tx(w: &mut impl Write, tx: &WalletTx) -> io::Result<()> {
+    write_u64(w, tx.account_id as u64)?;
+    write_txid(w, tx.txid)?;
+    write_optional_block_height(w, tx.expiry_h)?;
+    write_block_height(w, tx.h)?;
+    write_bool(w, tx.is_coinbase)?;
+    write_u8(w, tx.part_flags)?;
+    write_wallet_tx_part(w, &tx.parts[0])?;
+    write_wallet_tx_part(w, &tx.parts[1])?;
+    write_u64(w, tx.memo_count as u64)?;
+    w.write_all(&tx.memo)?;
+    write_tx_status(w, tx.status)?;
+    StakingAction::write(&tx.staking_action, w)
+}
+fn read_wallet_tx(r: &mut impl Read) -> io::Result<WalletTx> {
+    Ok(WalletTx {
+        account_id: usize::try_from(read_u64(r)?).map_err(|_| snapshot_invalid("account id too large"))?,
+        txid: read_txid(r)?,
+        expiry_h: read_optional_block_height(r)?,
+        h: read_block_height(r)?,
+        is_coinbase: read_bool(r)?,
+        part_flags: read_u8(r)?,
+        parts: [read_wallet_tx_part(r)?, read_wallet_tx_part(r)?],
+        memo_count: usize::try_from(read_u64(r)?).map_err(|_| snapshot_invalid("memo count too large"))?,
+        memo: read_array::<512>(r)?,
+        status: read_tx_status(r)?,
+        staking_action: StakingAction::read(r)?,
+    })
+}
+
+fn write_vec<W: Write, T>(w: &mut W, vec: &[T], mut write_item: impl FnMut(&mut W, &T) -> io::Result<()>) -> io::Result<()> {
+    write_len(w, vec.len())?;
+    for item in vec { write_item(w, item)?; }
+    Ok(())
+}
+fn read_vec<R: Read, T>(r: &mut R, mut read_item: impl FnMut(&mut R) -> io::Result<T>) -> io::Result<Vec<T>> {
+    let len = read_bounded_len(r, MAX_WALLET_SNAPSHOT_ITEMS, "vector")?;
+    let mut vec = Vec::with_capacity(len);
+    for _ in 0..len { vec.push(read_item(r)?); }
+    Ok(vec)
+}
+
+fn write_manual_account(w: &mut impl Write, account: &ManualAccount) -> io::Result<()> {
+    write_block_height(w, account.fully_detected_h)?;
+    write_block_height(w, account.fully_decoded_h)?;
+    write_block_height(w, account.birthday)?;
+    write_vec(w, &account.balance_changes, |w, (h, balance)| {
+        write_block_height(w, *h)?;
+        write_account_balance(w, balance)
+    })?;
+    write_vec(w, &account.recv_txos, |w, txo| write_txo(w, txo))?;
+    write_vec(w, &account.utxos, |w, txo| write_txo(w, txo))?;
+    write_vec(w, &account.stxos, |w, txo| write_txo(w, txo))?;
+    write_vec(w, &account.recv_orchard_notes, |w, note| write_orchard_note(w, note))?;
+    write_vec(w, &account.unspent_orchard_notes, |w, note| write_orchard_note(w, note))?;
+    write_vec(w, &account.spent_orchard_notes, |w, note| write_orchard_note(w, note))
+}
+fn read_manual_account(r: &mut impl Read, template: &ManualAccount) -> io::Result<ManualAccount> {
+    let fully_detected_h = read_block_height(r)?;
+    let fully_decoded_h = read_block_height(r)?;
+    let birthday = read_block_height(r)?;
+    let mut balance_changes = read_vec(r, |r| {
+        Ok((read_block_height(r)?, read_account_balance(r)?))
+    })?;
+    if balance_changes.is_empty() {
+        balance_changes.push((BlockHeight(0), data_api::AccountBalance::ZERO));
+    }
+    Ok(ManualAccount {
+        fully_detected_h,
+        fully_decoded_h,
+        ufvk: template.ufvk.clone(),
+        birthday,
+        balance_changes,
+        recv_txos: read_vec(r, |r| read_txo(r))?,
+        utxos: read_vec(r, |r| read_txo(r))?,
+        stxos: read_vec(r, |r| read_txo(r))?,
+        recv_orchard_notes: read_vec(r, |r| read_orchard_note(r))?,
+        unspent_orchard_notes: read_vec(r, |r| read_orchard_note(r))?,
+        spent_orchard_notes: read_vec(r, |r| read_orchard_note(r))?,
+    })
+}
+
+fn write_manual_stream(w: &mut impl Write, stream: &ManualStream) -> io::Result<()> {
+    write_u64(w, stream.account_id as u64)?;
+    write_block_height(w, stream.sync_h)?;
+    write_transparent_address(w, &stream.t_addr)
+}
+fn read_manual_stream(r: &mut impl Read) -> io::Result<ManualStream> {
+    Ok(ManualStream {
+        account_id: usize::try_from(read_u64(r)?).map_err(|_| snapshot_invalid("stream account id too large"))?,
+        sync_h: read_block_height(r)?,
+        t_addr: read_transparent_address(r)?,
+    })
+}
+
+fn write_manual_wallet(w: &mut impl Write, wallet: &ManualWallet) -> io::Result<()> {
+    write_len(w, wallet.accounts.len())?;
+    for account in &wallet.accounts { write_manual_account(w, account)?; }
+    write_vec(w, &wallet.strms, |w, stream| write_manual_stream(w, stream))?;
+    write_block_height(w, wallet.chain_tip_h)?;
+    write_vec(w, &wallet.txs, |w, tx| write_wallet_tx(w, tx))?;
+    write_len(w, wallet.tx_h_map.len())?;
+    for (txid, h) in &wallet.tx_h_map {
+        write_txid(w, *txid)?;
+        write_block_height(w, *h)?;
+    }
+    write_len(w, wallet.seen_bond_values.len())?;
+    for (key, value) in &wallet.seen_bond_values {
+        w.write_all(key)?;
+        write_u64(w, *value)?;
+    }
+    write_vec(w, &wallet.care_about_bonds, |w, key| w.write_all(key))
+}
+fn read_manual_wallet(r: &mut impl Read, name: &'static str, template: &ManualWallet) -> io::Result<ManualWallet> {
+    let account_len = read_bounded_len(r, MAX_WALLET_SNAPSHOT_ITEMS, "wallet account")?;
+    if account_len != template.accounts.len() {
+        return Err(snapshot_invalid(format!("wallet snapshot account count mismatch for {name}")));
+    }
+    let mut accounts = Vec::with_capacity(account_len);
+    for account_i in 0..account_len {
+        accounts.push(read_manual_account(r, &template.accounts[account_i])?);
+    }
+    let strms = read_vec(r, |r| read_manual_stream(r))?;
+    let chain_tip_h = read_block_height(r)?;
+    let txs = read_vec(r, |r| read_wallet_tx(r))?;
+
+    let tx_h_map_len = read_bounded_len(r, MAX_WALLET_SNAPSHOT_ITEMS, "transaction height map")?;
+    let mut tx_h_map = HashMap::with_capacity(tx_h_map_len);
+    for _ in 0..tx_h_map_len { tx_h_map.insert(read_txid(r)?, read_block_height(r)?); }
+
+    let seen_len = read_bounded_len(r, MAX_WALLET_SNAPSHOT_ITEMS, "seen bond value map")?;
+    let mut seen_bond_values = HashMap::with_capacity(seen_len);
+    for _ in 0..seen_len { seen_bond_values.insert(read_array::<32>(r)?, read_u64(r)?); }
+
+    let care_about_bonds = read_vec(r, |r| read_array::<32>(r))?;
+    Ok(ManualWallet { name, accounts, strms, chain_tip_h, txs, tx_h_map, seen_bond_values, care_about_bonds })
+}
+
+fn write_pow_cache(w: &mut impl Write, cache: &PoWCache) -> io::Result<()> {
+    write_len(w, cache.hashes.len())?;
+    for hash in &cache.hashes { w.write_all(hash)?; }
+    write_u64(w, cache.next_tip_h)
+}
+fn read_pow_cache(r: &mut impl Read) -> io::Result<PoWCache> {
+    let len = read_bounded_len(r, MAX_WALLET_SNAPSHOT_ITEMS, "PoW cache")?;
+    let mut hashes = Vec::with_capacity(len);
+    for _ in 0..len { hashes.push(read_array::<32>(r)?); }
+    let next_tip_h = read_u64(r)?;
+    let next_tip_h_usize = usize::try_from(next_tip_h)
+        .map_err(|_| snapshot_invalid("PoW cache height does not fit usize"))?;
+    if next_tip_h == 0 || hashes.len() < next_tip_h_usize {
+        return Err(snapshot_invalid("invalid PoW cache in wallet snapshot"));
+    }
+    Ok(PoWCache { hashes, next_tip_h })
+}
+
+fn shardtree_error(err: impl std::fmt::Debug) -> io::Error {
+    snapshot_invalid(format!("invalid orchard shard tree in wallet snapshot: {err:?}"))
+}
+fn write_orchard_tree(w: &mut impl Write, tree: &OrchardShardTree) -> io::Result<()> {
+    use shardtree::store::ShardStore;
+    use zcash_client_backend::serialization::shardtree::write_shard;
+
+    let mut cap_bytes = Vec::new();
+    write_shard(&mut cap_bytes, &tree.store().get_cap().map_err(shardtree_error)?)
+        .map_err(shardtree_error)?;
+    write_bytes(w, &cap_bytes)?;
+
+    let shard_roots = tree.store().get_shard_roots().map_err(shardtree_error)?;
+    write_len(w, shard_roots.len())?;
+    for shard_root in shard_roots {
+        let shard = tree.store().get_shard(shard_root).map_err(shardtree_error)?
+            .ok_or_else(|| snapshot_invalid("missing shard root in wallet snapshot write"))?;
+        let mut shard_data = Vec::new();
+        write_shard(&mut shard_data, shard.root()).map_err(shardtree_error)?;
+        write_u64(w, shard_root.index())?;
+        write_bytes(w, &shard_data)?;
+    }
+
+    let mut checkpoints = Vec::new();
+    tree.store().for_each_checkpoint(usize::MAX, |id, checkpoint| {
+        let position = match checkpoint.tree_state() {
+            shardtree::store::TreeState::Empty => 0,
+            shardtree::store::TreeState::AtPosition(position) => position.into(),
+        };
+        checkpoints.push((id.0, position));
+        Ok(())
+    }).map_err(shardtree_error)?;
+
+    write_len(w, checkpoints.len())?;
+    for (id, position) in checkpoints {
+        write_u32(w, id)?;
+        write_u64(w, position)?;
+    }
+    Ok(())
+}
+fn read_orchard_tree(r: &mut impl Read, max_checkpoints: usize) -> io::Result<OrchardShardTree> {
+    use incrementalmerkletree::{Address, Level};
+    use shardtree::{LocatedPrunableTree, store::{Checkpoint, ShardStore, memory::MemoryShardStore}};
+    use zcash_client_backend::serialization::shardtree::read_shard;
+
+    let mut tree = OrchardShardTree::new(MemoryShardStore::empty(), max_checkpoints);
+    let cap = read_shard(Cursor::new(read_bytes(r)?)).map_err(shardtree_error)?;
+    tree.store_mut().put_cap(cap).map_err(shardtree_error)?;
+
+    let shard_len = read_bounded_len(r, MAX_WALLET_SNAPSHOT_ITEMS, "orchard shard")?;
+    for _ in 0..shard_len {
+        let shard_root = Address::from_parts(Level::from(SHARD_HEIGHT), read_u64(r)?);
+        let shard_tree = read_shard(Cursor::new(read_bytes(r)?)).map_err(shardtree_error)?;
+        let shard = LocatedPrunableTree::from_parts(shard_root, shard_tree)
+            .map_err(|_| snapshot_invalid("invalid located shard in wallet snapshot"))?;
+        tree.store_mut().put_shard(shard).map_err(shardtree_error)?;
+    }
+
+    let checkpoint_len = read_bounded_len(r, MAX_WALLET_SNAPSHOT_ITEMS, "orchard checkpoint")?;
+    for _ in 0..checkpoint_len {
+        tree.store_mut().add_checkpoint(
+            BlockHeight(read_u32(r)?),
+            Checkpoint::at_position(read_u64(r)?.into()),
+        ).map_err(shardtree_error)?;
+    }
+    Ok(tree)
+}
+
+fn write_wallet_snapshot(
+    path: &Path,
+    global_seed: &[u8; 32],
+    genesis_hash: &[u8; 32],
+    miner_wallet: &ManualWallet,
+    user_wallet: &ManualWallet,
+    pow_cache: &PoWCache,
+    orchard_tree: &OrchardShardTree,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    let mut data = Vec::new();
+    data.write_all(WALLET_SNAPSHOT_MAGIC)?;
+    write_u32(&mut data, WALLET_SNAPSHOT_VERSION)?;
+    data.write_all(global_seed)?;
+    data.write_all(genesis_hash)?;
+    write_manual_wallet(&mut data, miner_wallet)?;
+    write_manual_wallet(&mut data, user_wallet)?;
+    write_pow_cache(&mut data, pow_cache)?;
+    write_orchard_tree(&mut data, orchard_tree)?;
+
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, data)?;
+    std::fs::rename(tmp_path, path)
+}
+
+fn wallet_from_usk<P: Parameters + 'static>(_params: P, name: &'static str, usk: &UnifiedSpendingKey) -> (ManualWallet, ManualAccount) {
+    let account = ManualAccount {
+        ufvk: usk.to_unified_full_viewing_key(),
+        birthday: BlockHeight(0),
+        balance_changes: vec![(BlockHeight(0), data_api::AccountBalance::ZERO)],
+        fully_decoded_h: BlockHeight(0),
+        fully_detected_h: BlockHeight(0),
+        recv_txos: Vec::new(),
+        utxos: Vec::new(),
+        stxos: Vec::new(),
+        recv_orchard_notes: Vec::new(),
+        unspent_orchard_notes: Vec::new(),
+        spent_orchard_notes: Vec::new(),
+    };
+
+    let wallet = ManualWallet {
+        name,
+        accounts: vec![account.clone()],
+        strms: Vec::new(),
+        chain_tip_h: BlockHeight(0),
+        txs: Vec::new(),
+        tx_h_map: HashMap::new(),
+        seen_bond_values: HashMap::new(),
+        care_about_bonds: Vec::new(),
+    };
+
+    (wallet, account)
+}
+
+fn read_wallet_snapshot(
+    path: &Path,
+    global_seed: &[u8; 32],
+    genesis_hash: &[u8; 32],
+    miner_template: &ManualWallet,
+    user_template: &ManualWallet,
+    max_checkpoints: usize,
+) -> io::Result<Option<ManualWalletSnapshot>> {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let mut r = Cursor::new(data);
+    let mut magic = [0u8; 8];
+    r.read_exact(&mut magic)?;
+    if &magic != WALLET_SNAPSHOT_MAGIC {
+        return Err(snapshot_invalid("wallet snapshot has invalid magic"));
+    }
+    let version = read_u32(&mut r)?;
+    if version != WALLET_SNAPSHOT_VERSION {
+        return Err(snapshot_invalid(format!("unsupported wallet snapshot version {version}")));
+    }
+    let snapshot_seed = read_array::<32>(&mut r)?;
+    let snapshot_genesis = read_array::<32>(&mut r)?;
+    if &snapshot_seed != global_seed || &snapshot_genesis != genesis_hash {
+        return Ok(None);
+    }
+    let snapshot = ManualWalletSnapshot {
+        miner_wallet: read_manual_wallet(&mut r, "miner", miner_template)?,
+        user_wallet: read_manual_wallet(&mut r, "user", user_template)?,
+        pow_cache: read_pow_cache(&mut r)?,
+        orchard_tree: read_orchard_tree(&mut r, max_checkpoints)?,
+    };
+    if r.position() != r.get_ref().len() as u64 {
+        return Err(snapshot_invalid("wallet snapshot has trailing bytes"));
+    }
+    Ok(Some(snapshot))
+}
+
+fn highest_common_ancestor_from_hashes(snapshot_hashes: &[[u8; 32]], live_hashes: &[[u8; 32]]) -> Option<u64> {
+    if snapshot_hashes.is_empty() || live_hashes.is_empty() || snapshot_hashes[0] != live_hashes[0] {
+        return None;
+    }
+
+    let mut high = (snapshot_hashes.len() - 1).min(live_hashes.len() - 1);
+    if snapshot_hashes[high] == live_hashes[high] {
+        return Some(high as u64);
+    }
+
+    let mut low = 0usize;
+    while low < high {
+        let mid = low + (high - low + 1) / 2;
+        if snapshot_hashes[mid] == live_hashes[mid] {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    Some(low as u64)
+}
+
+fn decode_block_hash(hash: &[u8], what: &str) -> Result<[u8; 32], String> {
+    <[u8; 32]>::try_from(hash)
+        .map_err(|_| format!("{what} returned malformed 32-byte hash: {}", LESlice(hash)))
+}
+
+async fn fetch_block_hash(client: &mut CompactTxStreamerClient<Channel>, height: u64, what: &str) -> Result<[u8; 32], String> {
+    let block = client
+        .get_block(BlockId { height, hash: Vec::new() })
+        .await
+        .map_err(|err| format!("failed to get {what} block at height {height}: {err:?}"))?
+        .into_inner();
+    decode_block_hash(&block.hash, what)
+}
+
+async fn observe_live_tip(client: &mut CompactTxStreamerClient<Channel>) -> Result<(u64, [u8; 32]), String> {
+    let info = client
+        .get_lightd_info(Empty {})
+        .await
+        .map_err(|err| format!("failed to read Zaino tip: {err:?}"))?
+        .into_inner();
+    let live_tip_h = u64::try_from(info.block_height)
+        .map_err(|err| format!("Zaino tip height is not representable: {err:?}"))?;
+    let live_tip_hash = fetch_block_hash(client, live_tip_h, "tip").await?;
+    Ok((live_tip_h, live_tip_hash))
+}
+
+struct SnapshotRecoveryProof {
+    live_tip_h: u64,
+    common_ancestor_h: u64,
+}
+
+async fn prove_snapshot_reusable_prefix(
+    client: &mut CompactTxStreamerClient<Channel>,
+    pow_cache: &PoWCache,
+) -> Result<SnapshotRecoveryProof, String> {
+    let snapshot_tip_h = pow_cache
+        .next_tip_h
+        .checked_sub(1)
+        .ok_or_else(|| "snapshot PoW cache has no tip".to_string())?;
+    let cached_genesis_hash = pow_cache
+        .hash_at_h(0)
+        .ok_or_else(|| "snapshot PoW cache is missing genesis hash".to_string())?;
+
+    let (live_tip_h, live_tip_hash) = observe_live_tip(client).await?;
+    let candidate_h = snapshot_tip_h.min(live_tip_h);
+    let live_genesis_hash = fetch_block_hash(client, 0, "genesis").await?;
+    if cached_genesis_hash != live_genesis_hash {
+        return Err(format!(
+            "snapshot genesis hash {} does not match Zaino genesis hash {}",
+            LEHash(cached_genesis_hash),
+            LEHash(live_genesis_hash),
+        ));
+    }
+
+    let candidate_live_hash = fetch_block_hash(client, candidate_h, "snapshot proof").await?;
+    let common_ancestor_h = if pow_cache.hash_at_h(candidate_h) == Some(candidate_live_hash) {
+        candidate_h
+    } else {
+        let mut low = 0u64;
+        let mut high = candidate_h;
+        while low < high {
+            let mid = low + (high - low + 1) / 2;
+            let mid_live_hash = fetch_block_hash(client, mid, "snapshot proof").await?;
+            if pow_cache.hash_at_h(mid) == Some(mid_live_hash) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        low
+    };
+
+    let (reobserved_tip_h, reobserved_tip_hash) = observe_live_tip(client).await?;
+    if reobserved_tip_h != live_tip_h || reobserved_tip_hash != live_tip_hash {
+        return Err(format!(
+            "Zaino tip changed during snapshot validation: {live_tip_h}/{} -> {reobserved_tip_h}/{}",
+            LEHash(live_tip_hash),
+            LEHash(reobserved_tip_hash),
+        ));
+    }
+
+    Ok(SnapshotRecoveryProof {
+        live_tip_h,
+        common_ancestor_h,
+    })
+}
+
+fn rewind_wallet_state_to_last_valid_h(
+    pow_cache: &mut PoWCache,
+    orchard_tree: &mut OrchardShardTree,
+    miner_wallet: &mut ManualWallet,
+    user_wallet: &mut ManualWallet,
+    last_valid_h: u64,
+    live_tip_h: BlockHeight,
+) -> Result<(), String> {
+    let last_valid_h_u32 = u32::try_from(last_valid_h)
+        .map_err(|_| format!("rewind height {last_valid_h} does not fit in 32 bits"))?;
+    let last_block_h = BlockHeight(last_valid_h_u32);
+    let first_invalid_h = last_block_h.sat_add(1);
+    let rewind_hash = pow_cache
+        .hash_at_h(last_valid_h)
+        .ok_or_else(|| format!("missing cached hash at rewind height {last_valid_h}"))?;
+
+    match orchard_tree.truncate_to_checkpoint(&last_block_h) {
+        Ok(true) => {}
+        Ok(false) if orchard_tree
+            .max_leaf_position(None)
+            .expect("Infallible Memory Store")
+            .is_none() => {}
+        Ok(false) => {
+            return Err(format!(
+                "Orchard checkpoint at {last_block_h} is unavailable; refusing to rewind wallet state"
+            ));
+        }
+        Err(err) => {
+            return Err(format!(
+                "failed to rewind Orchard checkpoint to {last_block_h}: {err:?}"
+            ));
+        }
+    }
+    pow_cache.push_new_tip(last_valid_h, rewind_hash);
+
+    for wallet in [&mut *miner_wallet, &mut *user_wallet] {
+        wallet.chain_tip_h = live_tip_h;
+
+        for strm in &mut wallet.strms {
+            strm.sync_h = strm.sync_h.min(last_block_h);
+        }
+
+        for account in &mut wallet.accounts {
+            account.fully_detected_h = account.fully_detected_h.min(last_block_h);
+            account.fully_decoded_h = account.fully_decoded_h.min(last_block_h);
+
+            let truncate_to_i = account.balance_changes.partition_point(|(b, _)| *b < first_invalid_h);
+            account.balance_changes.truncate(truncate_to_i);
+
+            let utxos_at_h_start = account.utxos.partition_point(|txo| txo.recv_h < first_invalid_h);
+            account.utxos.truncate(utxos_at_h_start);
+            let recv_txos_at_h_start = account.recv_txos.partition_point(|txo| txo.recv_h < first_invalid_h);
+
+            #[cfg(debug_assertions)]
+            for txo in &account.recv_txos[recv_txos_at_h_start..] {
+                let mut g_log = NOTE_LOG.lock().unwrap();
+                if let Some((tx_log, seq)) = g_log.get_expected(wallet.name, &txo.txid(), "unreceive") {
+                    tx_log.push(DevNoteAction {
+                        seq,
+                        kind: DevNoteActionKind::Unrecv,
+                        note: DevNote::Txo(txo.clone()),
+                        action_h: first_invalid_h,
+                        tip_h: live_tip_h,
+                    });
+                }
+            }
+            account.recv_txos.truncate(recv_txos_at_h_start);
+
+            let unspent_orchard_notes_at_h_start = account.unspent_orchard_notes.partition_point(|txo| txo.recv_h < first_invalid_h);
+            account.unspent_orchard_notes.truncate(unspent_orchard_notes_at_h_start);
+            let recv_orchard_notes_at_h_start = account.recv_orchard_notes.partition_point(|txo| txo.recv_h < first_invalid_h);
+
+            #[cfg(debug_assertions)]
+            for note in &account.recv_orchard_notes[recv_orchard_notes_at_h_start..] {
+                let mut g_log = NOTE_LOG.lock().unwrap();
+                if let Some((tx_log, seq)) = g_log.get_expected(wallet.name, &note.txid, "unreceive") {
+                    tx_log.push(DevNoteAction {
+                        seq,
+                        kind: DevNoteActionKind::Unrecv,
+                        note: DevNote::OrchardNote(note.clone()),
+                        action_h: first_invalid_h,
+                        tip_h: live_tip_h,
+                    });
+                }
+            }
+            account.recv_orchard_notes.truncate(recv_orchard_notes_at_h_start);
+
+            let stxos_at_h_start = account.stxos.partition_point(|txo| txo.spent_h < first_invalid_h);
+            for stxo in &account.stxos[stxos_at_h_start..] {
+                #[cfg(debug_assertions)]
+                {
+                    let mut g_log = NOTE_LOG.lock().unwrap();
+                    if let Some((tx_log, seq)) = g_log.get_expected(wallet.name, &stxo.txid(), "unspend") {
+                        tx_log.push(DevNoteAction {
+                            seq,
+                            kind: DevNoteActionKind::Unspend,
+                            note: DevNote::Txo(stxo.clone()),
+                            action_h: first_invalid_h,
+                            tip_h: live_tip_h,
+                        });
+                    }
+                }
+
+                if stxo.recv_h < first_invalid_h {
+                    txo_recv_h_insert(&mut account.utxos, Txo { spent_h: BlockHeight(0), ..stxo.clone() });
+                }
+            }
+            account.stxos.truncate(stxos_at_h_start);
+
+            let spent_orchard_notes_at_h_start = account.spent_orchard_notes.partition_point(|note| note.spent_h < first_invalid_h);
+            for note in &account.spent_orchard_notes[spent_orchard_notes_at_h_start..] {
+                #[cfg(debug_assertions)]
+                {
+                    let mut g_log = NOTE_LOG.lock().unwrap();
+                    if let Some((tx_log, seq)) = g_log.get_expected(wallet.name, &note.txid, "unspend") {
+                        tx_log.push(DevNoteAction {
+                            seq,
+                            kind: DevNoteActionKind::Unspend,
+                            note: DevNote::OrchardNote(note.clone()),
+                            action_h: first_invalid_h,
+                            tip_h: live_tip_h,
+                        });
+                    }
+                }
+
+                if note.recv_h < first_invalid_h {
+                    orchard_recv_h_insert(&mut account.unspent_orchard_notes, OrchardNote { spent_h: BlockHeight(0), ..note.clone() });
+                }
+            }
+            account.spent_orchard_notes.truncate(spent_orchard_notes_at_h_start);
+        }
+
+        let invalidate_from_i = wallet.txs.partition_point(|tx| tx.h < first_invalid_h);
+        for tx in &mut wallet.txs[invalidate_from_i..] {
+            if tx.h > BlockHeight::MEMPOOL {
+                break;
+            }
+            tx.status = TxStatus::SoftFail(tx.h);
+            tx.h = wallet.chain_tip_h;
+            wallet.tx_h_map.remove(&tx.txid);
+            wallet.tx_h_map.insert(tx.txid, tx.h);
+        }
+    }
+
+    Ok(())
+}
+
+fn recache_blocks_from(pow_cache: &mut PoWCache, new_blocks: &[CompactBlock], start_block_i: usize) -> Result<(), String> {
+    for block in &new_blocks[start_block_i..] {
+        let hash = decode_block_hash(&block.hash, "compact block")?;
+        pow_cache.push_new_tip(block.height, hash);
+    }
+    Ok(())
+}
+
+async fn recover_wallet_snapshot(
+    client: &mut CompactTxStreamerClient<Channel>,
+    mut snapshot: ManualWalletSnapshot,
+) -> Result<ManualWalletSnapshot, String> {
+    let snapshot_tip_h = snapshot
+        .pow_cache
+        .next_tip_h
+        .checked_sub(1)
+        .ok_or_else(|| "snapshot PoW cache has no tip".to_string())?;
+    let proof = prove_snapshot_reusable_prefix(client, &snapshot.pow_cache).await?;
+    let live_tip_h = BlockHeight(
+        u32::try_from(proof.live_tip_h)
+            .map_err(|_| format!("live tip {} does not fit in 32 bits", proof.live_tip_h))?,
+    );
+
+    if proof.common_ancestor_h < snapshot_tip_h {
+        rewind_wallet_state_to_last_valid_h(
+            &mut snapshot.pow_cache,
+            &mut snapshot.orchard_tree,
+            &mut snapshot.miner_wallet,
+            &mut snapshot.user_wallet,
+            proof.common_ancestor_h,
+            live_tip_h,
+        )?;
+    } else {
+        snapshot.miner_wallet.chain_tip_h = live_tip_h;
+        snapshot.user_wallet.chain_tip_h = live_tip_h;
+    }
+
+    Ok(snapshot)
+}
+
+fn save_wallet_snapshot_if_enabled(
+    path: Option<&Path>,
+    global_seed: &[u8; 32],
+    genesis_hash: &[u8; 32],
+    miner_wallet: &ManualWallet,
+    user_wallet: &ManualWallet,
+    pow_cache: &PoWCache,
+    orchard_tree: &OrchardShardTree,
+) {
+    let Some(path) = path else { return; };
+    if let Err(err) = write_wallet_snapshot(path, global_seed, genesis_hash, miner_wallet, user_wallet, pow_cache, orchard_tree) {
+        println!("WALLET SNAPSHOT ERROR: failed to save {path:?}: {err:?}");
+    }
+}
+
+fn publish_loaded_wallet_snapshot(
+    wallet_state: &Arc<Mutex<WalletState>>,
+    miner_wallet: &ManualWallet,
+    user_wallet: &ManualWallet,
+    pow_cache: &PoWCache,
+) {
+    fn balances(wallet: &ManualWallet) -> (u64, u64, u64) {
+        let mut unshielded_funds = 0;
+        let mut shielded_pending_funds = 0;
+        let mut shielded_spendable_funds = 0;
+
+        for txo in &wallet.accounts[0].utxos {
+            unshielded_funds += txo.value.into_u64();
+        }
+
+        for note in &wallet.accounts[0].unspent_orchard_notes {
+            let val = note.note.value().inner();
+            if note.recv_h < wallet.chain_tip_h.sat_sub(5) {
+                shielded_spendable_funds += val;
+            } else {
+                shielded_pending_funds += val;
+            }
+        }
+
+        (unshielded_funds, shielded_pending_funds, shielded_spendable_funds)
+    }
+
+    let (miner_unshielded_funds, miner_shielded_pending_funds, miner_shielded_spendable_funds) = balances(miner_wallet);
+    let (user_unshielded_funds, user_shielded_pending_funds, user_shielded_spendable_funds) = balances(user_wallet);
+
+    let mut stake_positions_bonded: Vec<(ScanBond, [u8; 32], u64)> = Vec::new();
+    let mut stake_positions_unbonded: Vec<(ScanBond, u64)> = Vec::new();
+    for tx in &user_wallet.txs {
+        if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
+        if let Some(staking_action) = &tx.staking_action {
+            if let Some(create_bond) = StakingAction_CreateNewDelegationBond::try_from_union(staking_action) {
+                stake_positions_bonded.push((ScanBond {
+                    pk: PubKeyID(create_bond.unique_pubkey),
+                    initial_val: create_bond.amount_zats,
+                    create_height: tx.h.0,
+                    create_txid: PubKeyID(<[u8; 32]>::from(tx.txid)),
+                }, create_bond.target_finalizer, create_bond.amount_zats));
+            }
+        }
+    }
+    for tx in &user_wallet.txs {
+        if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
+        if let Some(staking_action) = &tx.staking_action {
+            if let Some(retarget) = StakingAction_RetargetDelegationBond::try_from_union(staking_action) {
+                if let Some((_bond, finalizer, _latest_zats)) = stake_positions_bonded.iter_mut().find(|(bond, _, _)| bond.pk.0 == retarget.unique_pubkey) {
+                    *finalizer = retarget.target_finalizer;
+                }
+            }
+            if let Some(unbond) = StakingAction_BeginDelegationUnbonding::try_from_union(staking_action) {
+                if let Some(existing_i) = stake_positions_bonded.iter().position(|(bond, _, _)| bond.pk.0 == unbond.unique_pubkey) {
+                    let (bond, _finalizer, latest) = stake_positions_bonded.remove(existing_i);
+                    stake_positions_unbonded.push((bond, latest));
+                } else {
+                    stake_positions_unbonded.push((ScanBond {
+                        pk: PubKeyID(unbond.unique_pubkey),
+                        initial_val: u64::MAX,
+                        create_height: 0,
+                        create_txid: PubKeyID::NIL,
+                    }, u64::MAX));
+                }
+            }
+            if let Some(unbond) = StakingAction_WithdrawDelegationBond::try_from_union(staking_action) {
+                if let Some(existing_i) = stake_positions_unbonded.iter().position(|(bond, _)| bond.pk.0 == unbond.unique_pubkey) {
+                    stake_positions_unbonded.remove(existing_i);
+                }
+            }
+        }
+    }
+
+    let mut user_staked_funds = 0;
+    let mut user_withdrawable_funds = 0;
+    for (bond, _finalizer, latest_zats) in &mut stake_positions_bonded {
+        if let Some(zats) = user_wallet.seen_bond_values.get(&bond.pk.0) {
+            *latest_zats = *zats;
+        }
+        user_staked_funds += *latest_zats;
+    }
+    for (bond, latest_zats) in &mut stake_positions_unbonded {
+        if let Some(zats) = user_wallet.seen_bond_values.get(&bond.pk.0) {
+            *latest_zats = *zats;
+        }
+        if *latest_zats != u64::MAX {
+            user_withdrawable_funds += *latest_zats;
+        }
+    }
+
+    {
+        let mut active: BTreeMap<PubKeyID, Vec<(ScanBond, u64)>> = BTreeMap::new();
+        for (bond, finalizer, latest) in &stake_positions_bonded {
+            active.entry(PubKeyID(*finalizer)).or_default().push((bond.clone(), *latest));
+        }
+        let withdrawable = stake_positions_unbonded.iter()
+            .filter(|(bond, latest_zats)| *latest_zats != u64::MAX && bond.initial_val != u64::MAX)
+            .cloned()
+            .collect();
+        *STAKING_POSITIONS.lock().unwrap() = (active, withdrawable);
+    }
+
+    let mut lock = wallet_state.lock().unwrap();
+    lock.user_txs = user_wallet.txs.clone();
+    lock.miner_txs = miner_wallet.txs.clone();
+    lock.user_local_txs = [WalletTx::EMPTY; 3];
+    lock.user_local_txs_n = 0;
+    lock.miner_local_txs = [WalletTx::EMPTY; 3];
+    lock.miner_local_txs_n = 0;
+    lock.waiting_for_send = false;
+    lock.waiting_for_faucet = false;
+    lock.waiting_for_stake_to_finalizer = false;
+    lock.miner_unshielded_funds = miner_unshielded_funds;
+    lock.miner_shielded_pending_funds = miner_shielded_pending_funds;
+    lock.miner_shielded_spendable_funds = miner_shielded_spendable_funds;
+    lock.miner_seen_h = miner_wallet.chain_tip_h.0;
+    lock.user_unshielded_funds = user_unshielded_funds;
+    lock.user_shielded_pending_funds = user_shielded_pending_funds;
+    lock.user_shielded_spendable_funds = user_shielded_spendable_funds;
+    lock.stake_positions_bonded = stake_positions_bonded;
+    lock.stake_positions_unbonded = stake_positions_unbonded;
+    lock.wallets_sync_h = pow_cache.next_tip_h.saturating_sub(1);
+    lock.wallets_tip_h = user_wallet.chain_tip_h.0.into();
+    lock.staked_balance = user_staked_funds;
+    lock.withdrawable_balance = user_withdrawable_funds;
+}
+
 fn shard_tree_size(tree: &OrchardShardTree) -> u64 {
     tree.max_leaf_position(None)
         .expect("Infallible Memory Store")
@@ -2883,39 +3893,7 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
 }
 
 
-pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
-    fn wallet_from_usk<P: Parameters + 'static>(params: P, name: &'static str, usk: &UnifiedSpendingKey) -> (ManualWallet, ManualAccount) {
-        // TODO: skip this by changing API slightly
-        let account_id = zip32::AccountId::try_from(0).unwrap();
-
-        let account = ManualAccount {
-            ufvk: usk.to_unified_full_viewing_key(),
-            birthday: BlockHeight(0),
-            balance_changes: vec![(BlockHeight(0), data_api::AccountBalance::ZERO)],
-            fully_decoded_h: BlockHeight(0),
-            fully_detected_h: BlockHeight(0),
-            recv_txos: Vec::new(),
-            utxos: Vec::new(),
-            stxos: Vec::new(),
-            recv_orchard_notes: Vec::new(),
-            unspent_orchard_notes: Vec::new(),
-            spent_orchard_notes: Vec::new(),
-        };
-
-        let wallet = ManualWallet {
-            name,
-            accounts: vec![account.clone()],
-            strms: Vec::new(),
-            chain_tip_h: BlockHeight(0),
-            txs: Vec::new(),
-            tx_h_map: HashMap::new(),
-            seen_bond_values: HashMap::new(),
-            care_about_bonds: Vec::new(),
-        };
-
-        (wallet, account)
-    }
-
+pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>, snapshot_path: Option<PathBuf>) {
     fn get_transaction_history(wallet: &ManualWallet) -> Result<Vec<WalletTx>, Infallible> {
         Ok(wallet.txs.clone())
     }
@@ -3181,7 +4159,12 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         if let Some(global_seed) = *GLOBAL_SEED.lock().unwrap() {
             break global_seed;
         }
+        // `StartCmd` initializes the seed before the wallet can derive keys or
+        // decide whether an on-disk snapshot belongs to this node. Yield here
+        // instead of spinning on the mutex if the wallet task starts first.
+        tokio::time::sleep(Duration::from_millis(10)).await;
     };
+    let snapshot_path = snapshot_path.or_else(|| WALLET_SNAPSHOT_PATH.lock().unwrap().clone());
 
     let network = &TEST_NETWORK;
 
@@ -3365,7 +4348,29 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let mut orchard_tree = OrchardShardTree::new(shardtree::store::memory::MemoryShardStore::empty(), CHECKPOINTS_N);
     orchard_tree.checkpoint(BlockHeight(0)).unwrap();
 
-    const MAX_TXS_TO_DOWNLOAD_AT_TIME: u64 = 512;
+    if let Some(path) = snapshot_path.as_deref() {
+        match read_wallet_snapshot(path, &global_seed, &genesis_hash, &miner_wallet, &user_wallet, CHECKPOINTS_N) {
+            Ok(Some(snapshot)) => {
+                match recover_wallet_snapshot(&mut client, snapshot).await {
+                    Ok(snapshot) => {
+                        println!("loaded wallet snapshot from {path:?}");
+                        miner_wallet = snapshot.miner_wallet;
+                        user_wallet = snapshot.user_wallet;
+                        pow_cache = snapshot.pow_cache;
+                        orchard_tree = snapshot.orchard_tree;
+                        publish_loaded_wallet_snapshot(&wallet_state, &miner_wallet, &user_wallet, &pow_cache);
+                    }
+                    Err(err) => {
+                        println!("wallet snapshot rejected: {err}; starting wallet scan from genesis");
+                    }
+                }
+            }
+            Ok(None) => println!("no matching wallet snapshot at {path:?}; starting wallet scan from genesis"),
+            Err(err) => println!("WALLET SNAPSHOT ERROR: failed to load {path:?}: {err:?}; starting wallet scan from genesis"),
+        }
+    }
+
+    const MAX_TXS_TO_DOWNLOAD_AT_TIME: u64 = 64;
     // TODO: this is bad and should be replaced
     let mut in_flight_tx_requests = HashSet::<TxId>::new();
     let mut in_flight_tx_join_set = tokio::task::JoinSet::new();
@@ -3941,141 +4946,18 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         //-- REORG
         // TODO: double check mempool invalidation sequences correctly with async read (account for tip height on downloaded tx)
         if let Some(start_block_i) = sync_from_i {
-            // the regime is basically "always reorg", but that's often a no-op
-            // truncate wallet for everything below height
-            let sync_start_h = <u32>::try_from(new_blocks[start_block_i].height).expect("successfully converted above");
-            let block_h = BlockHeight(sync_start_h);
-            let last_block_h = block_h.sat_sub(1);
-
-            match orchard_tree.truncate_to_checkpoint(&last_block_h) { // N.B. checkpoints are at the *end* of their block
-                Ok(true) => (),
-                res => println!("****** WALLET TREE DESYNC: truncate_to_checkpoint({last_block_h}) = {res:?} with tree size {}; the rewind passed checkpoint retention, so spends will be invalid until restart", shard_tree_size(&orchard_tree)),
-            }
-
-            for (wallet_i, wallet) in [&mut miner_wallet, &mut user_wallet].into_iter().enumerate() {
-                //-- INVALIDATE SYNC >= NEW BLOCKS HEIGHT
-                for strm in &mut wallet.strms {
-                    strm.sync_h = strm.sync_h.min(last_block_h);
-                }
-
-                //-- INVALIDATE TXS >= NEW BLOCKS HEIGHT
-                for account in &mut wallet.accounts {
-                    account.fully_detected_h = account.fully_detected_h.min(last_block_h);
-                    account.fully_decoded_h = account.fully_decoded_h.min(last_block_h);
-
-                    // TODO: do we want to track balance changes or keep balances updated as chain changes occur?
-                    let truncate_to_i = account.balance_changes.partition_point(|(b,_)| *b < block_h);
-                    account.balance_changes.truncate(truncate_to_i);
-
-                    //- UNRECEIVE NOTES
-                    {
-                        let utxos_at_h_start = account.utxos.partition_point(|txo| txo.recv_h < block_h);
-                        account.utxos.truncate(utxos_at_h_start);
-                        let recv_txos_at_h_start = account.recv_txos.partition_point(|txo| txo.recv_h < block_h);
-
-                        #[cfg(debug_assertions)]
-                        for txo in &account.recv_txos[recv_txos_at_h_start..] {
-                            let mut g_log = NOTE_LOG.lock().unwrap();
-                            if let Some((tx_log, seq)) = g_log.get_expected(wallet.name, &txo.txid(), "unreceive") {
-                                tx_log.push(DevNoteAction{
-                                    seq,
-                                    kind: DevNoteActionKind::Unrecv,
-                                    note: DevNote::Txo(txo.clone()),
-                                    action_h: block_h,
-                                    tip_h: network_tip_h,
-                                });
-                            }
-                        }
-
-                        account.recv_txos.truncate(recv_txos_at_h_start);
-                    }
-
-                    {
-                        let unspent_orchard_notes_at_h_start = account.unspent_orchard_notes.partition_point(|txo| txo.recv_h < block_h);
-                        account.unspent_orchard_notes.truncate(unspent_orchard_notes_at_h_start);
-                        let recv_orchard_notes_at_h_start = account.recv_orchard_notes.partition_point(|txo| txo.recv_h < block_h);
-                        #[cfg(debug_assertions)]
-                        for note in &account.recv_orchard_notes[recv_orchard_notes_at_h_start..] {
-                            let mut g_log = NOTE_LOG.lock().unwrap();
-                            if let Some((tx_log, seq)) = g_log.get_expected(wallet.name, &note.txid, "unreceive") {
-                                tx_log.push(DevNoteAction{
-                                    seq,
-                                    kind: DevNoteActionKind::Unrecv,
-                                    note: DevNote::OrchardNote(note.clone()),
-                                    action_h: block_h,
-                                    tip_h: network_tip_h,
-                                });
-                            }
-                        }
-                        account.recv_orchard_notes.truncate(recv_orchard_notes_at_h_start);
-                    }
-
-                    //- UNSPEND NOTES
-                    // NOTE: spent notes are in spend_h order, NOT recv_h order
-                    {
-                        let stxos_at_h_start = account.stxos.partition_point(|txo| txo.spent_h < block_h);
-                        for stxo in &account.stxos[stxos_at_h_start..] {
-                            #[cfg(debug_assertions)]
-                            {
-                                let mut g_log = NOTE_LOG.lock().unwrap();
-                                if let Some((tx_log, seq)) = g_log.get_expected(wallet.name, &stxo.txid(), "unspend") {
-                                    tx_log.push(DevNoteAction{
-                                        seq,
-                                        kind: DevNoteActionKind::Unspend,
-                                        note: DevNote::Txo(stxo.clone()),
-                                        action_h: block_h,
-                                        tip_h: network_tip_h,
-                                    });
-                                }
-                            }
-
-                            if stxo.recv_h < block_h {
-                                txo_recv_h_insert(&mut account.utxos, Txo{ spent_h: BlockHeight(0), ..stxo.clone() });
-                            }
-                        }
-                        account.stxos.truncate(stxos_at_h_start);
-                    }
-
-                    {
-                        let spent_orchard_notes_at_h_start = account.spent_orchard_notes.partition_point(|note| note.spent_h < block_h);
-                        for note in &account.spent_orchard_notes[spent_orchard_notes_at_h_start..] {
-                            #[cfg(debug_assertions)]
-                            {
-                                let mut g_log = NOTE_LOG.lock().unwrap();
-                                if let Some((tx_log, seq)) = g_log.get_expected(wallet.name, &note.txid, "unspend") {
-                                    tx_log.push(DevNoteAction{
-                                        seq,
-                                        kind: DevNoteActionKind::Unspend,
-                                        note: DevNote::OrchardNote(note.clone()),
-                                        action_h: block_h,
-                                        tip_h: network_tip_h,
-                                    });
-                                }
-                            }
-
-                            if note.recv_h < block_h {
-                                orchard_recv_h_insert(&mut account.unspent_orchard_notes, OrchardNote{ spent_h: BlockHeight(0), ..note.clone() });
-                            }
-                        }
-                        account.spent_orchard_notes.truncate(spent_orchard_notes_at_h_start);
-                    }
-                }
-
-                //  higher blocks & mempool
-                let invalidate_from_i = wallet.txs.partition_point(|tx| tx.h < block_h);
-                for tx in &mut wallet.txs[invalidate_from_i..] {
-                    if tx.h > BlockHeight::MEMPOOL {
-                        // mid-construction items aren't auto-invalidated
-                        // maybe sent should be?
-                        break;
-                    }
-                    // N.B. these may get revalidated later if the same txs are found in the new blocks
-                    tx.status = TxStatus::SoftFail(tx.h);
-                    tx.h = wallet.chain_tip_h;
-                    wallet.tx_h_map.remove(&tx.txid);
-                    wallet.tx_h_map.insert(tx.txid, tx.h);
-                }
-            }
+            let last_valid_h = new_blocks[start_block_i].height.saturating_sub(1);
+            rewind_wallet_state_to_last_valid_h(
+                &mut pow_cache,
+                &mut orchard_tree,
+                &mut miner_wallet,
+                &mut user_wallet,
+                last_valid_h,
+                network_tip_h,
+            )
+            .expect("reorg rewind should succeed");
+            recache_blocks_from(&mut pow_cache, &new_blocks, start_block_i)
+                .expect("validated compact blocks should recache successfully");
         }
 
         // Cross-check our commitment tree against the node's own, at the height just
@@ -4259,6 +5141,16 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
             if DUMP_SYNC { println!("after  reading, there are {} in flight tx downloads", in_flight_tx_requests.len()); }
         }
+
+        save_wallet_snapshot_if_enabled(
+            snapshot_path.as_deref(),
+            &global_seed,
+            &genesis_hash,
+            &miner_wallet,
+            &user_wallet,
+            &pow_cache,
+            &orchard_tree,
+        );
 
         //-- SEND DATA TO UI
         {
@@ -4740,6 +5632,334 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod wallet_snapshot_tests {
+    use super::*;
+    use shardtree::store::memory::MemoryShardStore;
+
+    const TEST_CHECKPOINTS: usize = 100;
+
+    fn temp_snapshot_path(name: &str) -> PathBuf {
+        let unique = format!(
+            "zebra-wallet-snapshot-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos(),
+        );
+        std::env::temp_dir().join(unique).join("wallet.snapshot")
+    }
+
+    fn wallet_template(name: &'static str) -> ManualWallet {
+        let (_, usk) = stuff_from_seed_phrase(
+            &TEST_NETWORK,
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        );
+        wallet_from_usk(&TEST_NETWORK, name, &usk).0
+    }
+
+    fn sample_wallet(name: &'static str) -> ManualWallet {
+        let (_, usk) = stuff_from_seed_phrase(
+            &TEST_NETWORK,
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        );
+        let (mut wallet, account) = wallet_from_usk(&TEST_NETWORK, name, &usk);
+        let (t_addr, _, _) = addrs_from_account(&account, 0).expect("test account should derive an address");
+        wallet.chain_tip_h = BlockHeight(42);
+        wallet.strms.push(ManualStream {
+            account_id: 0,
+            sync_h: BlockHeight(40),
+            t_addr: t_addr.clone(),
+        });
+        wallet.accounts[0].fully_detected_h = BlockHeight(41);
+        wallet.accounts[0].fully_decoded_h = BlockHeight(40);
+        wallet.accounts[0].recv_txos.push(Txo {
+            recv_h: BlockHeight(3),
+            spent_h: BlockHeight(u32::MAX),
+            id: OutPoint::new([1; 32], 0),
+            value: Zatoshis::from_u64(12_345).expect("valid zatoshi amount"),
+            t_addr,
+        });
+        wallet.txs.push(WalletTx {
+            txid: TxId::from_bytes([2; 32]),
+            h: BlockHeight(7),
+            parts: [
+                WalletTxPart {
+                    recv_note_count: 1,
+                    recv_zats: Zatoshis::from_u64(12_345).expect("valid zatoshi amount"),
+                    ..WalletTxPart::ZERO
+                },
+                WalletTxPart::ZERO,
+            ],
+            ..WalletTx::EMPTY
+        });
+        wallet.tx_h_map.insert(TxId::from_bytes([2; 32]), BlockHeight(7));
+        wallet.seen_bond_values.insert([3; 32], 99);
+        wallet.care_about_bonds.push([4; 32]);
+        wallet
+    }
+
+    fn empty_orchard_tree() -> OrchardShardTree {
+        let mut tree = OrchardShardTree::new(MemoryShardStore::empty(), TEST_CHECKPOINTS);
+        tree.checkpoint(BlockHeight(0))
+            .expect("empty tree checkpoint should succeed");
+        tree
+    }
+
+    #[test]
+    fn wallet_snapshot_common_ancestor_full_match() {
+        let snapshot_hashes = vec![[1; 32], [2; 32], [3; 32], [4; 32]];
+        let live_hashes = snapshot_hashes.clone();
+
+        assert_eq!(highest_common_ancestor_from_hashes(&snapshot_hashes, &live_hashes), Some(3));
+    }
+
+    #[test]
+    fn wallet_snapshot_common_ancestor_divergent_suffix() {
+        let snapshot_hashes = vec![[1; 32], [2; 32], [3; 32], [4; 32], [5; 32]];
+        let live_hashes = vec![[1; 32], [2; 32], [3; 32], [8; 32], [9; 32]];
+
+        assert_eq!(highest_common_ancestor_from_hashes(&snapshot_hashes, &live_hashes), Some(2));
+    }
+
+    #[test]
+    fn wallet_snapshot_common_ancestor_requires_matching_genesis() {
+        let snapshot_hashes = vec![[1; 32], [2; 32], [3; 32]];
+        let live_hashes = vec![[9; 32], [2; 32], [3; 32]];
+
+        assert_eq!(highest_common_ancestor_from_hashes(&snapshot_hashes, &live_hashes), None);
+    }
+
+    #[test]
+    fn wallet_snapshot_common_ancestor_live_tip_below_snapshot_tip() {
+        let snapshot_hashes = vec![[1; 32], [2; 32], [3; 32], [4; 32], [5; 32]];
+        let live_hashes = vec![[1; 32], [2; 32], [3; 32]];
+
+        assert_eq!(highest_common_ancestor_from_hashes(&snapshot_hashes, &live_hashes), Some(2));
+    }
+
+    #[test]
+    fn wallet_snapshot_rewind_truncates_state_to_common_ancestor() {
+        let genesis_hash = [9; 32];
+        let mut pow_cache = PoWCache::new(0, genesis_hash);
+        pow_cache.push_new_tip(1, [10; 32]);
+        pow_cache.push_new_tip(2, [11; 32]);
+        pow_cache.push_new_tip(3, [12; 32]);
+
+        let mut miner_wallet = sample_wallet("miner");
+        let mut user_wallet = sample_wallet("user");
+        let rewind_tip = BlockHeight(9);
+
+        for wallet in [&mut miner_wallet, &mut user_wallet] {
+            wallet.chain_tip_h = BlockHeight(42);
+            wallet.strms[0].sync_h = BlockHeight(3);
+            wallet.accounts[0].fully_detected_h = BlockHeight(3);
+            wallet.accounts[0].fully_decoded_h = BlockHeight(3);
+            wallet.accounts[0].balance_changes = vec![
+                (BlockHeight(0), data_api::AccountBalance::ZERO),
+                (BlockHeight(1), data_api::AccountBalance::ZERO),
+                (BlockHeight(3), data_api::AccountBalance::ZERO),
+            ];
+            wallet.accounts[0].recv_txos = vec![
+                Txo {
+                    recv_h: BlockHeight(1),
+                    spent_h: BlockHeight(u32::MAX),
+                    id: OutPoint::new([1; 32], 0),
+                    value: Zatoshis::from_u64(10).unwrap(),
+                    t_addr: wallet.strms[0].t_addr.clone(),
+                },
+                Txo {
+                    recv_h: BlockHeight(3),
+                    spent_h: BlockHeight(u32::MAX),
+                    id: OutPoint::new([2; 32], 0),
+                    value: Zatoshis::from_u64(20).unwrap(),
+                    t_addr: wallet.strms[0].t_addr.clone(),
+                },
+            ];
+            wallet.accounts[0].utxos = wallet.accounts[0].recv_txos.clone();
+            wallet.accounts[0].stxos = vec![Txo {
+                recv_h: BlockHeight(1),
+                spent_h: BlockHeight(3),
+                id: OutPoint::new([3; 32], 0),
+                value: Zatoshis::from_u64(30).unwrap(),
+                t_addr: wallet.strms[0].t_addr.clone(),
+            }];
+            wallet.txs = vec![
+                WalletTx { txid: TxId::from_bytes([4; 32]), h: BlockHeight(1), status: TxStatus::OnBc, ..WalletTx::EMPTY },
+                WalletTx { txid: TxId::from_bytes([5; 32]), h: BlockHeight(3), status: TxStatus::OnBc, ..WalletTx::EMPTY },
+            ];
+            wallet.tx_h_map.clear();
+            wallet.tx_h_map.insert(TxId::from_bytes([4; 32]), BlockHeight(1));
+            wallet.tx_h_map.insert(TxId::from_bytes([5; 32]), BlockHeight(3));
+        }
+
+        let mut orchard_tree = empty_orchard_tree();
+
+        rewind_wallet_state_to_last_valid_h(
+            &mut pow_cache,
+            &mut orchard_tree,
+            &mut miner_wallet,
+            &mut user_wallet,
+            1,
+            rewind_tip,
+        )
+        .expect("rewind should succeed");
+
+        assert_eq!(pow_cache.next_tip_h, 2);
+        assert_eq!(pow_cache.hash_at_h(1), Some([10; 32]));
+        assert_eq!(pow_cache.hash_at_h(2), None);
+
+        for wallet in [&miner_wallet, &user_wallet] {
+            assert_eq!(wallet.chain_tip_h, rewind_tip);
+            assert_eq!(wallet.strms[0].sync_h, BlockHeight(1));
+            assert_eq!(wallet.accounts[0].fully_detected_h, BlockHeight(1));
+            assert_eq!(wallet.accounts[0].fully_decoded_h, BlockHeight(1));
+            assert_eq!(wallet.accounts[0].balance_changes.len(), 2);
+            assert_eq!(wallet.accounts[0].recv_txos.len(), 1);
+            assert_eq!(wallet.accounts[0].recv_txos[0].recv_h, BlockHeight(1));
+            assert_eq!(wallet.accounts[0].utxos.len(), 2);
+            assert!(wallet.accounts[0].utxos.iter().all(|txo| txo.recv_h == BlockHeight(1)));
+            assert!(wallet.accounts[0].stxos.is_empty());
+            assert_eq!(wallet.txs[0].status, TxStatus::OnBc);
+            assert_eq!(wallet.txs[1].status, TxStatus::SoftFail(BlockHeight(3)));
+            assert_eq!(wallet.txs[1].h, rewind_tip);
+            assert_eq!(wallet.tx_h_map.get(&TxId::from_bytes([5; 32])), Some(&rewind_tip));
+        }
+    }
+
+    #[test]
+    fn wallet_snapshot_round_trips_manual_wallet_state() {
+        let path = temp_snapshot_path("roundtrip");
+        let global_seed = [7; 32];
+        let genesis_hash = [9; 32];
+        let miner_wallet = sample_wallet("miner");
+        let user_wallet = sample_wallet("user");
+        let mut pow_cache = PoWCache::new(0, genesis_hash);
+        pow_cache.push_new_tip(1, [10; 32]);
+        let orchard_tree = empty_orchard_tree();
+
+        write_wallet_snapshot(
+            &path,
+            &global_seed,
+            &genesis_hash,
+            &miner_wallet,
+            &user_wallet,
+            &pow_cache,
+            &orchard_tree,
+        )
+        .expect("snapshot write should succeed");
+
+        let miner_template = wallet_template("miner");
+        let user_template = wallet_template("user");
+        let loaded = read_wallet_snapshot(
+            &path,
+            &global_seed,
+            &genesis_hash,
+            &miner_template,
+            &user_template,
+            TEST_CHECKPOINTS,
+        )
+        .expect("snapshot read should succeed")
+        .expect("snapshot should match seed and genesis");
+
+        assert_eq!(loaded.miner_wallet.chain_tip_h, miner_wallet.chain_tip_h);
+        assert_eq!(loaded.user_wallet.chain_tip_h, user_wallet.chain_tip_h);
+        assert_eq!(loaded.user_wallet.strms.len(), user_wallet.strms.len());
+        assert_eq!(loaded.user_wallet.txs, user_wallet.txs);
+        assert_eq!(loaded.user_wallet.tx_h_map, user_wallet.tx_h_map);
+        assert_eq!(loaded.user_wallet.seen_bond_values, user_wallet.seen_bond_values);
+        assert_eq!(loaded.user_wallet.care_about_bonds, user_wallet.care_about_bonds);
+        assert_eq!(loaded.pow_cache.hashes, pow_cache.hashes);
+        assert_eq!(loaded.pow_cache.next_tip_h, pow_cache.next_tip_h);
+        assert_eq!(shard_tree_size(&loaded.orchard_tree), shard_tree_size(&orchard_tree));
+
+        let _ = std::fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+
+    #[test]
+    fn wallet_snapshot_ignores_other_seed_or_genesis() {
+        let path = temp_snapshot_path("mismatch");
+        let global_seed = [7; 32];
+        let genesis_hash = [9; 32];
+        let miner_wallet = sample_wallet("miner");
+        let user_wallet = sample_wallet("user");
+        let pow_cache = PoWCache::new(0, genesis_hash);
+        let orchard_tree = empty_orchard_tree();
+
+        write_wallet_snapshot(
+            &path,
+            &global_seed,
+            &genesis_hash,
+            &miner_wallet,
+            &user_wallet,
+            &pow_cache,
+            &orchard_tree,
+        )
+        .expect("snapshot write should succeed");
+
+        let miner_template = wallet_template("miner");
+        let user_template = wallet_template("user");
+        let loaded = read_wallet_snapshot(
+            &path,
+            &[8; 32],
+            &genesis_hash,
+            &miner_template,
+            &user_template,
+            TEST_CHECKPOINTS,
+        )
+        .expect("mismatched snapshot should be a non-error miss");
+
+        assert!(loaded.is_none());
+
+        let _ = std::fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+
+    #[test]
+    fn wallet_snapshot_rejects_oversized_lengths() {
+        let path = temp_snapshot_path("oversized");
+        std::fs::create_dir_all(path.parent().expect("snapshot path should have a parent"))
+            .expect("temp dir should be created");
+
+        let global_seed = [7; 32];
+        let genesis_hash = [9; 32];
+        let mut bytes = Vec::new();
+        bytes.write_all(WALLET_SNAPSHOT_MAGIC).unwrap();
+        write_u32(&mut bytes, WALLET_SNAPSHOT_VERSION).unwrap();
+        bytes.write_all(&global_seed).unwrap();
+        bytes.write_all(&genesis_hash).unwrap();
+        write_u64(&mut bytes, (MAX_WALLET_SNAPSHOT_ITEMS as u64) + 1).unwrap();
+        std::fs::write(&path, bytes).expect("invalid snapshot should be written");
+
+        let miner_template = wallet_template("miner");
+        let user_template = wallet_template("user");
+        let err = match read_wallet_snapshot(
+            &path,
+            &global_seed,
+            &genesis_hash,
+            &miner_template,
+            &user_template,
+            TEST_CHECKPOINTS,
+        ) {
+            Ok(_) => panic!("oversized snapshot length should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir(parent);
         }
     }
 }
