@@ -1674,7 +1674,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
                         .expect("every magic memo output was added to this builder");
                     (action_i, chunk)
                 });
-                Some(with_magic_memo_chunks(bundle, chunk_action_is.collect()))
+                Some(with_magic_memo_chunks(bundle, chunk_action_is.collect(), &mut rng))
             }
             (_, bundle) => bundle,
         };
@@ -1840,7 +1840,8 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
 
 /// Returns `bundle` with, for each `(action_i, chunk)`, the `epk` and the first
 /// [`zcash_note_encryption::COMPACT_NOTE_SIZE`] bytes of the `enc_ciphertext` of its
-/// action at `action_i` replaced by `chunk`'s.
+/// action at `action_i` replaced by `chunk`'s, and its `out_ciphertext` too if `chunk`
+/// has one to carry (which depends on the action's `cv_net` and `cmx`).
 ///
 /// Every other part of every action is kept, in particular the proof-bound `nf`, `rk`,
 /// `cmx` and `cv_net`, as is all authorizing data. This is sound only before the
@@ -1851,9 +1852,10 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
 /// moved out, the actions are rebuilt with `Action::from_parts`, and the authorizing
 /// data is moved back in, in action order.
 #[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
-fn with_magic_memo_chunks<A: orchard::bundle::Authorization>(
+fn with_magic_memo_chunks<A: orchard::bundle::Authorization, R: RngCore>(
     bundle: orchard::Bundle<A, ZatBalance>,
     chunks: Vec<(usize, &crate::transaction::magic_memo::MagicMemoChunk)>,
+    rng: &mut R,
 ) -> orchard::Bundle<A, ZatBalance> {
     let flags = *bundle.flags();
     let value_balance = *bundle.value_balance();
@@ -1881,6 +1883,9 @@ fn with_magic_memo_chunks<A: orchard::bundle::Authorization>(
             encrypted_note.epk_bytes = *chunk.epk_bytes();
             encrypted_note.enc_ciphertext[..zcash_note_encryption::COMPACT_NOTE_SIZE]
                 .copy_from_slice(chunk.compact_ciphertext());
+            if let Some(out_ciphertext) = chunk.out_ciphertext(action.cv_net(), action.cmx(), rng) {
+                encrypted_note.out_ciphertext = out_ciphertext;
+            }
         }
         i += 1;
         orchard::Action::from_parts(
@@ -2486,13 +2491,15 @@ mod tests {
         );
     }
 
-    /// A magic memo must reach the chain as plaintext in the compact-visible bytes of the
-    /// built transaction while the Ironwood proof, every spend-authorization signature
-    /// and the binding signature still verify: the replaced `epk` and ciphertext bytes
-    /// are outside the proof and inside the digest the signatures commit to.
-    #[test]
+    /// Builds a transaction that spends one Ironwood note of `fvk`'s into an ordinary
+    /// output and the magic memo `memo_for` makes, then checks that the Ironwood proof,
+    /// every spend-authorization signature and the binding signature verify and that the
+    /// transaction round-trips: the replaced bytes are outside the proof and inside the
+    /// digest the signatures commit to.
     #[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
-    fn magic_memo_is_published_and_bundle_still_verifies() {
+    fn build_and_verify_with_magic_memo(
+        memo_for: impl FnOnce(&orchard::keys::FullViewingKey, orchard::Address) -> MagicMemo,
+    ) -> (super::BuildResult, orchard::keys::FullViewingKey, usize) {
         // Funded by one Ironwood note rather than a transparent input, so the shielded
         // sighash below needs no transparent input amounts or scripts.
         let sk = orchard::keys::SpendingKey::from_bytes([7; 32]).unwrap();
@@ -2531,9 +2538,9 @@ mod tests {
             },
         );
         builder
-            .add_ironwood_spend::<Infallible>(fvk, note, merkle_path)
+            .add_ironwood_spend::<Infallible>(fvk.clone(), note, merkle_path)
             .unwrap();
-        // An ordinary output first, so the memo's output index is not trivially 0.
+        // An ordinary output first, so the memo's output indices do not start at 0.
         builder
             .add_ironwood_output::<Infallible>(
                 None,
@@ -2542,13 +2549,8 @@ mod tests {
                 MemoBytes::empty(),
             )
             .unwrap();
-        // Spans three chunks, so three actions.
-        let payload: alloc::vec::Vec<u8> = (0..2 * magic_memo::MAGIC_MEMO_CHUNK_LEN + 10)
-            .map(|i| b'a' + (i % 26) as u8)
-            .collect();
-        let memo = MagicMemo::from_payload(&payload).unwrap();
+        let memo = memo_for(&fvk, recipient);
         let chunks_n = memo.chunks().len();
-        assert_eq!(chunks_n, 3);
         builder
             .add_ironwood_magic_memo::<Infallible>(recipient, memo)
             .unwrap();
@@ -2564,22 +2566,6 @@ mod tests {
         let tx = res.transaction();
         assert!(tx.transparent_bundle().is_none());
         let bundle = tx.ironwood_bundle().expect("Ironwood outputs were added");
-
-        // Read back only what a compact action shows: `epk` and the ciphertext prefix.
-        let memo_action_is: alloc::vec::Vec<usize> = (1..=chunks_n)
-            .map(|output_i| res.ironwood_meta().output_action_index(output_i).unwrap())
-            .collect();
-        let mut chunks = alloc::vec::Vec::new();
-        for (action_i, action) in bundle.actions().iter().enumerate() {
-            let note = action.encrypted_note();
-            let chunk = magic_memo::decode_chunk(
-                &note.enc_ciphertext[..zcash_note_encryption::COMPACT_NOTE_SIZE],
-                &note.epk_bytes,
-            );
-            assert_eq!(chunk.is_some(), memo_action_is.contains(&action_i));
-            chunks.extend(chunk);
-        }
-        assert_eq!(magic_memo::reassemble(chunks), Some(payload));
 
         let vk = orchard::circuit::VerifyingKey::build(bundle.bundle_version().circuit_version());
         bundle.verify_proof(&vk).unwrap();
@@ -2615,6 +2601,92 @@ mod tests {
             .binding_validating_key()
             .verify(sighash.as_ref(), bundle.authorization().binding_signature())
             .unwrap();
+
+        (res, fvk, chunks_n)
+    }
+
+    /// What a compact action shows of each of `bundle`'s actions: its ciphertext prefix
+    /// and `epk`.
+    #[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
+    fn compact_views<A: orchard::bundle::Authorization>(
+        bundle: &orchard::Bundle<A, ZatBalance>,
+    ) -> alloc::vec::Vec<(&[u8], &[u8])> {
+        bundle
+            .actions()
+            .iter()
+            .map(|action| {
+                let note = action.encrypted_note();
+                (
+                    &note.enc_ciphertext[..zcash_note_encryption::COMPACT_NOTE_SIZE],
+                    &note.epk_bytes[..],
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    #[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
+    fn public_magic_memo_is_published_and_bundle_still_verifies() {
+        // Spans three chunks, so three actions.
+        let payload: alloc::vec::Vec<u8> = (0..2 * magic_memo::MAGIC_MEMO_CHUNK_LEN + 10)
+            .map(|i| b'a' + (i % 26) as u8)
+            .collect();
+        let (res, _, chunks_n) =
+            build_and_verify_with_magic_memo(|_, _| MagicMemo::from_payload(&payload).unwrap());
+        assert_eq!(chunks_n, 3);
+        let bundle = res.transaction().ironwood_bundle().unwrap();
+
+        let memo_action_is: alloc::vec::Vec<usize> = (1..=chunks_n)
+            .map(|output_i| res.ironwood_meta().output_action_index(output_i).unwrap())
+            .collect();
+        let mut chunks = alloc::vec::Vec::new();
+        for (action_i, (ciphertext, epk)) in compact_views(bundle).into_iter().enumerate() {
+            let chunk = magic_memo::decode_chunk(ciphertext, epk);
+            assert_eq!(chunk.is_some(), memo_action_is.contains(&action_i));
+            chunks.extend(chunk);
+        }
+        assert_eq!(magic_memo::reassemble(chunks), Some(payload));
+    }
+
+    #[test]
+    #[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
+    fn encrypted_magic_memo_opens_with_ivk_and_ovk_only() {
+        // Spans three chunks: the first carries fewer bytes, its epk being a real key.
+        let payload: alloc::vec::Vec<u8> = (0..magic_memo::MAGIC_MEMO_ENCRYPTED_FIRST_CHUNK_LEN
+            + magic_memo::MAGIC_MEMO_CHUNK_LEN
+            + 10)
+            .map(|i| b'A' + (i % 26) as u8)
+            .collect();
+        let (res, fvk, chunks_n) = build_and_verify_with_magic_memo(|fvk, recipient| {
+            let ovk = fvk.to_ovk(orchard::keys::Scope::External);
+            MagicMemo::encrypted(recipient, Some(ovk), &payload, &mut OsRng).unwrap()
+        });
+        assert_eq!(chunks_n, 3);
+        let bundle = res.transaction().ironwood_bundle().unwrap();
+        let views = compact_views(bundle);
+
+        for (ciphertext, epk) in &views {
+            assert_eq!(magic_memo::decode_chunk(ciphertext, epk), None, "nothing public");
+        }
+
+        let ivk = orchard::keys::PreparedIncomingViewingKey::new(
+            &fvk.to_ivk(orchard::keys::Scope::External),
+        );
+        assert_eq!(magic_memo::decrypt_with_ivk(&ivk, &views), Some(payload.clone()));
+        let ovk = fvk.to_ovk(orchard::keys::Scope::External);
+        assert_eq!(magic_memo::recover_with_ovk(&ovk, bundle), Some(payload));
+
+        let other = orchard::keys::FullViewingKey::from(
+            &orchard::keys::SpendingKey::from_bytes([8; 32]).unwrap(),
+        );
+        let other_ivk = orchard::keys::PreparedIncomingViewingKey::new(
+            &other.to_ivk(orchard::keys::Scope::External),
+        );
+        assert_eq!(magic_memo::decrypt_with_ivk(&other_ivk, &views), None);
+        assert_eq!(
+            magic_memo::recover_with_ovk(&other.to_ovk(orchard::keys::Scope::External), bundle),
+            None
+        );
     }
 
     #[test]
