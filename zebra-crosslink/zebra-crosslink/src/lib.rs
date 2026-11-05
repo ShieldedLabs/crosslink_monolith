@@ -750,6 +750,30 @@ async fn tfl_service_incoming_request(
             }
         })),
 
+        // Staged for the wallet loop like a basic send; it answers with an error unless built with magic memos.
+        TFLServiceRequest::WalletMagicMemo(text, address) => Ok(TFLServiceResponse::WalletMagicMemo({
+            let rx = {
+                let mut lock = wallet::MAGIC_MEMO_RPC_STAGE.lock().unwrap();
+                match *lock {
+                    None => {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        *lock = Some((text, address, tx));
+                        rx
+                    }
+                    Some(_) => {
+                        return Err(TFLServiceError::Misc(
+                            "Another magic memo in progress, please try again soon".to_string(),
+                        ))
+                    }
+                }
+            };
+
+            match rx.await {
+                Ok(result) => result,
+                Err(err) => return Err(TFLServiceError::Misc(format!("{err}"))),
+            }
+        })),
+
         TFLServiceRequest::WalletStakingPositions => Ok(TFLServiceResponse::WalletStakingPositions(wallet::STAKING_POSITIONS.lock().unwrap().clone())),
 
         TFLServiceRequest::WalletSpendableFunds => Ok(TFLServiceResponse::WalletSpendableFunds(wallet::SPENDABLE_FUNDS.lock().unwrap().clone())),

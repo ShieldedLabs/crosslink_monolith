@@ -163,6 +163,9 @@ pub(super) const PARAM_VALUE_ZATS_DESC: &str =
     "The exact value to send, in zatoshis.";
 pub(super) const PARAM_DST_ADDRESS_DESC: &str =
     "The unified address to send to; it must have an Ironwood receiver.";
+pub(super) const PARAM_TEXT_DESC: &str = "The magic memo's text.";
+pub(super) const PARAM_ENCRYPT_TO_DESC: &str =
+    "Optional: a unified address with an Ironwood receiver to encrypt the magic memo to; plaintext if omitted.";
 pub(super) const PARAM_BOND_KEY_DESC: &str = "The 32-byte delegation bond key, hex-encoded.";
 pub(super) const PARAM_FINALIZER_DESC: &str = "The finalizer's 32-byte public key, hex-encoded.";
 pub(super) const PARAM_HASH_DESC: &str = "The block or transaction hash, hex-encoded.";
@@ -655,6 +658,23 @@ pub trait Rpc {
     /// ```
     #[method(name = "wallet_basic_send")]
     async fn wallet_basic_send(&self, value_zats: u64, dst_address: String) -> Result<String>;
+
+    /// Experimental: publish `text` from the wallet as a magic memo, returning the txid.
+    ///
+    /// A magic memo is carried entirely in the compact-block view of zero-value Ironwood actions, split across as
+    /// many as it needs, rather than in a note's memo field. Without `encrypt_to` it is public plaintext; with a
+    /// unified address it is encrypted so that only that address's incoming viewing key can read it. It costs only
+    /// the fee. Fails unless the node was built with the `magic-memo` feature. Blocks until the transaction is
+    /// built and submitted.
+    ///
+    /// ## Example Usage
+    /// ```shell
+    /// curl -X POST -H "Content-Type: application/json" -d \
+    /// '{ "jsonrpc": "2.0", "method": "wallet_send_magic_memo", "params": ["hello", "utest1..."], "id": 1 }' \
+    /// http://127.0.0.1:8232
+    /// ```
+    #[method(name = "wallet_send_magic_memo")]
+    async fn wallet_send_magic_memo(&self, text: String, encrypt_to: Option<String>) -> Result<String>;
 
     /// Returns the requested block header by hash or height, as a [`GetBlockHeader`] JSON string.
     /// If the block is not in Zebra's state,
@@ -2565,6 +2585,29 @@ where
                     None::<()>,
             )),
         }
+    }
+
+    async fn wallet_send_magic_memo(&self, text: String, encrypt_to: Option<String>) -> Result<String> {
+        let res = self
+            .tfl_service
+            .clone()
+            .ready()
+            .await
+            .unwrap()
+            .call(TFLServiceRequest::WalletMagicMemo(text, encrypt_to))
+            .await;
+
+        let err = match res {
+            Ok(TFLServiceResponse::WalletMagicMemo(Ok(res))) => return Ok(res),
+            Ok(TFLServiceResponse::WalletMagicMemo(Err(err))) => err,
+            Ok(_) => unreachable!("unmatched response to a WalletMagicMemo request"),
+            Err(err) => err.to_string(),
+        };
+        Err(ErrorObject::owned(
+            server::error::LegacyCode::Verify.into(),
+            format!("Magic memo failed: {err}"),
+            None::<()>,
+        ))
     }
 
     async fn get_block_header(

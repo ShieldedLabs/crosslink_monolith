@@ -43,6 +43,9 @@ pub enum TFLServiceRequest {
     WalletSpendableFunds,
     /// Send a basic shielded value transfer from the wallet: (value in zatoshis, unified address)
     WalletBasicSend(u64, String),
+    /// Experimental: publish a magic memo from the wallet: (text, unified address to encrypt it to, or `None` to
+    /// publish it in plaintext)
+    WalletMagicMemo(String, Option<String>),
     /// Write the best chain from genesis to a height (the best tip if `None`) to a chain prefix
     /// file in this node's export directory, with the BFT blocks `bft` selects.
     ExportChainPrefix {
@@ -72,6 +75,8 @@ pub enum TFLServiceResponse {
     WalletSpendableFunds(Option<WalletSpendableFunds>),
     /// Send a basic shielded value transfer from the wallet
     WalletBasicSend(Result<String, String>),
+    /// Experimental: publish a magic memo from the wallet
+    WalletMagicMemo(Result<String, String>),
     /// What was written for [`TFLServiceRequest::ExportChainPrefix`], or why nothing was
     ExportChainPrefix(Result<ChainPrefixExport, String>),
 }

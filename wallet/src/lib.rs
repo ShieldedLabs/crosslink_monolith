@@ -128,6 +128,10 @@ pub static STAKING_STAGE: Mutex<Option<(StakingActionRequest, tokio::sync::onesh
 /// Staged basic send requested over RPC: (value in zatoshis, unified address string, result channel).
 pub static BASIC_SEND_STAGE: Mutex<Option<(u64, String, tokio::sync::oneshot::Sender<Result<String, String>>)>> = Mutex::new(None);
 
+/// Experimental: a magic memo requested over RPC: (text, unified address to encrypt it to or `None` for plaintext,
+/// reply). Present in every build so the RPC can exist; answered with an error without the `magic-memo` feature.
+pub static MAGIC_MEMO_RPC_STAGE: Mutex<Option<(String, Option<String>, tokio::sync::oneshot::Sender<Result<String, String>>)>> = Mutex::new(None);
+
 /// Experimental: a magic memo for the user wallet to publish (see `zcash_primitives::transaction::magic_memo`).
 #[cfg(feature = "magic-memo")]
 #[derive(Clone, Debug, PartialEq)]
@@ -136,13 +140,6 @@ pub struct StagedMagicMemo {
     /// Encrypt to this address, which then holds the memo's zero-value outputs; publish in plaintext if `None`.
     pub to: Option<orchard::Address>,
 }
-
-/// Experimental: a magic memo waiting for the user wallet to publish it. It stays staged until a transaction
-/// carrying it is built, so it waits out a wallet with no spendable funds. Seeded at startup from the
-/// `CROSSLINK_MAGIC_MEMO` (text) and `CROSSLINK_MAGIC_MEMO_TO` (optional unified address to encrypt to)
-/// environment variables.
-#[cfg(feature = "magic-memo")]
-pub static MAGIC_MEMO_STAGE: Mutex<Option<StagedMagicMemo>> = Mutex::new(None);
 
 /// Experimental: a magic memo found while scanning compact blocks, reassembled from all of its tx's chunk actions.
 #[cfg(feature = "magic-memo")]
@@ -4006,25 +4003,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let mut just_init_new_tx = false;
 
-    // Experimental: CROSSLINK_MAGIC_MEMO=<text> publishes <text> from the user wallet once it can pay the fee: in
-    // plaintext, or encrypted to CROSSLINK_MAGIC_MEMO_TO=<unified address> if that is set.
-    #[cfg(feature = "magic-memo")]
-    if let Ok(text) = std::env::var("CROSSLINK_MAGIC_MEMO") {
-        let to = match std::env::var("CROSSLINK_MAGIC_MEMO_TO") {
-            Err(_) => Ok(None),
-            Ok(address) => decode_send_address(&address).map(|ua| ua.orchard().copied()),
-        };
-        let max_len = if matches!(to, Ok(Some(_))) { magic_memo::MAGIC_MEMO_ENCRYPTED_MAX_LEN } else { magic_memo::MAGIC_MEMO_MAX_LEN };
-        match to {
-            Err(reason) => println!("CROSSLINK_MAGIC_MEMO_TO: {reason}; not publishing the magic memo"),
-            Ok(_) if text.len() > max_len => println!("CROSSLINK_MAGIC_MEMO is longer than {max_len} bytes; not publishing it"),
-            Ok(to) => *MAGIC_MEMO_STAGE.lock().unwrap() = Some(StagedMagicMemo{ payload: text.into_bytes(), to }),
-        }
-    }
-    // Attempt at most once per tip, so a wallet without funds doesn't retry (and log) every loop.
-    #[cfg(feature = "magic-memo")]
-    let mut magic_memo_tried_tip_h = None;
-
     // Debug: WALLET_FORCE_REWIND_AT=<height> fires a single deep rewind of the request
     // window once the scan front passes that height, reproducing the reorg rewind path
     // without needing a real reorg.
@@ -5177,22 +5155,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
-        // Shares the GUI send slot, which is already guarded against double-spending with the other in-flight txs.
-        #[cfg(feature = "magic-memo")]
-        if !proposed_send.is_in_progress() && magic_memo_tried_tip_h != Some(user_wallet.chain_tip_h) {
-            let staged = MAGIC_MEMO_STAGE.lock().unwrap().clone();
-            if let Some(memo) = staged {
-                magic_memo_tried_tip_h = Some(user_wallet.chain_tip_h);
-                if user_wallet.publish_magic_memo(network, &mut proposed_send, &mut client, &user_usk, &orchard_tree, &memo).is_some() {
-                    let how = if memo.to.is_some() { "encrypted" } else { "public" };
-                    println!("prepared {how} magic memo: \"{}\"", String::from_utf8_lossy(&memo.payload));
-                    let mut stage = MAGIC_MEMO_STAGE.lock().unwrap();
-                    if stage.as_ref() == Some(&memo) { *stage = None; } // unless a new one was staged meanwhile
-                    just_init_new_tx = true;
-                }
-            }
-        }
-
         if rpc_send.is_none() {
             let staged_send = BASIC_SEND_STAGE.lock().unwrap().take();
             if let Some((value_zats, address, sender)) = staged_send {
@@ -5212,6 +5174,46 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             rpc_send = Some((tx, sender));
                         } else {
                             let _ = sender.send(Err("failed to create send transaction from notes".to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Experimental: an RPC-requested magic memo shares the RPC send slot, its double-spend tracking and its reply.
+        if rpc_send.is_none() {
+            let staged = MAGIC_MEMO_RPC_STAGE.lock().unwrap().take();
+            if let Some((text, address, sender)) = staged {
+                #[cfg(not(feature = "magic-memo"))]
+                {
+                    let _ = (text, address);
+                    let _ = sender.send(Err("this node was built without the magic-memo feature".to_string()));
+                }
+                #[cfg(feature = "magic-memo")]
+                {
+                    let to = match &address {
+                        None => Ok(None),
+                        Some(address) => decode_send_address(address)
+                            .map(|ua| Some(*ua.orchard().expect("decode_send_address only accepts addresses with an Orchard receiver")))
+                            .map_err(|reason| format!("{reason}: {address}")),
+                    };
+                    let max_len = if address.is_some() { magic_memo::MAGIC_MEMO_ENCRYPTED_MAX_LEN } else { magic_memo::MAGIC_MEMO_MAX_LEN };
+                    match to {
+                        Err(reason) => { let _ = sender.send(Err(reason)); }
+                        Ok(_) if text.len() > max_len => {
+                            let _ = sender.send(Err(format!("{} bytes is longer than the {max_len} a magic memo can carry", text.len())));
+                        }
+                        Ok(to) => {
+                            let staged = StagedMagicMemo{ payload: text.into_bytes(), to };
+                            let mut tx = ProposedTx::EMPTY;
+                            if user_wallet.publish_magic_memo(network, &mut tx, &mut client, &user_usk, &orchard_tree, &staged).is_some() {
+                                let how = if staged.to.is_some() { "encrypted" } else { "public" };
+                                println!("prepared RPC-requested {how} magic memo: \"{}\"", String::from_utf8_lossy(&staged.payload));
+                                just_init_new_tx = true;
+                                rpc_send = Some((tx, sender));
+                            } else {
+                                let _ = sender.send(Err("failed to create the magic memo transaction; are there spendable funds for the fee?".to_string()));
+                            }
                         }
                     }
                 }
