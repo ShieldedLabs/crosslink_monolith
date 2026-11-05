@@ -22,7 +22,8 @@ use crate::transaction::{
     fees::{
         FeeRule,
         transparent::{InputView, OutputView},
-    }
+    },
+    magic_memo::MagicMemo,
 };
 
 #[cfg(feature = "std")]
@@ -111,6 +112,10 @@ pub enum Error<FE> {
     /// The builder was constructed with a target height before NU6.3 activation,
     /// or without an Ironwood anchor, but an Ironwood spend or output was added.
     IronwoodBuilderNotAvailable,
+    /// A magic memo was added to a coinbase transaction, whose shielded outputs must be
+    /// decryptable by consensus, or to a builder used for PCZT construction, which does
+    /// not support them.
+    MagicMemoUnsupported,
     /// Anchors can be deferred to proving time only under a transaction version whose
     /// txid and sighash exclude shielded anchors (V6, NU6.3 onward); this version commits
     /// its signatures to the anchors, so they must be supplied at build time (use
@@ -171,6 +176,10 @@ impl<FE: fmt::Display> fmt::Display for Error<FE> {
             Error::IronwoodBuilderNotAvailable => write!(
                 f,
                 "Cannot create Ironwood transactions without an Ironwood anchor, or before NU6.3 activation"
+            ),
+            Error::MagicMemoUnsupported => write!(
+                f,
+                "Magic memos cannot be carried by coinbase transactions or PCZTs"
             ),
             Error::AnchorDeferralUnsupported(version) => write!(
                 f,
@@ -815,6 +824,9 @@ pub struct Builder<P, U> {
     orchard_builder: Option<orchard::builder::Builder>,
     orchard_bundle_version: Option<orchard::bundle::BundleVersion>,
     ironwood_builder: Option<orchard::builder::Builder>,
+    /// Each entry is the index of a zero-value output added to `ironwood_builder`, among
+    /// its plain outputs, and the memo that replaces that output's `enc_ciphertext`.
+    ironwood_magic_memos: alloc::vec::Vec<(usize, MagicMemo)>,
     staking_action: Option<StakingAction>,
     // NOTE: upstream removed `tze_builder` from `Builder` along with the `'a` lifetime it
     // required. The zfuture TZE experiment is not used by Crosslink, so the field is dropped
@@ -1014,6 +1026,7 @@ impl<P: consensus::Parameters> Builder<P, ()> {
             orchard_builder,
             orchard_bundle_version,
             ironwood_builder,
+            ironwood_magic_memos: alloc::vec::Vec::new(),
             staking_action: None,
             _progress_notifier: (),
         }
@@ -1044,6 +1057,7 @@ impl<P: consensus::Parameters> Builder<P, ()> {
             orchard_builder: self.orchard_builder,
             orchard_bundle_version: self.orchard_bundle_version,
             ironwood_builder: self.ironwood_builder,
+            ironwood_magic_memos: self.ironwood_magic_memos,
             staking_action: self.staking_action,
             _progress_notifier,
         }
@@ -1194,6 +1208,44 @@ impl<P: consensus::Parameters, U> Builder<P, U> {
                 memo.into_bytes(),
             )
             .map_err(Error::IronwoodRecipient)
+    }
+
+    /// Adds a zero-value Ironwood output to `recipient` whose `enc_ciphertext` is
+    /// replaced by `memo`, publishing the memo's payload unencrypted.
+    ///
+    /// The output's note is undecryptable, including by `recipient`. The output is an
+    /// ordinary plain output for fee and padding purposes.
+    ///
+    /// Returns [`Error::IronwoodBuilderNotAvailable`] if this builder has no Ironwood
+    /// pool, or [`Error::MagicMemoUnsupported`] if it builds a coinbase transaction.
+    ///
+    /// See [`crate::transaction::magic_memo`].
+    pub fn add_ironwood_magic_memo<FE>(
+        &mut self,
+        recipient: orchard::Address,
+        memo: MagicMemo,
+    ) -> Result<(), Error<FE>> {
+        if self.build_config.is_coinbase() {
+            return Err(Error::MagicMemoUnsupported);
+        }
+        let builder = self
+            .ironwood_builder
+            .as_mut()
+            .ok_or(Error::IronwoodBuilderNotAvailable)?;
+
+        // Plain outputs are numbered in the order they were added; see
+        // `orchard::builder::BundleMetadata::output_action_index`.
+        let output_i = builder.outputs().len();
+        builder
+            .add_output(
+                None,
+                recipient,
+                orchard::value::NoteValue::from_raw(0),
+                MemoBytes::empty().into_bytes(),
+            )
+            .map_err(Error::IronwoodRecipient)?;
+        self.ironwood_magic_memos.push((output_i, memo));
+        Ok(())
     }
 
     /// Adds a Sapling note to be spent in this transaction.
@@ -1599,6 +1651,18 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
             None => (None, orchard::builder::BundleMetadata::empty()),
         };
 
+        // Before the digest below, which the signatures commit to; the proof does not
+        // cover ciphertexts, so proving is unaffected.
+        let ironwood_bundle = ironwood_bundle.map(|mut bundle| {
+            for (output_i, memo) in &self.ironwood_magic_memos {
+                let action_i = ironwood_meta
+                    .output_action_index(*output_i)
+                    .expect("every magic memo output was added to this builder");
+                bundle = with_enc_ciphertext(bundle, action_i, *memo.enc_ciphertext());
+            }
+            bundle
+        });
+
         let unauthed_tx: TransactionData<A> = TransactionData {
             version: self.tx_version,
             consensus_branch_id: self.consensus_branch_id,
@@ -1758,6 +1822,75 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
     }
 }
 
+/// Returns `bundle` with the `enc_ciphertext` of its action at `action_i` replaced.
+///
+/// Every other part of every action is kept, in particular the proof-bound `nf`, `rk`,
+/// `cmx` and `cv_net` and the key-agreement `epk`, as is all authorizing data. This is
+/// sound only before the transaction digest that the signatures commit to is taken.
+///
+/// orchard exposes no constructor for an in-progress bundle, so the bundle passes
+/// through the public [`orchard::bundle::EffectsOnly`] state: its authorizing data is
+/// moved out, the actions are rebuilt with `Action::from_parts`, and the authorizing
+/// data is moved back in, in action order.
+#[cfg(feature = "circuits")]
+fn with_enc_ciphertext<A: orchard::bundle::Authorization>(
+    bundle: orchard::Bundle<A, ZatBalance>,
+    action_i: usize,
+    enc_ciphertext: [u8; zcash_note_encryption::ENC_CIPHERTEXT_SIZE],
+) -> orchard::Bundle<A, ZatBalance> {
+    let flags = *bundle.flags();
+    let value_balance = *bundle.value_balance();
+    let anchor = *bundle.anchor();
+    let bundle_version = bundle.bundle_version();
+
+    let mut stash: (Vec<A::SpendAuth>, Option<A>) = (Vec::new(), None);
+    let effects = bundle.map_authorization(
+        &mut stash,
+        |stash, _, spend_auth| stash.0.push(spend_auth),
+        |stash, authorization| {
+            stash.1 = Some(authorization);
+            orchard::bundle::EffectsOnly
+        },
+    );
+
+    let mut i = 0;
+    let actions = effects.actions().clone().map(|action| {
+        let mut encrypted_note = action.encrypted_note().clone();
+        if i == action_i {
+            encrypted_note.enc_ciphertext = enc_ciphertext;
+        }
+        i += 1;
+        orchard::Action::from_parts(
+            *action.nullifier(),
+            action.rk().clone(),
+            *action.cmx(),
+            encrypted_note,
+            action.cv_net().clone(),
+            (),
+        )
+        .expect("rk and epk are copied from an action that already satisfied from_parts")
+    });
+    assert!(action_i < i, "action index {action_i} is out of range");
+
+    let effects = orchard::Bundle::<orchard::bundle::EffectsOnly, ZatBalance>::from_parts(
+        actions,
+        flags,
+        value_balance,
+        anchor,
+        orchard::bundle::EffectsOnly,
+        bundle_version,
+    )
+    .expect("flags are copied from a bundle that already had this version");
+
+    let (spend_auths, authorization) = stash;
+    let mut restore = (spend_auths.into_iter(), authorization);
+    effects.map_authorization(
+        &mut restore,
+        |restore, _, ()| restore.0.next().expect("one authorization per action"),
+        |restore, _| restore.1.take().expect("the bundle authorization was stashed"),
+    )
+}
+
 impl<P: consensus::Parameters, U> Builder<P, U> {
     /// Builds a PCZT from the configured spends and outputs.
     ///
@@ -1769,6 +1902,10 @@ impl<P: consensus::Parameters, U> Builder<P, U> {
         mut rng: R,
         fee_rule: &FR,
     ) -> Result<PcztResult<P>, Error<FR::Error>> {
+        // A PCZT bundle's action ciphertexts cannot be replaced through orchard's API.
+        if !self.ironwood_magic_memos.is_empty() {
+            return Err(Error::MagicMemoUnsupported);
+        }
         let fee = self.get_fee(fee_rule).map_err(Error::Fee)?;
         self.check_version_compatibility::<FR::Error>(self.tx_version)?;
         self.check_coinbase_expiry_height::<FR::Error>()?;
@@ -1999,6 +2136,17 @@ mod tests {
         ::transparent::keys::{AccountPrivKey, IncomingViewingKey, NonHardenedChildIndex},
         zcash_protocol::consensus::BranchId,
         zip32::AccountId,
+    };
+
+    #[cfg(feature = "circuits")]
+    use {
+        crate::transaction::{
+            Transaction,
+            magic_memo::{self, MagicMemo},
+            sighash::{SignableInput, signature_hash},
+            txid::TxIdDigester,
+        },
+        incrementalmerkletree::{Hashable, Level},
     };
 
     // The Ironwood tests below reference `TxVersion`/`BranchId` directly; without the
@@ -2312,6 +2460,162 @@ mod tests {
                 TxVersion::V5,
                 None
             ))
+        );
+    }
+
+    /// A magic memo must reach the chain as plaintext in the built transaction while the
+    /// Ironwood proof, every spend-authorization signature and the binding signature
+    /// still verify: the replaced ciphertext is outside the proof and inside the digest
+    /// the signatures commit to.
+    #[test]
+    #[cfg(feature = "circuits")]
+    fn magic_memo_is_published_and_bundle_still_verifies() {
+        // Funded by one Ironwood note rather than a transparent input, so the shielded
+        // sighash below needs no transparent input amounts or scripts.
+        let sk = orchard::keys::SpendingKey::from_bytes([7; 32]).unwrap();
+        let fvk = orchard::keys::FullViewingKey::from(&sk);
+        let recipient = fvk.address_at(0u32, orchard::keys::Scope::External);
+        let rho = orchard::note::Rho::from_bytes(&[1; 32]).unwrap();
+        let rseed = (0u8..=255)
+            .find_map(|b| orchard::note::RandomSeed::from_bytes([b; 32], &rho).into_option())
+            .expect("at least one test rseed is valid");
+        let note = orchard::Note::from_parts(
+            recipient,
+            orchard::value::NoteValue::from_raw(50_000),
+            rho,
+            rseed,
+            orchard::note::NoteVersion::V3,
+        )
+        .unwrap();
+        // The note is the only leaf, at position 0, so its siblings are the empty roots.
+        let merkle_path = orchard::tree::MerklePath::from_parts(
+            0,
+            core::array::from_fn(|level| {
+                orchard::tree::MerkleHashOrchard::empty_root(Level::from(level as u8))
+            }),
+        );
+        let anchor = merkle_path.root(note.commitment().into());
+
+        let mut builder = Builder::new(
+            nu6_3_test_network(),
+            10u32.into(),
+            BuildConfig::Standard {
+                sapling_anchor: None,
+                orchard_anchor: None,
+                ironwood_anchor: Some(anchor),
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
+            },
+        );
+        builder
+            .add_ironwood_spend::<Infallible>(fvk, note, merkle_path)
+            .unwrap();
+        // An ordinary output first, so the memo's output index is not trivially 0.
+        builder
+            .add_ironwood_output::<Infallible>(
+                None,
+                recipient,
+                Zatoshis::const_from_u64(10_000),
+                MemoBytes::empty(),
+            )
+            .unwrap();
+        let payload: &[u8] = b"hello from a magic memo";
+        builder
+            .add_ironwood_magic_memo::<Infallible>(
+                recipient,
+                MagicMemo::from_payload(payload).unwrap(),
+            )
+            .unwrap();
+
+        let res = builder
+            .mock_build(
+                &TransparentSigningSet::new(),
+                &[],
+                &[orchard::keys::SpendAuthorizingKey::from(&sk)],
+                OsRng,
+            )
+            .unwrap();
+        let tx = res.transaction();
+        assert!(tx.transparent_bundle().is_none());
+        let bundle = tx.ironwood_bundle().expect("Ironwood outputs were added");
+
+        let memo_action_i = res.ironwood_meta().output_action_index(1).unwrap();
+        for (action_i, action) in bundle.actions().iter().enumerate() {
+            let carried = magic_memo::payload(&action.encrypted_note().enc_ciphertext);
+            if action_i == memo_action_i {
+                assert_eq!(carried, Some(payload));
+            } else {
+                assert_eq!(carried, None);
+            }
+        }
+
+        let vk = orchard::circuit::VerifyingKey::build(bundle.bundle_version().circuit_version());
+        bundle.verify_proof(&vk).unwrap();
+
+        let mut bytes = alloc::vec::Vec::new();
+        tx.write(&mut bytes).unwrap();
+        let parsed = Transaction::read(&bytes[..], tx.consensus_branch_id()).unwrap();
+        assert_eq!(parsed.txid(), tx.txid());
+
+        // `signature_hash` needs a transparent authorizing context even when there is no
+        // transparent bundle, which a fully authorized transaction lacks; this view
+        // supplies one and is otherwise the parsed transaction.
+        #[derive(Debug)]
+        struct ShieldedOnly;
+        impl crate::transaction::Authorization for ShieldedOnly {
+            type TransparentAuth = ::transparent::builder::Unauthorized;
+            type SaplingAuth = ::sapling::bundle::Authorized;
+            type OrchardAuth = orchard::bundle::Authorized;
+        }
+        let tx_data = parsed
+            .into_data()
+            .map_bundles::<ShieldedOnly>(|_| None, |s| s, |o| o);
+        let txid_parts = tx_data.digest(TxIdDigester);
+        let sighash = signature_hash(&tx_data, &SignableInput::Shielded, &txid_parts);
+        let bundle = tx_data.ironwood_bundle().unwrap();
+        for action in bundle.actions() {
+            action
+                .rk()
+                .verify(sighash.as_ref(), action.authorization())
+                .unwrap();
+        }
+        bundle
+            .binding_validating_key()
+            .verify(sighash.as_ref(), bundle.authorization().binding_signature())
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "circuits")]
+    fn magic_memo_is_refused_for_pczt() {
+        let mut builder = Builder::new(
+            nu6_3_test_network(),
+            10u32.into(),
+            BuildConfig::Standard {
+                sapling_anchor: None,
+                orchard_anchor: None,
+                ironwood_anchor: Some(orchard::Anchor::empty_tree()),
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
+            },
+        );
+        let recipient = orchard::keys::FullViewingKey::from(
+            &orchard::keys::SpendingKey::from_bytes([0; 32]).unwrap(),
+        )
+        .address_at(0u32, orchard::keys::Scope::External);
+        builder
+            .add_ironwood_magic_memo::<Infallible>(
+                recipient,
+                crate::transaction::magic_memo::MagicMemo::from_payload(b"pczt").unwrap(),
+            )
+            .unwrap();
+
+        assert_matches!(
+            builder.build_for_pczt(
+                OsRng,
+                &crate::transaction::fees::zip317::FeeRule::standard(),
+            ),
+            Err(Error::MagicMemoUnsupported)
         );
     }
 
@@ -2669,6 +2973,7 @@ mod tests {
             orchard_builder: None,
             orchard_bundle_version: None,
             ironwood_builder: None,
+            ironwood_magic_memos: alloc::vec::Vec::new(),
             _progress_notifier: (),
             staking_action: None,
         };

@@ -2,6 +2,7 @@
 pub mod builder;
 pub mod components;
 pub mod fees;
+pub mod magic_memo;
 pub mod sighash;
 pub mod sighash_v4;
 pub mod sighash_v5;
