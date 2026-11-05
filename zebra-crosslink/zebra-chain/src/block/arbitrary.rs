@@ -811,3 +811,34 @@ impl Arbitrary for Header {
 
     type Strategy = BoxedStrategy<Self>;
 }
+
+/// Any fat pointer: any vote bytes and up to three signatures of any bytes. The orphan rule
+/// keeps this from being an `Arbitrary` impl, since both the trait and the type are foreign.
+pub fn any_fat_pointer() -> BoxedStrategy<FatPointerToBftBlock> {
+    (
+        any::<[u8; 32]>(),
+        any::<[u8; 12]>(),
+        proptest::collection::vec(any::<([u8; 32], [u8; 32], [u8; 32])>(), 0..4),
+    )
+        .prop_map(|(hash, height_and_round, signatures)| {
+            let mut vote_for_block_without_finalizer_public_key = [0; 44];
+            vote_for_block_without_finalizer_public_key[..32].copy_from_slice(&hash);
+            vote_for_block_without_finalizer_public_key[32..].copy_from_slice(&height_and_round);
+            FatPointerToBftBlock {
+                vote_for_block_without_finalizer_public_key,
+                signatures: signatures
+                    .into_iter()
+                    .map(|(pub_key, low, high)| {
+                        let mut vote_signature = [0; 64];
+                        vote_signature[..32].copy_from_slice(&low);
+                        vote_signature[32..].copy_from_slice(&high);
+                        FatPointerSignature {
+                            pub_key: PubKeyID(pub_key),
+                            vote_signature,
+                        }
+                    })
+                    .collect(),
+            }
+        })
+        .boxed()
+}

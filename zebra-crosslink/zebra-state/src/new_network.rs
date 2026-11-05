@@ -990,6 +990,8 @@ impl SyncProfile {
     }
 }
 
+const DEFERRED_BLOCK_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
 const MAX_BANDWIDTH_BYTES_PER_MS: usize = 7_000; // 7 MB/s
 const MAX_BANDWIDTH_BYTES_PER_RES: usize = MAX_BANDWIDTH_BYTES_PER_MS * PEER_RESPOND_MS as usize;
 // x2: the budget sizes every in-flight block at MAX_BLOCK_BYTES, but real blocks are a small
@@ -2011,9 +2013,27 @@ struct BlockFate {
     pending_told: bool,
     /// Submitted with [`submit_trusted_block_to_new_network`]: `verify_expensive` is skipped.
     trusted: bool,
+    deferred_since: Option<std::time::Instant>,
+    next_stall_warning: Option<std::time::Instant>,
 }
 
 impl BlockFate {
+    /// Warns once the block has stayed deferred for `DEFERRED_BLOCK_WARN_INTERVAL`, and again
+    /// each interval after. The retry itself is silent, so without this a deferral that never
+    /// resolves shows only as a tip that stops moving.
+    fn warn_if_stalled(&mut self, height: u32, hash: Hash, reason: std::fmt::Arguments) {
+        let now = std::time::Instant::now();
+        let since = *self.deferred_since.get_or_insert(now);
+        let next = self.next_stall_warning.get_or_insert(since + DEFERRED_BLOCK_WARN_INTERVAL);
+        if now >= *next {
+            *next = now + DEFERRED_BLOCK_WARN_INTERVAL;
+            tracing::warn!(
+                "NewNet: block @ {height}, {hash} has been deferred for {}s, and the chain cannot advance past it until it commits: {reason}",
+                since.elapsed().as_secs(),
+            );
+        }
+    }
+
     fn tell(&mut self, synthetic_peers: &[SyntheticPeerLink], hash: Hash, outcome: IngestOutcome) {
         if let Some(reply) = self.reply.take() {
             let _ = reply.send(outcome.clone());
@@ -4307,6 +4327,7 @@ pub fn sync(
             if let Err((phase, err, true)) = &verdict {
                 commit_head.get_or_insert(if *phase == "crosslink" { CommitHead::BftGate } else { CommitHead::DeferredOther });
                 if first_attempt { println!("Deferring: @ {height}, {hash}: {phase}: {}", err.msg); }
+                fate.warn_if_stalled(height, hash, format_args!("{phase}: {}", err.msg));
                 fate.tell_pending(&synthetic_peers, hash, format_args!("{phase}: {}", err.msg));
                 return true; // keep
             }

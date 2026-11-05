@@ -475,11 +475,17 @@ pub fn bc_hdr_to_lrz(header: &Header) -> BcBlockHeader {
 }
 
 /// The context-free proof-of-work checks for a carried bc-header: a well-formed difficulty
-/// threshold within the network's PoWLimit, a block hash under that threshold, and a valid
+/// threshold within the network's PoWLimit, a proof-of-work hash under that threshold, and a valid
 /// Equihash solution. These are the same checks Zebra's block verifier applies to a header before
 /// it has the block's ancestry, including its exemption: on a network with PoW disabled it checks
-/// only the threshold, so a header here must not have to meet more than its block did.
-fn header_pow_is_valid(header: &BcBlockHeader, network: &zebra_chain::parameters::Network) -> Result<(), String> {
+/// only the threshold, so a header here must not have to meet more than its block did. The hash
+/// the filter compares depends on the header's height, unknown until the snapshot is, so this
+/// lets through a header either hash meets, and [`header_meets_filter_at`] settles it once the
+/// height is known.
+fn header_pow_is_valid(
+    header: &BcBlockHeader,
+    network: &zebra_chain::parameters::Network,
+) -> Result<(), String> {
     use zebra_chain::work::difficulty::ParameterDifficulty as _;
     let header = header_from_lrz(header)?;
     let hash = header.hash();
@@ -493,10 +499,33 @@ fn header_pow_is_valid(header: &BcBlockHeader, network: &zebra_chain::parameters
     if network.disable_pow() {
         return Ok(());
     }
-    if hash > threshold {
+    if hash > threshold && header.hash_without_fat_pointer() > threshold {
         return Err(format!("hash {hash} does not meet difficulty threshold {threshold:?}"));
     }
     header.solution.check(&header).map_err(|e| e.to_string())
+}
+
+/// The difficulty filter for a carried bc-header at `height`, its position on its chain, which
+/// picks the hash the filter compares (`Header::proof_of_work_hash`). The header's other proof-of-
+/// work checks are [`header_pow_is_valid`]'s.
+fn header_meets_filter_at(
+    header: &BcBlockHeader,
+    network: &zebra_chain::parameters::Network,
+    height: Height,
+) -> Result<(), String> {
+    if network.disable_pow() {
+        return Ok(());
+    }
+    let header = header_from_lrz(header)?;
+    let threshold = header
+        .difficulty_threshold
+        .to_expanded()
+        .ok_or_else(|| format!("invalid difficulty threshold {:?}", header.difficulty_threshold))?;
+    let hash = header.proof_of_work_hash(network, height);
+    if hash > threshold {
+        return Err(format!("proof-of-work hash {hash} at {height:?} does not meet difficulty threshold {threshold:?}"));
+    }
+    Ok(())
 }
 
 fn header_from_lrz(header: &BcBlockHeader) -> Result<Header, String> {
@@ -1998,6 +2027,14 @@ impl BftRunner {
             tracing::warn!("Didn't have hash available for confirmation: {}", new_final_hash);
             return needs_pow_block(new_final_hash);
         };
+
+        for (i, header) in new_block.headers.iter().enumerate() {
+            let height = Height(snapshot.height.0 + 1 + i as u32);
+            if let Err(reason) = header_meets_filter_at(header, network, height) {
+                tracing::warn!("BFT block header {i} fails proof of work: {reason}");
+                return fail;
+            }
+        }
 
         // From FeaturenetUpgrade2 each header must also carry the difficulty its position
         // requires, read from the snapshot's own ancestry, so the check stays objective.

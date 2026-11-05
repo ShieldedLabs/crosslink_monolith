@@ -1597,6 +1597,16 @@ pub struct ManualWallet {
     /// when another wallet holding the bond's key acted on it.
     pub seen_bond_versions: HashMap<[u8; 32], [u8; 32]>,
     pub care_about_bonds: Vec<[u8; 32]>,
+    pub sent_txs: HashMap<TxId, SentTx>,
+}
+
+/// A transaction this wallet sent, kept until it expires so it can be sent again if a reorg
+/// drops the block that mined it.
+#[derive(Clone, Debug)]
+pub struct SentTx {
+    pub data: Vec<u8>,
+    pub expiry_h: Option<BlockHeight>,
+    pub resent_h: BlockHeight,
 }
 // N.B. using some of the same API as WalletDb to allow smooth transition/comparison
 impl ManualWallet {
@@ -1656,6 +1666,7 @@ impl ManualWallet {
             wallet_tx.h = fail_h;
         } else {
             let tx_size = raw_tx.data.len();
+            let data = raw_tx.data.clone();
             let res = client.send_transaction(raw_tx).await;
             if DUMP_TX_SEND { println!("******* res for {:?} ({} B): {:?}", tx.txid(), tx_size, res); }
             // Transport/gRPC failures come back as Err; a node *rejection* comes back as Ok
@@ -1667,6 +1678,12 @@ impl ManualWallet {
                     let resp = resp.into_inner();
                     if resp.error_code == 0 {
                         wallet_tx.h = BlockHeight::SENT;
+                        let expiry_h = BlockHeight::from(tx.expiry_height());
+                        self.sent_txs.insert(tx.txid(), SentTx {
+                            data,
+                            expiry_h: if expiry_h.0 == 0 { None } else { Some(expiry_h) },
+                            resent_h: BlockHeight::INVALID,
+                        });
                     } else {
                         println!("node rejected transaction {:?} ({}): {}", tx.txid(), resp.error_code, resp.error_message);
                         let err_buf = ErrBuf::from_str(&format!("rejected ({}): {}", resp.error_code, resp.error_message));
@@ -3388,6 +3405,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             seen_bond_values: HashMap::new(),
             seen_bond_versions: HashMap::new(),
             care_about_bonds: Vec::new(),
+            sent_txs: HashMap::new(),
         };
 
         (wallet, account)
@@ -3912,6 +3930,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let mut faucet_shield_cooldown_instant = Instant::now()
         .checked_sub(Duration::from_secs(1000))
         .unwrap_or_else(Instant::now);
+
+    // The count and total of the miner's transparent outputs when its shield last failed to
+    // build. The same outputs fail the same way, so the shield waits for them to change.
+    let mut failed_shield_utxos: Option<(usize, u64)> = None;
 
     let mut proposed_faucet = ProposedTx::EMPTY;
     let mut proposed_miner_shield = ProposedTx::EMPTY;
@@ -4760,6 +4782,31 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
+        //-- RESEND REORGED-OUT TXS
+        // The node does not return the transactions of a block that lost a reorg to its mempool,
+        // so a tx of ours mined only there would never be mined again. Send every tx the reorg
+        // pass soft-failed, from a block or the mempool, again once per scanned block until it
+        // is back on the best chain or expires. A tx the node still holds is merely refused.
+        let mut resends = Vec::new();
+        for wallet in [&mut miner_wallet, &mut user_wallet] {
+            wallet.sent_txs.retain(|_, sent| sent.expiry_h.map_or(true, |expiry_h| expiry_h >= wallets_sync_h));
+            for tx in &wallet.txs {
+                let TxStatus::SoftFail(stage) = tx.status else { continue; };
+                if !(stage.is_in_block() || stage == BlockHeight::MEMPOOL) { continue; }
+                let Some(sent) = wallet.sent_txs.get_mut(&tx.txid) else { continue; };
+                if sent.resent_h == wallets_sync_h { continue; }
+                sent.resent_h = wallets_sync_h;
+                resends.push((wallet.name, tx.txid, sent.data.clone()));
+            }
+        }
+        for (name, txid, data) in resends {
+            match client.send_transaction(RawTransaction { data, height: 0 }).await {
+                Ok(resp) if resp.get_ref().error_code == 0 => println!("{name} wallet: resent tx {txid}, which a reorg dropped"),
+                Ok(resp) => println!("{name} wallet: the node refused tx {txid}, which a reorg dropped: {}", resp.get_ref().error_message),
+                Err(status) => println!("{name} wallet: failed to resend tx {txid}, which a reorg dropped: {status}"),
+            }
+        }
+
         //-- SEND DATA TO UI
         {
             if DUMP_NOTES {
@@ -5013,9 +5060,14 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // }
 
         if faucet_shield_cooldown_instant.elapsed().as_secs() > 15 && !proposed_miner_shield.is_in_progress() {
-            let memo = MemoBytes::from_bytes("shielding notes".as_bytes()).unwrap();
-            let ok = miner_wallet.shield_transparent_zats(network, &mut proposed_miner_shield, &mut client, &miner_usk, 1000000000, &orchard_tree, memo).is_some();
-            if DUMP_TX_BUILD { println!("Try miner shield {ok:?}"); }
+            let utxos = &miner_wallet.accounts[0].utxos;
+            let utxo_state = (utxos.len(), utxos.iter().map(|utxo| utxo.value.into_u64()).sum::<u64>());
+            if failed_shield_utxos != Some(utxo_state) {
+                let memo = MemoBytes::from_bytes("shielding notes".as_bytes()).unwrap();
+                let ok = miner_wallet.shield_transparent_zats(network, &mut proposed_miner_shield, &mut client, &miner_usk, 1000000000, &orchard_tree, memo).is_some();
+                if DUMP_TX_BUILD { println!("Try miner shield {ok:?}"); }
+                failed_shield_utxos = if ok { None } else { Some(utxo_state) };
+            }
             faucet_shield_cooldown_instant = Instant::now();
 
             // also inspect bonds
@@ -5576,6 +5628,7 @@ mod tests {
             name: "note-position-test", accounts: vec![account], strms: vec![],
             chain_tip_h: BlockHeight(100), sync_h: BlockHeight(100), branch_mismatch: None,
             txs: vec![], tx_h_map: HashMap::new(), seen_bond_values: HashMap::new(), seen_bond_versions: HashMap::new(), care_about_bonds: vec![],
+            sent_txs: HashMap::new(),
         };
         (wallet, keys, note, recipient)
     }

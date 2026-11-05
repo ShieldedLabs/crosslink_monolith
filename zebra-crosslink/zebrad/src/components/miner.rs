@@ -633,7 +633,11 @@ where
         };
 
         // Mine at least one block using the equihash solver.
-        let Ok(blocks) = mine_a_block(solver_id, low_priority, skip_pow, template, cancel_fn).await else {
+        let omits_fat_pointer =
+            zebra_chain::block::Header::proof_of_work_omits_fat_pointer(rpc.network(), height);
+        let Ok(blocks) =
+            mine_a_block(solver_id, low_priority, skip_pow, omits_fat_pointer, template, cancel_fn).await
+        else {
             // If the solver was cancelled, we're either shutting down, or we have a new template.
             if solver_id == 0 {
                 info!(
@@ -761,11 +765,14 @@ where
 ///
 /// If `cancel_fn()` returns an error, returns early with `Err(SolverCancelled)`.
 ///
+/// `omits_fat_pointer` is `Header::proof_of_work_omits_fat_pointer` at the template's height.
+///
 /// See [`run_mining_solver()`] for more details.
 pub async fn mine_a_block<F>(
     solver_id: u8,
     low_priority: bool,
     skip_pow: bool,
+    omits_fat_pointer: bool,
     template: Arc<Block>,
     cancel_fn: F,
 ) -> Result<AtLeastOne<Block>, SolverCancelled>
@@ -816,7 +823,7 @@ where
                     info!(?error, "could not set the miner thread priority: running at default priority");
                 }
 
-                Solution::solve(header, cancel_fn)
+                Solution::solve(header, omits_fat_pointer, cancel_fn)
             }).expect("unable to spawn miner thread");
 
             miner_thread_handle.wait_for_panics()

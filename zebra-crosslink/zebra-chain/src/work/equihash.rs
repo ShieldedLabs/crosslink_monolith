@@ -149,12 +149,16 @@ impl Solution {
     /// solvers at the same time, start them with different nonces.
     /// The `solution` in the header template is ignored.
     ///
+    /// `omits_fat_pointer` says which hash the difficulty filter compares at the template's
+    /// height (`Header::proof_of_work_omits_fat_pointer`).
+    ///
     /// This method is CPU and memory-intensive. It uses 144 MB of RAM and one CPU core while running.
     /// It can run for minutes or hours if the network difficulty is high.
     #[cfg(feature = "internal-miner")]
     #[allow(clippy::unwrap_in_result)]
     pub fn solve<F>(
         mut header: Header,
+        omits_fat_pointer: bool,
         mut cancel_fn: F,
     ) -> Result<AtLeastOne<Header>, SolverCancelled>
     where
@@ -197,7 +201,7 @@ impl Solution {
                     continue;
                 }
 
-                if Self::difficulty_is_valid(&header) {
+                if Self::difficulty_is_valid(&header, omits_fat_pointer) {
                     valid_solutions.push(header.clone());
                 }
             }
@@ -220,7 +224,7 @@ impl Solution {
     ///
     /// - If `header` contains an invalid difficulty threshold.
     #[cfg(feature = "internal-miner")]
-    fn difficulty_is_valid(header: &Header) -> bool {
+    fn difficulty_is_valid(header: &Header, omits_fat_pointer: bool) -> bool {
         // Simplified from zebra_consensus::block::check::difficulty_is_valid().
         let difficulty_threshold = header
             .difficulty_threshold
@@ -228,7 +232,11 @@ impl Solution {
             .expect("unexpected invalid header template: invalid difficulty threshold");
 
         // TODO: avoid calculating this hash multiple times
-        let hash = header.hash();
+        let hash = if omits_fat_pointer {
+            header.hash_without_fat_pointer()
+        } else {
+            header.hash()
+        };
 
         // Note: this comparison is a u256 integer comparison, like zcashd and bitcoin. Greater
         // values represent *less* work.

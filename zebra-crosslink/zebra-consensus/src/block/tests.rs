@@ -880,3 +880,51 @@ fn state_commit_duplicate_errors_are_duplicate_requests() {
     assert!(err.is_duplicate_request());
     assert_eq!(err.misbehavior_score(), 0);
 }
+
+mod proof_of_work_hash {
+    use proptest::prelude::*;
+
+    use zebra_chain::{
+        block::{arbitrary::any_fat_pointer, Header, Height},
+        parameters::{
+            testnet::{ConfiguredActivationHeights, RegtestParameters},
+            Network,
+        },
+        work::difficulty::ParameterDifficulty as _,
+    };
+
+    use crate::block::check;
+
+    proptest! {
+        /// The verifier's difficulty filter passes a header with a fat pointer exactly when the
+        /// header's hash without the pointer meets the threshold from FeaturenetUpgrade2, and
+        /// when its block hash does below it. The threshold is Regtest's PoWLimit, which about
+        /// one hash in seventeen meets, so many cases have one hash pass and the other fail.
+        #[test]
+        fn difficulty_filter_compares_the_hash_without_the_fat_pointer_from_featurenet_upgrade_2(
+            header in any::<Header>(),
+            version in 5u32..0x1_0000,
+            pointer in any_fat_pointer(),
+            height in 0u32..20,
+        ) {
+            let _init_guard = zebra_test::init();
+
+            let network = Network::new_regtest(RegtestParameters::from(ConfiguredActivationHeights {
+                nu5: Some(1),
+                featurenet_upgrade_2: Some(10),
+                ..Default::default()
+            }));
+            let mut header = header;
+            header.version = version;
+            header.fat_pointer_to_bft_block = pointer;
+            header.difficulty_threshold = network.target_difficulty_limit().to_compact();
+            let threshold = network.target_difficulty_limit();
+            let height = Height(height);
+            let hash = header.hash();
+
+            let compared = if height.0 >= 10 { header.hash_without_fat_pointer() } else { hash };
+            let result = check::difficulty_is_valid(&header, &network, &height, &hash);
+            prop_assert_eq!(result.is_ok(), compared <= threshold, "{:?}", result);
+        }
+    }
+}
