@@ -242,8 +242,29 @@ where
 /// Block and transaction verification requests should be wrapped in a timeout,
 /// so that out-of-order and invalid requests do not hang indefinitely.
 /// See the [`router`](`crate::router`) module documentation for details.
+pub async fn init(
+    config: Config,
+    network: &Network,
+    state_service: BoxStateService,
+    mempool: oneshot::Receiver<BoxMempoolService>,
+) -> (
+    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<
+        BoxService<transaction::MempoolRequest, transaction::MempoolResponse, TransactionError>,
+        transaction::MempoolRequest,
+    >,
+    BackgroundTaskHandles,
+    Height,
+) {
+    init_generic(config, network, state_service, mempool).await
+}
+
+/// The body of [`init`], kept generic so rustc checks its spawned tasks are `Send` against
+/// the service bounds. Checked against the concrete `Buffer` types instead, it hits a
+/// higher-ranked lifetime limitation on the boxed error type. [`init`] is its only caller,
+/// so it is still compiled once, here.
 #[instrument(skip(state_service, mempool))]
-pub async fn init<S, Mempool>(
+async fn init_generic<S, Mempool>(
     config: Config,
     network: &Network,
     mut state_service: S,
@@ -419,6 +440,16 @@ pub fn init_checkpoint_list(config: Config, network: &Network) -> (Arc<Checkpoin
     (list, max_checkpoint_height)
 }
 
+/// The state service the verifiers are built on.
+///
+/// [`init`] takes this concrete type rather than any `Service`, so the verifier stack is
+/// compiled once, here, instead of in every crate and test binary that calls `init`.
+pub type BoxStateService = Buffer<BoxService<zs::Request, zs::Response, BoxError>, zs::Request>;
+
+/// The mempool service the transaction verifier is handed once the mempool exists.
+pub type BoxMempoolService =
+    Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>;
+
 /// The background task handles for `zebra-consensus` verifier initialization.
 #[derive(Debug)]
 pub struct BackgroundTaskHandles {
@@ -431,10 +462,10 @@ pub struct BackgroundTaskHandles {
 ///
 /// See [`init`] for more details.
 #[cfg(any(test, feature = "proptest-impl"))]
-pub async fn init_test<S>(
+pub async fn init_test(
     config: Config,
     network: &Network,
-    state_service: S,
+    state_service: BoxStateService,
 ) -> (
     Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
     Buffer<
@@ -443,19 +474,12 @@ pub async fn init_test<S>(
     >,
     BackgroundTaskHandles,
     Height,
-)
-where
-    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
-    S::Future: Send + 'static,
-{
+) {
     init(
         config.clone(),
         network,
         state_service.clone(),
-        oneshot::channel::<
-            Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
-        >()
-        .1,
+        oneshot::channel::<BoxMempoolService>().1,
     )
     .await
 }
