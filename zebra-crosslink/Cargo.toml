@@ -46,7 +46,7 @@ zcash_proofs = { path = "../librustzcash/zcash_proofs", features = ["bundled-pro
 zcash_transparent = { path = "../librustzcash/zcash_transparent" }
 zcash_protocol = { path = "../librustzcash/components/zcash_protocol" }
 
-tenderlink = { path = "../tenderlink" }
+tenderlink = { path = "../tenderlink", default-features = false }
 zebra-debug-time = { path = "zebra-debug-time" }
 zebra-gui = { path = "../zebra-gui" }
 
