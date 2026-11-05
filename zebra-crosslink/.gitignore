@@ -170,3 +170,4 @@ __pycache__/
 zebra-rpc/qa/cache/
 .vscode/launch.json
 dilated_regtest/out/
+magic_memo_regtest/out/

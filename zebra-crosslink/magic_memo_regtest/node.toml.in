@@ -1,0 +1,55 @@
+# Rendered by run.sh: @OUT@ is this directory's out/. A single regtest node with its own ports, so it can run
+# beside other local nodes. Derived from dilated_regtest/node0.toml.in, without time dilation.
+[consensus]
+checkpoint_sync = true
+
+[crosslink]
+public_address = "127.0.0.1:12401"
+explicit_bft_key_seed = "127.0.0.1:12401"
+bft_peers = ["127.0.0.1:12401"]
+disable_shipped_slashforks = true
+
+[mempool]
+eviction_memory_time = "1h"
+tx_cost_limit = 80000000
+
+[mining]
+internal_miner = true
+miner_address = "tmRB9AEVsxNAQsqtJPqJUje9KCaAijpS77z"
+
+[network]
+cache_dir = false
+initial_mainnet_peers = []
+initial_testnet_peers = []
+listen_addr = "127.0.0.1:18433"
+max_connections_per_ip = 1
+network = "Regtest"
+peerset_initial_target_size = 25
+
+[network.testnet_parameters.crosslink]
+bootstrap_staking_height = 150
+bootstrap_roster_height = 300
+bootstrap_activation_height = 450
+staking_period = 150
+staking_day_window = 70
+staking_action_delay = 75
+
+[rpc]
+cookie_dir = "@OUT@/state"
+enable_cookie_auth = false
+listen_addr = "127.0.0.1:18432"
+
+[state]
+cache_dir = "@OUT@/state"
+delete_old_database = true
+ephemeral = false
+network_identity_seed_string = "Magic memo regtest node."
+network_local_port = 12101
+network_initial_peers = []
+
+[state.network_checkpoint]
+height = 0
+hash = ""
+
+[tracing]
+use_color = false
