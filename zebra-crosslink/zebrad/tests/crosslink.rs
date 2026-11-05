@@ -349,10 +349,11 @@ fn crosslink_upgrade_height_set_by_the_test_file() {
     test_bytes(tf.write_to_bytes());
 }
 
-/// FeaturenetUpgrade2 is unscheduled by default; a test file's node config schedules it at height
-/// 4, and the node switches to it at exactly that height, as for FeaturenetUpgrade1 above: a block
-/// there built for the default schedule, whose coinbase is still the older upgrade's, is refused,
-/// and one built for the moved schedule is accepted, as is the node's own next block.
+/// FeaturenetUpgrade2 activates far beyond any scenario by default; a test file's node config
+/// moves it to height 4, and the node switches to it at exactly that height, as for
+/// FeaturenetUpgrade1 above: a block there built for the default schedule, whose coinbase is still
+/// the older upgrade's, is refused, and one built for the moved schedule is accepted, as is the
+/// node's own next block.
 #[test]
 fn crosslink_featurenet_upgrade_2_height_set_by_the_test_file() {
     use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
@@ -370,8 +371,7 @@ fn crosslink_featurenet_upgrade_2_height_set_by_the_test_file() {
     let default_schedule = regtest_network(&params);
     assert_ne!(NetworkUpgrade::current(&network, BlockHeight(activation - 1)), NetworkUpgrade::FeaturenetUpgrade2);
     assert_eq!(NetworkUpgrade::current(&network, BlockHeight(activation)), NetworkUpgrade::FeaturenetUpgrade2);
-    assert_eq!(NetworkUpgrade::FeaturenetUpgrade2.activation_height(&default_schedule), None);
-    assert_ne!(NetworkUpgrade::current(&default_schedule, BlockHeight::MAX), NetworkUpgrade::FeaturenetUpgrade2);
+    assert_featurenet_upgrade_2_beyond_scenarios(&default_schedule);
 
     let key = TestKey::new(b"crosslink test miner");
     let miner = key.address();
@@ -445,15 +445,22 @@ fn crosslink_featurenet_upgrade_3_height_set_by_the_test_file() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// FeaturenetUpgrade2's default height is above every scenario, so a scenario on the default
+/// schedule runs entirely before it.
+fn assert_featurenet_upgrade_2_beyond_scenarios(network: &Network) {
+    let height = NetworkUpgrade::FeaturenetUpgrade2.activation_height(network);
+    assert!(height.map_or(true, |height| height.0 > 1_000), "FeaturenetUpgrade2 at {height:?}");
+}
+
 /// The node and the network for a fat pointer binding scenario: FeaturenetUpgrade2 at
-/// `activation`, or unscheduled as by default.
+/// `activation`, or at its default height beyond the scenario.
 fn fat_pointer_binding_node(activation: Option<u32>) -> (TF, Network) {
     use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
 
     let params = HARNESS_PARAMETERS;
     let Some(activation) = activation else {
         let network = regtest_network(&params);
-        assert_eq!(NetworkUpgrade::FeaturenetUpgrade2.activation_height(&network), None);
+        assert_featurenet_upgrade_2_beyond_scenarios(&network);
         return (TF::new(&params), network);
     };
     let node_config = node_config_with_activation_heights(ConfiguredActivationHeights {
@@ -541,9 +548,9 @@ fn crosslink_fat_pointer_changed_after_the_commitment_is_refused_from_featurenet
     test_bytes(tf.write_to_bytes());
 }
 
-/// The other side of the upgrade boundary: with FeaturenetUpgrade2 unscheduled the commitment
-/// binds no pointer, so the same changed copy is a valid sibling of the honest block, accepted as
-/// it is today.
+/// The other side of the upgrade boundary: below FeaturenetUpgrade2 the commitment binds no
+/// pointer, so the same changed copy is a valid sibling of the honest block, accepted as it is
+/// today.
 #[test]
 fn crosslink_fat_pointer_changed_after_the_commitment_is_accepted_without_featurenet_upgrade_2() {
     set_test_name(function_name!());
@@ -561,7 +568,7 @@ fn crosslink_fat_pointer_changed_after_the_commitment_is_accepted_without_featur
     test_bytes(tf.write_to_bytes());
 }
 
-/// With FeaturenetUpgrade2 unscheduled a block's hash is what it was before the pointer was bound:
+/// Below FeaturenetUpgrade2 a block's hash is what it was before the pointer was bound:
 /// the regtest genesis, and the ten blocks of finality diagram scene 1, the last four of which
 /// cite BFT blocks. The hashes were recorded from the scene as the node loaded it before the
 /// binding existed (commit 32a059c6). Needs no node.
@@ -572,10 +579,7 @@ fn crosslink_fat_pointer_changed_after_the_commitment_is_accepted_without_featur
 /// against output from before the binding.
 #[test]
 fn crosslink_block_hashes_without_featurenet_upgrade_2_are_unchanged() {
-    assert_eq!(
-        NetworkUpgrade::FeaturenetUpgrade2.activation_height(&regtest_network(&HARNESS_PARAMETERS)),
-        None
-    );
+    assert_featurenet_upgrade_2_beyond_scenarios(&regtest_network(&HARNESS_PARAMETERS));
     assert_eq!(zebra_chain::block::genesis::regtest_genesis_block().hash(), BlockGen::REGTEST_GENESIS_HASH);
     assert_eq!(
         BlockGen::REGTEST_GENESIS_HASH.to_string(),
@@ -4793,8 +4797,8 @@ const TWELVE_SEATS_PARAMETERS: zcash_primitives::bft::ZcashCrosslinkParameters =
 /// exactly this much per seat.
 const SEAT_STAKE: u64 = 100_000_000;
 
-/// A regtest network with FeaturenetUpgrade2 at `height`, or unscheduled, and the node config
-/// that gives the node the same schedule.
+/// A regtest network with FeaturenetUpgrade2 at `height`, or at its default height beyond the
+/// scenario, and the node config that gives the node the same schedule.
 fn network_with_featurenet_upgrade_2_at(params: &zcash_primitives::bft::ZcashCrosslinkParameters, height: Option<u32>) -> (Network, String) {
     let Some(height) = height else {
         return (regtest_network(params), String::new());
@@ -5016,7 +5020,7 @@ fn crosslink_bft_quorum_turns_strict_where_the_roster_snapshot_reaches_featurene
 }
 
 #[test]
-fn crosslink_bft_quorum_stays_2f_plus_1_with_featurenet_upgrade_2_unscheduled() {
+fn crosslink_bft_quorum_stays_2f_plus_1_below_featurenet_upgrade_2() {
     set_test_name(function_name!());
     bft_quorum_across_featurenet_upgrade_2(None);
 }
@@ -5025,7 +5029,7 @@ fn crosslink_bft_quorum_stays_2f_plus_1_with_featurenet_upgrade_2_unscheduled() 
 /// names, and a BFT proposal's previous-block pointer one for its parent. The node decides BFT
 /// height 1 through its own engine on nine of twelve precommits; then one PoW block per malformed
 /// certificate for that block is offered at the same height, each refused with the upgrade below
-/// the scenario and accepted with it unscheduled, beside an honest certificate accepted either
+/// the scenario and accepted with it above, beside an honest certificate accepted either
 /// way. A height-2 proposal whose previous-block pointer carries forged signatures is refused and
 /// accepted the same way.
 fn fat_pointer_certificates_across_featurenet_upgrade_2(upgrade: Option<u32>) {
@@ -5127,7 +5131,7 @@ fn crosslink_fat_pointer_certificates_are_checked_from_featurenet_upgrade_2() {
 }
 
 #[test]
-fn crosslink_fat_pointer_certificates_are_hash_only_with_featurenet_upgrade_2_unscheduled() {
+fn crosslink_fat_pointer_certificates_are_hash_only_below_featurenet_upgrade_2() {
     set_test_name(function_name!());
     fat_pointer_certificates_across_featurenet_upgrade_2(None);
 }
@@ -5144,7 +5148,7 @@ fn crosslink_fat_pointer_certificates_are_hash_only_with_featurenet_upgrade_2_un
 /// it passes the certificate check (`admit_fat_pointer`) and every other rule, and only the
 /// commitment check, which runs after it, can refuse it: that is what makes these copies isolate
 /// the binding. With the upgrade below the scenario the honest block is accepted and each copy
-/// refused with the commitment error; with it unscheduled all three are accepted as siblings.
+/// refused with the commitment error; with it above, all three are accepted as siblings.
 fn fat_pointer_binding_on_a_roster_across_featurenet_upgrade_2(upgrade: Option<u32>) {
     let (network, node_config) = network_with_featurenet_upgrade_2_at(&TWELVE_SEATS_PARAMETERS, upgrade);
     let mut tf = TF::new_with_node_config(&TWELVE_SEATS_PARAMETERS, &node_config);
@@ -5214,7 +5218,7 @@ fn crosslink_fat_pointer_binding_covers_the_signature_list_from_featurenet_upgra
 }
 
 #[test]
-fn crosslink_fat_pointer_binding_leaves_the_signature_list_free_with_featurenet_upgrade_2_unscheduled() {
+fn crosslink_fat_pointer_binding_leaves_the_signature_list_free_below_featurenet_upgrade_2() {
     set_test_name(function_name!());
     fat_pointer_binding_on_a_roster_across_featurenet_upgrade_2(None);
 }

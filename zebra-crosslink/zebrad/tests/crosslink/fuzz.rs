@@ -803,7 +803,7 @@ fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
 
 /// The deepest a replayed transaction's first copy sits below the tip. It stays in the
 /// non-finalized chain, where a replay is refused under any network upgrade; once finalized, it
-/// is refused only from FeaturenetUpgrade2, which these runs leave unscheduled, or from
+/// is refused only from FeaturenetUpgrade2, which these runs never reach, or from
 /// FeaturenetUpgrade3, where its spent version is gone.
 const REPLAY_DEPTH_MAX: u32 = zebra_state::MAX_BLOCK_REORG_HEIGHT / 2;
 

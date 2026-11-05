@@ -518,7 +518,7 @@ pub const TESTNET_FEATURENET_UPGRADE_1_HEIGHT: u32 = 55_296;
 /// while it is unscheduled. This is the one place to schedule it: the node's Testnet schedule, the
 /// Regtest default and the wallet's [`TestNetwork`] all take it from here, so they cannot disagree
 /// on which branch ID a height uses.
-pub const TESTNET_FEATURENET_UPGRADE_2_HEIGHT: Option<u32> = None;
+pub const TESTNET_FEATURENET_UPGRADE_2_HEIGHT: Option<u32> = Some(165_000);
 
 /// The Crosslink testnet activation height of [`NetworkUpgrade::FeaturenetUpgrade3`], or `None`
 /// while it is unscheduled. This is the one place to schedule it: the node's Testnet schedule, the

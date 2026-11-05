@@ -2942,8 +2942,12 @@ mod tests {
         assert!(!strict_quorum_at(&network, None));
         assert!(!strict_quorum_at(&network, Some(Height(49))));
         assert!(strict_quorum_at(&network, Some(Height(50))));
-        let unscheduled = Network::new_regtest(Default::default());
-        assert!(!strict_quorum_at(&unscheduled, Some(Height(1_000_000))));
+        let default = Network::new_regtest(Default::default());
+        let default_height =
+            zcash_protocol::consensus::Parameters::activation_height(&default, NetworkUpgrade::FeaturenetUpgrade2)
+                .expect("Regtest schedules FeaturenetUpgrade2 by default");
+        assert!(!strict_quorum_at(&default, Some(Height(u32::from(default_height) - 1))));
+        assert!(strict_quorum_at(&default, Some(Height(u32::from(default_height)))));
 
         assert_eq!(namespace_for_bft_height(&[], 7, false), [0; 32]);
         assert_ne!(namespace_for_bft_height(&[], 7, true), [0; 32]);
@@ -3104,8 +3108,8 @@ mod tests {
 
     /// A carried header declaring PoWLimit more than six spacings after the snapshot, above the
     /// minimum-difficulty start height: a legitimate minimum-difficulty header on stock Testnet
-    /// parameters, refused on parameters that switch the exemption off and once
-    /// FeaturenetUpgrade2 is active.
+    /// parameters with FeaturenetUpgrade2 moved above it, refused on parameters that switch the
+    /// exemption off and once FeaturenetUpgrade2 is active, as it is on stock Testnet itself.
     #[test]
     fn a_minimum_difficulty_carried_header_passes_only_where_the_exemption_holds() {
         use zebra_chain::parameters::testnet::{self, ConfiguredActivationHeights};
@@ -3118,6 +3122,12 @@ mod tests {
         let mut heights = ConfiguredActivationHeights::from(stock_params.activation_heights());
         let last_scheduled = stock_params.activation_heights().keys().last().expect("Testnet has upgrades").0;
         let snapshot_height = Height(last_scheduled.max(400_000));
+        heights.featurenet_upgrade_2 = Some(snapshot_height.0 + 2);
+        let exempt = testnet::Parameters::build()
+            .with_activation_heights(heights)
+            .expect("valid activation heights")
+            .to_network()
+            .expect("valid parameters");
         heights.featurenet_upgrade_2 = Some(snapshot_height.0);
         let upgraded = testnet::Parameters::build()
             .with_activation_heights(heights)
@@ -3140,8 +3150,8 @@ mod tests {
             headers_meet_required_difficulty(network, snapshot_height, context, &[bc_hdr_to_lrz(&gapped)])
         };
 
-        assert_eq!(check(&stock), Ok(()));
-        for network in [&featurenet, &upgraded] {
+        assert_eq!(check(&exempt), Ok(()));
+        for network in [&stock, &featurenet, &upgraded] {
             let err = check(network).expect_err("no minimum-difficulty exemption applies");
             assert!(err.contains("is not equal to the expected difficulty"), "{err}");
         }
