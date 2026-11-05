@@ -8,6 +8,11 @@ edition = "2021"
 # Dependencies are spelled out here rather than inherited, since there is no workspace
 # to inherit from. Keep the shared crates in step with zebra-crosslink/Cargo.toml.
 
+[features]
+# Experimental: publish and read magic memos, public payloads carried in the compact-block view of
+# zero-value Ironwood outputs (zcash_primitives::transaction::magic_memo). Off by default.
+magic-memo = ["zcash_primitives/unstable-magic-memo"]
+
 [dependencies]
 secp256k1 = "0.29"
 bip39 = "2.2.0"

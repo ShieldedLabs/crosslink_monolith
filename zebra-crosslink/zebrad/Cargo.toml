@@ -68,6 +68,9 @@ path = "tests/crosslink.rs"
 
 [features]
 
+# Experimental: the internal wallet publishes and reads magic memos (see the wallet crate's feature).
+magic-memo = ["wallet/magic-memo"]
+
 # No-op, kept for compatibility with build scripts that still pass `--features new-net`.
 #
 # new_network is the block pipeline now, not an option: every block entering this node goes

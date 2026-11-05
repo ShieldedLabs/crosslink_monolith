@@ -69,6 +69,7 @@ use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::{ZatBalance, Zatoshis};
 use zcash_protocol::{PoolType, ShieldedProtocol, TxId};
 use zcash_primitives::transaction::builder::BundlePadding;
+#[cfg(feature = "magic-memo")]
 use zcash_primitives::transaction::magic_memo::{self, MagicMemo};
 use zcash_primitives::ed25519_zebra::SigningKey;
 use zcash_keys::keys::BondSpendingKey;
@@ -127,25 +128,24 @@ pub static STAKING_STAGE: Mutex<Option<(StakingActionRequest, tokio::sync::onesh
 /// Staged basic send requested over RPC: (value in zatoshis, unified address string, result channel).
 pub static BASIC_SEND_STAGE: Mutex<Option<(u64, String, tokio::sync::oneshot::Sender<Result<String, String>>)>> = Mutex::new(None);
 
-/// A magic memo payload waiting for the user wallet to publish it (see `zcash_primitives::transaction::magic_memo`).
+/// Experimental: a magic memo waiting for the user wallet to publish it (see `zcash_primitives::transaction::magic_memo`).
 /// It stays staged until a transaction carrying it is built, so it waits out a wallet with no spendable funds.
 /// Seeded at startup from the `CROSSLINK_MAGIC_MEMO` environment variable.
+#[cfg(feature = "magic-memo")]
 pub static MAGIC_MEMO_STAGE: Mutex<Option<MagicMemo>> = Mutex::new(None);
 
-/// A magic memo found while scanning the chain.
+/// Experimental: a magic memo found while scanning compact blocks, reassembled from all of its tx's chunk actions.
+#[cfg(feature = "magic-memo")]
 #[derive(Clone, Debug)]
 pub struct SeenMagicMemo {
     pub h: BlockHeight,
     pub txid: TxId,
-    pub action_i: usize,
-    /// The payload as far as the compact block shows it: at most `magic_memo::MAGIC_MEMO_COMPACT_LEN` bytes.
-    pub text: String,
-    /// The full payload may be longer than `text`; it is only in the full transaction.
-    pub maybe_truncated: bool,
+    pub payload: Vec<u8>,
 }
 
-/// Every magic memo seen while scanning, in scan order, without repeats from rescans or from scanning with
-/// several wallets.
+/// Experimental: every magic memo seen while scanning, in scan order, without repeats from rescans or from
+/// scanning with several wallets.
+#[cfg(feature = "magic-memo")]
 pub static MAGIC_MEMOS_SEEN: Mutex<Vec<SeenMagicMemo>> = Mutex::new(Vec::new());
 
 pub static STAKING_POSITIONS: Mutex<zcash_primitives::bft::WalletStakingPositions> = Mutex::new((BTreeMap::new(), Vec::new()));
@@ -388,12 +388,22 @@ struct BuildPrep {
     t_outputs: Vec<ProposedTransparentOutput>,
     o_inputs: Vec<ProposedOrchardSpend>,
     o_outputs: Vec<ProposedOrchardOutput>,
-    o_magic_memos: Vec<(orchard::Address, MagicMemo)>, // each is one more Ironwood output
+    #[cfg(feature = "magic-memo")]
+    o_magic_memos: Vec<(orchard::Address, MagicMemo)>, // each adds one Ironwood output per chunk
 
     staking_action: Option<StakingAction>,
     staking_signing_key: Option<SigningKey>,
 }
 impl BuildPrep {
+    /// Ironwood outputs, counting each magic memo chunk as one.
+    fn o_outputs_n(&self) -> usize {
+        #[cfg(feature = "magic-memo")]
+        let magic_n: usize = self.o_magic_memos.iter().map(|(_, memo)| memo.chunks().len()).sum();
+        #[cfg(not(feature = "magic-memo"))]
+        let magic_n = 0;
+        self.o_outputs.len() + magic_n
+    }
+
     fn fee_required(&self) -> Result<Zatoshis, builder::FeeError<zip317::FeeError>> {
         // NOTE: we can impl these ourselves
         use zcash_primitives::transaction::fees::transparent::{InputView, OutputView, InputSize};
@@ -401,7 +411,7 @@ impl BuildPrep {
             // Crosslink spends from the Orchard pool; NU6.3 onward fixes its bundle version.
             orchard::bundle::BundleVersion::orchard_v3().default_flags(),
             self.o_inputs.len(),
-            self.o_outputs.len() + self.o_magic_memos.len(),
+            self.o_outputs_n(),
         ).map_err(|e| builder::FeeError::Bundle(e))?;
 
         zip317::FeeRule::standard().fee_required(
@@ -1251,7 +1261,9 @@ enum TxOutput {
         zats: Zatoshis,
         memo: MemoBytes,
     },
-    /// A zero-value Ironwood output to `dst` that publishes `memo` unencrypted; `dst` can never decrypt it.
+    /// Experimental: one zero-value Ironwood output to `dst` per chunk of `memo`, publishing it unencrypted;
+    /// `dst` can never decrypt them.
+    #[cfg(feature = "magic-memo")]
     IronwoodMagicMemo {
         dst: orchard::Address,
         memo: MagicMemo,
@@ -1697,15 +1709,18 @@ impl ManualWallet {
         await_wallet_proof(receiver, worker).await
     }
 
-    fn build_tx_from_prep<P: Parameters>(network: P, prep: BuildPrep) -> Option<TxBuildResult> {
+    fn build_tx_from_prep<P: Parameters>(network: P, mut prep: BuildPrep) -> Option<TxBuildResult> {
         let tz = Timer::scope_("build_tx_from_prep", DUMP_TX_SEND | DUMP_TX_BUILD);
         let prep_fee = prep.fee_required();
 
+        #[cfg(feature = "magic-memo")]
+        let o_magic_memos = std::mem::take(&mut prep.o_magic_memos);
         let BuildPrep{
             block_h, build_config,
             t_keys, s_keys, o_keys,
-            t_inputs, t_outputs, o_inputs, o_outputs, o_magic_memos,
+            t_inputs, t_outputs, o_inputs, o_outputs,
             staking_action, staking_signing_key,
+            ..
         } = prep;
 
         let mut txb = TxBuilder::new(network, LRZBlockHeight::from_u32(block_h), build_config);
@@ -1738,6 +1753,7 @@ impl ManualWallet {
             }
         }
 
+        #[cfg(feature = "magic-memo")]
         for (dst, memo) in o_magic_memos {
             if let Err(err) = txb.add_ironwood_magic_memo::<zip317::FeeError>(dst, memo) {
                 if DUMP_TX_BUILD { println!("constructing magic memo output: {err:?}"); }
@@ -1887,6 +1903,7 @@ impl ManualWallet {
             t_outputs: Vec::new(),
             o_inputs: Vec::new(),
             o_outputs: Vec::new(),
+            #[cfg(feature = "magic-memo")]
             o_magic_memos: Vec::new(),
             staking_action: None,
             staking_signing_key: None,
@@ -1988,8 +2005,9 @@ impl ManualWallet {
                     prep.o_outputs.push(ProposedOrchardOutput{ ovk: ovk.clone(), dst: dst.clone(), zats, memo: note_memo.clone() });
                     if DUMP_TX_BUILD { println!("  added orchard output: {}", zats.into_u64()); }
                 }
+                #[cfg(feature = "magic-memo")]
                 &TxOutput::IronwoodMagicMemo{ dst, ref memo } => {
-                    // Zero value: nothing sent or received, but the extra action raises the fee.
+                    // Zero value: nothing sent or received, but each chunk's action can raise the fee.
                     if let Err(err) = txb.add_ironwood_magic_memo::<zip317::FeeError>(dst, memo.clone()) {
                         println!("tx build error: {err:?}");
                         return None;
@@ -2237,7 +2255,9 @@ impl ManualWallet {
     }
 
 
-    /// Proposes a transaction whose only output is `memo`, published unencrypted on chain. It costs only the fee.
+    /// Experimental: proposes a transaction whose only outputs carry `memo`, published unencrypted on chain.
+    /// It costs only the fee, which grows with the memo's chunk count.
+    #[cfg(feature = "magic-memo")]
     pub fn publish_magic_memo<P: Parameters>(
         &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
         src_usk: &UnifiedSpendingKey, orchard_tree: &OrchardShardTree, memo: MagicMemo
@@ -2246,7 +2266,7 @@ impl ManualWallet {
         let tz = Timer::scope("publish_magic_memo");
         let account = &self.accounts[0];
         let (_t_addr, _p2sh, ua) = addrs_from_account(account, 0).unwrap(); // @Hack
-        // The output is undecryptable whoever receives it, so our own address is as good as any.
+        // The outputs are undecryptable whoever receives them, so our own address is as good as any.
         let dst = *ua.orchard()?;
         let out = &[TxOutput::IronwoodMagicMemo{ dst, memo }];
         let opts = &TxOptions{ src_pools: &[TxPool::Ironwood(orchard_tree), TxPool::Transparent], ..TxOptions::default() };
@@ -3256,34 +3276,39 @@ pub fn string_from_t_addr<P: Parameters>(params: P, t_addr: TransparentAddress) 
     t_addr.encode(&params)
 }
 
-/// NOTE: this *must* only be called in sequential order without gaps (including after reorg/truncate)
-/// Records a magic memo carried by a compact action's `ciphertext`, if it carries one.
-fn note_magic_memo(block_h: BlockHeight, txid: &TxId, action_i: usize, compact_ciphertext: &[u8]) {
-    let Some(payload) = magic_memo::payload(compact_ciphertext) else { return; };
-    // An ordinary ciphertext opens with the prefix with probability 2^-32; random bytes are almost never UTF-8.
-    let text = match std::str::from_utf8(payload) {
-        Ok(text) => text,
-        // The compact view can cut a long payload partway through a character.
-        Err(err) if err.error_len().is_none() => std::str::from_utf8(&payload[..err.valid_up_to()]).expect("valid up to here"),
-        Err(_) => return,
-    };
+/// Experimental: records the magic memo carried by a compact tx's Ironwood actions, if they carry one.
+/// Everything comes from the compact actions; the full transaction is never fetched.
+#[cfg(feature = "magic-memo")]
+fn note_magic_memo(block_h: BlockHeight, txid: &TxId, tx: &CompactTx) {
+    let chunks: Vec<magic_memo::DecodedChunk> = tx.ironwood_actions.iter()
+        .filter_map(|action| magic_memo::decode_chunk(&action.ciphertext, &action.ephemeral_key))
+        .collect();
+    if chunks.is_empty() { return; }
 
     let mut seen = MAGIC_MEMOS_SEEN.lock().unwrap();
-    if seen.iter().any(|m| m.txid == *txid && m.action_i == action_i) { return; }
-    let maybe_truncated = payload.len() == magic_memo::MAGIC_MEMO_COMPACT_LEN;
-    println!("************** MAGIC MEMO at {block_h:?} in {txid}: \"{text}{}\"", if maybe_truncated { "..." } else { "" });
-    seen.push(SeenMagicMemo{ h: block_h, txid: *txid, action_i, text: text.to_owned(), maybe_truncated });
+    if seen.iter().any(|m| m.txid == *txid) { return; }
+    let chunks_n = chunks.len();
+    let Some(payload) = magic_memo::reassemble(chunks) else {
+        println!("magic memo in {txid} at {block_h:?} has missing or repeated chunks ({chunks_n} seen); ignoring it");
+        return;
+    };
+    // An ordinary ciphertext opens with the prefix with probability 2^-32; random bytes are almost never UTF-8.
+    let Ok(text) = std::str::from_utf8(&payload) else { return; };
+    println!("************** MAGIC MEMO at {block_h:?} in {txid} ({chunks_n} actions, {} bytes): \"{text}\"", payload.len());
+    seen.push(SeenMagicMemo{ h: block_h, txid: *txid, payload });
 }
 
+/// NOTE: this *must* only be called in sequential order without gaps (including after reorg/truncate)
 fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &CompactTx, next_orchard_pos: &mut u64, insert_i: &mut usize, orchard_tree: &mut OrchardShardTree) -> (TxId, bool/*ours*/, bool/*ok*/) {
     let txid = TxId::from_bytes(<[u8;32]>::try_from(&tx.txid[..]).expect("successfully converted above"));
 
     let mut shielded_part = WalletTxPart::ZERO;
 
     // Ironwood-native: our notes live in the Ironwood bundle (see the build config).
-    for (action_i, orchard_action) in tx.ironwood_actions.iter().enumerate() {
-        note_magic_memo(block_h, &txid, action_i, &orchard_action.ciphertext);
+    #[cfg(feature = "magic-memo")]
+    note_magic_memo(block_h, &txid, tx);
 
+    for orchard_action in &tx.ironwood_actions {
         let action = match OrchardCompactAction::try_from(orchard_action) {
             Ok(v) => v,
             Err(err) => {
@@ -3943,7 +3968,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let mut just_init_new_tx = false;
 
-    // CROSSLINK_MAGIC_MEMO=<text> publishes <text> unencrypted from the user wallet once it can pay the fee.
+    // Experimental: CROSSLINK_MAGIC_MEMO=<text> publishes <text> unencrypted from the user wallet once it can
+    // pay the fee.
+    #[cfg(feature = "magic-memo")]
     if let Ok(text) = std::env::var("CROSSLINK_MAGIC_MEMO") {
         match MagicMemo::from_payload(text.as_bytes()) {
             Some(memo) => *MAGIC_MEMO_STAGE.lock().unwrap() = Some(memo),
@@ -3951,6 +3978,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
     }
     // Attempt at most once per tip, so a wallet without funds doesn't retry (and log) every loop.
+    #[cfg(feature = "magic-memo")]
     let mut magic_memo_tried_tip_h = None;
 
     // Debug: WALLET_FORCE_REWIND_AT=<height> fires a single deep rewind of the request
@@ -5106,6 +5134,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
 
         // Shares the GUI send slot, which is already guarded against double-spending with the other in-flight txs.
+        #[cfg(feature = "magic-memo")]
         if !proposed_send.is_in_progress() && magic_memo_tried_tip_h != Some(user_wallet.chain_tip_h) {
             let staged = MAGIC_MEMO_STAGE.lock().unwrap().clone();
             if let Some(memo) = staged {

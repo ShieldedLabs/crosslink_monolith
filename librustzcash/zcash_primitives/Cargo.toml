@@ -77,6 +77,9 @@ hex.workspace = true
 
 # - Shielded protocols
 redjubjub.workspace = true
+#   - Experimental magic memos: checking `epk` encodings
+group = { workspace = true, optional = true }
+pasta_curves = { workspace = true, optional = true }
 
 # No-std support
 corez.workspace = true
@@ -146,6 +149,10 @@ expensive-tests = []
 
 ## A feature used to ensure that expensive tests do not run when running with --all-features
 no-expensive-tests = []
+
+## Experimental: magic memos, public payloads carried in the compact-block view of
+## zero-value Ironwood outputs (`transaction::magic_memo`). Unstable; off by default.
+unstable-magic-memo = ["dep:group", "dep:pasta_curves"]
 
 ## A feature that provides `FeeRule` implementations and constructors for
 ## non-standard fees.
