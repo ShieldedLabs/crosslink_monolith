@@ -29,7 +29,7 @@ use zebra_chain::{
 use zebra_network::address_book_peers::MockAddressBookPeers;
 use zebra_node_services::mempool;
 use zebra_state::{BoxError, GetBlockTemplateChainInfo};
-use zebra_test::mock_service::MockService;
+use zebra_test::mock_service::{MockService, PropTestAssertion};
 
 use crate::methods::{
     self,
@@ -952,50 +952,7 @@ fn mock_services<Tip>(
         zebra_state::ReadResponse,
         zebra_test::mock_service::PropTestAssertion,
     >,
-    methods::RpcImpl<
-        zebra_test::mock_service::MockService<
-            zebra_node_services::mempool::Request,
-            zebra_node_services::mempool::Response,
-            zebra_test::mock_service::PropTestAssertion,
-        >,
-        zebra_test::mock_service::MockService<
-            zebra_state::crosslink::TFLServiceRequest,
-            zebra_state::crosslink::TFLServiceResponse,
-            zebra_test::mock_service::PropTestAssertion,
-        >,
-        tower::buffer::Buffer<
-            zebra_test::mock_service::MockService<
-                zebra_state::Request,
-                zebra_state::Response,
-                zebra_test::mock_service::PropTestAssertion,
-            >,
-            zebra_state::Request,
-        >,
-        /* tower::buffer::Buffer<
-            zebra_test::mock_service::MockService<
-                zebra_state::Request,
-                zebra_state::Response,
-                zebra_test::mock_service::PropTestAssertion,
-            >,
-            zebra_state::Request,
-        >, */
-        tower::buffer::Buffer<
-            zebra_test::mock_service::MockService<
-                zebra_state::ReadRequest,
-                zebra_state::ReadResponse,
-                zebra_test::mock_service::PropTestAssertion,
-            >,
-            zebra_state::ReadRequest,
-        >,
-        Tip,
-        MockAddressBookPeers,
-        zebra_test::mock_service::MockService<
-            zebra_consensus::Request,
-            block::Hash,
-            zebra_test::mock_service::PropTestAssertion,
-        >,
-        MockSyncStatus,
-    >,
+    methods::RpcImpl,
     tokio::task::JoinHandle<()>,
 )
 where
@@ -1008,9 +965,11 @@ where
     //     zebra_crosslink::service::TFLServiceResponse,
     //     _
     // > = crosslink;
-    let state = MockService::build().for_prop_tests();
+    let state: MockService<zebra_state::Request, zebra_state::Response, PropTestAssertion> =
+        MockService::build().for_prop_tests();
     let read_state = MockService::build().for_prop_tests();
-    let block_verifier_router = MockService::build().for_prop_tests();
+    let block_verifier_router: MockService<zebra_consensus::Request, block::Hash, PropTestAssertion> =
+        MockService::build().for_prop_tests();
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, mempool_tx_queue) = RpcImpl::new(
