@@ -1,6 +1,6 @@
 //! Build script for zebrad.
 
-use std::{env, path::Path, process::Command};
+use std::{env, process::Command};
 
 /// Process entry point for `zebrad`'s build script
 #[allow(clippy::print_stderr)]
@@ -179,7 +179,7 @@ fn append_env(key: &str, value: &str) {
 /// git information in a source tarball, is left out rather than failing the build.
 fn emit_build_info() {
     let mut features: Vec<String> = env::vars()
-        .filter_map(|(k, _)| k.strip_prefix("CARGO_FEATURE_").map(|f| f.to_lowercase().replace('_', "-")))
+        .filter_map(|(k, _)| k.strip_prefix("CARGO_FEATURE_").map(str::to_lowercase))
         .collect();
     features.sort();
     println!("cargo:rustc-env=VERGEN_CARGO_FEATURES={}", features.join(","));
@@ -200,30 +200,49 @@ fn emit_build_info() {
         }
     }
 
-    // Rerun when HEAD moves: HEAD itself lives in the (per-worktree) git dir, branch refs
-    // in the common dir, either loose or in packed-refs.
-    let (Some(git_dir), Some(common_dir)) = (
-        run("git", &["rev-parse", "--absolute-git-dir"]),
-        run("git", &["rev-parse", "--path-format=absolute", "--git-common-dir"]),
-    ) else {
-        return;
-    };
-    println!("cargo:rerun-if-changed={}", Path::new(&git_dir).join("HEAD").display());
-    println!("cargo:rerun-if-changed={}", Path::new(&common_dir).join("packed-refs").display());
-    if let Some(head_ref) = run("git", &["symbolic-ref", "-q", "HEAD"]) {
-        println!("cargo:rerun-if-changed={}", Path::new(&common_dir).join(&head_ref).display());
-    }
-
+    // Like vergen, emit no rerun-if-changed for git: the script reruns when a file in this
+    // package changes, so a commit alone does not rebuild zebrad.
     for (var, args) in [
-        ("VERGEN_GIT_DESCRIBE", &["describe", "--tags", "--dirty", "--match", "v*.*.*"][..]),
-        ("VERGEN_GIT_SHA", &["rev-parse", "HEAD"][..]),
+        // With no matching tag, vergen fell back to the short SHA, as --always does.
+        ("VERGEN_GIT_DESCRIBE", &["describe", "--tags", "--dirty", "--always", "--match", "v*.*.*"][..]),
+        ("VERGEN_GIT_SHA", &["rev-parse", "--short=7", "HEAD"][..]),
         ("VERGEN_GIT_BRANCH", &["rev-parse", "--abbrev-ref", "HEAD"][..]),
-        ("VERGEN_GIT_COMMIT_TIMESTAMP", &["log", "-1", "--format=%cI"][..]),
     ] {
         if let Some(value) = run("git", args) {
             println!("cargo:rustc-env={var}={value}");
         }
     }
+
+    // vergen took the timestamp from SOURCE_DATE_EPOCH when it was set (phargo sets it to 0).
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    let epoch = env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .or_else(|| run("git", &["log", "-1", "--format=%ct"])?.parse().ok());
+    if let Some(epoch) = epoch {
+        println!("cargo:rustc-env=VERGEN_GIT_COMMIT_TIMESTAMP={}", rfc3339_utc(epoch));
+    }
+}
+
+/// Formats Unix time `secs` as vergen did: `1970-01-01T00:00:00.000000000Z`.
+fn rfc3339_utc(secs: i64) -> String {
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.000000000Z",
+        rem / 3_600,
+        rem / 60 % 60,
+        rem % 60
+    )
 }
 
 /// Runs a command and returns its trimmed stdout, or `None` if it could not run or failed.
