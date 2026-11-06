@@ -97,46 +97,10 @@ impl RpcServer {
     // TODO:
     // - replace VersionString with semver::Version, and update the tests to provide valid versions
     #[allow(clippy::too_many_arguments)]
-    pub async fn start<
-        Mempool,
-        TFLService,
-        State,
-        ReadState,
-        Tip,
-        BlockVerifierRouter,
-        SyncStatus,
-        AddressBook,
-    >(
-        rpc: RpcImpl<
-            Mempool,
-            TFLService,
-            State,
-            ReadState,
-            Tip,
-            AddressBook,
-            BlockVerifierRouter,
-            SyncStatus,
-        >,
+    pub async fn start(
+        rpc: RpcImpl,
         conf: config::rpc::Config,
-    ) -> Result<ServerTask, tower::BoxError>
-    where
-        Mempool: MempoolService,
-    TFLService: Service<
-            TFLServiceRequest,
-            Response = TFLServiceResponse,
-            Error = zebra_node_services::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    TFLService::Future: Send,
-        State: StateService,
-        ReadState: ReadStateService,
-        Tip: ChainTip + Clone + Send + Sync + 'static,
-        AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
-        BlockVerifierRouter: BlockVerifierService,
-        SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
-    {
+    ) -> Result<ServerTask, tower::BoxError> {
         let listen_addr = conf
             .listen_addr
             .expect("caller should make sure listen_addr is set");

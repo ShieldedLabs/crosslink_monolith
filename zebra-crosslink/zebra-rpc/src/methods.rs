@@ -67,8 +67,8 @@ use zebra_chain::{
     block::{
         self, Block, Commitment, Height, SerializedBlock, TryIntoHeight,
     },
-    chain_sync_status::ChainSyncStatus,
-    chain_tip::{ChainTip, NetworkChainTipHeightEstimator},
+    chain_sync_status::{BoxSyncStatus, ChainSyncStatus},
+    chain_tip::{BoxChainTip, ChainTip, NetworkChainTipHeightEstimator},
     parameters::{
         subsidy::{
             block_subsidy, founders_reward, funding_stream_values, miner_subsidy,
@@ -91,8 +91,15 @@ use zebra_consensus::{
 };
 #[cfg(test)]
 use zebra_consensus::RouterError;
-use zebra_network::{address_book_peers::AddressBookPeers, types::PeerServices, PeerSocketAddr};
-use zebra_node_services::mempool::{self, CreatedOrSpent, MempoolService};
+use zebra_network::{
+    address_book_peers::{AddressBookPeers, BoxAddressBookPeers},
+    types::PeerServices,
+    BoxCloneSyncService, PeerSocketAddr,
+};
+use zebra_node_services::{
+    mempool::{self, CreatedOrSpent, MempoolService},
+    BoxError,
+};
 use zebra_state::{
     AnyTx, HashOrHeight, OutputLocation, ReadRequest, ReadResponse, ReadState as ReadStateService,
     State as StateService, TransactionLocation,
@@ -1194,34 +1201,7 @@ pub trait Rpc {
 
 /// RPC method implementations.
 #[derive(Clone)]
-pub struct RpcImpl<
-    Mempool,
-    TFLService,
-    State,
-    ReadState,
-    Tip,
-    AddressBook,
-    BlockVerifierRouter,
-    SyncStatus,
->
-where
-    Mempool: MempoolService,
-    TFLService: Service<
-            TFLServiceRequest,
-            Response = TFLServiceResponse,
-            Error = zebra_node_services::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    TFLService::Future: Send,
-    State: StateService,
-    ReadState: ReadStateService,
-    Tip: ChainTip + Clone + Send + Sync + 'static,
-    AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
-    BlockVerifierRouter: BlockVerifierService,
-    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
-{
+pub struct RpcImpl {
     // Configuration
     //
     /// Zebra's application version, with build metadata.
@@ -1244,20 +1224,20 @@ where
     // Services
     //
     /// A handle to the mempool service.
-    mempool: Mempool,
+    mempool: BoxMempool,
 
-    tfl_service: TFLService,
+    tfl_service: BoxTflService,
 
     /// A handle to the state service. Reads go through `read_state`; this is kept so the
     /// constructor still takes the same service the rest of the node is wired with.
     #[allow(dead_code)]
-    state: State,
+    state: BoxState,
 
     /// A handle to the state service.
-    read_state: ReadState,
+    read_state: BoxReadState,
 
     /// Allows efficient access to the best tip of the blockchain.
-    latest_chain_tip: Tip,
+    latest_chain_tip: BoxChainTip,
 
     // Tasks
     //
@@ -1265,48 +1245,34 @@ where
     queue_sender: broadcast::Sender<UnminedTx>,
 
     /// Peer address book.
-    address_book: AddressBook,
+    address_book: BoxAddressBookPeers,
 
     /// The last warning or error event logged by the server.
     last_warn_error_log_rx: LoggedLastEvent,
 
     /// Handler for the `getblocktemplate` RPC.
-    gbt: GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>,
+    gbt: GetBlockTemplateHandler<BoxBlockVerifier, BoxSyncStatus>,
 }
+
+/// The mempool service [`RpcImpl`] holds.
+pub type BoxMempool = BoxCloneSyncService<mempool::Request, mempool::Response, BoxError>;
+
+/// The TFL service [`RpcImpl`] holds.
+pub type BoxTflService = BoxCloneSyncService<TFLServiceRequest, TFLServiceResponse, BoxError>;
+
+/// The state service [`RpcImpl`] holds.
+pub type BoxState = BoxCloneSyncService<zebra_state::Request, zebra_state::Response, BoxError>;
+
+/// The read-only state service [`RpcImpl`] holds.
+pub type BoxReadState = BoxCloneSyncService<ReadRequest, ReadResponse, BoxError>;
+
+/// The block verifier router [`RpcImpl`] holds.
+pub type BoxBlockVerifier = BoxCloneSyncService<zebra_consensus::Request, block::Hash, BoxError>;
 
 /// A type alias for the last event logged by the server.
 pub type LoggedLastEvent = watch::Receiver<Option<(String, tracing::Level, chrono::DateTime<Utc>)>>;
 
-impl<Mempool, TFLService, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
-    fmt::Debug
-    for RpcImpl<
-        Mempool,
-        TFLService,
-        State,
-        ReadState,
-        Tip,
-        AddressBook,
-        BlockVerifierRouter,
-        SyncStatus,
-    >
-where
-    Mempool: MempoolService,
-    TFLService: Service<
-            TFLServiceRequest,
-            Response = TFLServiceResponse,
-            Error = zebra_node_services::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    TFLService::Future: Send,
-    State: StateService,
-    ReadState: ReadStateService,
-    Tip: ChainTip + Clone + Send + Sync + 'static,
-    AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
-    BlockVerifierRouter: BlockVerifierService,
-    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
-{
+impl fmt::Debug for RpcImpl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Skip fields without Debug impls, and skip channels
         f.debug_struct("RpcImpl")
@@ -1319,41 +1285,28 @@ where
     }
 }
 
-impl<Mempool, TFLService, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
-    RpcImpl<
-        Mempool,
-        TFLService,
-        State,
-        ReadState,
-        Tip,
-        AddressBook,
-        BlockVerifierRouter,
-        SyncStatus,
-    >
-where
-    Mempool: MempoolService,
-    TFLService: Service<
-            TFLServiceRequest,
-            Response = TFLServiceResponse,
-            Error = zebra_node_services::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    TFLService::Future: Send,
-    State: StateService,
-    ReadState: ReadStateService,
-    Tip: ChainTip + Clone + Send + Sync + 'static,
-    AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
-    BlockVerifierRouter: BlockVerifierService,
-    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
-{
+impl RpcImpl {
     /// Create a new instance of the RPC handler.
     //
     // TODO:
     // - put some of the configs or services in their own struct?
+    ///
+    /// This only boxes each service, so the RPC methods, which take the boxed types, are
+    /// compiled once, in this crate, instead of once per set of service types in each crate
+    /// and test binary that starts an RPC server.
     #[allow(clippy::too_many_arguments)]
-    pub fn new<VersionString, UserAgentString>(
+    pub fn new<
+        VersionString,
+        UserAgentString,
+        Mempool,
+        TFLService,
+        State,
+        ReadState,
+        BlockVerifierRouter,
+        SyncStatus,
+        Tip,
+        AddressBook,
+    >(
         network: Network,
         mining_config: config::mining::Config,
         debug_force_finished_sync: bool,
@@ -1373,11 +1326,62 @@ where
     where
         VersionString: ToString + Clone + Send + 'static,
         UserAgentString: ToString + Clone + Send + 'static,
+        Mempool: MempoolService,
+        TFLService: Service<
+                TFLServiceRequest,
+                Response = TFLServiceResponse,
+                Error = zebra_node_services::BoxError,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+        TFLService::Future: Send + 'static,
+        State: StateService,
+        ReadState: ReadStateService,
+        Tip: ChainTip + Clone + Send + Sync + 'static,
+        AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
+        BlockVerifierRouter: BlockVerifierService,
+        SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
     {
-        let (runner, queue_sender) = Queue::start();
+        Self::new_boxed(
+            network,
+            mining_config,
+            debug_force_finished_sync,
+            build_version.to_string(),
+            user_agent.to_string(),
+            BoxCloneSyncService::new(mempool),
+            BoxCloneSyncService::new(tfl_service),
+            BoxCloneSyncService::new(state),
+            BoxCloneSyncService::new(read_state),
+            BoxCloneSyncService::new(block_verifier_router),
+            BoxSyncStatus::new(sync_status),
+            BoxChainTip::new(latest_chain_tip),
+            BoxAddressBookPeers::new(address_book),
+            last_warn_error_log_rx,
+            mined_block_sender,
+        )
+    }
 
-        let mut build_version = build_version.to_string();
-        let user_agent = user_agent.to_string();
+    /// The body of [`RpcImpl::new`], on the boxed services.
+    #[allow(clippy::too_many_arguments)]
+    fn new_boxed(
+        network: Network,
+        mining_config: config::mining::Config,
+        debug_force_finished_sync: bool,
+        mut build_version: String,
+        user_agent: String,
+        mempool: BoxMempool,
+        tfl_service: BoxTflService,
+        state: BoxState,
+        read_state: BoxReadState,
+        block_verifier_router: BoxBlockVerifier,
+        sync_status: BoxSyncStatus,
+        latest_chain_tip: BoxChainTip,
+        address_book: BoxAddressBookPeers,
+        last_warn_error_log_rx: LoggedLastEvent,
+        mined_block_sender: Option<mpsc::Sender<(block::Hash, block::Height)>>,
+    ) -> (Self, JoinHandle<()>) {
+        let (runner, queue_sender) = Queue::start();
 
         // Match zcashd's version format, if the version string has anything in it
         if !build_version.is_empty() && !build_version.starts_with('v') {
@@ -1467,36 +1471,7 @@ where
 }
 
 #[async_trait]
-impl<Mempool, TFLService, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
-    RpcServer
-    for RpcImpl<
-        Mempool,
-        TFLService,
-        State,
-        ReadState,
-        Tip,
-        AddressBook,
-        BlockVerifierRouter,
-        SyncStatus,
-    >
-where
-    Mempool: MempoolService,
-    TFLService: Service<
-            TFLServiceRequest,
-            Response = TFLServiceResponse,
-            Error = zebra_node_services::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    TFLService::Future: Send,
-    State: StateService,
-    ReadState: ReadStateService,
-    Tip: ChainTip + Clone + Send + Sync + 'static,
-    AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
-    BlockVerifierRouter: BlockVerifierService,
-    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
-{
+impl RpcServer for RpcImpl {
     async fn get_info(&self) -> Result<GetInfoResponse> {
         let version = GetInfoResponse::version_from_string(&self.build_version)
             .expect("invalid version string");
