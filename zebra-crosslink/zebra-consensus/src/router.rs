@@ -242,11 +242,10 @@ where
 /// Block and transaction verification requests should be wrapped in a timeout,
 /// so that out-of-order and invalid requests do not hang indefinitely.
 /// See the [`router`](`crate::router`) module documentation for details.
-#[instrument(skip(state_service, mempool))]
 pub async fn init(
     config: Config,
     network: &Network,
-    mut state_service: BoxStateService,
+    state_service: BoxStateService,
     mempool: oneshot::Receiver<BoxMempoolService>,
 ) -> (
     Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
@@ -256,7 +255,37 @@ pub async fn init(
     >,
     BackgroundTaskHandles,
     Height,
+) {
+    init_generic(config, network, state_service, mempool).await
+}
+
+/// The body of [`init`], kept generic so rustc checks its spawned tasks are `Send` against
+/// the service bounds. Checked against the concrete `Buffer` types instead, it hits a
+/// higher-ranked lifetime limitation on the boxed error type. [`init`] is its only caller,
+/// so it is still compiled once, here.
+#[instrument(skip(state_service, mempool))]
+async fn init_generic<S, Mempool>(
+    config: Config,
+    network: &Network,
+    mut state_service: S,
+    mempool: oneshot::Receiver<Mempool>,
+) -> (
+    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<
+        BoxService<transaction::MempoolRequest, transaction::MempoolResponse, TransactionError>,
+        transaction::MempoolRequest,
+    >,
+    BackgroundTaskHandles,
+    Height,
 )
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+    Mempool: Service<mempool::Request, Response = mempool::Response, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
+    Mempool::Future: Send + 'static,
 {
     // Give other tasks priority before spawning the checkpoint task.
     tokio::task::yield_now().await;
