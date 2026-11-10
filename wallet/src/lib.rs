@@ -3209,9 +3209,39 @@ struct FaucetQ {
     pub write_o: u8,
     pub data: [Option<orchard::Address>; FAUCET_Q_LEN],
 }
+// The offsets are `u8` and wrap, so the ring's length must divide 256.
+const _: () = assert!(256 % FAUCET_Q_LEN == 0);
 impl FaucetQ {
     fn len(&self) -> usize {
         self.write_o.wrapping_sub(self.read_o).into()
+    }
+
+    /// Queues a faucet payment to `orchard_addr` (the faucet RPC's side of the queue).
+    fn push(&mut self, orchard_addr: &orchard::Address) -> Result<(), String> {
+        if self.len() == self.data.len() {
+            return Err(format!("faucet too busy, come back later"));
+        }
+
+        for idx in 0..self.len() {
+            let i = (self.read_o as usize + idx) % self.data.len();
+            if let Some(existing_addr) = &self.data[i] {
+                if orchard_addr == existing_addr {
+                    return Err(format!("the last request for this address is still pending, come back later"));
+                }
+            } else {
+                println!("Faucet Q error: got None result where there should be valid data");
+            }
+        }
+
+        let i = self.write_o as usize % self.data.len();
+        self.write_o = self.write_o.wrapping_add(1);
+        self.data[i] = Some(orchard_addr.clone());
+        Ok(())
+    }
+
+    /// Marks the oldest queued request as handled (the wallet loop's side of the queue).
+    fn advance_read(&mut self) {
+        self.read_o = self.read_o.wrapping_add(1);
     }
 }
 // TODO: atomic
@@ -3694,25 +3724,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             return Err(format!("must contain an orchard receiver"));
         };
 
-        let mut q = FAUCET_Q.lock().unwrap();
-        if q.len() == q.data.len() {
-            return Err(format!("faucet too busy, come back later"));
-        }
-
-        for idx in 0..q.len() {
-            let i = (q.read_o as usize + idx) % q.data.len();
-            if let Some(existing_addr) = &q.data[i] {
-                if orchard_addr == existing_addr {
-                    return Err(format!("the last request for this address is still pending, come back later"));
-                }
-            } else {
-                println!("Faucet Q error: got None result where there should be valid data");
-            }
-        }
-
-        let i = q.write_o as usize % q.data.len();
-        q.write_o += 1;
-        q.data[i] = Some(orchard_addr.clone());
+        FAUCET_Q.lock().unwrap().push(orchard_addr)?;
 
         Ok(FAUCET_VALUE)
     })));
@@ -3831,7 +3843,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
         println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: "arosienarsoienaroisetn".to_owned() }).await);
         println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
-        FAUCET_Q.lock().unwrap().read_o += 1; // fake read
+        FAUCET_Q.lock().unwrap().advance_read(); // fake read
         println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
     }
 
@@ -5190,7 +5202,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                 proposed_faucet.is_user_faucet = false;
                                 if DUMP_ACTIONS { println!("Try RPC faucet send: {ok:?}"); }
                                 just_init_new_tx |= ok;
-                                q.read_o += 1;
+                                q.advance_read();
                             } else {
                                 println!("Faucet Q error: got None result where there should be valid data");
                             }
@@ -5828,5 +5840,40 @@ mod tests {
             }
         }
         assert!(paid > 1_000 && hit_cap > 1_000, "paid {paid}, hit the cap {hit_cap}");
+    }
+
+    fn faucet_address(seed: u8) -> orchard::Address {
+        let sk = orchard::keys::SpendingKey::from_bytes([seed; 32]).unwrap();
+        orchard::keys::FullViewingKey::from(&sk).address_at(0u32, orchard::keys::Scope::External)
+    }
+
+    /// The queue's offsets are `u8`, so a long-running node takes them past 255 on its 256th
+    /// request. Both sides of the queue keep working there.
+    #[test]
+    fn faucet_queue_keeps_working_past_256_requests() {
+        let mut q = FaucetQ { read_o: 0, write_o: 0, data: [None; FAUCET_Q_LEN] };
+        let (a, b) = (faucet_address(1), faucet_address(2));
+        for n in 0..1000 {
+            assert_eq!(q.push(&a), Ok(()), "request {n}");
+            assert!(q.push(&a).is_err(), "request {n}: a second pending request for the same address was taken");
+            assert_eq!(q.push(&b), Ok(()), "request {n}");
+            assert_eq!(q.len(), 2);
+            assert_eq!(q.data[q.read_o as usize % FAUCET_Q_LEN], Some(a));
+            q.advance_read();
+            q.advance_read();
+            assert_eq!(q.len(), 0);
+        }
+    }
+
+    #[test]
+    fn faucet_queue_refuses_a_request_when_full() {
+        let mut q = FaucetQ { read_o: 250, write_o: 250, data: [None; FAUCET_Q_LEN] };
+        for seed in 0..FAUCET_Q_LEN as u8 {
+            assert_eq!(q.push(&faucet_address(seed + 1)), Ok(()));
+        }
+        assert_eq!(q.len(), FAUCET_Q_LEN);
+        assert!(q.push(&faucet_address(100)).is_err());
+        q.advance_read();
+        assert_eq!(q.push(&faucet_address(100)), Ok(()));
     }
 }
