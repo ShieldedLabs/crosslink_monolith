@@ -2221,8 +2221,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let mut synthetic_bft_peers: Vec<SyntheticBftPeerLink> = Vec::new();
     let mut bft_address_map = BftAddressMap::new();
 
-    let mut my_address_attestations = Vec::new();
-
     for FinalizerPeerAddress { bft_pk, address } in &finalizer_peer_addresses {
         bft_address_map.insert(bft_pk, address, None);
 
@@ -3222,7 +3220,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     attester_sig:       attestation.sig,
                     attestee_sig:       sig,
                 };
-                my_address_attestations.push(peer_attestation.clone());
                 bft_address_map.insert(&peer_attestation.attestee_bft_pk, &peer_attestation.stp_address, Some(peer_attestation.clone()));
 
                 // @Todo: Decide if @Temporary?
