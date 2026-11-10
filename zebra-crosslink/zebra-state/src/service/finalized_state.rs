@@ -120,6 +120,8 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "bft_block_by_height",
     "bft_fat_pointer_by_height",
     "bft_proposal_sigs_by_height",
+    // The finalizer's lock, one row (see `zebra_db::bft::BFT_LOCK`).
+    "bft_lock",
     // The node-local finalized marker.
     "crosslink_fin",
     // The decided-chain block this node could not follow when it dropped BFT.

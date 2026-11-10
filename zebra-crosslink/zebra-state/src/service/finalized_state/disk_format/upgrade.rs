@@ -122,7 +122,11 @@ fn format_upgrades(
             "add crosslink_bft_dropped column family",
             Version::new(31, 4, 0),
         )),
-    ] as [Box<dyn DiskFormatUpgrade>; 9])
+        Box::new(no_migration::NoMigration::new(
+            "add bft_lock column family",
+            Version::new(31, 5, 0),
+        )),
+    ] as [Box<dyn DiskFormatUpgrade>; 10])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
