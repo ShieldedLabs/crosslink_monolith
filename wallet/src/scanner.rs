@@ -204,7 +204,9 @@ pub fn scan_tx_staking(info: &mut ScanInfo, tx: &Transaction, txid: [u8; 32], co
             is_my_staking_action = timed(&PROF.orchard_ns, || {
                 for action in bundle.actions() {
                     let action: &orchard::Action<_> = action; // type-check
-                    let domain = orchard::note_encryption::OrchardDomain::for_action(action);
+                    // Ironwood notes are version 3; OrchardDomain accepts only version-2
+                    // plaintexts, so recovery under it never matched a single bond.
+                    let domain = orchard::note_encryption::IronwoodDomain::for_action(action);
 
                     for ovk in [&ctx.orchard_external_ovk, &ctx.orchard_internal_ovk] {
                         PROF.trial_decrypts.fetch_add(1, Relaxed);
@@ -236,4 +238,42 @@ pub fn scan_tx_staking(info: &mut ScanInfo, tx: &Transaction, txid: [u8; 32], co
         create_height: height,
     });
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A CreateNewDelegationBond of 0.1 cTAZ mined at height 151 on a local v17_rc1 regtest,
+    // built by node 0's wallet, and that wallet's UFVK (a throwaway regtest key).
+    const BOND_TX_HEX: &str = include_str!("testdata/regtest_bond_tx.hex");
+    const BOND_UFVK: &str = include_str!("testdata/regtest_bond_ufvk.txt");
+
+    fn ctx_for(ufvk: &zcash_keys::keys::UnifiedFullViewingKey) -> ScanCtx {
+        let external = PreparedKeys::from_ufvk_all(ufvk);
+        let internal = PreparedKeys::from_ufvk_all_internal(ufvk);
+        let (t_addr, t_addr_p2sh, _ua) = addrs_from_ufvk(ufvk, 0).unwrap();
+        ScanCtx::new(ufvk.clone(), t_addr, t_addr_p2sh, external.orchard_ovk.unwrap(), internal.orchard_ovk.unwrap())
+    }
+
+    #[test]
+    fn a_bond_paid_from_ironwood_notes_is_found_by_its_owner_only() {
+        let hex = BOND_TX_HEX.trim().as_bytes();
+        let bytes: Vec<u8> = hex.chunks(2).map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap()).collect();
+        let (tx, txid) = parse_tx(&bytes, 151).unwrap();
+
+        let owner = zcash_keys::keys::UnifiedFullViewingKey::decode(&TEST_NETWORK, BOND_UFVK.trim()).unwrap();
+        let mut info = ScanInfo::default();
+        assert!(scan_tx_staking(&mut info, &tx, txid, false, 151, &ctx_for(&owner)),
+                "the wallet that paid for the bond must find it");
+        assert_eq!(info.bonds.len(), 1);
+        assert_eq!(info.bonds[0].initial_val, 10_000_000);
+        assert_eq!(info.bonds[0].create_height, 151);
+
+        let usk = UnifiedSpendingKey::from_seed(&TEST_NETWORK, &[7; 32], zip32::AccountId::ZERO).unwrap();
+        let stranger = usk.to_unified_full_viewing_key();
+        let mut info = ScanInfo::default();
+        assert!(!scan_tx_staking(&mut info, &tx, txid, false, 151, &ctx_for(&stranger)));
+        assert!(info.bonds.is_empty());
+    }
 }
