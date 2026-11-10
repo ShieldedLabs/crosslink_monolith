@@ -40,7 +40,7 @@ use zebra_node_services::mempool;
 use zebra_state::ValidateContextError;
 use zebra_test::mock_service::MockService;
 
-use crate::{error::TransactionError, transaction::POLL_MEMPOOL_DELAY};
+use crate::{error::TransactionError, tests::block_vectors, transaction::POLL_MEMPOOL_DELAY};
 
 use super::{check, BlockRequest, BlockTxVerifier, MempoolRequest, MempoolTxVerifier};
 
@@ -64,7 +64,7 @@ fn v5_transactions_basic_check() -> Result<(), Report> {
     let _init_guard = zebra_test::init();
 
     for network in Network::iter() {
-        for transaction in v5_transactions(network.block_iter()) {
+        for transaction in v5_transactions(block_vectors(&network)) {
             match check::has_inputs_and_outputs(&transaction) {
                 Ok(()) => (),
                 Err(TransactionError::NoInputs) | Err(TransactionError::NoOutputs) => (),
@@ -82,7 +82,7 @@ fn v5_transactions_basic_check() -> Result<(), Report> {
 #[test]
 fn v5_transaction_with_orchard_actions_has_inputs_and_outputs() {
     for net in Network::iter() {
-        let mut tx = v5_transactions(net.block_iter())
+        let mut tx = v5_transactions(block_vectors(&net))
             .find(|transaction| {
                 transaction.inputs().is_empty()
                     && transaction.outputs().is_empty()
@@ -127,7 +127,7 @@ fn v5_transaction_with_orchard_actions_has_inputs_and_outputs() {
 #[test]
 fn v5_transaction_with_orchard_actions_has_flags() {
     for net in Network::iter() {
-        let mut tx = v5_transactions(net.block_iter())
+        let mut tx = v5_transactions(block_vectors(&net))
             .find(|transaction| {
                 transaction.inputs().is_empty()
                     && transaction.outputs().is_empty()
@@ -1343,8 +1343,11 @@ async fn mempool_request_with_transparent_coinbase_spend_is_accepted_on_regtest(
     );
 
     // Create a non-coinbase V5 tx with the last valid expiry height.
+    //
+    // Crosslink regtest activates NU6.1 through NU6.3 at NU6's height (`for_regtest`), so build
+    // the transaction for the upgrade that is active at `height`, not for NU6.
     let tx = Transaction::V5 {
-        network_upgrade: NetworkUpgrade::Nu6,
+        network_upgrade: NetworkUpgrade::current(&network, height),
         inputs: vec![input],
         outputs: vec![output],
         lock_time: LockTime::min_lock_time_timestamp(),
@@ -1520,7 +1523,7 @@ async fn state_error_converted_correctly() {
 #[test]
 fn v5_coinbase_transaction_without_enable_spends_flag_passes_validation() {
     for net in Network::iter() {
-        let mut tx = v5_transactions(net.block_iter())
+        let mut tx = v5_transactions(block_vectors(&net))
             .find(|transaction| transaction.is_coinbase())
             .expect("V5 coinbase tx");
 
@@ -1535,7 +1538,7 @@ fn v5_coinbase_transaction_without_enable_spends_flag_passes_validation() {
 #[test]
 fn v5_coinbase_transaction_with_enable_spends_flag_fails_validation() {
     for net in Network::iter() {
-        let mut tx = v5_transactions(net.block_iter())
+        let mut tx = v5_transactions(block_vectors(&net))
             .find(|transaction| transaction.is_coinbase())
             .expect("V5 coinbase tx");
 
@@ -3239,6 +3242,31 @@ fn orchard_disabling_soft_fork_activation_boundary() {
     );
 }
 
+/// Returns the public Zcash Testnet's network upgrade activation heights.
+///
+/// Crosslink's default Testnet activates NU6.3 at height 1 (`TESTNET_ACTIVATION_HEIGHTS`), so a
+/// Zcash Testnet vector transaction carries a consensus branch ID that its height no longer
+/// has there, and is refused with `WrongConsensusBranchId` before the check under test. Tests
+/// that verify such a transaction at its own height build their Testnet with these heights.
+fn public_testnet_activation_heights() -> ConfiguredActivationHeights {
+    use zebra_chain::parameters::constants::activation_heights::testnet::*;
+
+    ConfiguredActivationHeights {
+        before_overwinter: Some(BEFORE_OVERWINTER.0),
+        overwinter: Some(OVERWINTER.0),
+        sapling: Some(SAPLING.0),
+        blossom: Some(BLOSSOM.0),
+        heartwood: Some(HEARTWOOD.0),
+        canopy: Some(CANOPY.0),
+        nu5: Some(NU5.0),
+        nu6: Some(NU6.0),
+        nu6_1: Some(NU6_1.0),
+        nu6_2: Some(NU6_2.0),
+        nu6_3: Some(NU6_3.0),
+        ..Default::default()
+    }
+}
+
 /// The temporary Orchard-disabling soft fork must reject transactions that
 /// contain Orchard actions once it is active, in both block and mempool
 /// verification contexts.
@@ -3268,13 +3296,15 @@ async fn orchard_disabling_soft_fork_rejects_orchard_actions_in_blocks_and_mempo
         .flags = Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS;
 
     // Verify at the transaction's own expiry height, where its NU5 consensus
-    // branch id is valid on the default Testnet activation schedule.
+    // branch id is valid on the public Zcash Testnet activation schedule.
     let height = tx.expiry_height().expect("V5 tx has an expiry height");
 
-    // Configure a Testnet identical to the default public Testnet except that the
+    // Configure a Testnet with the public Zcash Testnet's activation heights, except that the
     // Orchard-disabling soft fork activates at `height`, so it is active for this
     // transaction.
     let network = Parameters::build()
+        .with_activation_heights(public_testnet_activation_heights())
+        .expect("public Testnet activation heights are in order")
         .with_temporary_orchard_disabling_soft_fork_height(height)
         .to_network()
         .expect("failed to build configured network");
@@ -3447,6 +3477,8 @@ async fn orchard_disabling_soft_fork_accepts_orchard_actions_below_activation_he
     // The soft fork activates one block above the transaction's height, so it is
     // inactive for this transaction and verification proceeds normally.
     let accepting_network = Parameters::build()
+        .with_activation_heights(public_testnet_activation_heights())
+        .expect("public Testnet activation heights are in order")
         .with_temporary_orchard_disabling_soft_fork_height(
             (height + 1).expect("height is too large"),
         )
@@ -3495,6 +3527,8 @@ async fn orchard_disabling_soft_fork_accepts_orchard_actions_below_activation_he
     // At the activation height the same transaction is rejected. The soft-fork
     // check runs before any state query, so the state service is never called.
     let rejecting_network = Parameters::build()
+        .with_activation_heights(public_testnet_activation_heights())
+        .expect("public Testnet activation heights are in order")
         .with_temporary_orchard_disabling_soft_fork_height(height)
         .to_network()
         .expect("failed to build configured network");
@@ -4174,7 +4208,7 @@ fn coinbase_outputs_are_decryptable_for_fake_v5_blocks() {
 fn shielded_outputs_are_not_decryptable_for_fake_v5_blocks() {
     for v in zebra_test::vectors::ORCHARD_NOTE_ENCRYPTION_VECTOR.iter() {
         for net in Network::iter() {
-            let mut tx = v5_transactions(net.block_iter())
+            let mut tx = v5_transactions(block_vectors(&net))
                 .find(|tx| tx.is_coinbase())
                 .expect("V5 coinbase tx");
 

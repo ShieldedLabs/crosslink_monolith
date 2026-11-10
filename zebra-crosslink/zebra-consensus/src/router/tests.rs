@@ -15,6 +15,8 @@ use zebra_chain::{
 use zebra_state as zs;
 use zebra_test::transcript::{ExpectedTranscriptError, Transcript};
 
+use crate::tests::state_with_checkpoint_commits;
+
 use super::*;
 
 /// The timeout we apply to each verify future during testing.
@@ -44,13 +46,16 @@ pub fn block_no_transactions() -> Block {
 
 /// Return a new chain verifier and state service,
 /// using the hard-coded checkpoint list for `network`.
+///
+/// The state service commits checkpoint-verified blocks through the block writer, because
+/// Crosslink's state service refuses them (see `state_with_checkpoint_commits`).
 async fn verifiers_from_network(
     network: Network,
 ) -> (
     Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
     Buffer<BoxService<zs::Request, zs::Response, BoxError>, zs::Request>,
 ) {
-    let state_service = zs::init_test(&network).await;
+    let state_service = state_with_checkpoint_commits(&network).await;
     let (
         block_verifier_router,
         _transaction_verifier,
@@ -157,7 +162,12 @@ async fn verify_checkpoint(config: Config) -> Result<(), Report> {
         _transaction_verifier,
         _groth16_download_handle,
         _max_checkpoint_height,
-    ) = super::init_test(config.clone(), &network, zs::init_test(&network).await).await;
+    ) = super::init_test(
+        config.clone(),
+        &network,
+        state_with_checkpoint_commits(&network).await,
+    )
+    .await;
 
     // Add a timeout layer
     let block_verifier_router =
