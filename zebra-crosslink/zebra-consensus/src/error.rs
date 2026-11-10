@@ -310,7 +310,7 @@ pub enum TransactionError {
 
     #[error(
         "staking action target finalizer address is not a valid capability: the embedded \
-         signature does not verify for pub key {pub_key:?}"
+         signature does not verify, or the key is small order, for pub key {pub_key:?}"
     )]
     #[non_exhaustive]
     StakingActionInvalidFinalizerAddress { pub_key: [u8; 32] },

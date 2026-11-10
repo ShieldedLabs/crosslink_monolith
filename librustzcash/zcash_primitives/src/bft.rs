@@ -707,7 +707,25 @@ pub fn fmt_prefixed_byte_str_rev(f: &mut std::fmt::Formatter<'_>, pre: &str, byt
 /// equivalent to [ed25519_zebra::VerificationKeyBytes]
 #[derive(Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PubKeyID(pub [u8; 32]);
-impl PubKeyID { pub const NIL: Self = Self([0; 32]); }
+impl PubKeyID {
+    pub const NIL: Self = Self([0; 32]);
+
+    /// Whether anyone can sign for this key. ed25519-zebra verifies as ZIP 215 does, which
+    /// accepts small-order keys, and under such a key the all-zero signature verifies over every
+    /// message. That property is the test, as consensus tests bond keys
+    /// (`staking_action_signature`). A key that does not decode is not one: nothing verifies
+    /// under it.
+    pub fn is_small_order(&self) -> bool {
+        TMSig::NIL.verify(*self, FINALIZER_ADDRESS_MSG).is_ok()
+    }
+}
+
+/// Whether consensus at `height` refuses a finalizer key anyone can sign for
+/// ([PubKeyID::is_small_order]) as a stake target or a reward-conversion authorizer: from
+/// FeaturenetUpgrade3 on. Before it such a key passed like any other.
+pub fn small_order_finalizer_keys_refused_at<P: zcash_protocol::consensus::Parameters>(params: &P, height: u32) -> bool {
+    params.is_nu_active(zcash_protocol::consensus::NetworkUpgrade::FeaturenetUpgrade3, zcash_protocol::consensus::BlockHeight::from_u32(height))
+}
 impl std::fmt::Display for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str_rev(f, &self.0) } }
 impl std::fmt::Debug   for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str_rev(f, "Pub{", &self.0[..2])?; write!(f, "}}") } }
 
@@ -813,8 +831,18 @@ impl FinalizerAddress {
         Self { pub_key, sig }
     }
 
+    /// Whether the signature verifies. A small-order key passes with a signature anyone can
+    /// make; consensus uses [FinalizerAddress::verify_at], which refuses those keys from
+    /// FeaturenetUpgrade3.
     pub fn verify(&self) -> bool {
         self.sig.verify(self.pub_key, FINALIZER_ADDRESS_MSG).is_ok()
+    }
+
+    /// [FinalizerAddress::verify] as consensus applies it at `height`: from FeaturenetUpgrade3 an
+    /// address whose key is small order is refused too, since everyone can sign for that key, so
+    /// stake pointed at it could be voted with and its commission converted by anyone.
+    pub fn verify_at<P: zcash_protocol::consensus::Parameters>(&self, params: &P, height: u32) -> bool {
+        self.verify() && !(small_order_finalizer_keys_refused_at(params, height) && self.pub_key.is_small_order())
     }
 
     /// `zfinv1` + 128 base64url chars = 134 chars, always. The payload is 96 bytes:
@@ -921,6 +949,14 @@ pub fn sign_finalizer_reward_conversion(finalizer_key: &SigningKey, bond_key: &[
 
 pub fn verify_finalizer_reward_conversion(finalizer: PubKeyID, bond_key: &[u8; 32], amount_zats: u64, sig: &[u8; 64]) -> bool {
     TMSig(*sig).verify(finalizer, &finalizer_reward_conversion_msg(bond_key, amount_zats)).is_ok()
+}
+
+/// [verify_finalizer_reward_conversion] as consensus applies it at `height`: from
+/// FeaturenetUpgrade3 a finalizer key that is small order authorizes nothing, since anyone can
+/// make its signature.
+pub fn verify_finalizer_reward_conversion_at<P: zcash_protocol::consensus::Parameters>(params: &P, height: u32, finalizer: PubKeyID, bond_key: &[u8; 32], amount_zats: u64, sig: &[u8; 64]) -> bool {
+    verify_finalizer_reward_conversion(finalizer, bond_key, amount_zats, sig)
+        && !(small_order_finalizer_keys_refused_at(params, height) && finalizer.is_small_order())
 }
 
 /// A finalizer key from an `explicit_bft_key_seed` string, the node's default identity string,
