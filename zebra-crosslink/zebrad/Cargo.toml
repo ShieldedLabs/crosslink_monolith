@@ -86,7 +86,7 @@ ape = ["dep:cosmo-build"]
 
 
 # Default features for official ZF binary release builds
-default = ["default-release-binaries", "internal-miner"]
+default = ["release_max_level_info", "progress-bar", "internal-miner"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
