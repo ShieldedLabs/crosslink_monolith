@@ -5100,7 +5100,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
 
         if rpc_stake.is_none() {
-            let staged_action = STAKING_STAGE.lock().unwrap().take();
+            // A request whose RPC caller has gone (a client timeout) is not built: nobody was
+            // told about it, and the caller may well have sent it again.
+            let staged_action = STAKING_STAGE.lock().unwrap().take().filter(|(_, sender)| !sender.is_closed());
             if let Some((request, sender)) = staged_action {
                 let mut tx = ProposedTx::EMPTY;
                 let res = match request {
@@ -5132,7 +5134,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
 
         if rpc_send.is_none() {
-            let staged_send = BASIC_SEND_STAGE.lock().unwrap().take();
+            let staged_send = BASIC_SEND_STAGE.lock().unwrap().take().filter(|(_, _, sender)| !sender.is_closed());
             if let Some((value_zats, address, sender)) = staged_send {
                 // The same rule as the GUI's Send modal, so both refuse the same addresses for the same reasons.
                 match decode_send_address(&address) {
