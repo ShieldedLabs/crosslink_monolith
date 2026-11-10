@@ -2401,6 +2401,26 @@ impl ManualWallet {
         }
     }
 
+    /// Records the node's refusal of a resent tx (see RESEND REORGED-OUT TXS). A tx whose
+    /// Ironwood anchor the node doesn't know any more can never be mined: the reorg removed the
+    /// block the anchor names (spends are anchored at `tip - 2`), and the bytes can't change. It
+    /// fails at once with the reason and is not resent again, instead of being resent each block
+    /// until it expires. Any other refusal leaves it to the next resend.
+    fn note_resend_refusal(&mut self, txid: TxId, refusal: &str) {
+        // zebra-state's ValidateContextError::UnknownIronwoodAnchor, as the mempool words it
+        if !refusal.contains("unknown Ironwood anchor") { return; }
+        let Some(tx_i) = tx_position(self, &txid) else { return; };
+        let mut tx = self.txs[tx_i];
+        let TxStatus::SoftFail(fail_stage) = tx.status else { return; };
+        self.sent_txs.remove(&txid);
+        println!("{} wallet: tx {txid} has an anchor a reorg removed, so it can never be mined and has failed", self.name);
+        tx.status = TxStatus::HardFail(fail_stage, ErrBuf::from_str("a reorg removed the block its anchor names; make it again"));
+        tx.h = self.sync_h;
+        let mut insert_i = 0;
+        update_insert_i(&self.txs, &mut insert_i, tx.h);
+        update_with_tx(self, tx, &mut insert_i);
+    }
+
     pub fn retarget_bond_using_ironwood<P: Parameters>(
         &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
         src_usk: &UnifiedSpendingKey, orchard_tree: &OrchardShardTree, bond_key: [u8; 32], new_target: bft::FinalizerAddress,
@@ -4799,11 +4819,23 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 resends.push((wallet.name, tx.txid, sent.data.clone()));
             }
         }
+        let mut refusals = Vec::new();
         for (name, txid, data) in resends {
             match client.send_transaction(RawTransaction { data, height: 0 }).await {
                 Ok(resp) if resp.get_ref().error_code == 0 => println!("{name} wallet: resent tx {txid}, which a reorg dropped"),
-                Ok(resp) => println!("{name} wallet: the node refused tx {txid}, which a reorg dropped: {}", resp.get_ref().error_message),
-                Err(status) => println!("{name} wallet: failed to resend tx {txid}, which a reorg dropped: {status}"),
+                Ok(resp) => {
+                    println!("{name} wallet: the node refused tx {txid}, which a reorg dropped: {}", resp.get_ref().error_message);
+                    refusals.push((txid, resp.into_inner().error_message));
+                }
+                Err(status) => {
+                    println!("{name} wallet: failed to resend tx {txid}, which a reorg dropped: {status}");
+                    refusals.push((txid, status.message().to_string()));
+                }
+            }
+        }
+        for wallet in [&mut miner_wallet, &mut user_wallet] {
+            for (txid, refusal) in &refusals {
+                wallet.note_resend_refusal(*txid, refusal);
             }
         }
 
@@ -5828,5 +5860,53 @@ mod tests {
             }
         }
         assert!(paid > 1_000 && hit_cap > 1_000, "paid {paid}, hit the cap {hit_cap}");
+    }
+
+    #[test]
+    fn a_resend_refused_for_an_unknown_anchor_fails_and_is_not_resent_again() {
+        let (mut wallet, ..) = note_fixture();
+        // Two txs a reorg dropped: soft-failed out of the mempool and kept for resending.
+        let dropped = |wallet: &mut ManualWallet, n: u8| {
+            let txid = TxId::from_bytes([n; 32]);
+            let part = WalletTxPart { spent_note_count: 1, spent_zats: Zatoshis::const_from_u64(1_000_000), ..WalletTxPart::ZERO };
+            let tx = WalletTx { txid, h: wallet.sync_h, status: TxStatus::SoftFail(BlockHeight::MEMPOOL),
+                                expiry_h: Some(BlockHeight(140)), part_flags: TxParts::FULL_TX,
+                                parts: [WalletTxPart::ZERO, part], ..WalletTx::EMPTY };
+            let mut insert_i = 0;
+            update_insert_i(&wallet.txs, &mut insert_i, tx.h);
+            update_with_tx(wallet, tx, &mut insert_i);
+            wallet.sent_txs.insert(txid, SentTx { data: vec![n], expiry_h: tx.expiry_h, resent_h: BlockHeight::INVALID });
+            txid
+        };
+        let bond = dropped(&mut wallet, 1);
+        let other = dropped(&mut wallet, 2);
+        let status_of = |wallet: &ManualWallet, txid| wallet.txs[tx_position(wallet, &txid).unwrap()].status;
+
+        // The node's answer to every resend of #322's bond, through the gRPC status.
+        let refusal = "failed to validate tx: WtxId(\"private\"), error: transaction did not pass consensus validation: \
+                       could not contextually validate transaction on best chain: unknown Ironwood anchor: \
+                       Root(\"d06f3e931b061446cfbd1be24e675a9e1ecd92c6db7618fb638210063d68b136\"),\nNone, index in block: None, \
+                       transaction::Hash(\"c0a58bf95646ac4ae7237f67d2a0c39f5514f7aa631fbc61548f5a27cf4e5dda\")";
+        wallet.note_resend_refusal(bond, refusal);
+        wallet.note_resend_refusal(other, "transaction dropped because it is already queued for download");
+
+        match status_of(&wallet, bond) {
+            TxStatus::HardFail(stage, msg) => {
+                assert_eq!(stage, BlockHeight::MEMPOOL);
+                assert_eq!(msg.to_string().trim_end_matches('\0'), "a reorg removed the block its anchor names; make it again");
+            }
+            status => panic!("the tx can never be mined, so it must fail, not stay {status:?}"),
+        }
+        assert!(!wallet.sent_txs.contains_key(&bond), "the resend pass sends only what sent_txs holds");
+
+        // any other refusal may pass, so that tx is resent next block, as before
+        assert_eq!(status_of(&wallet, other), TxStatus::SoftFail(BlockHeight::MEMPOOL));
+        assert!(wallet.sent_txs.contains_key(&other));
+
+        // a tx that got mined meanwhile is left alone
+        let idx = tx_position(&wallet, &other).unwrap();
+        wallet.txs[idx].status = TxStatus::OnBc;
+        wallet.note_resend_refusal(other, refusal);
+        assert_eq!(status_of(&wallet, other), TxStatus::OnBc);
     }
 }
