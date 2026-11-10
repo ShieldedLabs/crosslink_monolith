@@ -185,6 +185,20 @@ pub struct ClosureToValidateProposedBlock(pub Arc<dyn for<'a> Fn(&'a BlockValue)
 impl std::fmt::Debug for ClosureToValidateProposedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToValidateProposedBlock(..)") }
 }
+/// Whether this node may vote for a value it has found valid, asked each time it would prevote or
+/// precommit the value or propose it again. Validity is the same on every node and is cached per
+/// proposal; this is the node's own view, which can change between its prevote and its precommit
+/// (Crosslink: is the proposal's snapshot on this node's best chain now). Deciding does not ask
+/// it: a value with a quorum of precommits is decided whatever this answers.
+#[derive(Clone)]
+pub struct ClosureToCheckVoteForBlock(pub Arc<dyn for<'a> Fn(&'a BlockValue)-> core::pin::Pin<Box<dyn Future<Output = bool> + Send + 'a>> + Send + Sync + 'static>);
+impl ClosureToCheckVoteForBlock {
+    /// Votes for every valid value.
+    pub fn any() -> Self { Self(Arc::new(|_| Box::pin(async { true }))) }
+}
+impl std::fmt::Debug for ClosureToCheckVoteForBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToCheckVoteForBlock(..)") }
+}
 #[derive(Clone)]
 // Returns the roster for the next height together with that height's 32-byte vote-namespacing
 // domain separator (the cumulative hash of slashforks in effect; `[0; 32]` when there are none)
@@ -725,6 +739,8 @@ pub struct TMState {
 
     propose_closure: ClosureToProposeNewBlock,
     validate_closure: ClosureToValidateProposedBlock,
+    /// Every valid value until `entry_point` sets it.
+    vote_check_closure: ClosureToCheckVoteForBlock,
     push_block_closure: ClosureToPushDecidedBlock,
 
     update_peers_cmd_closure: ClosureToUpdatePeers,
@@ -760,6 +776,7 @@ impl TMState {
 
             propose_closure,
             validate_closure,
+            vote_check_closure: ClosureToCheckVoteForBlock::any(),
             push_block_closure,
             update_peers_cmd_closure,
             bft_access_closure,
@@ -875,6 +892,11 @@ impl TMState {
         insert_i
     }
 
+    /// Asked fresh each time, never cached: see [`ClosureToCheckVoteForBlock`].
+    async fn may_vote_for(&self, value: &BlockValue) -> bool {
+        self.vote_check_closure.0(value).await
+    }
+
     async fn start_round(&mut self, roster: &[SortedRosterMember], now: Instant, round: u32) {
         self.round = round;
         // self.active_proposal_value_round = (None, -1);
@@ -886,7 +908,14 @@ impl TMState {
 
         if Self::proposer_from_height_round(&self.hash_keys, roster, self.active_roster_max_n, self.height, round).1 == self.my_pub_key {
             let ctx_str = self.ctx_str(roster);
-            let proposal = if let Some(valid_value) = self.valid_value_round.0.clone() {
+            // A valid value this node may no longer vote for is not proposed again: the nodes that
+            // share its view would prevote nil on it in every round it led.
+            let mut valid_value = self.valid_value_round.0.clone();
+            if let Some(value) = &valid_value && !self.may_vote_for(value).await {
+                valid_value = None;
+            }
+            let valid_round = if valid_value.is_some() { self.valid_value_round.1 } else { -1 };
+            let proposal = if let Some(valid_value) = valid_value {
                 Some(valid_value)
             } else {
                 let ret = self.propose_closure.0().await;
@@ -898,7 +927,7 @@ impl TMState {
             // TODO: simple approach: send proposal messages to self when broadcasting
             // self.active_proposal_value_round = (Some(proposal), self.valid_value_round.1);
             if let Some(proposal) = proposal {
-                self.step = self.broadcast(roster, round_i, TMMsgData::Proposal(proposal, self.valid_value_round.1));
+                self.step = self.broadcast(roster, round_i, TMMsgData::Proposal(proposal, valid_round));
             } else {
                 self.step = TMStep::Propose;
             }
@@ -1355,7 +1384,8 @@ impl TMState {
                 // ALT: send NIL then later override with time-tagged message
                 if self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass && (
                     self.locked_value_round.1 == -1 ||
-                    self.locked_value_round.0 == Some(self.rounds_data[i].proposal.clone())) // TODO(perf): use (previously-checked) ids for easier comparison?
+                    self.locked_value_round.0 == Some(self.rounds_data[i].proposal.clone())) && // TODO(perf): use (previously-checked) ids for easier comparison?
+                    self.may_vote_for(&self.rounds_data[i].proposal).await
                 {
                     if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 22-0: receive first proposal this height"); }
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
@@ -1377,7 +1407,8 @@ impl TMState {
             {
                 if self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass && (
                     self.locked_value_round.1 <= self.rounds_data[i].proposal_valid_round ||
-                    self.locked_value_round.0 == Some(self.rounds_data[i].proposal.clone()))
+                    self.locked_value_round.0 == Some(self.rounds_data[i].proposal.clone())) &&
+                    self.may_vote_for(&self.rounds_data[i].proposal).await
                 {
                     if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 28-0: received 2f+1 prevotes"); }
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
@@ -1412,7 +1443,10 @@ impl TMState {
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
             {
                 if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 36: seen 2f+1 valid prevotes"); }
-                if self.step == TMStep::Prevote {
+                // Asked again rather than taken from the prevote: the view can have changed since.
+                // A node that may not vote for the value neither locks nor precommits it; it stays
+                // in the prevote step, so the prevote timeout started by line 34 precommits nil.
+                if self.step == TMStep::Prevote && self.may_vote_for(&self.rounds_data[i].proposal).await {
                     if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 36-0: seen 2f+1 valid prevotes"); }
                     self.locked_value_round = (Some(self.rounds_data[i].proposal.clone()), self.round as i64);
                     self.step = self.broadcast(roster, i, TMMsgData::Precommit(self.rounds_data[i].proposal_id));
@@ -1751,6 +1785,7 @@ async fn instance(
                 // else { (TMStatus::Fail, TMStatusReason::None) }
             })
         })),
+        ClosureToCheckVoteForBlock::any(),
         ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer, _tender_proposal_sigs| {
             let decisions = Arc::clone(&decisions);
             let roster2 = roster2.clone();
@@ -2169,6 +2204,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          maybe_seed: Option<u128>,
                          propose_closure: ClosureToProposeNewBlock,
                          validate_closure: ClosureToValidateProposedBlock,
+                         vote_check_closure: ClosureToCheckVoteForBlock,
                          push_block_closure: ClosureToPushDecidedBlock,
                          peer_cmd_closure: ClosureToUpdatePeers,
                          bft_access_closure: ClosureToAccessBft,
@@ -2251,6 +2287,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         peer_cmd_closure,
         bft_access_closure,
     ); // TODO: double-check this is the right key
+    bft_state.vote_check_closure = vote_check_closure;
 
     bft_state.height = ingest_startup_data.len() as u64;
     bft_state.vote_namespace = initial_vote_namespace;
@@ -4671,6 +4708,156 @@ mod tests {
             if only.is_some_and(|only| only != chunk_i) { continue; }
             let (data, sig) = chunk_msg(&keys[proposer], &node.vote_namespace, value, as_id, 0, -1, chunk_i);
             node.check_and_incorporate_msg(0, 0, chunk_i, as_id, -1, roster, proposer, PACKET_TYPE_PROPOSAL_CHUNK, &data, sig);
+        }
+    }
+
+    // #315. A finalizer prevotes, precommits or re-proposes a valid value only while its
+    // `ClosureToCheckVoteForBlock` allows it, asked afresh each time. In Crosslink that is "the
+    // snapshot is on my best chain now"; here `on_best_chain` stands in for it, and clearing it is the
+    // reorg that moves the node's best chain off the snapshot.
+    fn vote_check_engine(keys: &[SigningKey], roster: &[SortedRosterMember], i: usize, proposes: Option<BlockValue>, on_best_chain: &Arc<std::sync::atomic::AtomicBool>) -> TMState {
+        let mut node = split_engine(keys, roster, i, proposes);
+        let on_best_chain = Arc::clone(on_best_chain);
+        node.vote_check_closure = ClosureToCheckVoteForBlock(Arc::new(move |_| {
+            let allowed = on_best_chain.load(std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async move { allowed })
+        }));
+        node
+    }
+
+    #[test]
+    fn line22_a_valid_proposal_the_node_may_not_vote_for_gets_a_nil_prevote() {
+        let (keys, roster, proposer, others) = split_finalizers();
+        let me = others[0];
+        let value = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+
+        for on_best_chain in [true, false] {
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(on_best_chain));
+            let mut node = vote_check_engine(&keys, &roster, me, None, &flag);
+            node.insert_round(0, 0, &roster);
+            let id = value.id_from_value(&node.hash_keys);
+            split_chunks(&mut node, &keys, &roster, proposer, &value, id, None);
+            rt.block_on(node.bft_update(&mut roster.clone()));
+
+            let rd = &node.rounds_data[0];
+            assert_eq!(rd.proposal_checked_validity.0, TMStatus::Pass, "the value is valid either way");
+            assert_eq!(node.step, TMStep::Prevote);
+            if on_best_chain {
+                assert_eq!(rd.msg_val_sigs[me][0].0, id, "prevotes the value");
+            } else {
+                assert_eq!(rd.msg_val_sigs[me][0].1, TMSig::NIL, "does not prevote the value");
+                assert!(rd.msg_nil_sigs[me][0] != TMSig::NIL, "prevotes nil");
+            }
+        }
+    }
+
+    #[test]
+    fn line28_a_reproposal_the_node_may_not_vote_for_gets_a_nil_prevote() {
+        let (keys, roster, _, _) = split_finalizers();
+        let proposer = TMState::proposer_from_height_round(&HashKeys::default(), &roster, ROSTER_MAX_N, 0, 1).0.unwrap();
+        let me = (proposer + 1) % 4;
+        let cited: Vec<usize> = (0..4).filter(|&i| i != me).collect();
+        let value = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+
+        for on_best_chain in [true, false] {
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(on_best_chain));
+            let mut node = vote_check_engine(&keys, &roster, me, None, &flag);
+            node.insert_round(0, 0, &roster);
+            node.insert_round(1, 1, &roster);
+            node.round = 1;
+            let id = value.id_from_value(&node.hash_keys);
+            // Round 0's 2f+1 prevotes for the value, then its re-proposal in round 1 citing them.
+            for &i in &cited { split_vote(&mut node, &keys, &roster, i, false, id); }
+            for chunk_i in 0..value.chunks_n() {
+                let (data, sig) = chunk_msg(&keys[proposer], &node.vote_namespace, &value, id, 1, 0, chunk_i);
+                assert_eq!(node.check_and_incorporate_msg(0, 1, chunk_i, id, 0, &roster, proposer,
+                    PACKET_TYPE_PROPOSAL_CHUNK, &data, sig), TMStatus::Pass);
+            }
+            rt.block_on(node.bft_update(&mut roster.clone()));
+
+            let rd = &node.rounds_data[1];
+            assert_eq!((rd.height, rd.round), (0, 1));
+            assert_eq!(node.step, TMStep::Prevote);
+            if on_best_chain {
+                assert_eq!(rd.msg_val_sigs[me][0].0, id, "prevotes the cited value");
+            } else {
+                assert_eq!(rd.msg_val_sigs[me][0].1, TMSig::NIL, "does not prevote the cited value");
+                assert!(rd.msg_nil_sigs[me][0] != TMSig::NIL, "prevotes nil");
+            }
+        }
+    }
+
+    // The decision #315 reports was made of a prevote cast before a partition healed and a precommit
+    // cast after it, by a node whose best chain had by then left the value's snapshot.
+    #[test]
+    fn line36_a_value_prevoted_before_a_reorg_is_not_precommitted_after_it() {
+        let (keys, roster, proposer, others) = split_finalizers();
+        let me = others[0];
+        let value = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+
+        for reorg in [false, true] {
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let mut node = vote_check_engine(&keys, &roster, me, None, &flag);
+            node.insert_round(0, 0, &roster);
+            let id = value.id_from_value(&node.hash_keys);
+            split_chunks(&mut node, &keys, &roster, proposer, &value, id, None);
+            rt.block_on(node.bft_update(&mut roster.clone()));
+            assert_eq!(node.rounds_data[0].msg_val_sigs[me][0].0, id, "prevotes the value while it may");
+
+            if reorg { flag.store(false, std::sync::atomic::Ordering::Relaxed); }
+            split_vote(&mut node, &keys, &roster, others[1], false, id);
+            split_vote(&mut node, &keys, &roster, others[2], false, id);
+            rt.block_on(node.bft_update(&mut roster.clone()));
+
+            let rd = &node.rounds_data[0];
+            assert_eq!(rd.counts.yes_prevotes, 3, "2f+1 prevotes for the value");
+            if !reorg {
+                assert_eq!(rd.msg_val_sigs[me][1].0, id, "precommits the value");
+                assert_eq!(node.locked_value_round.1, 0, "and locks it");
+                assert_eq!(node.step, TMStep::Precommit);
+            } else {
+                assert_eq!(rd.msg_val_sigs[me][1].1, TMSig::NIL, "does not precommit the value after the reorg");
+                assert_eq!((node.locked_value_round.0.is_none(), node.locked_value_round.1), (true, -1), "nor locks it");
+                assert_eq!(node.step, TMStep::Prevote);
+                assert!(rd.timeout_triggered[0], "the prevote timeout runs, and precommits nil when it fires");
+            }
+
+            // Deciding does not ask: a quorum of the others' precommits decides the value either way.
+            for i in [proposer, others[1], others[2]] {
+                split_vote(&mut node, &keys, &roster, i, true, id);
+            }
+            rt.block_on(node.bft_update(&mut roster.clone()));
+            assert_eq!(node.height, 1, "decides what a quorum precommitted; reorg: {reorg}");
+        }
+    }
+
+    // A proposer whose valid value is off its best chain proposes a fresh value instead: every node
+    // that shares its best chain would prevote nil on the old one in every round it led.
+    #[test]
+    fn a_proposer_does_not_propose_again_a_valid_value_it_may_no_longer_vote_for() {
+        let (keys, roster, _, _) = split_finalizers();
+        let proposer = TMState::proposer_from_height_round(&HashKeys::default(), &roster, ROSTER_MAX_N, 0, 1).0.unwrap();
+        let held = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let fresh = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| (i as u8).wrapping_add(1)).collect());
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+
+        for on_best_chain in [true, false] {
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(on_best_chain));
+            let mut node = vote_check_engine(&keys, &roster, proposer, Some(fresh.clone()), &flag);
+            node.valid_value_round = (Some(held.clone()), 0);
+            rt.block_on(node.start_round(&roster, Instant::now(), 1));
+
+            let rd = node.rounds_data.iter().find(|rd| (rd.height, rd.round) == (0, 1)).unwrap();
+            assert!(rd.has_full_proposal());
+            let proposed = if rd.proposal == held { "held" } else if rd.proposal == fresh { "fresh" } else { "other" };
+            if on_best_chain {
+                assert_eq!((proposed, rd.proposal_valid_round), ("held", 0), "re-proposes its valid value");
+            } else {
+                assert_eq!((proposed, rd.proposal_valid_round), ("fresh", -1), "proposes afresh");
+            }
         }
     }
 

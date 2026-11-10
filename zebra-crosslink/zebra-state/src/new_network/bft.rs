@@ -356,6 +356,11 @@ pub enum BftRequest {
         block: BftBlock,
         reply: tokio::sync::oneshot::Sender<(TMStatus, TMStatusReason)>,
     },
+    /// Whether this node may vote for a valid proposal now: see [`snapshot_is_on_best_chain`].
+    CheckVote {
+        block: BftBlock,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
     Decided {
         block: BftBlock,
         fat_pointer: FatPointerToBftBlock,
@@ -422,6 +427,24 @@ pub async fn force_feed_bft_block(
         return Err("new_network is not running".to_string());
     }
     rx.await.map_err(|_| "new_network dropped the force-feed reply".to_string())?
+}
+
+/// Whether a finalizer may vote for a valid proposal whose snapshot is `snapshot`: only while the
+/// snapshot is on its best chain, an ancestor of (or equal to) its best tip. Asked when it would
+/// prevote and again when it would precommit, since a reorg can come between the two.
+///
+/// This is an honest-voting rule, not validity. `validate` stays objective and accepts a snapshot
+/// this state holds on any chain, so every node still agrees on what a quorum decided. Without the
+/// rule a finalizer votes for a snapshot on a branch it has already left, or prevotes before a
+/// partition heals and precommits after, and a decision there stops finality for good: fork choice
+/// keeps the heavier branch, and Linearity refuses every later snapshot on it (#315).
+///
+/// It is ancestry and not height: a snapshot on the lighter branch can sit below the best tip.
+fn snapshot_is_on_best_chain(read_state: &ReadState, snapshot: Hash) -> bool {
+    let Some((_, best_tip)) = read_state.best_tip() else {
+        return false;
+    };
+    read_state.is_ancestor_of(snapshot, best_tip) == Some(true)
 }
 
 /// Whether `block` is valid on the current BFT chain: the check a proposal gets, answered at
@@ -1510,6 +1533,22 @@ impl BftRunner {
                 }
                 let chain = BFT_CHAIN.read().unwrap();
                 let _ = reply.send(self.validate(&chain, read_state, &block));
+            }
+            BftRequest::CheckVote { block, reply } => {
+                // A block with no headers names no snapshot; it never passes `validate` either.
+                let may_vote = !bft_is_dropped()
+                    && block.headers.first().is_some_and(|deepest| {
+                        let snapshot = Hash(deepest.prev_block.0);
+                        let on_best_chain = snapshot_is_on_best_chain(read_state, snapshot);
+                        if !on_best_chain {
+                            tracing::info!(
+                                "not voting for BFT block {} at height {}: its snapshot {} is not on this node's best chain",
+                                block.blake3_hash(), block.height, snapshot,
+                            );
+                        }
+                        on_best_chain
+                    });
+                let _ = reply.send(may_vote);
             }
             BftRequest::Decided { block, fat_pointer, proposal_sigs, reply } => {
                 if bft_is_dropped() {
@@ -2646,6 +2685,18 @@ impl BftRunner {
                     rx.await.unwrap_or((TMStatus::Indeterminate, TMStatusReason::None))
                 })
             })),
+            tenderlink::ClosureToCheckVoteForBlock(Arc::new(move |block| {
+                let parsed = bft_block_from_canonical_bytes(&block.0);
+                Box::pin(async move {
+                    // Only a valid proposal is asked about, so it parses; no answer is no vote.
+                    let Some(block) = parsed else { return false };
+                    let (reply, rx) = tokio::sync::oneshot::channel();
+                    if !send_request(BftRequest::CheckVote { block, reply }) {
+                        return false;
+                    }
+                    rx.await.unwrap_or(false)
+                })
+            })),
             tenderlink::ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer, proposal_sigs| {
                 Box::pin(async move {
                     let block = BftBlock::zcash_deserialize(&block.0[..]).unwrap();
@@ -3024,6 +3075,66 @@ mod tests {
             assert!(same_instant.contains_key(&hash(n)));
             assert!(same_instant.len() <= MAX_MISSING_POW_BLOCKS);
         }
+    }
+
+    /// #315: a finalizer votes only for a snapshot on its best chain. Holding the block, which is
+    /// all `validate` asks, is not enough, a block below the best tip is not enough either, and the
+    /// answer follows the best chain when it switches.
+    #[test]
+    fn a_finalizer_votes_only_for_a_snapshot_on_its_best_chain() {
+        use crate::{arbitrary::Prepare, service::non_finalized_state::NonFinalizedState, tests::FakeChainHelper};
+        use zebra_chain::{amount::NonNegative, block::Block, value_balance::ValueBalance};
+
+        let _init_guard = zebra_test::init();
+
+        // Pre-Heartwood blocks, since a new `FinalizedState` gives no history tree. Branch A is
+        // root, a2, a3 and branch B is root, b2, b3, with more work: B is the best chain, and A's
+        // blocks are held as a side chain.
+        let network = Network::Mainnet;
+        let root: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());
+        let a2 = root.make_fake_child().set_work(1);
+        let a3 = a2.make_fake_child().set_work(1);
+        let b2 = root.make_fake_child().set_work(10);
+        let b3 = b2.make_fake_child().set_work(10);
+
+        let mut non_finalized_state = NonFinalizedState::new(&network, Default::default());
+        let finalized_state = crate::service::finalized_state::FinalizedState::new(
+            &crate::Config::ephemeral(),
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        )
+        .expect("an ephemeral database opens");
+        finalized_state.set_finalized_value_pool(ValueBalance::<NonNegative>::fake_populated_pool());
+        non_finalized_state.commit_new_chain(root.clone().prepare(), &finalized_state).unwrap();
+        for block in [&a2, &a3, &b2, &b3] {
+            non_finalized_state.commit_block(block.clone().prepare(), &finalized_state).unwrap();
+        }
+        let (sender, receiver) = tokio::sync::watch::channel(non_finalized_state.clone());
+        let read_state = crate::service::ReadStateService::new(
+            &finalized_state,
+            None,
+            crate::service::watch_receiver::WatchReceiver::new(receiver),
+        );
+
+        let votes_for = |block: &Arc<Block>| snapshot_is_on_best_chain(&read_state, block.hash());
+        assert_eq!(read_state.best_tip().map(|(_, hash)| hash), Some(b3.hash()));
+        for block in [&a2, &a3] {
+            assert!(read_state.known_block(block.hash()).is_some(), "held, so `validate` would pass it");
+        }
+        assert!(!votes_for(&a2), "a2 is below the best tip, but not on the best chain");
+        assert!(!votes_for(&a3));
+        assert!(votes_for(&root) && votes_for(&b2) && votes_for(&b3));
+        assert!(!snapshot_is_on_best_chain(&read_state, Hash([0x77; 32])), "a block this node lacks");
+
+        // A outgrows B: the best chain switches, and so do the answers.
+        let a4 = a3.make_fake_child().set_work(100);
+        non_finalized_state.commit_block(a4.clone().prepare(), &finalized_state).unwrap();
+        sender.send_replace(non_finalized_state.clone());
+        assert_eq!(read_state.best_tip().map(|(_, hash)| hash), Some(a4.hash()));
+        assert!(votes_for(&root) && votes_for(&a2) && votes_for(&a3) && votes_for(&a4));
+        assert!(!votes_for(&b2), "b2 was voted for before the switch, and is not after it");
+        assert!(!votes_for(&b3));
     }
 
     fn time(seconds: i64) -> DateTime<Utc> {
