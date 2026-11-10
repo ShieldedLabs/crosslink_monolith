@@ -130,6 +130,24 @@ pub struct TransportLimits {
     /// Connections a peer opened to us that we keep at once; more are closed as they arrive.
     /// Connections we dial are not counted. Every per-peer bound is multiplied by this.
     pub max_inbound_connections: usize,
+    /// Of those, the most from one source (an IPv4 address, or an IPv6 /64, see
+    /// [`inbound_source`]): a peer picks its own key and source port, so without this one host
+    /// could hold every inbound slot and the node would refuse everyone else. Loopback is not
+    /// limited, so local test networks are unaffected.
+    pub max_inbound_per_source: usize,
+}
+
+/// The source an inbound connection counts against for
+/// [`TransportLimits::max_inbound_per_source`]: its IPv4 address, or the /64 of its IPv6 address,
+/// which one host or one subscriber is usually given whole. `None` for loopback, which is not
+/// limited.
+pub fn inbound_source(ip: &std::net::Ipv6Addr) -> Option<u128> {
+    match ip.to_ipv4_mapped() {
+        Some(v4) if v4.is_loopback() => None,
+        Some(_) => Some(u128::from(*ip)),
+        None if ip.is_loopback() => None,
+        None => Some(u128::from(*ip) & !(u128::from(u64::MAX))),
+    }
 }
 
 impl Default for TransportLimits {
@@ -154,6 +172,8 @@ impl Default for TransportLimits {
             consumer_inbox_peer_messages: 1024,
             consumer_inbox_peer_bytes: 8 << 20,
             max_inbound_connections: 64,
+            // An eighth of the inbound slots: room for several nodes behind one NAT.
+            max_inbound_per_source: 8,
         }
     }
 }
@@ -922,7 +942,16 @@ impl NetworkThreadHandle {
                 self.pending_connects.retain(|a| a.connection_key() != peer);
                 if inbound && !self.peers.contains_key(&peer) {
                     let held = self.peers.values().filter(|s| s.inbound && !s.closing).count();
-                    if held >= self.limits.max_inbound_connections {
+                    let source = inbound_source(&peer.ip);
+                    let from_source = source.map_or(0, |source| {
+                        self.peers
+                            .iter()
+                            .filter(|(key, s)| s.inbound && !s.closing && inbound_source(&key.ip) == Some(source))
+                            .count()
+                    });
+                    if held >= self.limits.max_inbound_connections
+                        || (source.is_some() && from_source >= self.limits.max_inbound_per_source)
+                    {
                         self.stats.inbound_refused += 1;
                         self.peers.insert(peer, PeerState {
                             address,
@@ -2259,6 +2288,45 @@ mod tests {
             b_base.handle.stats().inbound_refused == 1
         });
         assert_eq!(b_base.connections.len(), 1);
+    }
+
+    /// The inbound cap is for the whole node, and a peer's key and source port are its own to
+    /// pick, so one host can open every inbound connection the node keeps and hold them (nothing
+    /// closes a connection for being idle). The node then refuses every other peer that dials it:
+    /// a bootstrap node stops taking new nodes. Driven by STP events directly, no sockets.
+    #[test]
+    fn one_source_address_cannot_take_every_inbound_slot() {
+        let local = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b).unwrap();
+        let remote = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b).unwrap();
+        let (mut a, _pump) = NetworkThreadHandle::new_unstarted(
+            vec![local], free_port(), None, (1_000_000, 512 * 1024, 32 << 20), TransportLimits::default(),
+        );
+        let cap = a.limits.max_inbound_connections;
+        let now = Instant::now();
+        let connect = |a: &mut NetworkThreadHandle, ip: Ipv6Addr, port: u16| {
+            let address = STPAddress::from(ip, port, &remote);
+            let peer = address.connection_key();
+            a.handle_event(Event::Connected { peer, address, handshake_hash: [port as u8; 64] }, &mut VecDeque::new(), now);
+            peer
+        };
+        // One host: a single IPv4 address, then (another run) a single IPv6 /64, which is what
+        // one host is usually given.
+        let hosts: [fn(u16) -> Ipv6Addr; 2] = [
+            |_| std::net::Ipv4Addr::new(198, 51, 100, 7).to_ipv6_mapped(),
+            |port| Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, port),
+        ];
+        for (run, host) in hosts.into_iter().enumerate() {
+            for port in 1..=cap as u16 + 10 {
+                connect(&mut a, host(port), port);
+            }
+            let held = a.peers.values().filter(|s| s.inbound && !s.closing).count();
+            let honest = connect(&mut a, Ipv6Addr::new(0x2001, 0xdb8, 1, run as u16, 0, 0, 0, 2), 8233);
+            assert!(
+                a.is_connected(honest),
+                "run {run}: one host holds {held} of the {cap} inbound connections and a peer from another address is refused",
+            );
+            a.peers.clear();
+        }
     }
 
     #[test]
