@@ -2359,22 +2359,16 @@ impl ManualWallet {
     }
 
     /// The bond's current target as a full capability, replayed from this
-    /// wallet's own mined transactions (the latest Create/Retarget for the bond
-    /// carries the address). Consensus validates a retarget's `from` against the
+    /// wallet's own mined transactions (the latest Create/Convert/Retarget for the
+    /// bond names its target). Consensus validates a retarget's `from` against the
     /// bond's actual target, so this must reflect the chain, not local intent.
-    pub fn current_bond_target_address(&self, bond_key: [u8; 32]) -> Option<bft::FinalizerAddress> {
-        let mut target = None;
-        for tx in &self.txs {
-            if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
-            match tx.staking_action.as_ref() {
-                Some(&StakingAction::CreateNewDelegationBond { unique_pubkey, target_finalizer, .. })
-                    if unique_pubkey == bond_key => target = Some(target_finalizer),
-                Some(&StakingAction::RetargetDelegationBond { unique_pubkey, to_finalizer, .. })
-                    if unique_pubkey == bond_key => target = Some(to_finalizer),
-                _ => {}
-            }
-        }
-        target
+    ///
+    /// A bond minted by ConvertFinalizerRewardToDelegationBond names its finalizer by
+    /// public key only (`this_finalizer`), so its address comes from `known_addresses`
+    /// (the roster's chain-revealed addresses) or from any other action in this
+    /// wallet's history that carries the same finalizer's address.
+    pub fn current_bond_target_address(&self, bond_key: [u8; 32], known_addresses: &[bft::FinalizerAddress]) -> Option<bft::FinalizerAddress> {
+        bond_target_address(&self.txs, bond_key, known_addresses)
     }
 
     /// The bond version this wallet's next action on `bond_key` must spend, or `None` before
@@ -2404,15 +2398,16 @@ impl ManualWallet {
     pub fn retarget_bond_using_ironwood<P: Parameters>(
         &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
         src_usk: &UnifiedSpendingKey, orchard_tree: &OrchardShardTree, bond_key: [u8; 32], new_target: bft::FinalizerAddress,
+        known_addresses: &[bft::FinalizerAddress],
     ) -> Option<()>
     {
-        let tz = Timer::scope("begin_unbonding_using_ironwood");
+        let tz = Timer::scope("retarget_bond_using_ironwood");
         if !new_target.verify() {
             println!("retarget_bond_using_ironwood: invalid finalizer address capability");
             return None;
         }
         let signing_key = self.bond_signing_key(bond_key, src_usk.bond())?;
-        let Some(from_finalizer) = self.current_bond_target_address(bond_key) else {
+        let Some(from_finalizer) = self.current_bond_target_address(bond_key, known_addresses) else {
             println!("retarget_bond_using_ironwood: no mined create/retarget found for bond {:?}", bond_key);
             return None;
         };
@@ -2554,6 +2549,33 @@ impl ManualWallet {
             self.audit_tx(tx);
         }
     }
+}
+
+fn roster_addresses(roster: &[RosterMember]) -> Vec<bft::FinalizerAddress> {
+    roster.iter().filter_map(|member| member.finalizer_address).collect()
+}
+
+/// See [`ManualWallet::current_bond_target_address`].
+fn bond_target_address(txs: &[WalletTx], bond_key: [u8; 32], known_addresses: &[bft::FinalizerAddress]) -> Option<bft::FinalizerAddress> {
+    let address_of = |pub_key: [u8; 32]| -> Option<bft::FinalizerAddress> {
+        known_addresses.iter().copied()
+            .chain(txs.iter().filter_map(|tx| tx.staking_action.and_then(|a| a.target_finalizer_address())))
+            .find(|addr| addr.pub_key.0 == pub_key && addr.verify())
+    };
+    let mut target = None;
+    for tx in txs {
+        if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
+        match tx.staking_action.as_ref() {
+            Some(&StakingAction::CreateNewDelegationBond { unique_pubkey, target_finalizer, .. })
+                if unique_pubkey == bond_key => target = Some(target_finalizer),
+            Some(&StakingAction::ConvertFinalizerRewardToDelegationBond { unique_pubkey, this_finalizer, .. })
+                if unique_pubkey == bond_key => target = address_of(this_finalizer),
+            Some(&StakingAction::RetargetDelegationBond { unique_pubkey, to_finalizer, .. })
+                if unique_pubkey == bond_key => target = Some(to_finalizer),
+            _ => {}
+        }
+    }
+    target
 }
 
 struct PoWCache {
@@ -5107,7 +5129,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     StakingActionRequest::CreateNewDelegationBond{ amount_zats, target_finalizer } =>
                         user_wallet.stake_ironwood_to_finalizer(network, &mut tx, &mut client, &user_usk, amount_zats, &orchard_tree, target_finalizer),
                     StakingActionRequest::RetargetDelegationBond{ bond_key, target_finalizer } =>
-                        user_wallet.retarget_bond_using_ironwood(network, &mut tx, &mut client, &user_usk, &orchard_tree, bond_key.0, target_finalizer),
+                        user_wallet.retarget_bond_using_ironwood(network, &mut tx, &mut client, &user_usk, &orchard_tree, bond_key.0, target_finalizer, &roster_addresses(&roster)),
                     StakingActionRequest::BeginDelegationUnbonding{ bond_key } =>
                         user_wallet.begin_unbonding_using_ironwood(network, &mut tx, &mut client, &user_usk, &orchard_tree, bond_key.0),
                     StakingActionRequest::WithdrawDelegationBond{ bond_key  } =>
@@ -5243,7 +5265,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
 
                 &WalletAction::RetargetBond(txid, new_target) => {
-                    let ok = user_wallet.retarget_bond_using_ironwood(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref(), new_target).is_some();
+                    let ok = user_wallet.retarget_bond_using_ironwood(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref(), new_target, &roster_addresses(&roster)).is_some();
                     just_init_new_tx |= ok;
                     if DUMP_ACTIONS { println!("Try retarget: {ok:?}"); }
                     ok
@@ -5828,5 +5850,36 @@ mod tests {
             }
         }
         assert!(paid > 1_000 && hit_cap > 1_000, "paid {paid}, hit the cap {hit_cap}");
+    }
+
+    #[test]
+    fn a_converted_bond_has_a_retarget_source() {
+        let finalizer_key = SigningKey::from([3u8; 32]);
+        let finalizer = bft::FinalizerAddress::create(&finalizer_key);
+        let other = bft::FinalizerAddress::create(&SigningKey::from([4u8; 32]));
+        let bond_key = [5u8; 32];
+        let convert = StakingAction::ConvertFinalizerRewardToDelegationBond {
+            unique_pubkey: bond_key,
+            signature: [0; 64],
+            bond_salt: [0; 32],
+            this_finalizer: finalizer.pub_key.0,
+            amount_zats: 100_000_000,
+            finalizer_signature: [0; 64],
+        };
+        let mined = |h, action| WalletTx { txid: TxId::from_bytes([h as u8; 32]), h: BlockHeight(h), status: TxStatus::OnBc,
+                                           staking_action: Some(action), ..WalletTx::EMPTY };
+        let txs = vec![mined(531, convert)];
+
+        // Only Create and Retarget were replayed, so a converted bond had no `from` and every
+        // retarget of it was refused before it was built.
+        assert_eq!(bond_target_address(&txs, bond_key, &[other, finalizer]).map(|a| a.pub_key), Some(finalizer.pub_key));
+        assert_eq!(bond_target_address(&txs, bond_key, &[other]), None);
+
+        // after a retarget the latest target wins, as for any bond
+        let retarget = StakingAction::RetargetDelegationBond {
+            unique_pubkey: bond_key, signature: [0; 64], from_finalizer: finalizer, to_finalizer: other, spends: None,
+        };
+        let txs = vec![mined(531, convert), mined(540, retarget)];
+        assert_eq!(bond_target_address(&txs, bond_key, &[]).map(|a| a.pub_key), Some(other.pub_key));
     }
 }
