@@ -2460,6 +2460,71 @@ fn crosslink_tx_relayed_over_stp_reaches_the_mempool() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// `attackers` new STP peers each list 512 transactions nobody has (two TX_STATUS of 256 ids, the
+/// most one peer may be the only lister of) and are killed for a malformed MEMPOOL_REQ in the same
+/// first tick. Then honest peer 1 lists a real transaction, which must be asked for and taken.
+fn tx_relay_killed_listers_scenario(attackers: u64) {
+    use zebra_chain::transaction::{Hash as TxHash, UnminedTxId};
+    use zebra_state::new_network::tx_relay::tx_status_packet;
+    // new_network's PACKET_TYPE_MEMPOOL_REQ, which carries no payload: one with a byte is
+    // malformed, and the sender is killed.
+    const MALFORMED_MEMPOOL_REQ: [u8; 2] = [0x0B, 0];
+
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let network = regtest_network(&HARNESS_PARAMETERS);
+    let key = TestKey::new(b"crosslink test miner");
+    let miner = key.address();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network.clone(), BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    while gen.mature_coinbase_for(&key).is_none() {
+        tf.push_instr_load_pow(&gen.next_block(&miner), 0);
+    }
+    let honest = transparent_spend(gen.next_upgrade(), &key, gen.mature_coinbase_for(&key).expect("matured above"));
+
+    for attacker in 0..attackers {
+        let mut packets: Vec<Vec<u8>> = (0..2u64)
+            .map(|status| {
+                let ids: Vec<UnminedTxId> = (0..256u64)
+                    .map(|i| {
+                        let mut id = [0xa7; 32];
+                        id[..8].copy_from_slice(&attacker.to_le_bytes());
+                        id[8..16].copy_from_slice(&(status * 256 + i).to_le_bytes());
+                        UnminedTxId::Legacy(TxHash(id))
+                    })
+                    .collect();
+                tx_status_packet(512, ids.iter().map(|id| (id, 1_000)))
+            })
+            .collect();
+        packets.push(MALFORMED_MEMPOOL_REQ.to_vec());
+        // Killed for the last packet: the expected outcome.
+        tf.push_instr_recv_stp_first_packets(&packets, 1_000 + attacker, SHOULD_FAIL);
+    }
+
+    tf.push_instr_recv_tx_stp(&honest, 1, 0);
+    tf.push_instr_expect_mempool_contains(&honest, 0);
+    tf.push_instr_expect_node_alive(0);
+    test_bytes(tf.write_to_bytes());
+}
+
+/// A peer that relay first hears from, and that is killed, in one tick is never told to relay as
+/// gone: the sync loop calls `on_peer_gone` only for keys that were live at the previous tick.
+/// Its state stays for good, and the 512 ids it listed stay wanted for a minute, counted against
+/// the node-wide `MAX_WANTED` (65,536) though it is no longer a connection. 160 such peers fill
+/// the wanted set, and an honest peer's transaction is then never asked for.
+#[test]
+fn crosslink_tx_relay_forgets_listers_killed_in_their_first_tick() {
+    set_test_name(function_name!());
+    tx_relay_killed_listers_scenario(160);
+}
+
+/// The same with 100 peers (51,200 ids, under `MAX_WANTED`): the honest transaction is taken,
+/// so it is the full wanted set that keeps it out in the test above.
+#[test]
+fn crosslink_tx_relay_forgets_listers_killed_in_their_first_tick_control() {
+    set_test_name(function_name!());
+    tx_relay_killed_listers_scenario(100);
+}
+
 /// The instructions no scenario used before: SUBMIT_TX via the wire, EXPECT_MEMPOOL_REJECTED
 /// (including that a mined transaction is not "rejected"), EXPECT_POOL_TOTALS,
 /// EXPECT_FINALIZER_BANK, and the load-rejected helper.
