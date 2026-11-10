@@ -4571,7 +4571,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let check_h = req_rng.0.saturating_sub(1);
             if (u32::from(prev_tip_chain_state.block_height()) as u64) == check_h {
                 if let Ok(Some(wallet_root)) = orchard_tree.root_at_checkpoint_id_caching(&BlockHeight(check_h as u32)) {
-                    let node_root = prev_tip_chain_state.final_orchard_tree().root();
+                    // the wallet's tree holds the Ironwood actions it scans (read_compact_tx)
+                    let node_root = prev_tip_chain_state.final_ironwood_tree().root();
                     if wallet_root.to_bytes() != node_root.to_bytes() {
                         println!("****** WALLET TREE ROOT MISMATCH at {check_h}: wallet {} vs node {} (tree size {})",
                             LEHash(wallet_root.to_bytes()), LEHash(node_root.to_bytes()), shard_tree_size(&orchard_tree));
