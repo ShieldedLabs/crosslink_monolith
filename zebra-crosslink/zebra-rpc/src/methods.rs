@@ -618,6 +618,10 @@ pub trait Rpc {
     async fn get_wallet_ufvk(&self) -> Option<String>;
 
     /// Send a staking action from the given wallet
+    ///
+    /// Returns a string holding a JSON object, e.g.
+    /// `{"txid":"<hex>","kind":"CreateNewDelegationBond","bond_key":"<hex>"}`. `bond_key` is in the
+    /// form `wallet_staking_positions` lists as `pk`, which later actions on the bond take.
     #[method(name = "wallet_staking_action")]
     async fn wallet_staking_action(&self, staking_action: StakingActionParam) -> Result<String>;
 
@@ -642,7 +646,8 @@ pub trait Rpc {
     #[method(name = "wallet_spendable_funds")]
     async fn wallet_spendable_funds(&self) -> Result<serde_json::Value>;
 
-    /// Send `value_zats` zatoshis from the wallet to a unified address, returning the txid.
+    /// Send `value_zats` zatoshis from the wallet to a unified address, returning the txid as a
+    /// string holding a JSON object, `{"txid":"<hex>"}`.
     ///
     /// Unlike the GUI's send buttons the value is not quantized; it is an exact zatoshi amount.
     /// Blocks until the transaction is built and submitted.
