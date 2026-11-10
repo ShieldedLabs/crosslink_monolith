@@ -980,8 +980,16 @@ impl TMState {
             // verifies against the wrong key with no other symptom. Trial-verify against the
             // whole roster to name the actual signer: "verifies as roster_i N" = index shift
             // (roster divergence); "verifies as nobody" = namespace divergence or garbage.
-            // Dead votes are re-delivered forever by catchup, hence the 1/s cap.
-            if self.sig_fault_printed.insert((height, round, roster_i, packet_type)) {
+            // Dead votes are re-delivered forever by catchup, hence the dedup per
+            // (height, round, roster_i, type).
+            //
+            // Any connected peer can send votes, unverified, with any round, so the trial check
+            // (one signature check per roster member) and the dedup entry are kept for rounds
+            // up to the next one, where an honest node's votes can be: a forged vote in a far
+            // round then costs its one failed check and nothing more. The entries of a height
+            // are dropped when the node moves past it.
+            if round <= self.round.saturating_add(1) &&
+               self.sig_fault_printed.insert((height, round, roster_i, packet_type)) {
                 // The vote payload embeds the signer's pub key in bytes 0..32, so naming a
                 // shifted signer requires rebuilding the payload per candidate key -- swapping
                 // only the verification key can never match. Proposal chunk payloads don't
@@ -1458,6 +1466,7 @@ impl TMState {
                 if PRINT_ROSTER { println!("{ctx_str} {ANSI_GRY}ROSTER{ANSI_RST}: new roster: {:?}", new_roster); }
                 *roster = new_roster;
                 self.height += 1;
+                self.sig_fault_printed.retain(|&(height, ..)| height >= self.height);
                 // Vote namespacing: adopt the namespace for the new height (supplied alongside the
                 // new roster by the decided-block closure).
                 self.vote_namespace = new_vote_namespace;
@@ -5022,5 +5031,55 @@ mod tests {
             let rngs = gen_mostly_empty_rngs(test.arr.len(), |i| test.arr[i] == b'0');
             assert_eq!(test.rngs, &rngs, "index {}", test_i);
         }
+    }
+
+    // A twelve-member roster (the prototype cap) and an engine for member 0 at height 0, round 0.
+    fn sig_fault_state() -> (TMState, Vec<SortedRosterMember>) {
+        let keys: Vec<SigningKey> = (0..12).map(|i| SigningKey::from([i as u8 + 1; 32])).collect();
+        let roster: Vec<SortedRosterMember> = keys.iter().enumerate().map(|(i, k)| SortedRosterMember {
+            pub_key: PubKeyID(VerificationKeyBytes::from(k).into()), stake: 1, cumulative_stake: i as u64 + 1 }).collect();
+        let state = TMState::init(
+            keys[0].clone(), roster[0].pub_key, 0, ROSTER_MAX_N,
+            ClosureToProposeNewBlock(Arc::new(|| Box::pin(async { None }))),
+            ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
+            ClosureToPushDecidedBlock(Arc::new(|_, _, _| Box::pin(async { (Vec::new(), [0; 32], false) }))),
+            ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
+            ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
+        );
+        (state, roster)
+    }
+
+    // A vote packet is read from any connected peer before (and without) ID verification, and its
+    // votes carry their own round. A forged vote (any signature) for the current height in a round
+    // nobody has reached costs the receiver, the first time its (height, round, roster_i, type) is
+    // seen, the signature check plus a trial check against every roster member, and a never-freed
+    // entry in `sig_fault_printed`, plus one stderr line. The peer picks a new round per vote.
+    #[test]
+    fn forged_votes_in_far_rounds_cost_one_signature_check_and_no_memory() {
+        let (mut state, roster) = sig_fault_state();
+        let value_id = ValueId([9; 32]);
+        let forged = TMSig([0x55; 64]);
+        let votes = 300u32;
+        let started = std::time::Instant::now();
+        for round in 1..=votes {
+            let data = make_vote_sign_datas(roster[1].pub_key, false, 0, round, value_id)[1];
+            assert_eq!(state.check_and_incorporate_msg(0, round, 0, value_id, -2, &roster, 1,
+                PACKET_TYPE_PREVOTE_SIGNATURES, &data, forged), TMStatus::Fail);
+        }
+        let fresh = started.elapsed();
+        // The same number of forged votes, all in one round the node already reported.
+        let started = std::time::Instant::now();
+        for _ in 1..=votes {
+            let data = make_vote_sign_datas(roster[1].pub_key, false, 0, 0, value_id)[1];
+            assert_eq!(state.check_and_incorporate_msg(0, 0, 0, value_id, -2, &roster, 1,
+                PACKET_TYPE_PREVOTE_SIGNATURES, &data, forged), TMStatus::Fail);
+        }
+        let repeated = started.elapsed();
+        eprintln!("{votes} forged votes: {fresh:?} in fresh rounds, {repeated:?} in one round");
+        assert!(state.rounds_data.is_empty(), "a forged vote must not create a round");
+        assert!(state.sig_fault_printed.len() <= 2 * roster.len() * 2,
+            "{} forged votes left {} sig-fault entries (each one a trial check against the {}-member roster); \
+             fresh rounds took {fresh:?}, the same votes in one round {repeated:?}",
+            votes, state.sig_fault_printed.len(), roster.len());
     }
 }
