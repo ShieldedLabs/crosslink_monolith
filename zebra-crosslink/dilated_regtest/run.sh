@@ -78,18 +78,31 @@ done
 until ua=$(rpc 0 wallet_spendable_funds | jq -r '.result.address // empty') && [ -n "$ua" ]; do log "waiting for the wallet"; sleep 3; done
 [ "$(tip 0)" -lt 4 ] && rpc 0 generate '[4]' >/dev/null
 log "faucet: $(rpc 0 requestfaucetdonation "[{\"address\":\"$ua\"}]" | jq -c '.result // .error')"
-settle() { # wait for the wallet's tx to reach the mempool, mine it in, mine until $1 zats are spendable
-  until [ "$(rpc 0 getrawmempool | jq -r '.result|length')" != 0 ]; do sleep 2; done
-  rpc 0 generate '[2]' >/dev/null
-  until s=$(rpc 0 wallet_spendable_funds | jq -r '.result.spendable_zats // empty') && [ -n "$s" ] && [ "$s" -ge "$1" ]; do rpc 0 generate '[1]' >/dev/null; sleep 2; done
+# The height of the block holding transaction $1 in node 0's best chain; -1 while it is in the
+# mempool, on a side chain or not known yet.
+mined_at() { h=$(rpc 0 getrawtransaction "[\"$1\",1]" | jq -r '.result.height // -1' 2>/dev/null); case "$h" in ''|*[!0-9-]*) h=-1;; esac; echo "$h"; }
+# Mine until transaction $2 (when given) is in a block and $1 zats are spendable, as the wallet
+# reports once it has seen that block. This waits for the transaction itself, not for a non-empty
+# mempool: node 0's internal miner can mine the transaction before the first look at the mempool
+# (a release build does so nearly every time), and then the mempool never fills.
+settle() {
+  h=0
+  if [ -n "${2:-}" ]; then
+    until h=$(mined_at "$2") && [ "$h" -ge 0 ]; do rpc 0 generate '[1]' >/dev/null; sleep 2; done
+  fi
+  until s=$(rpc 0 wallet_spendable_funds | jq -r --argjson h "$h" '.result | select(.tip_height >= $h) | .spendable_zats // empty') && [ -n "$s" ] && [ "$s" -ge "$1" ]; do rpc 0 generate '[1]' >/dev/null; sleep 2; done
 }
 settle $((2 * BOND + 1000000))
 # Staking actions are illegal below the staking height, the first staking day.
 while [ "$(tip 0)" -lt "$STAKING_HEIGHT" ]; do rpc 0 generate "[$(( STAKING_HEIGHT - $(tip 0) ))]" >/dev/null; sleep 1; done
 for n in 0 1; do
   cmd=$(jq -cn --arg f "${FIN[$n]}" --argjson a "$BOND" '{CreateNewDelegationBond:{amount_zats:$a,target_finalizer:$f}}')
-  log "bond -> node$n: $(rpc 0 wallet_staking_action "[$cmd]" | jq -c 'if .error then .error else "submitted" end')"
-  if [ $n = 0 ]; then settle $((BOND + 1000000)); else settle 0; fi
+  res=$(rpc 0 wallet_staking_action "[$cmd]")
+  # The answer names the txid first, as a string holding {"txid": ...}.
+  txid=$(echo "$res" | jq -r '.result // empty' 2>/dev/null | grep -o '[0-9a-f]\{64\}' | head -1)
+  log "bond -> node$n: $(if [ -n "$txid" ]; then echo "txid $txid"; else echo "$res" | jq -c '.error // .'; fi)"
+  [ -n "$txid" ] || { fail "the bond to node$n was not sent"; exit 1; }
+  if [ $n = 0 ]; then settle $((BOND + 1000000)) "$txid"; else settle 0 "$txid"; fi
 done
 rpc 0 generate '[1]' >/dev/null
 staked=$(tip 0); log "positions: $(rpc 0 wallet_staking_positions | jq -c '.result.active | map_values(length)')"
