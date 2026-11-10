@@ -11,7 +11,8 @@
 //! is always the most ordinary option, so any prefix of an input is itself an input.
 //!
 //! Run a campaign with `crosslink_fuzz` (CROSSLINK_FUZZ_SEEDS=a..b, CROSSLINK_FUZZ_SECS); replay
-//! one with `crosslink_fuzz_one` and CROSSLINK_FUZZ_SEED or CROSSLINK_FUZZ_FILE.
+//! one with `crosslink_fuzz_one` and CROSSLINK_FUZZ_SEED or CROSSLINK_FUZZ_FILE. The directed
+//! scenarios draw their choices from CROSSLINK_FUZZ_SEED too, 0 when it is unset.
 
 use super::*;
 
@@ -349,6 +350,13 @@ fn refresh_model(g: &mut FuzzGen) {
             p.known = false;
         }
     }
+    // A spend made under an earlier network upgrade can no longer be mined, and the mempool
+    // clears it at the activation (ZIP-200).
+    let upgrade = g.tip().next_upgrade();
+    let (current, stale): (Vec<FuzzPending>, Vec<FuzzPending>) =
+        std::mem::take(&mut g.pending).into_iter().partition(|p| p.tx.network_upgrade() == Some(upgrade));
+    g.pending = current;
+    g.unsure_coins.extend(stale.into_iter().map(|p| p.coin.0));
     let (kept, dropped): (Vec<FuzzMinedSpend>, Vec<FuzzMinedSpend>) =
         std::mem::take(&mut g.mined_spends).into_iter().partition(|s| on_main(g, (s.height, s.block)));
     g.mined_spends = kept;
@@ -801,19 +809,78 @@ fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
     }
 }
 
-/// The deepest a replayed transaction's first copy sits below the tip. It stays in the
-/// non-finalized chain, where a replay is refused under any network upgrade; once finalized, it
-/// is refused only from FeaturenetUpgrade2, which these runs never reach, or from
-/// FeaturenetUpgrade3, where its spent version is gone.
+/// The deepest a replayed transaction's first copy sits below the tip while it stays in the
+/// non-finalized chain, where a replay is refused under any network upgrade.
 const REPLAY_DEPTH_MAX: u32 = zebra_state::MAX_BLOCK_REORG_HEIGHT / 2;
 
-/// A staking action mined on `main`, mined again in the next block, which the node must refuse.
-/// Most often a retarget whose bond is first moved back to the finalizer the retarget leaves, so
-/// the replay passes every staking rule and only its hash tells it apart.
+/// Blocks enough for what was mined before them to be finalized.
+const FINALIZED_BETWEEN: u32 = zebra_state::MAX_BLOCK_REORG_HEIGHT + 10;
+
+/// Extends `main` by `n` empty blocks, loaded without drawing choices, which a long run would
+/// use up the input on.
+fn load_empty_blocks(g: &mut FuzzGen, n: u32) {
+    for _ in 0..n {
+        let mut next = g.tip().clone();
+        let block = next.next_block(&g.miner.clone());
+        g.main.push(next);
+        g.tf.push_instr_load_pow(&block, if g.tip_known { 0 } else { ANY_OUTCOME });
+        g.after_main_grew();
+    }
+    // A mempool that misses tips while blocks arrive this fast resets, dropping what it held.
+    for p in &mut g.pending {
+        p.known = false;
+    }
+    g.expect_tip();
+}
+
+/// A staking action, empty blocks until it is finalized, then a replay. A bond is made first if
+/// none is active, while the network upgrade may still allow a zero-zat create; then any
+/// activation the run would cross is passed before the action, since a replay made under another
+/// upgrade is refused for that alone. Many actions are refused on purpose, so a few are tried
+/// until one is mined.
+fn move_finalize(g: &mut FuzzGen, c: &mut Choices) {
+    refresh_model(g);
+    if !g.bonds.iter().any(|bond| bond.known && bond.state == FuzzBondState::Active) {
+        move_staking(g, c);
+    }
+    let n = FINALIZED_BETWEEN + c.below(8) as u32;
+    let upgrade_after_run = |g: &FuzzGen| NetworkUpgrade::current(&g.network, BlockHeight(g.height() + 2 + n));
+    while g.tip().next_upgrade() != upgrade_after_run(g) {
+        load_empty_blocks(g, 1);
+    }
+    let before = g.height();
+    for _ in 0..4 {
+        move_staking(g, c);
+        if g.mined_staking.last().is_some_and(|s| s.height > before) {
+            break;
+        }
+    }
+    load_empty_blocks(g, n);
+    move_replay(g, c);
+}
+
+/// Whether the next block of `main` must refuse `tx` mined again after it was finalized: from
+/// FeaturenetUpgrade2 any repeat, and from FeaturenetUpgrade3 an action whose spent version is gone.
+fn refuses_finalized_repeat(g: &FuzzGen, tx: &Transaction) -> bool {
+    let active = |nu: NetworkUpgrade| nu.activation_height(&g.network).is_some_and(|h| BlockHeight(g.height() + 1) >= h);
+    active(NetworkUpgrade::FeaturenetUpgrade2)
+        || (active(NetworkUpgrade::FeaturenetUpgrade3) && tx.staking_action().and_then(|action| action.spends()).is_some())
+}
+
+/// A staking action mined on `main`, mined again in the next block. Most often a retarget whose
+/// bond is first moved back to the finalizer the retarget leaves, so the replay passes every
+/// staking rule and only its hash tells it apart. The node must refuse it while the first copy is
+/// not finalized; once it is, only where `refuses_finalized_repeat` says so.
 fn move_replay(g: &mut FuzzGen, c: &mut Choices) {
     refresh_model(g);
-    let recent: Vec<usize> =
-        (0..g.mined_staking.len()).filter(|&i| g.height() + 1 - g.mined_staking[i].height < REPLAY_DEPTH_MAX).collect();
+    // A finalized first copy under another network upgrade would be refused for that alone.
+    let next_upgrade = g.tip().next_upgrade();
+    let recent: Vec<usize> = (0..g.mined_staking.len())
+        .filter(|&i| {
+            let depth = g.height() + 1 - g.mined_staking[i].height;
+            depth < REPLAY_DEPTH_MAX || (depth > FINALIZED_BETWEEN && g.mined_staking[i].tx.network_upgrade() == Some(next_upgrade))
+        })
+        .collect();
     if recent.is_empty() {
         return move_staking(g, c);
     }
@@ -840,7 +907,18 @@ fn move_replay(g: &mut FuzzGen, c: &mut Choices) {
     };
 
     let replay = g.mined_staking[i].clone();
-    let block = g.tip().clone().next_block_with_txs(&g.miner.clone(), &[replay.tx]);
+    let finalized = g.height() + 1 - replay.height > FINALIZED_BETWEEN;
+    let block = g.tip().clone().next_block_with_txs(&g.miner.clone(), &[replay.tx.clone()]);
+    if finalized && !refuses_finalized_repeat(g, &replay.tx) {
+        // The repeat is then as valid as its bond's state lets it be, which the model does not
+        // follow for an old action. Taken, it is a block at the next height that `main` lacks.
+        g.tf.push_instr_load_pow(&block, ANY_OUTCOME);
+        g.tf.push_instr_expect_node_alive(0);
+        g.tip_known = false;
+        g.rival_height = g.rival_height.max(g.height() + 1);
+        g.bonds[replay.bond_i].known = false;
+        return;
+    }
     refuse(g, c, &block);
     if !g.tip_known {
         g.bonds[replay.bond_i].known = false;
@@ -997,8 +1075,8 @@ fn generate_bft(c: &mut Choices) -> Vec<u8> {
 
 type Move = fn(&mut FuzzGen, &mut Choices);
 
-/// The lowest height an input schedules FeaturenetUpgrade3 at, and the span above it it may
-/// pick from: a run's staking moves reach a few staking periods.
+/// The lowest height an input schedules FeaturenetUpgrade2 or FeaturenetUpgrade3 at, and the
+/// span above it it may pick from: a run's staking moves reach a few staking periods.
 const FUZZ_UTXO_UPGRADE_FROM: u32 = 4;
 const FUZZ_UTXO_UPGRADE_SPAN: usize = 60;
 
@@ -1013,20 +1091,30 @@ pub(crate) fn generate(c: &mut Choices) -> Vec<u8> {
     }
     // The short staking calendar, so bonds can unbond and withdraw within one input.
     let params = zcash_primitives::bft::ZcashCrosslinkParameters { staking: short_staking(&HARNESS_PARAMETERS), ..HARNESS_PARAMETERS };
-    // Half the inputs bond under FeaturenetUpgrade3's spent versions, from early in the run or
-    // after some bonds act without them.
-    let node_config = if c.below(2) == 0 {
-        String::new()
-    } else {
-        node_config_with_activation_heights(zebra_chain::parameters::testnet::ConfiguredActivationHeights {
+    // A third of the inputs bond under FeaturenetUpgrade3's spent versions and a third refuse
+    // finalized repeats under FeaturenetUpgrade2, from early in the run or after some bonds act
+    // without them.
+    use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
+    let node_config = match c.below(3) {
+        0 => String::new(),
+        1 => node_config_with_activation_heights(ConfiguredActivationHeights {
             featurenet_upgrade_3: Some(FUZZ_UTXO_UPGRADE_FROM + c.below(FUZZ_UTXO_UPGRADE_SPAN) as u32),
             ..Default::default()
-        })
+        }),
+        _ => node_config_with_activation_heights(ConfiguredActivationHeights {
+            featurenet_upgrade_2: Some(FUZZ_UTXO_UPGRADE_FROM + c.below(FUZZ_UTXO_UPGRADE_SPAN) as u32),
+            ..Default::default()
+        }),
     };
     let mut g = FuzzGen::new_with_node_config(&params, &node_config);
     let enabled: Vec<Move> = MOVES.iter().enumerate().filter(|(i, _)| *i == 0 || !c.unusual(64)).map(|(_, m)| *m).collect();
     let moves_n = 4 + c.below(28);
-    for _ in 0..moves_n {
+    // A quarter of the inputs replay an action after it is finalized.
+    let finalize_at = c.unusual(64).then(|| c.below(moves_n));
+    for k in 0..moves_n {
+        if finalize_at == Some(k) {
+            move_finalize(&mut g, c);
+        }
         let m = enabled[c.below(enabled.len())];
         m(&mut g, c);
     }
@@ -1051,6 +1139,7 @@ fn crosslink_fuzz_one() {
         (Ok(path), _) => std::fs::read(&path).expect("CROSSLINK_FUZZ_FILE reads"),
         (_, Ok(seed)) => {
             let seed: u64 = seed.parse().expect("CROSSLINK_FUZZ_SEED is a number");
+            eprintln!("fuzz seed {seed}");
             let bytes = generate(&mut Choices::from_seed(seed, 4096));
             std::fs::write(fuzz_dir().join(format!("seed-{seed}.zeccltf")), &bytes).expect("fuzz input writes");
             bytes
@@ -1301,13 +1390,20 @@ fn crosslink_fuzz_finding_refused_body_poisons_the_next_block_control() {
 // merkle root and the auth commitment. A copy of a real block with a different body under the
 // same header has the real block's hash, and is refused for its body. If the node then condemns
 // the hash, anyone who relays such a copy first keeps the real block out (the mutated-block
-// class, CVE-2012-2459 in Bitcoin). Each scenario: three blocks, the copy (refused), the real
-// block (must be taken), and one more on top.
+// class, CVE-2012-2459 in Bitcoin). Each scenario: a few blocks, the copy (refused), the real
+// block (must be taken), and a few more on top.
+
+/// The choices for a directed scenario, from CROSSLINK_FUZZ_SEED or 0.
+fn directed_choices() -> Choices {
+    let seed: u64 = std::env::var("CROSSLINK_FUZZ_SEED").map_or(0, |seed| seed.parse().expect("CROSSLINK_FUZZ_SEED is a number"));
+    eprintln!("fuzz seed {seed}");
+    Choices::from_seed(seed, 4096)
+}
 
 fn refused_body_then_real(mutate: fn(&mut Block)) -> Vec<u8> {
-    let mut c = Choices::from_seed(0, 0);
+    let mut c = directed_choices();
     let mut g = FuzzGen::new(&HARNESS_PARAMETERS);
-    for _ in 0..3 {
+    for _ in 0..1 + c.below(6) {
         move_extend(&mut g, &mut c);
     }
     let mut next = g.tip().clone();
@@ -1320,7 +1416,9 @@ fn refused_body_then_real(mutate: fn(&mut Block)) -> Vec<u8> {
     g.tf.push_instr_load_pow(&real, 0);
     g.main.push(next);
     g.expect_tip();
-    move_extend(&mut g, &mut c);
+    for _ in 0..1 + c.below(3) {
+        move_extend(&mut g, &mut c);
+    }
     g.tf.write_to_bytes()
 }
 
@@ -1344,8 +1442,8 @@ fn crosslink_fuzz_directed_repeated_coinbase_does_not_condemn_the_real_block() {
 // A transaction with no spends has no nullifier or outpoint to stop it being mined twice. A
 // retarget is one: once its bond is moved back to the finalizer it left, it passes every staking
 // rule again, and only its hash shows it is a replay. Each scenario: a bond to finalizer 0,
-// retargeted to 1, `blocks_between` empty blocks, retargeted back to 0, and the first retarget
-// mined again.
+// retargeted to another, `blocks_between` empty blocks and a few more, retargeted back to 0, a
+// few more blocks, and the first retarget mined again.
 
 fn replayed_retarget(
     featurenet_upgrade_2: Option<u32>,
@@ -1366,7 +1464,7 @@ fn replayed_retarget(
     };
     let upgrade_height = featurenet_upgrade_2.max(featurenet_upgrade_3);
     let params = zcash_primitives::bft::ZcashCrosslinkParameters { staking: short_staking(&HARNESS_PARAMETERS), ..HARNESS_PARAMETERS };
-    let mut c = Choices::from_seed(0, 0);
+    let mut c = directed_choices();
     let mut g = FuzzGen::new_with_node_config(&params, &node_config);
     let staking = params.staking;
     while (g.height() + 1) % staking.period >= staking.day_window {
@@ -1384,14 +1482,19 @@ fn replayed_retarget(
     // Under FeaturenetUpgrade3 the first retarget spends the bond's first version, its key, and
     // the second spends the first's txid.
     let away_spends = spends_versions(&g).then_some(key);
-    let away = fuzz_retarget(&mut g, &seed, 0, 1, away_spends);
+    let to = 1 + c.below(2);
+    let away = fuzz_retarget(&mut g, &seed, 0, to, away_spends);
     assert!(mine(&mut g, &mut c, &[away.clone()]));
-    for _ in 0..blocks_between {
+    load_empty_blocks(&mut g, blocks_between);
+    for _ in 0..c.below(8) {
         mine(&mut g, &mut c, &[]);
     }
     let back_spends = spends_versions(&g).then_some(away.hash().0);
-    let back = fuzz_retarget(&mut g, &seed, 1, 0, back_spends);
+    let back = fuzz_retarget(&mut g, &seed, to, 0, back_spends);
     assert!(mine(&mut g, &mut c, &[back]));
+    for _ in 0..c.below(4) {
+        mine(&mut g, &mut c, &[]);
+    }
 
     if refused {
         let block = g.tip().clone().next_block_with_txs(&g.miner.clone(), &[away]);
@@ -1419,9 +1522,6 @@ fn crosslink_fuzz_directed_replayed_retarget_is_refused_under_featurenet_upgrade
     test_bytes(replayed_retarget(None, Some(REPLAY_UPGRADE), 0, true));
 }
 
-/// Blocks enough for the first copy to be finalized before the replay.
-const FINALIZED_BETWEEN: u32 = zebra_state::MAX_BLOCK_REORG_HEIGHT + 10;
-
 /// Where the replay scenarios schedule FeaturenetUpgrade2 or FeaturenetUpgrade3: below the first
 /// retarget.
 const REPLAY_UPGRADE: u32 = 4;
@@ -1432,8 +1532,8 @@ fn crosslink_fuzz_directed_replayed_finalized_retarget_is_refused_from_featurene
     test_bytes(replayed_retarget(Some(REPLAY_UPGRADE), None, FINALIZED_BETWEEN, true));
 }
 
-/// FeaturenetUpgrade3 refuses a finalized replay without FeaturenetUpgrade2's duplicate check:
-/// the replay is invalid by construction, since the version it spends is spent.
+/// Scheduling FeaturenetUpgrade3 alone activates FeaturenetUpgrade2 with it, so its duplicate
+/// check refuses the replay before the spent version it carries is looked at.
 #[test]
 fn crosslink_fuzz_directed_replayed_finalized_retarget_is_refused_from_featurenet_upgrade_3() {
     set_test_name(function_name!());
@@ -1484,4 +1584,71 @@ fn crosslink_fuzz_census() {
         eprintln!("  {:<32} {outcome:<4} {n}", format!("{} ({kind}.{doorway})", TFInstr::str_from_kind(u32::from(*kind))));
     }
     eprintln!("  EXPECT_BOND by status (0 active, 1 unbonding, 2 withdrawn, 255 absent): {bonds:?}");
+}
+
+// # The generator's own invariants
+//
+// These run no node. They read what `generate` writes over many seeds, so a mistake in the model
+// fails here instead of turning up as a false finding in a campaign.
+
+/// The seeds the generator checks read: CROSSLINK_FUZZ_SEEDS, or 0..200.
+fn generator_seeds() -> std::ops::Range<u64> {
+    let seeds = std::env::var("CROSSLINK_FUZZ_SEEDS").unwrap_or_else(|_| "0..200".to_string());
+    let (a, b) = seeds.split_once("..").expect("CROSSLINK_FUZZ_SEEDS is a..b");
+    a.parse().expect("seed range start")..b.parse().expect("seed range end")
+}
+
+/// The blocks of an input's LOAD_POWs that parse and have a height, with their flags.
+fn generated_blocks(bytes: &[u8]) -> Vec<(u32, u32, Block)> {
+    let tf = TF::read_from_bytes(bytes).expect("a generated file reads");
+    tf.instrs
+        .iter()
+        .filter(|instr| instr.kind == TFInstr::LOAD_POW)
+        .filter_map(|instr| {
+            let block = Block::zcash_deserialize(instr.data_slice(bytes)).ok()?;
+            Some((instr.flags, block.coinbase_height()?.0, block))
+        })
+        .collect()
+}
+
+/// Every block an input expects the node to take holds only transactions made for its height's
+/// network upgrade, which its coinbase carries.
+#[test]
+fn crosslink_fuzz_generator_expects_blocks_under_one_network_upgrade() {
+    let mut bad = Vec::new();
+    for seed in generator_seeds() {
+        let bytes = generate(&mut Choices::from_seed(seed, 4096));
+        for (flags, height, block) in generated_blocks(&bytes) {
+            let upgrade = block.transactions[0].network_upgrade();
+            if flags == 0 && block.transactions.iter().any(|tx| tx.network_upgrade() != upgrade) {
+                bad.push((seed, height));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "blocks expected valid with a transaction from another network upgrade, as (seed, height): {bad:?}");
+}
+
+/// Some inputs mine a transaction again more than FINALIZED_BETWEEN blocks after it was first
+/// mined, in a block the node must refuse.
+#[test]
+fn crosslink_fuzz_generator_replays_finalized_transactions() {
+    let mut inputs = 0;
+    for seed in generator_seeds() {
+        let bytes = generate(&mut Choices::from_seed(seed, 4096));
+        let mut mined: std::collections::HashMap<zebra_chain::transaction::Hash, u32> = Default::default();
+        let mut found = false;
+        for (flags, height, block) in generated_blocks(&bytes) {
+            let txs = &block.transactions[1..];
+            if flags == 0 {
+                for tx in txs {
+                    mined.entry(tx.hash()).or_insert(height);
+                }
+            } else if flags == SHOULD_FAIL {
+                found |= txs.iter().any(|tx| mined.get(&tx.hash()).is_some_and(|&first| height > first + FINALIZED_BETWEEN));
+            }
+        }
+        inputs += usize::from(found);
+    }
+    eprintln!("{inputs} inputs replay a finalized transaction in a block the node must refuse");
+    assert!(inputs >= 5, "only {inputs} inputs replay a finalized transaction in a block the node must refuse");
 }
