@@ -1177,6 +1177,42 @@ pub(super) enum FeedOutcome {
     Refused { why: String, peer_fault: bool },
 }
 
+/// What [`screen_fetched`] makes of a fetched decision for the next height.
+#[derive(Debug, PartialEq)]
+enum FetchedScreen {
+    /// Refused as [`FeedOutcome::Refused`].
+    Refused { why: String, peer_fault: bool },
+    /// Its certificate is valid; it waits for its snapshot PoW block.
+    WaitForSnapshot,
+    /// Ready for the checks every force-fed decision gets.
+    Check,
+}
+
+/// The checks a fetched decision for the next height gets before it may wait for its snapshot:
+/// its fat pointer names its block, and is a valid certificate for its height under `voting`,
+/// that height's roster (skipped when `certificate_checked`: already found valid). Both need only
+/// what this node holds. A decision that waits keeps its height in the sync loop's fetch window,
+/// and the loop asks nobody else for a height it holds, so one waiting on a snapshot that does
+/// not exist, which any peer can make, would keep the node from fetching that height at all.
+fn screen_fetched(decision: &super::bft_sync::WireDecision, voting: &VotingRoster, certificate_checked: bool, snapshot_known: bool) -> FetchedScreen {
+    if decision.fat_pointer.points_at_block_hash() != decision.block.blake3_hash() {
+        return FetchedScreen::Refused {
+            why: format!("the fat pointer for BFT height {} names another block", decision.height),
+            peer_fault: true,
+        };
+    }
+    if !certificate_checked && !certificate_is_valid(&decision.fat_pointer, decision.height, voting) {
+        return FetchedScreen::Refused {
+            why: format!("the fat pointer is not a valid certificate for BFT height {}", decision.height),
+            peer_fault: false,
+        };
+    }
+    if !snapshot_known {
+        return FetchedScreen::WaitForSnapshot;
+    }
+    FetchedScreen::Check
+}
+
 /// A supplied decision that passed `BftRunner::check_force_fed`.
 enum ForceFed {
     New,
@@ -1256,6 +1292,10 @@ pub(super) struct BftRunner {
     /// Tenderlink was due to start while catching up. It starts from the stored chain once the
     /// node has caught up.
     spawn_deferred: bool,
+    /// The height and certificate of the last fetched decision whose certificate `feed_fetched`
+    /// checked before it waited for its snapshot. A decision waiting there is fed again on every
+    /// pass of the sync loop, and its signatures need checking only once.
+    fetched_certificate_checked: Option<(u64, FatPointerToBftBlock)>,
 }
 
 struct ParkedDecision {
@@ -1298,6 +1338,7 @@ impl BftRunner {
             next_diagnostic: std::time::Instant::now(),
             catching_up: false,
             spawn_deferred: false,
+            fetched_certificate_checked: None,
         };
         metrics::gauge!("state.crosslink.bft_dropped").set(0.0);
         crate::new_network::fin::load(&block_writer.finalized_state.db);
@@ -1359,9 +1400,6 @@ impl BftRunner {
             }
             let () = super::bft_sync::ASSUME_BFT_BLOCK_HAS_HEADERS;
             debug_assert!(!decision.block.headers.is_empty());
-            if read_state.known_block(Hash(decision.block.snapshot_block_hash().0)).is_none() {
-                return FeedOutcome::NotReady(decision);
-            }
             self.next_voting_roster(&chain)
         };
         // Past genesis, a roster with no stake has no honest decision to accept: the chain has
@@ -1375,6 +1413,19 @@ impl BftRunner {
                 );
             }
             return FeedOutcome::NotReady(decision);
+        }
+        let certificate_checked = self
+            .fetched_certificate_checked
+            .as_ref()
+            .is_some_and(|(height, fat_pointer)| *height == decision.height && *fat_pointer == decision.fat_pointer);
+        let snapshot_known = read_state.known_block(Hash(decision.block.snapshot_block_hash().0)).is_some();
+        match screen_fetched(&decision, &voting, certificate_checked, snapshot_known) {
+            FetchedScreen::Refused { why, peer_fault } => return FeedOutcome::Refused { why, peer_fault },
+            FetchedScreen::WaitForSnapshot => {
+                self.fetched_certificate_checked = Some((decision.height, decision.fat_pointer.clone()));
+                return FeedOutcome::NotReady(decision);
+            }
+            FetchedScreen::Check => {}
         }
         // Proposal signatures are not checked here: the certificate is what makes a decision
         // decided. They are kept only if they verify as a fresh proposal's, below.
@@ -2929,6 +2980,36 @@ mod tests {
         for (defect, fat_pointer) in cases {
             assert!(!certificate_is_valid(&fat_pointer, 5, &voting), "accepted a certificate with {defect}");
         }
+    }
+
+    /// A fetched decision on a snapshot this node does not have waits for it only once its
+    /// certificate is valid. One nobody signed is refused at once, so no peer can hold a height in
+    /// the fetch window with a block on a made-up snapshot.
+    #[test]
+    fn a_fetched_decision_waits_for_its_snapshot_only_with_a_valid_certificate() {
+        let namespace = namespace_for_bft_height(&[], 9, true);
+        let (keys, voting) = four_finalizers(true, namespace);
+        let block = test_block(2);
+        let height = u64::from(block.height);
+        let mut named = template(height, 0x8000_0000);
+        named[..32].copy_from_slice(&block.blake3_hash().0);
+        let decision = |fat_pointer: FatPointerToBftBlock| super::super::bft_sync::WireDecision { height, block: block.clone(), fat_pointer, proposal_sigs: Vec::new() };
+        let signed = decision(certificate(named, &keys, &[0, 1, 2], &namespace));
+        let unsigned = decision(certificate(named, &keys, &[], &namespace));
+        let elsewhere = decision(certificate(template(height, 0x8000_0000), &keys, &[0, 1, 2], &namespace));
+
+        assert_eq!(screen_fetched(&signed, &voting, false, false), FetchedScreen::WaitForSnapshot);
+        assert_eq!(screen_fetched(&signed, &voting, false, true), FetchedScreen::Check);
+        assert_eq!(
+            screen_fetched(&unsigned, &voting, false, false),
+            FetchedScreen::Refused { why: "the fat pointer is not a valid certificate for BFT height 9".to_string(), peer_fault: false },
+        );
+        assert_eq!(
+            screen_fetched(&elsewhere, &voting, false, false),
+            FetchedScreen::Refused { why: "the fat pointer for BFT height 9 names another block".to_string(), peer_fault: true },
+        );
+        // A certificate already checked is not checked again while it waits.
+        assert_eq!(screen_fetched(&unsigned, &voting, true, false), FetchedScreen::WaitForSnapshot);
     }
 
     /// 2f+1 and the strict quorum differ at seven of twelve, the deployed shape.
