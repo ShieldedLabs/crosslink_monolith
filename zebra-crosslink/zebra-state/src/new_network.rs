@@ -846,6 +846,44 @@ fn bft_startup_holding(peers: &HashMap<ConnectionKey, Peer>, our_len: u64, until
         && !(!reported.is_empty() && reported.iter().all(|peer| peer.their_bft_len <= our_len + BFT_CATCH_UP_SLACK))
 }
 
+/// STP connect selectors of earlier releases for the same Noise IK handshake over an X25519 key:
+/// 0.x's `1fgEw5Nx`, which `zebrad generate` of v16 and v17 wrote into every config's
+/// `network_initial_peers`, and 1.0's `11Q8bpGo`. A node's key comes from its seed alone, so it
+/// kept the same key across them, and a peer written with one of them is the same peer under
+/// `CRYPTO_MAGIC`.
+const OLD_CRYPTO_MAGIC1S: [u64; 2] = [0x7193_c304_f8d5, 0xa891_6e3c_54d7];
+
+/// What startup does with one `network_initial_peers` entry.
+#[derive(Debug, PartialEq)]
+enum InitialPeer {
+    Dial(STPAddress),
+    /// Written with an older release's selector for this node's handshake: dialled with the
+    /// current one.
+    Updated(STPAddress),
+    /// Not dialled, and why.
+    Skipped(String),
+}
+
+fn initial_peer(peer_str: &str) -> InitialPeer {
+    let Some(mut address) = STPAddress::parse(peer_str) else {
+        return InitialPeer::Skipped("not an STP address".to_string());
+    };
+    if address.magic1 == CRYPTO_MAGIC {
+        return InitialPeer::Dial(address);
+    }
+    if OLD_CRYPTO_MAGIC1S.contains(&address.magic1) {
+        address.magic1 = CRYPTO_MAGIC;
+        return InitialPeer::Updated(address);
+    }
+    InitialPeer::Skipped(format!(
+        "its selector {} ({}) is not this node's {} ({})",
+        tenderlink::stp::b64(&address.magic1.to_le_bytes()[..6]),
+        tenderlink::stp::crypto_string_from_connect_magic1(address.magic1).unwrap_or("unknown"),
+        tenderlink::stp::b64(&CRYPTO_MAGIC.to_le_bytes()[..6]),
+        tenderlink::stp::crypto_string_from_connect_magic1(CRYPTO_MAGIC).unwrap_or("unknown"),
+    ))
+}
+
 /// Store every fetched decision that is ready: the next height, its snapshot committed. Called
 /// between PoW commits, so a decision lands as soon as its snapshot does and the PoW blocks
 /// citing it find it decided.
@@ -2221,7 +2259,8 @@ pub fn sync(
     let block_response_deadline = block_response_deadline(network_thread_handle.limits().peer_outbox_bytes as u64);
     tracing::info!("NewNet: Bound to port {}", actual_network_local_port);
     // A fresh peer string for other nodes' network_initial_peers (replace the IP with this
-    // node's reachable one). STP 2.0 addresses cannot be reused from 1.x or 0.x configs.
+    // node's reachable one). 1.x and 0.x configs name peers with older selectors, which
+    // `initial_peer` replaces with this one.
     tracing::info!("NewNet: PEER ADDRESS: {:?}", STPAddress::from(std::net::Ipv6Addr::LOCALHOST, actual_network_local_port, &network_keypair));
 
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
@@ -2237,22 +2276,23 @@ pub fn sync(
     // Parse and connect to initial peers
     let mut initial_peer_addresses: Vec<STPAddress> = Vec::new();
     for peer_str in &config.network_initial_peers {
-        if let Some(address) = STPAddress::parse(peer_str) {
-            if address.magic1 != CRYPTO_MAGIC {
-                // @Dev
-                panic!("The magic in the config toml - {} ({}) is different from the crypto magic - {} ({})! Modify one or the other!",
-                        tenderlink::stp::b64(&address.magic1.to_le_bytes()[..6]),
-                        tenderlink::stp::crypto_string_from_connect_magic1(address.magic1).unwrap_or("<invalid>"),
-                        tenderlink::stp::b64(&CRYPTO_MAGIC  .to_le_bytes()[..6]),
-                        tenderlink::stp::crypto_string_from_connect_magic1(CRYPTO_MAGIC).unwrap(),
-                        );
+        let address = match initial_peer(peer_str) {
+            InitialPeer::Dial(address) => address,
+            InitialPeer::Updated(address) => {
+                tracing::warn!(
+                    "NewNet: Initial peer {peer_str} uses an older STP selector; dialling it as {address:?}. \
+                     Update network_initial_peers in your zebrad.toml."
+                );
+                address
             }
-            tracing::info!("NewNet: Connecting to peer: {:?}", address);
-            initiate_connections.push(address.clone());
-            initial_peer_addresses.push(address);
-        } else {
-            tracing::warn!("NewNet: Failed to parse peer address: {}", peer_str);
-        }
+            InitialPeer::Skipped(why) => {
+                tracing::warn!("NewNet: Not dialling initial peer {peer_str}: {why}");
+                continue;
+            }
+        };
+        tracing::info!("NewNet: Connecting to peer: {:?}", address);
+        initiate_connections.push(address.clone());
+        initial_peer_addresses.push(address);
     }
 
     if config.network_connect_only {
@@ -4490,6 +4530,28 @@ mod tests {
         let key = ConnectionKey { ip: std::net::Ipv6Addr::LOCALHOST, port, key_15_bits: 0 };
         let peer = Peer { their_bft_len, bft_answered_at: answered_ago.map(|ago| now - ago), ..Default::default() };
         (key, peer)
+    }
+
+    /// A config written by v16 or v17 names its peers with the 0.x selector. Each is dialled
+    /// with the current selector and the same key, and any other selector is skipped, so the
+    /// node starts either way.
+    #[test]
+    fn initial_peers_with_an_older_selector_are_dialled_with_the_current_one() {
+        // The same feature-net node as `zebrad generate` of v17 wrote it and as dev lists it.
+        let v17 = "[::ffff:45.63.75.9]:12001:1fgEw5Nx:-w4ArAa4esTUBjgig6xIQJ4N8DlwL5aufGMcDPGzPE4";
+        let current = "[::ffff:45.63.75.9]:12001:-fCmrBqp:-w4ArAa4esTUBjgig6xIQJ4N8DlwL5aufGMcDPGzPE4";
+        let address = STPAddress::parse(current).unwrap();
+        assert_eq!(initial_peer(current), InitialPeer::Dial(address.clone()));
+        assert_eq!(initial_peer(v17), InitialPeer::Updated(address.clone()));
+        assert_eq!(initial_peer(&v17.replace("1fgEw5Nx", "11Q8bpGo")), InitialPeer::Updated(address.clone()));
+        assert_eq!(format!("{address:?}"), current);
+
+        // Plaintext, of 1.0 or now, and a selector no release used.
+        for selector in ["Gwn4skNt", "qzmupjQf", "AQAAAAAA"] {
+            let peer = v17.replace("1fgEw5Nx", selector);
+            assert!(matches!(initial_peer(&peer), InitialPeer::Skipped(_)), "{peer}");
+        }
+        assert_eq!(initial_peer("45.63.75.9:12001"), InitialPeer::Skipped("not an STP address".to_string()));
     }
 
     /// Only a peer that has recently answered our requests can hold tenderlink back: a length
