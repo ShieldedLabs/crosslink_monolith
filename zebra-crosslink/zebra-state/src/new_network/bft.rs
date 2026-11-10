@@ -2770,6 +2770,26 @@ mod tests {
         }
     }
 
+    /// A PoW header below logical version 5 carries no fat pointer on the wire in zebra's
+    /// encoding, so librustzcash's must leave it out too: `bc_hdr_to_lrz` then converts it (it
+    /// used to hit EOF and panic), and both encodings give it zebra's block hash, which
+    /// `validate`'s header linkage compares. Mainnet block 1 is version 4; the same header is
+    /// also tried bit-reversed (as some old pools wrote 4) and at versions 5 and 6.
+    #[test]
+    fn a_header_below_version_5_converts_and_hashes_as_zebra_does() {
+        use zebra_chain::{block::Block, serialization::ZcashDeserializeInto};
+        let block: Block = zebra_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into().expect("test vector deserializes");
+        assert_eq!(block.header.version, 4);
+        for version in [4, 4u32.reverse_bits(), 5, 6] {
+            let mut header = (*block.header).clone();
+            header.version = version;
+            let lrz = bc_hdr_to_lrz(&header);
+            assert_eq!(BlockHash::from_header_data(&lrz).0, header.hash().0, "version {version:#x}");
+            assert_eq!(header_from_lrz(&lrz).as_ref(), Ok(&header), "version {version:#x}");
+            assert_eq!(BcBlockHeader::version_has_fat_pointer(lrz.version), version >= 5 && version < 0x1_0000, "version {version:#x}");
+        }
+    }
+
     #[test]
     fn only_the_canonical_encoding_of_a_bft_block_is_accepted() {
         for version in [1, 2] {
