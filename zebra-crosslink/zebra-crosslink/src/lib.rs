@@ -673,6 +673,16 @@ async fn total_issuance_from_key(
     Ok(scan_infos)
 }
 
+/// Whether this node runs a wallet loop to take the requests the wallet RPCs stage: the GUI
+/// wallet, or the headless one unless `crosslink.disable_the_headless_wallet` is set. This is the
+/// choice `zebrad start` makes when it starts the wallet.
+fn runs_a_wallet_loop(config: &config::Config) -> bool {
+    viz2::gui_wallet_state().is_some() || !config.disable_the_headless_wallet
+}
+
+const NO_WALLET_LOOP: &str =
+    "this node runs no wallet (crosslink.disable_the_headless_wallet is set), so it cannot build the transaction";
+
 async fn tfl_service_incoming_request(
     internal_handle: TFLServiceHandle,
     request: TFLServiceRequest,
@@ -695,17 +705,22 @@ async fn tfl_service_incoming_request(
             }))
         }
 
+        TFLServiceRequest::WalletStakingAction(_) if !runs_a_wallet_loop(&internal_handle.config) => {
+            Ok(TFLServiceResponse::WalletStakingAction(Err(NO_WALLET_LOOP.to_string())))
+        }
         TFLServiceRequest::WalletStakingAction(request) => Ok(TFLServiceResponse::WalletStakingAction({
             let rx = {
                 let mut lock = wallet::STAKING_STAGE.lock().unwrap();
-                match *lock {
-                    None => {
-                        let (tx, mut rx) = tokio::sync::oneshot::channel();
+                match &*lock {
+                    Some((_, tx)) if !tx.is_closed() => return Err(zebra_state::crosslink::TFLServiceError::Misc("Another stake in progress, please try again soon".to_string())),
+
+                    // Free, or held by a request whose caller has gone (an RPC client that timed
+                    // out) before the wallet took it. That request is dropped unsent.
+                    _ => {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
                         *lock = Some((request, tx));
                         rx
                     }
-
-                    Some(_) => return Err(zebra_state::crosslink::TFLServiceError::Misc("Another stake in progress, please try again soon".to_string())),
                 }
             };
 
@@ -717,19 +732,23 @@ async fn tfl_service_incoming_request(
 
         // As with staking, only the wallet can fund and build the transaction, so the request is
         // staged for the wallet loop and we wait on the channel it answers with.
+        TFLServiceRequest::WalletBasicSend(..) if !runs_a_wallet_loop(&internal_handle.config) => {
+            Ok(TFLServiceResponse::WalletBasicSend(Err(NO_WALLET_LOOP.to_string())))
+        }
         TFLServiceRequest::WalletBasicSend(value_zats, address) => Ok(TFLServiceResponse::WalletBasicSend({
             let rx = {
                 let mut lock = wallet::BASIC_SEND_STAGE.lock().unwrap();
-                match *lock {
-                    None => {
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        *lock = Some((value_zats, address, tx));
-                        rx
-                    }
-                    Some(_) => {
+                match &*lock {
+                    Some((_, _, tx)) if !tx.is_closed() => {
                         return Err(TFLServiceError::Misc(
                             "Another send in progress, please try again soon".to_string(),
                         ))
+                    }
+                    // As with staking, a request whose caller has gone doesn't hold the stage.
+                    _ => {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        *lock = Some((value_zats, address, tx));
+                        rx
                     }
                 }
             };
@@ -921,4 +940,125 @@ async fn _tfl_dump_block_sequence(
 ) {
     let blocks = tfl_block_sequence(call, anchor, hi_height, lo_height, max_len).await;
     tfl_dump_blocks(&blocks[..]);
+}
+
+#[cfg(test)]
+mod wallet_rpc_tests {
+    //! The wallet RPCs hand their request to the wallet loop through a one-slot stage. These
+    //! tests drive the request handler with no wallet loop behind it.
+
+    use super::*;
+    use crate::service::{
+        BlockFromTemplateProcedure, InboundWireProcedure, MempoolServiceProcedure,
+        ReadStateServiceProcedure, RpcCallProcedure, StateServiceProcedure,
+    };
+    use zcash_primitives::transaction::StakingActionRequest;
+
+    // The stages are process-wide statics, so the tests that use them take turns.
+    static STAGE_TESTS: Mutex<()> = Mutex::new(());
+
+    fn handle(disable_the_headless_wallet: bool) -> TFLServiceHandle {
+        let state: StateServiceProcedure = Arc::new(|_| Box::pin(async { Err("unused".into()) }));
+        let read_state: ReadStateServiceProcedure = Arc::new(|_| Box::pin(async { Err("unused".into()) }));
+        let mempool: MempoolServiceProcedure = Arc::new(|_| Box::pin(async { Err("unused".into()) }));
+        let inbound_wire: InboundWireProcedure = Arc::new(|_, _| Box::pin(async { Err("unused".into()) }));
+        let network = zebra_chain::parameters::Network::new_regtest(Default::default());
+        TFLServiceHandle {
+            internal: Arc::new(TokioMutex::new(TFLServiceInternal {
+                bft_msg_flags: 0,
+                bft_err_flags: 0,
+                our_set_bft_string: None,
+                active_bft_string: None,
+            })),
+            call: TFLServiceCalls {
+                state,
+                read_state,
+                mempool,
+                inbound_wire,
+                block_from_template: Arc::new(std::sync::OnceLock::<BlockFromTemplateProcedure>::new()),
+                rpc_call: Arc::new(std::sync::OnceLock::<RpcCallProcedure>::new()),
+            },
+            config: config::Config { disable_the_headless_wallet, ..Default::default() },
+            params: network.crosslink_parameters(),
+            network,
+        }
+    }
+
+    fn unbond() -> TFLServiceRequest {
+        TFLServiceRequest::WalletStakingAction(StakingActionRequest::BeginDelegationUnbonding {
+            bond_key: PubKeyID([7; 32]),
+        })
+    }
+
+    fn send() -> TFLServiceRequest {
+        TFLServiceRequest::WalletBasicSend(1000, "utest1notparsedhere".to_string())
+    }
+
+    async fn call_for(
+        handle: &TFLServiceHandle,
+        request: TFLServiceRequest,
+        millis: u64,
+    ) -> Result<Result<TFLServiceResponse, TFLServiceError>, tokio::time::error::Elapsed> {
+        tokio::time::timeout(
+            Duration::from_millis(millis),
+            tfl_service_incoming_request(handle.clone(), request),
+        )
+        .await
+    }
+
+    fn clear_stages() {
+        wallet::STAKING_STAGE.lock().unwrap().take();
+        wallet::BASIC_SEND_STAGE.lock().unwrap().take();
+    }
+
+    #[tokio::test]
+    async fn wallet_rpcs_answer_at_once_when_the_headless_wallet_is_disabled() {
+        let _guard = STAGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        clear_stages();
+        let handle = handle(true);
+        for request in [unbond(), send()] {
+            let answer = call_for(&handle, request, 1000).await;
+            clear_stages();
+            match answer {
+                Ok(Ok(TFLServiceResponse::WalletStakingAction(Err(msg))))
+                | Ok(Ok(TFLServiceResponse::WalletBasicSend(Err(msg)))) => {
+                    assert!(msg.contains("disable_the_headless_wallet"), "{msg}")
+                }
+                Err(_) => panic!("no answer within 1 s from a node without a wallet loop"),
+                other => panic!("expected an error answer, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wallet_rpc_whose_caller_gave_up_does_not_lock_out_the_next_call() {
+        let _guard = STAGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        clear_stages();
+        // The wallet is on but hasn't taken the request (still syncing, or busy), and the RPC
+        // client times out and goes away.
+        let handle = handle(false);
+        for request in [unbond, send] {
+            assert!(call_for(&handle, request(), 200).await.is_err(), "nothing answers the first call");
+            // The next call is staged for the wallet as the first one was, not refused.
+            let second = call_for(&handle, request(), 200).await;
+            if let Ok(Err(TFLServiceError::Misc(msg))) = &second {
+                panic!("the abandoned request locks out the next call: {msg:?}");
+            }
+            assert!(second.is_err(), "the second call waits for the wallet like the first: {second:?}");
+
+            // While a caller is still waiting, a third call is refused as before.
+            let waiting = tokio::spawn({
+                let handle = handle.clone();
+                let request = request();
+                async move { call_for(&handle, request, 1000).await }
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                matches!(call_for(&handle, request(), 200).await, Ok(Err(TFLServiceError::Misc(_)))),
+                "a call made while another caller waits is refused"
+            );
+            let _ = waiting.await;
+            clear_stages();
+        }
+    }
 }
