@@ -825,10 +825,7 @@ impl Service<Request> for Mempool {
 
                 for tx in storage.remove_staking_transactions() {
                     let tx_id = tx.id;
-                    if tx_downloads
-                        .download_if_needed_and_verify(tx.into(), None)
-                        .is_err()
-                    {
+                    if tx_downloads.reverify_mempool_transaction(tx).is_err() {
                         invalidated_ids.insert(tx_id);
                     }
                 }
