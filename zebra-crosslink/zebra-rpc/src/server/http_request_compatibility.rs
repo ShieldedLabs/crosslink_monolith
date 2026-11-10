@@ -13,7 +13,6 @@ use jsonrpsee::{
     core::BoxError,
     server::{HttpBody, HttpRequest, HttpResponse},
 };
-use jsonrpsee_types::ErrorObject;
 use serde::{Deserialize, Serialize};
 use tower::Service;
 
@@ -67,6 +66,33 @@ impl<S> HttpRequestMiddleware<S> {
             cookie,
             max_request_body_size,
         }
+    }
+
+    /// The response to a request without a valid auth cookie: HTTP 401 with a `WWW-Authenticate`
+    /// challenge, as bitcoind and zcashd answer, and a JSON-RPC error that says where the cookie is.
+    pub fn unauthenticated_response() -> HttpResponse {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": {
+                "code": 401,
+                "message": "unauthenticated: send the contents of the .cookie file in the RPC \
+                            cookie_dir as HTTP basic auth (curl --user \"$(cat .cookie)\"), or set \
+                            enable_cookie_auth = false under [rpc]",
+            },
+        });
+        let mut response = HttpResponse::new(HttpBody::from(body.to_string()));
+        *response.status_mut() = hyper::StatusCode::UNAUTHORIZED;
+        let headers = response.headers_mut();
+        headers.insert(
+            header::WWW_AUTHENTICATE,
+            header::HeaderValue::from_static("Basic realm=\"jsonrpc\""),
+        );
+        headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+        response
     }
 
     /// Check if the request is authenticated.
@@ -221,9 +247,11 @@ where
     fn call(&mut self, mut request: HttpRequest<HttpBody>) -> Self::Future {
         // Check if the request is authenticated
         if !self.check_credentials(request.headers_mut()) {
-            let error = ErrorObject::borrowed(401, "unauthenticated method", None);
-            // TODO: Error object is not being returned to the user but an empty response.
-            return future::err(BoxError::from(error)).boxed();
+            // Answer with a real HTTP 401 rather than an error: an error from this service makes
+            // the server drop the connection without a response, so a client that does not send
+            // the cookie (any script or pool written before cookie auth became the default) sees
+            // only "empty reply from server" and no hint about what is missing.
+            return future::ok(Self::unauthenticated_response()).boxed();
         }
 
         // Fix the request headers.
