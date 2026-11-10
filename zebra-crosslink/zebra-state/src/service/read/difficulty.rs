@@ -407,13 +407,50 @@ mod tests {
     use zebra_chain::parameters::POST_BLOSSOM_POW_TARGET_SPACING as SPACING;
     use zebra_chain::work::difficulty::ParameterDifficulty as _;
 
-    // A Testnet height at which the minimum-difficulty rule is active (>= 299188) and the
-    // target spacing is the post-Blossom one, so the minimum-difficulty gap is 6 * SPACING
-    // (150s at this fork's 25s spacing). Derived from the constant rather than written out,
-    // so lowering the block time again can't leave these tests asserting the wrong boundary.
+    // A Testnet height at which the minimum-difficulty rule is active (>= 299188, on
+    // `min_difficulty_testnet`) and the target spacing is the post-Blossom one, so the
+    // minimum-difficulty gap is 6 * SPACING (150s at this fork's 25s spacing). Derived from the
+    // constant rather than written out, so lowering the block time again can't leave these tests
+    // asserting the wrong boundary.
     const ACTIVE_HEIGHT: Height = Height(2_000_000);
     const PREV: u32 = 1_600_000_000;
     const GAP: u32 = 6 * SPACING;
+
+    /// Stock Testnet parameters with FeaturenetUpgrade2 moved above `ACTIVE_HEIGHT`.
+    ///
+    /// No block gets the minimum-difficulty exemption once FeaturenetUpgrade2 is active, and the
+    /// built-in Testnet schedules it at 165,000, below the rule's start height (299,188), so the
+    /// rule never applies there (see `default_testnet_is_a_no_op`). These parameters keep the
+    /// rule active at `ACTIVE_HEIGHT`, so the template adjustment itself can be tested.
+    fn min_difficulty_testnet() -> Network {
+        use zebra_chain::parameters::testnet;
+
+        let Network::Testnet(stock) = Network::new_default_testnet() else {
+            unreachable!("the default testnet is a Testnet");
+        };
+        let mut heights = testnet::ConfiguredActivationHeights::from(stock.activation_heights());
+        let last_scheduled = stock
+            .activation_heights()
+            .keys()
+            .last()
+            .expect("Testnet has upgrades")
+            .0;
+        // Above the candidate height too: templates check the rule at the tip's height, the
+        // difficulty at the candidate's (`ACTIVE_HEIGHT + 1`).
+        heights.featurenet_upgrade_2 = Some(last_scheduled.max(ACTIVE_HEIGHT.0 + 1) + 1);
+        let network = testnet::Parameters::build()
+            .with_activation_heights(heights)
+            .expect("valid activation heights")
+            .to_network()
+            .expect("valid parameters");
+        for height in [ACTIVE_HEIGHT, Height(ACTIVE_HEIGHT.0 + 1)] {
+            assert!(
+                NetworkUpgrade::minimum_difficulty_spacing_for_height(&network, height).is_some(),
+                "the minimum-difficulty rule must be active at {height:?} on these parameters"
+            );
+        }
+        network
+    }
 
     /// Recent block difficulties and times in reverse order from the tip, with the most
     /// recent (first) block time equal to `PREV`. The difficulty thresholds are irrelevant
@@ -446,7 +483,7 @@ mod tests {
     /// with `cur_time` clamped up to `PREV + GAP + 1`.
     #[test]
     fn eager_window_stays_standard_difficulty_and_is_not_future_dated() {
-        let network = Network::new_default_testnet();
+        let network = min_difficulty_testnet();
         let cur = PREV + GAP - SPACING;
         let mut result = chain_info(cur);
 
@@ -468,7 +505,7 @@ mod tests {
     /// A candidate time strictly past `PREV + GAP` switches to a minimum-difficulty template.
     #[test]
     fn past_the_threshold_switches_to_minimum_difficulty() {
-        let network = Network::new_default_testnet();
+        let network = min_difficulty_testnet();
         let cur = PREV + GAP + 2 * SPACING;
         let mut result = chain_info(cur);
 
@@ -492,7 +529,7 @@ mod tests {
     /// The gap is a strict `>`: exactly `PREV + GAP` is standard, `PREV + GAP + 1` is minimum.
     #[test]
     fn threshold_is_inclusive_for_standard_difficulty() {
-        let network = Network::new_default_testnet();
+        let network = min_difficulty_testnet();
 
         let mut at_threshold = chain_info(PREV + GAP);
         adjust_difficulty_and_time_for_testnet(
@@ -540,6 +577,37 @@ mod tests {
             result.max_time,
             DateTime32::from(PREV + BLOCK_MAX_TIME_SINCE_MEDIAN)
         );
+    }
+
+    /// On the built-in Testnet, FeaturenetUpgrade2 (165,000) is active below the rule's start
+    /// height, so the adjustment is a no-op at every height above it, including `ACTIVE_HEIGHT`:
+    /// templates never offer a minimum-difficulty time, matching the consensus check.
+    #[test]
+    fn default_testnet_is_a_no_op() {
+        let network = Network::new_default_testnet();
+        assert_eq!(
+            NetworkUpgrade::minimum_difficulty_spacing_for_height(&network, ACTIVE_HEIGHT),
+            None
+        );
+
+        for cur in [PREV + GAP - SPACING, PREV + GAP + 2 * SPACING] {
+            let mut result = chain_info(cur);
+
+            adjust_difficulty_and_time_for_testnet(
+                &mut result,
+                &network,
+                ACTIVE_HEIGHT,
+                recent_block_data(&network),
+            );
+
+            assert_eq!(result.expected_difficulty, CompactDifficulty::default());
+            assert_eq!(result.cur_time, DateTime32::from(cur));
+            assert_eq!(result.min_time, DateTime32::from(PREV - 100));
+            assert_eq!(
+                result.max_time,
+                DateTime32::from(PREV + BLOCK_MAX_TIME_SINCE_MEDIAN)
+            );
+        }
     }
 
     /// Below `TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT` (299188) the rule is inactive, so the

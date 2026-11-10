@@ -19,7 +19,7 @@ use zebra_chain::{
             large_multi_transaction_block, large_single_transaction_block_many_inputs,
             large_single_transaction_block_many_outputs,
         },
-        Block, Height,
+        Block, Height, MAX_BLOCK_BYTES,
     },
     parameters::Network::{self, *},
     serialization::{ZcashDeserializeInto, ZcashSerialize},
@@ -40,9 +40,22 @@ fn test_block_db_round_trip() {
     let mainnet_test_cases = MAINNET_BLOCKS
         .values()
         .map(|block| block.zcash_deserialize_into().unwrap());
-    let testnet_test_cases = TESTNET_BLOCKS
-        .values()
-        .map(|block| block.zcash_deserialize_into().unwrap());
+
+    // Crosslink lowers `MAX_BLOCK_BYTES` to 100 kB until the block size returns to normal (#168),
+    // so the parser refuses the ~2 MB Testnet block 141042. Check that it does, and round-trip
+    // the vectors that fit.
+    let (testnet_vectors, oversized_testnet_vectors): (Vec<_>, Vec<_>) = TESTNET_BLOCKS
+        .iter()
+        .partition(|(_height, block)| block.len() as u64 <= MAX_BLOCK_BYTES);
+    for (height, block) in oversized_testnet_vectors {
+        assert!(
+            block.zcash_deserialize_into::<Block>().is_err(),
+            "Testnet block {height} is larger than MAX_BLOCK_BYTES, so it must not parse"
+        );
+    }
+    let testnet_test_cases = testnet_vectors
+        .into_iter()
+        .map(|(_height, block)| block.zcash_deserialize_into().unwrap());
 
     test_block_db_round_trip_with(&Mainnet, mainnet_test_cases);
     test_block_db_round_trip_with(&Network::new_default_testnet(), testnet_test_cases);

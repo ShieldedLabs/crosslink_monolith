@@ -26,6 +26,7 @@ use crate::{
     CheckpointVerifiedBlock,
     ValidateContextError::{
         DuplicateOrchardNullifier, DuplicateSaplingNullifier, DuplicateSproutNullifier,
+        DuplicateTransaction,
     },
 };
 
@@ -1133,15 +1134,15 @@ proptest! {
 
     /// A block whose sapling-shielded transaction has the same hash as one
     /// already present in the **non-finalized** part of the chain must be
-    /// rejected with `DuplicateSaplingNullifier` — not panic.
+    /// rejected — not panic.
     ///
     /// This is the BIP30-style duplicate-txid scenario where the prior
     /// occurrence lives in the non-finalized chain (so the
     /// `no_duplicates_in_finalized_chain` check in `initial_contextual_validity`
-    /// cannot catch it). The fix in
-    /// `zebra-state/src/service/non_finalized_state/chain.rs` runs the
-    /// shielded nullifier check before the `tx_loc_by_hash` assertion,
-    /// so the duplicate is rejected via the existing nullifier check.
+    /// cannot catch it). Upstream rejects it through the shielded nullifier check
+    /// (`DuplicateSaplingNullifier`). Crosslink's `transactions_are_new_to_chain` runs
+    /// first and refuses any repeated transaction, including ones with no spends (#260),
+    /// so the block is rejected with `DuplicateTransaction` naming block 1.
     #[test]
     fn reject_block_containing_sapling_tx_already_in_non_finalized_chain(
         spend in TypeNameToDebug::<sapling::Spend<PerSpendAnchor>>::arbitrary(),
@@ -1156,8 +1157,6 @@ proptest! {
             .zcash_deserialize_into::<Block>()
             .expect("block should deserialize");
 
-        let expected_duplicate_nullifier = spend.nullifier;
-
         let transaction = Arc::new(transaction_v4_with_sapling_shielded_data(
             sapling_shielded_data.0,
             [spend.0],
@@ -1167,6 +1166,7 @@ proptest! {
         block2.transactions[0] = transaction_v4_from_coinbase(&block2.transactions[0]).into();
 
         // Push the same Arc into both blocks so they share a tx hash.
+        let duplicate_hash = transaction.hash();
         block1.transactions.push(transaction.clone());
         block2.transactions.push(transaction);
 
@@ -1194,8 +1194,9 @@ proptest! {
 
         prop_assert_eq!(
             commit_result,
-            Err(DuplicateSaplingNullifier {
-                nullifier: expected_duplicate_nullifier,
+            Err(DuplicateTransaction {
+                transaction_hash: duplicate_hash,
+                prior_height: Height(1),
                 in_finalized_state: false,
             })
         );

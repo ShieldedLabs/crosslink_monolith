@@ -12,13 +12,18 @@ fn ensure_timing_consistent() {
         "a mempool crawl should complete before most new blocks"
     );
 
-    // The default peer crawler interval should be at least
-    // `HANDSHAKE_TIMEOUT` lower than all other crawler intervals.
-    //
-    // See `DEFAULT_CRAWL_NEW_PEER_INTERVAL` for details.
+    // Upstream also requires the default peer crawler interval to be at least
+    // `HANDSHAKE_TIMEOUT` lower than this crawler's interval (see
+    // `DEFAULT_CRAWL_NEW_PEER_INTERVAL`). With Crosslink's 25 s blocks the mempool crawler
+    // runs every 17 s, to stay under the block spacing (checked above), so it is meant to run
+    // several times per 61 s peer crawl. What still holds is that a crawl interval leaves
+    // room for a peer handshake.
     assert!(
-        DEFAULT_CRAWL_NEW_PEER_INTERVAL.as_secs() + HANDSHAKE_TIMEOUT.as_secs()
-            < RATE_LIMIT_DELAY.as_secs(),
-        "an address crawl and peer connections should complete before most syncer restarts"
+        HANDSHAKE_TIMEOUT.as_secs() < RATE_LIMIT_DELAY.as_secs(),
+        "a peer handshake should complete within one mempool crawl interval"
+    );
+    assert!(
+        RATE_LIMIT_DELAY < DEFAULT_CRAWL_NEW_PEER_INTERVAL,
+        "the mempool crawler runs more often than the peer address crawler"
     );
 }
