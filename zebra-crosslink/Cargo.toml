@@ -199,7 +199,7 @@ allow-branch = ["main"]
 # Compilation settings
 
 [profile.dev]
-panic = "abort"
+panic = "unwind"
 # Line tables only: backtraces and stepping work, but locals cannot be inspected. Crates
 # that are debugged often opt back into full debug info below; to opt another one in for
 # yourself, pass --config 'profile.dev.package.<crate>.debug=true' or set it in
