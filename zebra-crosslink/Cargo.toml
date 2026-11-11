@@ -300,6 +300,14 @@ lto = "thin"
 # inherits = "release"
 
 
+# Optimized builds for iterating on code that needs optimization, with `--profile release-iter`.
+# Without LTO and with incremental compilation, an edit rebuilds in about the time a debug
+# build takes, instead of re-running thin LTO over the whole program. Ship `release` builds.
+[profile.release-iter]
+inherits = "release"
+lto = "off"
+incremental = true
+
 [workspace.lints.rust]
 # The linter should ignore these expected config flags/values
 unexpected_cfgs = { level = "warn", check-cfg = [
