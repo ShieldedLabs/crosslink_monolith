@@ -208,7 +208,7 @@ pub type NetworkCheckpoint = (u32, block::Hash);
 
 /// The built-in lite checkpoint: a featurenet block, the default for `network_checkpoint`.
 pub fn featurenet_checkpoint() -> NetworkCheckpoint {
-    (115014, "000068d97d552a99dbf1bc327e1a9be7a0aeeda45c1b537a5433e3c7fce8e320".parse().expect("valid checkpoint hash"))
+    (125202, "000055cc297557ecec82269320a987d4431a16e05e6f86878c9ef90028eda120".parse().expect("valid checkpoint hash"))
 }
 
 // the on-disk shape; `height = 0, hash = ""` (exactly that pair) means disabled.
