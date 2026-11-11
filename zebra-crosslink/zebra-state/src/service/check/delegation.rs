@@ -154,11 +154,12 @@ impl InBlockBonds {
         // The target finalizer is a capability: the address embeds the
         // finalizer key's signature over the standard message, and an action
         // whose signature doesn't verify is consensus-invalid. This is what
-        // stops stake being pointed at a key nobody controls. Retarget's
-        // `from_finalizer` must verify too.
+        // stops stake being pointed at a key nobody controls, and from
+        // FeaturenetUpgrade3 at a small-order key everybody can sign for.
+        // Retarget's `from_finalizer` must verify too.
         for addr in [staking_action.target_finalizer_address(), staking_action.from_finalizer_address()] {
             if let Some(addr) = addr {
-                if !addr.verify() {
+                if !addr.verify_at(&non_finalized_chain.network(), height.0) {
                     return Err(ValidateContextError::InvalidDelegationBond(format!(
                         "invalid finalizer address capability: {:?}",
                         addr.pub_key
@@ -824,6 +825,64 @@ mod tests {
             amount_zats: 1500, finalizer_signature: [0; 64],
         };
         assert!(convert.amount_is_valid_at(&network, ACTIVATION));
+    }
+
+    /// Under ZIP 215 verification a small-order key accepts the all-zero signature over every
+    /// message, so the identity key with that signature is a finalizer address that verifies and
+    /// that everyone can sign for. From FeaturenetUpgrade3 a bond may not point at it, and its
+    /// signature authorizes no reward conversion. Before the upgrade both pass, as they always did.
+    #[test]
+    fn a_small_order_finalizer_key_is_refused_from_featurenet_upgrade_3() {
+        use zcash_primitives::{
+            bft::{finalizer_key_from_seed, sign_finalizer_reward_conversion, verify_finalizer_reward_conversion_at, FinalizerAddress, PubKeyID, TMSig},
+            transaction::StakingAction,
+        };
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+        use zebra_chain::parameters::testnet::{ConfiguredActivationHeights, RegtestParameters};
+
+        let network = Network::new_regtest(RegtestParameters::from(ConfiguredActivationHeights {
+            featurenet_upgrade_3: Some(CREATED + 50),
+            ..Default::default()
+        }));
+        let activation = u32::from(network.activation_height(NetworkUpgrade::FeaturenetUpgrade3).unwrap());
+
+        // The identity point's encoding, and the signature R = identity, s = 0.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut forged = [0u8; 64];
+        forged[0] = 1;
+        let small_order = FinalizerAddress { pub_key: PubKeyID(identity), sig: TMSig(forged) };
+        assert!(small_order.verify());
+        assert!(small_order.pub_key.is_small_order());
+        let (finalizer_key, _) = finalizer_key_from_seed(b"target");
+        let honest = FinalizerAddress::create(&finalizer_key);
+        assert!(!honest.pub_key.is_small_order());
+
+        for (height, refused) in [(activation - 1, false), (activation, true)] {
+            assert_eq!(small_order.verify_at(&network, height), !refused, "height {height}");
+            assert!(honest.verify_at(&network, height), "height {height}");
+            assert_eq!(verify_finalizer_reward_conversion_at(&network, height, PubKeyID(identity), &[9; 32], 1, &forged), !refused, "height {height}");
+            let signed = sign_finalizer_reward_conversion(&finalizer_key, &[9; 32], 1);
+            assert!(verify_finalizer_reward_conversion_at(&network, height, honest.pub_key, &[9; 32], 1, &signed), "height {height}");
+        }
+
+        let finalized_state = finalized_state();
+        let chain = Chain::new(
+            &network,
+            Height(CREATED),
+            NoteCommitmentTrees::default(),
+            Default::default(),
+            ValueBalance::zero(),
+            [(KEY, bond(), BondStatus::Active)],
+            std::iter::empty(),
+        );
+        let create = |target_finalizer| StakingAction::CreateNewDelegationBond {
+            amount_zats: 1000, unique_pubkey: [2; 32], bond_salt: [0; 32], target_finalizer, signature: [0; 64],
+        };
+        let invalid_at = |height, target| invalid_in_order(&[create(target)], Height(height), &chain, &finalized_state.db);
+        assert_eq!(invalid_at(activation - 1, small_order), Vec::<usize>::new());
+        assert_eq!(invalid_at(activation, small_order), vec![0]);
+        assert_eq!(invalid_at(activation, honest), Vec::<usize>::new());
     }
 
     /// A second withdrawal of one bond in a block must be rejected here: the commit expects each

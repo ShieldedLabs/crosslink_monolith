@@ -2304,6 +2304,12 @@ impl ManualWallet {
             println!("stake_ironwood_to_finalizer: invalid finalizer address capability");
             return None;
         }
+        // Consensus takes a small-order key until FeaturenetUpgrade3, but anyone can sign for
+        // it: vote with the stake and convert its commission.
+        if target_finalizer.pub_key.is_small_order() {
+            println!("stake_ironwood_to_finalizer: the finalizer address has a key anyone can sign for");
+            return None;
+        }
         // From FeaturenetUpgrade1 consensus only accepts new bonds of a power of 10 zats.
         if !zcash_primitives::transaction::is_power_of_10(exact_amount_to_send) {
             println!("stake_ironwood_to_finalizer: bond amount {exact_amount_to_send} zats is not a power of 10");
@@ -2409,6 +2415,10 @@ impl ManualWallet {
         let tz = Timer::scope("begin_unbonding_using_ironwood");
         if !new_target.verify() {
             println!("retarget_bond_using_ironwood: invalid finalizer address capability");
+            return None;
+        }
+        if new_target.pub_key.is_small_order() {
+            println!("retarget_bond_using_ironwood: the finalizer address has a key anyone can sign for");
             return None;
         }
         let signing_key = self.bond_signing_key(bond_key, src_usk.bond())?;

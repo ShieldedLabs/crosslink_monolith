@@ -513,7 +513,7 @@ where
             let params = network.crosslink_parameters();
             let staking = params.staking;
             check_staking_day_window(&tx, height, &params)?;
-            check_staking_target_capability(&tx)?;
+            check_staking_target_capability(&tx, height, &network)?;
 
             tracing::trace!(?tx_id, "passed quick checks");
 
@@ -949,15 +949,16 @@ fn check_staking_action_delay(
 
 /// Checks that a staking action's target finalizer address, when it carries one,
 /// is a valid capability: the address embeds the finalizer key's signature over
-/// the standard message. Stateless, so it runs for mempool and block paths alike.
-fn check_staking_target_capability(tx: &Transaction) -> Result<(), TransactionError> {
+/// the standard message, and from FeaturenetUpgrade3 its key is not one anyone can sign for.
+/// Needs only the height, so it runs for mempool and block paths alike.
+fn check_staking_target_capability(tx: &Transaction, height: block::Height, network: &Network) -> Result<(), TransactionError> {
     if let Some(staking_action) = tx.staking_action() {
         // Retarget's claimed current target must be a valid capability too;
         // whether it matches the bond's actual target is a contextual check
         // in zebra-state (validate_delegation_bonds).
         for addr in [staking_action.target_finalizer_address(), staking_action.from_finalizer_address()] {
             if let Some(addr) = addr {
-                if !addr.verify() {
+                if !addr.verify_at(network, height.0) {
                     return Err(TransactionError::StakingActionInvalidFinalizerAddress {
                         pub_key: addr.pub_key.0,
                     });
@@ -973,8 +974,8 @@ fn check_staking_target_capability(tx: &Transaction) -> Result<(), TransactionEr
         if let zcash_primitives::transaction::StakingAction::ConvertFinalizerRewardToDelegationBond {
             unique_pubkey, this_finalizer, amount_zats, finalizer_signature, ..
         } = staking_action {
-            let ok = zcash_primitives::bft::verify_finalizer_reward_conversion(
-                zcash_primitives::bft::PubKeyID(*this_finalizer), unique_pubkey, *amount_zats, finalizer_signature);
+            let ok = zcash_primitives::bft::verify_finalizer_reward_conversion_at(
+                network, height.0, zcash_primitives::bft::PubKeyID(*this_finalizer), unique_pubkey, *amount_zats, finalizer_signature);
             if !ok {
                 return Err(TransactionError::StakingActionFinalizerAuthorizationInvalid {
                     finalizer: *this_finalizer,
@@ -1066,7 +1067,7 @@ pub fn check_block_transaction(
 
     // The target finalizer address must be a valid capability (its embedded
     // signature verifies); the state contextual check enforces the same rule on blocks.
-    check_staking_target_capability(tx)?;
+    check_staking_target_capability(tx, height, network)?;
 
     check_structure_and_network_rules(tx, height, network)?;
 

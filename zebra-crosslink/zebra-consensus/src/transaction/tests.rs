@@ -5066,6 +5066,49 @@ mod staking_signature {
         }
     }
 
+    /// The same holds for a finalizer key: the identity key with the signature R = identity,
+    /// s = 0 is a finalizer address that verifies, and that signature authorizes any reward
+    /// conversion. From FeaturenetUpgrade3 the transaction verifier refuses both; before it they
+    /// pass, as they always did.
+    #[test]
+    fn small_order_finalizer_keys_are_refused_from_featurenet_upgrade_3() {
+        use zebra_chain::parameters::{testnet::ConfiguredActivationHeights, Network};
+
+        let network = Network::new_regtest(
+            ConfiguredActivationHeights { featurenet_upgrade_3: Some(150), ..Default::default() }.into(),
+        );
+        let activation = NetworkUpgrade::FeaturenetUpgrade3.activation_height(&network).expect("scheduled on this regtest");
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut forged = [0u8; 64];
+        forged[0] = 1;
+
+        let (create, _) = create_action([0xa1; 32]);
+        let StakingAction::CreateNewDelegationBond { amount_zats, unique_pubkey, bond_salt, signature, .. } = create else {
+            unreachable!("create_action builds a create")
+        };
+        let to_small_order = tx_with(Some(StakingAction::CreateNewDelegationBond {
+            amount_zats, unique_pubkey, bond_salt, signature,
+            target_finalizer: FinalizerAddress { pub_key: PubKeyID(identity), sig: TMSig(forged) },
+        }));
+        let converted_by_anyone = tx_with(Some(StakingAction::ConvertFinalizerRewardToDelegationBond {
+            unique_pubkey, signature, bond_salt, this_finalizer: identity, amount_zats, finalizer_signature: forged,
+        }));
+
+        let before = block::Height(activation.0 - 1);
+        for tx in [&to_small_order, &converted_by_anyone] {
+            assert!(crate::transaction::check_staking_target_capability(tx, before, &network).is_ok());
+        }
+        assert!(matches!(
+            crate::transaction::check_staking_target_capability(&to_small_order, activation, &network),
+            Err(TransactionError::StakingActionInvalidFinalizerAddress { pub_key }) if pub_key == identity
+        ));
+        assert!(matches!(
+            crate::transaction::check_staking_target_capability(&converted_by_anyone, activation, &network),
+            Err(TransactionError::StakingActionFinalizerAuthorizationInvalid { finalizer }) if finalizer == identity
+        ));
+    }
+
     #[test]
     fn transactions_without_a_staking_action_are_not_checked() {
         assert!(check(&tx_with(None)).is_ok());
