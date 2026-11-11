@@ -5,6 +5,7 @@
 //! stored: it is recomputed from the bonds at each block's snapshot, so a node can never load a
 //! validator set that disagrees with the votes, which travel by roster index (FINALITY.md §8.1).
 
+use tenderlink::{BlockValue, TMLock};
 use zcash_primitives::bft::{BftBlock, FatPointerToBftBlock, TMSig};
 
 use crate::service::finalized_state::disk_format::{FromDisk, IntoDisk};
@@ -101,5 +102,54 @@ impl FromDisk for ProposalSignatures {
             sigs.push(TMSig(bytes[offset..offset + 64].try_into().unwrap()));
         }
         ProposalSignatures(sigs)
+    }
+}
+
+/// The key of the single lock row.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct BftLockKey;
+
+impl IntoDisk for BftLockKey {
+    type Bytes = [u8; 1];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        [0]
+    }
+}
+
+impl FromDisk for BftLockKey {
+    fn from_bytes(_bytes: impl AsRef<[u8]>) -> Self {
+        BftLockKey
+    }
+}
+
+/// The finalizer's lock: the value it last precommitted, the height and the round. Node-local
+/// like `fin`, and kept for the same reason: a finalizer that forgot it after a restart could
+/// prevote another value at a height where it already precommitted one. Big-endian height and
+/// round, then the value's bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredBftLock(pub TMLock);
+
+impl IntoDisk for StoredBftLock {
+    type Bytes = Vec<u8>;
+
+    fn as_bytes(&self) -> Self::Bytes {
+        let mut bytes = Vec::with_capacity(12 + self.0.value.0.len());
+        bytes.extend_from_slice(&self.0.height.to_be_bytes());
+        bytes.extend_from_slice(&self.0.round.to_be_bytes());
+        bytes.extend_from_slice(&self.0.value.0);
+        bytes
+    }
+}
+
+impl FromDisk for StoredBftLock {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        let bytes = bytes.as_ref();
+        assert!(bytes.len() >= 12, "a stored BFT lock has at least 12 bytes");
+        StoredBftLock(TMLock {
+            height: u64::from_be_bytes(bytes[0..8].try_into().expect("8 bytes")),
+            round: u32::from_be_bytes(bytes[8..12].try_into().expect("4 bytes")),
+            value: BlockValue(bytes[12..].to_vec()),
+        })
     }
 }

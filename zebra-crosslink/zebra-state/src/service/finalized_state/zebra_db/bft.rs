@@ -1,12 +1,13 @@
 //! Decided BFT chain database access and write methods.
 
+use tenderlink::TMLock;
 use zcash_primitives::bft::{BftBlock, FatPointerToBftBlock, TMSig};
 
 use zebra_chain::block::{self, Height};
 
 use crate::service::finalized_state::{
     disk_db::DiskWriteBatch,
-    disk_format::bft::{BftHeight, ProposalSignatures, StoredBftBlock, StoredFatPointer},
+    disk_format::bft::{BftHeight, BftLockKey, ProposalSignatures, StoredBftBlock, StoredBftLock, StoredFatPointer},
     disk_format::fin::{FinKey, FinMarker},
     zebra_db::ZebraDb,
     TypedColumnFamily,
@@ -23,6 +24,12 @@ pub const BFT_PROPOSAL_SIGS_BY_HEIGHT: &str = "bft_proposal_sigs_by_height";
 
 /// The name of the column family recording that this database dropped BFT.
 pub const CROSSLINK_BFT_DROPPED: &str = "crosslink_bft_dropped";
+
+/// The name of the finalizer's lock column family (one row).
+pub const BFT_LOCK: &str = "bft_lock";
+
+/// The type for reading the finalizer's lock from the database.
+pub type BftLockCf<'cf> = TypedColumnFamily<'cf, BftLockKey, StoredBftLock>;
 
 /// The type for reading decided BFT blocks from the database.
 pub type BftBlockByHeightCf<'cf> = TypedColumnFamily<'cf, BftHeight, StoredBftBlock>;
@@ -63,6 +70,27 @@ impl ZebraDb {
     fn crosslink_bft_dropped_cf(&self) -> CrosslinkBftDroppedCf<'_> {
         CrosslinkBftDroppedCf::new(&self.db, CROSSLINK_BFT_DROPPED)
             .expect("column family was created when database was created")
+    }
+
+    fn bft_lock_cf(&self) -> BftLockCf<'_> {
+        BftLockCf::new(&self.db, BFT_LOCK)
+            .expect("column family was created when database was created")
+    }
+
+    /// The lock this finalizer last stored, at whatever height it was taken.
+    pub fn bft_lock(&self) -> Option<TMLock> {
+        self.bft_lock_cf().zs_get(&BftLockKey).map(|stored| stored.0)
+    }
+
+    /// Replace the stored lock. Tenderlink asks for this before each value precommit and does
+    /// not precommit until it succeeds.
+    pub fn write_bft_lock(&self, lock: &TMLock) -> Result<(), rocksdb::Error> {
+        let mut batch = DiskWriteBatch::new();
+        // zs_insert writes into the batch and returns it; the batch is committed below.
+        let _ = self.bft_lock_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_insert(&BftLockKey, &StoredBftLock(lock.clone()));
+        self.db.write(batch)
     }
 
     /// The decided BFT chain, ascending from height 0. Stops at the first gap: a crash before
@@ -170,5 +198,54 @@ impl ZebraDb {
             .with_batch_for_writing(&mut batch)
             .zs_insert(&FinKey, &FinMarker { height, hash });
         self.db.write(batch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tenderlink::{BlockValue, TMLock};
+    use zebra_chain::parameters::Network;
+
+    use crate::{
+        constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
+        service::finalized_state::{ZebraDb, STATE_COLUMN_FAMILIES_IN_CODE},
+        Config,
+    };
+
+    fn open(cache_dir: &std::path::Path) -> ZebraDb {
+        let config = Config { cache_dir: cache_dir.to_path_buf(), ephemeral: false, ..Config::default() };
+        ZebraDb::new(
+            &config,
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &Network::Mainnet,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE.iter().map(ToString::to_string),
+            false,
+        )
+        .expect("opening the database should succeed")
+    }
+
+    /// The lock is what a finalizer must not forget across a restart, so it has to come back from
+    /// a database that was closed and opened again, and the newest one wins.
+    #[test]
+    fn the_bft_lock_survives_reopening_the_database() {
+        let _init_guard = zebra_test::init();
+        let cache_dir = tempfile::tempdir().expect("creating a temporary directory should succeed");
+        let first = TMLock { height: 7, round: 3, value: BlockValue((0..2000u32).map(|i| i as u8).collect()) };
+        let second = TMLock { height: 8, round: 0, value: BlockValue(vec![9; 17]) };
+
+        let db = open(cache_dir.path());
+        assert_eq!(db.bft_lock(), None);
+        db.write_bft_lock(&first).expect("writing the lock should succeed");
+        drop(db);
+
+        let db = open(cache_dir.path());
+        assert_eq!(db.bft_lock(), Some(first));
+        db.write_bft_lock(&second).expect("writing the lock should succeed");
+        drop(db);
+
+        let db = open(cache_dir.path());
+        assert_eq!(db.bft_lock(), Some(second));
     }
 }

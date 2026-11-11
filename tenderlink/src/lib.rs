@@ -203,6 +203,18 @@ pub struct ClosureToAccessBft(pub Arc<dyn for<'a> Fn(&'a TMState, &'a BftAddress
 impl std::fmt::Debug for ClosureToAccessBft {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToAccessBft(..)") }
 }
+/// Stores the finalizer's lock durably and answers whether it did. The engine awaits it before it
+/// precommits a value, so a restart can never come back without a lock it has precommitted under
+/// (see [`TMLock`]); on `false` it does not precommit and asks again on the next update.
+#[derive(Clone)]
+pub struct ClosureToStoreLock(pub Arc<dyn Fn(TMLock) -> core::pin::Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>);
+impl std::fmt::Debug for ClosureToStoreLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToStoreLock(..)") }
+}
+impl ClosureToStoreLock {
+    /// For an engine nobody restarts from storage (tests, the simulator).
+    pub fn none() -> Self { Self(Arc::new(|_| Box::pin(async { true }))) }
+}
 
 fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMember]) -> FatPointerToBftBlock {
     let vote_for_block_without_finalizer_public_key: [u8; 76 - 32];
@@ -685,6 +697,15 @@ pub fn decision_threshold(total_stake: u64, strict_quorum: bool) -> u64 {
 }
 
 
+/// What a finalizer has to keep across a restart so that it never prevotes against its own
+/// precommit: the value it locked at `height` and the round it locked it in (Tendermint's
+/// lockedValue and lockedRound). The engine changes it only where it precommits a value (line 36).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TMLock {
+    pub height: u64,
+    pub round: u32,
+    pub value: BlockValue,
+}
 
 #[derive(Debug)]
 pub struct TMState {
@@ -729,6 +750,10 @@ pub struct TMState {
 
     update_peers_cmd_closure: ClosureToUpdatePeers,
     bft_access_closure: ClosureToAccessBft,
+    store_lock_closure: ClosureToStoreLock,
+    /// A lock restored for a height this node has not reached yet (storage replayed less than it
+    /// had decided); taken up when it gets there.
+    pending_lock: Option<TMLock>,
 }
 
 impl TMState {
@@ -763,7 +788,29 @@ impl TMState {
             push_block_closure,
             update_peers_cmd_closure,
             bft_access_closure,
+            store_lock_closure: ClosureToStoreLock::none(),
+            pending_lock: None,
         }
+    }
+
+    /// The lock this finalizer holds at the current height, if any.
+    pub fn lock(&self) -> Option<TMLock> {
+        let (Some(value), round) = &self.locked_value_round else { return None; };
+        Some(TMLock { height: self.height, round: u32::try_from(*round).ok()?, value: value.clone() })
+    }
+
+    /// Takes back the lock this finalizer held before a restart; call before the first round
+    /// starts. A lock for a later height is held until the engine reaches it; one for an earlier
+    /// height is spent and dropped. The locked value is also what this node proposes, cited as fresh
+    /// (-1): the prevotes that would let it cite the lock round did not survive the restart, and a
+    /// fresh proposal of the locked value is one every finalizer locked on it prevotes (line 22).
+    pub fn restore_lock(&mut self, lock: TMLock) {
+        if lock.height > self.height { self.pending_lock = Some(lock); return; }
+        if lock.height != self.height { return; }
+        if self.valid_value_round.0.is_none() {
+            self.valid_value_round = (Some(lock.value.clone()), -1);
+        }
+        self.locked_value_round = (Some(lock.value), lock.round as i64);
     }
 
     // NOTE: we just add our info to our round data & have it become equivalent to everyone else's...
@@ -1415,7 +1462,18 @@ impl TMState {
                 if self.step == TMStep::Prevote {
                     if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 36-0: seen 2f+1 valid prevotes"); }
                     self.locked_value_round = (Some(self.rounds_data[i].proposal.clone()), self.round as i64);
-                    self.step = self.broadcast(roster, i, TMMsgData::Precommit(self.rounds_data[i].proposal_id));
+                    // The lock is stored before the precommit exists anywhere, so a restart cannot
+                    // forget a lock this finalizer has precommitted under. Not stored: no precommit
+                    // yet; this condition holds on the next update and asks again.
+                    let stored = match self.lock() {
+                        Some(lock) => self.store_lock_closure.0(lock).await,
+                        None => true,
+                    };
+                    if stored {
+                        self.step = self.broadcast(roster, i, TMMsgData::Precommit(self.rounds_data[i].proposal_id));
+                    } else {
+                        eprintln!("{ctx_str} {ANSI_RED}BFT ERROR{ANSI_RST}: could not store the lock on {}; not precommitting it yet", self.rounds_data[i].proposal_id);
+                    }
                 }
                 self.valid_value_round = (Some(self.rounds_data[i].proposal.clone()), self.round as i64);
             }
@@ -1466,6 +1524,9 @@ impl TMState {
                 self.rounds_data.retain(|r| r.height >= self.height);
                 self.locked_value_round = (None, -1);
                 self.valid_value_round = (None, -1);
+                if let Some(lock) = self.pending_lock.take_if(|lock| lock.height <= self.height) {
+                    self.restore_lock(lock);
+                }
                 self.start_round(roster, now, 0).await;
                 break;
             }
@@ -1771,6 +1832,8 @@ async fn instance(
         Vec::new(),
         [0u8; 32], // initial_vote_namespace: no slashforks in the sim
         false,     // initial_strict_quorum
+        ClosureToStoreLock::none(), // nothing restarts the sim from storage
+        None,
     ).await
 }
 
@@ -2178,6 +2241,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          initial_vote_namespace: [u8; 32],
                          // Whether the startup height decides by the strict quorum.
                          initial_strict_quorum: bool,
+                         // Stores the lock before each value precommit (see `TMLock`).
+                         store_lock_closure: ClosureToStoreLock,
+                         // The lock last stored, if any; applied only at its own height.
+                         startup_lock: Option<TMLock>,
                         ) -> std::io::Result<()> {
     hook_fail_on_panic();
 
@@ -2256,6 +2323,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     bft_state.vote_namespace = initial_vote_namespace;
     bft_state.strict_quorum = initial_strict_quorum;
     bft_state.recent_commit_round_cache = ingest_startup_data;
+    bft_state.store_lock_closure = store_lock_closure;
+    if let Some(lock) = startup_lock {
+        bft_state.restore_lock(lock);
+    }
 
     bft_state.start_round(&roster, zebra_debug_time::instant_now(), 0).await;
 
@@ -5000,6 +5071,195 @@ mod tests {
         }
         // let (Some(i), _) = TMState::proposer_from_height_round(&roster[..2], 100, heig) else { panic!(); };
         // println!("BFT Proposer at {}.{}: {}", 2, 2, i);
+    }
+
+    // What the send loop gives a peer that is behind (`send_round_data_to_peer` with prevotes off): every
+    // chunk under a header built from the cached round, then the precommits for the proposal.
+    fn serve_decided_round(rd: &RoundData, roster: &[SortedRosterMember], to: &mut TMState) {
+        let proposer = TMState::proposer_from_height_round(&to.hash_keys, roster, ROSTER_MAX_N, rd.height, rd.round).0.unwrap();
+        for chunk_i in 0..rd.proposal_sigs.len() {
+            if rd.proposal_sigs[chunk_i] == TMSig::NIL { continue; }
+            let hdr = PacketProposalChunkHeader {
+                chunk_i: chunk_i as u32, proposal_size: rd.proposal.0.len() as u32, round: rd.round,
+                valid_round: rd.proposal_valid_round, height: rd.height, proposal_id: rd.proposal_id,
+            };
+            let mut data = vec![0u8; PacketProposalChunkHeader::SERIALIZED_SIZE];
+            hdr.write_to(&mut data);
+            let (chunk_o, chunk_size) = rd.proposal.chunk_o_size(chunk_i);
+            data.extend_from_slice(&rd.proposal.0[chunk_o..chunk_o + chunk_size]);
+            to.check_and_incorporate_msg(rd.height, rd.round, chunk_i, rd.proposal_id, rd.proposal_valid_round, roster, proposer,
+                PACKET_TYPE_PROPOSAL_CHUNK, &data, rd.proposal_sigs[chunk_i]);
+        }
+        for voter in 0..rd.msg_val_sigs.len() {
+            let (value_id, sig) = rd.msg_val_sigs[voter][1];
+            if sig == TMSig::NIL || value_id != rd.proposal_id { continue; }
+            let data = make_vote_sign_datas(roster[voter].pub_key, true, rd.height, rd.round, value_id)[1];
+            to.check_and_incorporate_msg(rd.height, rd.round, 0, value_id, -2, roster, voter, PACKET_TYPE_PRECOMMIT_SIGNATURES, &data, sig);
+        }
+    }
+
+    // Hands `to` the vote finalizer `i` signs for `value_id` at height 0, `round`.
+    fn vote_from(to: &mut TMState, keys: &[SigningKey], roster: &[SortedRosterMember], i: usize, is_precommit: bool, round: u32, value_id: ValueId) {
+        let data = make_vote_sign_datas(roster[i].pub_key, is_precommit, 0, round, value_id)[1];
+        let sig = TMSig(sign_with_namespace(&keys[i], &data, &to.vote_namespace));
+        to.check_and_incorporate_msg(0, round, 0, value_id, -2, roster, i, PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit as u8, &data, sig);
+    }
+
+    // A finalizer that restarts comes back as `entry_point` builds it: a fresh engine at the height after
+    // its last stored decision, given back the lock it stored (zebra-state's `bft_lock` row).
+    fn restart_finalizer(keys: &[SigningKey], roster: &[SortedRosterMember], i: usize, proposes: Option<BlockValue>, held: &TMState) -> TMState {
+        let mut node = split_engine(keys, roster, i, proposes);
+        if let Some(lock) = held.lock() { node.restore_lock(lock); }
+        node
+    }
+
+    // Tendermint's safety rests on the lock: a finalizer that precommitted a value in some round prevotes
+    // nothing else at that height unless a later round shows 2f+1 prevotes for it. Here four finalizers
+    // with equal stake (2f+1 = 3) all lock A in round 0 and precommit it. One of them, D, gets the three
+    // precommits and decides A; the precommits have not reached the other three when they are killed.
+    // They restart at the same height, and the round-0 proposer, now proposing from a newer tip, offers
+    // B. With D away for a few seconds, the three must not decide B: without the lock they would, which
+    // gives two decisions at one height from three crashes and one slow node, with nobody dishonest.
+    #[test]
+    fn finalizers_that_restart_after_precommitting_do_not_decide_a_second_value() {
+        let (keys, roster, proposer, others) = split_finalizers();
+        let value_a = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let value_b = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| (i as u8).wrapping_add(1)).collect());
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut rosters: Vec<Vec<SortedRosterMember>> = vec![roster.clone(); 4];
+        let decider = others[0];
+
+        let mut nodes: Vec<TMState> = (0..4).map(|i| {
+            let mut node = split_engine(&keys, &roster, i, if i == proposer { Some(value_a.clone()) } else { None });
+            rt.block_on(node.start_round(&roster, Instant::now(), 0));
+            node
+        }).collect();
+        let id_a = value_a.id_from_value(&nodes[0].hash_keys);
+        let id_b = value_b.id_from_value(&nodes[0].hash_keys);
+
+        // Round 0: everyone gets A and every prevote, locks A and precommits it.
+        for &i in &others { split_chunks(&mut nodes[i], &keys, &roster, proposer, &value_a, id_a, None); }
+        for i in 0..4 { rt.block_on(nodes[i].bft_update(&mut rosters[i])); }
+        for to in 0..4 { for from in 0..4 { if from != to { vote_from(&mut nodes[to], &keys, &roster, from, false, 0, id_a); } } }
+        for i in 0..4 {
+            rt.block_on(nodes[i].bft_update(&mut rosters[i]));
+            assert_eq!(nodes[i].locked_value_round, (Some(value_a.clone()), 0), "node {i} locked A in round 0");
+        }
+
+        // D alone gets the precommits and decides A.
+        for from in 0..4 { if from != decider { vote_from(&mut nodes[decider], &keys, &roster, from, true, 0, id_a); } }
+        rt.block_on(nodes[decider].bft_update(&mut rosters[decider]));
+        assert_eq!(nodes[decider].height, 1);
+        assert_eq!(nodes[decider].recent_commit_round_cache[0].proposal_id, id_a);
+
+        // The other three are killed and restart. The proposer builds B now.
+        let restarted: Vec<usize> = (0..4).filter(|&i| i != decider).collect();
+        for &i in &restarted {
+            let proposes = if i == proposer { Some(value_b.clone()) } else { None };
+            nodes[i] = restart_finalizer(&keys, &roster, i, proposes, &nodes[i]);
+            rt.block_on(nodes[i].start_round(&roster, Instant::now(), 0));
+        }
+
+        // D is away. The three hear each other, many times over.
+        for _ in 0..8 {
+            for &i in &restarted { rt.block_on(nodes[i].bft_update(&mut rosters[i])); }
+            for &to in &restarted { for &from in &restarted {
+                if from == to || nodes[from].height > 0 || nodes[to].height > 0 { continue; }
+                let held = nodes[from].rounds_data.iter().find(|rd| (rd.height, rd.round) == (0, 0)).cloned();
+                let Some(rd) = held else { continue; };
+                if rd.has_full_proposal() {
+                    let value = if rd.proposal_id == id_a { &value_a } else { &value_b };
+                    split_chunks(&mut nodes[to], &keys, &roster, proposer, value, rd.proposal_id, None);
+                }
+                for is_precommit in [false, true] {
+                    let (value_id, sig) = rd.msg_val_sigs[from][is_precommit as usize];
+                    if sig != TMSig::NIL { vote_from(&mut nodes[to], &keys, &roster, from, is_precommit, 0, value_id); }
+                    if rd.msg_nil_sigs[from][is_precommit as usize] != TMSig::NIL { vote_from(&mut nodes[to], &keys, &roster, from, is_precommit, 0, ValueId::NIL); }
+                }
+            } }
+        }
+
+        for &i in &restarted {
+            let decided = nodes[i].recent_commit_round_cache.first().map(|rd| rd.proposal_id);
+            assert!(decided != Some(id_b), "node {i} decided B at height 0, where node {decider} decided A");
+        }
+
+        // When D is back, any node that has not decided yet decides A from D's cache.
+        let served = nodes[decider].recent_commit_round_cache[0].clone();
+        for &i in &restarted {
+            if nodes[i].height == 0 {
+                serve_decided_round(&served, &roster, &mut nodes[i]);
+                rt.block_on(nodes[i].bft_update(&mut rosters[i]));
+            }
+            assert_eq!(nodes[i].recent_commit_round_cache.first().map(|rd| rd.proposal_id), Some(id_a), "node {i}");
+        }
+    }
+
+    // The lock is handed to storage before the precommit under it exists, and a node whose store
+    // fails does not precommit: it asks again on the next update and precommits once it succeeds.
+    #[test]
+    fn the_lock_is_stored_before_the_value_precommit_and_a_failed_store_holds_it_back() {
+        let (keys, roster, proposer, others) = split_finalizers();
+        let me = others[2];
+        let value = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let stored: Arc<Mutex<Vec<(TMLock, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let store_works = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut node = split_engine(&keys, &roster, me, None);
+        node.store_lock_closure = {
+            let (stored, store_works) = (Arc::clone(&stored), Arc::clone(&store_works));
+            ClosureToStoreLock(Arc::new(move |lock| {
+                let ok = store_works.load(std::sync::atomic::Ordering::SeqCst);
+                stored.lock().unwrap().push((lock, ok));
+                Box::pin(async move { ok })
+            }))
+        };
+        rt.block_on(node.start_round(&roster, Instant::now(), 0));
+        let id = value.id_from_value(&node.hash_keys);
+        split_chunks(&mut node, &keys, &roster, proposer, &value, id, None);
+        for i in [proposer, others[0], others[1]] { vote_from(&mut node, &keys, &roster, i, false, 0, id); }
+
+        rt.block_on(node.bft_update(&mut roster.clone()));
+        let lock = TMLock { height: 0, round: 0, value: value.clone() };
+        assert_eq!(*stored.lock().unwrap(), vec![(lock.clone(), false)]);
+        assert_eq!(node.step, TMStep::Prevote, "no precommit while the lock is not stored");
+        assert_eq!(node.rounds_data[0].msg_val_sigs[me][1].1, TMSig::NIL);
+
+        store_works.store(true, std::sync::atomic::Ordering::SeqCst);
+        rt.block_on(node.bft_update(&mut roster.clone()));
+        assert_eq!(stored.lock().unwrap().last(), Some(&(lock, true)));
+        assert_eq!(node.step, TMStep::Precommit);
+        assert_eq!(node.rounds_data[0].msg_val_sigs[me][1].0, id);
+    }
+
+    // Storage can replay fewer decisions than the node had made (a decided snapshot it no longer
+    // holds), so the stored lock can be for a later height. It is kept until the engine gets there;
+    // a lock for an earlier height is spent.
+    #[test]
+    fn a_restored_lock_applies_at_its_own_height_only() {
+        let (keys, roster, proposer, others) = split_finalizers();
+        let me = others[2];
+        let value = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let later = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| (i as u8).wrapping_add(5)).collect());
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+
+        let mut node = split_engine(&keys, &roster, me, None);
+        node.restore_lock(TMLock { height: 1, round: 2, value: later.clone() });
+        assert_eq!(node.locked_value_round, (None, -1), "not at height 0");
+        rt.block_on(node.start_round(&roster, Instant::now(), 0));
+        let id = value.id_from_value(&node.hash_keys);
+        split_chunks(&mut node, &keys, &roster, proposer, &value, id, None);
+        for i in [proposer, others[0], others[1]] { vote_from(&mut node, &keys, &roster, i, true, 0, id); }
+        rt.block_on(node.bft_update(&mut roster.clone()));
+        assert_eq!(node.height, 1);
+        assert_eq!(node.locked_value_round, (Some(later.clone()), 2), "taken up at height 1");
+
+        let mut node = split_engine(&keys, &roster, me, None);
+        node.height = 3;
+        node.restore_lock(TMLock { height: 2, round: 0, value: later });
+        assert_eq!(node.locked_value_round, (None, -1), "a lock from a decided height is spent");
+        assert!(node.pending_lock.is_none());
     }
 
     #[test]

@@ -15,7 +15,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 use chrono::{DateTime, Utc};
 use tenderlink::{
     addr_string_to_stuff, BftAddressMap, BlockValue, ConsensusCounts, FinalizerPeerAddress,
-    RoundData, SortedRosterMember, TMState, TMStatus, TMStatusReason, TMStep, ValueId,
+    RoundData, SortedRosterMember, TMLock, TMState, TMStatus, TMStatusReason, TMStep, ValueId,
 };
 use zcash_primitives::bft::{
     BftBlock, BftBootstrap, Blake3Hash, FatPointerToBftBlock, FinalizerRecencyStatus,
@@ -361,6 +361,11 @@ pub enum BftRequest {
         fat_pointer: FatPointerToBftBlock,
         proposal_sigs: Vec<TMSig>,
         reply: tokio::sync::oneshot::Sender<(Vec<SortedRosterMember>, [u8; 32], bool)>,
+    },
+    /// Store tenderlink's lock before it precommits under it; answers whether it was stored.
+    StoreLock {
+        lock: TMLock,
+        reply: tokio::sync::oneshot::Sender<bool>,
     },
     /// A decided block supplied from outside (the test format's `LoadPoS`): validated and stored
     /// exactly as a tenderlink decision, with the proposer's chunk signatures, or none for a round
@@ -840,6 +845,13 @@ fn fresh_proposal_sigs(block: &BftBlock, fat_pointer: &FatPointerToBftBlock, sig
         None => sigs,
         Some(_) => Vec::new(),
     }
+}
+
+/// The stored lock, unless it was taken at a height below the one tenderlink starts at: a lock
+/// from a decided height is spent. One from a later height (replay stopped short of it at a
+/// missing snapshot) is kept: tenderlink holds it until it reaches that height again.
+fn startup_lock(stored: Option<TMLock>, startup_bft_height: u64) -> Option<TMLock> {
+    stored.filter(|lock| lock.height >= startup_bft_height)
 }
 
 /// The round data tenderlink keeps for an already-decided height, as the live path would have
@@ -1517,6 +1529,18 @@ impl BftRunner {
                     return;
                 }
                 self.decide(block, fat_pointer, proposal_sigs, DecisionReply::Tenderlink(reply), read_state, block_writer);
+            }
+            BftRequest::StoreLock { lock, reply } => {
+                // Stored even when BFT has been dropped: the row is only ever read back at its own
+                // height, and refusing would only hold back a precommit.
+                let stored = match block_writer.finalized_state.db.write_bft_lock(&lock) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        tracing::error!("could not store the BFT lock at height {} round {}: {err}", lock.height, lock.round);
+                        false
+                    }
+                };
+                let _ = reply.send(stored);
             }
             BftRequest::ForceFeed { block, fat_pointer, proposal_sigs, valid_round, require_certificate, reply } => {
                 match self.check_force_fed(&block, &fat_pointer, &proposal_sigs, valid_round, require_certificate, true, read_state, block_writer) {
@@ -2468,7 +2492,11 @@ impl BftRunner {
                 "crosslink restore: resuming BFT at height {}, finalizing bc height {}",
                 startup_bft_height, finalized_watermark,
             );
-            self.spawn_tenderlink(roster, ingest, startup_voting.vote_namespace, startup_voting.strict_quorum);
+            let startup_lock = startup_lock(block_writer.finalized_state.db.bft_lock(), startup_bft_height);
+            if let Some(lock) = &startup_lock {
+                tracing::info!("crosslink restore: keeping this finalizer's lock from round {} at BFT height {}", lock.round, lock.height);
+            }
+            self.spawn_tenderlink(roster, ingest, startup_voting.vote_namespace, startup_voting.strict_quorum, startup_lock);
         }
     }
 
@@ -2562,14 +2590,16 @@ impl BftRunner {
         let PendingBootstrap { genesis, fat_pointer, .. } = self.pending_bootstrap.take().unwrap();
         let (genesis_roster, genesis_voting) = roster_for_bft_height(&self.network, self.slashforks.rules(), &[], 0, None);
         let genesis_round = decided_round_data(&genesis, &fat_pointer, genesis_roster, &genesis_voting, Vec::new(), 0, self.params.active_roster_max_n);
-        self.spawn_tenderlink(roster, vec![genesis_round], vote_namespace, strict_quorum);
+        // Nothing was stored before genesis, so there is no lock to keep: any later restart
+        // finds genesis stored and goes through `restore`.
+        self.spawn_tenderlink(roster, vec![genesis_round], vote_namespace, strict_quorum, None);
     }
 
     /// Start tenderlink at the height after `ingest` with `roster`, and mark BFT active. Refuses
     /// an empty roster: BFT height 1's roster is fixed by the stakes at h1, so nothing would ever
     /// change. Dropping the launch on that path is what stops the caller retrying: genesis is
     /// already decided and stored, and `decide` refuses to decide it twice.
-    fn spawn_tenderlink(&mut self, roster: Vec<SortedRosterMember>, ingest: Vec<RoundData>, vote_namespace: [u8; 32], strict_quorum: bool) {
+    fn spawn_tenderlink(&mut self, roster: Vec<SortedRosterMember>, ingest: Vec<RoundData>, vote_namespace: [u8; 32], strict_quorum: bool, startup_lock: Option<TMLock>) {
         if roster.is_empty() {
             tracing::error!(
                 "BFT height {} has an empty roster: no stake was bonded by the bootstrap roster height ({:?}). BFT will not run on this chain.",
@@ -2684,6 +2714,16 @@ impl BftRunner {
             ingest,
             vote_namespace,
             strict_quorum,
+            tenderlink::ClosureToStoreLock(Arc::new(move |lock| {
+                Box::pin(async move {
+                    let (reply, rx) = tokio::sync::oneshot::channel();
+                    if !send_request(BftRequest::StoreLock { lock, reply }) {
+                        return false;
+                    }
+                    rx.await.unwrap_or(false)
+                })
+            })),
+            startup_lock,
         ));
         *TENDERLINK_TASK.lock().unwrap() = Some(task.abort_handle());
     }
@@ -2864,6 +2904,16 @@ mod tests {
 
         let round_data = decided_round_data(&block, &fat_pointer, voting.roster.clone(), &voting, sign(&keys[proposer], 1), height, 4);
         assert_eq!(round_data.proposal_valid_round, 1);
+    }
+
+    /// `restore` hands tenderlink the stored lock unless it is from a height already decided.
+    #[test]
+    fn restore_passes_on_a_lock_from_the_startup_height_or_later_only() {
+        let lock = |height| TMLock { height, round: 1, value: BlockValue(vec![1, 2, 3]) };
+        assert_eq!(startup_lock(None, 5), None);
+        assert_eq!(startup_lock(Some(lock(4)), 5), None);
+        assert_eq!(startup_lock(Some(lock(5)), 5), Some(lock(5)));
+        assert_eq!(startup_lock(Some(lock(6)), 5), Some(lock(6)));
     }
 
     /// A fetched decision keeps its proposal signatures only if they verify as a fresh proposal's,
