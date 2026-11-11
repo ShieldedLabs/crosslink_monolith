@@ -2384,16 +2384,25 @@ impl ManualWallet {
     }
 
     /// The bond version this wallet's next action on `bond_key` must spend, or `None` before
-    /// FeaturenetUpgrade3, when actions carry none. The version starts as the bond key, and each
-    /// mined action that spends it moves it to that action's txid. The search starts from the
-    /// version the node last reported, which covers actions other wallets mined, and follows
+    /// FeaturenetUpgrade3, when actions carry none. The version starts as the txid of the
+    /// transaction that created the bond, and each mined action that spends it moves it to that
+    /// action's txid. The search starts from the version the node last reported, which covers
+    /// actions other wallets mined, or else from this wallet's own mined create, and follows
     /// this wallet's own mined actions from there, which covers ones the node reported before.
+    /// It is `None` too when the wallet knows neither starting point.
     pub fn bond_spends<P: Parameters>(&self, network: &P, bond_key: [u8; 32]) -> Option<[u8; 32]> {
         let next_h = LRZBlockHeight::from_u32(self.chain_tip_h.0 + 1);
         if !network.is_nu_active(zcash_protocol::consensus::NetworkUpgrade::FeaturenetUpgrade3, next_h) {
             return None;
         }
-        let mut version = self.seen_bond_versions.get(&bond_key).copied().unwrap_or(bond_key);
+        let own_create = || {
+            self.txs
+                .iter()
+                .filter(|tx| tx.is_on_bc() && tx.h.is_in_block())
+                .find(|tx| tx.staking_action.as_ref().is_some_and(|action| action.bond_key() == bond_key && !action.acts_on_existing_bond()))
+                .map(|tx| *tx.txid.as_ref())
+        };
+        let mut version = self.seen_bond_versions.get(&bond_key).copied().or_else(own_create)?;
         'follow: loop {
             for tx in &self.txs {
                 if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }

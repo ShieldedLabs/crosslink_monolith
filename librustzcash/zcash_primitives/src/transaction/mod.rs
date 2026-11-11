@@ -1828,10 +1828,10 @@ impl StakingAction {
     ///
     /// From [`NetworkUpgrade::FeaturenetUpgrade3`] a bond is a single unspent output: an
     /// unbond, withdraw or retarget must name the bond's current version, and becomes its new
-    /// version. The version is the txid of the last action that spent the bond, or the bond key
-    /// when no action has. Each version can be spent once, so an action can never be mined
-    /// twice, as a Zcash spend can't. Before the upgrade the field must be absent, and the
-    /// action is carried under its old wire tag.
+    /// version. The version is the txid of the last action that spent the bond, or of the
+    /// transaction that created it when no action has. Each version can be spent once, so an
+    /// action can never be mined twice, as a Zcash spend can't. Before the upgrade the field
+    /// must be absent, and the action is carried under its old wire tag.
     pub fn spends(&self) -> Option<[u8; 32]> {
         match self {
             StakingAction::BeginDelegationUnbonding { spends, .. }

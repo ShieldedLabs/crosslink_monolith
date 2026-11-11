@@ -2216,16 +2216,25 @@ async fn staking_replay_matches(internal_handle: &TFLServiceHandle) -> (bool, St
             BondStatusInChain::Withdrawn { .. } => 2,
             BondStatusInChain::Burned => 3,
         };
+        let replayed_version = bond.current_version(|created_at| {
+            blocks[created_at.height.0 as usize].transactions[created_at.index.as_usize()].hash().0
+        });
         let answer = tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.state)(StateRequest::BondInfo(*key))).await;
         match answer {
             Ok(Ok(StateResponse::BondInfo(Some(info)))) => {
-                if info.amount != bond.amount || info.status != replayed_status || info.target_finalizer != bond.target_finalizer {
+                if info.amount != bond.amount
+                    || info.status != replayed_status
+                    || info.target_finalizer != bond.target_finalizer
+                    || info.version != replayed_version
+                {
                     differences.push(format!(
-                        "bond {}: replay has amount {} status {replayed_status}, node has amount {} status {}",
+                        "bond {}: replay has amount {} status {replayed_status} version {}, node has amount {} status {} version {}",
                         hex32(key),
                         u64::from(bond.amount),
+                        hex32(&replayed_version),
                         u64::from(info.amount),
-                        info.status
+                        info.status,
+                        hex32(&info.version)
                     ));
                 }
             }

@@ -37,7 +37,8 @@ pub struct DelegationBond {
     pub created_at: TransactionLocation,
 
     /// The txid, in internal byte order, of the last action that spent this bond's version,
-    /// or `None` when no action has, and the version is the bond key. See
+    /// or `None` when no action has, and the version is the txid of the transaction at
+    /// `created_at`, which created the bond. See
     /// [`zcash_primitives::transaction::StakingAction::spends`].
     pub version: Option<[u8; 32]>,
 }
@@ -57,9 +58,10 @@ impl DelegationBond {
         }
     }
 
-    /// The bond version the next action on the bond `bond_key` must spend.
-    pub fn current_version(&self, bond_key: &BondKey) -> [u8; 32] {
-        self.version.unwrap_or(*bond_key)
+    /// The bond version the next action on the bond must spend. `creation_txid` gives the txid
+    /// of the transaction at a location, and is only called when no action has spent the bond.
+    pub fn current_version(&self, creation_txid: impl FnOnce(TransactionLocation) -> [u8; 32]) -> [u8; 32] {
+        self.version.unwrap_or_else(|| creation_txid(self.created_at))
     }
 
     /// Returns the amount of this bond

@@ -1661,13 +1661,15 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::BondInfo(bond_key) => {
-                let bond_info = read::delegation::delegation_bond(&state.db, state.latest_best_chain().as_deref(), &bond_key);
-                Ok(ReadResponse::BondInfo(bond_info.map(|info| bond_info_response(&bond_key, info))))
+                let chain = state.latest_best_chain();
+                let bond_info = read::delegation::delegation_bond(&state.db, chain.as_deref(), &bond_key);
+                Ok(ReadResponse::BondInfo(bond_info.map(|info| bond_info_response(info, chain.as_deref(), &state.db))))
             }
 
             ReadRequest::BondInfoForBlock { bond_key, height } => {
-                let bond_info = read::delegation::delegation_bond(&state.db, state.chain_for_block_at(height).as_deref(), &bond_key);
-                Ok(ReadResponse::BondInfo(bond_info.map(|info| bond_info_response(&bond_key, info))))
+                let chain = state.chain_for_block_at(height);
+                let bond_info = read::delegation::delegation_bond(&state.db, chain.as_deref(), &bond_key);
+                Ok(ReadResponse::BondInfo(bond_info.map(|info| bond_info_response(info, chain.as_deref(), &state.db))))
             }
 
             // Used by the visualizer to render forks alongside the best chain: it follows each
@@ -2036,10 +2038,14 @@ use finalized_state::disk_format::{BondKey, DelegationBond};
 use non_finalized_state::BondStatusInChain;
 use std::collections::BTreeSet;
 
-fn bond_info_response(bond_key: &BondKey, (bond, status): (DelegationBond, finalized_state::disk_format::BondStatus)) -> BondInfoResponse {
+fn bond_info_response(
+    (bond, status): (DelegationBond, finalized_state::disk_format::BondStatus),
+    chain: Option<&non_finalized_state::Chain>,
+    finalized_state: &ZebraDb,
+) -> BondInfoResponse {
     use finalized_state::disk_format::BondStatus;
     BondInfoResponse {
-        version: bond.current_version(bond_key),
+        version: check::delegation::bond_version(&bond, chain, finalized_state),
         amount: bond.amount,
         status: match status {
             BondStatus::Active => 0,

@@ -71,24 +71,38 @@ struct InBlockBonds {
     // finalizer -> bank balance after in-block conversions; the block's own
     // commission is paid after its transactions, so it never funds them
     banks: HashMap<[u8; 32], u64>,
-    // bond_key -> version after in-block spends, so a second spend in the same
-    // block must name the first one's transaction
+    // bond_key -> version after in-block creates and spends, so an action on a
+    // bond created or spent earlier in the block must name that transaction
     versions: HashMap<[u8; 32], [u8; 32]>,
 }
 
+/// The current version of `bond`, which `chain` holds if it is given and the finalized state
+/// holds otherwise: the txid of the last action that spent it, or of the transaction that
+/// created it.
+pub(crate) fn bond_version(bond: &DelegationBond, chain: Option<&Chain>, finalized_state: &ZebraDb) -> [u8; 32] {
+    bond.current_version(|created_at| {
+        chain
+            .and_then(|chain| chain.blocks.get(&created_at.height))
+            .and_then(|block| block.transaction_hashes.get(created_at.index.as_usize()).copied())
+            .or_else(|| finalized_state.transaction_hash(created_at))
+            .expect("a bond's creating transaction is in the chain that holds the bond")
+            .0
+    })
+}
+
 impl InBlockBonds {
-    /// The bond version an action on `bond_key` must spend, after this block's earlier actions.
-    /// A bond missing everywhere is created earlier in the block, so its version is its key.
-    fn current_version(&self, bond_key: [u8; 32], non_finalized_chain: &Chain, finalized_state: &ZebraDb) -> [u8; 32] {
+    /// The bond version an action on `bond_key` must spend, after this block's earlier actions,
+    /// or `None` if there is no such bond.
+    fn current_version(&self, bond_key: [u8; 32], non_finalized_chain: &Chain, finalized_state: &ZebraDb) -> Option<[u8; 32]> {
         if let Some(version) = self.versions.get(&bond_key) {
-            return *version;
+            return Some(*version);
         }
         if let Some((bond, _status)) = non_finalized_chain.delegation_bonds.get(&bond_key) {
-            return bond.current_version(&bond_key);
+            return Some(bond_version(bond, Some(non_finalized_chain), finalized_state));
         }
         finalized_state
             .delegation_bond(&bond_key)
-            .map_or(bond_key, |bond| bond.current_version(&bond_key))
+            .map(|bond| bond_version(&bond, Some(non_finalized_chain), finalized_state))
     }
 
     fn apply(
@@ -124,15 +138,21 @@ impl InBlockBonds {
                         bond_key
                     )));
                 }
-                (true, Some(spends)) => {
-                    let current_version = self.current_version(bond_key, non_finalized_chain, finalized_state);
-                    if spends != current_version {
+                (true, Some(spends)) => match self.current_version(bond_key, non_finalized_chain, finalized_state) {
+                    Some(current_version) if current_version == spends => {}
+                    Some(current_version) => {
                         return Err(ValidateContextError::InvalidDelegationBond(format!(
                             "action spends bond version {:?}, but the bond's current version is {:?}: {:?}",
                             spends, current_version, bond_key
                         )));
                     }
-                }
+                    None => {
+                        return Err(ValidateContextError::InvalidDelegationBond(format!(
+                            "action spends bond version {:?} of a bond that does not exist: {:?}",
+                            spends, bond_key
+                        )));
+                    }
+                },
                 (false, None) => {}
             }
         }
@@ -207,6 +227,7 @@ impl InBlockBonds {
                     ),
                 );
                 self.new_bonds.insert(bond_key, bond);
+                self.versions.insert(bond_key, transaction_hash.0);
             }
             StakingActionKind::BeginDelegationUnbonding => {
                 // Check that bond exists and is active
@@ -319,6 +340,7 @@ impl InBlockBonds {
                     ),
                 );
                 self.new_bonds.insert(bond_key, bond);
+                self.versions.insert(bond_key, transaction_hash.0);
             }
             StakingActionKind::Null => {}
         }
@@ -627,23 +649,30 @@ mod tests {
         zebra_chain::transaction::Hash([i as u8 + 1; 32])
     }
 
-    /// From FeaturenetUpgrade3 a retarget must spend the bond's current version, which starts as
-    /// the bond key and then is the txid of the last action that spent it. So a retarget can't
-    /// be mined twice, even after the bond is moved back to where it started. Before the
-    /// upgrade the spending form is refused and the old one accepted.
+    /// From FeaturenetUpgrade3 a retarget must spend the bond's current version: the txid of the
+    /// transaction that created the bond, then of the last action that spent it, and never the
+    /// bond key. So a retarget can't be mined twice, even after the bond is moved back to where it
+    /// started. Before the upgrade the spending form is refused and the old one accepted.
     #[test]
     fn bond_actions_spend_the_bond_version_from_featurenet_upgrade_3() {
         use zcash_primitives::{bft::{finalizer_key_from_seed, FinalizerAddress}, transaction::StakingAction};
         use zebra_chain::parameters::testnet::{ConfiguredActivationHeights, RegtestParameters};
 
         const ACTIVATION: u32 = CREATED + 50;
+        const NEW_KEY: [u8; 32] = [0x20; 32];
         let network = Network::new_regtest(RegtestParameters::from(ConfiguredActivationHeights {
             featurenet_upgrade_3: Some(ACTIVATION),
             ..Default::default()
         }));
         let a = FinalizerAddress::create(&finalizer_key_from_seed(b"a").0);
         let b = FinalizerAddress::create(&finalizer_key_from_seed(b"b").0);
-        let bond = DelegationBond::new(Amount::try_from(1000u64).unwrap(), a.pub_key.0, loc(CREATED));
+        // Spent once already, so its version is known without the transaction that created it,
+        // which this test's chain doesn't hold.
+        let spent = tx_hash(9).0;
+        let bond = DelegationBond {
+            version: Some(spent),
+            ..DelegationBond::new(Amount::try_from(1000u64).unwrap(), a.pub_key.0, loc(CREATED))
+        };
         let mut chain = Chain::new(
             &network,
             Height(CREATED),
@@ -655,21 +684,31 @@ mod tests {
         );
         let finalized_state = finalized_state();
         let db = &finalized_state.db;
-        let retarget = |from: FinalizerAddress, to: FinalizerAddress, spends| StakingAction::RetargetDelegationBond {
-            unique_pubkey: KEY, signature: [0; 64], from_finalizer: from, to_finalizer: to, spends,
+        let retarget_of = |key, from: FinalizerAddress, to: FinalizerAddress, spends| StakingAction::RetargetDelegationBond {
+            unique_pubkey: key, signature: [0; 64], from_finalizer: from, to_finalizer: to, spends,
         };
+        let retarget = |from, to, spends| retarget_of(KEY, from, to, spends);
 
         let below = Height(ACTIVATION - 1);
         assert_eq!(invalid_in_order(&[retarget(a, b, None)], below, &chain, db), Vec::<usize>::new());
-        assert_eq!(invalid_in_order(&[retarget(a, b, Some(KEY))], below, &chain, db), vec![0]);
+        assert_eq!(invalid_in_order(&[retarget(a, b, Some(spent))], below, &chain, db), vec![0]);
 
         let at = Height(ACTIVATION);
         assert_eq!(invalid_in_order(&[retarget(a, b, None)], at, &chain, db), vec![0]);
         assert_eq!(invalid_in_order(&[retarget(a, b, Some([9; 32]))], at, &chain, db), vec![0]);
-        assert_eq!(invalid_in_order(&[retarget(a, b, Some(KEY))], at, &chain, db), Vec::<usize>::new());
+        assert_eq!(invalid_in_order(&[retarget(a, b, Some(KEY))], at, &chain, db), vec![0]);
+        assert_eq!(invalid_in_order(&[retarget(a, b, Some(spent))], at, &chain, db), Vec::<usize>::new());
+        assert_eq!(invalid_in_order(&[retarget_of(NEW_KEY, a, b, Some(NEW_KEY))], at, &chain, db), vec![0]);
+
+        // A bond created earlier in the block starts at the create's txid, not at its key.
+        let create = StakingAction::CreateNewDelegationBond {
+            amount_zats: 1000, unique_pubkey: NEW_KEY, bond_salt: [0; 32], target_finalizer: a, signature: [0; 64],
+        };
+        assert_eq!(invalid_in_order(&[create, retarget_of(NEW_KEY, a, b, Some(NEW_KEY))], at, &chain, db), vec![1]);
+        assert_eq!(invalid_in_order(&[create, retarget_of(NEW_KEY, a, b, Some(tx_hash(0).0))], at, &chain, db), Vec::<usize>::new());
 
         // In one block: there and back, each spending the last, and then the first one again.
-        let there = retarget(a, b, Some(KEY));
+        let there = retarget(a, b, Some(spent));
         let back = retarget(b, a, Some(tx_hash(0).0));
         assert_eq!(invalid_in_order(&[there, back, there], at, &chain, db), vec![2]);
 
@@ -682,13 +721,14 @@ mod tests {
         };
         mine(b, 0);
         mine(a, 1);
-        assert_eq!(chain.delegation_bonds[&KEY].0.current_version(&KEY), tx_hash(1).0);
+        assert_eq!(bond_version(&chain.delegation_bonds[&KEY].0, Some(&chain), db), tx_hash(1).0);
         assert_eq!(invalid_in_order(&[there], Height(ACTIVATION + 2), &chain, db), vec![0]);
         assert_eq!(invalid_in_order(&[retarget(a, b, Some(tx_hash(1).0))], Height(ACTIVATION + 2), &chain, db), Vec::<usize>::new());
     }
 
     /// A bond's version is stored after the rest of the bond only once an action has spent it,
-    /// so a record written before versions existed reads back as an unspent bond.
+    /// so a record written before versions existed reads back as an unspent bond, whose version
+    /// is the txid of the transaction at its creation location.
     #[test]
     fn bond_version_round_trips_through_disk_format() {
         use crate::service::finalized_state::{FromDisk, IntoDisk};
@@ -699,8 +739,14 @@ mod tests {
 
         let spent = DelegationBond { version: Some([5; 32]), ..bond() };
         assert_eq!(DelegationBond::from_bytes(spent.as_bytes()), spent);
-        assert_eq!(spent.current_version(&KEY), [5; 32]);
-        assert_eq!(unspent.current_version(&KEY), KEY);
+        assert_eq!(spent.current_version(|_| panic!("a spent bond's version is stored")), [5; 32]);
+        assert_eq!(
+            unspent.current_version(|created_at| {
+                assert_eq!(created_at, loc(CREATED));
+                [6; 32]
+            }),
+            [6; 32]
+        );
     }
 
     #[test]

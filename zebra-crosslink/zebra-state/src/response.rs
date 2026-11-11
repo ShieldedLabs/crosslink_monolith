@@ -684,7 +684,7 @@ pub struct BondInfoResponse {
     /// The finalizer the bond's stake currently points at.
     pub target_finalizer: [u8; 32],
     /// The version an action on this bond must spend from FeaturenetUpgrade3: the txid of the
-    /// last action that spent the bond, or the bond key if none has.
+    /// last action that spent the bond, or of the transaction that created it if none has.
     pub version: [u8; 32],
 }
 

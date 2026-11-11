@@ -12,7 +12,8 @@
 //!
 //! Run a campaign with `crosslink_fuzz` (CROSSLINK_FUZZ_SEEDS=a..b, CROSSLINK_FUZZ_SECS); replay
 //! one with `crosslink_fuzz_one` and CROSSLINK_FUZZ_SEED or CROSSLINK_FUZZ_FILE. The directed
-//! scenarios draw their choices from CROSSLINK_FUZZ_SEED too, 0 when it is unset.
+//! scenarios draw their choices from CROSSLINK_FUZZ_SEED too, and from a fresh random seed each
+//! run when it is unset.
 
 use super::*;
 
@@ -138,8 +139,8 @@ pub(crate) enum FuzzBondState {
 /// (height and block hash on `main`), and the index of the `fuzz_finalizer` it targets, which
 /// its last retarget, if any, set at `target_at`. A retarget does not move `at`, since the
 /// staking action delay counts from the bond's creation and its unbonding only. `version` is
-/// the bond version its next action spends under FeaturenetUpgrade3: its key, then the txid of
-/// the last action that spent it, which also moved `at` or `target_at`.
+/// the bond version its next action spends under FeaturenetUpgrade3: the txid of the create or
+/// of the last action that spent it, which also moved `at` or `target_at`.
 #[derive(Clone)]
 pub(crate) struct FuzzBond {
     pub seed: Vec<u8>,
@@ -239,6 +240,12 @@ fn move_fork(g: &mut FuzzGen, c: &mut Choices) {
     }
     let depth = 1 + c.below(max_depth);
     let len = 1 + c.below(depth + 2);
+    fork(g, c, depth, len);
+}
+
+/// Delivers a branch from `depth` blocks below the tip, `len` blocks long, mined to its own
+/// address, and makes it `main` if it is longer.
+fn fork(g: &mut FuzzGen, c: &mut Choices, depth: usize, len: usize) {
     g.forks_made += 1;
     let fork_miner = TestKey::new(format!("crosslink fuzz fork {}", g.forks_made).as_bytes()).address();
 
@@ -624,7 +631,8 @@ fn mine_staking(
         bond.at = at;
     }
     bond.known = known;
-    if tx.staking_action().and_then(|action| action.spends()).is_some() {
+    let action = tx.staking_action().expect("a staking transaction");
+    if !action.acts_on_existing_bond() || action.spends().is_some() {
         bond.version = tx.hash().0;
     }
     g.mined_staking.push(FuzzMinedStaking { tx, bond_i, height: at.0, block: at.1, retarget });
@@ -649,15 +657,17 @@ fn zero_create_allowed(g: &FuzzGen) -> bool {
 
 /// The version an action on `bond` in the next block spends, and whether that is the one the
 /// node requires: mostly the bond's version under FeaturenetUpgrade3 and none before it, and
-/// sometimes the wrong one, for the refusal: none, a stale or made-up version, or one too early.
+/// sometimes the wrong one, for the refusal: none, the bond's key, which is never a version, a
+/// made-up version, or the right one too early.
 fn fuzz_spends(g: &FuzzGen, c: &mut Choices, bond: &FuzzBond) -> (Option<[u8; 32]>, bool) {
     let required = spends_versions(g).then_some(bond.version);
     if !c.unusual(32) {
         return (required, true);
     }
-    let wrong = match (required, c.below(2)) {
+    let wrong = match (required, c.below(3)) {
         (Some(_), 0) => None,
-        (Some(_), _) if bond.version != bond.key => Some(bond.key),
+        (Some(_), 1) => Some(bond.key),
+        (None, 0) => Some(bond.version),
         _ => Some([0xee; 32]),
     };
     (wrong, wrong == required)
@@ -679,6 +689,19 @@ fn fuzz_withdraw(g: &FuzzGen, bond_seed: &[u8], amount_zats: u64, spends: Option
     signed_staking_tx(g.tip().next_upgrade(), bond_seed, 0, |unique_pubkey, signature| {
         StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey, signature, spends }
     })
+}
+
+/// A bond not yet created, added to `g.bonds`. Returns its index.
+fn new_fuzz_bond(g: &mut FuzzGen) -> usize {
+    g.txs_made += 1;
+    let seed = format!("crosslink fuzz bond {}", g.txs_made).into_bytes();
+    let key = staking_tx_create_bond(g.tip().next_upgrade(), &seed, fuzz_finalizer(0), 0)
+        .staking_action()
+        .expect("a staking transaction")
+        .bond_key();
+    let none = (0, BlockHash([0; 32]));
+    g.bonds.push(FuzzBond { seed, key, state: FuzzBondState::Absent, at: none, known: true, target: 0, target_at: none, version: [0; 32] });
+    g.bonds.len() - 1
 }
 
 /// A bond action in the next block: create, unbond, withdraw or retarget, on a new bond or one
@@ -714,15 +737,7 @@ fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
     } else if !g.bonds.is_empty() && action != 0 && !c.unusual(64) {
         c.below(g.bonds.len())
     } else {
-        g.txs_made += 1;
-        let seed = format!("crosslink fuzz bond {}", g.txs_made).into_bytes();
-        let key = staking_tx_create_bond(g.tip().next_upgrade(), &seed, fuzz_finalizer(0), 0)
-            .staking_action()
-            .expect("a staking transaction")
-            .bond_key();
-        let none = (0, BlockHash([0; 32]));
-        g.bonds.push(FuzzBond { seed, key, state: FuzzBondState::Absent, at: none, known: true, target: 0, target_at: none, version: key });
-        g.bonds.len() - 1
+        new_fuzz_bond(g)
     };
 
     let is_staking_day = |h: u32| h % staking.period < staking.day_window;
@@ -834,14 +849,19 @@ fn load_empty_blocks(g: &mut FuzzGen, n: u32) {
 }
 
 /// A staking action, empty blocks until it is finalized, then a replay. A bond is made first if
-/// none is active, while the network upgrade may still allow a zero-zat create; then any
-/// activation the run would cross is passed before the action, since a replay made under another
-/// upgrade is refused for that alone. Many actions are refused on purpose, so a few are tried
-/// until one is mined.
+/// none is active, while the network upgrade may still allow a zero-zat create, and is sometimes
+/// finalized first; then any activation the run would cross is passed before the action, since a
+/// replay made under another upgrade is refused for that alone. Many actions are refused on
+/// purpose, so a few are tried until one is mined.
 fn move_finalize(g: &mut FuzzGen, c: &mut Choices) {
     refresh_model(g);
     if !g.bonds.iter().any(|bond| bond.known && bond.state == FuzzBondState::Active) {
         move_staking(g, c);
+    }
+    // Half the time the bonds are finalized before the action too, so under FeaturenetUpgrade3
+    // the node finds a bond's first version in the finalized state.
+    if c.unusual(128) {
+        load_empty_blocks(g, FINALIZED_BETWEEN + c.below(8) as u32);
     }
     let n = FINALIZED_BETWEEN + c.below(8) as u32;
     let upgrade_after_run = |g: &FuzzGen| NetworkUpgrade::current(&g.network, BlockHeight(g.height() + 2 + n));
@@ -857,6 +877,62 @@ fn move_finalize(g: &mut FuzzGen, c: &mut Choices) {
     }
     load_empty_blocks(g, n);
     move_replay(g, c);
+}
+
+/// Bonds made before FeaturenetUpgrade3 and acted on after it, so a bond's first action spends
+/// its create's txid. Ordinary moves seldom reach that before a run ends, since the fuzzer's
+/// zero-zat create is refused from the activation on. A bond is made on a staking day before
+/// the activation if none is active, then `main` grows past it, sometimes until the bond is
+/// finalized. Sometimes a retarget naming the bond's key comes first, which must be refused, and
+/// sometimes a heavier branch from below the first spend undoes it.
+fn move_cross_featurenet_upgrade_3(g: &mut FuzzGen, c: &mut Choices) {
+    refresh_model(g);
+    let ahead = NetworkUpgrade::FeaturenetUpgrade3.activation_height(&g.network).filter(|&h| BlockHeight(g.height() + 1) < h);
+    let Some(activation) = ahead else {
+        return move_staking(g, c);
+    };
+    let staking = g.params.staking;
+    let active_bonds = |g: &FuzzGen| -> Vec<usize> {
+        (0..g.bonds.len()).filter(|&i| g.bonds[i].known && g.bonds[i].state == FuzzBondState::Active).collect()
+    };
+    if active_bonds(g).is_empty() {
+        while (g.height() + 1) % staking.period >= staking.day_window {
+            mine(g, c, &[]);
+        }
+        if zero_create_allowed(g) && g.tip_known {
+            let bond_i = new_fuzz_bond(g);
+            let target = c.below(3);
+            let create = staking_tx_create_bond(g.tip().next_upgrade(), &g.bonds[bond_i].seed, fuzz_finalizer(target), 0);
+            mine_staking(g, c, bond_i, create, FuzzBondState::Active, target, None);
+        }
+    }
+    let mut past = c.below(8) as u32;
+    if c.unusual(128) {
+        past += FINALIZED_BETWEEN;
+    }
+    load_empty_blocks(g, (activation.0 - 1).saturating_sub(g.height()) + past);
+    refresh_model(g);
+
+    let active = active_bonds(g);
+    if g.tip_known && !active.is_empty() && c.unusual(128) {
+        let bond = g.bonds[active[c.below(active.len())]].clone();
+        let wrong = fuzz_retarget(g, &bond.seed, bond.target, (bond.target + 1 + c.below(2)) % 3, Some(bond.key));
+        let block = g.tip().clone().next_block_with_txs(&g.miner.clone(), &[wrong]);
+        refuse(g, c, &block);
+    }
+    let before = g.height();
+    for _ in 0..4 {
+        move_staking(g, c);
+        if g.mined_staking.last().is_some_and(|s| s.height > before) {
+            break;
+        }
+    }
+    let spent_at_tip = g.mined_staking.last().is_some_and(|s| s.height > before && s.height == g.height());
+    if spent_at_tip && c.unusual(128) {
+        let depth = 1 + c.below((g.height() as usize - 1).min(FORK_DEPTH_MAX));
+        let len = depth + 1 + c.below(2);
+        fork(g, c, depth, len);
+    }
 }
 
 /// Whether the next block of `main` must refuse `tx` mined again after it was finalized: from
@@ -1095,7 +1171,8 @@ pub(crate) fn generate(c: &mut Choices) -> Vec<u8> {
     // finalized repeats under FeaturenetUpgrade2, from early in the run or after some bonds act
     // without them.
     use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
-    let node_config = match c.below(3) {
+    let upgrades = c.below(3);
+    let node_config = match upgrades {
         0 => String::new(),
         1 => node_config_with_activation_heights(ConfiguredActivationHeights {
             featurenet_upgrade_3: Some(FUZZ_UTXO_UPGRADE_FROM + c.below(FUZZ_UTXO_UPGRADE_SPAN) as u32),
@@ -1111,7 +1188,13 @@ pub(crate) fn generate(c: &mut Choices) -> Vec<u8> {
     let moves_n = 4 + c.below(28);
     // A quarter of the inputs replay an action after it is finalized.
     let finalize_at = c.unusual(64).then(|| c.below(moves_n));
+    // Three quarters of those that schedule FeaturenetUpgrade3 cross it early with bonds made
+    // before it, while the activation is still ahead.
+    let cross_at = (upgrades == 1 && c.unusual(192)).then(|| c.below(moves_n.min(4)));
     for k in 0..moves_n {
+        if cross_at == Some(k) {
+            move_cross_featurenet_upgrade_3(&mut g, c);
+        }
         if finalize_at == Some(k) {
             move_finalize(&mut g, c);
         }
@@ -1393,10 +1476,18 @@ fn crosslink_fuzz_finding_refused_body_poisons_the_next_block_control() {
 // class, CVE-2012-2459 in Bitcoin). Each scenario: a few blocks, the copy (refused), the real
 // block (must be taken), and a few more on top.
 
-/// The choices for a directed scenario, from CROSSLINK_FUZZ_SEED or 0.
+/// The choices for a directed scenario, from CROSSLINK_FUZZ_SEED or else a fresh random seed, so
+/// each run tries the scenario another way. The seed goes straight to stderr, which the test
+/// harness's capture does not hold back, since a failing scenario ends the process.
 fn directed_choices() -> Choices {
-    let seed: u64 = std::env::var("CROSSLINK_FUZZ_SEED").map_or(0, |seed| seed.parse().expect("CROSSLINK_FUZZ_SEED is a number"));
-    eprintln!("fuzz seed {seed}");
+    use std::hash::{BuildHasher, Hasher};
+    use std::io::Write;
+
+    let seed: u64 = match std::env::var("CROSSLINK_FUZZ_SEED") {
+        Ok(seed) => seed.parse().expect("CROSSLINK_FUZZ_SEED is a number"),
+        Err(_) => std::collections::hash_map::RandomState::new().build_hasher().finish(),
+    };
+    let _ = writeln!(std::io::stderr(), "fuzz seed {seed}: set CROSSLINK_FUZZ_SEED={seed} to run this again");
     Choices::from_seed(seed, 4096)
 }
 
@@ -1472,20 +1563,20 @@ fn replayed_retarget(
     }
     let seed = b"crosslink fuzz replayed retarget".to_vec();
     let create = staking_tx_create_bond(g.tip().next_upgrade(), &seed, fuzz_finalizer(0), 0);
-    let key = create.staking_action().expect("a staking transaction").bond_key();
+    let created = create.hash().0;
     assert!(mine(&mut g, &mut c, &[create]));
     // The replay must carry the network upgrade of the height it is mined at, or it is refused for that.
     while g.height() + 1 < upgrade_height.unwrap_or(0) {
         mine(&mut g, &mut c, &[]);
     }
 
-    // Under FeaturenetUpgrade3 the first retarget spends the bond's first version, its key, and
-    // the second spends the first's txid.
-    let away_spends = spends_versions(&g).then_some(key);
+    // Under FeaturenetUpgrade3 the first retarget spends the bond's first version, the create's
+    // txid, and the second spends the first's txid.
+    let away_spends = spends_versions(&g).then_some(created);
     let to = 1 + c.below(2);
     let away = fuzz_retarget(&mut g, &seed, 0, to, away_spends);
     assert!(mine(&mut g, &mut c, &[away.clone()]));
-    load_empty_blocks(&mut g, blocks_between);
+    load_empty_blocks(&mut g, blocks_between + c.below(16) as u32);
     for _ in 0..c.below(8) {
         mine(&mut g, &mut c, &[]);
     }
@@ -1546,6 +1637,111 @@ fn crosslink_fuzz_directed_replayed_finalized_retarget_is_refused_from_featurene
 fn crosslink_fuzz_directed_replayed_finalized_retarget_is_accepted_without_featurenet_upgrade_2() {
     set_test_name(function_name!());
     test_bytes(replayed_retarget(None, None, FINALIZED_BETWEEN, false));
+}
+
+// # Directed: a bond's first spend
+//
+// Under FeaturenetUpgrade3 a bond's first version is the txid of the transaction that created it,
+// never its key. The node finds that txid in the non-finalized chain or, once the create is
+// finalized, in the finalized state. Each scenario: a bond made before the upgrade to a random
+// finalizer, a random run of empty blocks that leaves the create in the non-finalized chain or
+// finalizes it, retargets spending the bond's key and sometimes other wrong versions, in random
+// order, each of which must be refused, then one spending the create's txid, which must be taken.
+// A heavier branch from a random height at or below that block then undoes it, so the bond is
+// back at its first version, and the same retarget or another one spending it is taken again.
+
+fn first_bond_spend(finalized: bool) -> Vec<u8> {
+    use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
+
+    let node_config = node_config_with_activation_heights(ConfiguredActivationHeights {
+        featurenet_upgrade_3: Some(REPLAY_UPGRADE),
+        ..Default::default()
+    });
+    let params = zcash_primitives::bft::ZcashCrosslinkParameters { staking: short_staking(&HARNESS_PARAMETERS), ..HARNESS_PARAMETERS };
+    let mut c = directed_choices();
+    let mut g = FuzzGen::new_with_node_config(&params, &node_config);
+    let staking = params.staking;
+    while (g.height() + 1) % staking.period >= staking.day_window {
+        mine(&mut g, &mut c, &[]);
+    }
+    let seed = b"crosslink fuzz first bond spend".to_vec();
+    let from = c.below(3);
+    let create = staking_tx_create_bond(g.tip().next_upgrade(), &seed, fuzz_finalizer(from), 0);
+    let created = create.hash().0;
+    let key = create.staking_action().expect("a staking transaction").bond_key();
+    assert!(mine(&mut g, &mut c, &[create]));
+    let created_at = g.height();
+    while g.height() + 1 < REPLAY_UPGRADE {
+        mine(&mut g, &mut c, &[]);
+    }
+    let blocks_between = if finalized { FINALIZED_BETWEEN + c.below(16) as u32 } else { c.below(REPLAY_DEPTH_MAX as usize) as u32 };
+    load_empty_blocks(&mut g, blocks_between);
+    assert!(spends_versions(&g));
+    g.tf.push_instr_expect_bond(key, TF_BOND_ACTIVE, TEST_STAKE_IGNORED, 0);
+    g.tf.push_instr_expect_staking_replay_matches(0);
+
+    let mut wrongs = vec![Some(key)];
+    if c.unusual(128) {
+        wrongs.push(None);
+    }
+    if c.unusual(128) {
+        wrongs.push(Some([0xee; 32]));
+    }
+    for i in (1..wrongs.len()).rev() {
+        wrongs.swap(i, c.below(i + 1));
+    }
+    let other = |c: &mut Choices| (from + 1 + c.below(2)) % 3;
+    for spends in wrongs {
+        let to = other(&mut c);
+        let wrong = fuzz_retarget(&mut g, &seed, from, to, spends);
+        let block = g.tip().clone().next_block_with_txs(&g.miner.clone(), &[wrong]);
+        refuse(&mut g, &mut c, &block);
+    }
+    let to = other(&mut c);
+    let right = fuzz_retarget(&mut g, &seed, from, to, Some(created));
+    assert!(mine(&mut g, &mut c, &[right.clone()]));
+    let spent_at = g.height();
+    g.tf.push_instr_expect_bond(key, TF_BOND_ACTIVE, TEST_STAKE_IGNORED, 0);
+    g.tf.push_instr_expect_staking_replay_matches(0);
+    for _ in 0..c.below(4) {
+        mine(&mut g, &mut c, &[]);
+    }
+
+    // The branch leaves the create in place: it grows from the spend's parent or a little below.
+    let fork_from = spent_at - 1 - c.below((spent_at - created_at).min(FORK_DEPTH_MAX as u32) as usize) as u32;
+    g.forks_made += 1;
+    let fork_miner = TestKey::new(format!("crosslink fuzz fork {}", g.forks_made).as_bytes()).address();
+    let mut branch: Vec<BlockGen> = g.main[..fork_from as usize].to_vec();
+    let branch_len = g.main.len() + 1 + c.below(2);
+    while branch.len() < branch_len {
+        let mut next = branch.last().expect("the branch starts above genesis").clone();
+        let block = next.next_block(&fork_miner);
+        branch.push(next);
+        g.deliver(&mut c, &block, 0);
+    }
+    g.main = branch;
+    g.expect_tip();
+    g.tf.push_instr_expect_staking_replay_matches(0);
+    let again = if c.below(2) == 0 { right } else { fuzz_retarget(&mut g, &seed, from, other(&mut c), Some(created)) };
+    assert!(mine(&mut g, &mut c, &[again]));
+    g.tf.push_instr_expect_staking_replay_matches(0);
+    for _ in 0..1 + c.below(3) {
+        move_extend(&mut g, &mut c);
+    }
+    g.tf.push_instr_expect_node_alive(0);
+    g.tf.write_to_bytes()
+}
+
+#[test]
+fn crosslink_fuzz_directed_first_bond_spend_names_its_create() {
+    set_test_name(function_name!());
+    test_bytes(first_bond_spend(false));
+}
+
+#[test]
+fn crosslink_fuzz_directed_first_bond_spend_names_its_finalized_create() {
+    set_test_name(function_name!());
+    test_bytes(first_bond_spend(true));
 }
 
 /// How often the generator emits each kind of instruction (LOAD_POW and SUBMIT_TX by doorway), with
@@ -1651,4 +1847,71 @@ fn crosslink_fuzz_generator_replays_finalized_transactions() {
     }
     eprintln!("{inputs} inputs replay a finalized transaction in a block the node must refuse");
     assert!(inputs >= 5, "only {inputs} inputs replay a finalized transaction in a block the node must refuse");
+}
+
+/// Under FeaturenetUpgrade3 a bond's first spend names the txid of its create. Some inputs mine one
+/// in a block the node must take with the create still in the non-finalized chain, some with the
+/// create finalized, and some then move the tip off the spend's block, so the node undoes it; some
+/// refuse a block whose action spends the bond's key instead.
+#[test]
+fn crosslink_fuzz_generator_spends_bonds_from_their_create() {
+    use std::collections::HashMap;
+
+    const KINDS: [&str; 4] = ["create in the chain", "create finalized", "spend undone by a reorg", "bond key refused"];
+    let mut inputs = [0usize; 4];
+    for seed in generator_seeds() {
+        let bytes = generate(&mut Choices::from_seed(seed, 4096));
+        let tf = TF::read_from_bytes(&bytes).expect("a generated file reads");
+        let mut parents: HashMap<BlockHash, (u32, BlockHash)> = HashMap::new();
+        let mut creates: HashMap<[u8; 32], ([u8; 32], u32)> = HashMap::new();
+        let mut first_spends: Vec<(BlockHash, u32)> = Vec::new();
+        let mut found = [false; 4];
+        for instr in &tf.instrs {
+            if instr.kind == TFInstr::EXPECT_POW_TIP {
+                let Ok(tip) = <[u8; 32]>::try_from(instr.data_slice(&bytes)) else { continue };
+                let holds = |block: BlockHash, height: u32| {
+                    let mut at = BlockHash(tip);
+                    while let Some(&(h, parent)) = parents.get(&at) {
+                        if h <= height {
+                            break;
+                        }
+                        at = parent;
+                    }
+                    at == block
+                };
+                found[2] |= first_spends.iter().any(|&(block, height)| !holds(block, height));
+                continue;
+            }
+            if instr.kind != TFInstr::LOAD_POW {
+                continue;
+            }
+            let Ok(block) = Block::zcash_deserialize(instr.data_slice(&bytes)) else { continue };
+            let Some(height) = block.coinbase_height() else { continue };
+            parents.insert(block.hash(), (height.0, block.header.previous_block_hash));
+            for tx in &block.transactions[1..] {
+                let Some(action) = tx.staking_action() else { continue };
+                let key = action.bond_key();
+                if !action.acts_on_existing_bond() {
+                    if instr.flags == 0 {
+                        creates.entry(key).or_insert((tx.hash().0, height.0));
+                    }
+                    continue;
+                }
+                match (instr.flags, action.spends(), creates.get(&key)) {
+                    (0, Some(spends), Some(&(created, at))) if spends == created => {
+                        found[usize::from(height.0 > at + FINALIZED_BETWEEN)] = true;
+                        first_spends.push((block.hash(), height.0));
+                    }
+                    (SHOULD_FAIL, Some(spends), Some(_)) if spends == key => found[3] = true,
+                    _ => {}
+                }
+            }
+        }
+        for (n, found) in inputs.iter_mut().zip(found) {
+            *n += usize::from(found);
+        }
+    }
+    let counts: Vec<String> = KINDS.iter().zip(inputs).map(|(kind, n)| format!("{kind}: {n}")).collect();
+    eprintln!("inputs with a bond's first spend: {}", counts.join(", "));
+    assert!(inputs.iter().all(|&n| n >= 10), "too few inputs with a bond's first spend: {}", counts.join(", "));
 }
