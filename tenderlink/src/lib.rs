@@ -1532,6 +1532,7 @@ pub struct Peer {
     pub bft_pk: PubKeyID,             // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
     pub stp_address: STPAddress,      // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
     pub stp_handshake_hash: [u8; 64], // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
+    pub id_hello_refresh_utc: u64,    // when to re-send ID_HELLO on this link (see next_id_hello_refresh_utc)
 }
 /// The Peer for a connection's session, when that session is new to us: a key we have no Peer
 /// for, or a known key whose STP handshake hash changed. STP replaces a restarted peer's session
@@ -1562,6 +1563,7 @@ impl Default for Peer {
         bft_pk:                       Default::default(),
         stp_address:                  Default::default(),
         stp_handshake_hash:           [0u8; 64],
+        id_hello_refresh_utc:         0,
     } }
 }
 impl Peer {
@@ -1820,6 +1822,11 @@ pub struct BftAddressMap {
     pub by_key:  HashMap<PubKeyID, HashMap<STPAddress, Option<PeerAttestation>>>,
     pub by_addr: HashMap<STPAddress, PubKeyID>,
     pub last_packet_utcs: HashMap<PubKeyID, i64>,
+    // #261: the address each roster key last proved itself on at ID_HELLO / ID_HELLO_ACK. Kept apart
+    // from the attestations and never pruned with them, so a roster key dropped from by_key can still
+    // be re-dialed. Only roster keys are stored. @Todo: drop entries for keys no longer on any roster,
+    // so this cannot grow across roster rotations.
+    pub hello_addrs: HashMap<PubKeyID, STPAddress>,
 }
 impl BftAddressMap {
     pub fn new() -> Self { Self::default() }
@@ -1828,9 +1835,59 @@ impl BftAddressMap {
         self.by_addr.insert(addr.clone(), *key);
     }
     pub fn get_key(&self, addr: &STPAddress) -> Option<&PubKeyID> { self.by_addr.get(addr) }
+    /// The BFT key of a live connection. Prefer the key the peer proved at ID_HELLO / ID_HELLO_ACK
+    /// and that we keep on its `Peer` as `bft_pk`. `by_addr` is last-write-wins and is pruned
+    /// together with the address attestation, so a link that is still up can lose its `by_addr`
+    /// entry at expiry + 120 and then be sent no more of our votes (issue #261). Fall back to
+    /// `by_addr` only before the handshake has named a key for this connection (`bft_pk` is NIL).
+    pub fn key_for_connection(&self, verified_bft_pk: PubKeyID, addr: &STPAddress) -> Option<PubKeyID> {
+        if verified_bft_pk != PubKeyID::NIL { Some(verified_bft_pk) } else { self.get_key(addr).copied() }
+    }
+    /// Remember where a roster key last proved itself at ID_HELLO / ID_HELLO_ACK, so it can be
+    /// re-dialed after its address attestation is pruned. Only roster keys are kept.
+    pub fn remember_hello_addr(&mut self, roster: &[SortedRosterMember], key: PubKeyID, addr: &STPAddress) {
+        if key != PubKeyID::NIL && roster.iter().any(|m| m.pub_key == key) {
+            self.hello_addrs.insert(key, addr.clone());
+        }
+    }
+    /// Active-roster finalizers we hold a last-HELLO address for but have no live link to. The connect
+    /// loop otherwise re-dials only keys still in `by_key` (and seeds), so a finalizer pruned from
+    /// `by_key` stayed unreachable until one side restarted.
+    pub fn roster_redial_addrs(&self, active_roster: &[SortedRosterMember], my_bft_pk: PubKeyID, connected_bft_pks: &[PubKeyID]) -> Vec<STPAddress> {
+        active_roster.iter()
+            .filter(|m| m.pub_key != my_bft_pk && !connected_bft_pks.contains(&m.pub_key))
+            .filter_map(|m| self.hello_addrs.get(&m.pub_key).cloned())
+            .collect()
+    }
     pub fn get_addrs(&self, key: &PubKeyID) -> impl Iterator<Item = (&STPAddress, &Option<PeerAttestation>)> { self.by_key.get(key).map(|v| v.iter()).unwrap_or_default() }
     pub fn contains_key(&self, key: &PubKeyID) -> bool { self.by_key.contains_key(key) }
     pub fn all_addrs(&self) -> impl Iterator<Item = (&STPAddress, &PubKeyID)> { self.by_addr.iter() }
+    /// Attestations worth gossiping: ones a receiver will still accept. Relaying one that is about to
+    /// expire only wastes bandwidth (the receiver skips it), and against an unpatched peer it got the
+    /// relaying link dropped (#272). The 120s margin covers clock skew between peers.
+    pub fn gossipable_attestations(&self, now: u64) -> Vec<&PeerAttestation> {
+        self.by_key.values().flat_map(|a| a.values()).filter_map(|o| o.as_ref())
+            .filter(|a| a.expiry > now.saturating_add(120)).collect()
+    }
+}
+
+// #261: a node's address attestation lives this long (`expiry = issued + lifetime`). Until the
+// verified-key routing above reaches every peer, a peer still tells one finalizer from another by
+// holding a fresh attestation of its address, and a long-lived link mints one only at its handshake.
+// So re-send ID_HELLO on every live link well within the lifetime: the peer answers any ID_HELLO with
+// an ID_HELLO_ACK carrying a fresh attestation of our address, which we countersign and gossip as on
+// first contact -- no new packet types or fields. Transitional, needed only while peers still route
+// by these attestations.
+pub const PEER_ATTESTATION_LIFETIME_SECS: u64 = 24 * 60 * 60;
+pub const ID_HELLO_REFRESH_SECS: u64 = PEER_ATTESTATION_LIFETIME_SECS / 4;
+// The last refresh before an attestation would expire falls 2 * ID_HELLO_REFRESH_SECS after the
+// handshake that minted it; that stays before the attestation expires. This is the lossless bound --
+// a run of lost ID_HELLOs can still delay a refresh, which only matters to peers not yet routing by
+// the verified key (#261).
+const _: () = assert!(2 * ID_HELLO_REFRESH_SECS < PEER_ATTESTATION_LIFETIME_SECS);
+// Jittered so a roster's links do not all refresh in lockstep; the result is in [REFRESH, 2*REFRESH).
+pub fn next_id_hello_refresh_utc(now: u64, jitter: u64) -> u64 {
+    now.saturating_add(ID_HELLO_REFRESH_SECS + jitter % ID_HELLO_REFRESH_SECS)
 }
 
 /// A finalizer played by a test. What it sends the node arrives as from a connected peer, after
@@ -2281,8 +2338,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 let mut bft_key = PubKeyID::NIL;
                 for (c, _) in &current_connections {
                     if c.connection_key() == *ck {
-                        if let Some(k) = bft_address_map.get_key(c) {
-                            bft_key = *k;
+                        if let Some(k) = bft_address_map.key_for_connection(p.bft_pk, c) {
+                            bft_key = k;
                         }
                         break;
                     }
@@ -2583,8 +2640,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     let mut bft_key = PubKeyID::NIL;
                     for (c, _) in &current_connections {
                         if c.connection_key() == *ck {
-                            if let Some(k) = bft_address_map.get_key(&c) {
-                                bft_key = *k;
+                            if let Some(k) = bft_address_map.key_for_connection(p.bft_pk, &c) {
+                                bft_key = k;
                             }
                             break;
                         }
@@ -2596,8 +2653,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     let mut peer_bft_key = PubKeyID::NIL;
                     for (c, _) in &current_connections {
                         if c.connection_key() == *connection_key {
-                            if let Some(k) = bft_address_map.get_key(&c) {
-                                peer_bft_key = *k;
+                            // #261: route current-height votes by the key the peer proved at HELLO.
+                            if let Some(k) = bft_address_map.key_for_connection(peer.bft_pk, &c) {
+                                peer_bft_key = k;
                             }
                             break;
                         }
@@ -2676,7 +2734,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 });
 
                 if zebra_debug_time::instant_now() >= next_peer_gossip {
-                    let mut peer_attestations: Vec<&PeerAttestation> = bft_address_map.by_key.values().flat_map(|a| a.values()).filter_map(|o| o.as_ref()).collect();
+                    // #272: relay only attestations a receiver will still accept, not ones about to expire.
+                    let mut peer_attestations: Vec<&PeerAttestation> = bft_address_map.gossipable_attestations(now);
                     peer_attestations.shuffle(&mut rand::thread_rng());
                     peer_attestations.truncate(1191 / PEER_ATTESTATION_SERIALIZED_SIZE);
                     for (connection_key, peer) in &mut peers {
@@ -2707,11 +2766,16 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     const PEERS_TO_ASK_PUNCH:               usize = 2;
 
                     let mut all_addresses: Vec<(&PubKeyID, &HashMap<STPAddress, Option<PeerAttestation>>)> = bft_address_map.by_key.iter().collect(); all_addresses.shuffle(rng);
-                    for (_, map) in &all_addresses {
-                        // Grab a random address associated with this BFT key. @Todo: prioritize by trustworthiness and expiry time.
-                        let Some((address, _)) = map.iter().choose(rng) else {
-                            continue;
-                        };
+                    // One random known address per BFT key, as before. @Todo: prioritize by trustworthiness and expiry time.
+                    let mut dial_addresses: Vec<STPAddress> = all_addresses.iter().filter_map(|(_, map)| map.keys().choose(&mut *rng).cloned()).collect();
+                    // #261: also re-dial active-roster finalizers whose link is down, at the
+                    // address they last proved themselves on. The per-key list above only re-dials keys
+                    // still in by_key, so a finalizer pruned from by_key stayed unreachable until a restart.
+                    let connected_bft_pks: Vec<PubKeyID> = peers.values().map(|p| p.bft_pk).filter(|pk| *pk != PubKeyID::NIL).collect();
+                    for address in bft_address_map.roster_redial_addrs(&roster[..active_roster_len(&roster, bft_state.active_roster_max_n)], bft_state.my_pub_key, &connected_bft_pks) {
+                        if !dial_addresses.contains(&address) { dial_addresses.push(address); }
+                    }
+                    for address in &dial_addresses {
                         // Don't connect to myself.
                         if address.key == my_stp_keypair.public {
                             continue;
@@ -2842,15 +2906,29 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         }
         LOOP_PASSES.fetch_add(1, std::sync::atomic::Ordering::Release);
 
-        // Ensure a Peer entry exists for every active connection's session
+        // Ensure a Peer entry exists for every active connection's session, and (re)send ID_HELLO:
+        // on a new session, and on an already-verified live link once its refresh falls due (#261).
+        let now_utc: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
         for &(ref stp_address, handshake_hash) in &current_connections {
             let key = stp_address.connection_key();
-            let Some((peer, replaced)) = peer_for_new_session(&mut peers, stp_address, handshake_hash) else {
-                continue;
-            };
-            if replaced {
-                println!("{:05}: Peer {:?} has a new STP session; verifying it again.", my_port, key);
+            match peer_for_new_session(&mut peers, stp_address, handshake_hash) {
+                Some((peer, replaced)) => {
+                    if replaced {
+                        println!("{:05}: Peer {:?} has a new STP session; verifying it again.", my_port, key);
+                    }
+                    peer.id_hello_refresh_utc = next_id_hello_refresh_utc(now_utc, rand::random::<u64>());
+                }
+                None => {
+                    // An already-verified live link: re-send ID_HELLO only when its refresh falls
+                    // due, and without resetting the Peer; otherwise leave it be.
+                    let peer = peers.get_mut(&key).expect("a known session has a Peer");
+                    if now_utc < peer.id_hello_refresh_utc {
+                        continue;
+                    }
+                    peer.id_hello_refresh_utc = next_id_hello_refresh_utc(now_utc, rand::random::<u64>());
+                }
             }
+            let peer = peers.get_mut(&key).expect("a session has a Peer");
 
             let verification = { // almost @Duplicate
                 let pk_bytes = my_root_public_bft_key.as_ref();
@@ -3030,6 +3108,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
 
             else if packet_type == PACKET_TYPE_ID_HELLO {
+                // A repeated ID_HELLO on an already-verified link is expected (a refresh, see
+                // next_id_hello_refresh_utc) and is answered with a fresh ID_HELLO_ACK as on first
+                // contact: that is how a long-lived link's attestation of the sender's address is
+                // renewed. It must not be rejected or disconnected on that account.
 
                 let Some(their_verification) = PacketIdVerification::read_from(&mut &msg[read_o..]) else {
                     if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID verification: Failed to read ID Hello packet"); }
@@ -3052,6 +3134,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 bft_address_map.insert(&their_verification.pk, &peer.stp_address, None);
                 peer.bft_pk = their_verification.pk;
+                bft_address_map.remember_hello_addr(&roster, their_verification.pk, &peer.stp_address); // #261: remember this roster key's address for re-dial
 
                 let my_verification = { // almost @Duplicate
                     let pk_bytes = my_root_public_bft_key.as_ref();
@@ -3072,14 +3155,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 let attestation = { // @Duplicate
                     let addr = peer.stp_address.clone();
                     let issued: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
-                    let expiry = {
-                        let seconds_per_minute = 60;
-                        let minutes_per_hour   = 60;
-                        let hours_per_day      = 24;
-                        let days_expiry        =  1;
-
-                        issued + (seconds_per_minute * minutes_per_hour * hours_per_day * days_expiry)
-                    };
+                    // Single-sourced with the refresh cadence and the far-future cap, which are all
+                    // derived from PEER_ATTESTATION_LIFETIME_SECS; the compile-time assert on the refresh
+                    // interval only holds if the minted lifetime is this same constant.
+                    let expiry = issued + PEER_ATTESTATION_LIFETIME_SECS;
                     let sig = {
                         let hash_key_for_attestation = HashKey(blake3::Hasher::new_derive_key("Tenderlink One Party Signed Peer Attestation").finalize().into());
 
@@ -3133,8 +3212,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     } };
                 }
 
-                bft_address_map.insert(&their_verification.pk, &peer.stp_address, None);
+                // On a re-HELLO's ACK the link is already verified with this key; keep any attestation
+                // we hold for it rather than overwriting it with None (#261).
+                if peer.bft_pk != their_verification.pk {
+                    bft_address_map.insert(&their_verification.pk, &peer.stp_address, None);
+                }
                 peer.bft_pk = their_verification.pk;
+                bft_address_map.remember_hello_addr(&roster, their_verification.pk, &peer.stp_address); // #261: remember this roster key's address for re-dial
 
                 let Some(attestation) = PacketIdAttestation::read_from(msg) else {
                     if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID verification: Failed to read ID Hello Ack packet: Failed to read attestation"); }
@@ -3281,8 +3365,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             else {
             }
 
-            if let Some(pk) = bft_address_map.get_key(&peer.stp_address) {
-                bft_address_map.last_packet_utcs.insert(*pk, chrono::Utc::now().timestamp());
+            // #261: recency follows the verified HELLO key too, not the prunable by_addr entry.
+            if let Some(pk) = bft_address_map.key_for_connection(peer.bft_pk, &peer.stp_address) {
+                bft_address_map.last_packet_utcs.insert(pk, chrono::Utc::now().timestamp());
             }
         }
 
@@ -3869,6 +3954,97 @@ mod tests {
     /// otherwise.
     const ROSTER_MAX_N: usize = zcash_primitives::bft::PROTOTYPE_PARAMETERS.active_roster_max_n;
 
+    /// #272: only attestations a receiver will still accept are gossiped. Relaying one about to expire
+    /// wastes bandwidth and, against an unpatched peer, dropped the relaying link. 120s covers skew.
+    #[test]
+    fn only_attestations_with_comfortable_remaining_life_are_gossiped() {
+        let now = 1_700_000_000u64;
+        let addr = |b: u8| {
+            let key = crate::stp::new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+            STPAddress::from(std::net::Ipv6Addr::LOCALHOST, 15000 + b as u16, &key)
+        };
+        let att = |expiry: u64| PeerAttestation {
+            stp_address: addr(0), issued: now - 1000, expiry,
+            attester_bft_pk: PubKeyID([1; 32]), attestee_bft_pk: PubKeyID([2; 32]),
+            attester_sig: TMSig::NIL, attestee_sig: TMSig::NIL,
+        };
+        let mut map = BftAddressMap::new();
+        map.insert(&PubKeyID([10; 32]), &addr(1), Some(att(now + 3600))); // comfortably fresh -> gossiped
+        map.insert(&PubKeyID([11; 32]), &addr(2), Some(att(now + 60)));   // expiring within 120s -> not
+        map.insert(&PubKeyID([12; 32]), &addr(3), Some(att(now - 10)));   // already expired -> not
+        map.insert(&PubKeyID([13; 32]), &addr(4), None);                  // no attestation held -> not
+
+        let gossiped = map.gossipable_attestations(now);
+        assert_eq!(gossiped.len(), 1, "only the comfortably-fresh attestation is gossiped");
+        assert_eq!(gossiped[0].expiry, now + 3600);
+    }
+
+    /// #261 at the engine level: boot a real node (one instance, ephemeral loopback port so there is
+    /// no socket collision like single_rt's), connect a synthetic finalizer, complete the ID_HELLO
+    /// handshake, and confirm the running loop resolves that peer's BFT key on the live connection
+    /// (via key_for_connection / peer.bft_pk) and reports it connected. Exercises the full loop with
+    /// the vote-routing, re-HELLO and gossip-filter changes end to end -- no panic, no regression, and
+    /// the #261 resolution path working live. The by_addr-pruned fallback is wall-clock driven and is
+    /// covered by a_live_links_key_survives_its_address_attestation_being_pruned.
+    #[test]
+    fn a_connected_finalizers_key_is_resolved_from_its_verified_hello_in_the_running_engine() {
+        use std::sync::{Arc, Mutex};
+
+        let node_bft = SigningKey::from([3u8; 32]);
+        let synth_bft = SigningKey::from([7u8; 32]);
+        let node_pk = PubKeyID(VerificationKeyBytes::from(&node_bft).into());
+        let synth_pk = PubKeyID(VerificationKeyBytes::from(&synth_bft).into());
+
+        let roster = vec![
+            SortedRosterMember { pub_key: node_pk,  stake: 2, cumulative_stake: 2 },
+            SortedRosterMember { pub_key: synth_pk, stake: 1, cumulative_stake: 3 },
+        ];
+
+        let node_stp = crate::stp::new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+        let endpoint = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, 0, &node_stp); // port 0 -> ephemeral
+
+        let synth = attach_synthetic_bft_peer(1);
+        let hello = id_hello_packet(&synth_bft, &synth.handshake_hash);
+
+        // The key the engine reports for the (only) connected peer each tick, via its peer-update closure.
+        let observed: Arc<Mutex<Option<PubKeyID>>> = Arc::new(Mutex::new(None));
+        let observed2 = observed.clone();
+        let peer_cmd = ClosureToUpdatePeers(Arc::new(move |peers: Vec<PeerInfo>| {
+            let observed = observed2.clone();
+            Box::pin(async move {
+                if let Some(k) = peers.iter()
+                    .filter(|p| p.connected)
+                    .find_map(|p| p.root_public_bft_key.filter(|k| *k != PubKeyID::NIL))
+                {
+                    *observed.lock().unwrap() = Some(k);
+                }
+            })
+        }));
+
+        let propose  = ClosureToProposeNewBlock(Arc::new(move || Box::pin(async move { None::<BlockValue> })));
+        let validate = ClosureToValidateProposedBlock(Arc::new(move |_b| Box::pin(async move { (TMStatus::Pass, TMStatusReason::None) })));
+        let push     = ClosureToPushDecidedBlock(Arc::new(move |_b, _f, _s| Box::pin(async move { (Vec::<SortedRosterMember>::new(), [0u8; 32], false) })));
+        let access   = ClosureToAccessBft(Arc::new(move |_bft, _map| Box::pin(async move {})));
+
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        rt.spawn(async move {
+            let _ = entry_point(node_bft, None, Some(node_stp), Some(endpoint), roster, ROSTER_MAX_N,
+                Vec::new(), Some(0), propose, validate, push, peer_cmd, access, Vec::new(), [0u8; 32], false).await;
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut got = None;
+        while std::time::Instant::now() < deadline {
+            let _ = synth.inbound.send(hello.clone()); // resend until a tick picks it up
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Some(k) = *observed.lock().unwrap() { got = Some(k); break; }
+        }
+        rt.shutdown_background();
+
+        assert_eq!(got, Some(synth_pk),
+                   "the running engine resolved the connected finalizer's key from its verified ID_HELLO");
+    }
+
     /// A known key whose STP session hash changes (STP replacing a restarted peer's session in
     /// place) gets a fresh Peer, verified again; the same session gets nothing. Regression: the
     /// Peer kept the dead session's hash, failed the new session's ID verification and killed it,
@@ -3893,6 +4069,70 @@ mod tests {
         assert_eq!(peer.stp_handshake_hash, [2; 64]);
         assert_eq!((peer.index_counter, peer.latest_status_request_height), (0, None), "nothing kept from the old session");
         assert_eq!(peers.len(), 1);
+    }
+
+    /// A connected finalizer's votes are routed by the key it proved at ID_HELLO, not by its
+    /// `by_addr` entry. Regression for #261: `by_addr` is pruned together with the finalizer's
+    /// address attestation at expiry + 120, so while the link was still up its votes stopped
+    /// until one side restarted and a fresh handshake re-created the entry.
+    #[test]
+    fn a_live_links_key_survives_its_address_attestation_being_pruned() {
+        let key = crate::stp::new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+        let address = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, 13101, &key);
+        let verified = PubKeyID([7; 32]);
+        let mut map = BftAddressMap::new();
+
+        // Before the handshake names a key for the connection, we can only route by its address.
+        assert_eq!(map.key_for_connection(PubKeyID::NIL, &address), None);
+        map.insert(&verified, &address, None);
+        assert_eq!(map.key_for_connection(PubKeyID::NIL, &address), Some(verified));
+
+        // The address attestation ages out and `by_addr` / `by_key` are pruned, but the link is up
+        // and still verified with `verified`: its votes must keep flowing.
+        map.by_addr.clear();
+        map.by_key.clear();
+        assert_eq!(map.get_key(&address), None, "by_addr no longer resolves the key");
+        assert_eq!(map.key_for_connection(verified, &address), Some(verified),
+                   "a live link routes by its verified HELLO key");
+    }
+
+    /// Every ID_HELLO refresh is due in [REFRESH, 2*REFRESH) and, for any jitter, strictly before the
+    /// attestation minted at the handshake would expire -- so a live link is never left without a
+    /// fresh attestation of its address. The cadence-vs-lifetime bound is also a compile-time assert.
+    #[test]
+    fn id_hello_refresh_is_due_well_before_its_attestation_expires() {
+        for jitter in [0u64, 1, ID_HELLO_REFRESH_SECS - 1, ID_HELLO_REFRESH_SECS, u64::MAX] {
+            let due = next_id_hello_refresh_utc(1_000, jitter);
+            assert!(due >= 1_000 + ID_HELLO_REFRESH_SECS, "refresh no sooner than one interval");
+            assert!(due <  1_000 + 2 * ID_HELLO_REFRESH_SECS, "refresh within two intervals");
+        }
+        assert!(2 * ID_HELLO_REFRESH_SECS < PEER_ATTESTATION_LIFETIME_SECS,
+                "the latest refresh still precedes the attestation's expiry");
+    }
+
+    /// Active-roster finalizers with no live link are re-dialed at their last HELLO address; a
+    /// connected one, this node itself, and a key never seen on the roster are not. Bug G: the connect
+    /// loop re-dialed only keys still in `by_key`, so a finalizer pruned from it stayed gone.
+    #[test]
+    fn roster_finalizers_without_a_live_link_are_re_dialed_at_their_last_hello_address() {
+        let addr = |b: u8| {
+            let key = crate::stp::new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+            STPAddress::from(std::net::Ipv6Addr::LOCALHOST, 14000 + b as u16, &key)
+        };
+        let (me, up, down, off_roster) = (PubKeyID([1; 32]), PubKeyID([2; 32]), PubKeyID([3; 32]), PubKeyID([4; 32]));
+        let (up_addr, down_addr, off_addr) = (addr(2), addr(3), addr(4));
+        let roster: Vec<SortedRosterMember> = [me, up, down].iter()
+            .map(|&pk| SortedRosterMember { pub_key: pk, stake: 1, cumulative_stake: 1 }).collect();
+
+        let mut map = BftAddressMap::new();
+        map.remember_hello_addr(&roster, up, &up_addr);
+        map.remember_hello_addr(&roster, down, &down_addr);
+        map.remember_hello_addr(&roster, off_roster, &off_addr); // ignored: not on the roster
+        assert!(!map.hello_addrs.contains_key(&off_roster), "a non-roster key is not remembered");
+
+        // Only `up` has a live link; `me` is this node.
+        let redial = map.roster_redial_addrs(&roster, me, &[up]);
+        assert_eq!(redial, vec![down_addr], "re-dial only the roster finalizer with no live link");
     }
 
     /// Restored signatures are over the legacy application format, not the active STP MTU.
