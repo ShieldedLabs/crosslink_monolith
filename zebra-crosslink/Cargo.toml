@@ -200,7 +200,9 @@ allow-branch = ["main"]
 
 [profile.dev]
 panic = "abort"
-codegen-units = 1
+# One unit makes every edit regenerate the whole crate; 256 (the incremental default)
+# costs test builds on 2-core machines. Dependencies keep one unit below.
+codegen-units = 16
 opt-level = 0
 
 [profile.dev.build-override]
