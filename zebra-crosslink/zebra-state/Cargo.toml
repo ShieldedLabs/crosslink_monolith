@@ -61,7 +61,6 @@ indexmap = { workspace = true }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
 metrics = { workspace = true }
-mset = { workspace = true }
 regex = { workspace = true }
 rlimit = { workspace = true }
 rocksdb = { workspace = true, features = ["lz4", "bindgen-runtime"] }

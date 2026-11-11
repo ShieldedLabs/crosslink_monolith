@@ -29,6 +29,7 @@ use crate::{
 
 mod backup;
 mod chain;
+mod multiset;
 
 pub use backup::BackupTask;
 
