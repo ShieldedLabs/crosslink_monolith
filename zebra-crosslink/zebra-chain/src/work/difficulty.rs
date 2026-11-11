@@ -415,7 +415,9 @@ impl From<ExpandedDifficulty> for CompactDifficulty {
 
 impl BytesInDisplayOrder for ExpandedDifficulty {
     fn bytes_in_serialized_order(&self) -> [u8; 32] {
-        self.0.to_big_endian()
+        let mut bytes = [0; 32];
+        self.0.to_big_endian(&mut bytes);
+        bytes
     }
 
     fn from_bytes_in_serialized_order(bytes: [u8; 32]) -> Self {

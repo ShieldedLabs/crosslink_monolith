@@ -2064,7 +2064,7 @@ dependencies = [
  "rand 0.8.7",
  "sinsemilla",
  "subtle",
- "uint 0.9.5",
+ "uint",
 ]
 
 [[package]]
@@ -4104,7 +4104,7 @@ checksum = "0b34d9fd68ae0b74a41b21c03c2f62847aa0ffea044eee893b4c140b37e244e2"
 dependencies = [
  "fixed-hash",
  "impl-codec",
- "uint 0.9.5",
+ "uint",
 ]
 
 [[package]]
@@ -6504,18 +6504,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "uint"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f9227a75a5a540a464c832ad4a4195dbdbecd8787610a56262721fde6f04f90"
-dependencies = [
- "byteorder",
- "crunchy",
- "hex",
- "static_assertions",
-]
-
-[[package]]
 name = "uname"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7620,7 +7608,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "uint 0.10.1",
+ "uint",
  "x25519-dalek",
  "zcash_address",
  "zcash_encoding 0.5.0",
