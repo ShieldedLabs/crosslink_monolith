@@ -9,7 +9,6 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use mset::MultiSet;
 use tracing::instrument;
 
 use zebra_chain::{
@@ -51,6 +50,7 @@ use crate::{
 use crate::request::Spend;
 
 use self::index::TransparentTransfers;
+use super::multiset::MultiSet;
 
 pub mod index;
 

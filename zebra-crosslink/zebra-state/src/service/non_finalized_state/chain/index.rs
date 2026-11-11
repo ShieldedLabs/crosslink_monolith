@@ -5,8 +5,6 @@ use std::{
     ops::RangeInclusive,
 };
 
-use mset::MultiSet;
-
 use zebra_chain::{
     amount::{Amount, NegativeAllowed},
     block::Height,
@@ -15,7 +13,7 @@ use zebra_chain::{
 
 use crate::{OutputLocation, TransactionLocation, ValidateContextError};
 
-use super::{RevertPosition, UpdateWith};
+use super::{super::multiset::MultiSet, RevertPosition, UpdateWith};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransparentTransfers {

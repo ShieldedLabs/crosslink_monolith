@@ -1,10 +1,12 @@
 //! Consensus check functions
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use chrono::{DateTime, Utc};
 
-use mset::MultiSet;
 use zebra_chain::{
     amount::{
         Amount, DeferredPoolBalanceChange, Error as AmountError, NegativeAllowed, NonNegative,
@@ -170,19 +172,31 @@ pub fn subsidy_is_valid(
 
     let height = block.coinbase_height().ok_or(SubsidyError::NoCoinbase)?;
 
-    let mut coinbase_outputs: MultiSet<Output> = block
+    // How many times each output appears in the coinbase: each required payment consumes one.
+    let mut coinbase_outputs: HashMap<Output, usize> = HashMap::new();
+    for output in block
         .transactions
         .first()
         .ok_or(SubsidyError::NoCoinbase)?
         .outputs()
-        .iter()
-        .cloned()
-        .collect();
+    {
+        *coinbase_outputs.entry(output.clone()).or_default() += 1;
+    }
 
     let mut has_amount = |addr: &Address, amount| {
         assert!(addr.is_script_hash(), "address must be P2SH");
 
-        coinbase_outputs.remove(&Output::new(amount, addr.script()))
+        let output = Output::new(amount, addr.script());
+        match coinbase_outputs.get_mut(&output) {
+            Some(count) => {
+                *count -= 1;
+                if *count == 0 {
+                    coinbase_outputs.remove(&output);
+                }
+                true
+            }
+            None => false,
+        }
     };
 
     // # Note

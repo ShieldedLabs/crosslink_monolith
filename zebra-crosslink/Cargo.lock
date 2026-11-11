@@ -3239,12 +3239,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mset"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26c4d16a3d2b0e89ec6e7d509cf791545fcb48cbc8fc2fb2e96a492defda9140"
-
-[[package]]
 name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7688,7 +7682,6 @@ dependencies = [
  "lazy_static",
  "libzcash_script",
  "metrics",
- "mset",
  "num-integer",
  "once_cell",
  "orchard",
@@ -7946,7 +7939,6 @@ dependencies = [
  "jubjub",
  "lazy_static",
  "metrics",
- "mset",
  "once_cell",
  "proptest",
  "proptest-derive",
