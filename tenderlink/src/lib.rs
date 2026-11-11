@@ -1357,7 +1357,11 @@ impl TMState {
                 // don't need the proposal itself
                 big_threshold <= counts.prevotes &&
                 self.step == TMStep::Prevote &&
-                !self.rounds_data[i].timeout_triggered[0]) // "for the first time" // ALT: round.timeout_step != TMStep::Prevote
+                !self.rounds_data[i].timeout_triggered[0] && // "for the first time" // ALT: round.timeout_step != TMStep::Prevote
+                // The round keeps one timeout. A precommit timeout already scheduled by line 47 ends the
+                // round, which the prevote timeout would only delay; replacing it would leave nothing to
+                // end the round once the step moves on to precommit.
+                !self.rounds_data[i].timeout_triggered[1])
             {
                 if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 34: last orders on prevote period"); }
                 self.rounds_data[i].timeout_triggered[0] = true;
@@ -4348,6 +4352,49 @@ mod tests {
         assert_eq!(run(old_namespace, false, &mixed), (0, 2), "the old engine counts only the old finalizers");
         let all_upgraded: Vec<([u8; 32], usize)> = (0..4).map(|i| (new_namespace, i)).collect();
         assert_eq!(run(new_namespace, true, &all_upgraded), (1, 4), "a quorum under its own namespace decides");
+    }
+
+    // Hands `to` the vote finalizer `i` signs for `value_id` at height 0, `round`.
+    fn vote_from(to: &mut TMState, keys: &[SigningKey], roster: &[SortedRosterMember], i: usize, is_precommit: bool, round: u32, value_id: ValueId) {
+        let data = make_vote_sign_datas(roster[i].pub_key, is_precommit, 0, round, value_id)[1];
+        let sig = TMSig(sign_with_namespace(&keys[i], &data, &to.vote_namespace));
+        to.check_and_incorporate_msg(0, round, 0, value_id, -2, roster, i, PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit as u8, &data, sig);
+    }
+
+    // A round keeps one timeout. Line 47 (2f+1 precommits of any kind) schedules the precommit timeout,
+    // which ends the round, and has no step condition, so it can come first: a node still waiting for
+    // the proposal, whose prevotes have not all arrived, counts 2f+1 precommits. When the proposal and
+    // the prevotes then arrive, line 34 schedules the prevote timeout in the same slot and the precommit
+    // timeout is gone. Line 44 or the prevote timeout moves the node to the precommit step, the prevote
+    // timeout then does nothing, and line 47 does not run twice. The node never leaves the round on its
+    // own; only a decision or f+1 of a later round (line 55) can move it.
+    #[test]
+    fn a_precommit_timeout_scheduled_before_the_prevote_timeout_still_ends_the_round() {
+        let (keys, roster, proposer, others) = split_finalizers();
+        let me = others[2];
+        let value = BlockValue((0..2 * PROPOSAL_CHUNK_DATA_SIZE).map(|i| i as u8).collect());
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut node = split_engine(&keys, &roster, me, None);
+        let mut node_roster = roster.clone();
+        rt.block_on(node.start_round(&roster, Instant::now(), 0));
+        let id = value.id_from_value(&node.hash_keys);
+
+        // 2f+1 nil precommits, before the proposal and before 2f+1 prevotes.
+        for i in [proposer, others[0], others[1]] { vote_from(&mut node, &keys, &roster, i, true, 0, ValueId::NIL); }
+        rt.block_on(node.bft_update(&mut node_roster));
+        assert!(node.rounds_data[0].timeout_triggered[1], "line 47 scheduled the precommit timeout");
+        assert_eq!(node.step, TMStep::Propose);
+
+        // Then the proposal and the nil prevotes of the other three.
+        split_chunks(&mut node, &keys, &roster, proposer, &value, id, None);
+        for i in [proposer, others[0], others[1]] { vote_from(&mut node, &keys, &roster, i, false, 0, ValueId::NIL); }
+        rt.block_on(node.bft_update(&mut node_roster));
+        assert_eq!(node.step, TMStep::Precommit, "line 44 precommitted nil");
+
+        // Every round-0 timeout has expired.
+        std::thread::sleep(zebra_debug_time::real_duration(std::time::Duration::from_millis(1200)));
+        rt.block_on(node.bft_update(&mut node_roster));
+        assert_eq!((node.height, node.round), (0, 1), "the node is still in round 0 with no timeout left to fire: {:?}", node.rounds_data[0].active_timeout);
     }
 
     // #[ignore]
