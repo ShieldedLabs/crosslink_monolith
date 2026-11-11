@@ -200,6 +200,11 @@ allow-branch = ["main"]
 
 [profile.dev]
 panic = "abort"
+# Line tables only: backtraces and stepping work, but locals cannot be inspected. Crates
+# that are debugged often opt back into full debug info below; to opt another one in for
+# yourself, pass --config 'profile.dev.package.<crate>.debug=true' or set it in
+# ~/.cargo/config.toml.
+debug = "line-tables-only"
 # One unit makes every edit regenerate the whole crate; 256 (the incremental default)
 # costs test builds on 2-core machines. Dependencies keep one unit below.
 codegen-units = 16
@@ -217,7 +222,14 @@ debug = false
 codegen-units = 1
 # opt-level = 1
 
+# Full debug info for the crates that are stepped through most.
 [profile.dev.package.tenderlink]
+debug = true
+
+[profile.dev.package.zebra-state]
+debug = true
+
+[profile.dev.package.zebra-network]
 debug = true
 
 # Speed up tests by optimizing performance-critical crates
@@ -247,6 +259,7 @@ opt-level = 3
 
 [profile.dev.package.zebra-gui]
 opt-level = 3
+debug = true
 
 [profile.dev.package.orchard]
 opt-level = 3
