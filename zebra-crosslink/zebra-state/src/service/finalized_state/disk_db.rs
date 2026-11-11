@@ -620,8 +620,8 @@ impl DiskDb {
                 column_families_log_string,
                 "{} (Disk: {}, Memory: {})",
                 cf_name,
-                human_bytes::human_bytes(cf_disk_size as f64),
-                human_bytes::human_bytes(mem_table_size.unwrap_or(0) as f64)
+                human_bytes(cf_disk_size as f64),
+                human_bytes(mem_table_size.unwrap_or(0) as f64)
             )
             .unwrap();
         }
@@ -629,15 +629,15 @@ impl DiskDb {
         debug!("{}", column_families_log_string);
         info!(
             "Total Database Disk Size: {}",
-            human_bytes::human_bytes(total_size_on_disk as f64)
+            human_bytes(total_size_on_disk as f64)
         );
         info!(
             "Total Live Data Disk Size: {}",
-            human_bytes::human_bytes(total_live_size_on_disk as f64)
+            human_bytes(total_live_size_on_disk as f64)
         );
         info!(
             "Total Database Memory Size: {}",
-            human_bytes::human_bytes(total_size_in_mem as f64)
+            human_bytes(total_size_in_mem as f64)
         );
     }
 
@@ -1773,4 +1773,20 @@ impl Drop for DiskDb {
 
         self.shutdown(false);
     }
+}
+
+/// Formats `size` bytes in decimal units, as the `human_bytes` 0.4 crate did with its
+/// default features off: `0 B`, `512 B`, `1.5 KB`, `12 MB`.
+fn human_bytes(size: f64) -> String {
+    const SUFFIX: [&str; 9] = ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
+    const UNIT: f64 = 1000.0;
+
+    if size <= 0.0 {
+        return "0 B".to_string();
+    }
+    let base = size.log10() / UNIT.log10();
+    let value = format!("{:.1}", UNIT.powf(base - base.floor()));
+    // A size under one byte makes `base` negative, and the cast saturates it to 0 ("B"),
+    // as the crate's did.
+    format!("{} {}", value.trim_end_matches(".0"), SUFFIX[base.floor() as usize])
 }
