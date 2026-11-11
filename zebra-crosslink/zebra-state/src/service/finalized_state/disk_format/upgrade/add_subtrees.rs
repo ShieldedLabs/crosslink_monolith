@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, TryRecvError};
-use hex_literal::hex;
+use hex::FromHex;
 use itertools::Itertools;
 use semver::Version;
 use tracing::instrument;
@@ -227,9 +227,10 @@ fn first_sapling_mainnet_subtree() -> NoteCommitmentSubtree<sapling_crypto::Node
     // ```
     NoteCommitmentSubtree {
         index: 0.into(),
-        root: sapling_crypto::Node::from_bytes(hex!(
-            "754bb593ea42d231a7ddf367640f09bbf59dc00f2c1d2003cc340e0c016b5b13"
-        ))
+        root: sapling_crypto::Node::from_bytes(
+            <[u8; 32]>::from_hex("754bb593ea42d231a7ddf367640f09bbf59dc00f2c1d2003cc340e0c016b5b13")
+                .expect("test vector is hex"),
+        )
         .expect("test vector is valid"),
         end_height: Height(558822),
     }
@@ -243,7 +244,8 @@ fn first_orchard_mainnet_subtree() -> NoteCommitmentSubtree<orchard::tree::Node>
     // ```
     NoteCommitmentSubtree {
         index: 0.into(),
-        root: hex!("d4e323b3ae0cabfb6be4087fec8c66d9a9bbfc354bf1d9588b6620448182063b")
+        root: <[u8; 32]>::from_hex("d4e323b3ae0cabfb6be4087fec8c66d9a9bbfc354bf1d9588b6620448182063b")
+            .expect("test vector is hex")
             .as_slice()
             .try_into()
             .expect("test vector is valid"),
