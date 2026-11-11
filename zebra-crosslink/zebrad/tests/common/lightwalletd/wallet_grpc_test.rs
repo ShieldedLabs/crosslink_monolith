@@ -34,7 +34,6 @@
 //! - `Ping`: Not covered and it will never be. `Ping` is only used for testing purposes.
 
 use color_eyre::eyre::Result;
-use hex_literal::hex;
 
 use zebra_chain::{
     block::{Block, Height},
@@ -438,14 +437,14 @@ pub async fn run() -> Result<()> {
             0 => {
                 assert_eq!(
                     subtree.root_hash,
-                    hex!("754bb593ea42d231a7ddf367640f09bbf59dc00f2c1d2003cc340e0c016b5b13")
+                    hex::decode("754bb593ea42d231a7ddf367640f09bbf59dc00f2c1d2003cc340e0c016b5b13").expect("test vector is hex")
                 );
                 assert_eq!(subtree.completing_block_height, 558822u64);
             }
             1 => {
                 assert_eq!(
                     subtree.root_hash,
-                    hex!("03654c3eacbb9b93e122cf6d77b606eae29610f4f38a477985368197fd68e02d")
+                    hex::decode("03654c3eacbb9b93e122cf6d77b606eae29610f4f38a477985368197fd68e02d").expect("test vector is hex")
                 );
                 assert_eq!(subtree.completing_block_height, 670209u64);
             }
@@ -473,14 +472,14 @@ pub async fn run() -> Result<()> {
             0 => {
                 assert_eq!(
                     subtree.root_hash,
-                    hex!("d4e323b3ae0cabfb6be4087fec8c66d9a9bbfc354bf1d9588b6620448182063b")
+                    hex::decode("d4e323b3ae0cabfb6be4087fec8c66d9a9bbfc354bf1d9588b6620448182063b").expect("test vector is hex")
                 );
                 assert_eq!(subtree.completing_block_height, 1707429u64);
             }
             1 => {
                 assert_eq!(
                     subtree.root_hash,
-                    hex!("8c47d0ca43f323ac573ee57c90af4ced484682827248ca5f3eead95eb6415a14")
+                    hex::decode("8c47d0ca43f323ac573ee57c90af4ced484682827248ca5f3eead95eb6415a14").expect("test vector is hex")
                 );
                 assert_eq!(subtree.completing_block_height, 1708132u64);
             }

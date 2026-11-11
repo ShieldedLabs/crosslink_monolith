@@ -330,7 +330,6 @@ embed-resource = "3"
 abscissa_core = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
 anyhow = { workspace = true }
-hex-literal = { workspace = true }
 jsonrpsee-types = { workspace = true }
 once_cell = { workspace = true }
 regex = { workspace = true }
