@@ -3852,9 +3852,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     // The count and total of the miner's transparent outputs when its shield last failed to
     // build. The same outputs fail the same way, so the shield waits for them to change.
     let mut failed_shield_utxos: Option<(usize, u64)> = None;
+    let mut failed_user_shield_utxos: Option<(usize, u64)> = None;
 
     let mut proposed_faucet = ProposedTx::EMPTY;
     let mut proposed_miner_shield = ProposedTx::EMPTY;
+    let mut proposed_user_shield = ProposedTx::EMPTY;
     let mut proposed_stake = ProposedTx::EMPTY;
     let mut proposed_send = ProposedTx::EMPTY;
 
@@ -4986,6 +4988,19 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 if DUMP_TX_BUILD { println!("Try miner shield {ok:?}"); }
                 failed_shield_utxos = if ok { None } else { Some(utxo_state) };
             }
+
+            // Mining to the default (transparent) address lands coinbase in the user wallet, so shield it too.
+            // Wait for the user's other txs so we never build two spends of the same inputs.
+            if !proposed_user_shield.is_in_progress() && !proposed_stake.is_in_progress() && !proposed_send.is_in_progress() {
+                let utxos = &user_wallet.accounts[0].utxos;
+                let utxo_state = (utxos.len(), utxos.iter().map(|utxo| utxo.value.into_u64()).sum::<u64>());
+                if failed_user_shield_utxos != Some(utxo_state) {
+                    let memo = MemoBytes::from_bytes("shielding notes".as_bytes()).unwrap();
+                    let ok = user_wallet.shield_transparent_zats(network, &mut proposed_user_shield, &mut client, &user_usk, 1000000000, &orchard_tree, memo).is_some();
+                    if DUMP_TX_BUILD { println!("Try user shield {ok:?}"); }
+                    failed_user_shield_utxos = if ok { None } else { Some(utxo_state) };
+                }
+            }
             faucet_shield_cooldown_instant = Instant::now();
 
             // also inspect bonds
@@ -5286,6 +5301,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
 
             continue_proposed_tx(&mut miner_wallet, network, &mut proposed_miner_shield, &mut client, "miner shield", DUMP_TX_SEND && false).await;
+            continue_proposed_tx(&mut user_wallet,  network, &mut proposed_user_shield, &mut client, "user shield",  DUMP_TX_SEND && false).await;
             continue_proposed_tx(&mut user_wallet,  network, &mut proposed_stake,        &mut client, "stake",        DUMP_TX_SEND).await;
             continue_proposed_tx(&mut user_wallet,  network, &mut proposed_send,         &mut client, "send",         DUMP_TX_SEND).await;
 
