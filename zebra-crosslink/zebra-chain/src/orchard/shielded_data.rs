@@ -344,25 +344,24 @@ impl Flags {
     }
 }
 
-// We use the `bitflags 2.x` library to implement [`Flags`]. The
-// `2.x` version of the library uses a different serialization
-// format compared to `1.x`.
-// This manual implementation uses the `bitflags_serde_legacy` crate
-// to serialize `Flags` as `bitflags 1.x` would.
+/// [`Flags`] in the serde format `bitflags` 1.x derived: a struct named `Flags` with one `bits`
+/// field. `bitflags` 2.x, which implements [`Flags`], uses a different format.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename = "Flags", deny_unknown_fields)]
+struct FlagsBits {
+    bits: u8,
+}
+
 impl serde::Serialize for Flags {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        bitflags_serde_legacy::serialize(self, "Flags", serializer)
+        FlagsBits { bits: self.bits() }.serialize(serializer)
     }
 }
 
-// We use the `bitflags 2.x` library to implement [`Flags`]. The
-// `2.x` version of the library uses a different deserialization
-// format compared to `1.x`.
-// This manual implementation uses the `bitflags_serde_legacy` crate
-// to deserialize `Flags` as `bitflags 1.x` would.
 impl<'de> serde::Deserialize<'de> for Flags {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        bitflags_serde_legacy::deserialize("Flags", deserializer)
+        // Like `bitflags` 1.x, keep any unknown bits; `zcash_deserialize` is what rejects them.
+        FlagsBits::deserialize(deserializer).map(|flags| Self::from_bits_retain(flags.bits))
     }
 }
 

@@ -467,16 +467,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bitflags-serde-legacy"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b64e60c28b6d25ad92e8b367801ff9aa12b41d05fc8798055d296bace4a60cc"
-dependencies = [
- "bitflags 2.13.1",
- "serde",
-]
-
-[[package]]
 name = "bitvec"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7585,7 +7575,6 @@ version = "11.3.0"
 dependencies = [
  "bech32",
  "bitflags 2.13.1",
- "bitflags-serde-legacy",
  "bitvec",
  "blake2b_simd",
  "blake2s_simd",
