@@ -200,10 +200,10 @@ allow-branch = ["main"]
 
 [profile.dev]
 panic = "unwind"
-# Line tables only: backtraces and stepping work, but locals cannot be inspected. Crates
-# that are debugged often opt back into full debug info below; to opt another one in for
-# yourself, pass --config 'profile.dev.package.<crate>.debug=true' or set it in
-# ~/.cargo/config.toml.
+# The debugging build: minimal optimization. Line tables only is the default, so backtraces and
+# stepping work but locals cannot be inspected; every first-party crate opts back into full
+# debug info below. Drop a crate to line tables by removing it from that list, or for yourself
+# with --config 'profile.dev.package.<crate>.debug="line-tables-only"' or ~/.cargo/config.toml.
 debug = "line-tables-only"
 # One unit makes every edit regenerate the whole crate; 256 (the incremental default)
 # costs test builds on 2-core machines. Dependencies keep one unit below.
@@ -222,8 +222,44 @@ debug = false
 codegen-units = 1
 # opt-level = 1
 
-# Full debug info for the crates that are stepped through most.
+# Full debug info for every first-party crate. zebra-gui's is with its opt-level below.
 [profile.dev.package.tenderlink]
+debug = true
+
+[profile.dev.package.zebrad]
+debug = true
+
+[profile.dev.package.zebra-chain]
+debug = true
+
+[profile.dev.package.zebra-script]
+debug = true
+
+[profile.dev.package.zebra-consensus]
+debug = true
+
+[profile.dev.package.zebra-rpc]
+debug = true
+
+[profile.dev.package.zebra-node-services]
+debug = true
+
+[profile.dev.package.zebra-test]
+debug = true
+
+[profile.dev.package.zebra-utils]
+debug = true
+
+[profile.dev.package.zebra-crosslink]
+debug = true
+
+[profile.dev.package.zebra-debug-time]
+debug = true
+
+[profile.dev.package.tower-batch-control]
+debug = true
+
+[profile.dev.package.tower-fallback]
 debug = true
 
 [profile.dev.package.zebra-state]
