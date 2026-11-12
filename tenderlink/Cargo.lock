@@ -1504,8 +1504,6 @@ dependencies = [
 [[package]]
 name = "shielded_transport_pigeon"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc46352b465cfed285246194e3c9028b5fef3b99f05f1d6859c55030316f9ef1"
 dependencies = [
  "base64",
  "blake3",
