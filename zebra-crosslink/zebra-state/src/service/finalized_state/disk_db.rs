@@ -958,6 +958,10 @@ impl DiskDb {
     /// <https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ#configuration-and-tuning>
     const MEMTABLE_RAM_CACHE_MEGABYTES: usize = 128;
 
+    /// The total size of write-ahead log files past which RocksDB flushes the column families
+    /// that keep the oldest one alive.
+    const MAX_TOTAL_WAL_BYTES: u64 = 1 << 30;
+
     /// Build a vector of current column families on the disk and optionally any new column families.
     /// Returns an iterable collection of all column families.
     fn construct_column_families(
@@ -1324,7 +1328,7 @@ impl DiskDb {
         // Without a cap, RocksDB's own limit is four times the sum of every family's write
         // buffers, about 31 GiB here, so the logs grew until the disk filled. Past this cap
         // RocksDB flushes the families holding the oldest log, so it can be deleted.
-        opts.set_max_total_wal_size(1024 * ONE_MEGABYTE as u64);
+        opts.set_max_total_wal_size(Self::MAX_TOTAL_WAL_BYTES);
 
         // Increase the process open file limit if needed,
         // then use it to set RocksDB's limit.
