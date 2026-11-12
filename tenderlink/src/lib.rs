@@ -482,11 +482,13 @@ impl RoundData {
     // header, so serving the round with -1 after a restart gets every chunk refused. Find the valid
     // round the first chunk's signature verifies under: one signature check for most decisions above
     // round 0, and none for round 0, which can only cite -1.
-    fn recover_proposal_valid_round(&mut self, hash_keys: &HashKeys) {
+    //
+    // The roster cap is the engine's: a restored round is built without one (`EMPTY` holds 0).
+    fn recover_proposal_valid_round(&mut self, hash_keys: &HashKeys, active_roster_max_n: usize) {
         if self.round == 0 || self.proposal_valid_round != -1 || self.roster.is_empty() { return; }
         let Some(chunk_i) = self.proposal_sigs.iter().position(|sig| *sig != TMSig::NIL) else { return; };
         if chunk_i >= self.proposal.chunks_n() { return; }
-        let (Some(_), proposer) = TMState::proposer_from_height_round(hash_keys, &self.roster, self.height, self.round) else { return; };
+        let (Some(_), proposer) = TMState::proposer_from_height_round(hash_keys, &self.roster, active_roster_max_n, self.height, self.round) else { return; };
         let (chunk_o, chunk_size) = self.proposal.chunk_o_size(chunk_i);
         let mut signed_data = vec![0u8; PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size];
         signed_data[PacketProposalChunkHeader::SERIALIZED_SIZE..].copy_from_slice(&self.proposal.0[chunk_o..chunk_o + chunk_size]);
@@ -903,7 +905,7 @@ impl TMState {
 
     fn ingest_decided_rounds(&mut self, mut decided_rounds: Vec<RoundData>) {
         for round_data in &mut decided_rounds {
-            round_data.recover_proposal_valid_round(&self.hash_keys);
+            round_data.recover_proposal_valid_round(&self.hash_keys, self.active_roster_max_n);
         }
         self.recent_commit_round_cache = decided_rounds;
     }
@@ -5597,7 +5599,7 @@ mod tests {
             let total: u64 = stakes.iter().sum();
             let strict_quorum = rng.random_bool(0.5);
             let threshold = if TMState::f_from_n(total) == 0 { total } else { decision_threshold(total, strict_quorum) };
-            let proposer = TMState::proposer_from_height_round(&HashKeys::default(), &roster, 0, 0).0.unwrap();
+            let proposer = TMState::proposer_from_height_round(&HashKeys::default(), &roster, ROSTER_MAX_N, 0, 0).0.unwrap();
             let me = rng.random_range(0..n);
 
             let mut value = BlockValue(vec![0; rng.random_range(1..=3 * PROPOSAL_CHUNK_DATA_SIZE)]);
@@ -5708,7 +5710,7 @@ mod tests {
     // What the send loop gives a peer that is behind: every chunk under a header built from the cached
     // round, then the precommits for the proposal.
     fn serve_decided_round(rd: &RoundData, roster: &[SortedRosterMember], to: &mut TMState) {
-        let proposer = TMState::proposer_from_height_round(&to.hash_keys, roster, rd.height, rd.round).0.unwrap();
+        let proposer = TMState::proposer_from_height_round(&to.hash_keys, roster, to.active_roster_max_n, rd.height, rd.round).0.unwrap();
         for chunk_i in 0..rd.proposal_sigs.len() {
             if rd.proposal_sigs[chunk_i] == TMSig::NIL { continue; }
             let hdr = PacketProposalChunkHeader {
@@ -5735,7 +5737,7 @@ mod tests {
         let decided_roster = roster.to_vec();
         let proposes: Option<BlockValue> = None;
         let mut node = TMState::init(
-            key.clone(), PubKeyID(VerificationKeyBytes::from(key).into()), 0,
+            key.clone(), PubKeyID(VerificationKeyBytes::from(key).into()), 0, ROSTER_MAX_N,
             ClosureToProposeNewBlock(Arc::new(move || { let value = proposes.clone(); Box::pin(async move { value }) })),
             ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
             ClosureToPushDecidedBlock(Arc::new(move |_, _, _| { let roster = decided_roster.clone(); Box::pin(async move { (roster, [0; 32], false) }) })),
@@ -5790,7 +5792,7 @@ mod tests {
                 cumulative_stake += stakes[i];
                 SortedRosterMember { pub_key: PubKeyID(VerificationKeyBytes::from(&keys[i]).into()), stake: stakes[i], cumulative_stake }
             }).collect();
-            let active_n = active_roster_len(&roster);
+            let active_n = active_roster_len(&roster, ROSTER_MAX_N);
             let me = rng.random_range(0..keys.len());
 
             let decisions_n = rng.random_range(1..=4u64);
@@ -5803,7 +5805,7 @@ mod tests {
                 let valid_round: i64 = if round == 0 || rng.random_bool(0.25) { -1 } else { rng.random_range(0..round as i64) };
                 let mut value = BlockValue(vec![0; rng.random_range(1..=4 * PROPOSAL_CHUNK_DATA_SIZE)]);
                 rng.fill_bytes(&mut value.0);
-                let proposer = TMState::proposer_from_height_round(&HashKeys::default(), &roster, height, round).0.unwrap();
+                let proposer = TMState::proposer_from_height_round(&HashKeys::default(), &roster, ROSTER_MAX_N, height, round).0.unwrap();
 
                 let mut voters: Vec<usize> = (0..active_n).collect();
                 voters.shuffle(&mut rng);
