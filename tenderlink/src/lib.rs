@@ -2652,13 +2652,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             return true; // keep forever if None. // @Todo: @Incomplete?
                         };
 
-                        if peer_attestation.expiry + 120 <= now {
+                        if attestation_is_past_gossip(peer_attestation.expiry, now) {
                             return false; // prune
                         }
                         if peer_attestation.issued >= peer_attestation.expiry {
                             return false; // prune
                         }
-                        if peer_attestation.issued + 60 > peer_attestation.expiry {
+                        if attestation_lives_under_60s(peer_attestation.issued, peer_attestation.expiry) {
                             return false; // prune
                         }
 
@@ -2988,7 +2988,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         connection_keys_to_disconnect.push(connection_key);
                         continue;
                     }
-                    if peer_attestation.issued + 60 > peer_attestation.expiry {
+                    if attestation_lives_under_60s(peer_attestation.issued, peer_attestation.expiry) {
                         if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent invalid peer attestation: Expires less than 60 seconds after issued. Issued at {}, expiry is {}.", peer_attestation.issued, peer_attestation.expiry); }
                         connection_keys_to_disconnect.push(connection_key);
                         continue;
@@ -3175,7 +3175,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     connection_keys_to_disconnect.push(connection_key);
                     continue;
                 }
-                if attestation.issued + 60 > attestation.expiry {
+                if attestation_lives_under_60s(attestation.issued, attestation.expiry) {
                     if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID attestation: Expires less than 60 seconds after issued"); }
                     connection_keys_to_disconnect.push(connection_key);
                     continue;
@@ -3626,6 +3626,14 @@ impl SliceRead for PeerAttestation {
         })
     }
 }
+
+// An attestation's `issued` and `expiry` are whatever the peer wrote, and they are checked before
+// any signature, so the checks must not overflow: `issued + 60` aborts a debug build at u64::MAX,
+// and in a release build it wraps and lets a 1-second attestation through.
+/// Whether an attestation lives less than 60 seconds (or not at all).
+fn attestation_lives_under_60s(issued: u64, expiry: u64) -> bool { expiry.saturating_sub(issued) < 60 }
+/// Whether an attestation expired at least 120 seconds ago, after which its holders stop gossiping it.
+fn attestation_is_past_gossip(expiry: u64, now: u64) -> bool { now.saturating_sub(expiry) >= 120 }
 
 pub const PEER_ATTESTATION_SERIALIZED_SIZE: usize = // @Volatile.
     STP_ADDRESS_SERIALIZED_SIZE /* stp_address */ +
@@ -5068,6 +5076,23 @@ mod tests {
         for (test_i, test) in tests.iter().enumerate() {
             let rngs = gen_mostly_empty_rngs(test.arr.len(), |i| test.arr[i] == b'0');
             assert_eq!(test.rngs, &rngs, "index {}", test_i);
+        }
+    }
+
+    // The receive loop checks a peer's attestation times before any signature, so the checks
+    // must hold for every u64 a peer can write, and agree with `issued + 60 > expiry` and
+    // `expiry + 120 <= now` wherever those do not overflow.
+    #[test]
+    fn attestation_time_checks_do_not_overflow() {
+        let max = u64::MAX;
+        for (issued, expiry, lives_under_60s) in [
+            (max - 1, max, true), (max - 59, max, true), (max - 60, max, false), (0, max, false),
+            (max, max, true), (max, 0, true), (100, 159, true), (100, 160, false),
+        ] {
+            assert_eq!(attestation_lives_under_60s(issued, expiry), lives_under_60s, "issued {issued}, expiry {expiry}");
+        }
+        for (expiry, now, past) in [(max, 0, false), (max - 119, max, false), (max - 120, max, true), (max, max, false), (0, 119, false), (0, 120, true), (5, 0, false)] {
+            assert_eq!(attestation_is_past_gossip(expiry, now), past, "expiry {expiry}, now {now}");
         }
     }
 }
