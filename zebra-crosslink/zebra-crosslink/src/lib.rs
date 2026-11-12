@@ -995,6 +995,7 @@ mod wallet_rpc_tests {
                 mempool,
                 inbound_wire,
                 block_from_template: Arc::new(std::sync::OnceLock::<BlockFromTemplateProcedure>::new()),
+                rpc_call: Arc::new(std::sync::OnceLock::new()),
             },
             config: config::Config { disable_the_headless_wallet, ..Default::default() },
             params: network.crosslink_parameters(),
