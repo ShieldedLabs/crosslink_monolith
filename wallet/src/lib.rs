@@ -125,6 +125,17 @@ pub static STAKING_STAGE: Mutex<Option<(StakingActionRequest, tokio::sync::onesh
 /// Staged basic send requested over RPC: (value in zatoshis, unified address string, result channel).
 pub static BASIC_SEND_STAGE: Mutex<Option<(u64, String, tokio::sync::oneshot::Sender<Result<String, String>>)>> = Mutex::new(None);
 
+/// Takes the staged RPC staking request for the wallet to build, unless its caller has gone (an RPC
+/// client that timed out): nobody would be told about it, and the caller may well have sent it again.
+pub fn take_staged_staking_action() -> Option<(StakingActionRequest, tokio::sync::oneshot::Sender<Result<String, String>>)> {
+    STAKING_STAGE.lock().unwrap().take().filter(|(_, sender)| !sender.is_closed())
+}
+
+/// Takes the staged RPC send for the wallet to build, unless its caller has gone, as with staking.
+pub fn take_staged_basic_send() -> Option<(u64, String, tokio::sync::oneshot::Sender<Result<String, String>>)> {
+    BASIC_SEND_STAGE.lock().unwrap().take().filter(|(_, _, sender)| !sender.is_closed())
+}
+
 pub static STAKING_POSITIONS: Mutex<zcash_primitives::bft::WalletStakingPositions> = Mutex::new((BTreeMap::new(), Vec::new()));
 /// Read by the `wallet_spendable_funds` RPC; kept fresh by `wallet_main` beside the balances
 /// it already computes for the GUI.
@@ -5070,9 +5081,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
 
         if rpc_stake.is_none() && !proposed_user_shield.is_in_progress() {
-            // A request whose RPC caller has gone (a client timeout) is not built: nobody was
-            // told about it, and the caller may well have sent it again.
-            let staged_action = STAKING_STAGE.lock().unwrap().take().filter(|(_, sender)| !sender.is_closed());
+            let staged_action = take_staged_staking_action();
             if let Some((request, sender)) = staged_action {
                 let mut tx = ProposedTx::EMPTY;
                 let res = match request {
@@ -5104,7 +5113,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
 
         if rpc_send.is_none() && !proposed_user_shield.is_in_progress() {
-            let staged_send = BASIC_SEND_STAGE.lock().unwrap().take().filter(|(_, _, sender)| !sender.is_closed());
+            let staged_send = take_staged_basic_send();
             if let Some((value_zats, address, sender)) = staged_send {
                 // The address arrives as a string and is decoded here rather than at the RPC
                 // boundary because this loop is what knows the network the wallet was built for.
