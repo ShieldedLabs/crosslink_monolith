@@ -307,10 +307,15 @@ overflow-checks = false
 incremental = false
 codegen-units = 16
 
+# Server release: full debug info and every optimization. Each build takes much longer than
+# with thin LTO; to iterate on optimized code use `--profile release-iter`, and for binaries
+# to distribute use `--profile public-release`.
 [profile.release]
 panic = "abort"
 debug = "full" # Don't change. We need debug=full for server debugging!
 strip = "none"
+# One codegen unit lets LLVM optimize across the whole crate, and fat LTO across all crates.
+codegen-units = 1
 
 # Speed up release builds and sync tests using link-time optimization.
 # Some of Zebra's code is CPU-intensive, and needs extra optimizations for peak performance.
@@ -322,7 +327,7 @@ strip = "none"
 #     - use clang to compile all C/C++ code
 #     - add "-flto=thin" to all C/C++ code builds
 #     - see https://doc.rust-lang.org/rustc/linker-plugin-lto.html#cc-code-as-a-dependency-in-rust
-lto = "thin"
+lto = "fat"
 
 # [profile.release-debug]
 # inherits = "release"
@@ -335,6 +340,8 @@ lto = "thin"
 inherits = "release"
 lto = "off"
 incremental = true
+# Not release's one unit: with one, an edit regenerates the whole crate.
+codegen-units = 256
 
 [workspace.lints.rust]
 # The linter should ignore these expected config flags/values
