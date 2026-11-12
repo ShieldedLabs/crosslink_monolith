@@ -4430,6 +4430,125 @@ mod tests {
         assert_eq!((node.height, node.round), (0, 1), "the node is still in round 0 with no timeout left to fire: {:?}", node.rounds_data[0].active_timeout);
     }
 
+    // Round 0 of height 0 always ends once 2f+1 precommits reach the node, whatever else arrives and in
+    // whatever order. Each case draws a roster (size, stakes), the node (the proposer or not) and its
+    // quorum rule, then hands the node a shuffled stream of proposal chunks, prevotes and precommits
+    // from the others, each for the proposal, nil, or another value, some withheld and some repeated,
+    // with updates and elapsed timeouts in between. A timeout elapses by setting its time to now, so no
+    // case sleeps. After every update, a round whose precommit timeout was scheduled must still hold it:
+    // the round keeps one timeout, and only the precommit timeout ends the round. At the end every
+    // timeout elapses in turn, and the node must leave round 0 whenever the precommits it was handed
+    // carried 2f+1 of the stake.
+    //
+    // Every run draws a fresh seed (set CROSSLINK_FUZZ_SEED to replay one).
+    #[test]
+    fn a_round_with_2f_plus_1_precommits_always_ends_whatever_order_its_messages_arrive_in() {
+        use rand::seq::SliceRandom;
+        #[derive(Clone, Copy, Debug)]
+        enum Event { Chunk(usize), Vote(usize, bool, ValueId), Update, Elapse }
+
+        let seed: u64 = std::env::var("CROSSLINK_FUZZ_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| rand::rng().next_u64());
+        eprintln!("CROSSLINK_FUZZ_SEED={seed}");
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let (mut precommit_timeout_first, mut decided, mut moved_on, mut stuck_allowed) = (0, 0, 0, 0);
+
+        for _ in 0..1000 {
+            let n = rng.random_range(1..=7);
+            let mut stakes: Vec<u64> = (0..n).map(|_| if rng.random_bool(0.5) { 1 } else { rng.random_range(1..=1000) }).collect();
+            stakes.sort_unstable_by(|a, b| b.cmp(a));
+            let keys: Vec<SigningKey> = (0..n).map(|_| { let mut s = [0u8; 32]; rng.fill_bytes(&mut s); SigningKey::from(s) }).collect();
+            let mut cumulative_stake = 0;
+            let roster: Vec<SortedRosterMember> = (0..n).map(|i| {
+                cumulative_stake += stakes[i];
+                SortedRosterMember { pub_key: PubKeyID(VerificationKeyBytes::from(&keys[i]).into()), stake: stakes[i], cumulative_stake }
+            }).collect();
+            let total: u64 = stakes.iter().sum();
+            let strict_quorum = rng.random_bool(0.5);
+            let threshold = if TMState::f_from_n(total) == 0 { total } else { decision_threshold(total, strict_quorum) };
+            let proposer = TMState::proposer_from_height_round(&HashKeys::default(), &roster, 0, 0).0.unwrap();
+            let me = rng.random_range(0..n);
+
+            let mut value = BlockValue(vec![0; rng.random_range(1..=3 * PROPOSAL_CHUNK_DATA_SIZE)]);
+            rng.fill_bytes(&mut value.0);
+            let mut node = split_engine(&keys, &roster, me, (me == proposer).then(|| value.clone()));
+            node.strict_quorum = strict_quorum;
+            let mut node_roster = roster.clone();
+            let id = value.id_from_value(&node.hash_keys);
+            let mut other = [0u8; 32];
+            rng.fill_bytes(&mut other);
+            let other = ValueId(other);
+
+            let mut events = Vec::new();
+            if me != proposer {
+                for chunk_i in 0..value.chunks_n() { if rng.random_bool(0.85) { events.push(Event::Chunk(chunk_i)); } }
+            }
+            let mut precommitted_stake = 0;
+            for i in (0..n).filter(|&i| i != me) {
+                for is_precommit in [false, true] {
+                    if !rng.random_bool(if is_precommit { 0.9 } else { 0.75 }) { continue; }
+                    let vote = *[id, ValueId::NIL, other].choose(&mut rng).unwrap();
+                    events.push(Event::Vote(i, is_precommit, vote));
+                    if is_precommit { precommitted_stake += stakes[i]; }
+                }
+            }
+            for _ in 0..rng.random_range(0..=3) { if let Some(&e) = events.choose(&mut rng) { events.push(e); } }
+            for _ in 0..rng.random_range(0..=events.len()) { events.push(Event::Update); }
+            for _ in 0..rng.random_range(0..=2) { events.push(Event::Elapse); }
+            events.shuffle(&mut rng);
+            // The order that lost the precommit timeout: the precommits first, then the rest.
+            if rng.random_bool(0.4) { events.sort_by_key(|e| !matches!(e, Event::Vote(_, true, _))); }
+
+            let case = format!("seed {seed}: {n} members with stakes {stakes:?}, node {me}, proposer {proposer}, strict quorum {strict_quorum}, events {events:?}");
+
+            let elapse = |node: &mut TMState| {
+                let current = (node.height, node.round);
+                if let Some(rd) = node.rounds_data.iter_mut().find(|rd| (rd.height, rd.round) == current) {
+                    if let Some(timeout) = &mut rd.active_timeout { timeout.time = Instant::now(); }
+                }
+            };
+            // Votes count on receipt, so the prevotes are compared with what the previous update saw.
+            let (mut precommit_timeout_while_proposing, mut prevotes_seen) = (false, 0);
+            let mut update = |node: &mut TMState, node_roster: &mut Vec<SortedRosterMember>| {
+                rt.block_on(node.bft_update(node_roster));
+                if (node.height, node.round) != (0, 0) { return; }
+                let rd = node.rounds_data.iter().find(|rd| (rd.height, rd.round) == (0, 0)).unwrap();
+                if rd.timeout_triggered[1] {
+                    assert!(rd.active_timeout.as_ref().is_some_and(|t| t.step == TMStep::Precommit),
+                        "{case}: round 0 lost its precommit timeout to {:?} in step {:?}", rd.active_timeout, node.step);
+                    if precommit_timeout_while_proposing && prevotes_seen < threshold && threshold <= rd.counts.prevotes { precommit_timeout_first += 1; }
+                    if node.step == TMStep::Propose { precommit_timeout_while_proposing = true; }
+                }
+                prevotes_seen = rd.counts.prevotes;
+            };
+
+            rt.block_on(node.start_round(&roster, Instant::now(), 0));
+            for &event in &events {
+                match event {
+                    Event::Chunk(chunk_i) => split_chunks(&mut node, &keys, &roster, proposer, &value, id, Some(chunk_i)),
+                    Event::Vote(i, is_precommit, vote) => if (node.height, node.round) == (0, 0) { vote_from(&mut node, &keys, &roster, i, is_precommit, 0, vote) },
+                    Event::Update => update(&mut node, &mut node_roster),
+                    Event::Elapse => elapse(&mut node),
+                }
+            }
+            update(&mut node, &mut node_roster);
+            for _ in 0..4 {
+                if (node.height, node.round) != (0, 0) { break; }
+                elapse(&mut node);
+                update(&mut node, &mut node_roster);
+            }
+
+            if node.height > 0 { decided += 1; } else if node.round > 0 { moved_on += 1; }
+            if (node.height, node.round) == (0, 0) {
+                assert!(precommitted_stake < threshold, "{case}: the node got {precommitted_stake} of {threshold} precommitting stake and is still in round 0, step {:?}, timeout {:?}",
+                    node.step, node.rounds_data.iter().find(|rd| (rd.height, rd.round) == (0, 0)).map(|rd| rd.active_timeout.clone()));
+                stuck_allowed += 1;
+            }
+        }
+        eprintln!("decided {decided}, moved on {moved_on}, waiting short of 2f+1 precommits {stuck_allowed}, precommit timeout before 2f+1 prevotes {precommit_timeout_first}");
+        assert!(decided > 50 && moved_on > 100 && stuck_allowed > 20 && precommit_timeout_first > 20, "seed {seed}: too few cases reached every path");
+    }
+
     // The decided round as zebra-state's `decided_round_data` rebuilds it after a restart, from the
     // stored block, certificate and chunk signatures. Storage keeps no valid round, so it has the -1
     // of `RoundData::EMPTY` whatever the proposal cited.
