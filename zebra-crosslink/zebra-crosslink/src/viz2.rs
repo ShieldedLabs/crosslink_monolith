@@ -666,7 +666,7 @@ pub async fn service_viz_requests(
                                 TEST_FAILED_INSTR_IDXS.lock().unwrap().clear();
                                 let handle = tfl_handle.clone();
                                 tokio::task::spawn(async move {
-                                    test_format::read_instrs(handle, &bytes, &tf.instrs).await;
+                                    test_format::read_instrs(handle, &bytes, &tf.instrs, test_format::ReadOptions::UNTRUSTED).await;
                                 });
                             }
                             Err(err) => {

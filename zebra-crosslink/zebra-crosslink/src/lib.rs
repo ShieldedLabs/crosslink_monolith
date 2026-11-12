@@ -32,6 +32,8 @@ pub static TEST_FAILED_INSTR_IDXS: Mutex<Vec<(usize, String)>> = Mutex::new(Vec:
 pub static TEST_CHECK_ASSERT: Mutex<u8> = Mutex::new(1);
 pub static TEST_INSTR_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 pub static TEST_INSTR_BYTES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// How the test's file is run, set with its bytes.
+pub static TEST_READ_OPTIONS: Mutex<test_format::ReadOptions> = Mutex::new(test_format::ReadOptions::UNTRUSTED);
 pub static TEST_INSTRS: Mutex<Vec<test_format::TFInstr>> = Mutex::new(Vec::new());
 pub static TEST_SHUTDOWN_FN: Mutex<fn()> = Mutex::new(|| ());
 pub static TEST_NAME: Mutex<&'static str> = Mutex::new("‰‰TEST_NAME_NOT_SET‰‰");

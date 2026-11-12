@@ -537,12 +537,23 @@ pub fn val_from_finality(val: Option<TFLBlockFinality>) -> [u64; 2] {
     }
 }
 
+/// How [`read_instrs`] runs a file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadOptions {
+    /// The instructions before this index submit their PoW blocks through
+    /// [`zebra_state::new_network::submit_trusted_block_to_new_network`]: the blocks' proofs,
+    /// signatures and scripts are not checked. 0 trusts none. Set only for a chain prefix the
+    /// operator has marked trusted (see `chain_prefix`).
+    pub trusted_before: usize,
+}
+
+impl ReadOptions {
+    /// Every check runs.
+    pub const UNTRUSTED: ReadOptions = ReadOptions { trusted_before: 0 };
+}
+
 /// The file magic this build writes. Version 1 always writes the staking calendar in SET_PARAMS
 /// and may follow it with a node config fragment; version 0 files are still read.
-/// While set, `LOAD_POW` submits through [`zebra_state::new_network::submit_trusted_block_to_new_network`]:
-/// the block's proofs, signatures and scripts are not checked. Set only by a chain prefix import
-/// the operator has marked trusted (see `chain_prefix`).
-pub static TRUSTED_LOAD_POW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub const TF_MAGIC: &[u8; 8] = b"ZECCLTF1";
 const TF_MAGIC_V0: &[u8; 8] = b"ZECCLTF0";
@@ -1467,6 +1478,7 @@ pub(crate) async fn handle_instr(
     instr: TestInstr,
     flags: u32,
     instr_i: usize,
+    trusted: bool,
 ) {
     let is_bft = matches!(
         instr,
@@ -1490,7 +1502,7 @@ pub(crate) async fn handle_instr(
 
             // Through new_network's ingest queue, the doorway submitblock uses, so blocks take
             // the production admission path rather than a parallel one.
-            let outcome = if TRUSTED_LOAD_POW.load(std::sync::atomic::Ordering::Relaxed) {
+            let outcome = if trusted {
                 zebra_state::new_network::submit_trusted_block_to_new_network(Arc::new(block), NODE_ANSWER_WAIT).await
             } else {
                 zebra_state::new_network::submit_block_to_new_network(Arc::new(block), NODE_ANSWER_WAIT).await
@@ -2760,7 +2772,7 @@ async fn await_tx_verdict(internal_handle: &TFLServiceHandle, transaction: &Tran
     }
 }
 
-pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs: &[TFInstr]) {
+pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs: &[TFInstr], options: ReadOptions) {
     // A failed deserialize is a hard error for a normal test but an expected input rejection
     // for the fuzzer; `uhh_option` decides which via TEST_ON_FAIL (PANIC vs recover).
     let on_fail = *TEST_ON_FAIL.lock().unwrap();
@@ -2802,6 +2814,7 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
                 instr,
                 instrs[instr_i].flags,
                 instr_i,
+                instr_i < options.trusted_before,
             )
             .await;
 
@@ -2868,7 +2881,8 @@ pub(crate) async fn instr_reader(internal_handle: TFLServiceHandle) {
     *TEST_INSTRS.lock().unwrap() = tf.instrs.clone();
 
     let params = internal_handle.params;
-    read_instrs(internal_handle, &bytes, &tf.instrs).await;
+    let options = *crate::TEST_READ_OPTIONS.lock().unwrap();
+    read_instrs(internal_handle, &bytes, &tf.instrs, options).await;
 
     // Copy everything out and release every lock BEFORE asserting. The panic hook runs before
     // unwinding, while anything the failing statement holds is still held, and it calls
