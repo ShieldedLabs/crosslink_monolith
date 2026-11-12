@@ -98,7 +98,7 @@ pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
 use static_assertions::const_assert;
 use std::{hash::DefaultHasher, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, sync::{Arc, Mutex}};
 use ed25519_zebra::{SigningKey, VerificationKeyBytes, VerificationKey};
-use rand::{seq::{IndexedRandom}, Rng, RngCore, SeedableRng};
+use rand::{seq::{IndexedRandom, SliceRandom}, Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rand_pcg::Lcg128CmDxsm64 as SimRng;
 use snow::resolvers::CryptoResolver;
@@ -1536,6 +1536,19 @@ pub struct Peer {
     pub bft_pk: PubKeyID,             // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
     pub stp_address: STPAddress,      // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
     pub stp_handshake_hash: [u8; 64], // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
+
+    // Gossip state; see `gossip_to_peer`.
+    have_seq: u64,
+    have_height_round: Option<(u64, u32)>,
+    view_height: u64,
+    view: Vec<PeerRoundView>,
+    repair_cursor: u32,
+    first_tick: Option<u64>,
+    have_sent_height: u64,
+    have_sent: Vec<(u32, u64)>,
+    have_sent_tick: Option<u64>,
+    have_rotate_tick: Option<u64>,
+    have_cursor: u32,
 }
 /// The Peer for a connection's session, when that session is new to us: a key we have no Peer
 /// for, or a known key whose STP handshake hash changed. STP replaces a restarted peer's session
@@ -1566,6 +1579,17 @@ impl Default for Peer {
         bft_pk:                       Default::default(),
         stp_address:                  Default::default(),
         stp_handshake_hash:           [0u8; 64],
+        have_seq:                     0,
+        have_height_round:            None,
+        view_height:                  0,
+        view:                         Vec::new(),
+        repair_cursor:                0,
+        first_tick:                   None,
+        have_sent_height:             0,
+        have_sent:                    Vec::new(),
+        have_sent_tick:               None,
+        have_rotate_tick:             None,
+        have_cursor:                  0,
     } }
 }
 impl Peer {
@@ -1988,14 +2012,15 @@ pub fn value_id_of(hash_keys: &HashKeys, value: &[u8]) -> ValueId {
     ValueId(hash_keys.value_id.hash(value))
 }
 
-/// An empty packet whose status says the sender is at `height` and `round` and holds none of its
-/// proposal or votes, so the node answers with everything it has for them.
+/// A HAVE saying the sender is at `height` and `round` and holds none of its proposal or votes,
+/// so the node sends it everything it has for them that it has not sent it lately.
 pub fn status_packet_needing_everything(height: u64, round: u32, roster_n: usize) -> Vec<u8> {
-    let mut buf = [0u8; 256];
-    let mut header = PacketHeader::new::<PACKET_TYPE_EMPTY>();
+    let mut buf = [0u8; PACKET_HEADER_SIZE + PACKET_STATUS_SIZE + HAVE_FIXED_SIZE];
+    let mut header = PacketHeader::new::<PACKET_TYPE_HAVE>();
     header.tag |= PACKET_TAG_STATUS_FLAG as u64;
     let mut o = header.write_to(&mut buf);
-    o += needing_everything(height, round, roster_n).write_to(&mut buf[o..]);
+    o += PacketStatus { height, round, ..Default::default() }.write_to(&mut buf[o..]);
+    o += write_have_fixed(next_have_seq(), height, round, roster_n.min(VOTE_BITS_MAX), 0, &mut buf[o..]);
     buf[..o].to_vec()
 }
 
@@ -2159,6 +2184,747 @@ fn write_signed_proposal_chunk(round_data: &RoundData, chunk_i: usize,
     Some(o)
 }
 
+// Consensus gossip. Tendermint's proofs assume that whatever one correct node sends or receives
+// reaches every correct node within a bound once the network is synchronous, so a node passes on
+// every proposal chunk and vote it holds for its height, a faulty finalizer's second vote
+// included, until each peer says it has it. Each tick a node sends every peer a HAVE: which
+// chunks and votes it holds, for the rounds of its height whose holdings changed since it last
+// told that peer, plus a slow rotation over all of them in case a HAVE was lost. It then sends a
+// peer what the peer's newest HAVE says it lacks, within a byte budget per peer and tick that
+// shrinks by what the transport has not yet put on the wire. What it sent is not sent again
+// until a retry interval passes without the peer reporting it. TENDERLINK.md has the reasoning.
+
+const GOSSIP_BYTES_PER_PEER_TICK:   usize = 20_000;
+/// At least this fraction of a tick's budget goes to the rotation over every round, so the
+/// current round's traffic cannot starve the others.
+const GOSSIP_REPAIR_SHARE_DIV:      usize = 4;
+const GOSSIP_RETRY_MIN_TICKS:       u64   = 4;
+const GOSSIP_RETRY_MAX_TICKS:       u64   = 16;
+/// How long a new peer has to send its first HAVE before it is served from its status alone.
+const GOSSIP_FIRST_HAVE_WAIT_TICKS: u64   = 8;
+const HAVE_REFRESH_TICKS:           u64   = 4;
+const VOTE_BITS_MAX:                usize = 256;
+type VoteBits = [u64; VOTE_BITS_MAX / 64];
+const PROPOSAL_CHUNKS_MAX:          usize = PROPOSAL_MAX_SIZE.div_ceil(PROPOSAL_CHUNK_DATA_SIZE);
+const PACKET_VOTES_FIXED_SIZE:      usize = 1 + 1 + 4 + 8 + 32;
+const PACKET_VOTE_SIZE:             usize = 2 + 64;
+/// As many votes as fit one datagram, so losing a datagram loses no more than one packet.
+const VOTES_PER_PACKET:             usize = (PROPOSAL_PACKET_SIZE - PACKET_HEADER_SIZE - PACKET_STATUS_SIZE - PACKET_VOTES_FIXED_SIZE) / PACKET_VOTE_SIZE;
+const_assert!(VOTES_PER_PACKET <= 18);
+const HAVE_FIXED_SIZE:              usize = 8 + 8 + 4 + 2 + 2;
+const HAVE_ROUND_MAX_SIZE:          usize = PROPOSAL_PACKET_SIZE - PACKET_HEADER_SIZE - PACKET_STATUS_SIZE - HAVE_FIXED_SIZE;
+
+fn bits_get(bits: &[u64], i: usize) -> bool { bits.get(i / 64).is_some_and(|&word| word >> (i % 64) & 1 != 0) }
+fn bits_set(bits: &mut [u64], i: usize) { bits[i / 64] |= 1 << (i % 64); }
+fn bits_count(bits: &[u64]) -> usize { bits.iter().map(|word| word.count_ones() as usize).sum() }
+
+fn write_bits(bits: &[u64], n: usize, buf: &mut [u8]) -> usize {
+    let bytes_n = n.div_ceil(8);
+    for b in 0..bytes_n {
+        buf[b] = (bits.get(b / 8).copied().unwrap_or(0) >> (b % 8 * 8)) as u8;
+    }
+    if n % 8 != 0 {
+        buf[bytes_n - 1] &= (1u8 << (n % 8)) - 1;
+    }
+    bytes_n
+}
+
+fn read_bits(buf: &mut &[u8], n: usize, bits: &mut [u64]) -> Option<()> {
+    let bytes_n = n.div_ceil(8);
+    if buf.len() < bytes_n || bits.len() * 64 < n { return None; }
+    for b in 0..bytes_n {
+        bits[b / 8] |= (buf[b] as u64) << (b % 8 * 8);
+    }
+    for (w, word) in bits.iter_mut().enumerate() {
+        let lo = w * 64;
+        if lo >= n { *word = 0; } else if n - lo < 64 { *word &= (1u64 << (n - lo)) - 1; }
+    }
+    *buf = &buf[bytes_n..];
+    Some(())
+}
+
+/// How many of a round's finalizers can have votes in it, as far as gossip tracks them.
+fn round_voters_n(rd: &RoundData) -> usize {
+    active_roster_len(&rd.roster, rd.active_roster_max_n).min(rd.msg_val_sigs.len()).min(VOTE_BITS_MAX)
+}
+
+/// Which chunks and votes of one round a node holds: what a HAVE says of a round, and what a
+/// node records of a peer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HaveRound {
+    round: u32,
+    proposal_id: ValueId,
+    chunks_n: usize,
+    chunk_bits: Vec<u64>,
+    nil: [VoteBits; 2],
+    values: Vec<(ValueId, [VoteBits; 2])>,
+}
+
+impl HaveRound {
+    fn empty(round: u32) -> Self { HaveRound { round, ..Default::default() } }
+
+    fn of(rd: &RoundData) -> Self {
+        let mut have = HaveRound::empty(rd.round);
+        have.proposal_id = rd.proposal_id;
+        have.chunks_n    = rd.proposal_sigs.len();
+        have.chunk_bits  = vec![0; have.chunks_n.div_ceil(64)];
+        for (chunk_i, sig) in rd.proposal_sigs.iter().enumerate() {
+            if *sig != TMSig::NIL { bits_set(&mut have.chunk_bits, chunk_i); }
+        }
+        for roster_i in 0..round_voters_n(rd) {
+            for is_precommit in 0..2 {
+                if rd.msg_nil_sigs.get(roster_i).is_some_and(|sigs| sigs[is_precommit] != TMSig::NIL) {
+                    bits_set(&mut have.nil[is_precommit], roster_i);
+                }
+                for (value_id, sig) in [rd.msg_val_sigs[roster_i][is_precommit], rd.other_vote(roster_i, is_precommit)] {
+                    if sig != TMSig::NIL && value_id != ValueId::NIL { have.set_vote(is_precommit, value_id, roster_i); }
+                }
+            }
+        }
+        // A HAVE may not fit every value, so the ones that matter most go first.
+        let proposal_id = rd.proposal_id;
+        have.values.sort_by_key(|(value_id, bits)| (*value_id != proposal_id, std::cmp::Reverse(bits_count(&bits[0]) + bits_count(&bits[1])), *value_id));
+        have
+    }
+
+    fn set_vote(&mut self, is_precommit: usize, value_id: ValueId, roster_i: usize) {
+        if roster_i >= VOTE_BITS_MAX { return; }
+        if value_id == ValueId::NIL {
+            bits_set(&mut self.nil[is_precommit], roster_i);
+            return;
+        }
+        let i = match self.values.iter().position(|value| value.0 == value_id) {
+            Some(i) => i,
+            None => { self.values.push((value_id, [VoteBits::default(); 2])); self.values.len() - 1 }
+        };
+        bits_set(&mut self.values[i].1[is_precommit], roster_i);
+    }
+
+    fn has_vote(&self, is_precommit: usize, value_id: ValueId, roster_i: usize) -> bool {
+        if value_id == ValueId::NIL { return bits_get(&self.nil[is_precommit], roster_i); }
+        self.values.iter().any(|value| value.0 == value_id && bits_get(&value.1[is_precommit], roster_i))
+    }
+
+    /// Whether a node holding this would store chunks of `proposal_id`. One holding another
+    /// proposal's chunks refuses them, or takes them as proof its proposer signed two values;
+    /// either way it stores one proposal per round, and a decided one reaches it by adoption once
+    /// it has the decision's precommits.
+    fn takes_chunks_of(&self, proposal_id: ValueId) -> bool {
+        self.proposal_id == ValueId::NIL || self.proposal_id == proposal_id
+    }
+
+    fn has_chunk(&self, proposal_id: ValueId, chunk_i: usize) -> bool {
+        self.proposal_id == proposal_id && bits_get(&self.chunk_bits, chunk_i)
+    }
+
+    fn set_chunk(&mut self, proposal_id: ValueId, chunks_n: usize, chunk_i: usize) {
+        if self.proposal_id != proposal_id || self.chunks_n != chunks_n {
+            self.proposal_id = proposal_id;
+            self.chunks_n    = chunks_n;
+            self.chunk_bits  = vec![0; chunks_n.div_ceil(64)];
+        }
+        if chunk_i < chunks_n { bits_set(&mut self.chunk_bits, chunk_i); }
+    }
+
+    fn items_n(&self) -> usize {
+        bits_count(&self.chunk_bits) + bits_count(&self.nil[0]) + bits_count(&self.nil[1]) +
+            self.values.iter().map(|(_, bits)| bits_count(&bits[0]) + bits_count(&bits[1])).sum::<usize>()
+    }
+
+    fn wire_size(&self, vote_bits_n: usize, values_n: usize) -> usize {
+        let have_n = bits_count(&self.chunk_bits);
+        let chunk_bitmap = if have_n > 0 && have_n < self.chunks_n { self.chunks_n.div_ceil(8) } else { 0 };
+        let b = vote_bits_n.div_ceil(8);
+        4 + 32 + 2 + 2 + chunk_bitmap + 2 * b + 1 + values_n * (32 + 2 * b)
+    }
+
+    /// Leaves out the last values if the round would not fit one HAVE. A peer then thinks this
+    /// node lacks their votes and sends them again, which costs bandwidth and loses nothing.
+    fn write_to(&self, vote_bits_n: usize, buf: &mut [u8]) -> usize {
+        let have_n = bits_count(&self.chunk_bits);
+        let mut values_n = self.values.len().min(u8::MAX as usize);
+        while values_n > 0 && self.wire_size(vote_bits_n, values_n) > HAVE_ROUND_MAX_SIZE {
+            values_n -= 1;
+        }
+        let mut o = 0;
+        o += self.round.write_to(&mut buf[o..]);
+        o += self.proposal_id.0.write_to(&mut buf[o..]);
+        o += (self.chunks_n as u16).write_to(&mut buf[o..]);
+        o += (have_n as u16).write_to(&mut buf[o..]);
+        if have_n > 0 && have_n < self.chunks_n {
+            o += write_bits(&self.chunk_bits, self.chunks_n, &mut buf[o..]);
+        }
+        for is_precommit in 0..2 {
+            o += write_bits(&self.nil[is_precommit], vote_bits_n, &mut buf[o..]);
+        }
+        o += (values_n as u8).write_to(&mut buf[o..]);
+        for (value_id, bits) in &self.values[..values_n] {
+            o += value_id.0.write_to(&mut buf[o..]);
+            for is_precommit in 0..2 {
+                o += write_bits(&bits[is_precommit], vote_bits_n, &mut buf[o..]);
+            }
+        }
+        o
+    }
+
+    fn read_from(buf: &mut &[u8], vote_bits_n: usize) -> Option<Self> {
+        let mut have = HaveRound::empty(u32::read_from(buf)?);
+        have.proposal_id = ValueId(SliceRead::read_from(buf)?);
+        have.chunks_n    = u16::read_from(buf)? as usize;
+        let have_n       = u16::read_from(buf)? as usize;
+        if have.chunks_n > PROPOSAL_CHUNKS_MAX || have_n > have.chunks_n { return None; }
+        have.chunk_bits = vec![0; have.chunks_n.div_ceil(64)];
+        if have_n == have.chunks_n {
+            for chunk_i in 0..have_n { bits_set(&mut have.chunk_bits, chunk_i); }
+        } else if have_n > 0 {
+            read_bits(buf, have.chunks_n, &mut have.chunk_bits)?;
+        }
+        for is_precommit in 0..2 {
+            read_bits(buf, vote_bits_n, &mut have.nil[is_precommit])?;
+        }
+        let values_n = u8::read_from(buf)?;
+        for _ in 0..values_n {
+            let value_id = ValueId(SliceRead::read_from(buf)?);
+            let mut bits = [VoteBits::default(); 2];
+            for is_precommit in 0..2 {
+                read_bits(buf, vote_bits_n, &mut bits[is_precommit])?;
+            }
+            if value_id != ValueId::NIL && !have.values.iter().any(|value| value.0 == value_id) {
+                have.values.push((value_id, bits));
+            }
+        }
+        Some(have)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PacketHave {
+    seq: u64,
+    height: u64,
+    round: u32,
+    vote_bits_n: usize,
+    rounds: Vec<HaveRound>,
+}
+
+impl PacketHave {
+    fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        let mut have = PacketHave {
+            seq:         u64::read_from(buf)?,
+            height:      u64::read_from(buf)?,
+            round:       u32::read_from(buf)?,
+            vote_bits_n: u16::read_from(buf)? as usize,
+            rounds:      Vec::new(),
+        };
+        let rounds_n = u16::read_from(buf)?;
+        if have.vote_bits_n > VOTE_BITS_MAX { return None; }
+        for _ in 0..rounds_n {
+            have.rounds.push(HaveRound::read_from(buf, have.vote_bits_n)?);
+        }
+        Some(have)
+    }
+}
+
+fn write_have_fixed(seq: u64, height: u64, round: u32, vote_bits_n: usize, rounds_n: usize, buf: &mut [u8]) -> usize {
+    let mut o = 0;
+    o += seq.write_to(&mut buf[o..]);
+    o += height.write_to(&mut buf[o..]);
+    o += round.write_to(&mut buf[o..]);
+    o += (vote_bits_n as u16).write_to(&mut buf[o..]);
+    o += (rounds_n as u16).write_to(&mut buf[o..]);
+    o
+}
+
+static HAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A peer drops a HAVE no newer than the newest it took, and keeps what it took for as long as
+/// the session lasts. Starting from the clock keeps the sequence rising if this engine starts
+/// again on a session that outlived it.
+fn next_have_seq() -> u64 {
+    use std::sync::atomic::Ordering;
+    let now_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
+    HAVE_SEQ.fetch_max(now_us, Ordering::Relaxed);
+    HAVE_SEQ.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// The header and status every consensus packet goes out with. The status asks for nothing: a
+/// node without HAVE reads only its height and round, and a node with it reads HAVEs instead.
+fn write_gossip_header(packet_type: u8, bft_state: &TMState, buf: &mut [u8]) -> usize {
+    let mut header = PacketHeader::new_(packet_type);
+    header.tag |= PACKET_TAG_STATUS_FLAG as u64;
+    print_packet_tag_send(header);
+    let mut o = header.write_to(buf);
+    o += PacketStatus { height: bft_state.height, round: bft_state.round, ..Default::default() }.write_to(&mut buf[o..]);
+    o
+}
+
+/// What a node knows of one round of a peer's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeerRoundView {
+    /// As the peer's newest HAVE reports it.
+    have: HaveRound,
+    /// What was sent to the peer, or received from it, since `sent_tick`.
+    sent: HaveRound,
+    sent_tick: Option<u64>,
+    retry_ticks: u64,
+    reported_n_at_retry: usize,
+}
+
+impl PeerRoundView {
+    fn new(round: u32) -> Self {
+        PeerRoundView { have: HaveRound::empty(round), sent: HaveRound::empty(round), sent_tick: None, retry_ticks: GOSSIP_RETRY_MIN_TICKS, reported_n_at_retry: 0 }
+    }
+
+    fn knows_vote(&self, is_precommit: usize, value_id: ValueId, roster_i: usize) -> bool {
+        self.have.has_vote(is_precommit, value_id, roster_i) || self.sent.has_vote(is_precommit, value_id, roster_i)
+    }
+
+    fn knows_chunk(&self, proposal_id: ValueId, chunk_i: usize) -> bool {
+        self.have.has_chunk(proposal_id, chunk_i) || self.sent.has_chunk(proposal_id, chunk_i)
+    }
+
+    /// Forgets what was sent once the retry interval is up, so whatever the peer still lacks goes
+    /// again. The interval doubles each time the peer has reported nothing new since the last.
+    fn expire(&mut self, tick: u64) {
+        let Some(sent_tick) = self.sent_tick else { return; };
+        if tick < sent_tick + self.retry_ticks { return; }
+        let reported_n = self.have.items_n();
+        if reported_n <= self.reported_n_at_retry {
+            self.retry_ticks = (self.retry_ticks * 2).min(GOSSIP_RETRY_MAX_TICKS);
+        }
+        self.reported_n_at_retry = reported_n;
+        self.sent      = HaveRound::empty(self.sent.round);
+        self.sent_tick = None;
+    }
+}
+
+fn peer_round_view(view: &mut Vec<PeerRoundView>, round: u32) -> &mut PeerRoundView {
+    let i = match view.binary_search_by_key(&round, |v| v.have.round) {
+        Ok(i)  => i,
+        Err(i) => { view.insert(i, PeerRoundView::new(round)); i }
+    };
+    &mut view[i]
+}
+
+fn set_peer_view_height(peer: &mut Peer, height: u64) {
+    if peer.view_height != height {
+        peer.view.clear();
+        peer.view_height   = height;
+        peer.repair_cursor = 0;
+    }
+}
+
+fn cached_round(bft_state: &TMState, height: u64) -> Option<&RoundData> {
+    usize::try_from(height).ok().and_then(|h| bft_state.recent_commit_round_cache.get(h)).filter(|rd| rd.height == height)
+}
+
+/// Whether this node holds anything a peer at `height` could be sent for `round`: a round of its
+/// own height, or the round that decided an earlier one.
+fn holds_round(bft_state: &TMState, height: u64, round: u32) -> bool {
+    if height == bft_state.height {
+        bft_state.rounds_data.binary_search_by_key(&(height, round), |rd| (rd.height, rd.round)).is_ok()
+    } else {
+        height < bft_state.height && cached_round(bft_state, height).is_some_and(|rd| rd.round == round)
+    }
+}
+
+struct GossipRound {
+    round_i: usize,
+    round: u32,
+    have: Vec<u8>,
+    have_hash: u64,
+    value_precommits: bool,
+}
+
+/// The rounds of a node's height as its HAVEs describe them, built once per tick for all peers.
+struct GossipRounds {
+    height: u64,
+    round: u32,
+    vote_bits_n: usize,
+    rounds: Vec<GossipRound>,
+}
+
+static ROSTER_PAST_VOTE_BITS_PRINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn gossip_rounds_of(bft_state: &TMState) -> GossipRounds {
+    let start = bft_state.rounds_data.partition_point(|rd| rd.height < bft_state.height);
+    let end   = bft_state.rounds_data.partition_point(|rd| rd.height <= bft_state.height);
+    let rds   = &bft_state.rounds_data[start..end];
+    if rds.iter().any(|rd| active_roster_len(&rd.roster, rd.active_roster_max_n) > VOTE_BITS_MAX) &&
+       !ROSTER_PAST_VOTE_BITS_PRINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("{ANSI_RED}BFT ERROR{ANSI_RST}: the active roster has more than {VOTE_BITS_MAX} finalizers; votes of the rest are not gossiped");
+    }
+    let vote_bits_n = rds.iter().map(round_voters_n).max().unwrap_or(0);
+    let mut buf = [0u8; HAVE_ROUND_MAX_SIZE];
+    let rounds = rds.iter().enumerate().map(|(k, rd)| {
+        let have = HaveRound::of(rd);
+        let n = have.write_to(vote_bits_n, &mut buf);
+        let mut hasher = DefaultHasher::new();
+        buf[..n].hash(&mut hasher);
+        GossipRound {
+            round_i: start + k,
+            round: rd.round,
+            have: buf[..n].to_vec(),
+            have_hash: hasher.finish(),
+            value_precommits: have.values.iter().any(|(_, bits)| bits[1] != VoteBits::default()),
+        }
+    }).collect();
+    GossipRounds { height: bft_state.height, round: bft_state.round, vote_bits_n, rounds }
+}
+
+fn put_have_round(gr: &GossipRound, buf: &mut [u8], o: &mut usize, have_sent: &mut Vec<(u32, u64)>) -> bool {
+    if *o + gr.have.len() > PROPOSAL_PACKET_SIZE { return false; }
+    buf[*o..*o + gr.have.len()].copy_from_slice(&gr.have);
+    *o += gr.have.len();
+    match have_sent.binary_search_by_key(&gr.round, |e| e.0) {
+        Ok(i)  => have_sent[i].1 = gr.have_hash,
+        Err(i) => have_sent.insert(i, (gr.round, gr.have_hash)),
+    }
+    true
+}
+
+/// The HAVE for `peer` this tick, if it is owed one: rounds whose holdings changed since the
+/// peer was last told, ours and the peer's current rounds first, then on every refresh as many
+/// of the rest as fit, taken in turn. A HAVE that lists no rounds says this node holds none.
+fn write_have_for_peer(bft_state: &TMState, rounds: &GossipRounds, peer: &mut Peer, tick: u64, buf: &mut [u8]) -> Option<usize> {
+    let fresh = peer.have_sent_tick.is_none() || peer.have_sent_height != rounds.height;
+    if peer.have_sent_height != rounds.height {
+        peer.have_sent.clear();
+        peer.have_sent_height = rounds.height;
+    }
+    let dirty: Vec<bool> = rounds.rounds.iter().map(|gr| {
+        peer.have_sent.binary_search_by_key(&gr.round, |e| e.0).ok().map(|i| peer.have_sent[i].1) != Some(gr.have_hash)
+    }).collect();
+    let rotate = peer.have_rotate_tick.is_none_or(|t| tick >= t + HAVE_REFRESH_TICKS);
+    if !fresh && !rotate && !dirty.contains(&true) { return None; }
+
+    let mut o = write_gossip_header(PACKET_TYPE_HAVE, bft_state, buf);
+    let fixed_o = o;
+    o += HAVE_FIXED_SIZE;
+    let mut written = vec![false; rounds.rounds.len()];
+
+    let peer_round = peer.have_height_round.filter(|&(height, _)| height == rounds.height).map(|(_, round)| round);
+    let mut order: Vec<usize> = (0..rounds.rounds.len()).collect();
+    order.sort_by_key(|&i| {
+        let round = rounds.rounds[i].round;
+        (round != rounds.round, Some(round) != peer_round, std::cmp::Reverse(round))
+    });
+    for &i in &order {
+        if !dirty[i] { continue; }
+        if !put_have_round(&rounds.rounds[i], buf, &mut o, &mut peer.have_sent) { break; }
+        written[i] = true;
+    }
+    if rotate {
+        let n = rounds.rounds.len();
+        if n > 0 {
+            let start = rounds.rounds.partition_point(|gr| gr.round < peer.have_cursor) % n;
+            for k in 0..n {
+                let i = (start + k) % n;
+                if written[i] { continue; }
+                if !put_have_round(&rounds.rounds[i], buf, &mut o, &mut peer.have_sent) {
+                    peer.have_cursor = rounds.rounds[i].round;
+                    break;
+                }
+                written[i] = true;
+            }
+        }
+        peer.have_rotate_tick = Some(tick);
+    }
+
+    let rounds_n = written.iter().filter(|&&w| w).count();
+    write_have_fixed(next_have_seq(), rounds.height, rounds.round, rounds.vote_bits_n, rounds_n, &mut buf[fixed_o..]);
+    peer.have_sent_tick = Some(tick);
+    Some(o)
+}
+
+fn take_have(bft_state: &TMState, peer: &mut Peer, have: PacketHave) {
+    if have.seq <= peer.have_seq { return; }
+    peer.have_seq = have.seq;
+    peer.have_height_round = Some((have.height, have.round));
+    peer.latest_status_request_height = Some(have.height);
+    set_peer_view_height(peer, have.height);
+    if have.rounds.is_empty() {
+        for view in &mut peer.view { view.have = HaveRound::empty(view.have.round); }
+    }
+    for round_have in have.rounds {
+        let round = round_have.round;
+        if holds_round(bft_state, have.height, round) {
+            peer_round_view(&mut peer.view, round).have = round_have;
+        }
+    }
+}
+
+/// Records that the peer holds something it just sent, so it is not sent straight back.
+fn note_peer_holds(bft_state: &TMState, peer: &mut Peer, tick: u64, height: u64, round: u32, note: impl FnOnce(&RoundData, &mut HaveRound)) {
+    if height != bft_state.height || peer.view_height != height { return; }
+    let Ok(round_i) = bft_state.rounds_data.binary_search_by_key(&(height, round), |rd| (rd.height, rd.round)) else { return; };
+    let view = peer_round_view(&mut peer.view, round);
+    note(&bft_state.rounds_data[round_i], &mut view.sent);
+    view.sent_tick.get_or_insert(tick);
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct GossipSent {
+    have_bytes: usize,
+    data_bytes: usize,
+    chunks: usize,
+    votes: [usize; 2],
+}
+
+struct GossipWriter<'a> {
+    bft_state: &'a TMState,
+    ctx_str:   &'a str,
+    tick:      u64,
+    budget:    usize,
+    out:       &'a mut Vec<Vec<u8>>,
+    sent:      GossipSent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GossipKind { Prevotes, Precommits, Chunks }
+
+fn send_votes(w: &mut GossipWriter, rd: &RoundData, view: &mut PeerRoundView, is_precommit: usize, value_id: ValueId, no: &[PubKeySig], yes: &[PubKeySig]) -> bool {
+    let votes_n = no.len() + yes.len();
+    let size = PACKET_HEADER_SIZE + PACKET_STATUS_SIZE + PACKET_VOTES_FIXED_SIZE + votes_n * PACKET_VOTE_SIZE;
+    if size > w.budget { return false; }
+    let mut packet = PacketVotes {
+        no_votes_n: no.len() as u8, yes_votes_n: yes.len() as u8,
+        round: rd.round, height: rd.height, value_id,
+        votes: [PubKeySig::NIL; 18],
+    };
+    packet.votes[..no.len()].copy_from_slice(no);
+    packet.votes[no.len()..votes_n].copy_from_slice(yes);
+    let mut buf = [0u8; PROPOSAL_PACKET_SIZE];
+    let mut o = write_gossip_header(PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit as u8, w.bft_state, &mut buf);
+    o += packet.write_to(&mut buf[o..]);
+    debug_assert_eq!(o, size);
+    if PRINT_SENDS { println!("{} {ANSI_GRY}SENDS{ANSI_RST}: {} {} {}s at {}.{} for {}", w.ctx_str, no.len(), yes.len(), ["prevote", "precommit"][is_precommit], rd.height, rd.round, value_id); }
+    w.out.push(buf[..o].to_vec());
+    w.budget                     -= size;
+    w.sent.data_bytes            += size;
+    w.sent.votes[is_precommit]   += votes_n;
+    for vote in no  { view.sent.set_vote(is_precommit, ValueId::NIL, vote.roster_i as usize); }
+    for vote in yes { view.sent.set_vote(is_precommit, value_id,     vote.roster_i as usize); }
+    view.sent_tick.get_or_insert(w.tick);
+    true
+}
+
+/// Sends every vote of the step that the peer is not known to hold: nil and value votes, and
+/// both values of a finalizer that signed two. False when the budget ran out first.
+fn gossip_votes(w: &mut GossipWriter, rd: &RoundData, view: &mut PeerRoundView, is_precommit: usize) -> bool {
+    let mut nils: Vec<PubKeySig> = Vec::new();
+    let mut values: Vec<(ValueId, Vec<PubKeySig>)> = Vec::new();
+    for roster_i in 0..round_voters_n(rd) {
+        let nil_sig = rd.msg_nil_sigs.get(roster_i).map_or(TMSig::NIL, |sigs| sigs[is_precommit]);
+        if nil_sig != TMSig::NIL && !view.knows_vote(is_precommit, ValueId::NIL, roster_i) {
+            nils.push(PubKeySig { roster_i: roster_i as u16, sig: nil_sig });
+        }
+        for (value_id, sig) in [rd.msg_val_sigs[roster_i][is_precommit], rd.other_vote(roster_i, is_precommit)] {
+            if sig == TMSig::NIL || value_id == ValueId::NIL || view.knows_vote(is_precommit, value_id, roster_i) { continue; }
+            let vote = PubKeySig { roster_i: roster_i as u16, sig };
+            match values.iter_mut().find(|value| value.0 == value_id) {
+                Some(value) => value.1.push(vote),
+                None        => values.push((value_id, vec![vote])),
+            }
+        }
+    }
+    values.sort_by_key(|value| (value.0 != rd.proposal_id, value.0));
+
+    let mut nils = &nils[..];
+    for (value_id, yes) in &values {
+        for yes in yes.chunks(VOTES_PER_PACKET) {
+            let top_up = (VOTES_PER_PACKET - yes.len()).min(nils.len());
+            if !send_votes(w, rd, view, is_precommit, *value_id, &nils[..top_up], yes) { return false; }
+            nils = &nils[top_up..];
+        }
+    }
+    for no in nils.chunks(VOTES_PER_PACKET) {
+        if !send_votes(w, rd, view, is_precommit, ValueId::NIL, no, &[]) { return false; }
+    }
+    true
+}
+
+/// Sends every chunk of the round's proposal that the peer is not known to hold, if it would
+/// take them. False when the budget ran out first.
+fn gossip_chunks(w: &mut GossipWriter, rd: &RoundData, view: &mut PeerRoundView) -> bool {
+    if rd.proposal_sigs_n == 0 || !view.have.takes_chunks_of(rd.proposal_id) { return true; }
+    let proposer_pub_key = TMState::proposer_from_height_round(&w.bft_state.hash_keys, &rd.roster, rd.active_roster_max_n, rd.height, rd.round).1;
+    for chunk_i in 0..rd.proposal_sigs.len() {
+        if rd.proposal_sigs[chunk_i] == TMSig::NIL || view.knows_chunk(rd.proposal_id, chunk_i) { continue; }
+        let (_, chunk_size) = rd.proposal.chunk_o_size(chunk_i);
+        let size = PROPOSAL_PACKET_EXTRA + chunk_size;
+        if size > w.budget { return false; }
+        let mut buf = [0u8; PROPOSAL_PACKET_SIZE];
+        let mut o = write_gossip_header(PACKET_TYPE_PROPOSAL_CHUNK, w.bft_state, &mut buf);
+        let Some(n) = write_signed_proposal_chunk(rd, chunk_i, proposer_pub_key, w.ctx_str, &mut buf[o..]) else { continue; };
+        o += n;
+        debug_assert_eq!(o, size);
+        if PRINT_SENDS { println!("{} {ANSI_GRY}SENDS{ANSI_RST}: proposal chunk {} at {}.{}", w.ctx_str, chunk_i, rd.height, rd.round); }
+        w.out.push(buf[..o].to_vec());
+        w.budget          -= size;
+        w.sent.data_bytes += size;
+        w.sent.chunks     += 1;
+        view.sent.set_chunk(rd.proposal_id, rd.proposal_sigs.len(), chunk_i);
+        view.sent_tick.get_or_insert(w.tick);
+    }
+    true
+}
+
+fn gossip_round(w: &mut GossipWriter, rd: &RoundData, peer: &mut Peer, kind: GossipKind) -> bool {
+    let view = peer_round_view(&mut peer.view, rd.round);
+    match kind {
+        GossipKind::Prevotes   => gossip_votes(w, rd, view, 0),
+        GossipKind::Precommits => gossip_votes(w, rd, view, 1),
+        GossipKind::Chunks     => gossip_chunks(w, rd, view),
+    }
+}
+
+/// One tick of gossip to one peer: its HAVE if it is owed one, then what it lacks, within the
+/// budget less `backlog`, the bytes already queued to it. A peer behind gets the proposal and
+/// precommits that decided its height, which are all it needs from that height; a peer ahead
+/// gets only HAVEs, from which it catches this node up.
+fn gossip_to_peer(bft_state: &TMState, roster: &[SortedRosterMember], rounds: &GossipRounds, peer: &mut Peer, peer_bft_key: PubKeyID,
+                  ctx_str: &str, tick: u64, backlog: u64, out: &mut Vec<Vec<u8>>) -> GossipSent {
+    let mut buf = [0u8; PROPOSAL_PACKET_SIZE];
+    let have_bytes = write_have_for_peer(bft_state, rounds, peer, tick, &mut buf).unwrap_or(0);
+    if have_bytes > 0 { out.push(buf[..have_bytes].to_vec()); }
+    let mut w = GossipWriter { bft_state, ctx_str, tick, budget: 0, out, sent: GossipSent { have_bytes, ..Default::default() } };
+
+    let first_tick = *peer.first_tick.get_or_insert(tick);
+    let (peer_height, peer_round) = match (peer.have_height_round, peer.latest_status) {
+        (Some(height_round), _) => height_round,
+        (None, Some(status)) if tick >= first_tick + GOSSIP_FIRST_HAVE_WAIT_TICKS => (status.height, status.round),
+        _ => return w.sent,
+    };
+    let backlog = usize::try_from(backlog).unwrap_or(usize::MAX);
+    let allowance = GOSSIP_BYTES_PER_PEER_TICK.saturating_sub(backlog.saturating_add(have_bytes));
+    set_peer_view_height(peer, peer_height);
+    for view in &mut peer.view { view.expire(tick); }
+
+    if peer_height < bft_state.height {
+        let Some(rd) = cached_round(bft_state, peer_height) else { return w.sent; };
+        w.budget = allowance;
+        let view = peer_round_view(&mut peer.view, rd.round);
+        let _ = gossip_votes(&mut w, rd, view, 1) && gossip_chunks(&mut w, rd, view);
+        return w.sent;
+    }
+    if peer_height > bft_state.height { return w.sent; }
+    if roster_i_from_pub_key(&roster[..active_roster_len(roster, bft_state.active_roster_max_n)], peer_bft_key).is_none() { return w.sent; }
+
+    let rds = &bft_state.rounds_data;
+    let find = |round: u32| rounds.rounds.binary_search_by_key(&round, |gr| gr.round).ok().map(|i| rounds.rounds[i].round_i);
+    let focus = [find(bft_state.round), if peer_round != bft_state.round { find(peer_round) } else { None }];
+    let mut plan: Vec<(usize, GossipKind)> = Vec::new();
+    for gr in rounds.rounds.iter().rev().filter(|gr| gr.value_precommits) {
+        plan.push((gr.round_i, GossipKind::Precommits));
+    }
+    for &round_i in focus.iter().flatten() {
+        plan.push((round_i, GossipKind::Precommits));
+        plan.push((round_i, GossipKind::Prevotes));
+    }
+    // Line 28 needs the prevotes of the round a re-proposal cites.
+    for &round_i in focus.iter().flatten() {
+        if let Some(vr_i) = u32::try_from(rds[round_i].proposal_valid_round).ok().and_then(|vr| find(vr)) {
+            plan.push((vr_i, GossipKind::Prevotes));
+        }
+    }
+    for &round_i in focus.iter().flatten() {
+        plan.push((round_i, GossipKind::Chunks));
+    }
+    for gr in rounds.rounds.iter().rev().filter(|gr| gr.value_precommits) {
+        plan.push((gr.round_i, GossipKind::Chunks));
+    }
+
+    let priority = allowance - allowance / GOSSIP_REPAIR_SHARE_DIV;
+    w.budget = priority;
+    for &(round_i, kind) in &plan {
+        if !gossip_round(&mut w, &rds[round_i], peer, kind) { break; }
+    }
+    w.budget += allowance - priority;
+    let n = rounds.rounds.len();
+    let start = rounds.rounds.partition_point(|gr| gr.round < peer.repair_cursor);
+    for k in 0..n {
+        let gr = &rounds.rounds[(start + k) % n];
+        let rd = &rds[gr.round_i];
+        if ![GossipKind::Precommits, GossipKind::Prevotes, GossipKind::Chunks].into_iter().all(|kind| gossip_round(&mut w, rd, peer, kind)) {
+            peer.repair_cursor = gr.round;
+            break;
+        }
+    }
+    w.sent
+}
+
+/// Takes in a proposal chunk, vote or HAVE packet from `peer`, `body` being what follows its
+/// header and status. False for any other packet type.
+fn take_consensus_packet(bft_state: &mut TMState, roster: &[SortedRosterMember], peer: &mut Peer, tick: u64, packet_type: u8, body: &[u8]) -> bool {
+    const_assert!(PACKET_TYPE_PREVOTE_SIGNATURES + 1 == PACKET_TYPE_PRECOMMIT_SIGNATURES);
+    let my_port = bft_state.my_port;
+    match packet_type {
+        PACKET_TYPE_PROPOSAL_CHUNK => {
+            let Some(hdr) = PacketProposalChunkHeader::read_from(&mut &body[..]) else {
+                eprintln!("{:05}: couldn't read proposal header", my_port);
+                return true;
+            };
+            let proposal_size = hdr.proposal_size as usize;
+            let chunk_i       = hdr.chunk_i       as usize;
+            // Nothing is verified yet: these two fields are whatever the peer wrote.
+            let chunks_n = proposal_size.div_ceil(PROPOSAL_CHUNK_DATA_SIZE);
+            if proposal_size > PROPOSAL_MAX_SIZE || chunk_i >= chunks_n {
+                eprintln!("{:05}: couldn't read proposal chunk: chunk {} of a {}-byte value", my_port, chunk_i, proposal_size);
+                return true;
+            }
+            let chunk_size = usize::min(PROPOSAL_CHUNK_DATA_SIZE, proposal_size - chunk_i * PROPOSAL_CHUNK_DATA_SIZE);
+            let sig_o = PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
+            if body.len() != sig_o + 64 {
+                eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, body.len());
+                return true;
+            }
+            if let (Some(roster_i), _) = TMState::proposer_from_height_round(&bft_state.hash_keys, roster, bft_state.active_roster_max_n, hdr.height, hdr.round) {
+                bft_state.check_and_incorporate_msg(hdr.height, hdr.round, chunk_i, hdr.proposal_id, hdr.valid_round,
+                    roster, roster_i, packet_type, &body[..sig_o], TMSig(body[sig_o..sig_o + 64].try_into().unwrap()));
+                note_peer_holds(bft_state, peer, tick, hdr.height, hdr.round, |rd, sent| {
+                    if rd.proposal_id == hdr.proposal_id && rd.proposal_sigs.len() == chunks_n { sent.set_chunk(hdr.proposal_id, chunks_n, chunk_i); }
+                });
+            }
+            true
+        }
+
+        PACKET_TYPE_PREVOTE_SIGNATURES | PACKET_TYPE_PRECOMMIT_SIGNATURES => {
+            let Some(packet) = PacketVotes::read_from(&mut &body[..]) else {
+                eprintln!("{:05}: couldn't read {}", my_port, packet_name_from_tag(packet_type));
+                return true;
+            };
+            let is_precommit = packet_type - PACKET_TYPE_PREVOTE_SIGNATURES;
+            let value_ids    = [ValueId::NIL, packet.value_id];
+            let votes_n      = (packet.no_votes_n + packet.yes_votes_n) as usize;
+            for vote_i in 0..votes_n {
+                let vote = packet.votes[vote_i];
+                let Some(roster_member) = roster.get(vote.roster_i as usize) else { continue; };
+                let sign_datas = make_vote_sign_datas(roster_member.pub_key, is_precommit != 0, packet.height, packet.round, packet.value_id);
+                let no_yes_i   = (vote_i >= packet.no_votes_n as usize) as usize;
+                bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
+                    roster, vote.roster_i as usize, packet_type, &sign_datas[no_yes_i], vote.sig);
+            }
+            note_peer_holds(bft_state, peer, tick, packet.height, packet.round, |_, sent| {
+                for vote_i in 0..votes_n {
+                    let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
+                    sent.set_vote(is_precommit as usize, value_ids[no_yes_i], packet.votes[vote_i].roster_i as usize);
+                }
+            });
+            true
+        }
+
+        PACKET_TYPE_HAVE => {
+            match PacketHave::read_from(&mut &body[..]) {
+                Some(have) => take_have(bft_state, peer, have),
+                None       => eprintln!("{:05}: couldn't read HAVE", my_port),
+            }
+            true
+        }
+
+        _ => false,
+    }
+}
+
 pub async fn entry_point(my_root_private_key: SigningKey,
                          // The node's transport, shared with its base protocol; `None` makes one
                          // of tenderlink's own (standalone runs and tests). When shared,
@@ -2276,6 +3042,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     let mut send_buf1 = [0u8; 2048];
     let mut next_tick_time = zebra_debug_time::instant_now();
+    let mut gossip_tick: u64 = 0;
     loop {
         let pass_start = std::time::Instant::now();
         let ctx_str = bft_state.ctx_str(&roster);
@@ -2424,165 +3191,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 // account for the state updates we've accumulated
                 bft_state.bft_update(&mut roster).await;
 
-                fn send_round_data_to_peer(bft_state: &TMState,
-                                           should_send_prevotes: bool,
-                                           round_data: &RoundData,
-                                           ctx_str: &str,
-                                           roster: &[SortedRosterMember],
-                                           messages_to_send: &mut Vec<(ConnectionKey, Vec<u8>)>,
-                                           send_buf1: &mut [u8],
-                                           peer: &mut Peer,
-                                           connection_key: &ConnectionKey,
-                                           peer_bft_key: PubKeyID,
-                                           stats: &mut NetworkStats) {
-                    let height = round_data.height;
-                    let round  = round_data.round;
-
-                    // Make sure to always sent at least one status.
-                    {
-                        let header = PacketHeader::new::<PACKET_TYPE_EMPTY>();
-                        let mut o = 0;
-                        o += write_header_and_maybe_status(header, true, bft_state, roster, &mut send_buf1[o..], peer.index_counter); peer.index_counter += 1;
-                        send_stp_msg(messages_to_send, connection_key, &send_buf1[..o], stats);
-                    }
-
-                    let (_, proposer_pub_key) = TMState::proposer_from_height_round(&bft_state.hash_keys, &round_data.roster, round_data.active_roster_max_n, height, round);
-
-                    let mut sent_chunk_cs = 0;
-                    let mut sent_c: [usize; 2] = [0; 2];
-
-                    if round_data.proposal_sigs_n > 0 {
-                        for chunk_i in 0..round_data.proposal_sigs.len() {
-                            // send all of the proposal chunks we've seen
-                            if round_data.proposal_sigs[chunk_i] != TMSig::NIL {
-                                let mut o = 0;
-
-                                let header = PacketHeader::new::<PACKET_TYPE_PROPOSAL_CHUNK>();
-                                // @Todo @Speed: We should build the header once and save it for all chunks. Peers only obey the latest status anyway.
-                                o += write_header_and_maybe_status(header, true, bft_state, roster, &mut send_buf1[o..], peer.index_counter); peer.index_counter += 1;
-
-                                let Some(written) = write_signed_proposal_chunk(round_data, chunk_i, proposer_pub_key, ctx_str, &mut send_buf1[o..]) else {
-                                    continue;
-                                };
-                                o += written;
-                                if PRINT_SENDS { println!("{ctx_str} {ANSI_GRY}SENDS{ANSI_RST}: sending proposal chunk {} to {:?}", chunk_i, peer_bft_key); }
-                                sent_chunk_cs += 1;
-                                print_packet_tag_send(header);
-                                send_stp_msg(messages_to_send, connection_key, &send_buf1[..o], stats);
-                            }
-                        }
-                    }
-
-                    let vote_start: u8 = if should_send_prevotes { 0 } else { 1 };
-                    for is_precommit in vote_start..2 {
-                        if  (is_precommit == 0 && round_data.counts.prevotes   == 0) ||
-                            (is_precommit == 1 && round_data.counts.precommits == 0)
-                        {
-                            continue;
-                        }
-
-                        let header = PacketHeader::new_(PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit);
-                        let mut packet = PacketVotes {
-                            height, round,
-                            value_id: round_data.proposal_id,
-                            no_votes_n: 0, yes_votes_n: 0,
-                            votes: [ PubKeySig::NIL; 18 ],
-                        };
-
-                        fn dbg_check_votes(ctx_str: &str, roster: &[SortedRosterMember], is_precommit: usize, packet: &PacketVotes, vote_namespace: &[u8; 32]) {
-                            #[cfg(debug_assertions)] // self-check signatures as sanity check
-                            for i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
-                                let (roster_i, sig) = (packet.votes[i].roster_i as usize, &packet.votes[i].sig);
-                                let Some(member) = roster.get(roster_i) else {
-                                    eprintln!("{ctx_str}: {ANSI_RED}BFT ERROR{ANSI_RST}: {} from {roster_i} - not in roster {}.{}: {}", ["prevote", "precommit"][is_precommit], packet.height, packet.round, packet.value_id);
-                                    return;
-                                };
-                                let pub_key = member.pub_key;
-                                let sign_datas = make_vote_sign_datas(pub_key, is_precommit != 0, packet.height, packet.round, packet.value_id);
-                                let sign_data  = &sign_datas[(i >= packet.no_votes_n as usize) as usize];
-                                match sig.verify_with_namespace(pub_key, sign_data, vote_namespace) { Ok(_)=>{} Err((err, str)) => {
-                                    if PRINT_BFT_SIG_FAULT {
-                                        eprintln!("{ctx_str}: {ANSI_RED}BFT FAULT{ANSI_RST}: {str} [..{}): for {} from {roster_i}-{pub_key:?} {}.{}: {} {err}",
-                                            sign_data.len(), ["prevote", "precommit"][is_precommit], packet.height, packet.round, packet.value_id);
-                                    }
-                                }}
-                            }
-                        }
-
-                        for roster_i in 0..round_data.msg_val_sigs.len() {
-                            // gossip both slots: a finalizer may hold a NIL vote and a value vote
-                            for (value_id, sig) in [(ValueId::NIL, round_data.msg_nil_sigs[roster_i][is_precommit as usize]),
-                                                    round_data.msg_val_sigs[roster_i][is_precommit as usize]] {
-                                if sig == TMSig::NIL { continue; }
-                                let pub_key_sig = PubKeySig{ roster_i: roster_i.try_into().unwrap(), sig };
-                                // println!("{} {}: packing in sig from {}", PubKeyID(my_root_public_bft_key.into()), pub_key_sig.pub_key);
-
-                                if packet.value_id == ValueId::NIL {
-                                    // NOTE(azmr): gossip seen votes even if we haven't seen proposal, but only 1 non-nil value id per packet
-                                    packet.value_id = value_id;
-                                }
-                                if value_id != ValueId::NIL && value_id != packet.value_id {
-                                    // A vote for a value other than the proposal we hold. We count it but do
-                                    // not pass it on: a packet carries one value. Its signer sends it itself.
-                                    continue;
-                                }
-
-                                // add nos and yeses from opposite ends to avoid excess moves
-                                if value_id == ValueId::NIL {
-                                    packet.votes[packet.no_votes_n as usize] = pub_key_sig;
-                                    packet.no_votes_n += 1;
-                                } else {
-                                    packet.yes_votes_n += 1; // *intentionally* pre-decrement because we're indexing from end
-                                    packet.votes[packet.votes.len() - packet.yes_votes_n as usize] = pub_key_sig;
-                                };
-
-
-                                if (packet.no_votes_n + packet.yes_votes_n) as usize == packet.votes.len() {
-                                    sent_c[is_precommit as usize] += (packet.no_votes_n + packet.yes_votes_n) as usize;
-                                    // full evidence block; send it
-                                    if PRINT_SENDS { println!("{ctx_str} {ANSI_GRY}SENDS{ANSI_RST}: sending full {} block: {:#?}", ["prevote", "precommit"][is_precommit as usize], packet); }
-                                    dbg_check_votes(ctx_str, &round_data.roster, is_precommit as usize, &packet, &round_data.vote_namespace);
-
-                                    let mut o = 0;
-                                    // @Todo @Speed: We should build the header once and save it for all votes. Peers only obey the latest status anyway.
-                                    o += write_header_and_maybe_status(header, true, bft_state, roster, &mut send_buf1[o..], peer.index_counter); peer.index_counter += 1;
-                                    o += packet.write_to(&mut send_buf1[o..]);
-                                    send_stp_msg(messages_to_send, connection_key, &send_buf1[..o], stats);
-
-                                    packet.no_votes_n  = 0;
-                                    packet.yes_votes_n = 0;
-                                    packet.votes       = [PubKeySig::NIL; 18];
-                                }
-                            }
-                        }
-
-                        // send any half-filled vote blocks
-                        if (packet.no_votes_n + packet.yes_votes_n) > 0 {
-                            sent_c[is_precommit as usize] += (packet.no_votes_n + packet.yes_votes_n) as usize;
-                            // println!("{} half-filled block pre-gap-close: {:#?}", packet);
-                            // move items from end to fill gap
-                            for gap_i in 0..packet.votes.len() - (packet.no_votes_n + packet.yes_votes_n) as usize {
-                                packet.votes[packet.no_votes_n as usize + gap_i] = packet.votes[packet.votes.len() - 1 - gap_i];
-                            }
-
-                            if PRINT_SENDS { println!("{ctx_str} {ANSI_GRY}SENDS{ANSI_RST}: half-filled block post-gap-close: {:#?}", packet); }
-                            dbg_check_votes(ctx_str, &round_data.roster, is_precommit as usize, &packet, &round_data.vote_namespace);
-
-                            let mut o = 0;
-                            // @Todo @Speed: We should build the header once and save it for all votes. Peers only obey the latest status anyway.
-                            o += write_header_and_maybe_status(header, true, bft_state, roster, &mut send_buf1[o..], peer.index_counter); peer.index_counter += 1;
-                            o += packet.write_to(&mut send_buf1[o..]);
-                            // TODO: maybe status
-                            print_packet_tag_send(header);
-                            send_stp_msg(messages_to_send, connection_key, &send_buf1[..o], stats);
-                        }
-                    }
-
-                    if PRINT_SEND_CS && sent_chunk_cs > 0 { eprintln!("{ctx_str} {ANSI_GRY}SEND_CS{ANSI_RST}: sent {} proposal chunks", sent_chunk_cs); }
-                    if PRINT_SEND_CS && sent_c[0]     > 0 { eprintln!("{ctx_str} {ANSI_GRY}SEND_CS{ANSI_RST}: sent {} prevotes",        sent_c[0]);     }
-                    if PRINT_SEND_CS && sent_c[1]     > 0 { eprintln!("{ctx_str} {ANSI_GRY}SEND_CS{ANSI_RST}: sent {} precommits",      sent_c[1]);     }
-                }
-
                 if PRINT_PEERS { println!("{ctx_str} {ANSI_GRY}PEERS{ANSI_RST}: {:?}", peers.iter().map(|(ck, p)| {
                     let mut bft_key = PubKeyID::NIL;
                     for (c, _) in &current_connections {
@@ -2596,6 +3204,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     (bft_key, p.latest_status.clone())
                 }).collect::<Vec<_>>()); }
 
+                let gossip_rounds = gossip_rounds_of(&bft_state);
+                let mut gossip_out: Vec<Vec<u8>> = Vec::new();
                 for (connection_key, peer) in &mut peers {
                     let mut peer_bft_key = PubKeyID::NIL;
                     for (c, _) in &current_connections {
@@ -2606,43 +3216,19 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             break;
                         }
                     }
-                    if let Some(height) = peer.latest_status_request_height && height < bft_state.height {
-                        peer.latest_status_request_height = None;
-                        send_round_data_to_peer(&bft_state,
-                                                false,
-                                                &bft_state.recent_commit_round_cache[height as usize],
-                                                &ctx_str,
-                                                &roster,
-                                                &mut messages_to_send,
-                                                &mut send_buf1,
-                                                peer,
-                                                connection_key,
-                                                peer_bft_key,
-                                                &mut net_stats);
+                    let backlog = network_thread_handle.send_backlog_bytes(*connection_key, transport::Channel::BftLive).unwrap_or(0);
+                    let sent = gossip_to_peer(&bft_state, &roster, &gossip_rounds, peer, peer_bft_key, &ctx_str, gossip_tick, backlog, &mut gossip_out);
+                    if PRINT_SEND_CS && sent.data_bytes > 0 {
+                        eprintln!("{ctx_str} {ANSI_GRY}SEND_CS{ANSI_RST}: to {:?}: {} proposal chunks, {} prevotes, {} precommits; {} bytes, {} of them HAVE, {} queued before",
+                            peer_bft_key, sent.chunks, sent.votes[0], sent.votes[1], sent.have_bytes + sent.data_bytes, sent.have_bytes, backlog);
                     }
-                    else if roster_i_from_pub_key(&roster[..active_roster_len(&roster, bft_state.active_roster_max_n)], peer_bft_key).is_some() {
-                        if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
-                        {
-                            for round_i in (current_height_start_i..bft_state.rounds_data.len()).rev()
-                            {
-                                let round_data = &bft_state.rounds_data[round_i];
-                                send_round_data_to_peer(&bft_state,
-                                                        true,
-                                                        &round_data,
-                                                        &ctx_str,
-                                                        &roster,
-                                                        &mut messages_to_send,
-                                                        &mut send_buf1,
-                                                        peer,
-                                                        connection_key,
-                                                        peer_bft_key,
-                                                        &mut net_stats);
-                            }
-                        } else {
-                            eprintln!("{ctx_str} {ANSI_RED}BFT ERROR{ANSI_RST}: round_data array was empty");
-                        }
+                    for msg in gossip_out.drain(..) {
+                        net_stats.packets_sent += 1;
+                        net_stats.bytes_sent   += msg.len();
+                        messages_to_send.push((*connection_key, msg));
                     }
                 }
+                gossip_tick += 1;
 
                 // Prune attestations that expire in <60s
                 let now: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
@@ -2815,9 +3401,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
         }
 
-        use rand::seq::SliceRandom;
-        messages_to_send.shuffle(&mut rand::thread_rng());
-
         // Synthetic peers sit on this side of the transport: their packets bypass it both ways,
         // and the transport is never asked to keep a connection to them.
         synthetic_bft_peers.extend(SYNTHETIC_BFT_PEERS_TO_ATTACH.lock().unwrap().drain(..));
@@ -2916,53 +3499,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 peer.latest_status = Some(status);
             }
 
-            const_assert!(PACKET_TYPE_PREVOTE_SIGNATURES + 1 == PACKET_TYPE_PRECOMMIT_SIGNATURES);
-            if packet_type == PACKET_TYPE_PROPOSAL_CHUNK {
-                let Some(hdr) = PacketProposalChunkHeader::read_from(&mut &msg[read_o..]) else {
-                    eprintln!("{:05}: couldn't read proposal header", my_port);
-                    continue;
-                };
-                let proposal_size = hdr.proposal_size as usize;
-                let chunk_i       = hdr.chunk_i       as usize;
-                // Nothing is verified yet: these two fields are whatever the peer wrote.
-                if proposal_size > PROPOSAL_MAX_SIZE || chunk_i >= proposal_size.div_ceil(PROPOSAL_CHUNK_DATA_SIZE) {
-                    eprintln!("{:05}: couldn't read proposal chunk: chunk {} of a {}-byte value", my_port, chunk_i, proposal_size);
-                    continue;
-                }
-                let chunk_size = usize::min(PROPOSAL_CHUNK_DATA_SIZE, proposal_size - chunk_i * PROPOSAL_CHUNK_DATA_SIZE);
-                let packet_size = chunk_size + PROPOSAL_PACKET_EXTRA;
-
-                // NOTE: assume for the moment that this is the valid height, we'll check in the subsequent call
-                // ALT:  cache proposer for *current* round
-                if msg.len() == packet_size {
-                    if let (Some(roster_i), _) = TMState::proposer_from_height_round(&bft_state.hash_keys, &roster, bft_state.active_roster_max_n, hdr.height, hdr.round) {
-                        let sig_o = read_o + PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
-                        bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
-                            &roster, roster_i, packet_type, &msg[read_o..sig_o], TMSig(msg[sig_o..sig_o+64].try_into().unwrap()));
-                    }
-                } else {
-                    eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, msg.len());
-                }
-            }
-
-            else if packet_type == PACKET_TYPE_PREVOTE_SIGNATURES || packet_type == PACKET_TYPE_PRECOMMIT_SIGNATURES {
-                if let Some(packet) = PacketVotes::read_from(&mut &msg[read_o..]) {
-                    let is_precommit = packet_type - PACKET_TYPE_PREVOTE_SIGNATURES;
-                    let value_ids    = [ ValueId::NIL, packet.value_id ];
-
-                    for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
-                        // Note(Sam): We can change the format of votes to be cool and branchless after the workshop.
-                        if let Some(roster_member) = roster.get(packet.votes[vote_i].roster_i as usize) {
-                            let sign_datas   = make_vote_sign_datas(roster_member.pub_key, is_precommit != 0, packet.height, packet.round, packet.value_id);
-                            let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
-                            bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
-                                &roster, packet.votes[vote_i].roster_i as usize, packet_type, &sign_datas[no_yes_i], TMSig(packet.votes[vote_i].sig.0));
-                        }
-                    }
-                } else {
-                    eprintln!("{:05}: couldn't read {}", my_port, packet_name_from_tag(packet_type));
-                }
-            }
+            if take_consensus_packet(&mut bft_state, &roster, peer, gossip_tick, packet_type, &msg[read_o..]) {}
 
             else if packet_type == PACKET_TYPE_PEER_ATTESTATIONS {
                 let chunks = msg[read_o..].chunks(PEER_ATTESTATION_SERIALIZED_SIZE);
@@ -3337,6 +3874,7 @@ const PACKET_TYPE_TRY_HOLE_PUNCH:    u8 = 6;
 const PACKET_TYPE_PROPOSAL_CHUNK:       u8 =  7;
 const PACKET_TYPE_PREVOTE_SIGNATURES:   u8 =  8;
 const PACKET_TYPE_PRECOMMIT_SIGNATURES: u8 =  9;
+const PACKET_TYPE_HAVE:                 u8 = 10;
 
 // misc
 const PACKET_TYPE_COUNT:                u8 = 11;
@@ -3370,6 +3908,7 @@ const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
     names[PACKET_TYPE_PROPOSAL_CHUNK       as usize] = ["PROPOSAL_CHUNK",           "STATUS+PROPOSAL_CHUNK"];
     names[PACKET_TYPE_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
     names[PACKET_TYPE_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES",     "STATUS+PRECOMMIT_SIGNATURES"];
+    names[PACKET_TYPE_HAVE                 as usize] = ["HAVE",                     "STATUS+HAVE"];
     const_assert!(PACKET_TYPE_COUNT == 11); // keep names array updated when adding other tags
     names
 };
@@ -5068,6 +5607,614 @@ mod tests {
         for (test_i, test) in tests.iter().enumerate() {
             let rngs = gen_mostly_empty_rngs(test.arr.len(), |i| test.arr[i] == b'0');
             assert_eq!(test.rngs, &rngs, "index {}", test_i);
+        }
+    }
+
+    // Gossip fuzzing. CROSSLINK_FUZZ_SEED replays a run; unset, each run takes a fresh seed and
+    // prints it. CROSSLINK_FUZZ_CASES sets how many cases a run tries.
+
+    fn gossip_fuzz_seed() -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let seed = match std::env::var("CROSSLINK_FUZZ_SEED") {
+            Ok(seed) => seed.parse().expect("CROSSLINK_FUZZ_SEED is a number"),
+            Err(_)   => std::collections::hash_map::RandomState::new().build_hasher().finish(),
+        };
+        eprintln!("fuzz seed {seed}: set CROSSLINK_FUZZ_SEED={seed} to run this again");
+        seed
+    }
+
+    fn gossip_fuzz_cases() -> u64 {
+        std::env::var("CROSSLINK_FUZZ_CASES").map_or(8, |cases| cases.parse().expect("CROSSLINK_FUZZ_CASES is a number"))
+    }
+
+    fn random_vote_bits(rng: &mut SimRng, n: usize, p: f64) -> VoteBits {
+        let mut bits = VoteBits::default();
+        for i in 0..n { if rng.random_bool(p) { bits_set(&mut bits, i); } }
+        bits
+    }
+
+    /// A round's entry reads back as written, less the values that did not fit, and no bytes make
+    /// the reader panic.
+    #[test]
+    fn gossip_have_rounds_read_back_as_written() {
+        let mut rng = SimRng::seed_from_u64(gossip_fuzz_seed());
+        for _ in 0..gossip_fuzz_cases() * 250 {
+            let vote_bits_n = [rng.random_range(0..=16), rng.random_range(0..=VOTE_BITS_MAX), VOTE_BITS_MAX][rng.random_range(0..3)];
+            let mut have = HaveRound::empty(rng.random());
+            have.proposal_id = ValueId(rng.random());
+            have.chunks_n    = if rng.random_bool(0.1) { PROPOSAL_CHUNKS_MAX } else { rng.random_range(0..=70) };
+            have.chunk_bits  = vec![0; have.chunks_n.div_ceil(64)];
+            let chunk_p = [0.0, 1.0, rng.random()][rng.random_range(0..3)];
+            for chunk_i in 0..have.chunks_n { if rng.random_bool(chunk_p) { bits_set(&mut have.chunk_bits, chunk_i); } }
+            let vote_p: f64 = rng.random();
+            have.nil = [random_vote_bits(&mut rng, vote_bits_n, vote_p), random_vote_bits(&mut rng, vote_bits_n, vote_p)];
+            for k in 0..rng.random_range(0..40) {
+                let mut id: [u8; 32] = rng.random();
+                id[0] = k as u8 + 1;
+                have.values.push((ValueId(id), [random_vote_bits(&mut rng, vote_bits_n, vote_p), random_vote_bits(&mut rng, vote_bits_n, vote_p)]));
+            }
+
+            let mut buf = [0u8; HAVE_ROUND_MAX_SIZE];
+            let n = have.write_to(vote_bits_n, &mut buf);
+            let read = HaveRound::read_from(&mut &buf[..n], vote_bits_n).expect("an entry reads back");
+            let kept = read.values.len();
+            assert_eq!(n, have.wire_size(vote_bits_n, kept));
+            assert!(kept == have.values.len() || have.wire_size(vote_bits_n, kept + 1) > HAVE_ROUND_MAX_SIZE, "{kept} of {} values kept, and another fits", have.values.len());
+            let mut expected = have.clone();
+            expected.values.truncate(kept);
+            assert_eq!(read, expected);
+
+            for cut in 0..n { let _ = HaveRound::read_from(&mut &buf[..cut], vote_bits_n); }
+            let mut bent = buf[..n].to_vec();
+            if n > 0 { bent[rng.random_range(0..n)] ^= 1 << rng.random_range(0..8); }
+            let _ = HaveRound::read_from(&mut &bent[..], vote_bits_n);
+            let mut junk = vec![0u8; rng.random_range(0..PROPOSAL_PACKET_SIZE)];
+            rng.fill_bytes(&mut junk);
+            let _ = PacketHave::read_from(&mut &junk[..]);
+        }
+    }
+
+    fn sim_finalizers(n: usize) -> (Vec<SigningKey>, Vec<SortedRosterMember>) {
+        let keys: Vec<SigningKey> = (0..n).map(|i| SigningKey::from([i as u8 + 1; 32])).collect();
+        let roster = keys.iter().enumerate().map(|(i, k)| SortedRosterMember {
+            pub_key: PubKeyID(VerificationKeyBytes::from(k).into()), stake: 1, cumulative_stake: i as u64 + 1 }).collect();
+        (keys, roster)
+    }
+
+    fn sim_engine(keys: &[SigningKey], roster: &[SortedRosterMember], i: usize, round: u32) -> TMState {
+        let mut node = split_engine(keys, roster, i, None);
+        node.round = round;
+        node
+    }
+
+    /// A signed chunk or vote at height 0, as `check_and_incorporate_msg` takes it.
+    struct SimItem {
+        round: u32,
+        chunk_i: usize,
+        value_id: ValueId,
+        valid_round: i64,
+        signer: usize,
+        packet_type: u8,
+        data: Vec<u8>,
+        sig: TMSig,
+    }
+
+    fn sim_vote(keys: &[SigningKey], roster: &[SortedRosterMember], round: u32, is_precommit: bool, signer: usize, value_id: ValueId) -> SimItem {
+        let data = make_vote_sign_datas(roster[signer].pub_key, is_precommit, 0, round, value_id)[(value_id != ValueId::NIL) as usize].to_vec();
+        let sig = TMSig(sign_with_namespace(&keys[signer], &data, &[0; 32]));
+        SimItem { round, chunk_i: 0, value_id, valid_round: -2, signer, packet_type: PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit as u8, data, sig }
+    }
+
+    fn sim_chunks(keys: &[SigningKey], proposer: usize, value: &BlockValue, value_id: ValueId, round: u32, valid_round: i64) -> Vec<SimItem> {
+        (0..value.chunks_n()).map(|chunk_i| {
+            let (data, sig) = chunk_msg(&keys[proposer], &[0; 32], value, value_id, round, valid_round, chunk_i);
+            SimItem { round, chunk_i, value_id, valid_round, signer: proposer, packet_type: PACKET_TYPE_PROPOSAL_CHUNK, data, sig }
+        }).collect()
+    }
+
+    fn sim_proposal(rng: &mut SimRng, keys: &[SigningKey], roster: &[SortedRosterMember], round: u32, chunks_n: usize) -> (ValueId, Vec<SimItem>) {
+        let proposer = TMState::proposer_from_height_round(&HashKeys::default(), roster, ROSTER_MAX_N, 0, round).0.unwrap();
+        let size = (chunks_n - 1) * PROPOSAL_CHUNK_DATA_SIZE + rng.random_range(1..=PROPOSAL_CHUNK_DATA_SIZE);
+        let value = BlockValue((0..size).map(|_| rng.random()).collect());
+        let value_id = value.id_from_value(&HashKeys::default());
+        let valid_round = if round == 0 { -1 } else { rng.random_range(-1..round as i64) };
+        (value_id, sim_chunks(keys, proposer, &value, value_id, round, valid_round))
+    }
+
+    fn sim_put(node: &mut TMState, roster: &[SortedRosterMember], item: &SimItem) {
+        let status = node.check_and_incorporate_msg(0, item.round, item.chunk_i, item.value_id, item.valid_round, roster,
+            item.signer, item.packet_type, &item.data, item.sig);
+        assert_ne!(status, TMStatus::Fail, "{} of round {} by {} was refused", packet_name_from_tag(item.packet_type), item.round, item.signer);
+    }
+
+    fn sim_holdings(node: &TMState) -> Vec<HaveRound> {
+        node.rounds_data.iter().filter(|rd| rd.height == node.height).map(HaveRound::of).collect()
+    }
+
+    fn sim_has_vote(node: &TMState, round: u32, is_precommit: usize, value_id: ValueId, roster_i: usize) -> bool {
+        node.rounds_data.iter().find(|rd| (rd.height, rd.round) == (node.height, round))
+            .is_some_and(|rd| HaveRound::of(rd).has_vote(is_precommit, value_id, roster_i))
+    }
+
+    /// One direction of a link: what is sent queues and leaves at `capacity` bytes a tick, then
+    /// arrives `latency` ticks later, unless it is lost on the way before GST.
+    struct SimLink {
+        capacity: usize,
+        latency: u64,
+        credit: usize,
+        outbox: std::collections::VecDeque<Vec<u8>>,
+        outbox_bytes: usize,
+        in_flight: std::collections::VecDeque<(u64, Vec<u8>)>,
+    }
+
+    #[derive(Debug, Default)]
+    struct SimCoverage {
+        losses: usize,
+        gated: usize,
+        partial: usize,
+        equivocations: usize,
+        cuts: usize,
+    }
+
+    struct Sim {
+        roster: Vec<SortedRosterMember>,
+        nodes: Vec<TMState>,
+        /// `peers[i][j]` is node `i`'s Peer for node `j`.
+        peers: Vec<Vec<Peer>>,
+        links: Vec<Vec<Option<SimLink>>>,
+        loss: f64,
+        /// Before GST nothing crosses between nodes on different sides.
+        side: Vec<u8>,
+        gst: u64,
+        tick: u64,
+        rng: SimRng,
+        cov: SimCoverage,
+    }
+
+    /// Links among `members` of `n` nodes: a ring plus random chords if `partial`, else every pair.
+    /// A partial mesh of four or more always lacks a pair. Nodes outside `members` have no links.
+    fn sim_links(rng: &mut SimRng, n: usize, members: &[usize], partial: bool, capacity: std::ops::RangeInclusive<usize>, cov: &mut SimCoverage) -> Vec<Vec<Option<SimLink>>> {
+        let m = members.len();
+        let mut linked = vec![vec![false; n]; n];
+        let q: f64 = if partial { rng.random_range(0.0..0.5) } else { 1.0 };
+        for a in 0..m {
+            for b in a + 1..m {
+                if !partial || b == a + 1 || (a == 0 && b == m - 1) || rng.random_bool(q) {
+                    linked[members[a]][members[b]] = true;
+                    linked[members[b]][members[a]] = true;
+                }
+            }
+        }
+        if partial && m >= 4 && members.iter().all(|&i| members.iter().all(|&j| i == j || linked[i][j])) {
+            linked[members[0]][members[2]] = false;
+            linked[members[2]][members[0]] = false;
+        }
+        let mut links: Vec<Vec<Option<SimLink>>> = (0..n).map(|_| (0..n).map(|_| None).collect()).collect();
+        for &i in members {
+            for &j in members {
+                if i == j { continue; }
+                if !linked[i][j] { cov.partial += 1; continue; }
+                links[i][j] = Some(SimLink {
+                    capacity: rng.random_range(capacity.clone()), latency: rng.random_range(1..=3), credit: 0,
+                    outbox: Default::default(), outbox_bytes: 0, in_flight: Default::default(),
+                });
+            }
+        }
+        links
+    }
+
+    fn sim_deliver(node: &mut TMState, roster: &[SortedRosterMember], peer: &mut Peer, tick: u64, packet: &[u8]) {
+        let mut body = packet;
+        let header = PacketHeader::read_from(&mut body).expect("a BFT packet");
+        if header.has_status() {
+            let status = PacketStatus::read_from(&mut body).expect("a status");
+            peer.latest_status_request_height = Some(status.height);
+            peer.latest_status = Some(status);
+        }
+        assert!(take_consensus_packet(node, roster, peer, tick, header.type_(), body), "{} is not a consensus packet", packet_name_from_tag(header.type_()));
+    }
+
+    /// One tick: every node gossips to every peer it has a link to, links carry what they can,
+    /// and what arrives is taken in. Returns the bytes of chunks and votes sent.
+    fn sim_step(sim: &mut Sim) -> usize {
+        let n = sim.nodes.len();
+        let mut data_bytes = 0;
+        let mut out = Vec::new();
+        for i in 0..n {
+            let rounds = gossip_rounds_of(&sim.nodes[i]);
+            let ctx_str = sim.nodes[i].ctx_str(&sim.roster);
+            for j in 0..n {
+                let Some(link) = sim.links[i][j].as_mut() else { continue; };
+                let backlog = link.outbox_bytes;
+                if backlog >= PROPOSAL_PACKET_SIZE { sim.cov.gated += 1; }
+                let sent = gossip_to_peer(&sim.nodes[i], &sim.roster, &rounds, &mut sim.peers[i][j], sim.roster[j].pub_key, &ctx_str, sim.tick, backlog as u64, &mut out);
+                assert!(sent.have_bytes <= PROPOSAL_PACKET_SIZE);
+                assert!(sent.data_bytes <= GOSSIP_BYTES_PER_PEER_TICK.saturating_sub(backlog + sent.have_bytes),
+                    "tick {}: {i} sent {j} {} bytes with {backlog} queued and a {}-byte HAVE", sim.tick, sent.data_bytes, sent.have_bytes);
+                data_bytes += sent.data_bytes;
+                for packet in out.drain(..) {
+                    assert!(packet.len() <= PROPOSAL_PACKET_SIZE, "a {}-byte packet", packet.len());
+                    link.outbox_bytes += packet.len();
+                    link.outbox.push_back(packet);
+                }
+            }
+        }
+        for i in 0..n {
+            for j in 0..n {
+                let Some(link) = sim.links[i][j].as_mut() else { continue; };
+                link.credit += link.capacity;
+                while link.outbox.front().is_some_and(|packet| packet.len() <= link.credit) {
+                    let packet = link.outbox.pop_front().unwrap();
+                    link.credit       -= packet.len();
+                    link.outbox_bytes -= packet.len();
+                    if sim.tick < sim.gst {
+                        if sim.side[i] != sim.side[j] { sim.cov.cuts += 1; continue; }
+                        if sim.rng.random_bool(sim.loss) { sim.cov.losses += 1; continue; }
+                    }
+                    link.in_flight.push_back((sim.tick + link.latency, packet));
+                }
+                if link.outbox.is_empty() { link.credit = 0; }
+            }
+        }
+        for i in 0..n {
+            for j in 0..n {
+                while let Some(link) = sim.links[i][j].as_mut() && link.in_flight.front().is_some_and(|&(at, _)| at <= sim.tick) {
+                    let (_, packet) = link.in_flight.pop_front().unwrap();
+                    sim_deliver(&mut sim.nodes[j], &sim.roster, &mut sim.peers[j][i], sim.tick, &packet);
+                }
+            }
+        }
+        sim.tick += 1;
+        data_bytes
+    }
+
+    fn sim_new(nodes: Vec<TMState>, roster: &[SortedRosterMember], links: Vec<Vec<Option<SimLink>>>, loss: f64, gst: u64, rng: SimRng) -> Sim {
+        let n = nodes.len();
+        Sim {
+            roster: roster.to_vec(), nodes, peers: (0..n).map(|_| (0..n).map(|_| Peer::default()).collect()).collect(),
+            links, loss, side: vec![0; n], gst, tick: 0, rng, cov: SimCoverage::default(),
+        }
+    }
+
+    /// Runs 64 ticks, then asserts 40 more send no chunk or vote.
+    fn sim_assert_quiet(sim: &mut Sim, case_str: &str) {
+        for _ in 0..64 { sim_step(sim); }
+        for _ in 0..40 {
+            let data_bytes = sim_step(sim);
+            assert_eq!(data_bytes, 0, "{case_str}: every node holds everything, yet tick {} sent {data_bytes} bytes of chunks and votes", sim.tick - 1);
+        }
+    }
+
+    /// One case of `gossip_reaches_every_node_within_budget_and_then_goes_quiet`. The nodes are at
+    /// height 0 and round `cur`, and never run the state machine: this is about what reaches whom.
+    /// Feature 0 links them by a partial mesh, 1 by slow links, 2 adds a finalizer that votes for
+    /// two values in every step, 3 loses packets before GST.
+    fn gossip_sim_case(seed: u64, case: u64, cov: &mut SimCoverage) {
+        let mut rng = SimRng::seed_from_u64(seed ^ case.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let feature = case % 4;
+        let n = rng.random_range(4..=7usize).min(ROSTER_MAX_N);
+        let (keys, roster) = sim_finalizers(n);
+        let threshold = decision_threshold(n as u64, false) as usize;
+        let cur: u32 = if feature == 1 { 3 } else { rng.random_range(0..=3) };
+        let equivocator = (feature == 2).then(|| rng.random_range(0..n));
+        let focus_signer = loop { let i = rng.random_range(0..n); if Some(i) != equivocator { break i; } };
+        let hold_p: f64 = if feature == 1 { 0.5 } else { rng.random_range(0.0..0.6) };
+        let w0 = ValueId([0xA0; 32]);
+
+        let mut items: Vec<SimItem> = Vec::new();
+        let mut proposal_ids = vec![ValueId::NIL; cur as usize + 1];
+        for round in 0..=cur {
+            if round != cur && rng.random_bool(0.2) { continue; }
+            let w = ValueId([0xB0 + round as u8; 32]);
+            if feature == 1 || rng.random_bool(0.7) {
+                let chunks_n = if feature == 1 { 3 } else { rng.random_range(1..=3) };
+                let (value_id, chunks) = sim_proposal(&mut rng, &keys, &roster, round, chunks_n);
+                proposal_ids[round as usize] = value_id;
+                items.extend(chunks);
+            }
+            let proposal_id = proposal_ids[round as usize];
+            for is_precommit in [false, true] {
+                // A quorum of precommits for another value would replace the proposal, at each node
+                // when it got there. Which nodes see that first is not what this test is about.
+                let mut others_n: HashMap<ValueId, usize> = HashMap::new();
+                for signer in 0..n {
+                    if is_precommit && round == cur && signer == focus_signer { continue; }
+                    let mut values = Vec::new();
+                    let choice = rng.random_range(0..4);
+                    if choice & 1 != 0 { values.push(ValueId::NIL); }
+                    if choice & 2 != 0 {
+                        values.push(if proposal_id != ValueId::NIL && rng.random_bool(0.7) { proposal_id } else if rng.random_bool(0.5) { w0 } else { w });
+                    }
+                    if Some(signer) == equivocator {
+                        values.retain(|&value_id| value_id == ValueId::NIL);
+                        values.extend([if proposal_id != ValueId::NIL { proposal_id } else { w0 }, w]);
+                        cov.equivocations += 1;
+                    }
+                    for value_id in values {
+                        if is_precommit && proposal_id != ValueId::NIL && value_id != ValueId::NIL && value_id != proposal_id {
+                            let others = others_n.entry(value_id).or_default();
+                            if *others + 1 >= threshold { continue; }
+                            *others += 1;
+                        }
+                        items.push(sim_vote(&keys, &roster, round, is_precommit, signer, value_id));
+                    }
+                }
+            }
+        }
+        let focus_value = if proposal_ids[cur as usize] != ValueId::NIL { proposal_ids[cur as usize] } else { w0 };
+        let focus = sim_vote(&keys, &roster, cur, true, focus_signer, focus_value);
+
+        let mut nodes: Vec<TMState> = (0..n).map(|i| sim_engine(&keys, &roster, i, cur)).collect();
+        for (i, node) in nodes.iter_mut().enumerate() {
+            let mut held: Vec<&SimItem> = items.iter().filter(|item| item.signer == i || rng.random_bool(hold_p)).collect();
+            held.shuffle(&mut rng);
+            for item in held { sim_put(node, &roster, item); }
+        }
+        let mut oracle = sim_engine(&keys, &roster, 0, cur);
+        for item in &items { sim_put(&mut oracle, &roster, item); }
+        sim_put(&mut oracle, &roster, &focus);
+        let truth = sim_holdings(&oracle);
+
+        let gst = rng.random_range(10..120u64);
+        let loss = if feature == 3 { rng.random_range(0.2..0.5) } else { 0.0 };
+        let links = sim_links(&mut rng, n, &(0..n).collect::<Vec<_>>(), feature == 0, if feature == 1 { 1500..=2500 } else { 20_000..=60_000 }, cov);
+        let min_capacity = links.iter().flatten().flatten().map(|link| link.capacity).min().unwrap();
+        let max_latency  = links.iter().flatten().flatten().map(|link| link.latency).max().unwrap();
+        let case_str = format!("case {case} (feature {feature}): {n} nodes at round {cur}, {} items, GST at tick {gst}, loss {loss:.2}, capacity from {min_capacity}, latency up to {max_latency}", items.len());
+        let mut sim = sim_new(nodes, &roster, links, loss, gst, rng);
+
+        while sim.tick < gst { sim_step(&mut sim); }
+
+        // The Gossip property: a vote a correct node holds at GST reaches every correct node within
+        // a bound. A hop waits a tick for the sender's turn, a few more for its queue to fall below
+        // the budget, then for that queue to drain, then for the link's latency. The first HAVEs
+        // after GST may still be on their way.
+        sim_put(&mut sim.nodes[focus_signer], &roster, &focus);
+        let hop_ticks = 6 + max_latency + (GOSSIP_BYTES_PER_PEER_TICK + 3 * PROPOSAL_PACKET_SIZE).div_ceil(min_capacity) as u64;
+        let focus_deadline = gst + (n as u64 - 1) * hop_ticks + HAVE_REFRESH_TICKS + max_latency + 2;
+        while !(0..n).all(|i| sim_has_vote(&sim.nodes[i], cur, 1, focus_value, focus_signer)) {
+            assert!(sim.tick <= focus_deadline, "{case_str}: the precommit made at GST had not reached every node by tick {focus_deadline}");
+            sim_step(&mut sim);
+        }
+
+        while (0..n).any(|i| sim_holdings(&sim.nodes[i]) != truth) {
+            assert!(sim.tick <= gst + 3000, "{case_str}: some node still lacks something at tick {}", sim.tick);
+            sim_step(&mut sim);
+        }
+        sim_assert_quiet(&mut sim, &case_str);
+        cov.losses += sim.cov.losses;
+        cov.gated  += sim.cov.gated;
+    }
+
+    /// Finalizers whose chunks and votes are spread across a few rounds gossip until every node
+    /// holds all of them: whatever one holds at GST reaches the rest within a bound, nothing sent
+    /// to a peer in a tick exceeds its budget less what is queued to it, and once all hold
+    /// everything only HAVEs are sent.
+    #[test]
+    fn gossip_reaches_every_node_within_budget_and_then_goes_quiet() {
+        let seed = gossip_fuzz_seed();
+        let cases = gossip_fuzz_cases();
+        let mut cov = SimCoverage::default();
+        for case in 0..cases { gossip_sim_case(seed, case, &mut cov); }
+        eprintln!("gossip coverage: {cov:?}");
+        if cases >= 4 {
+            assert!(cov.losses > 0 && cov.gated > 0 && cov.partial > 0 && cov.equivocations > 0, "a feature went unexercised: {cov:?}");
+        }
+    }
+
+    /// A node a height behind holds some of the round that decided it; its peers have moved on
+    /// and hold that round only as a decision. They send it the proposal and precommits until it
+    /// holds all of them, and then nothing.
+    #[test]
+    fn gossip_brings_a_node_behind_the_decision_and_then_goes_quiet() {
+        let seed = gossip_fuzz_seed();
+        for case in 0..gossip_fuzz_cases() {
+            let mut rng = SimRng::seed_from_u64(!seed ^ case.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let n = rng.random_range(4..=7usize).min(ROSTER_MAX_N);
+            let (keys, roster) = sim_finalizers(n);
+            let threshold = decision_threshold(n as u64, false) as usize;
+            let round = rng.random_range(0..=3u32);
+            let chunks_n = rng.random_range(1..=3);
+            let (value_id, mut items) = sim_proposal(&mut rng, &keys, &roster, round, chunks_n);
+            let mut signers: Vec<usize> = (0..n).collect();
+            signers.shuffle(&mut rng);
+            let yes_n = rng.random_range(threshold..=n);
+            for (k, &signer) in signers.iter().enumerate() {
+                if k < yes_n { items.push(sim_vote(&keys, &roster, round, true, signer, value_id)); }
+                else if rng.random_bool(0.5) { items.push(sim_vote(&keys, &roster, round, true, signer, ValueId::NIL)); }
+                if rng.random_bool(0.5) { items.push(sim_vote(&keys, &roster, round, false, signer, value_id)); }
+            }
+            let mut decider = sim_engine(&keys, &roster, 1, round);
+            for item in &items { sim_put(&mut decider, &roster, item); }
+            let decided = decider.rounds_data[0].clone();
+            let truth = HaveRound::of(&decided);
+
+            let mut behind = sim_engine(&keys, &roster, 0, round);
+            let mut held: Vec<&SimItem> = items.iter().filter(|_| rng.random_bool(0.4)).collect();
+            held.shuffle(&mut rng);
+            for item in held { sim_put(&mut behind, &roster, item); }
+            let mut nodes = vec![behind];
+            for i in 1..n {
+                let mut node = sim_engine(&keys, &roster, i, 0);
+                node.height = 1;
+                node.recent_commit_round_cache.push(decided.clone());
+                nodes.push(node);
+            }
+
+            let gst  = rng.random_range(0..60u64);
+            let loss = rng.random_range(0.0..0.4);
+            let links = sim_links(&mut rng, n, &(0..n).collect::<Vec<_>>(), false, 1500..=40_000, &mut SimCoverage::default());
+            let case_str = format!("case {case}: {n} nodes, decided at round {round}, GST at tick {gst}, loss {loss:.2}");
+            let mut sim = sim_new(nodes, &roster, links, loss, gst, rng);
+
+            let holds_decision = |node: &TMState| node.rounds_data.iter().find(|rd| (rd.height, rd.round) == (0, round)).is_some_and(|rd| {
+                let have = HaveRound::of(rd);
+                have.proposal_id == truth.proposal_id && have.chunks_n == truth.chunks_n && have.chunk_bits == truth.chunk_bits &&
+                (0..n).all(|i| !bits_get(&truth.nil[1], i) || bits_get(&have.nil[1], i)) &&
+                truth.values.iter().all(|(value_id, bits)| (0..n).all(|i| !bits_get(&bits[1], i) || have.has_vote(1, *value_id, i)))
+            });
+            while !holds_decision(&sim.nodes[0]) {
+                assert!(sim.tick <= gst + 2000, "{case_str}: the node behind still lacks part of the decision at tick {}", sim.tick);
+                sim_step(&mut sim);
+            }
+            sim_assert_quiet(&mut sim, &case_str);
+        }
+    }
+
+    /// Runs a node's step timeouts on the sim's clock, a tick being the send loop's. Tests share
+    /// one process clock, so a sim cannot supply it; instead a timeout first seen gets a deadline
+    /// in ticks and is moved out of the real clock's reach, and once that tick comes it is made
+    /// due, so the next `bft_update` takes it.
+    fn sim_timeouts(node: &mut TMState, deadlines: &mut HashMap<(u64, u32, u8), u64>, tick: u64) {
+        let now = zebra_debug_time::instant_now();
+        for rd in &mut node.rounds_data {
+            let Some(timeout) = rd.active_timeout.as_mut() else { continue; };
+            let left = timeout.time.saturating_duration_since(now);
+            let due = *deadlines.entry((timeout.height, timeout.round, timeout.step as u8))
+                .or_insert(tick + left.as_nanos().div_ceil(TICK_DURATION.as_nanos()) as u64);
+            timeout.time = if tick >= due { now } else { now + std::time::Duration::from_secs(1 << 20) };
+        }
+    }
+
+    /// An engine like `split_engine`'s whose proposals differ each time and take their sizes in
+    /// turn from `sizes`, counting the strict quorum or `2f+1` at every height.
+    fn sim_live_engine(keys: &[SigningKey], roster: &[SortedRosterMember], i: usize, sizes: Vec<usize>, strict_quorum: bool) -> TMState {
+        let proposals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let decided_roster = roster.to_vec();
+        let mut node = TMState::init(
+            keys[i].clone(), roster[i].pub_key, 0, ROSTER_MAX_N,
+            ClosureToProposeNewBlock(Arc::new(move || {
+                let k = proposals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let value = BlockValue((0..sizes[k % sizes.len()]).map(|b| (b ^ k.wrapping_mul(31) ^ i.wrapping_mul(101)) as u8).collect());
+                Box::pin(async move { Some(value) })
+            })),
+            ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
+            ClosureToPushDecidedBlock(Arc::new(move |_, _, _| { let roster = decided_roster.clone(); Box::pin(async move { (roster, [0; 32], strict_quorum) }) })),
+            ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
+            ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
+        );
+        node.strict_quorum = strict_quorum;
+        node
+    }
+
+    #[derive(Debug, Default)]
+    struct LiveCoverage {
+        strict: usize,
+        silent: usize,
+        partial: usize,
+        losses: usize,
+        cuts: usize,
+        gated: usize,
+        late_rounds: usize,
+        undecided_at_gst: usize,
+        most_ticks_after_gst: u64,
+    }
+
+    const LIVE_HEIGHTS: u64 = 3;
+    /// Some six times the most that 96 cases took, so gossip that delivers but slowly fails too.
+    const LIVE_TICKS_PER_HEIGHT: u64 = 300;
+
+    fn sim_live_tick(sim: &mut Sim, rt: &tokio::runtime::Runtime, members: &[usize], rosters: &mut [Vec<SortedRosterMember>], deadlines: &mut [HashMap<(u64, u32, u8), u64>]) {
+        for &i in members {
+            sim_timeouts(&mut sim.nodes[i], &mut deadlines[i], sim.tick);
+            rt.block_on(sim.nodes[i].bft_update(&mut rosters[i]));
+            sim_timeouts(&mut sim.nodes[i], &mut deadlines[i], sim.tick);
+        }
+        sim_step(sim);
+    }
+
+    /// One case of `gossip_lets_the_state_machine_decide_heights`. Feature 0 is a full mesh, 1 a
+    /// partial one, 2 slow links, 3 heavy loss before GST, 4 a partition before GST with no quorum
+    /// on either side; any case may have finalizers that never run.
+    fn gossip_live_case(seed: u64, case: u64, cov: &mut LiveCoverage) {
+        let mut rng = SimRng::seed_from_u64(seed ^ case.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x11FE);
+        let feature = case % 5;
+        // At least four run in a partial mesh, so it always lacks a pair.
+        let n = rng.random_range(if feature == 1 { 5 } else { 4 }..=7usize).min(ROSTER_MAX_N);
+        let (keys, roster) = sim_finalizers(n);
+        // A partition with no quorum on either side needs the strict quorum: `2f+1` of five or six
+        // fits on both sides of some split.
+        let strict_quorum = feature == 4 || case % 2 == 1;
+        cov.strict += strict_quorum as usize;
+        let threshold = decision_threshold(n as u64, strict_quorum) as usize;
+        let most_silent = (n - threshold).min(TMState::f_from_n(n as u64) as usize);
+        let silent_n = rng.random_range(if case % 3 == 2 { 1 } else { 0 }..=most_silent);
+        let mut order: Vec<usize> = (0..n).collect();
+        order.shuffle(&mut rng);
+        let mut members = order[silent_n..].to_vec();
+        members.sort();
+        cov.silent += silent_n;
+
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut deadlines: Vec<HashMap<(u64, u32, u8), u64>> = vec![HashMap::new(); n];
+        let mut rosters = vec![roster.clone(); n];
+        let nodes: Vec<TMState> = (0..n).map(|i| {
+            let sizes = (0..4).map(|_| rng.random_range(1..=3 * PROPOSAL_CHUNK_DATA_SIZE)).collect();
+            let mut node = sim_live_engine(&keys, &roster, i, sizes, strict_quorum);
+            if members.contains(&i) {
+                rt.block_on(node.start_round(&roster, zebra_debug_time::instant_now(), 0));
+                sim_timeouts(&mut node, &mut deadlines[i], 0);
+            }
+            node
+        }).collect();
+
+        let gst = rng.random_range(if feature >= 3 { 20 } else { 0 }..300u64);
+        let loss = if feature == 3 { rng.random_range(0.5..0.95) } else { 0.0 };
+        let mut side = vec![0u8; n];
+        if feature == 4 {
+            // Each side short of a quorum: neither decides, nor, lacking 2f+1 prevotes of any kind,
+            // even starts its prevote timeout, until GST lets the old votes through.
+            let mut shuffled = members.clone();
+            shuffled.shuffle(&mut rng);
+            let a_n = rng.random_range(members.len() + 1 - threshold..threshold);
+            for &i in &shuffled[..a_n] { side[i] = 1; }
+        }
+        let mut link_cov = SimCoverage::default();
+        let links = sim_links(&mut rng, n, &members, feature == 1, if feature == 2 { 1500..=2500 } else { 20_000..=60_000 }, &mut link_cov);
+        let case_str = format!("case {case} (feature {feature}): {n} finalizers, {silent_n} silent, quorum {threshold}, GST at tick {gst}, loss {loss:.2}, sides {side:?}");
+        let mut sim = sim_new(nodes, &roster, links, loss, gst, rng);
+        sim.side = side;
+
+        while sim.tick < gst { sim_live_tick(&mut sim, &rt, &members, &mut rosters, &mut deadlines); }
+        let at_gst = members.iter().map(|&i| sim.nodes[i].height).max().unwrap();
+        if at_gst == 0 { cov.undecided_at_gst += 1; }
+        let target = at_gst + LIVE_HEIGHTS;
+        let deadline = gst + LIVE_HEIGHTS * LIVE_TICKS_PER_HEIGHT;
+        while !members.iter().all(|&i| sim.nodes[i].height >= target) {
+            assert!(sim.tick <= deadline, "{case_str}: at tick {} the running finalizers are at heights {:?}, rounds {:?}, short of {target}",
+                sim.tick, members.iter().map(|&i| sim.nodes[i].height).collect::<Vec<_>>(), members.iter().map(|&i| sim.nodes[i].round).collect::<Vec<_>>());
+            sim_live_tick(&mut sim, &rt, &members, &mut rosters, &mut deadlines);
+        }
+
+        for h in 0..target as usize {
+            let decided: Vec<(u32, ValueId)> = members.iter().map(|&i| {
+                let rd = &sim.nodes[i].recent_commit_round_cache[h];
+                assert_eq!(rd.height, h as u64, "{case_str}: node {i}'s decision cache is out of order");
+                (rd.round, rd.proposal_id)
+            }).collect();
+            assert!(decided.iter().all(|d| d.1 == decided[0].1), "{case_str}: height {h} decided differently: {decided:?}");
+            cov.late_rounds += decided.iter().filter(|d| d.0 > 0).count();
+        }
+        cov.partial += link_cov.partial;
+        cov.losses  += sim.cov.losses;
+        cov.cuts    += sim.cov.cuts;
+        cov.gated   += sim.cov.gated;
+        cov.most_ticks_after_gst = cov.most_ticks_after_gst.max(sim.tick - gst);
+    }
+
+    /// Real engines run the state machine over simulated links, deciding by the gossip alone: every
+    /// finalizer that runs decides three more heights within a bound after GST, all decide the same
+    /// value at each height, and no tick's data to a peer exceeds its budget less what is queued to it.
+    #[test]
+    fn gossip_lets_the_state_machine_decide_heights() {
+        let seed = gossip_fuzz_seed();
+        let cases = gossip_fuzz_cases();
+        let mut cov = LiveCoverage::default();
+        for case in 0..cases { gossip_live_case(seed, case, &mut cov); }
+        eprintln!("gossip live coverage: {cov:?}");
+        if cases >= 8 {
+            assert!(cov.strict > 0 && cov.strict < cases as usize && cov.silent > 0 && cov.partial > 0 && cov.losses > 0 && cov.cuts > 0 && cov.gated > 0 && cov.late_rounds > 0 && cov.undecided_at_gst > 0,
+                "a feature went unexercised: {cov:?}");
         }
     }
 }
