@@ -307,6 +307,10 @@ fn move_invalid_block(g: &mut FuzzGen, c: &mut Choices) {
 }
 
 /// The next block with random bytes flipped: the node may take it or not, but must keep running.
+/// Bytes that still parse to a block with a coinbase height are loaded as they are, or sometimes
+/// served by a peer that claims they are the valid block; bytes that do not are always served
+/// that way, which is the only way they reach a node. Either way the valid block comes later
+/// through the ordinary moves, so a lie told about it must not keep it out.
 fn move_mangled_block(g: &mut FuzzGen, c: &mut Choices) {
     let mut scratch = g.tip().clone();
     let valid = scratch.next_block(&g.miner.clone());
@@ -316,20 +320,30 @@ fn move_mangled_block(g: &mut FuzzGen, c: &mut Choices) {
         let i = c.below(bytes.len());
         bytes[i] ^= 1 << c.below(8);
     }
-    // A synthetic peer advertises a block by its coinbase height and LOAD_POW hands the node a
-    // parsed block, so bytes that no longer parse to a block with one have no doorway.
-    // TODO: a raw wire doorway (RECV_STP_PACKET with BLOCK_CHUNKs) for bytes that don't parse.
-    // Only loaded, not offered by a peer: a node need not fetch an advertised block (one at a
-    // height it holds adds no work), and an offer it ignores costs the instruction's whole wait.
+    if c.unusual(64) {
+        let cut = c.below(bytes.len());
+        bytes.truncate(cut);
+    }
     let parses = Block::zcash_deserialize(&bytes[..]).is_ok_and(|b| b.coinbase_height().is_some());
-    if !parses {
+    if parses && !c.unusual(64) {
+        // Only loaded, not offered as itself by a peer: a node need not fetch an advertised block
+        // (one at a height it holds adds no work), and an offer it ignores costs the
+        // instruction's whole wait.
+        g.tf.push_instr_load_pow_bytes(&bytes, ANY_OUTCOME);
+        g.tf.push_instr_expect_node_alive(0);
+        // Taken, it is a block at the tip's next height that `main` does not have.
+        g.tip_known = false;
+        g.rival_height = g.rival_height.max(g.height() + 1);
         return;
     }
-    g.tf.push_instr_load_pow_bytes(&bytes, ANY_OUTCOME);
+    // Claimed as the valid block, which is at the next height, so the node asks for it. Bytes
+    // that do not hash to the claim, or do not parse, are not that block.
+    let claim = StpClaim::of(&valid).expect("a generated block has a coinbase height");
+    let peer = g.next_fresh_peer;
+    g.next_fresh_peer += 1;
+    let same = bytes == valid.zcash_serialize_to_vec().expect("a generated block serializes");
+    g.tf.push_instr_recv_pow_claimed(claim, &bytes, peer, if same { ANY_OUTCOME } else { SHOULD_FAIL });
     g.tf.push_instr_expect_node_alive(0);
-    // Taken, it is a block at the tip's next height that `main` does not have.
-    g.tip_known = false;
-    g.rival_height = g.rival_height.max(g.height() + 1);
 }
 
 // ---- Transaction and staking moves ----
@@ -1621,6 +1635,61 @@ fn directed_choices() -> Choices {
     };
     let _ = writeln!(std::io::stderr(), "fuzz seed {seed}: set CROSSLINK_FUZZ_SEED={seed} to run this again");
     Choices::from_seed(seed, 4096)
+}
+
+/// Three blocks, a peer serving `serve(real block's bytes)` under the real block's claim (refused
+/// for `reason`, since what it serves is not that block), the real block (must be taken), and one
+/// more on top.
+fn claimed_garbage_then_real(serve: fn(Vec<u8>) -> Vec<u8>, reason: &str) -> Vec<u8> {
+    let mut c = directed_choices();
+    let mut g = FuzzGen::new(&HARNESS_PARAMETERS);
+    for _ in 0..1 + c.below(6) {
+        move_extend(&mut g, &mut c);
+    }
+    let mut next = g.tip().clone();
+    let real = next.next_block(&g.miner.clone());
+    let served = serve(real.zcash_serialize_to_vec().expect("a generated block serializes"));
+    g.tf.push_instr_recv_pow_claimed(StpClaim::of(&real).expect("a generated block has a height"), &served, FRESH_PEERS_FROM, SHOULD_FAIL);
+    g.tf.push_instr_expect_rejection_reason(reason, 0);
+    g.tf.push_instr_expect_node_alive(0);
+    g.tf.push_instr_load_pow(&real, 0);
+    g.main.push(next);
+    g.expect_tip();
+    for _ in 0..1 + c.below(3) {
+        move_extend(&mut g, &mut c);
+    }
+    g.tf.write_to_bytes()
+}
+
+#[test]
+fn crosslink_fuzz_directed_truncated_bytes_under_a_claim_do_not_condemn_the_real_block() {
+    set_test_name(function_name!());
+    test_bytes(claimed_garbage_then_real(
+        |mut bytes| {
+            bytes.truncate(bytes.len() / 2);
+            bytes
+        },
+        "Failed to deserialize block",
+    ));
+}
+
+#[test]
+fn crosslink_fuzz_directed_unparseable_bytes_under_a_claim_do_not_condemn_the_real_block() {
+    set_test_name(function_name!());
+    test_bytes(claimed_garbage_then_real(|bytes| vec![0xff; bytes.len()], "Failed to deserialize block"));
+}
+
+#[test]
+fn crosslink_fuzz_directed_another_block_under_a_claim_does_not_condemn_the_real_block() {
+    set_test_name(function_name!());
+    // A valid block's bytes, but not the claimed one's: its header has one bit of its nonce flipped.
+    test_bytes(claimed_garbage_then_real(
+        |mut bytes| {
+            bytes[4 + 32 + 32 + 32 + 4 + 4] ^= 1;
+            bytes
+        },
+        "did not match advertised hash",
+    ));
 }
 
 fn refused_body_then_real(mutate: fn(&mut Block)) -> Vec<u8> {

@@ -153,6 +153,7 @@ pub fn instrs_through_height(bytes: &[u8], instrs: &[TFInstr], height: u32) -> u
         .position(|instr| {
             let block_height = match tf_read_instr(bytes, instr) {
                 Some(TestInstr::LoadPoW(block)) => block.coinbase_height(),
+                Some(TestInstr::RecvPoW { claim: Some(claim), .. }) => Some(zebra_chain::block::Height(claim.height)),
                 Some(TestInstr::RecvPoW { block, .. }) => {
                     Block::zcash_deserialize(&block[..]).ok().and_then(|block| block.coinbase_height())
                 }
