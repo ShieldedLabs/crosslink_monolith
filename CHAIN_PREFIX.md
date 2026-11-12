@@ -75,7 +75,7 @@ proposer of a decision made after round 0 did not sign its certificate.
 
 ## Importing
 
-    zebrad -c node.toml import-chain prefix.zeccltf [--cache-dir DIR] [--height H] [--trusted] [--connect]
+    zebrad -c node.toml import-chain prefix.zeccltf [--cache-dir DIR] [--height H] [--trusted] [--keep-identity] [--connect]
 
 This builds a new state and runs a node on it. The configured state is never touched. By default
 the new state goes beside the configured one, named for the file, as in
@@ -109,9 +109,16 @@ including scenario instructions appended to the file. Since each BFT block sits 
 live node could have decided it, what runs is what a node at `H` held. One export can so be
 imported at any height below its tip.
 
-A new state directory is a new node. Its `secret.seed`, and with it the node's network identity,
-wallet and default finalizer key, is generated fresh. To rebuild a node as itself, copy the old
-`secret.seed` into the new directory before importing, or set `explicit_bft_key_seed`.
+A new state directory is a new node by default. Its `secret.seed`, and with it the node's network
+identity, wallet and default finalizer key, is generated fresh. That is right for a second node
+built from a file: one to replay or investigate on beside the original.
+
+To rebuild a node as itself, as in a rollback, pass `--keep-identity`. The import copies the
+configured node's `secret.seed` into the new state, so the rebuilt node has the same identity,
+wallet and finalizer key. It refuses while the configured node is running, which it tells by that
+node's state database being held open, because two nodes with one seed vote as the same
+finalizer. Stop the configured node first. Copying `secret.seed` in by hand does not work: the
+import refuses a directory that holds anything.
 
 `--trusted` skips only the proof, signature and script checks (`verify_expensive`) for the
 file's PoW blocks. Everything else above still runs. Use it for files from a node you trust,
