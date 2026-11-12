@@ -378,6 +378,12 @@ lto = "off"
 incremental = true
 # Not release's one unit: with one, an edit regenerates the whole crate.
 codegen-units = 256
+# Workspace crates at opt-level 2, which compiles faster than 3; dependencies, which hold the
+# hot cryptography and rarely rebuild, stay at release's 3.
+opt-level = 2
+
+[profile.release-iter.package."*"]
+opt-level = 3
 
 # Public release: the release optimizations without debug info, and with symbols stripped, for
 # the smallest binary to distribute. Panics still print their message, but backtraces have no
