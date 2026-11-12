@@ -125,6 +125,17 @@ pub static STAKING_STAGE: Mutex<Option<(StakingActionRequest, tokio::sync::onesh
 /// Staged basic send requested over RPC: (value in zatoshis, unified address string, result channel).
 pub static BASIC_SEND_STAGE: Mutex<Option<(u64, String, tokio::sync::oneshot::Sender<Result<String, String>>)>> = Mutex::new(None);
 
+/// Takes the staged RPC staking request for the wallet to build, unless its caller has gone (an RPC
+/// client that timed out): nobody would be told about it, and the caller may well have sent it again.
+pub fn take_staged_staking_action() -> Option<(StakingActionRequest, tokio::sync::oneshot::Sender<Result<String, String>>)> {
+    STAKING_STAGE.lock().unwrap().take().filter(|(_, sender)| !sender.is_closed())
+}
+
+/// Takes the staged RPC send for the wallet to build, unless its caller has gone, as with staking.
+pub fn take_staged_basic_send() -> Option<(u64, String, tokio::sync::oneshot::Sender<Result<String, String>>)> {
+    BASIC_SEND_STAGE.lock().unwrap().take().filter(|(_, _, sender)| !sender.is_closed())
+}
+
 pub static STAKING_POSITIONS: Mutex<zcash_primitives::bft::WalletStakingPositions> = Mutex::new((BTreeMap::new(), Vec::new()));
 /// Read by the `wallet_spendable_funds` RPC; kept fresh by `wallet_main` beside the balances
 /// it already computes for the GUI.
@@ -197,11 +208,42 @@ pub fn spend_order(values: &[u64]) -> Vec<usize> {
     order
 }
 
+/// Each coin's value if a new transaction may spend it, else 0, which `spend_order` passes over.
+/// A coin stays in `utxos` until the wallet scans the block that spends it, so a coin that a sent
+/// transaction spends still looks unspent; a second spend of it is refused as a double spend.
+fn spendable_utxo_values(utxos: &[Txo], in_flight: &[OutPoint]) -> Vec<u64> {
+    utxos.iter().map(|utxo| match utxo.t_addr {
+        TransparentAddress::PublicKeyHash(_) if !in_flight.contains(&utxo.id) => utxo.value.into_u64(),
+        _ => 0,
+    }).collect()
+}
+
+/// The user wallet shields its transparent coins once they are worth this much. A won block pays
+/// its miner 2.5 cTAZ, so one block is enough.
+pub const USER_SHIELD_MIN_ZATS: u64 = 10_000_000;
+
+/// The amount a shield of coins worth `values` should send: everything the transaction can spend,
+/// less a fee allowance, so no coin is left behind. None while that is below `USER_SHIELD_MIN_ZATS`.
+pub fn user_shield_zats(values: &[u64]) -> Option<u64> {
+    let order = spend_order(values);
+    let n = order.len().min(MAX_TRANSPARENT_SPENDS);
+    let total: u64 = order[..n].iter().map(|&i| values[i]).sum();
+    // ZIP-317 charges n + 2 marginal fees here: one per input and two for the Ironwood actions.
+    // Two more spare the shield from failing if that count is off; the excess comes back as change.
+    let fee_allowance = zip317::MARGINAL_FEE.into_u64() * (n as u64 + 4);
+    total.checked_sub(fee_allowance).filter(|&zats| zats >= USER_SHIELD_MIN_ZATS)
+}
+
 impl ManualWallet {
     /// The tip that confirmations are counted against. The wallet can only witness notes in blocks
     /// it has scanned, so this trails the network tip while it catches up.
     pub fn confirmations_tip(&self) -> BlockHeight {
         self.chain_tip_h.min(self.sync_h)
+    }
+
+    /// The transparent coins spent by transactions this wallet has sent and not yet seen expire.
+    pub fn t_spends_in_flight(&self) -> Vec<OutPoint> {
+        self.sent_txs.values().flat_map(|sent| sent.t_spends.iter().cloned()).collect()
     }
 }
 impl From<LRZBlockHeight> for BlockHeight {
@@ -1607,6 +1649,7 @@ pub struct SentTx {
     pub data: Vec<u8>,
     pub expiry_h: Option<BlockHeight>,
     pub resent_h: BlockHeight,
+    pub t_spends: Vec<OutPoint>,
 }
 // N.B. using some of the same API as WalletDb to allow smooth transition/comparison
 impl ManualWallet {
@@ -1679,10 +1722,12 @@ impl ManualWallet {
                     if resp.error_code == 0 {
                         wallet_tx.h = BlockHeight::SENT;
                         let expiry_h = BlockHeight::from(tx.expiry_height());
+                        let t_spends = tx.transparent_bundle().map_or(Vec::new(), |bundle| bundle.vin.iter().map(|input| input.prevout.clone()).collect());
                         self.sent_txs.insert(tx.txid(), SentTx {
                             data,
                             expiry_h: if expiry_h.0 == 0 { None } else { Some(expiry_h) },
                             resent_h: BlockHeight::INVALID,
+                            t_spends,
                         });
                     } else {
                         println!("node rejected transaction {:?} ({}): {}", tx.txid(), resp.error_code, resp.error_message);
@@ -2037,7 +2082,7 @@ impl ManualWallet {
 
                 TxPool::Transparent => {
                     let t_pubkey = t_pubkey.expect("checked above");
-                    let values: Vec<u64> = account.utxos.iter().map(|utxo| utxo.value.into_u64()).collect();
+                    let values = spendable_utxo_values(&account.utxos, &self.t_spends_in_flight());
                     for i in spend_order(&values) {
                         if txb.transparent_inputs().len() >= MAX_TRANSPARENT_SPENDS { break; }
                         let utxo = &account.utxos[i];
@@ -5091,15 +5136,21 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
 
             // Mining to the default (transparent) address lands coinbase in the user wallet, so shield it too.
-            // Wait for the user's other txs so we never build two spends of the same inputs.
-            if !proposed_user_shield.is_in_progress() && !proposed_stake.is_in_progress() && !proposed_send.is_in_progress() {
-                let utxos = &user_wallet.accounts[0].utxos;
-                let utxo_state = (utxos.len(), utxos.iter().map(|utxo| utxo.value.into_u64()).sum::<u64>());
-                if failed_user_shield_utxos != Some(utxo_state) {
-                    let memo = MemoBytes::from_bytes("shielding notes".as_bytes()).unwrap();
-                    let ok = user_wallet.shield_transparent_zats(network, &mut proposed_user_shield, &mut client, &user_usk, 1000000000, &orchard_tree, memo).is_some();
-                    if DUMP_TX_BUILD { println!("Try user shield {ok:?}"); }
-                    failed_user_shield_utxos = if ok { None } else { Some(utxo_state) };
+            // Sent transactions' coins are skipped when building, but one still being built or proven
+            // isn't sent yet, so wait for those; the user's stakes and sends wait for this one likewise.
+            let user_spend_in_progress = proposed_stake.is_in_progress() || proposed_send.is_in_progress()
+                || rpc_stake.is_some() || rpc_send.is_some();
+            if !proposed_user_shield.is_in_progress() && !user_spend_in_progress {
+                let values = spendable_utxo_values(&user_wallet.accounts[0].utxos, &user_wallet.t_spends_in_flight());
+                // The spendable coins, not all of them, so a coin freed by an expired send is retried.
+                let utxo_state = (values.iter().filter(|&&v| v > 0).count(), values.iter().sum::<u64>());
+                if let Some(zats) = user_shield_zats(&values) {
+                    if failed_user_shield_utxos != Some(utxo_state) {
+                        let memo = MemoBytes::from_bytes("shielding notes".as_bytes()).unwrap();
+                        let ok = user_wallet.shield_transparent_zats(network, &mut proposed_user_shield, &mut client, &user_usk, zats, &orchard_tree, memo).is_some();
+                        if DUMP_TX_BUILD { println!("Try user shield {ok:?}"); }
+                        failed_user_shield_utxos = if ok { None } else { Some(utxo_state) };
+                    }
                 }
             }
             faucet_shield_cooldown_instant = Instant::now();
@@ -5133,10 +5184,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
-        if rpc_stake.is_none() {
-            // A request whose RPC caller has gone (a client timeout) is not built: nobody was
-            // told about it, and the caller may well have sent it again.
-            let staged_action = STAKING_STAGE.lock().unwrap().take().filter(|(_, sender)| !sender.is_closed());
+        if rpc_stake.is_none() && !proposed_user_shield.is_in_progress() {
+            let staged_action = take_staged_staking_action();
             if let Some((request, sender)) = staged_action {
                 let mut tx = ProposedTx::EMPTY;
                 let res = match request {
@@ -5167,8 +5216,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
-        if rpc_send.is_none() {
-            let staged_send = BASIC_SEND_STAGE.lock().unwrap().take().filter(|(_, _, sender)| !sender.is_closed());
+        if rpc_send.is_none() && !proposed_user_shield.is_in_progress() {
+            let staged_send = take_staged_basic_send();
             if let Some((value_zats, address, sender)) = staged_send {
                 // The same rule as the GUI's Send modal, so both refuse the same addresses for the same reasons.
                 match decode_send_address(&address) {
@@ -5235,6 +5284,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                     break;
                 };
+                // The user shield's coins are only skipped once it is sent, so a user spend waits for that.
+                if proposed_user_shield.is_in_progress() && !matches!(action, WalletAction::RequestFromFaucet) {
+                    break;
+                }
                 action.clone()
             };
 
@@ -5645,6 +5698,86 @@ mod tests {
         assert!(decode_roster_bytes(&bytes).is_err());
         bytes[last - 64] = 2;
         assert!(decode_roster_bytes(&bytes).is_err());
+    }
+
+    /// Random user wallets: P2PKH and P2SH coins worth dust, a few fees, a won block and random
+    /// amounts, some spent by transactions already sent, sometimes more than one transaction can
+    /// spend. Selection runs the way `send_zats_no_insert` spends transparent coins, under the real
+    /// ZIP-317 fee rule. The shield must be affordable, skip every coin a sent transaction spends,
+    /// and leave behind no more than the fee allowance's spare.
+    #[test]
+    fn user_shield_spends_every_free_coin() {
+        use rand_chacha::ChaCha20Rng;
+        use zcash_primitives::transaction::fees::transparent::InputSize;
+        let fee_unit = zip317::MARGINAL_FEE.into_u64();
+        let flags = orchard::bundle::BundleVersion::orchard_v3().default_flags();
+        let fee = |inputs: usize, ironwood_outputs: usize| {
+            let actions = orchard::builder::BundleType::DEFAULT.num_actions(flags, 0, ironwood_outputs).unwrap();
+            zip317::FeeRule::standard().fee_required(
+                &TEST_NETWORK, LRZBlockHeight::from_u32(1_000_000),
+                std::iter::repeat(InputSize::STANDARD_P2PKH).take(inputs), std::iter::empty::<usize>(),
+                0, 0, 0, actions, 0,
+            ).unwrap().into_u64()
+        };
+        // The builder prices the shield before adding its change output, so both must cost the same.
+        let fee_table: Vec<u64> = (0..=MAX_TRANSPARENT_SPENDS).map(|k| {
+            assert_eq!(fee(k, 1), fee(k, 2));
+            assert!(fee(k, 1) <= fee_unit * (k as u64 + 4), "the allowance is short at {k} inputs");
+            fee(k, 1)
+        }).collect();
+
+        let mut rng = ChaCha20Rng::seed_from_u64(307);
+        let (mut shielded, mut too_little, mut hit_cap) = (0, 0, 0);
+        for _ in 0..5_000 {
+            let n = if rng.gen_ratio(1, 4) { rng.gen_range(0..6) } else { rng.gen_range(0..250) };
+            let utxos: Vec<Txo> = (0..n).map(|i| {
+                let value = match rng.gen_range(0..6) {
+                    0 => rng.gen_range(1..=fee_unit),
+                    1 => rng.gen_range(fee_unit + 1..10 * fee_unit),
+                    2 => 250_000_000,
+                    3 => 250_000_000 + rng.gen_range(0..100_000),
+                    4 => rng.gen_range(1..USER_SHIELD_MIN_ZATS),
+                    _ => rng.gen_range(1..1_000_000_000),
+                };
+                let t_addr = if rng.gen_ratio(1, 8) { TransparentAddress::ScriptHash([1; 20]) } else { TransparentAddress::PublicKeyHash([2; 20]) };
+                Txo { recv_h: BlockHeight(1), spent_h: BlockHeight(0), id: OutPoint::new(rng.gen(), i as u32), value: Zatoshis::const_from_u64(value), t_addr }
+            }).collect();
+            let mut in_flight: Vec<OutPoint> = utxos.iter().filter(|_| rng.gen_ratio(1, 5)).map(|utxo| utxo.id.clone()).collect();
+            in_flight.push(OutPoint::new(rng.gen(), 0));
+
+            let values = spendable_utxo_values(&utxos, &in_flight);
+            for (utxo, &value) in utxos.iter().zip(&values) {
+                let free = matches!(utxo.t_addr, TransparentAddress::PublicKeyHash(_)) && !in_flight.contains(&utxo.id);
+                assert_eq!(value, if free { utxo.value.into_u64() } else { 0 });
+            }
+
+            let order = spend_order(&values);
+            let cap = order.len().min(MAX_TRANSPARENT_SPENDS);
+            let best: u64 = order[..cap].iter().map(|&i| values[i]).sum();
+            let Some(zats) = user_shield_zats(&values) else {
+                assert!(best.saturating_sub(fee_table[cap]) < USER_SHIELD_MIN_ZATS + 2 * fee_unit, "gave up on {best} zats in {cap} coins");
+                too_little += 1;
+                continue;
+            };
+            assert!(zats >= USER_SHIELD_MIN_ZATS);
+
+            let mut spent = 0;
+            let mut total = 0;
+            for &i in &order {
+                if spent >= MAX_TRANSPARENT_SPENDS { break; }
+                assert!(values[i] > 0 && !in_flight.contains(&utxos[i].id));
+                spent += 1;
+                total += values[i];
+                if total >= zats + fee_table[spent] { break; }
+            }
+            assert!(total >= zats + fee_table[spent], "can't afford {zats} from {total} in {spent} coins");
+            let left: u64 = order[spent..cap].iter().map(|&i| values[i]).sum();
+            assert!(left <= fee_unit * (cap - spent + 2) as u64, "left {left} zats in {} coins", cap - spent);
+
+            shielded += 1;
+            hit_cap += (cap == MAX_TRANSPARENT_SPENDS) as usize;
+        }
+        assert!(shielded > 1_000 && too_little > 100 && hit_cap > 300, "shielded {shielded}, too little {too_little}, hit the cap {hit_cap}");
     }
 
     fn note_fixture() -> (ManualWallet, PreparedKeys, orchard::Note, orchard::Address) {

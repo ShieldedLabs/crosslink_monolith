@@ -82,3 +82,8 @@ Changing the name starts a new chain, and the old chain's state stays behind
 under the old name. The featurenet's `crosslink_featurenet_20260929_staking3d`
 predates this rule; keep it as it is, since renaming it would strand the
 featurenet's state.
+
+## Units
+
+cTAZ means Crosslink TAZ, the featurenet's coin: 1 cTAZ is 100,000,000 zats.
+The "c" is never centi-, so 10 cTAZ is 1,000,000,000 zats.

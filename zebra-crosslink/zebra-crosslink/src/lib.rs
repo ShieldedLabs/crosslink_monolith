@@ -961,3 +961,201 @@ async fn _tfl_dump_block_sequence(
     let blocks = tfl_block_sequence(call, anchor, hi_height, lo_height, max_len).await;
     tfl_dump_blocks(&blocks[..]);
 }
+
+#[cfg(test)]
+mod wallet_rpc_tests {
+    use super::*;
+    use crate::service::{
+        BlockFromTemplateProcedure, InboundWireProcedure, MempoolServiceProcedure,
+        ReadStateServiceProcedure, StateServiceProcedure,
+    };
+    use rand::{Rng, RngCore, SeedableRng};
+    use zcash_primitives::transaction::StakingActionRequest;
+
+    type Answer = Result<TFLServiceResponse, TFLServiceError>;
+
+    fn handle(disable_the_headless_wallet: bool) -> TFLServiceHandle {
+        let state: StateServiceProcedure = Arc::new(|_| Box::pin(async { Err("unused".into()) }));
+        let read_state: ReadStateServiceProcedure = Arc::new(|_| Box::pin(async { Err("unused".into()) }));
+        let mempool: MempoolServiceProcedure = Arc::new(|_| Box::pin(async { Err("unused".into()) }));
+        let inbound_wire: InboundWireProcedure = Arc::new(|_, _| Box::pin(async { Err("unused".into()) }));
+        let network = zebra_chain::parameters::Network::new_regtest(Default::default());
+        TFLServiceHandle {
+            internal: Arc::new(TokioMutex::new(TFLServiceInternal {
+                bft_msg_flags: 0,
+                bft_err_flags: 0,
+                our_set_bft_string: None,
+                active_bft_string: None,
+            })),
+            call: TFLServiceCalls {
+                state,
+                read_state,
+                mempool,
+                inbound_wire,
+                block_from_template: Arc::new(std::sync::OnceLock::<BlockFromTemplateProcedure>::new()),
+            },
+            config: config::Config { disable_the_headless_wallet, ..Default::default() },
+            params: network.crosslink_parameters(),
+            network,
+        }
+    }
+
+    // Kind 0 is wallet_staking_action and kind 1 is wallet_basic_send. The request's id rides in the
+    // bond key or the amount, so what the wallet takes can be traced back to its caller.
+    fn request(kind: usize, id: u64) -> TFLServiceRequest {
+        if kind == 0 {
+            let mut bond_key = [0u8; 32];
+            bond_key[..8].copy_from_slice(&id.to_le_bytes());
+            TFLServiceRequest::WalletStakingAction(StakingActionRequest::BeginDelegationUnbonding { bond_key: PubKeyID(bond_key) })
+        } else {
+            TFLServiceRequest::WalletBasicSend(id, "utest1notparsedhere".to_string())
+        }
+    }
+
+    fn wallet_take(kind: usize) -> Option<(u64, tokio::sync::oneshot::Sender<Result<String, String>>)> {
+        if kind == 0 {
+            wallet::take_staged_staking_action().map(|(request, sender)| match request {
+                StakingActionRequest::BeginDelegationUnbonding { bond_key } => (u64::from_le_bytes(bond_key.0[..8].try_into().unwrap()), sender),
+                other => panic!("the wallet took a request no caller made: {other:?}"),
+            })
+        } else {
+            wallet::take_staged_basic_send().map(|(value_zats, _, sender)| (value_zats, sender))
+        }
+    }
+
+    // What the RPC answered, if it has: Ok(the wallet's answer) or Err(the refusal).
+    fn wallet_answer(kind: usize, answer: Answer) -> Result<Result<String, String>, String> {
+        match (kind, answer) {
+            (0, Ok(TFLServiceResponse::WalletStakingAction(result))) | (1, Ok(TFLServiceResponse::WalletBasicSend(result))) => Ok(result),
+            (_, Err(TFLServiceError::Misc(msg))) => Err(msg),
+            (kind, other) => panic!("kind {kind} got {other:?}"),
+        }
+    }
+
+    async fn settle() {
+        for _ in 0..8 { tokio::task::yield_now().await; }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Caller { Waiting, TakenByWallet, GaveUp, Done }
+
+    // The wallet RPCs hand their request to the wallet loop through a one-slot stage per kind, and
+    // wait for its answer. Each case draws whether the node runs a wallet loop, then a random run of
+    // RPC calls of both kinds, callers that give up (an RPC client timing out drops the call), and a
+    // wallet loop that takes staged requests and answers the ones it took, in any order. The handler
+    // under test is the real one, and the wallet takes with the functions its loop uses.
+    //
+    // Without a wallet loop every call is answered at once with an error naming the setting. With
+    // one, a call is refused exactly while another caller of its kind still waits on the stage, a
+    // request whose caller gave up never holds the stage and is never taken by the wallet, the wallet
+    // takes each live request once, and every caller still waiting gets the answer to its own request.
+    //
+    // Every run draws a fresh seed (set CROSSLINK_FUZZ_SEED to replay one).
+    #[tokio::test]
+    async fn wallet_rpcs_stage_one_live_request_per_kind_and_drop_the_ones_whose_caller_gave_up() {
+        let seed: u64 = std::env::var("CROSSLINK_FUZZ_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| rand::thread_rng().next_u64());
+        eprintln!("CROSSLINK_FUZZ_SEED={seed}");
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
+        let (mut refused, mut replaced, mut skipped, mut answered, mut answered_late, mut no_wallet) = (0, 0, 0, 0, 0, 0);
+        let mut next_id = 1u64;
+
+        for case_i in 0..300 {
+            let runs_wallet = rng.gen_bool(0.8);
+            let handle = handle(!runs_wallet);
+            wallet::STAKING_STAGE.lock().unwrap().take();
+            wallet::BASIC_SEND_STAGE.lock().unwrap().take();
+            let mut callers: Vec<(usize, u64, Caller, tokio::task::JoinHandle<Answer>)> = Vec::new();
+            let mut staged: [Option<u64>; 2] = [None, None];
+            let mut stage_holds_a_gone_caller = [false; 2];
+            let mut taken: Vec<(usize, u64, tokio::sync::oneshot::Sender<Result<String, String>>)> = Vec::new();
+            let mut log = Vec::new();
+
+            for _ in 0..rng.gen_range(1..60) {
+                let kind = rng.gen_range(0..2);
+                match rng.gen_range(0..10) {
+                    0..=3 => {
+                        let id = next_id;
+                        next_id += 1;
+                        log.push(format!("call {kind} #{id}"));
+                        let mut task = tokio::spawn(tfl_service_incoming_request(handle.clone(), request(kind, id)));
+                        settle().await;
+                        let case = format!("seed {seed} case {case_i}: {log:?}");
+                        if !runs_wallet {
+                            assert!(task.is_finished(), "{case}: no answer from a node without a wallet loop");
+                            let msg = wallet_answer(kind, (&mut task).await.unwrap()).expect(&case).expect_err(&case);
+                            assert!(msg.contains("disable_the_headless_wallet"), "{case}: {msg}");
+                            no_wallet += 1;
+                            callers.push((kind, id, Caller::Done, task));
+                        } else if staged[kind].is_some() {
+                            assert!(task.is_finished(), "{case}: a call waits while another caller of its kind waits on the stage");
+                            let msg = wallet_answer(kind, (&mut task).await.unwrap()).expect_err(&case);
+                            assert!(msg.contains("in progress"), "{case}: {msg}");
+                            refused += 1;
+                            callers.push((kind, id, Caller::Done, task));
+                        } else {
+                            assert!(!task.is_finished(), "{case}: a call to a free stage was answered before the wallet took it");
+                            if stage_holds_a_gone_caller[kind] { replaced += 1; }
+                            stage_holds_a_gone_caller[kind] = false;
+                            staged[kind] = Some(id);
+                            callers.push((kind, id, Caller::Waiting, task));
+                        }
+                    }
+                    4 | 5 => {
+                        let live: Vec<usize> = (0..callers.len()).filter(|&i| matches!(callers[i].2, Caller::Waiting | Caller::TakenByWallet)).collect();
+                        if live.is_empty() { continue; }
+                        let i = live[rng.gen_range(0..live.len())];
+                        log.push(format!("caller #{} gives up", callers[i].1));
+                        callers[i].3.abort();
+                        settle().await;
+                        if callers[i].2 == Caller::Waiting {
+                            staged[callers[i].0] = None;
+                            stage_holds_a_gone_caller[callers[i].0] = true;
+                        }
+                        callers[i].2 = Caller::GaveUp;
+                    }
+                    6..=7 if runs_wallet => {
+                        log.push(format!("wallet takes {kind}"));
+                        let case = format!("seed {seed} case {case_i}: {log:?}");
+                        let took = wallet_take(kind);
+                        assert_eq!(took.as_ref().map(|t| t.0), staged[kind], "{case}: the wallet took the wrong request");
+                        if stage_holds_a_gone_caller[kind] { skipped += 1; }
+                        stage_holds_a_gone_caller[kind] = false;
+                        if let Some((id, sender)) = took {
+                            staged[kind] = None;
+                            callers.iter_mut().find(|c| c.1 == id).unwrap().2 = Caller::TakenByWallet;
+                            taken.push((kind, id, sender));
+                        }
+                    }
+                    8..=9 if !taken.is_empty() => {
+                        let (kind, id, sender) = taken.swap_remove(rng.gen_range(0..taken.len()));
+                        log.push(format!("wallet answers #{id}"));
+                        let _ = sender.send(Ok(format!("txid {id}")));
+                        settle().await;
+                        let case = format!("seed {seed} case {case_i}: {log:?}");
+                        let caller = callers.iter_mut().find(|c| c.1 == id).unwrap();
+                        if caller.2 == Caller::TakenByWallet {
+                            assert!(caller.3.is_finished(), "{case}: the caller did not get the wallet's answer");
+                            let answer = wallet_answer(kind, (&mut caller.3).await.unwrap()).expect(&case);
+                            assert_eq!(answer, Ok(format!("txid {id}")), "{case}");
+                            if staged[kind].is_some() { answered_late += 1; }
+                            caller.2 = Caller::Done;
+                            answered += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                let case = format!("seed {seed} case {case_i}: {log:?}");
+                for c in &callers {
+                    if matches!(c.2, Caller::Waiting | Caller::TakenByWallet) {
+                        assert!(!c.3.is_finished(), "{case}: caller #{} got an answer before the wallet gave one", c.1);
+                    }
+                }
+            }
+            for c in &callers { c.3.abort(); }
+        }
+        wallet::STAKING_STAGE.lock().unwrap().take();
+        wallet::BASIC_SEND_STAGE.lock().unwrap().take();
+        eprintln!("refused {refused}, replaced a gone caller {replaced}, wallet skipped a gone caller {skipped}, answered {answered} ({answered_late} while the next waited), no wallet {no_wallet}");
+        assert!(refused > 100 && replaced > 50 && skipped > 50 && answered > 100 && answered_late > 20 && no_wallet > 100, "seed {seed}: too few cases reached every path");
+    }
+}
