@@ -1163,6 +1163,253 @@ fn generate_bft(c: &mut Choices) -> Vec<u8> {
 }
 // ---- End of BFT ----
 
+// ---- BFT through the engine ----
+// Inputs where the node's own tenderlink engine runs: the bonded four-member roster of the BFT
+// rounds scenes, activated, then PoW growth (direct and over STP, with side branches) between
+// heights the engine decides from the synthetic finalizers' messages, which arrive in any order,
+// with duplicates and wrong-namespace votes among them, and the clock moving between them.
+//
+// The writer must know every decided block, to propose the next height on it, and every
+// proposer. The proposer is a pure function of the roster, height and round, and the roster for
+// a height is the stake at the snapshot of the block below: active bonds plus reward banks,
+// which every PoW block's issuance grows. The writer replays the chain it generated up to each
+// snapshot, as the node does, and picks the proposer from that. A round the node would propose
+// is failed with nil votes, so the node's own proposals, whose values only it knows, are never
+// decided.
+
+struct EngineFuzz {
+    tf: TF,
+    scene: BftRoundsScene,
+    /// `gens[i]` is the generator after the `i`-th block above the scene's, so a side branch can
+    /// start below the tip.
+    gens: Vec<BlockGen>,
+    /// The engine's height and round, as the writer has driven it.
+    height: u64,
+    round: u32,
+    /// The decided block the next proposal builds on, and the PoW height it finalized.
+    parent: FatPointerToBftBlock,
+    snapshot: u32,
+    next_fresh_peer: u64,
+    sides: u8,
+    /// The best chain's blocks by height (genesis, which carries no staking state, as `None`).
+    main: Vec<Option<Arc<Block>>>,
+    /// The chain's staking, replayed through `replayed_to`.
+    replay: zebra_state::StakingReplay,
+    replayed_to: u32,
+}
+
+impl EngineFuzz {
+    /// The stake each finalizer votes with at `snapshot`: its active bonds plus its bank, as the
+    /// node aggregates them.
+    fn stakes_at(&mut self, snapshot: u32) -> Vec<([u8; 32], u64)> {
+        assert!(snapshot >= self.replayed_to, "snapshots only move up");
+        for height in self.replayed_to + 1..=snapshot {
+            let block = self.main[height as usize].clone().expect("only genesis is missing");
+            let main = &self.main;
+            let block_at = |at: zebra_chain::block::Height| main[at.0 as usize].clone().expect("the slash window does not reach genesis");
+            // Every block pays issuance, as on the node (see staking_replay_matches).
+            self.replay
+                .apply_block(&self.scene.gen.network, zebra_chain::block::Height(height), &block, true, block_at)
+                .expect("the generated chain replays");
+        }
+        self.replayed_to = snapshot;
+        let mut stakes: std::collections::HashMap<[u8; 32], u64> = Default::default();
+        for (bond, status) in self.replay.delegation_bonds.values() {
+            if matches!(status, zebra_state::BondStatusInChain::Active) {
+                *stakes.entry(bond.target_finalizer).or_default() += u64::from(bond.amount);
+            }
+        }
+        for (finalizer, bank) in &self.replay.finalizer_rewards {
+            if *bank != 0 {
+                *stakes.entry(*finalizer).or_default() += bank;
+            }
+        }
+        stakes.into_iter().collect()
+    }
+
+    /// Who proposes at the engine's height and round: a synthetic finalizer, or TF_BFT_THE_NODE.
+    fn proposer(&mut self) -> u64 {
+        let members = self.stakes_at(self.snapshot);
+        let proposer = bft_proposer(&members, self.scene.active_roster_max_n, self.height, self.round).expect("the roster has stake");
+        if proposer == self.scene.member_pub_keys[0].0 {
+            return TF_BFT_THE_NODE;
+        }
+        self.scene
+            .finalizers
+            .iter()
+            .map(|&k| u64::from(k))
+            .find(|&k| synthetic_finalizer_pub_key(k) == proposer)
+            .expect("the proposer is on the roster")
+    }
+
+    fn tip_height(&self) -> u32 {
+        self.scene.gen.tip.coinbase_height().expect("generated blocks have a height").0
+    }
+
+    fn extend(&mut self, c: &mut Choices) {
+        self.gens.push(self.scene.gen.clone());
+        let block = self.scene.gen.next_block(&self.scene.miner.clone());
+        self.main.push(Some(block.clone()));
+        if c.unusual(64) {
+            self.tf.push_instr_recv_pow(&block, self.next_fresh_peer, 0);
+            self.next_fresh_peer += 1;
+        } else {
+            self.tf.push_instr_load_pow(&block, 0);
+        }
+        self.scene.pow.push(block);
+        self.tf.push_instr_expect_pow_tip(&self.scene.gen.tip.hash(), 0);
+    }
+
+    /// A branch from two or more below the tip, shorter than the best chain, so the tip stays.
+    fn side_branch(&mut self, c: &mut Choices) {
+        let n = self.gens.len();
+        if n < 3 {
+            return self.extend(c);
+        }
+        let from = n - 2 - c.below((n - 2).min(4));
+        let mut side = self.gens[from].clone();
+        self.sides = self.sides.wrapping_add(1);
+        let miner = Address::Transparent(zcash_transparent::address::TransparentAddress::PublicKeyHash([self.sides | 0x80; 20]));
+        // Shorter than main: `from + 1` holds main's block at the same height as side's first.
+        for _ in 0..1 + c.below(n - from - 1) {
+            let block = side.next_block(&miner);
+            self.tf.push_instr_load_pow(&block, 0);
+        }
+        self.tf.push_instr_expect_pow_tip(&self.scene.gen.tip.hash(), 0);
+    }
+
+    fn votes(&mut self, bits: u64, id: &[u8; 32]) {
+        for k in self.scene.finalizers {
+            self.tf.push_instr_bft_recv_vote(k, bits, self.height, self.round, id, 0);
+        }
+    }
+
+    /// Gives up the current round: every synthetic finalizer prevotes and precommits nil, and the
+    /// writer moves on to the next round without waiting out the timeouts. How long those take
+    /// depends on whether the node had anything to propose, which the writer does not model; the
+    /// next round's messages, from more than a third of the stake, pull the engine into that
+    /// round at once (tendermint's round catch-up), whatever this one is doing.
+    fn nil_round(&mut self) {
+        self.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+        self.votes(TF_BFT_NIL, &[0; 32]);
+        self.votes(TF_BFT_PRECOMMIT | TF_BFT_NIL, &[0; 32]);
+        self.round += 1;
+    }
+
+    /// Decides the engine's height on a proposal from the round's synthetic proposer. Its
+    /// messages (the proposal, three prevotes, three precommits, some sent twice, some
+    /// prevotes under the wrong namespace too) arrive in a random order with up to five ticks
+    /// between them: a proposal and a quorum of precommits decide whatever the order.
+    fn decide(&mut self, c: &mut Choices) {
+        let sigma = BFT_ROUNDS_PARAMETERS.bc_confirmation_depth_sigma as u32;
+        while self.tip_height() < self.snapshot + 1 + sigma {
+            self.extend(c);
+        }
+        while self.proposer() == TF_BFT_THE_NODE {
+            self.nil_round();
+        }
+        let proposer = u16::try_from(self.proposer()).expect("a synthetic finalizer proposes");
+        let snapshot = self.snapshot + 1 + c.below((self.tip_height() - sigma - self.snapshot) as usize) as u32;
+        let block = bft_proposal(&BFT_ROUNDS_PARAMETERS, self.height as u32, self.parent.clone(), 0, &self.scene.tail_above(snapshot));
+        let value = bft_proposal_value(&block);
+        let id = bft_value_id(&value);
+
+        enum Message {
+            Proposal,
+            Vote(u16, u64),
+        }
+        let mut messages = vec![Message::Proposal];
+        for k in self.scene.finalizers {
+            messages.push(Message::Vote(k, 0));
+            messages.push(Message::Vote(k, TF_BFT_PRECOMMIT));
+            if c.unusual(48) {
+                messages.push(Message::Vote(k, if c.below(2) == 0 { TF_BFT_PRECOMMIT } else { 0 }));
+            }
+            if c.unusual(32) {
+                messages.push(Message::Vote(k, TF_BFT_WRONG_NAMESPACE));
+            }
+        }
+        let mut ticks = 1;
+        self.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+        while !messages.is_empty() {
+            match messages.remove(c.below(messages.len())) {
+                Message::Proposal => {
+                    self.tf.push_instr_bft_recv_proposal(proposer, self.height, self.round, -1, 0, &value, 0)
+                }
+                Message::Vote(k, bits) => self.tf.push_instr_bft_recv_vote(k, bits, self.height, self.round, &id, 0),
+            }
+            if ticks < 6 && c.unusual(48) {
+                ticks += 1;
+                self.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+            }
+        }
+        // A decision waits on the node's answer before the engine starts the next height, and
+        // the last message may arrive after the engine's own precommit: four ticks see both out.
+        for _ in 0..4 {
+            self.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+        }
+
+        let seeds: Vec<String> = self.scene.finalizers.iter().map(|&k| synthetic_finalizer_seed(k.into())).collect();
+        let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
+        self.parent = signed_fat_pointer(&block, self.height, self.round, &seeds, &[0; 32]);
+        self.snapshot = snapshot;
+        self.height += 1;
+        self.round = 0;
+        self.tf.push_instr_expect_bft_step(self.height, 0, None, 0);
+        self.tf.push_instr_expect_pos_chain_length(self.height as usize, 0);
+    }
+}
+
+fn generate_engine(c: &mut Choices) -> Vec<u8> {
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let node_proposes_round_0 = c.below(2) == 0;
+    let scene = bft_rounds_scene(&mut tf, &[node_proposes_round_0]);
+    let zcash_primitives::bft::BftBootstrap::FromChain { roster_height, .. } = BFT_ROUNDS_PARAMETERS.bootstrap else {
+        unreachable!("the BFT rounds scenes bootstrap from the chain")
+    };
+    let parent = FatPointerToBftBlock::from_parts(scene.genesis().blake3_hash(), 0, 0, &[]);
+    // The scene loads only best-chain blocks, so they are the chain from genesis + 1 on.
+    let bytes = tf.write_to_bytes();
+    let mut main: Vec<Option<Arc<Block>>> = vec![None];
+    for instr in &TF::read_from_bytes(&bytes).expect("the scene reads back").instrs {
+        if instr.kind == TFInstr::LOAD_POW {
+            let block = Block::zcash_deserialize(instr.data_slice(&bytes)).expect("the scene's blocks parse");
+            assert_eq!(block.coinbase_height().map(|h| h.0 as usize), Some(main.len()), "the scene loads one chain in order");
+            main.push(Some(Arc::new(block)));
+        }
+    }
+    let replay = zebra_state::StakingReplay::new(&Default::default(), BFT_ROUNDS_PARAMETERS.staking.slash_analysis_window());
+    let mut f = EngineFuzz {
+        tf, scene, gens: Vec::new(), height: 1, round: 0, parent, snapshot: roster_height, next_fresh_peer: FRESH_PEERS_FROM, sides: 0,
+        main, replay, replayed_to: 0,
+    };
+    // BFT starts at the activation height the scene loaded up to.
+    f.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    for _ in 0..2 + c.below(10) {
+        match c.below(8) {
+            0..=2 => {
+                for _ in 0..1 + c.below(3) {
+                    f.extend(c);
+                }
+            }
+            3 => f.side_branch(c),
+            _ => f.decide(c),
+        }
+    }
+    f.tf.push_instr_expect_node_alive(0);
+    f.tf.push_instr_expect_staking_replay_matches(0);
+    f.tf.write_to_bytes()
+}
+
+/// One engine input, drawn from the seed like the directed scenarios: whatever order a round's
+/// messages arrive in, a proposal and a quorum of precommits decide the height.
+#[test]
+fn crosslink_fuzz_directed_the_engine_decides_each_height_whatever_order_its_messages_arrive_in() {
+    set_test_name(function_name!());
+    test_bytes(generate_engine(&mut directed_choices()));
+}
+// ---- End of BFT through the engine ----
+
 type Move = fn(&mut FuzzGen, &mut Choices);
 
 /// The lowest height an input schedules FeaturenetUpgrade2 or FeaturenetUpgrade3 at, and the
@@ -1174,10 +1421,14 @@ const FUZZ_UTXO_UPGRADE_SPAN: usize = 60;
 const MOVES: &[Move] = &[move_extend, move_fork, move_invalid_block, move_mangled_block, move_spend, move_mine_pending, move_double_spend, move_staking, move_replay, move_retarget_twice];
 
 /// The test file for `c`. Each input enables a subset of the moves, so rare combinations are not
-/// drowned out by common ones. Some inputs are BFT chains instead (`generate_bft`).
+/// drowned out by common ones. Some inputs are BFT chains instead (`generate_bft`), and some run
+/// the node's BFT engine (`generate_engine`).
 pub(crate) fn generate(c: &mut Choices) -> Vec<u8> {
     if c.unusual(48) {
         return generate_bft(c);
+    }
+    if c.unusual(64) {
+        return generate_engine(c);
     }
     // The short staking calendar, so bonds can unbond and withdraw within one input.
     let params = zcash_primitives::bft::ZcashCrosslinkParameters { staking: short_staking(&HARNESS_PARAMETERS), ..HARNESS_PARAMETERS };
