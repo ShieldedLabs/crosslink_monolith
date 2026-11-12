@@ -70,7 +70,7 @@ use zcash_protocol::value::{ZatBalance, Zatoshis};
 use zcash_protocol::{PoolType, ShieldedProtocol, TxId};
 use zcash_primitives::transaction::builder::BundlePadding;
 #[cfg(feature = "magic-memo")]
-use zcash_primitives::transaction::magic_memo::{self, MagicMemo};
+use zcash_primitives::transaction::magic_memo::{self, MagicMemo, MagicMemoContent, MagicMemoKind, MagicMemoRecipients};
 use zcash_primitives::ed25519_zebra::SigningKey;
 use zcash_keys::keys::BondSpendingKey;
 use zcash_transparent::{
@@ -136,7 +136,7 @@ pub static MAGIC_MEMO_RPC_STAGE: Mutex<Option<(String, Option<String>, tokio::sy
 #[cfg(feature = "magic-memo")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct StagedMagicMemo {
-    pub payload: Vec<u8>,
+    pub content: MagicMemoContent,
     /// Encrypt to this address, which then holds the memo's zero-value outputs; publish in plaintext if `None`.
     pub to: Option<orchard::Address>,
 }
@@ -147,7 +147,7 @@ pub struct StagedMagicMemo {
 pub struct SeenMagicMemo {
     pub h: BlockHeight,
     pub txid: TxId,
-    pub payload: Vec<u8>,
+    pub content: MagicMemoContent,
     /// The wallet whose incoming viewing key decrypted it, or `None` for a public memo.
     pub decrypted_by: Option<&'static str>,
 }
@@ -403,6 +403,10 @@ struct BuildPrep {
     staking_action: Option<StakingAction>,
     staking_signing_key: Option<SigningKey>,
 }
+/// Whether a transaction's change output is still to be added when its fee is computed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingChange { Pending, Added }
+
 impl BuildPrep {
     /// Ironwood outputs, counting each magic memo chunk as one.
     fn o_outputs_n(&self) -> usize {
@@ -413,14 +417,18 @@ impl BuildPrep {
         self.o_outputs.len() + magic_n
     }
 
-    fn fee_required(&self) -> Result<Zatoshis, builder::FeeError<zip317::FeeError>> {
+    /// The fee for the transaction prepared so far, counting one more Ironwood output if `change` is pending
+    /// (the change output is added only once the fee is known, so it must be paid for in advance).
+    fn fee_required(&self, change: PendingChange) -> Result<Zatoshis, builder::FeeError<zip317::FeeError>> {
         // NOTE: we can impl these ourselves
         use zcash_primitives::transaction::fees::transparent::{InputView, OutputView, InputSize};
+        let change_n = match change { PendingChange::Pending => 1, PendingChange::Added => 0 };
+        // Every spend and output goes in the Ironwood bundle, where a spend and an output share an action, so the
+        // count matches the builder's (and the bundle's) and spends up to the number of outputs cost nothing extra.
         let orchard_actions = orchard::builder::BundleType::DEFAULT.num_actions(
-            // Crosslink spends from the Orchard pool; NU6.3 onward fixes its bundle version.
-            orchard::bundle::BundleVersion::orchard_v3().default_flags(),
+            orchard::bundle::BundleVersion::ironwood_v3().default_flags(),
             self.o_inputs.len(),
-            self.o_outputs_n(),
+            self.o_outputs_n() + change_n,
         ).map_err(|e| builder::FeeError::Bundle(e))?;
 
         zip317::FeeRule::standard().fee_required(
@@ -1718,7 +1726,7 @@ impl ManualWallet {
 
     fn build_tx_from_prep<P: Parameters>(network: P, mut prep: BuildPrep) -> Option<TxBuildResult> {
         let tz = Timer::scope_("build_tx_from_prep", DUMP_TX_SEND | DUMP_TX_BUILD);
-        let prep_fee = prep.fee_required();
+        let prep_fee = prep.fee_required(PendingChange::Added);
 
         #[cfg(feature = "magic-memo")]
         let o_magic_memos = std::mem::take(&mut prep.o_magic_memos);
@@ -2030,18 +2038,21 @@ impl ManualWallet {
         //- SPENDS
         // TODO: use fee_required with our own data directly
         fn calc_fee<P: Parameters>(txb: &TxBuilder<P, ()>, prep: &BuildPrep) -> Option<u64> {
-            let prep_fee = prep.fee_required();
+            let prep_fee = prep.fee_required(PendingChange::Pending);
 
             {
                 // NOTE: comparison is only a warning while we're using P2SH, which the
-                // zip317 standard doesn't account for — the estimates legitimately
-                // disagree on P2SH-spending txs (e.g. the miner's shield), and prep's
-                // higher estimate just overpays the minimum fee, which is valid.
+                // zip317 standard doesn't account for. prep's estimate pays in advance for
+                // the change output that the builder has not seen yet, and a higher estimate
+                // just overpays the minimum fee, which is valid; only a lower one is a problem.
                 let txb_fee = txb.get_fee(&zip317::FeeRule::standard());
-                let agree = (prep_fee.is_err() && txb_fee.is_err()) ||
-                    (prep_fee.as_ref().ok() == txb_fee.as_ref().ok());
-                if !agree {
-                    println!("fee estimate mismatch (expected with P2SH inputs): prep_fee {prep_fee:?}, txb_fee {txb_fee:?}");
+                let underpays = match (&prep_fee, &txb_fee) {
+                    (Ok(prep_fee), Ok(txb_fee)) => prep_fee < txb_fee,
+                    (Err(_), Err(_)) => false,
+                    _ => true,
+                };
+                if underpays {
+                    println!("fee estimate below the builder's (expected with P2SH inputs): prep_fee {prep_fee:?}, txb_fee {txb_fee:?}");
                 }
             }
 
@@ -2164,6 +2175,36 @@ impl ManualWallet {
             }
         }
 
+        // Each magic memo action beyond the spends pairs its output with a dummy spend. Spending our own notes in
+        // those slots, smallest first, consolidates them for free: an Ironwood bundle has max(spends, outputs)
+        // actions, and the fee counts the same, so neither size nor fee grows while spends <= outputs.
+        #[cfg(feature = "magic-memo")]
+        if !prep.o_magic_memos.is_empty() {
+            let ironwood_tree = opts.src_pools.iter().find_map(|pool| match pool { TxPool::Ironwood(tree) => Some(*tree), _ => None });
+            if let (Some(tree), Some(fvk)) = (ironwood_tree, &keys.orchard_fvk) {
+                // The change output these spends fund counts too.
+                let outputs_n = prep.o_outputs_n() + 1;
+                let mut spare: Vec<OrchardNote> = account.unspent_orchard_notes.iter().copied()
+                    .filter(|note| note.recv_h.confirmations(self.confirmations_tip()) >= SPENDABLE_CONFIRMATIONS)
+                    .filter(|note| note.position != unknown_tree_position())
+                    .filter(|note| !prep.o_inputs.iter().any(|spend| spend.note.position == note.position))
+                    .collect();
+                spare.sort_by_key(|note| note.note.value().inner());
+                for note in spare {
+                    if prep.o_inputs.len() >= outputs_n { break; }
+                    // A note without a witness at the anchor is skipped; it was never needed.
+                    let Ok(Some(witness)) = tree.witness_at_checkpoint_id(note.position, &orchard_anchor_h) else { continue; };
+                    let merkle_path = orchard::tree::MerklePath::from(witness);
+                    if txb.add_ironwood_spend::<zip317::FeeError>(fvk.clone(), note.note, merkle_path.clone()).is_err() { continue; }
+                    let note_val = note.note.value().inner();
+                    s.spent(to_zats_or_dump_err("tx build orchard note", note_val)?, true)?;
+                    if DUMP_TX_BUILD { println!("  added orchard spend into a magic memo's dummy slot: {}", note_val); }
+                    prep.o_inputs.push(ProposedOrchardSpend{ fvk: fvk.clone(), note, witness_merkle_path: merkle_path });
+                    total_spend += note_val;
+                }
+            }
+        }
+
         let min_spend = target_send + calc_fee::<P>(&txb, &prep)?;
         let change = match total_spend.cmp(&min_spend) {
             std::cmp::Ordering::Less => {
@@ -2262,7 +2303,7 @@ impl ManualWallet {
     }
 
 
-    /// Experimental: proposes a transaction whose only outputs carry `staged.payload` as a magic memo: in plaintext,
+    /// Experimental: proposes a transaction whose only outputs carry `staged.content` as a magic memo: in plaintext,
     /// or encrypted to `staged.to` (which our outgoing viewing key can also recover from the full tx).
     /// It costs only the fee, which grows with the number of actions the memo takes.
     #[cfg(feature = "magic-memo")]
@@ -2280,13 +2321,13 @@ impl ManualWallet {
                     println!("an encrypted magic memo needs the wallet's outgoing viewing key");
                     return None;
                 };
-                MagicMemo::encrypted(&staged.payload, to, ovk)
+                MagicMemo::encrypted(&staged.content, to, ovk)
             }
             // The outputs are useless to whoever receives them, so our own address is as good as any.
-            None => MagicMemo::public(&staged.payload, *ua.orchard()?),
+            None => MagicMemo::public(&staged.content, *ua.orchard()?),
         };
         let Some(memo) = memo else {
-            println!("magic memo of {} bytes is too long to publish", staged.payload.len());
+            println!("magic memo of {} bytes is too long to publish", staged.content.to_bytes().len());
             return None;
         };
         let out = &[TxOutput::IronwoodMagicMemo{ memo }];
@@ -3297,9 +3338,9 @@ pub fn string_from_t_addr<P: Parameters>(params: P, t_addr: TransparentAddress) 
     t_addr.encode(&params)
 }
 
-/// Experimental: records the magic memo carried by a compact tx's Ironwood actions, if they carry a public one or
-/// one encrypted to the scanning wallet `wallet_name`'s default Orchard address. Everything comes from the compact
-/// actions; the full transaction is never fetched.
+/// Experimental: records the magic memo carried by a compact tx's Ironwood actions, if they carry a public text one
+/// or one encrypted to an address of the scanning wallet `wallet_name`. Everything comes from the compact actions;
+/// the full transaction is never fetched.
 #[cfg(feature = "magic-memo")]
 fn note_magic_memo(block_h: BlockHeight, txid: &TxId, tx: &CompactTx, keys: &PreparedKeys, wallet_name: &'static str) {
     if tx.ironwood_actions.is_empty() { return; }
@@ -3308,24 +3349,27 @@ fn note_magic_memo(block_h: BlockHeight, txid: &TxId, tx: &CompactTx, keys: &Pre
         .collect();
 
     // Public: every wallet sees it; record it once. MEMO at a fixed place in a random ciphertext has
-    // probability 2^-32 per action, and random bytes are almost never UTF-8.
-    let public = magic_memo::decode_public(&views).filter(|payload| std::str::from_utf8(payload).is_ok());
-    let (payload, decrypted_by) = if let Some(payload) = public {
+    // probability 2^-32 per action, and random bytes are almost never text.
+    let public = magic_memo::decode_public(&views).filter(|content| matches!(content, MagicMemoContent::Text(_)));
+    let (content, decrypted_by) = if let Some(content) = public {
         if MAGIC_MEMOS_SEEN.lock().unwrap().iter().any(|m| m.txid == *txid) { return; }
-        (payload, None)
+        (content, None)
     } else {
-        // Encrypted: about one key agreement per action, as the note trial decryption that follows costs. Only
-        // memos to the wallet's default address (diversifier index 0, the one it hands out) are found.
+        // Encrypted: about one key agreement per action, as the note trial decryption that follows costs. Memos to
+        // any address in the table are found; this wallet hands out only its default one (diversifier index 0).
         let (Some(ivk), Some(fvk)) = (&keys.orchard_ivk, &keys.orchard_fvk) else { return; };
         if MAGIC_MEMOS_SEEN.lock().unwrap().iter().any(|m| m.txid == *txid && m.decrypted_by == Some(wallet_name)) { return; }
-        let address = fvk.address_at(0u32, orchard::keys::Scope::External);
-        let Some(payload) = magic_memo::decrypt_with_ivk(ivk, address, &views) else { return; };
-        (payload, Some(wallet_name))
+        let recipients = MagicMemoRecipients::new([fvk.address_at(0u32, orchard::keys::Scope::External)]);
+        let Some((content, _address)) = magic_memo::decrypt_with_ivk(ivk, &recipients, &views) else { return; };
+        (content, Some(wallet_name))
     };
 
     let how = decrypted_by.map_or("public".to_owned(), |name| format!("decrypted by {name} wallet"));
-    println!("************** MAGIC MEMO at {block_h:?} in {txid} ({how}, {} bytes): \"{}\"", payload.len(), String::from_utf8_lossy(&payload));
-    MAGIC_MEMOS_SEEN.lock().unwrap().push(SeenMagicMemo{ h: block_h, txid: *txid, payload, decrypted_by });
+    match &content {
+        MagicMemoContent::Text(text) => println!("************** MAGIC MEMO at {block_h:?} in {txid} ({how}, {} bytes): \"{text}\"", text.len()),
+        other => println!("************** MAGIC MEMO at {block_h:?} in {txid} ({how}, {} bytes, not text): {other:?}", other.to_bytes().len()),
+    }
+    MAGIC_MEMOS_SEEN.lock().unwrap().push(SeenMagicMemo{ h: block_h, txid: *txid, content, decrypted_by });
 }
 
 /// NOTE: this *must* only be called in sequential order without gaps (including after reorg/truncate)
@@ -5192,18 +5236,20 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             .map(|ua| Some(*ua.orchard().expect("decode_send_address only accepts addresses with an Orchard receiver")))
                             .map_err(|reason| format!("{reason}: {address}")),
                     };
-                    let max_len = if address.is_some() { magic_memo::MAGIC_MEMO_ENCRYPTED_MAX_LEN } else { magic_memo::MAGIC_MEMO_PUBLIC_MAX_LEN };
+                    let kind = if address.is_some() { MagicMemoKind::Encrypted } else { MagicMemoKind::Public };
+                    let text_len = text.len();
+                    let content = MagicMemoContent::Text(text);
                     match to {
                         Err(reason) => { let _ = sender.send(Err(reason)); }
-                        Ok(_) if text.len() > max_len => {
-                            let _ = sender.send(Err(format!("{} bytes is longer than the {max_len} a magic memo can carry", text.len())));
+                        Ok(_) if !magic_memo::fits(&content, kind) => {
+                            let _ = sender.send(Err(format!("{text_len} bytes of text do not fit in a magic memo, even compressed (it stores at most {} bytes)", kind.max_stored_len())));
                         }
                         Ok(to) => {
-                            let staged = StagedMagicMemo{ payload: text.into_bytes(), to };
+                            let staged = StagedMagicMemo{ content, to };
                             let mut tx = ProposedTx::EMPTY;
                             if user_wallet.publish_magic_memo(network, &mut tx, &mut client, &user_usk, &orchard_tree, &staged).is_some() {
                                 let how = if staged.to.is_some() { "encrypted" } else { "public" };
-                                println!("prepared RPC-requested {how} magic memo: \"{}\"", String::from_utf8_lossy(&staged.payload));
+                                println!("prepared RPC-requested {how} magic memo of {text_len} bytes of text");
                                 just_init_new_tx = true;
                                 rpc_send = Some((tx, sender));
                             } else {

@@ -1905,6 +1905,9 @@ fn with_magic_memo_chunks<A: orchard::bundle::Authorization>(
             encrypted_note.epk_bytes = *chunk.epk_bytes();
             encrypted_note.enc_ciphertext[..zcash_note_encryption::COMPACT_NOTE_SIZE]
                 .copy_from_slice(chunk.compact_ciphertext());
+            if let Some(out_ciphertext) = chunk.out_ciphertext() {
+                encrypted_note.out_ciphertext = *out_ciphertext;
+            }
         }
         i += 1;
         orchard::Action::from_parts(
@@ -2009,8 +2012,8 @@ fn build_ironwood_with_magic_memo<FE, R: RngCore>(
         // The indices are distinct, so they are consecutive iff they all fit in the run.
         if action_is.iter().all(|&i| i < first + actions_n) {
             let chunks = memo
-                .chunks_for(&bundle.actions()[first])
-                .expect("the first memo action is an output built for this memo");
+                .chunks_for(&bundle.actions()[first], &mut *rng)
+                .expect("a memo's actions admit chunks but with negligible probability");
             let bundle = with_magic_memo_chunks(bundle, (first..).zip(chunks.iter()).collect());
             return Ok((bundle, meta));
         }
@@ -2270,7 +2273,7 @@ mod tests {
     use {
         crate::transaction::{
             Transaction,
-            magic_memo::{self, MagicMemo},
+            magic_memo::{self, MagicMemo, MagicMemoContent, MagicMemoRecipients},
             sighash::{SignableInput, signature_hash},
             txid::TxIdDigester,
         },
@@ -2715,6 +2718,14 @@ mod tests {
             .collect()
     }
 
+    /// `len` bytes that Brotli cannot shrink, so a memo of them is stored as is.
+    #[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
+    fn incompressible(len: usize) -> alloc::vec::Vec<u8> {
+        let mut bytes = alloc::vec![0u8; len];
+        rand_core::RngCore::fill_bytes(&mut OsRng, &mut bytes);
+        bytes
+    }
+
     /// What a compact block shows of each of `bundle`'s actions.
     #[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
     fn compact_views<'a, A: orchard::bundle::Authorization>(
@@ -2744,11 +2755,9 @@ mod tests {
     #[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
     fn public_magic_memo_is_published_and_bundle_still_verifies() {
         // Spans three actions.
-        let payload: alloc::vec::Vec<u8> = (0..magic_memo::MAGIC_MEMO_PUBLIC_FIRST_LEN
-            + magic_memo::MAGIC_MEMO_NEXT_LEN
-            + 10)
-            .map(|i| b'a' + (i % 26) as u8)
-            .collect();
+        let payload = MagicMemoContent::Arbitrary(incompressible(
+            magic_memo::MAGIC_MEMO_PUBLIC_FIRST_LEN + magic_memo::MAGIC_MEMO_NEXT_LEN + 10,
+        ));
         let (res, _, chunks_n) = build_and_verify_with_magic_memo(|_, recipient| {
             MagicMemo::public(&payload, recipient).unwrap()
         });
@@ -2766,11 +2775,9 @@ mod tests {
     #[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
     fn encrypted_magic_memo_opens_with_ivk_and_ovk_only() {
         // Spans three actions.
-        let payload: alloc::vec::Vec<u8> = (0..magic_memo::MAGIC_MEMO_ENCRYPTED_FIRST_LEN
-            + magic_memo::MAGIC_MEMO_NEXT_LEN
-            + 10)
-            .map(|i| b'A' + (i % 26) as u8)
-            .collect();
+        let payload = MagicMemoContent::Arbitrary(incompressible(
+            magic_memo::MAGIC_MEMO_ENCRYPTED_FIRST_LEN + magic_memo::MAGIC_MEMO_NEXT_LEN + 10,
+        ));
         let (res, fvk, chunks_n) = build_and_verify_with_magic_memo(|fvk, recipient| {
             let ovk = fvk.to_ovk(orchard::keys::Scope::External);
             MagicMemo::encrypted(&payload, recipient, ovk).unwrap()
@@ -2785,9 +2792,11 @@ mod tests {
         let ivk = fvk.to_ivk(orchard::keys::Scope::External);
         let recipient = ivk.address_at(0u32);
         let prepared_ivk = orchard::keys::PreparedIncomingViewingKey::new(&ivk);
+        // Found among several of the wallet's addresses, which it names.
+        let recipients = MagicMemoRecipients::new([ivk.address_at(1u32), recipient]);
         assert_eq!(
-            magic_memo::decrypt_with_ivk(&prepared_ivk, recipient, &views),
-            Some(payload.clone())
+            magic_memo::decrypt_with_ivk(&prepared_ivk, &recipients, &views),
+            Some((payload.clone(), recipient))
         );
         let ovk = fvk.to_ovk(orchard::keys::Scope::External);
         assert_eq!(magic_memo::recover_with_ovk(&ovk, bundle), Some(payload));
@@ -2805,7 +2814,11 @@ mod tests {
 
         // Another address of the same key, and another key, open nothing.
         assert_eq!(
-            magic_memo::decrypt_with_ivk(&prepared_ivk, ivk.address_at(1u32), &views),
+            magic_memo::decrypt_with_ivk(
+                &prepared_ivk,
+                &MagicMemoRecipients::new([ivk.address_at(1u32)]),
+                &views
+            ),
             None
         );
         let other = orchard::keys::FullViewingKey::from(
@@ -2815,7 +2828,7 @@ mod tests {
         assert_eq!(
             magic_memo::decrypt_with_ivk(
                 &orchard::keys::PreparedIncomingViewingKey::new(&other_ivk),
-                other_ivk.address_at(0u32),
+                &MagicMemoRecipients::new([other_ivk.address_at(0u32)]),
                 &views
             ),
             None
@@ -2846,7 +2859,7 @@ mod tests {
         .address_at(0u32, orchard::keys::Scope::External);
         builder
             .add_ironwood_magic_memo::<Infallible>(
-                crate::transaction::magic_memo::MagicMemo::public(b"pczt", recipient).unwrap(),
+                MagicMemo::public(&MagicMemoContent::Text("pczt".into()), recipient).unwrap(),
             )
             .unwrap();
 
