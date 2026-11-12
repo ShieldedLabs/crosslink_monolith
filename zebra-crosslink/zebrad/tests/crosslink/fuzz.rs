@@ -1246,12 +1246,12 @@ enum Verdict {
 /// far past its longest normal time is not still working.
 const CHILD_LIMIT_SECS: u64 = 150;
 
-fn run_child(env: (&str, String), log: &std::path::Path) -> Verdict {
+fn run_child(envs: &[(&str, String)], log: &std::path::Path) -> Verdict {
     let exe = std::env::current_exe().expect("the test binary path");
     let log_file = std::fs::File::create(log).expect("child log creates");
     let mut child = std::process::Command::new(exe)
         .args(["fuzz::crosslink_fuzz_one", "--exact", "--ignored", "--nocapture"])
-        .env(env.0, env.1)
+        .envs(envs.iter().map(|(name, value)| (*name, value.as_str())))
         .stdout(log_file.try_clone().expect("log handle clones"))
         .stderr(log_file)
         .spawn()
@@ -1332,7 +1332,7 @@ fn minimize(bytes: Vec<u8>, keep: &dyn Fn(&Verdict, &std::path::Path) -> bool, n
             std::fs::write(&path, &candidate).expect("candidate writes");
             tried += 1;
             let log = dir.join(format!("{name}.try.log"));
-            let got = run_child(("CROSSLINK_FUZZ_FILE", path.display().to_string()), &log);
+            let got = run_child(&[("CROSSLINK_FUZZ_FILE", path.display().to_string()), ("CROSSLINK_TEST_TIMINGS", "off".to_string())], &log);
             if keep(&got, &log) {
                 best = candidate;
                 progressed = true;
@@ -1350,10 +1350,106 @@ fn minimize(bytes: Vec<u8>, keep: &dyn Fn(&Verdict, &std::path::Path) -> bool, n
     best
 }
 
+// # Doorways
+//
+// A block or transaction must get the same verdict whichever way it reaches the node. After an
+// input passes, a second run sends some of its direct block loads over STP and some of its local
+// transaction submissions over the wire or STP, each made to expect the verdict the first run
+// saw, so a doorway that disagrees fails the second run like any other expectation, and is
+// minimized like one.
+
+/// The most instructions one doorway pass sends another way.
+const DOORWAY_SWAPS_MAX: usize = 8;
+
+/// Peer indices for the doorway pass, above any the generator uses (`FRESH_PEERS_FROM` up).
+const DOORWAY_PEERS_FROM: u64 = 10_000;
+
+/// Mixed into an input's seed for the doorway pass's choices, so the input itself is unchanged.
+const DOORWAY_SEED_SALT: u64 = 0xd008_3a75;
+
+/// What an instruction's check said in a run, by its timing row; `None` for one with no verdict
+/// that the doorways could share (pending, no answer, or no check).
+fn seen_verdicts(timings: &std::path::Path) -> std::collections::HashMap<usize, bool> {
+    let text = std::fs::read_to_string(timings).unwrap_or_default();
+    let mut seen = std::collections::HashMap::new();
+    for row in text.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()) {
+        if row["type"] != "instr" {
+            continue;
+        }
+        let (Some(index), Some(accepted), Some(message)) = (row["index"].as_u64(), row["accepted"].as_bool(), row["message"].as_str()) else {
+            continue;
+        };
+        if accepted {
+            seen.insert(index as usize, true);
+        } else if message.contains("rejected") && !message.contains("pending:") && !message.contains("no verdict") {
+            seen.insert(index as usize, false);
+        }
+    }
+    seen
+}
+
+/// `bytes` with up to `DOORWAY_SWAPS_MAX` of its direct block loads and local transaction
+/// submissions sent another way, each expecting the verdict `seen` gives it, or `None` when none
+/// can be. A held block is left alone (a peer is not asked for a block whose parent is missing),
+/// as is one that does not parse or has no coinbase height: a peer's STATUS cannot advertise it,
+/// so it has no other doorway until a raw packet one exists. A reason check after a swapped
+/// instruction is dropped: the doorways word their reasons differently, and only the verdict
+/// has to agree.
+fn swap_doorways(bytes: &[u8], seen: &std::collections::HashMap<usize, bool>, c: &mut Choices) -> Option<(Vec<u8>, usize)> {
+    let tf = TF::read_from_bytes(bytes).ok()?;
+    let eligible: Vec<usize> = (0..tf.instrs.len())
+        .filter(|&i| {
+            let instr = &tf.instrs[i];
+            seen.contains_key(&i)
+                && match instr.kind {
+                    TFInstr::LOAD_POW => {
+                        instr.val[1] == TF_POW_DIRECT
+                            && instr.flags & SHOULD_DEFER == 0
+                            && Block::zcash_deserialize(instr.data_slice(bytes)).is_ok_and(|block| block.coinbase_height().is_some())
+                    }
+                    TFInstr::SUBMIT_TX => instr.val[1] == TF_TX_LOCAL,
+                    _ => false,
+                }
+        })
+        .collect();
+    if eligible.is_empty() {
+        return None;
+    }
+    let mut eligible = eligible;
+    let mut picked = Vec::new();
+    for _ in 0..1 + c.below(DOORWAY_SWAPS_MAX.min(eligible.len())) {
+        picked.push(eligible.remove(c.below(eligible.len())));
+    }
+    let mut out = TF { instrs: Vec::new(), data: Vec::new() };
+    let mut peer = DOORWAY_PEERS_FROM;
+    let mut drop_reason_check = false;
+    for (i, instr) in tf.instrs.iter().enumerate() {
+        let data = instr.data_slice(bytes);
+        if std::mem::take(&mut drop_reason_check) && instr.kind == TFInstr::EXPECT_REJECTION_REASON {
+            continue;
+        }
+        if !picked.contains(&i) {
+            out.push_instr_ex(instr.kind, instr.flags, data, instr.val);
+            continue;
+        }
+        let doorway = match instr.kind {
+            TFInstr::LOAD_POW => TF_POW_STP_PEER,
+            _ if c.below(2) == 0 => TF_TX_WIRE,
+            _ => TF_TX_STP_PEER,
+        };
+        let expect = if seen[&i] { 0 } else { SHOULD_FAIL };
+        out.push_instr_ex(instr.kind, (instr.flags & !(SHOULD_FAIL | SHOULD_DEFER | ANY_OUTCOME)) | expect, data, [peer, doorway]);
+        peer += 1;
+        drop_reason_check = true;
+    }
+    Some((out.write_to_bytes(), picked.len()))
+}
+
 /// A campaign: CROSSLINK_FUZZ_SEEDS (`a..b`, default 0..20) within CROSSLINK_FUZZ_SECS (default
 /// 300, inside nextest's per-test bound; run the test binary directly to go longer). Passing
 /// inputs are deleted; a failing one is kept with its log, minimized (CROSSLINK_FUZZ_MINIMIZE
-/// attempts, default 40, 0 for none), and the campaign fails listing what it found.
+/// attempts, default 40, 0 for none), and the campaign fails listing what it found. Each passing
+/// input also gets a doorway pass (see # Doorways); CROSSLINK_FUZZ_DOORWAYS=0 turns it off.
 #[test]
 #[ignore]
 fn crosslink_fuzz() {
@@ -1362,33 +1458,69 @@ fn crosslink_fuzz() {
     let (a, b): (u64, u64) = (a.parse().expect("seed range start"), b.parse().expect("seed range end"));
     let secs: u64 = std::env::var("CROSSLINK_FUZZ_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
     let attempts: usize = std::env::var("CROSSLINK_FUZZ_MINIMIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+    let doorways = std::env::var("CROSSLINK_FUZZ_DOORWAYS").map_or(true, |v| v != "0");
     let dir = fuzz_dir();
     let start = std::time::Instant::now();
     let mut findings = Vec::new();
     let mut ran = 0;
+    let mut swapped_n = 0;
     for seed in a..b {
         if start.elapsed().as_secs() >= secs {
             break;
         }
         let log = dir.join(format!("seed-{seed}.log"));
-        let verdict = run_child(("CROSSLINK_FUZZ_SEED", seed.to_string()), &log);
+        let timings = dir.join(format!("seed-{seed}.timings.jsonl"));
+        let _ = std::fs::remove_file(&timings);
+        let verdict = run_child(
+            &[("CROSSLINK_FUZZ_SEED", seed.to_string()), ("CROSSLINK_TEST_TIMINGS", timings.display().to_string())],
+            &log,
+        );
         ran += 1;
         let input = dir.join(format!("seed-{seed}.zeccltf"));
         eprintln!("fuzz seed {seed}: {verdict:?}");
-        if verdict == Verdict::Pass {
+        let (name, input, verdict) = if verdict != Verdict::Pass {
+            (format!("seed-{seed}"), input, verdict)
+        } else {
+            let swapped = if doorways {
+                let bytes = std::fs::read(&input).expect("the passing input was written");
+                swap_doorways(&bytes, &seen_verdicts(&timings), &mut Choices::from_seed(seed ^ DOORWAY_SEED_SALT, 256))
+            } else {
+                None
+            };
             let _ = std::fs::remove_file(&input);
             let _ = std::fs::remove_file(&log);
-            continue;
-        }
+            let _ = std::fs::remove_file(&timings);
+            let Some((swapped, n)) = swapped else {
+                continue;
+            };
+            swapped_n += n;
+            let name = format!("seed-{seed}.doorways");
+            let swapped_input = dir.join(format!("{name}.zeccltf"));
+            std::fs::write(&swapped_input, &swapped).expect("the doorway input writes");
+            let log = dir.join(format!("{name}.log"));
+            let verdict = run_child(
+                &[("CROSSLINK_FUZZ_FILE", swapped_input.display().to_string()), ("CROSSLINK_TEST_TIMINGS", "off".to_string())],
+                &log,
+            );
+            eprintln!("fuzz seed {seed}: {n} instruction(s) through other doorways: {verdict:?}");
+            if verdict == Verdict::Pass {
+                let _ = std::fs::remove_file(&swapped_input);
+                let _ = std::fs::remove_file(&log);
+                continue;
+            }
+            (name, swapped_input, verdict)
+        };
+        let _ = std::fs::remove_file(dir.join(format!("seed-{seed}.timings.jsonl")));
         let bytes = std::fs::read(&input).expect("the failing input was written");
         if attempts > 0 {
             let same = |got: &Verdict, _: &std::path::Path| *got == verdict;
-            let min = minimize(bytes.clone(), &same, &format!("seed-{seed}"), attempts);
-            std::fs::write(dir.join(format!("seed-{seed}.min.zeccltf")), &min).expect("minimized input writes");
-            eprintln!("fuzz seed {seed}: minimized {} -> {} bytes", bytes.len(), min.len());
+            let min = minimize(bytes.clone(), &same, &name, attempts);
+            std::fs::write(dir.join(format!("{name}.min.zeccltf")), &min).expect("minimized input writes");
+            eprintln!("fuzz {name}: minimized {} -> {} bytes", bytes.len(), min.len());
         }
-        findings.push((seed, verdict));
+        findings.push((name, verdict));
     }
+    eprintln!("fuzz: {swapped_n} instruction(s) sent through other doorways");
     eprintln!("fuzz: {ran} inputs, {} findings, in {:?}; files in {}", findings.len(), start.elapsed(), dir.display());
     assert!(findings.is_empty(), "fuzz findings: {findings:?}");
 }
