@@ -69,3 +69,8 @@ of a fix already done on another branch needs `Fix #N` too.
 
 A semicolon in a title joins two unrelated changes only. Two parts of one fix
 join with "and".
+
+## Units
+
+cTAZ means Crosslink TAZ, the featurenet's coin: 1 cTAZ is 100,000,000 zats.
+The "c" is never centi-, so 10 cTAZ is 1,000,000,000 zats.
