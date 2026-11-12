@@ -444,6 +444,32 @@ impl RoundData {
         self.proposal.0    = vec![0;          proposal_size as usize];
         self.proposal_sigs = vec![TMSig::NIL; self.proposal.chunks_n()];
     }
+    // A decided round read back from storage has no valid round, since zebra-state keeps only the
+    // block, the certificate and the chunk signatures. But the proposer signed the valid round into
+    // every chunk header, and a peer that is behind checks each chunk it is served against that
+    // header, so serving the round with -1 after a restart gets every chunk refused. Find the valid
+    // round the first chunk's signature verifies under: one signature check for most decisions above
+    // round 0, and none for round 0, which can only cite -1.
+    fn recover_proposal_valid_round(&mut self, hash_keys: &HashKeys) {
+        if self.round == 0 || self.proposal_valid_round != -1 || self.roster.is_empty() { return; }
+        let Some(chunk_i) = self.proposal_sigs.iter().position(|sig| *sig != TMSig::NIL) else { return; };
+        if chunk_i >= self.proposal.chunks_n() { return; }
+        let (Some(_), proposer) = TMState::proposer_from_height_round(hash_keys, &self.roster, self.height, self.round) else { return; };
+        let (chunk_o, chunk_size) = self.proposal.chunk_o_size(chunk_i);
+        let mut signed_data = vec![0u8; PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size];
+        signed_data[PacketProposalChunkHeader::SERIALIZED_SIZE..].copy_from_slice(&self.proposal.0[chunk_o..chunk_o + chunk_size]);
+        // Most recent rounds first, and not thousands back, so a corrupt entry cannot stall startup.
+        for valid_round in std::iter::once(-1).chain((0..self.round as i64).rev().take(4096)) {
+            PacketProposalChunkHeader {
+                chunk_i: chunk_i as u32, proposal_size: self.proposal.0.len() as u32, round: self.round,
+                valid_round, height: self.height, proposal_id: self.proposal_id,
+            }.write_to(&mut signed_data);
+            if self.proposal_sigs[chunk_i].verify_with_namespace(proposer, &signed_data, &self.vote_namespace).is_ok() {
+                self.proposal_valid_round = valid_round;
+                return;
+            }
+        }
+    }
     fn has_enough_info_to_determine_validity(&self) -> bool {
         self.proposal_is_faulty || self.has_full_proposal()
     }
@@ -837,6 +863,13 @@ impl TMState {
             ..RoundData::EMPTY
         });
         insert_i
+    }
+
+    fn ingest_decided_rounds(&mut self, mut decided_rounds: Vec<RoundData>) {
+        for round_data in &mut decided_rounds {
+            round_data.recover_proposal_valid_round(&self.hash_keys);
+        }
+        self.recent_commit_round_cache = decided_rounds;
     }
 
     async fn start_round(&mut self, roster: &[SortedRosterMember], now: Instant, round: u32) {
@@ -1866,7 +1899,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     bft_state.height = ingest_startup_data.len() as u64;
     bft_state.vote_namespace = initial_vote_namespace;
     bft_state.strict_quorum = initial_strict_quorum;
-    bft_state.recent_commit_round_cache = ingest_startup_data;
+    bft_state.ingest_decided_rounds(ingest_startup_data);
 
     bft_state.start_round(&roster, Instant::now(), 0).await;
 
@@ -4395,6 +4428,119 @@ mod tests {
         std::thread::sleep(zebra_debug_time::real_duration(std::time::Duration::from_millis(1200)));
         rt.block_on(node.bft_update(&mut node_roster));
         assert_eq!((node.height, node.round), (0, 1), "the node is still in round 0 with no timeout left to fire: {:?}", node.rounds_data[0].active_timeout);
+    }
+
+    // The decided round as zebra-state's `decided_round_data` rebuilds it after a restart, from the
+    // stored block, certificate and chunk signatures. Storage keeps no valid round, so it has the -1
+    // of `RoundData::EMPTY` whatever the proposal cited.
+    fn decided_round_as_stored(live: &RoundData) -> RoundData {
+        let signers = live.msg_val_sigs.iter().map(|votes| votes[1]).filter(|&(id, sig)| id == live.proposal_id && sig != TMSig::NIL).count() as u64;
+        let mut rd = RoundData::EMPTY;
+        rd.msg_val_sigs = live.msg_val_sigs.iter().map(|votes| {
+            let sig = if votes[1].0 == live.proposal_id { votes[1].1 } else { TMSig::NIL };
+            [(ValueId::NIL, TMSig::NIL), (live.proposal_id, sig)]
+        }).collect();
+        rd.msg_nil_sigs = vec![[TMSig::NIL; 2]; live.roster.len()];
+        rd.roster = live.roster.clone();
+        rd.counts.precommits = signers;
+        rd.counts.yes_precommits = signers;
+        rd.proposal_sigs_n = live.proposal_sigs.len();
+        rd.proposal_sigs = live.proposal_sigs.clone();
+        rd.proposal = live.proposal.clone();
+        rd.proposal_id = live.proposal_id;
+        rd.height = live.height;
+        rd.round = live.round;
+        rd.vote_namespace = live.vote_namespace;
+        rd.strict_quorum = live.strict_quorum;
+        rd
+    }
+
+    // What the send loop gives a peer that is behind: every chunk under a header built from the cached
+    // round, then the precommits for the proposal.
+    fn serve_decided_round(rd: &RoundData, roster: &[SortedRosterMember], to: &mut TMState) {
+        let proposer = TMState::proposer_from_height_round(&to.hash_keys, roster, rd.height, rd.round).0.unwrap();
+        for chunk_i in 0..rd.proposal_sigs.len() {
+            if rd.proposal_sigs[chunk_i] == TMSig::NIL { continue; }
+            let hdr = PacketProposalChunkHeader {
+                chunk_i: chunk_i as u32, proposal_size: rd.proposal.0.len() as u32, round: rd.round,
+                valid_round: rd.proposal_valid_round, height: rd.height, proposal_id: rd.proposal_id,
+            };
+            let mut data = vec![0u8; PacketProposalChunkHeader::SERIALIZED_SIZE];
+            hdr.write_to(&mut data);
+            let (chunk_o, chunk_size) = rd.proposal.chunk_o_size(chunk_i);
+            data.extend_from_slice(&rd.proposal.0[chunk_o..chunk_o + chunk_size]);
+            to.check_and_incorporate_msg(rd.height, rd.round, chunk_i, rd.proposal_id, rd.proposal_valid_round, roster, proposer,
+                PACKET_TYPE_PROPOSAL_CHUNK, &data, rd.proposal_sigs[chunk_i]);
+        }
+        for voter in 0..rd.msg_val_sigs.len() {
+            let (value_id, sig) = rd.msg_val_sigs[voter][1];
+            if sig == TMSig::NIL || value_id != rd.proposal_id { continue; }
+            let data = make_vote_sign_datas(roster[voter].pub_key, true, rd.height, rd.round, value_id)[1];
+            to.check_and_incorporate_msg(rd.height, rd.round, 0, value_id, -2, roster, voter, PACKET_TYPE_PRECOMMIT_SIGNATURES, &data, sig);
+        }
+    }
+
+    // A height can be decided in a round whose proposer re-proposed the value it last saw 2f+1 prevotes
+    // for, so the proposal cites that valid round, signed into every chunk header. A node that decided
+    // the height and then restarted must still serve it to a peer that is behind, from what storage
+    // gave back, or after a network-wide restart nobody can serve it and BFT sync stops there. Each
+    // case draws the decided round, the valid round, the proposal size and contents, and which
+    // finalizers precommit; set TENDERLINK_FUZZ_SEED to replay a run.
+    #[test]
+    fn a_restarted_node_serves_a_decided_reproposal_that_a_peer_behind_can_decide() {
+        let seed: u64 = std::env::var("TENDERLINK_FUZZ_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| rand::rng().next_u64());
+        eprintln!("TENDERLINK_FUZZ_SEED={seed}");
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+        let (keys, roster, _, _) = split_finalizers();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut reproposals = 0;
+
+        for _ in 0..64 {
+            let round: u32 = rng.random_range(0..8);
+            let valid_round: i64 = if round == 0 || rng.random_bool(0.25) { -1 } else { rng.random_range(0..round as i64) };
+            reproposals += (valid_round >= 0) as usize;
+            let mut value = BlockValue(vec![0; rng.random_range(1..=3 * PROPOSAL_CHUNK_DATA_SIZE)]);
+            rng.fill_bytes(&mut value.0);
+            let case = format!("seed {seed}: decided in round {round} on a {}-byte proposal citing valid round {valid_round}", value.0.len());
+            let proposer = TMState::proposer_from_height_round(&HashKeys::default(), &roster, 0, round).0.unwrap();
+            let me = (proposer + rng.random_range(1..4)) % 4;
+            let behind_i = (me + rng.random_range(1..4)) % 4;
+            let absent = (me + rng.random_range(1..4)) % 4;
+            let precommitters: Vec<usize> = (0..4).filter(|&i| i != absent).collect();
+
+            // A node decides height 0 in `round`: the proposal, and precommits from three of four.
+            let mut decider = split_engine(&keys, &roster, me, None);
+            decider.insert_round(0, 0, &roster);
+            let id = value.id_from_value(&decider.hash_keys);
+            for chunk_i in 0..value.chunks_n() {
+                let (data, sig) = chunk_msg(&keys[proposer], &decider.vote_namespace, &value, id, round, valid_round, chunk_i);
+                assert_eq!(decider.check_and_incorporate_msg(0, round, chunk_i, id, valid_round, &roster, proposer,
+                    PACKET_TYPE_PROPOSAL_CHUNK, &data, sig), TMStatus::Pass, "{case}");
+            }
+            for &voter in &precommitters {
+                let data = make_vote_sign_datas(roster[voter].pub_key, true, 0, round, id)[1];
+                let sig = TMSig(sign_with_namespace(&keys[voter], &data, &decider.vote_namespace));
+                decider.check_and_incorporate_msg(0, round, 0, id, -2, &roster, voter, PACKET_TYPE_PRECOMMIT_SIGNATURES, &data, sig);
+            }
+            rt.block_on(decider.bft_update(&mut roster.clone()));
+            assert_eq!(decider.height, 1, "{case}");
+            let live = decider.recent_commit_round_cache[0].clone();
+            assert_eq!(live.proposal_valid_round, valid_round, "{case}");
+
+            // After a restart, from storage, as `entry_point` takes it in.
+            let mut restarted = split_engine(&keys, &roster, me, None);
+            restarted.height = 1;
+            restarted.ingest_decided_rounds(vec![decided_round_as_stored(&live)]);
+            assert_eq!(restarted.recent_commit_round_cache[0].proposal_valid_round, valid_round, "{case}");
+            let mut behind = split_engine(&keys, &roster, behind_i, None);
+            rt.block_on(behind.start_round(&roster, Instant::now(), 0));
+            serve_decided_round(&restarted.recent_commit_round_cache[0], &roster, &mut behind);
+            let assembled = behind.rounds_data.iter().find(|rd| (rd.height, rd.round) == (0, round)).is_some_and(|rd| rd.has_full_proposal());
+            rt.block_on(behind.bft_update(&mut roster.clone()));
+            assert!(assembled, "the peer behind refused the restarted node's chunks; {case}");
+            assert_eq!(behind.height, 1, "served by the restarted node; {case}");
+        }
+        assert!(reproposals >= 16, "seed {seed}: only {reproposals} of 64 cases decided a re-proposal");
     }
 
     // #[ignore]
