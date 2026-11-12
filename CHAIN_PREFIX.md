@@ -75,7 +75,7 @@ proposer of a decision made after round 0 did not sign its certificate.
 
 ## Importing
 
-    zebrad -c node.toml import-chain prefix.zeccltf [--cache-dir DIR] [--trusted] [--connect]
+    zebrad -c node.toml import-chain prefix.zeccltf [--cache-dir DIR] [--height H] [--trusted] [--connect]
 
 This builds a new state and runs a node on it. The configured state is never touched. By default
 the new state goes beside the configured one, named for the file, as in
@@ -102,6 +102,12 @@ reach disk on a graceful shutdown.
 The node is isolated while it loads, so only the file's blocks reach it: no PoW or BFT peers,
 and no internal miner. `--connect` keeps the configured peers and miner instead, for example to
 let the rebuilt node rejoin a network once the file is in.
+
+`--height H` loads only the chain up to PoW height `H`, as `export-chain --height H` would have
+written it: the file runs up to its first PoW block above `H`, and nothing after that point runs,
+including scenario instructions appended to the file. Since each BFT block sits as early as a
+live node could have decided it, what runs is what a node at `H` held. One export can so be
+imported at any height below its tip.
 
 A new state directory is a new node. Its `secret.seed`, and with it the node's network identity,
 wallet and default finalizer key, is generated fresh. To rebuild a node as itself, copy the old

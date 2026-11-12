@@ -42,6 +42,15 @@ pub struct ImportChainCmd {
     )]
     trusted: bool,
 
+    /// The last PoW height to load.
+    #[clap(
+        long,
+        help = "the last PoW height to load: the file runs up to its first PoW block above it, \
+                and nothing after that runs, appended scenario instructions included \
+                [default: the whole file]"
+    )]
+    height: Option<u32>,
+
     /// Keep the configured peers and internal miner.
     #[clap(
         long,
@@ -87,6 +96,7 @@ impl Runnable for ImportChainCmd {
             Some(zebra_crosslink::chain_prefix::ChainImport {
                 path: self.input.clone(),
                 trusted: self.trusted,
+                height: self.height,
             });
         StartCmd::default().run();
     }

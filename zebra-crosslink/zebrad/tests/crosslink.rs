@@ -3852,7 +3852,8 @@ fn chain_prefix_of_scene_2_loads(cutoff: zebra_state::BftCutoff, trusted: bool) 
     tf.push_instr_expect_pow_block_finality(&p4, Some(TFLBlockFinality::Finalized), 0);
     tf.push_instr_expect_pow_block_finality(&p5, Some(TFLBlockFinality::NotYetFinalized), 0);
 
-    zebra_crosslink::test_format::TRUSTED_LOAD_POW.store(trusted, std::sync::atomic::Ordering::Relaxed);
+    let trusted_before = if trusted { tf.instrs.len() } else { 0 };
+    *zebra_crosslink::TEST_READ_OPTIONS.lock().unwrap() = zebra_crosslink::test_format::ReadOptions { trusted_before };
     test_bytes(tf.write_to_bytes());
 }
 

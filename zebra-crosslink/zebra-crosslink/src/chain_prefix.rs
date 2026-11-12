@@ -26,7 +26,9 @@ use zebra_state::crosslink::ChainPrefixExport;
 use zebra_state::{BftCutoff, BftDecision, ChainPrefix, ChainPrefixItem};
 
 use crate::service::TFLServiceHandle;
-use crate::test_format::{self, BftBlockAndFatPointerToItWrap, TF};
+use crate::test_format::{self, tf_read_instr, BftBlockAndFatPointerToItWrap, ReadOptions, TFInstr, TestInstr, TF};
+use zebra_chain::block::Block;
+use zebra_chain::serialization::ZcashDeserialize;
 
 /// The test file for `prefix`, with the BFT blocks `cutoff` selects.
 pub fn prefix_tf(params: &ZcashCrosslinkParameters, prefix: &ChainPrefix, cutoff: BftCutoff) -> TF {
@@ -137,6 +139,28 @@ pub struct ChainImport {
     pub path: PathBuf,
     /// Skip proof, signature and script verification of the file's PoW blocks.
     pub trusted: bool,
+    /// The last PoW height to load: the file runs up to its first PoW block above it, and
+    /// nothing after that point runs, appended scenario instructions included. `None` runs it all.
+    pub height: Option<u32>,
+}
+
+/// How many of `instrs` hold the chain up to PoW height `height`: the index of the first PoW
+/// block above it, or all of them. A prefix file places each BFT block as early as a live node
+/// could have decided it, so what comes before that block is what a node at `height` held.
+pub fn instrs_through_height(bytes: &[u8], instrs: &[TFInstr], height: u32) -> usize {
+    instrs
+        .iter()
+        .position(|instr| {
+            let block_height = match tf_read_instr(bytes, instr) {
+                Some(TestInstr::LoadPoW(block)) => block.coinbase_height(),
+                Some(TestInstr::RecvPoW { block, .. }) => {
+                    Block::zcash_deserialize(&block[..]).ok().and_then(|block| block.coinbase_height())
+                }
+                _ => None,
+            };
+            block_height.is_some_and(|block_height| block_height.0 > height)
+        })
+        .unwrap_or(instrs.len())
 }
 
 /// Set by zebrad before the node starts; taken by the TFL service once it is running.
@@ -201,12 +225,24 @@ pub(crate) async fn run_import(handle: TFLServiceHandle, import: ChainImport) {
     *crate::TEST_INSTR_C.lock().unwrap() = 0;
     crate::TEST_FAILED_INSTR_IDXS.lock().unwrap().clear();
     crate::test_timing::RECORD.store(false, Relaxed);
-    test_format::TRUSTED_LOAD_POW.store(import.trusted, Relaxed);
 
+    let instrs = match import.height {
+        Some(height) => &tf.instrs[..instrs_through_height(&bytes, &tf.instrs, height)],
+        None => &tf.instrs[..],
+    };
+    let options = ReadOptions { trusted_before: if import.trusted { instrs.len() } else { 0 } };
     info!(
-        "chain import: loading {} instructions from {}{}",
-        tf.instrs.len(),
+        "chain import: loading {} instructions from {}{}{}",
+        instrs.len(),
         import.path.display(),
+        match import.height {
+            Some(height) if instrs.len() < tf.instrs.len() => format!(
+                ", up to PoW height {height} (the last {} are not run)",
+                tf.instrs.len() - instrs.len()
+            ),
+            Some(height) => format!(", up to PoW height {height} (the whole file)"),
+            None => String::new(),
+        },
         if import.trusted {
             ", trusting its blocks' proofs and signatures"
         } else {
@@ -214,8 +250,7 @@ pub(crate) async fn run_import(handle: TFLServiceHandle, import: ChainImport) {
         },
     );
     let start = std::time::Instant::now();
-    test_format::read_instrs(handle.clone(), &bytes, &tf.instrs).await;
-    test_format::TRUSTED_LOAD_POW.store(false, Relaxed);
+    test_format::read_instrs(handle.clone(), &bytes, instrs, options).await;
 
     let tip = match (handle.call.state)(Request::Tip).await {
         Ok(Response::Tip(Some((height, hash)))) => format!("{} ({hash})", height.0),
@@ -226,14 +261,14 @@ pub(crate) async fn run_import(handle: TFLServiceHandle, import: ChainImport) {
         info!(
             "chain import: done in {:.1?}; {} instructions, all as the file expects; best tip {tip}",
             start.elapsed(),
-            tf.instrs.len(),
+            instrs.len(),
         );
     } else {
         warn!(
             "chain import: done in {:.1?}; {} of {} instructions did not do what the file expects; best tip {tip}",
             start.elapsed(),
             failed.len(),
-            tf.instrs.len(),
+            instrs.len(),
         );
         for (i, message) in failed.iter().take(20) {
             warn!("chain import: instruction {i}: {message}");
@@ -439,6 +474,31 @@ mod tests {
             test_format::crosslink_parameters_for_test(&bytes),
             HARNESS_PARAMETERS
         );
+    }
+
+    #[test]
+    fn an_import_height_cuts_before_the_first_block_above_it() {
+        let prefix = scene_prefix(BFT_SCENES[0]);
+        let bytes = prefix_tf(&HARNESS_PARAMETERS, &prefix, BftCutoff::Supported).write_to_bytes();
+        let tf = TF::read_from_bytes(&bytes).expect("a written prefix reads");
+        let pow_height = |instr: &TFInstr| match tf_read_instr(&bytes, instr) {
+            Some(TestInstr::LoadPoW(block)) => block.coinbase_height().map(|height| height.0),
+            _ => None,
+        };
+        let tip = prefix.blocks.len() as u32 - 1;
+        for height in 0..=tip + 1 {
+            let cut = instrs_through_height(&bytes, &tf.instrs, height);
+            assert!(
+                tf.instrs[..cut].iter().filter_map(pow_height).all(|h| h <= height),
+                "nothing above height {height} runs"
+            );
+            let kept = tf.instrs[..cut].iter().filter_map(pow_height).count() as u32;
+            assert_eq!(kept, height.min(tip) + 1, "every block up to height {height} runs");
+            match tf.instrs.get(cut) {
+                Some(next) => assert_eq!(pow_height(next), Some(height + 1), "the cut is at the next block"),
+                None => assert!(height >= tip, "only a height at or past the tip keeps the whole file"),
+            }
+        }
     }
 
     #[test]
