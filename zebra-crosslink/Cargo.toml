@@ -343,6 +343,14 @@ incremental = true
 # Not release's one unit: with one, an edit regenerates the whole crate.
 codegen-units = 256
 
+# Public release: the release optimizations without debug info, and with symbols stripped, for
+# the smallest binary to distribute. Panics still print their message, but backtraces have no
+# function names.
+[profile.public-release]
+inherits = "release"
+debug = false
+strip = "symbols"
+
 [workspace.lints.rust]
 # The linter should ignore these expected config flags/values
 unexpected_cfgs = { level = "warn", check-cfg = [
