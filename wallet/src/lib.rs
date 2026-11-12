@@ -873,6 +873,16 @@ impl WalletTx {
         self.status.is_on_bc()
     }
 
+    /// Why the first send of this tx failed for good (the node refused it, or the network
+    /// upgraded past its consensus branch), for a caller still waiting on that send.
+    pub fn send_error(&self) -> Option<String> {
+        match self.status {
+            TxStatus::HardFail(stage, msg) if stage == BlockHeight::BUILT =>
+                Some(format!("failed to send transaction {}: {}", self.txid, msg.to_string().trim_end_matches('\0'))),
+            _ => None,
+        }
+    }
+
     pub fn with_fake_data(kind: WalletTxKind, sent: u64, recv: u64, shielding: bool, is_outside_bc: bool, memo: &str, mined_h: u32) -> Self {
         let mut memo_as_bytes = EMPTY_MEMO_BYTES;
         &memo_as_bytes[0..memo.len()].copy_from_slice(memo.as_bytes());
@@ -1601,12 +1611,40 @@ pub struct ManualWallet {
 }
 
 /// A transaction this wallet sent, kept until it expires so it can be sent again if a reorg
-/// drops the block that mined it.
+/// drops the block that mined it. A first send the node didn't take for a passing reason (a
+/// transport error, a mempool conflict) is kept too, only so it can fail once the network
+/// upgrades past its branch; it is not resent.
 #[derive(Clone, Debug)]
 pub struct SentTx {
     pub data: Vec<u8>,
     pub expiry_h: Option<BlockHeight>,
     pub resent_h: BlockHeight,
+    /// The consensus branch the tx was built for. Once the network upgrades past it, no
+    /// resend can land.
+    pub branch_id: BranchId,
+}
+
+/// Why a tx built for consensus branch `branch` can never be mined from block `next_h` on, or
+/// None while it still can. `refusal` is the node's answer to the last send, when it refused.
+/// A branch that only starts above `next_h` is still live: a reorg took the tip below its
+/// activation, and it activates again.
+fn unminable_branch_reason<P: Parameters>(network: &P, branch: BranchId, next_h: BlockHeight, refusal: Option<&str>) -> Option<String> {
+    let next_lrz_h = LRZBlockHeight::from_u32(next_h.0);
+    let (ended, upcoming) = match branch.height_bounds(network) {
+        Some((start, end)) => (end.map_or(false, |end| end <= next_lrz_h), next_lrz_h < start),
+        None => (true, false),
+    };
+    // zebra-consensus's TransactionError::WrongConsensusBranchId
+    let refused_for_branch = refusal.map_or(false, |msg| msg.contains("incorrect consensus branch id"));
+    if ended {
+        let needed = BranchId::for_height(network, next_lrz_h);
+        Some(format!("built for {branch:?}, but block {next_h} needs {needed:?}; make it again"))
+    } else if refused_for_branch && !upcoming {
+        // the node is past an upgrade the wallet hasn't seen yet
+        Some(format!("the node no longer accepts {branch:?}; make it again"))
+    } else {
+        None
+    }
 }
 // N.B. using some of the same API as WalletDb to allow smooth transition/comparison
 impl ManualWallet {
@@ -1646,6 +1684,94 @@ impl ManualWallet {
         )))
     }
 
+    /// The block a tx built or sent now is for; the same height the builder targets.
+    fn next_block_h(&self) -> BlockHeight {
+        BlockHeight(self.chain_tip_h.0.saturating_add(1))
+    }
+
+    /// Marks a sent tx that can never be mined failed, so it stops being resent and shows as
+    /// failed with `reason`. Its notes are already spendable again: only a block that spends
+    /// them takes them out, and the reorg pass put back any it had taken. A staking action in it
+    /// never happened, so no bond view lists it (they read only mined txs).
+    fn fail_unminable_tx(&mut self, txid: TxId, reason: &str) {
+        self.sent_txs.remove(&txid);
+        let Some(tx_i) = tx_position(self, &txid) else { return; };
+        let mut tx = self.txs[tx_i];
+        if matches!(tx.status, TxStatus::HardFail(..)) { return; }
+        println!("{} wallet: tx {txid} can never be mined, so it is not resent and has failed: {reason}", self.name);
+        // keep the stage it died from, as the expiry sweep does
+        let fail_stage = tx.status.to_any_fail().unwrap_or(tx.h);
+        tx.status = TxStatus::HardFail(fail_stage, ErrBuf::from_str(reason));
+        tx.h = self.sync_h;
+        let mut insert_i = 0;
+        update_insert_i(&self.txs, &mut insert_i, tx.h);
+        update_with_tx(self, tx, &mut insert_i);
+    }
+
+    /// The txs to send again after a reorg or a mempool reset dropped them: every tx the reorg
+    /// pass soft-failed, from a block or the mempool, once per scanned block (`sync_h`) until it
+    /// is back on the best chain or expires. A tx built for a consensus branch the next block no
+    /// longer accepts is failed instead: a network upgrade activated, and no resend can land it.
+    /// So is a first send that soft-failed for another reason (it is never resent), instead of
+    /// waiting pending until it expires.
+    fn take_resends<P: Parameters>(&mut self, network: &P, sync_h: BlockHeight) -> Vec<(TxId, Vec<u8>)> {
+        self.sent_txs.retain(|_, sent| sent.expiry_h.map_or(true, |expiry_h| expiry_h >= sync_h));
+        let next_h = self.next_block_h();
+        let mut resends = Vec::new();
+        let mut unminable = Vec::new();
+        for tx in &self.txs {
+            let TxStatus::SoftFail(stage) = tx.status else { continue; };
+            let dropped = stage.is_in_block() || stage == BlockHeight::MEMPOOL;
+            if !(dropped || stage == BlockHeight::BUILT) { continue; }
+            let Some(sent) = self.sent_txs.get_mut(&tx.txid) else { continue; };
+            if let Some(reason) = unminable_branch_reason(network, sent.branch_id, next_h, None) {
+                unminable.push((tx.txid, reason));
+                continue;
+            }
+            if !dropped || sent.resent_h == sync_h { continue; }
+            sent.resent_h = sync_h;
+            resends.push((tx.txid, sent.data.clone()));
+        }
+        for (txid, reason) in unminable {
+            self.fail_unminable_tx(txid, &reason);
+        }
+        resends
+    }
+
+    /// Fails a resent tx the node refused for its consensus branch, even though this wallet's
+    /// view of the tip still accepts that branch. Other refusals leave it to the next resend.
+    fn note_resend_refusal<P: Parameters>(&mut self, network: &P, txid: TxId, refusal: &str) {
+        let Some(sent) = self.sent_txs.get(&txid) else { return; };
+        if let Some(reason) = unminable_branch_reason(network, sent.branch_id, self.next_block_h(), Some(refusal)) {
+            self.fail_unminable_tx(txid, &reason);
+        }
+    }
+
+    /// Records a first send the node did not take (`refusal` is why) in `wallet_tx`. A refusal
+    /// for its branch id fails it at once. Any other leaves it soft-failed, and `sent` is kept so
+    /// take_resends fails it once the next block needs a newer branch.
+    fn note_first_send_refusal<P: Parameters>(&mut self, network: &P, wallet_tx: &mut WalletTx, sent: SentTx, fail_stage: BlockHeight, refusal: &str) {
+        let status = self.first_send_failure(network, sent.branch_id, fail_stage, Some(refusal))
+            .unwrap_or(TxStatus::SoftFail(fail_stage));
+        if let TxStatus::SoftFail(_) = status {
+            self.sent_txs.insert(wallet_tx.txid, sent);
+        }
+        wallet_tx.status = status;
+        wallet_tx.h = self.sync_h;
+    }
+
+    /// The status of a built tx the node did not take on its first send (`refusal` is why), or
+    /// that was never sent (None) because the network upgraded past its consensus branch
+    /// between build and send. A tx refused for its branch id can never be mined, so it fails
+    /// at once instead of waiting soft-failed until it expires.
+    fn first_send_failure<P: Parameters>(&self, network: &P, branch: BranchId, fail_stage: BlockHeight, refusal: Option<&str>) -> Option<TxStatus> {
+        match (unminable_branch_reason(network, branch, self.next_block_h(), refusal), refusal) {
+            (Some(reason), _) => Some(TxStatus::HardFail(fail_stage, ErrBuf::from_str(&reason))),
+            (None, Some(_))   => Some(TxStatus::SoftFail(fail_stage)),
+            (None, None)      => None,
+        }
+    }
+
     // TODO: always return full tx if created
     async fn send_built_tx<P: Parameters>(&mut self, network: P, client: &mut CompactTxStreamerClient<Channel>, wallet_tx: &mut WalletTx, tx: &Transaction) -> bool {
         let tz = Timer::scope_("send_built_tx", DUMP_TX_SEND);
@@ -1659,14 +1785,25 @@ impl ManualWallet {
         let fail_stage = wallet_tx.h;
         let fail_h = self.sync_h;
         let mut raw_tx = RawTransaction{ data: Vec::new(), height: 0 };
-        if let Err(err) = tx.write(&mut raw_tx.data) {
+        if let Some(status) = self.first_send_failure(&network, tx.consensus_branch_id(), fail_stage, None) {
+            // the tip passed an upgrade while the tx was being built
+            println!("not sending transaction {:?}: it was built for {:?}, a consensus branch block {} no longer accepts", tx.txid(), tx.consensus_branch_id(), self.next_block_h());
+            wallet_tx.status = status;
+            wallet_tx.h = fail_h;
+        } else if let Err(err) = tx.write(&mut raw_tx.data) {
             println!("couldn't serialize transaction for network send: {err:?}");
             let err_buf = ErrBuf::from_str(&format!("couldn't serialize: {err:?}"));
             wallet_tx.status = TxStatus::HardFail(fail_stage, err_buf);
             wallet_tx.h = fail_h;
         } else {
             let tx_size = raw_tx.data.len();
-            let data = raw_tx.data.clone();
+            let expiry_h = BlockHeight::from(tx.expiry_height());
+            let sent = SentTx {
+                data: raw_tx.data.clone(),
+                expiry_h: if expiry_h.0 == 0 { None } else { Some(expiry_h) },
+                resent_h: BlockHeight::INVALID,
+                branch_id: tx.consensus_branch_id(),
+            };
             let res = client.send_transaction(raw_tx).await;
             if DUMP_TX_SEND { println!("******* res for {:?} ({} B): {:?}", tx.txid(), tx_size, res); }
             // Transport/gRPC failures come back as Err; a node *rejection* comes back as Ok
@@ -1678,12 +1815,7 @@ impl ManualWallet {
                     let resp = resp.into_inner();
                     if resp.error_code == 0 {
                         wallet_tx.h = BlockHeight::SENT;
-                        let expiry_h = BlockHeight::from(tx.expiry_height());
-                        self.sent_txs.insert(tx.txid(), SentTx {
-                            data,
-                            expiry_h: if expiry_h.0 == 0 { None } else { Some(expiry_h) },
-                            resent_h: BlockHeight::INVALID,
-                        });
+                        self.sent_txs.insert(tx.txid(), sent);
                     } else {
                         println!("node rejected transaction {:?} ({}): {}", tx.txid(), resp.error_code, resp.error_message);
                         let err_buf = ErrBuf::from_str(&format!("rejected ({}): {}", resp.error_code, resp.error_message));
@@ -1693,8 +1825,7 @@ impl ManualWallet {
                 }
                 Err(status) => {
                     println!("failed to send transaction {:?}: {status}", tx.txid());
-                    wallet_tx.status = TxStatus::SoftFail(fail_stage);
-                    wallet_tx.h = fail_h;
+                    self.note_first_send_refusal(&network, wallet_tx, sent, fail_stage, status.message());
                 }
             }
         }
@@ -4808,23 +4939,17 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // so a tx of ours mined only there would never be mined again. Send every tx the reorg
         // pass soft-failed, from a block or the mempool, again once per scanned block until it
         // is back on the best chain or expires. A tx the node still holds is merely refused.
-        let mut resends = Vec::new();
+        // A network upgrade's mempool reset drops txs too, and those built for the old consensus
+        // branch can never land: they fail instead, so the caller sees it and makes them again.
         for wallet in [&mut miner_wallet, &mut user_wallet] {
-            wallet.sent_txs.retain(|_, sent| sent.expiry_h.map_or(true, |expiry_h| expiry_h >= wallets_sync_h));
-            for tx in &wallet.txs {
-                let TxStatus::SoftFail(stage) = tx.status else { continue; };
-                if !(stage.is_in_block() || stage == BlockHeight::MEMPOOL) { continue; }
-                let Some(sent) = wallet.sent_txs.get_mut(&tx.txid) else { continue; };
-                if sent.resent_h == wallets_sync_h { continue; }
-                sent.resent_h = wallets_sync_h;
-                resends.push((wallet.name, tx.txid, sent.data.clone()));
-            }
-        }
-        for (name, txid, data) in resends {
-            match client.send_transaction(RawTransaction { data, height: 0 }).await {
-                Ok(resp) if resp.get_ref().error_code == 0 => println!("{name} wallet: resent tx {txid}, which a reorg dropped"),
-                Ok(resp) => println!("{name} wallet: the node refused tx {txid}, which a reorg dropped: {}", resp.get_ref().error_message),
-                Err(status) => println!("{name} wallet: failed to resend tx {txid}, which a reorg dropped: {status}"),
+            for (txid, data) in wallet.take_resends(network, wallets_sync_h) {
+                let name = wallet.name;
+                let refusal = match client.send_transaction(RawTransaction { data, height: 0 }).await {
+                    Ok(resp) if resp.get_ref().error_code == 0 => { println!("{name} wallet: resent tx {txid}, which a reorg dropped"); continue; }
+                    Ok(resp) => { println!("{name} wallet: the node refused tx {txid}, which a reorg dropped: {}", resp.get_ref().error_message); resp.into_inner().error_message }
+                    Err(status) => { println!("{name} wallet: failed to resend tx {txid}, which a reorg dropped: {status}"); status.message().to_string() }
+                };
+                wallet.note_resend_refusal(network, txid, &refusal);
             }
         }
 
@@ -5420,6 +5545,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         sender.send(Err(format!("failed to build staking action")));
                         rpc_stake = None;
                     }
+                    _ if tx_progress.send_error().is_some() => {
+                        sender.send(Err(tx_progress.send_error().unwrap()));
+                        rpc_stake = None;
+                    }
                     BlockHeight::SENT => {
                         let res = if let Some(staking_action) = tx_progress.staking_action {
                             format!("{{ \"txid\": {}, \"staking_action\": {} }}", tx_progress.txid, staking_action)
@@ -5442,6 +5571,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 match tx_progress.h {
                     BlockHeight::INVALID => {
                         let _ = sender.send(Err("failed to build send transaction".to_string()));
+                    }
+                    _ if tx_progress.send_error().is_some() => {
+                        let _ = sender.send(Err(tx_progress.send_error().unwrap()));
                     }
                     BlockHeight::SENT => {
                         let _ = sender.send(Ok(format!("{{ \"txid\": {} }}", tx_progress.txid)));
@@ -5865,5 +5997,192 @@ mod tests {
             }
         }
         assert!(paid > 1_000 && hit_cap > 1_000, "paid {paid}, hit the cap {hit_cap}");
+    }
+
+    // A network upgrade's first block: the block below it takes the old consensus branch.
+    const UPGRADE_H: u32 = zcash_protocol::consensus::TESTNET_FEATURENET_UPGRADE_1_HEIGHT;
+
+    fn branch_for(h: u32) -> BranchId {
+        BranchId::for_height(&TEST_NETWORK, LRZBlockHeight::from_u32(h))
+    }
+
+    fn set_tip(wallet: &mut ManualWallet, h: u32) {
+        wallet.chain_tip_h = BlockHeight(h);
+        wallet.sync_h = BlockHeight(h);
+    }
+
+    /// A tx this wallet sent, built for block `built_for_h`, that the reorg pass then
+    /// soft-failed out of the mempool (a reorg or a mempool reset dropped it).
+    fn dropped_sent_tx(wallet: &mut ManualWallet, n: u8, built_for_h: u32) -> TxId {
+        let txid = TxId::from_bytes([n; 32]);
+        let part = WalletTxPart { spent_note_count: 1, spent_zats: Zatoshis::const_from_u64(1_000_000), ..WalletTxPart::ZERO };
+        let tx = WalletTx {
+            txid, h: wallet.sync_h, status: TxStatus::SoftFail(BlockHeight::MEMPOOL),
+            expiry_h: Some(BlockHeight(built_for_h + 40)), part_flags: TxParts::FULL_TX,
+            parts: [WalletTxPart::ZERO, part], ..WalletTx::EMPTY
+        };
+        let mut insert_i = 0;
+        update_insert_i(&wallet.txs, &mut insert_i, tx.h);
+        update_with_tx(wallet, tx, &mut insert_i);
+        wallet.sent_txs.insert(txid, SentTx {
+            data: vec![n], expiry_h: tx.expiry_h, resent_h: BlockHeight::INVALID, branch_id: branch_for(built_for_h),
+        });
+        txid
+    }
+
+    fn resent(wallet: &mut ManualWallet) -> Vec<TxId> {
+        let sync_h = wallet.sync_h;
+        let mut txids: Vec<TxId> = wallet.take_resends(&TEST_NETWORK, sync_h).into_iter().map(|(txid, _)| txid).collect();
+        txids.sort_by_key(|txid| *txid.as_ref());
+        txids
+    }
+
+    fn status_of(wallet: &ManualWallet, txid: TxId) -> TxStatus {
+        wallet.txs[tx_position(wallet, &txid).unwrap()].status
+    }
+
+    fn fail_reason(status: TxStatus) -> String {
+        match status {
+            TxStatus::HardFail(_, msg) => msg.to_string().trim_end_matches('\0').to_string(),
+            other => panic!("expected a failed tx, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dropped_tx_fails_instead_of_being_resent_once_the_next_block_needs_a_newer_branch() {
+        let (mut wallet, ..) = note_fixture();
+        let u = UPGRADE_H;
+        set_tip(&mut wallet, u - 2);
+        let old = dropped_sent_tx(&mut wallet, 1, u - 1);
+        let new = dropped_sent_tx(&mut wallet, 2, u);
+        assert_ne!(branch_for(u - 1), branch_for(u));
+
+        // The tip is two below the upgrade (as after a reorg below it): block u-1 takes the old
+        // branch, and the new one is live again from u, so both are sent again.
+        assert_eq!(resent(&mut wallet), vec![old, new]);
+
+        // The tip reaches u-1 and the node resets its mempool: block u is the upgrade's, so the
+        // tx built for u-1 can never be mined. It fails with the reason; the other is resent.
+        set_tip(&mut wallet, u - 1);
+        assert_eq!(resent(&mut wallet), vec![new]);
+        let status = status_of(&wallet, old);
+        assert!(matches!(status, TxStatus::HardFail(stage, _) if stage == BlockHeight::MEMPOOL), "{status:?}");
+        let reason = fail_reason(status);
+        assert_eq!(reason, format!("built for {:?}, but block {u} needs {:?}; make it again", branch_for(u - 1), branch_for(u)));
+        assert!(!wallet.sent_txs.contains_key(&old));
+        assert_eq!(wallet.txs[tx_position(&wallet, &old).unwrap()].h, BlockHeight(u - 1));
+
+        // It stays failed.
+        set_tip(&mut wallet, u);
+        assert_eq!(resent(&mut wallet), vec![new]);
+        assert_eq!(fail_reason(status_of(&wallet, old)), reason);
+    }
+
+    #[test]
+    fn a_resend_the_node_refuses_for_its_branch_id_fails_and_other_refusals_are_retried() {
+        let (mut wallet, ..) = note_fixture();
+        let u = UPGRADE_H;
+        // The wallet's view of the tip lags the node's: to the wallet, block u-1 still takes the
+        // branch this tx was built for.
+        set_tip(&mut wallet, u - 2);
+        let tx = dropped_sent_tx(&mut wallet, 1, u - 1);
+        let ahead = dropped_sent_tx(&mut wallet, 2, u);
+
+        assert_eq!(resent(&mut wallet), vec![tx, ahead]);
+        wallet.note_resend_refusal(&TEST_NETWORK, tx, "transaction is already in the mempool");
+        assert_eq!(status_of(&wallet, tx), TxStatus::SoftFail(BlockHeight::MEMPOOL));
+
+        // The node's wording from #340, through the gRPC status.
+        let refusal = "failed to validate tx: Tx(WrongConsensusBranchId) transaction uses an incorrect consensus branch id";
+        wallet.note_resend_refusal(&TEST_NETWORK, tx, refusal);
+        // A tx for a branch that only starts above the next block is live again once the
+        // chain gets there, so the same refusal leaves it alone.
+        wallet.note_resend_refusal(&TEST_NETWORK, ahead, refusal);
+
+        assert_eq!(fail_reason(status_of(&wallet, tx)), format!("the node no longer accepts {:?}; make it again", branch_for(u - 1)));
+        assert_eq!(status_of(&wallet, ahead), TxStatus::SoftFail(BlockHeight::MEMPOOL));
+        set_tip(&mut wallet, u - 1);
+        assert_eq!(resent(&mut wallet), vec![ahead]);
+    }
+
+    #[test]
+    fn a_first_send_built_for_a_branch_the_node_moved_past_fails_at_once_and_tells_the_caller() {
+        let (mut wallet, ..) = note_fixture();
+        let u = UPGRADE_H;
+        let (old, new) = (branch_for(u - 1), branch_for(u));
+        let refusal = "transaction uses an incorrect consensus branch id";
+
+        // Built for block u-1, and the wallet has since seen the tip reach u-1: not sent at all.
+        set_tip(&mut wallet, u - 1);
+        let status = wallet.first_send_failure(&TEST_NETWORK, old, BlockHeight::BUILT, None);
+        assert!(matches!(status, Some(TxStatus::HardFail(stage, _)) if stage == BlockHeight::BUILT), "{status:?}");
+        assert_eq!(wallet.first_send_failure(&TEST_NETWORK, new, BlockHeight::BUILT, None), None);
+
+        // The wallet is a block behind its node (#340's shielding tx): the node's refusal is final.
+        set_tip(&mut wallet, u - 2);
+        assert_eq!(wallet.first_send_failure(&TEST_NETWORK, old, BlockHeight::BUILT, None), None);
+        let status = wallet.first_send_failure(&TEST_NETWORK, old, BlockHeight::BUILT, Some(refusal)).unwrap();
+        assert_eq!(fail_reason(status), format!("the node no longer accepts {old:?}; make it again"));
+        // A transport failure may pass; it keeps the soft failure it had.
+        assert_eq!(wallet.first_send_failure(&TEST_NETWORK, old, BlockHeight::BUILT, Some("connection reset")),
+                   Some(TxStatus::SoftFail(BlockHeight::BUILT)));
+
+        // An RPC caller waiting on that send gets the reason, not a txid or a build error.
+        let txid = TxId::from_bytes([3; 32]);
+        let failed = WalletTx { txid, h: BlockHeight(u - 2), status, ..WalletTx::EMPTY };
+        assert_eq!(failed.send_error(), Some(format!("failed to send transaction {txid}: the node no longer accepts {old:?}; make it again")));
+        let soft = WalletTx { status: TxStatus::SoftFail(BlockHeight::BUILT), ..failed };
+        assert_eq!(soft.send_error(), None);
+        let build_failure = WalletTx { status: TxStatus::HardFail(BlockHeight::PROPOSED, ErrBuf::from_str("failed to build")), ..failed };
+        assert_eq!(build_failure.send_error(), None);
+    }
+
+    #[test]
+    fn a_first_send_soft_failed_for_another_reason_fails_once_the_next_block_needs_a_newer_branch() {
+        let (mut wallet, ..) = note_fixture();
+        let u = UPGRADE_H;
+        set_tip(&mut wallet, u - 2);
+        // Two built txs whose first send the node refused for a reason other than the branch
+        // (#347's regtest: shielding txs built for the block below the upgrade), one built for
+        // u-1 and one for u.
+        let first_send = |wallet: &mut ManualWallet, n: u8, built_for_h: u32, refusal: &str| {
+            let txid = TxId::from_bytes([n; 32]);
+            let part = WalletTxPart { spent_note_count: 1, spent_zats: Zatoshis::const_from_u64(1_000_000), ..WalletTxPart::ZERO };
+            let mut tx = WalletTx {
+                txid, h: BlockHeight::BUILT, status: TxStatus::OnBc, expiry_h: Some(BlockHeight(built_for_h + 40)),
+                part_flags: TxParts::FULL_TX, parts: [WalletTxPart::ZERO, part], ..WalletTx::EMPTY
+            };
+            let sent = SentTx { data: vec![n], expiry_h: tx.expiry_h, resent_h: BlockHeight::INVALID, branch_id: branch_for(built_for_h) };
+            wallet.note_first_send_refusal(&TEST_NETWORK, &mut tx, sent, BlockHeight::BUILT, refusal);
+            let mut insert_i = 0;
+            update_insert_i(&wallet.txs, &mut insert_i, tx.h);
+            update_with_tx(wallet, tx, &mut insert_i);
+            txid
+        };
+        let old = first_send(&mut wallet, 1, u - 1, "transaction conflicts with a mempool transaction");
+        let new = first_send(&mut wallet, 2, u, "connection reset");
+
+        // Both wait soft-failed, and neither is sent again: only a dropped tx is resent.
+        assert_eq!(resent(&mut wallet), vec![]);
+        assert_eq!(status_of(&wallet, old), TxStatus::SoftFail(BlockHeight::BUILT));
+        assert_eq!(status_of(&wallet, new), TxStatus::SoftFail(BlockHeight::BUILT));
+
+        // The tip reaches u-1: block u is the upgrade's, so the tx built for u-1 fails now, with
+        // the reason, instead of staying pending until it expires at u+39.
+        set_tip(&mut wallet, u - 1);
+        assert_eq!(resent(&mut wallet), vec![]);
+        let status = status_of(&wallet, old);
+        assert!(matches!(status, TxStatus::HardFail(stage, _) if stage == BlockHeight::BUILT), "{status:?}");
+        let reason = fail_reason(status);
+        assert_eq!(reason, format!("built for {:?}, but block {u} needs {:?}; make it again", branch_for(u - 1), branch_for(u)));
+        assert!(!wallet.sent_txs.contains_key(&old));
+        assert_eq!(wallet.txs[tx_position(&wallet, &old).unwrap()].send_error(), Some(format!("failed to send transaction {old}: {reason}")));
+        assert_eq!(status_of(&wallet, new), TxStatus::SoftFail(BlockHeight::BUILT));
+
+        // It stays failed, and the live one is still left alone.
+        set_tip(&mut wallet, u);
+        assert_eq!(resent(&mut wallet), vec![]);
+        assert_eq!(fail_reason(status_of(&wallet, old)), reason);
+        assert_eq!(status_of(&wallet, new), TxStatus::SoftFail(BlockHeight::BUILT));
     }
 }
