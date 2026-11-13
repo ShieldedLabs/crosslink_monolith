@@ -229,6 +229,16 @@ pub(super) fn decided_missing_pow_block_needs_parent(hash: Hash, parent: Hash) {
     decided.insert(parent);
 }
 
+/// The decision this node stored at the height BFT resumed at, by height and block hash, when
+/// `restore` could not replay it because this state does not hold its snapshot.
+///
+/// The height is decided, with this node's own certificate, so the stored block is the only one
+/// this node may vote for or store there. Without this a restarted node votes on the height
+/// afresh, and when no node holds the snapshot any more (every node killed before it reached the
+/// non-finalized backup) the network decides a second block at a decided height and the stored
+/// row is overwritten: a final block reverted.
+static STORED_UNREPLAYED_DECISION: Mutex<Option<(u64, Blake3Hash)>> = Mutex::new(None);
+
 /// Why this node stopped taking part in BFT, and when it last said so.
 ///
 /// Following Π_bft's decision would take a reorganization below the committed tip, which one
@@ -1870,6 +1880,19 @@ impl BftRunner {
             return fail;
         }
 
+        // This node has a stored decision at this height that `restore` could not replay (its
+        // snapshot is missing). Any other block here would be a second decision at a decided height.
+        if let Some((_, stored)) = STORED_UNREPLAYED_DECISION.lock().unwrap().filter(|(height, _)| *height == bft_height) {
+            if new_block_hash != stored {
+                tracing::warn!(
+                    "refusing BFT block {} at height {}: this node has stored decision {} for that height, \
+                     whose snapshot it does not hold yet",
+                    new_block_hash, bft_height, stored,
+                );
+                return fail;
+            }
+        }
+
         // From the first height under FeaturenetUpgrade2's rules, the previous-block pointer must
         // be a certificate for the parent and not only its hash: once this block is decided, that
         // pointer is what `fat_pointer_to_block_at_height` hands miners for the parent.
@@ -2209,6 +2232,8 @@ impl BftRunner {
         push_voting_roster(&mut chain.voting_rosters, voting);
         chain.hash_to_height.insert(new_block_hash, insert_i as u64);
         chain.blocks.push(new_block.clone());
+        // A stored decision held at this height is decided again (`validate` let only it through).
+        STORED_UNREPLAYED_DECISION.lock().unwrap().take_if(|(height, _)| *height == insert_i as u64);
         chain.fat_pointer_to_tip = fat_pointer.clone();
         chain.bft_final_snapshot = Some((new_final_height, new_final_hash));
         drop(chain);
@@ -2286,7 +2311,8 @@ impl BftRunner {
         // disk write. A crash before the row lands leaves the BFT chain one height short and
         // that height is decided again on the next run. A crash after it, while the snapshot is
         // still only in the non-finalized state, leaves a row whose snapshot the next run may
-        // not hold; `restore` resumes BFT below that row and decides it again.
+        // not hold; `restore` resumes BFT below that row and decides it again, with the same block
+        // (`STORED_UNREPLAYED_DECISION`), so this write never replaces a stored block with another.
         if let Err(err) = block_writer.finalized_state.db.write_bft_decision(
             block.height,
             &block,
@@ -2361,6 +2387,8 @@ impl BftRunner {
         let mut prev_finalized_bc_height: Option<Height> = None;
         // The snapshot of the last replayed block, when this state holds it.
         let mut last_final: Option<(Height, Hash)> = None;
+        // Set again below if replay stops at a stored decision.
+        *STORED_UNREPLAYED_DECISION.lock().unwrap() = None;
         // Dropping BFT is permanent for a database (FINALITY.md §4.3).
         let recorded_drop = block_writer.finalized_state.db.crosslink_bft_dropped();
 
@@ -2392,7 +2420,9 @@ impl BftRunner {
                         // a lost backup or a disabled one does not bring back. The decision is
                         // still final, so BFT resumes at this height and catch-up decides it
                         // again once PoW sync has the snapshot. Replay cannot go past it, because
-                        // the next height's roster is the stake at this snapshot.
+                        // the next height's roster is the stake at this snapshot. Only this block
+                        // is valid at this height meanwhile: if no node holds the snapshot, BFT
+                        // waits here rather than deciding the height a second time.
                         tracing::warn!(
                             "crosslink restore: BFT height {} finalizes {}, which this state does not hold; \
                              resuming BFT at that height",
@@ -2401,6 +2431,7 @@ impl BftRunner {
                         // This node stored the decision, so the snapshot is on the decided chain:
                         // fetched whatever height a peer alleges, and never expired.
                         DECIDED_MISSING_POW_BLOCKS.lock().unwrap().insert(snapshot);
+                        *STORED_UNREPLAYED_DECISION.lock().unwrap() = Some((this_bft_height, block.blake3_hash()));
                         break;
                     }
                     // BFT was dropped here, so nothing is decided from this replay; the stored
@@ -3192,5 +3223,95 @@ mod tests {
             let err = check(network).expect_err("no minimum-difficulty exemption applies");
             assert!(err.contains("is not equal to the expected difficulty"), "{err}");
         }
+    }
+
+    /// A BFT block at height 0 of a Supplied-bootstrap regtest chain whose carried headers sit on
+    /// `snapshot`, distinguished by `nonce`. Regtest skips proof of work, so `validate` judges it on
+    /// its links and its snapshot alone.
+    fn regtest_block_on(params: &ZcashCrosslinkParameters, snapshot: Hash, nonce: u8) -> (BftBlock, FatPointerToBftBlock) {
+        let bits = zebra_chain::block::genesis::regtest_genesis_block().header.difficulty_threshold;
+        let mut headers: Vec<BcBlockHeader> = Vec::new();
+        let mut prev_block = snapshot;
+        for i in 0..params.bc_confirmation_depth_sigma {
+            let mut next = header(prev_block, i as i64, bits);
+            next.nonce = zebra_chain::fmt::HexDebug([nonce; 32]);
+            headers.push(bc_hdr_to_lrz(&next));
+            prev_block = Hash(BlockHash::from_header_data(headers.last().unwrap()).0);
+        }
+        let block = BftBlock::new(params, BFT_BLOCK_VERSION_LATEST, 0, FatPointerToBftBlock::null(), headers, Vec::new(), 0)
+            .expect("sigma headers");
+        let mut fat_pointer = FatPointerToBftBlock::null();
+        fat_pointer.vote_for_block_without_finalizer_public_key[..32].copy_from_slice(&block.blake3_hash().0);
+        (block, fat_pointer)
+    }
+
+    /// #329: a node restarts with a decision stored at a height whose snapshot it no longer holds
+    /// (every node was killed before the snapshot reached its non-finalized backup). `restore`
+    /// stops there and BFT resumes at that height, but the height is decided: the only block this
+    /// node may vote for there is the stored one. Without that, a proposal for another block at the
+    /// same height passes as soon as its snapshot is known, the network decides a second block at
+    /// a decided height, and the stored row is overwritten.
+    #[tokio::test]
+    async fn a_stored_decision_restore_cannot_replay_is_the_only_block_valid_at_its_height() {
+        let _init_guard = zebra_test::init();
+        let params = ZcashCrosslinkParameters {
+            bootstrap: BftBootstrap::Supplied,
+            ..zcash_primitives::bft::PROTOTYPE_PARAMETERS
+        };
+        let network = Network::new_regtest(zebra_chain::parameters::testnet::RegtestParameters {
+            crosslink: Some(params),
+            ..Default::default()
+        });
+        let config = crate::Config::ephemeral();
+
+        let mut finalized_state = crate::service::finalized_state::FinalizedState::new(
+            &config,
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        )
+        .expect("an ephemeral database opens");
+        let genesis = zebra_chain::block::genesis::regtest_genesis_block();
+        finalized_state
+            .commit_finalized_direct(crate::CheckpointVerifiedBlock::from(genesis.clone()).into(), None, "test")
+            .expect("the regtest genesis block commits");
+        let non_finalized_state = crate::service::non_finalized_state::NonFinalizedState::new(&network, Default::default());
+        let (non_finalized_state_sender, non_finalized_state_receiver) = tokio::sync::watch::channel(non_finalized_state.clone());
+        let (chain_tip_sender, _, _) = crate::service::chain_tip::ChainTipSender::new(None, &network);
+        let read_state = crate::service::ReadStateService::new(
+            &finalized_state,
+            None,
+            crate::service::watch_receiver::WatchReceiver::new(non_finalized_state_receiver),
+        );
+        let mut block_writer = WriteBlockWorkerTask::new(
+            finalized_state.clone(),
+            non_finalized_state,
+            chain_tip_sender,
+            non_finalized_state_sender,
+            None,
+        );
+
+        // The stored decision at height 0 finalizes a block this state does not hold. Another
+        // block at height 0 sits on the genesis block, which it does hold.
+        let lost_snapshot = hash(0x29);
+        let (stored, stored_fat_pointer) = regtest_block_on(&params, lost_snapshot, 1);
+        let (other, _) = regtest_block_on(&params, genesis.hash(), 2);
+        finalized_state.db.write_bft_decision(0, &stored, &stored_fat_pointer, &[]).expect("the decision is stored");
+
+        let mut runner = BftRunner::new(None, &config, &read_state, &mut block_writer, tokio::runtime::Handle::current());
+        runner.restore(&read_state, &mut block_writer);
+
+        let chain = BFT_CHAIN.read().unwrap();
+        assert!(chain.blocks.is_empty(), "replay stops at the decision whose snapshot is missing");
+        assert_eq!(
+            runner.validate(&chain, &read_state, &stored),
+            (TMStatus::Indeterminate, TMStatusReason::NeedsBlock { hash: lost_snapshot.0 }),
+            "the stored block waits for its snapshot",
+        );
+        assert_eq!(
+            runner.validate(&chain, &read_state, &other).0,
+            TMStatus::Fail,
+            "another block at a height this node has a stored decision for is refused, not voted for",
+        );
     }
 }
