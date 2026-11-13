@@ -47,7 +47,7 @@ use tracing_futures::Instrument;
 use zebra_chain::{
     block::Height,
     parameters::NetworkUpgrade,
-    transaction::{self, UnminedTxId, VerifiedUnminedTx},
+    transaction::{self, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
 use zebra_consensus::transaction as tx;
@@ -422,18 +422,32 @@ where
         source: Option<PeerSource>,
     ) -> Result<oneshot::Receiver<Verdict>, MempoolError> {
         let (rsp_tx, rsp_rx) = VerdictSender::channel();
-        self.queue(gossiped_tx, source, rsp_tx)
+        self.queue(gossiped_tx, source, rsp_tx, true)
             .map_err(|(error, _rsp_tx)| error)?;
         Ok(rsp_rx)
+    }
+
+    /// Queue a transaction taken out of the mempool's own storage for verification again, such
+    /// as a staking transaction on a new block.
+    ///
+    /// It is not counted against [`MAX_INBOUND_CONCURRENCY`]: the mempool's size limit already
+    /// bounds these, and a full queue would drop the transaction from the mempool.
+    pub fn reverify_mempool_transaction(&mut self, tx: UnminedTx) -> Result<(), MempoolError> {
+        let (rsp_tx, _rsp_rx) = VerdictSender::channel();
+        self.queue(Gossip::Tx(tx), None, rsp_tx, false)
+            .map_err(|(error, _rsp_tx)| error)
     }
 
     /// Queue an already-verified transaction for verification again, because the chain grew
     /// while it was verified, sending its verdict to `rsp_tx`.
     ///
     /// The transaction is re-queued without its source, so it doesn't count against the
-    /// source's cap again. If it can't be queued, its verdict is [`Verdict::Dropped`].
+    /// source's cap again. It is not counted against [`MAX_INBOUND_CONCURRENCY`] either: its
+    /// own task has just left the queue, so this doesn't grow it, and a re-verified mempool
+    /// transaction may be one of more than the queue holds. If it can't be queued, its verdict
+    /// is [`Verdict::Dropped`].
     pub fn requeue(&mut self, gossiped_tx: Gossip, rsp_tx: VerdictSender) {
-        if let Err((error, rsp_tx)) = self.queue(gossiped_tx, None, rsp_tx) {
+        if let Err((error, rsp_tx)) = self.queue(gossiped_tx, None, rsp_tx, false) {
             rsp_tx.send(Verdict::Dropped {
                 reason: error.to_string(),
             });
@@ -442,6 +456,9 @@ where
 
     /// Queue a transaction for download (if needed) and verification, sending its verdict to
     /// `rsp_tx`. If it can't be queued, returns why, along with `rsp_tx`.
+    ///
+    /// `enforce_queue_limit` is false only for transactions the mempool has already verified,
+    /// which [`MAX_INBOUND_CONCURRENCY`] is not meant to drop.
     #[instrument(skip(self, gossiped_tx, rsp_tx), fields(txid = %gossiped_tx.id()))]
     #[allow(clippy::unwrap_in_result)]
     fn queue(
@@ -449,6 +466,7 @@ where
         gossiped_tx: Gossip,
         source: Option<PeerSource>,
         rsp_tx: VerdictSender,
+        enforce_queue_limit: bool,
     ) -> Result<(), (MempoolError, VerdictSender)> {
         let txid = gossiped_tx.id();
 
@@ -465,7 +483,7 @@ where
             return Err((MempoolError::AlreadyQueued, rsp_tx));
         }
 
-        if self.pending.len() >= MAX_INBOUND_CONCURRENCY {
+        if enforce_queue_limit && self.pending.len() >= MAX_INBOUND_CONCURRENCY {
             debug!(
                 ?txid,
                 queue_len = self.pending.len(),

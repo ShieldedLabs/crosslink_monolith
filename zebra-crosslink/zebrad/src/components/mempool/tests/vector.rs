@@ -2150,7 +2150,12 @@ async fn setup_with_misbehavior_receiver(
         zebra_state::init(state_config, network, Height::MAX, 0).await;
     let state_service = ServiceBuilder::new().buffer(10).service(state);
 
-    let tx_verifier = MockService::build().for_unit_tests();
+    // Room for every download the mempool can have in flight at once (the staking tests have
+    // more than `MAX_INBOUND_CONCURRENCY`): past the mock's default of 100 unread requests, the
+    // oldest are dropped unanswered.
+    let tx_verifier = MockService::build()
+        .with_proxy_channel_size(2 * mempool::downloads::MAX_INBOUND_CONCURRENCY)
+        .for_unit_tests();
 
     let (sync_status, recent_syncs) = SyncStatus::new();
     let (misbehavior_tx, misbehavior_rx) = tokio::sync::mpsc::channel(10);
@@ -2754,6 +2759,319 @@ async fn conflicting_pushed_transaction_is_refused_before_verification() -> Resu
         results[0].is_ok(),
         "a transaction ID is queued, and checked for conflicts on insertion"
     );
+
+    Ok(())
+}
+
+/// A VCrosslink transaction that unbonds bond `index`, with a dummy fee and no sigops.
+/// Each index is a different bond, so the mempool's one-action-per-bond rule keeps them all.
+fn staking_unbond_transaction(index: u32) -> VerifiedUnminedTx {
+    use zebra_chain::{block::Height, transaction::LockTime};
+
+    let mut bond_key = [0xA5; 32];
+    bond_key[..4].copy_from_slice(&index.to_le_bytes());
+
+    let tx = Transaction::VCrosslink {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::Height(Height(0)),
+        expiry_height: Height(0),
+        inputs: vec![],
+        outputs: vec![],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+        staking_action: Some(
+            zcash_primitives::transaction::StakingAction::BeginDelegationUnbonding {
+                unique_pubkey: bond_key,
+                signature: [0; 64],
+                spends: None,
+            },
+        ),
+    };
+
+    VerifiedUnminedTx::new(
+        tx.into(),
+        Amount::try_from(1_000_000).expect("valid amount"),
+        0,
+        0,
+        std::sync::Arc::new(vec![]),
+    )
+    .expect("verification should pass")
+}
+
+/// Answers a verifier request with "valid" (dummy fee, no sigops).
+fn answer_valid(
+    responder: zebra_test::mock_service::ResponseSender<
+        tx::MempoolRequest,
+        tx::MempoolResponse,
+        TransactionError,
+    >,
+) {
+    let transaction = responder.request().clone().transaction;
+    responder.respond(transaction::MempoolResponse::from(
+        VerifiedUnminedTx::new(
+            transaction,
+            Amount::try_from(1_000_000).expect("valid amount"),
+            0,
+            0,
+            std::sync::Arc::new(vec![]),
+        )
+        .expect("verification should pass"),
+    ));
+}
+
+/// Answers `count` verifier requests with "valid".
+async fn verify_all(tx_verifier: &mut MockTxVerifier, count: usize) {
+    for _ in 0..count {
+        tx_verifier
+            .expect_request_that(|_| true)
+            .map(answer_valid)
+            .await;
+    }
+}
+
+/// Commits mainnet block 1, which activates a network upgrade (a `TipAction::Reset`), so the
+/// next block is a plain `TipAction::Grow`.
+async fn commit_block_1(
+    mempool: &mut Mempool,
+    chain_tip_change: &mut ChainTipChange,
+    block_writer: &mut zebra_state::WriteBlockWorkerTask,
+) {
+    let block1: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    block_writer
+        .commit_checkpoint_verified(block1.into())
+        .unwrap();
+    chain_tip_change
+        .wait_for_tip_change()
+        .await
+        .expect("unexpected chain tip update failure");
+    mempool.dummy_call().await;
+}
+
+/// Commits mainnet block 2 (a `TipAction::Grow`) and lets the mempool handle it.
+async fn commit_block_2(
+    mempool: &mut Mempool,
+    chain_tip_change: &mut ChainTipChange,
+    block_writer: &mut zebra_state::WriteBlockWorkerTask,
+) {
+    let block2: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    block_writer
+        .commit_checkpoint_verified(block2.into())
+        .unwrap();
+    chain_tip_change
+        .wait_for_tip_change()
+        .await
+        .expect("unexpected chain tip update failure");
+    mempool.dummy_call().await;
+}
+
+/// On every new block the mempool takes all staking transactions out of storage and re-queues
+/// them for verification. None of them may be lost when there are more than the download queue
+/// holds (`MAX_INBOUND_CONCURRENCY`).
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_keeps_staking_transactions_beyond_download_queue_after_block() -> Result<(), Report>
+{
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        mut chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+        mut block_writer,
+    ) = setup(&network, u64::MAX, true).await;
+
+    mempool.enable(&mut recent_syncs).await;
+    assert!(mempool.is_enabled());
+    commit_block_1(&mut mempool, &mut chain_tip_change, &mut block_writer).await;
+
+    let count = mempool::downloads::MAX_INBOUND_CONCURRENCY + 1;
+    for index in 0..count {
+        mempool
+            .storage()
+            .insert(staking_unbond_transaction(index as u32), Vec::new(), None)
+            .expect("staking transaction is accepted");
+    }
+    assert_eq!(mempool.storage().transaction_count(), count);
+
+    commit_block_2(&mut mempool, &mut chain_tip_change, &mut block_writer).await;
+
+    let held = mempool.storage().transaction_count() + mempool.tx_downloads().in_flight();
+    assert_eq!(
+        held, count,
+        "staking transactions were dropped from the mempool by the per-block re-verification"
+    );
+
+    // All of them pass re-verification and are back in storage.
+    verify_all(&mut tx_verifier, count).await;
+    for _ in 0..50 {
+        mempool.dummy_call().await;
+        if mempool.storage().transaction_count() == count {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(mempool.storage().transaction_count(), count);
+    assert_eq!(mempool.tx_downloads().in_flight(), 0);
+
+    Ok(())
+}
+
+/// The download queue is shared with gossip and crawler downloads. A single staking transaction
+/// must survive a new block while that queue is full of other downloads.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_keeps_staking_transaction_when_download_queue_is_full() -> Result<(), Report> {
+    use zebra_chain::transaction::{self as chain_tx, UnminedTxId};
+
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        mut chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+        mut block_writer,
+    ) = setup(&network, u64::MAX, true).await;
+
+    mempool.enable(&mut recent_syncs).await;
+    assert!(mempool.is_enabled());
+    commit_block_1(&mut mempool, &mut chain_tip_change, &mut block_writer).await;
+
+    // Fill the download queue with transaction IDs, as the crawler does (no source peer).
+    let queue_size = mempool::downloads::MAX_INBOUND_CONCURRENCY;
+    let ids: Vec<Gossip> = (0..queue_size as u32)
+        .map(|index| {
+            let mut hash = [0x5A; 32];
+            hash[..4].copy_from_slice(&index.to_le_bytes());
+            UnminedTxId::Legacy(chain_tx::Hash(hash)).into()
+        })
+        .collect();
+    let response = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::Queue(ids))
+        .await
+        .unwrap();
+    let Response::Queued(queued) = response else {
+        unreachable!("wrong response")
+    };
+    assert!(queued.iter().all(Result::is_ok));
+    assert_eq!(mempool.tx_downloads().in_flight(), queue_size);
+
+    let staking = staking_unbond_transaction(0);
+    let staking_id = staking.transaction.id;
+    mempool
+        .storage()
+        .insert(staking, Vec::new(), None)
+        .expect("staking transaction is accepted");
+
+    commit_block_2(&mut mempool, &mut chain_tip_change, &mut block_writer).await;
+
+    let in_storage = mempool
+        .storage()
+        .contains_transaction_exact(&staking_id.mined_id());
+    let in_queue = mempool
+        .tx_downloads()
+        .transaction_requests()
+        .any(|gossip| gossip.id() == staking_id);
+    assert!(
+        in_storage || in_queue,
+        "the staking transaction was dropped from the mempool after a block"
+    );
+
+    Ok(())
+}
+
+/// A transaction verified against a tip that has moved on is queued again (`Downloads::requeue`).
+/// When more staking transactions are being re-verified than the download queue holds, one that
+/// comes back after another block must not be dropped because the queue is still full.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_keeps_staking_transactions_beyond_download_queue_when_chain_grows_during_reverification(
+) -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        mut chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+        mut block_writer,
+    ) = setup(&network, u64::MAX, true).await;
+
+    mempool.enable(&mut recent_syncs).await;
+    assert!(mempool.is_enabled());
+    commit_block_1(&mut mempool, &mut chain_tip_change, &mut block_writer).await;
+
+    let count = mempool::downloads::MAX_INBOUND_CONCURRENCY + 1;
+    for index in 0..count {
+        mempool
+            .storage()
+            .insert(staking_unbond_transaction(index as u32), Vec::new(), None)
+            .expect("staking transaction is accepted");
+    }
+
+    commit_block_2(&mut mempool, &mut chain_tip_change, &mut block_writer).await;
+    let held = mempool.storage().transaction_count() + mempool.tx_downloads().in_flight();
+    assert_eq!(
+        held, count,
+        "staking transactions were dropped from the mempool by the per-block re-verification"
+    );
+
+    // Every re-verification reaches the verifier at block 2; hold the answers until block 3.
+    let mut responders = Vec::with_capacity(count);
+    for _ in 0..count {
+        responders.push(tx_verifier.expect_request_that(|_| true).await);
+    }
+    let block3: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_3_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    block_writer
+        .commit_checkpoint_verified(block3.into())
+        .unwrap();
+    chain_tip_change
+        .wait_for_tip_change()
+        .await
+        .expect("unexpected chain tip update failure");
+    mempool.dummy_call().await;
+
+    // Verified for block 3's parent, so the mempool queues each one again as it takes the
+    // answer in. Poll it, and answer the second round of requests as they come.
+    for responder in responders {
+        answer_valid(responder);
+    }
+    let mut verified_again = 0;
+    for _ in 0..100 {
+        mempool.dummy_call().await;
+        let held = mempool.storage().transaction_count() + mempool.tx_downloads().in_flight();
+        assert_eq!(
+            held, count,
+            "staking transactions were dropped when they were queued again after another block"
+        );
+        while let Some(responder) = tx_verifier.try_next_request().await {
+            answer_valid(responder);
+            verified_again += 1;
+        }
+        if verified_again == count && mempool.storage().transaction_count() == count {
+            break;
+        }
+    }
+    assert_eq!(
+        verified_again, count,
+        "every staking transaction is verified again"
+    );
+    assert_eq!(mempool.storage().transaction_count(), count);
+    assert_eq!(mempool.tx_downloads().in_flight(), 0);
 
     Ok(())
 }
