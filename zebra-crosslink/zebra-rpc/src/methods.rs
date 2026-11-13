@@ -285,7 +285,7 @@ pub trait Rpc {
     ///
     /// # Parameters
     ///
-    /// - `bond_key`: (string, required) The 32-byte bond key as a hex string.
+    /// - `bond_key`: (string, required) The 32-byte bond key as hex, as `wallet_staking_positions` lists it (`pk`).
     ///
     /// # Returns
     ///
@@ -299,7 +299,7 @@ pub trait Rpc {
     ///
     /// # Parameters
     ///
-    /// - `finalizer`: (string, required) The finalizer's 32-byte public key as hex.
+    /// - `finalizer`: (string, required) The finalizer's 32-byte public key as hex, as `wallet_staking_positions` groups by it.
     #[method(name = "getfinalizerrewardbalance")]
     async fn get_finalizer_reward_balance(&self, finalizer: String) -> Result<u64>;
 
@@ -1745,18 +1745,7 @@ where
     }
 
     async fn get_bond_info(&self, bond_key: String) -> Result<Option<GetBondInfoResponse>> {
-        let bond_key_bytes: [u8; 32] = Vec::from_hex(&bond_key)
-            .map_err(|_| ErrorObject::owned(
-                ErrorCode::InvalidParams.code(),
-                "invalid hex string for bond_key",
-                None::<()>,
-            ))?
-            .try_into()
-            .map_err(|_| ErrorObject::owned(
-                ErrorCode::InvalidParams.code(),
-                "bond_key must be exactly 32 bytes",
-                None::<()>,
-            ))?;
+        let bond_key_bytes = key_from_display_hex(&bond_key, "bond_key")?;
 
         let request = zebra_state::ReadRequest::BondInfo(bond_key_bytes);
         let response = self
@@ -1780,18 +1769,7 @@ where
     }
 
     async fn get_finalizer_reward_balance(&self, finalizer: String) -> Result<u64> {
-        let finalizer: [u8; 32] = Vec::from_hex(&finalizer)
-            .map_err(|_| ErrorObject::owned(
-                ErrorCode::InvalidParams.code(),
-                "invalid hex string for finalizer",
-                None::<()>,
-            ))?
-            .try_into()
-            .map_err(|_| ErrorObject::owned(
-                ErrorCode::InvalidParams.code(),
-                "finalizer must be exactly 32 bytes",
-                None::<()>,
-            ))?;
+        let finalizer = key_from_display_hex(&finalizer, "finalizer")?;
 
         let response = self
             .read_state
@@ -5042,6 +5020,46 @@ enum DGetAddressUtxosRequest {
 impl ValidateAddresses for GetAddressUtxosRequest {
     fn addresses(&self) -> &[String] {
         &self.addresses
+    }
+}
+
+/// Parses a 32-byte bond or finalizer key given as hex in display order: the order
+/// `wallet_staking_positions` lists bond keys (`pk`) and finalizer keys in, and the order
+/// `wallet_staking_action` takes and prints them in (`PubKeyID`'s `Display`, byte-reversed like a
+/// txid). Parsing the hex as stored bytes instead made `getbondinfo` answer `null` for every
+/// `pk` the wallet lists.
+fn key_from_display_hex(hex_str: &str, name: &str) -> Result<[u8; 32]> {
+    let mut bytes: [u8; 32] = Vec::from_hex(hex_str)
+        .map_err(|_| ErrorObject::owned(
+            ErrorCode::InvalidParams.code(),
+            format!("invalid hex string for {name}"),
+            None::<()>,
+        ))?
+        .try_into()
+        .map_err(|_| ErrorObject::owned(
+            ErrorCode::InvalidParams.code(),
+            format!("{name} must be exactly 32 bytes"),
+            None::<()>,
+        ))?;
+    bytes.reverse();
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod key_from_display_hex_tests {
+    use super::key_from_display_hex;
+    use zcash_primitives::bft::PubKeyID;
+
+    #[test]
+    fn parses_the_order_the_wallet_prints() {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = i as u8; // i < 32, so the cast is exact
+        }
+        let printed = PubKeyID(key).to_string();
+        assert_eq!(key_from_display_hex(&printed, "bond_key").unwrap(), key);
+        assert!(key_from_display_hex("zz", "bond_key").is_err());
+        assert!(key_from_display_hex(&"00".repeat(31), "bond_key").is_err());
     }
 }
 
