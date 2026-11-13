@@ -745,7 +745,7 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
         .to_network()
         .expect("configured network is valid");
 
-    let _genesis_block: Arc<Block> = zebra_test::vectors::BLOCK_TESTNET_GENESIS_BYTES
+    let genesis_block: Arc<Block> = zebra_test::vectors::BLOCK_TESTNET_GENESIS_BYTES
         .zcash_deserialize_into()
         .unwrap();
     let block1: Arc<Block> = zebra_test::vectors::BLOCK_TESTNET_1_BYTES
@@ -755,8 +755,9 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
         .zcash_deserialize_into()
         .unwrap();
 
-    // Don't commit the genesis block during setup: we commit it below so we control when the
-    // mempool first sees a chain tip (it can only be enabled once there is a tip).
+    // Don't commit the genesis block during setup: `setup` commits the Mainnet genesis block,
+    // and this network's blocks descend from the Testnet one. We commit it below so we control
+    // when the mempool first sees a chain tip (it can only be enabled once there is a tip).
     let (
         mut mempool,
         mut peer_set,
@@ -766,7 +767,14 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
         mut recent_syncs,
         _mempool_transaction_receiver,
         mut block_writer,
-    ) = setup(&network, u64::MAX, true).await;
+    ) = setup(&network, u64::MAX, false).await;
+
+    // Commit the Testnet genesis block so the mempool can be enabled.
+    block_writer.commit_genesis(genesis_block.clone()).unwrap();
+    chain_tip_change
+        .wait_for_tip_change()
+        .await
+        .expect("unexpected chain tip update failure");
 
     // Enable the mempool
     mempool.enable(&mut recent_syncs).await;
@@ -885,24 +893,17 @@ async fn mempool_reset_keeps_active_state_when_sync_status_falls_behind() -> Res
     let (
         mut mempool,
         mut peer_set,
-        mut state_service,
+        _state_service,
         mut chain_tip_change,
         _tx_verifier,
         mut recent_syncs,
         _mempool_transaction_receiver,
-        _block_writer,
-) = setup(&network, u64::MAX, false).await;
+        mut block_writer,
+    ) = setup(&network, u64::MAX, false).await;
 
-    // Commit the genesis block so the mempool can be enabled.
-    state_service
-        .ready()
-        .await
-        .unwrap()
-        .call(zebra_state::Request::CommitCheckpointVerifiedBlock(
-            genesis_block.clone().into(),
-        ))
-        .await
-        .unwrap();
+    // Commit the genesis block so the mempool can be enabled. Crosslink commits blocks
+    // through the block writer, not the state service.
+    block_writer.commit_genesis(genesis_block.clone()).unwrap();
     chain_tip_change
         .wait_for_tip_change()
         .await
@@ -944,15 +945,7 @@ async fn mempool_reset_keeps_active_state_when_sync_status_falls_behind() -> Res
 
     // Push block 1 to the state. Its next height (2) is the Overwinter
     // activation height, so this triggers a network-upgrade reset.
-    state_service
-        .ready()
-        .await
-        .unwrap()
-        .call(zebra_state::Request::CommitCheckpointVerifiedBlock(
-            block1.clone().into(),
-        ))
-        .await
-        .unwrap();
+    block_writer.commit_checkpoint_verified(block1.clone().into()).unwrap();
 
     // Wait for the chain tip update.
     if let Err(timeout_error) = timeout(
@@ -1178,9 +1171,6 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
     let block2: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_2_BYTES
         .zcash_deserialize_into()
         .unwrap();
-    let _block3: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_3_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
     let block4: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_4_BYTES
         .zcash_deserialize_into()
         .unwrap();
@@ -1201,7 +1191,7 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
     assert!(mempool.is_enabled());
 
     // Queue transaction from block 4 for download.
-    // Blocks 1-3 are committed to the state below, so the transaction must come from a
+    // Blocks 1-2 are committed to the state below, so the transaction must come from a
     // later block, or it would be cancelled as a mined transaction instead of re-verified.
     let tx = block4.transactions[0].clone();
     let txid = block4.transactions[0].unmined_id();
@@ -1250,8 +1240,10 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
         })
         .await;
 
-    // Push block 1 to the state. This is considered a network upgrade,
-    // and must cancel all pending transaction downloads with a `TipAction::Reset`.
+    // Push block 1 to the state. The mempool resets one block *before* an activation height
+    // (`ChainTipChange::action`), and on Mainnet the next height (2) activates nothing, so
+    // this is a `TipAction::Grow`: the transaction, verified at the old tip height, is
+    // re-verified.
     block_writer.commit_checkpoint_verified(block1.clone().into()).unwrap();
 
     // Wait for the chain tip update without a timeout
@@ -1261,7 +1253,8 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
         .await
         .expect("unexpected chain tip update failure");
 
-    // Query the mempool to make it poll chain_tip_change and try reverifying its state for the `TipAction::Reset`
+    // Query the mempool to make it poll chain_tip_change and tx_downloads, and re-queue the
+    // transaction verified at the previous tip height.
     mempool.dummy_call().await;
 
     // Check that there is still an in-flight tx_download and that
@@ -1269,16 +1262,8 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
     assert_eq!(mempool.storage().transaction_count(), 0);
 
-    // Verify the transaction again
-
-    peer_set
-        .expect_request_that(|req| matches!(req, zn::Request::TransactionsById(_)))
-        .map(|responder| {
-            responder.respond(zn::Response::Transactions(vec![
-                zn::InventoryResponse::Available((tx.into(), None)),
-            ]));
-        })
-        .await;
+    // Verify the transaction again. The retry carries the transaction it already
+    // downloaded, so it goes straight to the verifier without a peer request.
 
     // Verify the transaction now that the mempool has already checked chain_tip_change
     tx_verifier
@@ -1299,8 +1284,9 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
             ));
         })
         .await;
+    peer_set.expect_no_requests().await;
 
-    // Push block 3 to the state. This will increase the tip height past the expected
+    // Push block 2 to the state. This will increase the tip height past the expected
     // tip height that the tx was verified at.
     block_writer.commit_checkpoint_verified(block2.clone().into()).unwrap();
 
