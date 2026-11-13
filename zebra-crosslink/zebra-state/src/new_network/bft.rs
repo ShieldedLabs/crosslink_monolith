@@ -713,7 +713,10 @@ pub fn certificate_is_valid(fat_pointer: &FatPointerToBftBlock, bft_height: u64,
     let active = &voting.roster[..];
     let total_stake: u64 = active.iter().map(|member| member.stake).sum();
     if total_stake == 0 {
-        return fat_pointer.signatures.is_empty() && vote.round == 0;
+        // Only genesis is decided by the nil roster. Above it, a roster whose stake has gone to
+        // zero (zero-zat bonds, every member terminated) decides nothing: an empty certificate
+        // there would pass any block as final.
+        return bft_height == 0 && fat_pointer.signatures.is_empty() && vote.round == 0;
     }
     let mut signed_stake: u64 = 0;
     let mut next = 0;
@@ -2966,6 +2969,46 @@ mod tests {
         assert!(!certificate_is_valid(&FatPointerToBftBlock::from_parts(Blake3Hash([7; 32]), 0, 1, &[]), 0, &nil));
         let (keys, _) = four_finalizers(false, [0; 32]);
         assert!(!certificate_is_valid(&certificate(template(0, 0x8000_0000), &keys, &[0], &[0; 32]), 0, &nil));
+    }
+
+    /// `FatPointerToBftBlock::try_from_bytes` reads back what `to_bytes` writes, and refuses
+    /// truncated input, trailing bytes and a signature count past the data.
+    #[test]
+    fn fat_pointer_try_from_bytes_reads_back_to_bytes() {
+        let (keys, _) = four_finalizers(false, [0; 32]);
+        for signers in [&[][..], &[0][..], &[0, 1, 2][..]] {
+            let fat_pointer = certificate(template(5, 0x8000_0000), &keys, signers, &[0; 32]);
+            let bytes = fat_pointer.to_bytes();
+            let read = std::panic::catch_unwind(|| FatPointerToBftBlock::try_from_bytes(&bytes));
+            assert!(read.is_ok(), "try_from_bytes panicked on a {}-byte fat pointer", bytes.len());
+            assert_eq!(read.unwrap(), Some(fat_pointer), "{} signatures", signers.len());
+        }
+
+        let bytes = certificate(template(5, 0x8000_0000), &keys, &[0, 1], &[0; 32]).to_bytes();
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        let mut count_past_data = bytes.clone();
+        count_past_data[44] = 3;
+        for bad in [&bytes[..bytes.len() - 1], &trailing[..], &count_past_data[..], &bytes[..45]] {
+            let read = std::panic::catch_unwind(|| FatPointerToBftBlock::try_from_bytes(bad));
+            assert!(matches!(read, Ok(None)), "{}-byte input not refused", bad.len());
+        }
+    }
+
+    /// Only genesis is decided without stake. A roster whose members all have zero stake (every
+    /// bond a zero-zat bond from before FeaturenetUpgrade1, or every member terminated) must not
+    /// make an empty certificate valid above it, or any block there would pass as final.
+    #[test]
+    fn certificate_is_valid_refuses_an_empty_certificate_above_genesis_from_a_zero_stake_roster() {
+        let (keys, mut voting) = four_finalizers(false, [0; 32]);
+        for member in &mut voting.roster {
+            member.stake = 0;
+        }
+        let empty = FatPointerToBftBlock::from_parts(Blake3Hash([7; 32]), 5, 0, &[]);
+        assert!(!certificate_is_valid(&empty, 5, &voting), "zero-stake roster: empty certificate accepted at height 5");
+        let nil = VotingRoster { roster: Vec::new(), vote_namespace: [0; 32], strict_quorum: false };
+        assert!(!certificate_is_valid(&empty, 5, &nil), "nil roster: empty certificate accepted at height 5");
+        assert!(!certificate_is_valid(&certificate(template(5, 0x8000_0000), &keys, &[0, 1, 2, 3], &[0; 32]), 5, &voting));
     }
 
     /// The rule switches on the height of the roster's snapshot, and with it the namespace: nil

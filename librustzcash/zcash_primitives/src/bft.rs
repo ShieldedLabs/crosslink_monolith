@@ -1158,27 +1158,11 @@ impl FatPointerToBftBlock {
         buf
     }
 
-    #[allow(clippy::reversed_empty_ranges)]
-    pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 76 - 32 + 2 {
-            return None;
-        }
-        let vote_for_block_without_finalizer_public_key = bytes[0..76 - 32].try_into().unwrap();
-        let len = u16::from_le_bytes(bytes[76 - 32..2].try_into().unwrap()) as usize;
-
-        if 76 - 32 + 2 + len * (32 + 64) > bytes.len() {
-            return None;
-        }
-        let rem = &bytes[76 - 32 + 2..];
-        let signatures = rem
-            .chunks_exact(32 + 64)
-            .map(|chunk| FatPointerSignature::from_bytes(chunk.try_into().unwrap()))
-            .collect();
-
-        Some(Self {
-            vote_for_block_without_finalizer_public_key,
-            signatures,
-        })
+    /// Reads what [`Self::to_bytes`] writes, with the same limits as
+    /// [`Self::zcash_deserialize`]. Refuses truncated input and trailing bytes.
+    pub fn try_from_bytes(mut bytes: &[u8]) -> Option<Self> {
+        let fat_pointer = Self::zcash_deserialize(&mut bytes).ok()?;
+        bytes.is_empty().then_some(fat_pointer)
     }
 
     pub fn from_parts(bft_block_hash: Blake3Hash, height: u64, round: u32, signatures: &[FatPointerSignature]) -> Self {
