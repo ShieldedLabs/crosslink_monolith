@@ -745,6 +745,21 @@ where
         self.pending.len()
     }
 
+    /// Whether `tx` conflicts with a full transaction being verified that no peer sent: one the
+    /// mempool held before a chain reset and is verifying again, or a local submission.
+    ///
+    /// A reset empties the mempool and verifies its transactions again in the background, so
+    /// until that finishes the storage alone would let a conflicting newcomer in, and whichever
+    /// verified first would win. Peer-sent ones are left out: anyone can forge a transaction
+    /// spending someone else's outputs, and one still being verified would then keep the real
+    /// spend out.
+    pub fn unsourced_conflict(&self, tx: &zebra_chain::transaction::UnminedTx) -> Option<super::storage::SameEffectsTipRejectionError> {
+        self.cancel_handles.values().find_map(|(_, gossip, source)| match (gossip, source) {
+            (Gossip::Tx(pending), None) if pending.id != tx.id => super::storage::transactions_conflict(pending, tx),
+            _ => None,
+        })
+    }
+
     /// Get a list of the currently pending transaction requests.
     pub fn transaction_requests(&self) -> impl Iterator<Item = &Gossip> {
         self.cancel_handles

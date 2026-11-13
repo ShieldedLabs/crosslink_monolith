@@ -500,7 +500,7 @@ impl Mempool {
         storage.should_download_or_verify(candidate.id())?;
 
         if let Gossip::Tx(tx) = &candidate {
-            if let Some(conflict) = storage.conflict(tx) {
+            if let Some(conflict) = storage.conflict(tx).or_else(|| tx_downloads.unsourced_conflict(tx)) {
                 trace!(txid = ?tx.id, ?conflict, "refused a conflicting candidate before verifying it");
                 metrics::counter!("mempool.refused.conflict.total").increment(1);
                 return Err(QueueRefusal::SpendConflict);

@@ -2757,3 +2757,110 @@ async fn conflicting_pushed_transaction_is_refused_before_verification() -> Resu
 
     Ok(())
 }
+
+/// A chain reset empties the mempool and verifies its transactions again. Until one of them is
+/// verified, a full transaction conflicting with it is refused, from a peer or not, so the
+/// transaction the mempool held keeps its place whichever verification would finish first. A
+/// transaction a peer sent that is still being verified holds no place: a peer can forge a
+/// spend of anyone's outputs.
+#[tokio::test(flavor = "multi_thread")]
+async fn transaction_verified_again_after_a_reset_keeps_out_conflicts() -> Result<(), Report> {
+    use zebra_chain::transaction::UnminedTx;
+
+    // As in `mempool_cancel_downloads_after_network_upgrade`: Overwinter activates at height 2,
+    // so committing block 1 resets the mempool.
+    let network = ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(2),
+            sapling: Some(3),
+            blossom: Some(4),
+            heartwood: Some(5),
+            canopy: Some(6),
+            nu5: Some(7),
+            nu6: Some(8),
+            nu6_1: Some(9),
+            nu6_2: Some(10),
+            nu6_3: Some(11),
+            featurenet_upgrade_1: None,
+            featurenet_upgrade_2: None,
+            featurenet_upgrade_3: None,
+            nu7: Some(12),
+        })
+        .expect("activation heights are valid")
+        .extend_funding_streams()
+        .to_network()
+        .expect("configured network is valid");
+    // Mainnet's, as `setup` commits Mainnet's genesis block on any network.
+    let block1: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into().unwrap();
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        mut chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+        mut block_writer,
+    ) = setup(&network, u64::MAX, true).await;
+    mempool.enable(&mut recent_syncs).await;
+    mempool.dummy_call().await;
+
+    // Not from block 1, or committing it would cancel the transaction as mined.
+    let spends_and_pays = |transaction: &VerifiedUnminedTx| {
+        let transaction = &transaction.transaction.transaction;
+        !transaction.outputs().is_empty()
+            && transaction.inputs().iter().any(|input| matches!(input, transparent::Input::PrevOut { .. }))
+    };
+    // From Mainnet's vectors: a later Testnet vector no longer parses.
+    let mut candidates = Network::Mainnet.unmined_transactions_in_blocks(2..).filter(spends_and_pays);
+    let held = candidates.next().expect("a test transaction that spends an outpoint and has an output");
+    let from_peer = candidates.next().expect("a second such test transaction");
+    let conflict_with = |transaction: &VerifiedUnminedTx| {
+        let mut conflicting = (*transaction.transaction.transaction).clone();
+        let new_value: i64 = if i64::from(conflicting.outputs()[0].value) == 1 { 2 } else { 1 };
+        conflicting.outputs_mut()[0].value = Amount::try_from(new_value).expect("a valid value");
+        let conflicting = UnminedTx::from(conflicting);
+        assert_ne!(conflicting.id, transaction.transaction.id);
+        conflicting
+    };
+
+    mempool.storage().insert(held.clone(), Vec::new(), None).expect("the held transaction is inserted");
+
+    block_writer.commit_checkpoint_verified(block1.into()).unwrap();
+    chain_tip_change.wait_for_tip_change().await.expect("the tip changes");
+    mempool.dummy_call().await;
+    assert_eq!(mempool.storage().transaction_count(), 0, "the reset empties the mempool");
+    assert_eq!(mempool.tx_downloads().in_flight(), 1, "and verifies the held transaction again");
+    let reverify = tx_verifier.expect_request_that(|_| true).await;
+
+    let conflicting = conflict_with(&held);
+    for source in [Some(PeerSource::Stp([5; 32])), Some(PeerSource::Legacy("203.0.113.12:8233".parse()?)), None] {
+        let results = queue_candidates(&mut mempool, vec![conflicting.clone().into()], source).await;
+        assert!(
+            matches!(results[0], Err(QueueRefusal::SpendConflict)),
+            "a transaction conflicting with one being verified again is refused, from {source:?}"
+        );
+    }
+    tx_verifier.expect_no_requests().await;
+
+    reverify.respond(tx::MempoolResponse { transaction: held.clone(), spent_mempool_outpoints: Vec::new() });
+    for _ in 0..100 {
+        mempool.dummy_call().await;
+        if mempool.storage().transaction_count() == 1 {
+            break;
+        }
+        time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(mempool.storage().contains_transaction_exact(&held.transaction.id.mined_id()), "the held transaction is back");
+    let results = queue_candidates(&mut mempool, vec![conflicting.into()], None).await;
+    assert!(matches!(results[0], Err(QueueRefusal::SpendConflict)), "and still keeps the conflict out");
+
+    // A peer's transaction being verified does not keep a conflicting one out.
+    let results = queue_candidates(&mut mempool, vec![from_peer.transaction.clone().into()], Some(PeerSource::Stp([6; 32]))).await;
+    assert!(results[0].is_ok(), "the peer's transaction is queued");
+    let results = queue_candidates(&mut mempool, vec![conflict_with(&from_peer).into()], None).await;
+    assert!(results[0].is_ok(), "a transaction conflicting with a peer's unverified one is queued");
+
+    Ok(())
+}
