@@ -737,6 +737,12 @@ impl TxRelay {
         }
     }
 
+    /// The peers relay holds state for that are not in `live`: each is owed an
+    /// [`Self::on_peer_gone`].
+    pub fn peers_not_in(&self, live: &HashSet<ConnectionKey>) -> Vec<ConnectionKey> {
+        self.peers.keys().filter(|key| !live.contains(key)).copied().collect()
+    }
+
     /// Statuses due, asks refilled, re-requests of what was not delivered, giving up on what
     /// nobody delivers, and a `MEMPOOL_REQ` to each peer once per session. `live` are the
     /// connected peers.
@@ -1046,6 +1052,29 @@ mod tests {
         // When peer 1 goes, what only it listed and nobody is asked for goes with it.
         relay.on_peer_gone(peer(1));
         assert_eq!(relay.wanted.keys().collect::<Vec<_>>(), vec![&id(100_000)]);
+    }
+
+    #[test]
+    fn a_peer_heard_and_gone_without_being_polled_is_found_and_its_listing_forgotten() {
+        let now = Instant::now();
+        let mut relay = TxRelay::default();
+        let (a, b) = (peer(1), peer(2));
+        // `a` lists ids and asks for ours but is never in a poll's live list: it went in the tick
+        // it came.
+        relay.on_status(a, (0..4).map(|n| (id(n), 100)).collect(), now);
+        relay.on_filtered(a, (0..4).map(|n| (id(n), 100)).collect(), now);
+        relay.on_request(b, vec![id(9)], now);
+        assert_eq!(relay.wanted.len(), 4);
+        let live: HashSet<ConnectionKey> = [b].into_iter().collect();
+        assert_eq!(relay.peers_not_in(&live), vec![a]);
+        for gone in relay.peers_not_in(&live) {
+            relay.on_peer_gone(gone);
+        }
+        assert!(relay.peers_not_in(&live).is_empty());
+        assert!(relay.wanted.is_empty(), "what only `a` listed is forgotten with it");
+        // A late answer for it is not taken.
+        relay.on_filtered(a, vec![(id(5), 100)], now);
+        assert!(relay.wanted.is_empty());
     }
 
     #[test]

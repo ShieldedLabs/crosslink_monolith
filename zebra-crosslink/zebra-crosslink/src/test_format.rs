@@ -253,6 +253,10 @@ impl TFInstr {
     pub const EXPECT_POOL_TOTALS: TFInstrKind = 17;
     /// An STP application packet (the data, type byte first) arriving from synthetic peer
     /// `val[0]`. Fails when the node kills the peer for it; any other handling passes.
+    /// With `val[1]` `TF_STP_FIRST_PACKETS`, the data is several packets, each after its length
+    /// as a little-endian u32, from a peer the node has not heard of yet: the node hears of the
+    /// peer and receives all of them in the same tick, as it does a real peer whose first
+    /// messages arrive with its handshake.
     pub const RECV_STP_PACKET: TFInstrKind = 19;
     /// The best chain's tip is the block whose hash is the data, or, with no data, the block
     /// remembered in slot `val[0]`. Says which of two equally long branches the node is on.
@@ -458,6 +462,9 @@ impl TFInstr {
             Some(TestInstr::RecvStpPacket { packet, peer }) => {
                 str += &format!("type {:?}, {} bytes from peer {peer}", packet.first(), packet.len())
             }
+            Some(TestInstr::RecvStpFirstPackets { packets, peer }) => {
+                str += &format!("{} first packets from new peer {peer}", packets.len())
+            }
             Some(TestInstr::RecvTxStp { tx, peer }) => str += &format!("{} via STP peer {peer}", tx.hash()),
             Some(TestInstr::ExpectBftDropped { dropped, hash }) => {
                 str += &format!("{dropped}");
@@ -533,6 +540,9 @@ impl StpClaim {
         Some((StpClaim { hash, parent, height }, &data[Self::SIZE..]))
     }
 }
+
+/// RECV_STP_PACKET's `val[1]`: the data is a new peer's first packets, length-prefixed.
+pub const TF_STP_FIRST_PACKETS: u64 = 1;
 
 /// SUBMIT_TX's doorways, in `val[1]`.
 pub const TF_TX_LOCAL: u64 = 0;
@@ -831,6 +841,16 @@ impl TF {
 
     pub fn push_instr_recv_stp_packet(&mut self, packet: &[u8], peer: u64, flags: u32) {
         self.push_instr_ex(TFInstr::RECV_STP_PACKET, flags, packet, [peer, 0])
+    }
+
+    /// See `TF_STP_FIRST_PACKETS`.
+    pub fn push_instr_recv_stp_first_packets(&mut self, packets: &[Vec<u8>], peer: u64, flags: u32) {
+        let mut data = Vec::new();
+        for packet in packets {
+            data.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+            data.extend_from_slice(packet);
+        }
+        self.push_instr_ex(TFInstr::RECV_STP_PACKET, flags, &data, [peer, TF_STP_FIRST_PACKETS])
     }
 
     pub fn push_instr_recv_tx_stp(&mut self, tx: &Transaction, peer: u64, flags: u32) {
@@ -1461,6 +1481,16 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
                 Some(TestInstr::ExpectFinalizedTip { hash, slot })
             }
         }
+        TFInstr::RECV_STP_PACKET if instr.val[1] == TF_STP_FIRST_PACKETS => {
+            let mut data = instr.data_slice(bytes);
+            let mut packets = Vec::new();
+            while !data.is_empty() {
+                let len = u32::from_le_bytes(data.get(..4)?.try_into().ok()?) as usize;
+                packets.push(data.get(4..4 + len)?.to_vec());
+                data = &data[4 + len..];
+            }
+            Some(TestInstr::RecvStpFirstPackets { packets, peer: instr.val[0] })
+        }
         TFInstr::RECV_STP_PACKET => Some(TestInstr::RecvStpPacket {
             packet: instr.data_slice(bytes).to_vec(),
             peer: instr.val[0],
@@ -1504,6 +1534,8 @@ pub(crate) enum TestInstr {
     /// With a claim, the peer advertises it instead of what the bytes parse to.
     RecvPoW { block: Vec<u8>, peer: u64, claim: Option<StpClaim> },
     RecvStpPacket { packet: Vec<u8>, peer: u64 },
+    /// A new peer's first packets, all heard in the tick the node first hears of the peer.
+    RecvStpFirstPackets { packets: Vec<Vec<u8>>, peer: u64 },
     RecvTxStp { tx: Transaction, peer: u64 },
     MineFromTemplate { slot: u64 },
     /// The block named by `hash`, or by `slot` when there is no hash.
@@ -1976,6 +2008,11 @@ pub(crate) async fn handle_instr(
                 check_ingest(flags, &format!("LOAD_POW via STP peer {peer}: "), outcome);
             }
         },
+
+        TestInstr::RecvStpFirstPackets { packets, peer } => {
+            let (survived, message) = deliver_first_stp_packets(peer, packets).await;
+            test_check(flags, survived, &message);
+        }
 
         TestInstr::RecvStpPacket { packet, peer } => match take_stp_peer(peer) {
             Err(err) => test_check_outcome(false, false, &format!("RECV_STP_PACKET: {err}")),
@@ -2530,6 +2567,42 @@ fn drain_stp_peer(stp: &mut HarnessStpPeer) {
             stp.killed = Some(reason);
         }
     }
+}
+
+/// Attaches synthetic peer `index`, which must be new, with `packets` already queued, so the sync
+/// loop reads them in the tick it attaches the peer; then waits as `deliver_stp_packet` does.
+async fn deliver_first_stp_packets(index: u64, packets: Vec<Vec<u8>>) -> (bool, String) {
+    use zebra_state::new_network::SyntheticPeerEvent;
+    if TEST_STP_PEERS.lock().unwrap().iter().any(|p| p.index == index) {
+        return (false, format!("RECV_STP_PACKET: peer {index} is not new"));
+    }
+    let Ok(link_index) = u16::try_from(index) else {
+        return (false, format!("synthetic peer index {index} does not fit in 16 bits"));
+    };
+    let n = packets.len();
+    let mut stp = HarnessStpPeer {
+        index,
+        link: zebra_state::new_network::attach_synthetic_peer_with_packets(link_index, packets),
+        killed: None,
+    };
+    let deadline = tokio::time::Instant::now() + STP_PACKET_SETTLE;
+    let verdict = loop {
+        tokio::select! {
+            event = stp.link.events.recv() => match event {
+                Some(SyntheticPeerEvent::Killed(reason)) => {
+                    stp.killed = Some(reason.clone());
+                    break (false, format!("RECV_STP_PACKET: the node killed new peer {index} for its first {n} packets: {reason}"));
+                }
+                Some(_) => {}
+                None => break (false, "RECV_STP_PACKET: the sync loop is gone".to_string()),
+            },
+            _ = tokio::time::sleep_until(deadline) => {
+                break (true, format!("RECV_STP_PACKET: new peer {index} still connected after {STP_PACKET_SETTLE:?}"));
+            }
+        }
+    };
+    put_stp_peer(stp);
+    verdict
 }
 
 async fn deliver_stp_packet(stp: &mut HarnessStpPeer, packet: Vec<u8>) -> (bool, String) {

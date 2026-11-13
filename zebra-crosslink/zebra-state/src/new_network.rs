@@ -1885,6 +1885,13 @@ static SYNTHETIC_PEERS_TO_ATTACH: std::sync::Mutex<Vec<SyntheticPeerLink>> = std
 /// is behaviour tests assert on, and in debug builds the kill path would otherwise stop the
 /// process.
 pub fn attach_synthetic_peer(index: u16) -> SyntheticPeer {
+    attach_synthetic_peer_with_packets(index, Vec::new())
+}
+
+/// [`attach_synthetic_peer`], with `packets` already received from the peer when the sync loop
+/// first hears of it, so they are read in that same tick, as a real peer's first messages are
+/// when they arrive with its handshake.
+pub fn attach_synthetic_peer_with_packets(index: u16, packets: Vec<Vec<u8>>) -> SyntheticPeer {
     tenderlink::DBG_TRAPS.store(false, std::sync::atomic::Ordering::Relaxed);
 
     // 127.2.x.y is loopback nobody listens on, so if the address is ever gossiped or dialled,
@@ -1902,6 +1909,9 @@ pub fn attach_synthetic_peer(index: u16) -> SyntheticPeer {
     let (inbound_tx, inbound_rx) = std::sync::mpsc::channel();
     let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel();
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+    for packet in packets {
+        let _ = inbound_tx.send(packet);
+    }
     SYNTHETIC_PEERS_TO_ATTACH.lock().unwrap().push(SyntheticPeerLink {
         address: address.clone(),
         inbound: inbound_rx,
@@ -2189,10 +2199,9 @@ pub fn sync(
     tx_relay: Option<tx_relay::TxRelayLaunch>,
 ) {
     // Transaction relay over our own connections: the mempool bridge, relay's bookkeeping,
-    // the connections it knows of, what it wants done, and whether it is active this tick.
+    // what it wants done, and whether it is active this tick.
     let tx_bridge = tx_relay.map(|launch| tx_relay_bridge::spawn(&rt, launch));
     let mut tx_state = tx_relay_state::TxRelay::default();
-    let mut tx_live: HashSet<ConnectionKey> = HashSet::new();
     let mut tx_outs: Vec<tx_relay_state::Out> = Vec::new();
     let mut tx_relay_active = false;
     // Bytes of each peer's TX bodies queued to the bridge to decode.
@@ -3399,11 +3408,13 @@ pub fn sync(
             let now = std::time::Instant::now();
             let live_now: HashSet<ConnectionKey> = current_connections.iter().map(|(a, _)| a.connection_key()).collect();
             let () = tx_relay_bridge::ASSUME_PEER_GONE_FOR_EVERY_KEY;
-            for gone in tx_live.difference(&live_now) {
-                tx_state.on_peer_gone(*gone);
-                tx_decoding.remove(gone);
+            // Every peer relay holds state for, not only those live at the last tick: a peer can be
+            // heard from (TX_STATUS, TX_REQ, MEMPOOL_REQ) and killed in the tick it first appears,
+            // between two of these, and its state, and the ids it alone listed, would stay for good.
+            for gone in tx_state.peers_not_in(&live_now) {
+                tx_state.on_peer_gone(gone);
             }
-            tx_live = live_now;
+            tx_decoding.retain(|key, _| live_now.contains(key));
             // Near the PoW tip and not catching up on BFT: otherwise our mempool is judged
             // against a stale chain, and so would everything peers send. Peers' tips are their
             // unverified claims, so the lower median is used, of the peers we chose from our
@@ -3468,7 +3479,7 @@ pub fn sync(
             }
 
             if tx_relay_active {
-                let live: Vec<ConnectionKey> = tx_live.iter().copied().collect();
+                let live: Vec<ConnectionKey> = live_now.iter().copied().collect();
                 tx_outs.extend(tx_state.poll(&live, now));
             }
 
@@ -3477,7 +3488,8 @@ pub fn sync(
             // does not fit is rolled back, so it is made again rather than waited on.
             let mut reserved: HashMap<(ConnectionKey, bool), u64> = HashMap::new();
             let mut try_send = |to: ConnectionKey, packet: Vec<u8>, bulk: bool| -> bool {
-                let is_synthetic = synthetic_peers.iter().any(|p| p.address.connection_key() == to);
+                // A killed synthetic peer has no budget, as a disconnected real one has none.
+                let is_synthetic = synthetic_peers.iter().any(|p| p.alive && p.address.connection_key() == to);
                 let channel = if bulk { Channel::Bulk } else { Channel::Control };
                 let budget = if is_synthetic { u64::MAX } else { network_thread_handle.send_budget(to, channel) };
                 let headroom = if packet[0] == PACKET_TYPE_TX_STATUS { TX_STATUS_CONTROL_HEADROOM } else { 0 };
