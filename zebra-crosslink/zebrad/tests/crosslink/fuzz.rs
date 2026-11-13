@@ -86,6 +86,10 @@ pub(crate) struct FuzzGen {
     pub rival_height: u32,
     /// Next fresh peer index for deliveries that may get the peer disconnected.
     pub next_fresh_peer: u64,
+    /// Hashes a peer has already served corrupt bytes under. A refused delivery puts the hash in
+    /// the node's backoff, so another offer of it may go unasked for longer than an instruction
+    /// waits; the node is right not to ask, and the input must not depend on when it does.
+    pub claimed: Vec<zebra_chain::block::Hash>,
     /// For distinct forks: each one mines to its own address.
     pub forks_made: u64,
 
@@ -179,7 +183,7 @@ impl FuzzGen {
         tf.push_instr_load_pow(&gen.tip, 0);
         let model_tip = (1, gen.tip.hash());
         FuzzGen {
-            tf, network, key, miner, main: vec![gen], tip_known: true, rival_height: 0, next_fresh_peer: FRESH_PEERS_FROM, forks_made: 0,
+            tf, network, key, miner, main: vec![gen], tip_known: true, rival_height: 0, next_fresh_peer: FRESH_PEERS_FROM, claimed: Vec::new(), forks_made: 0,
             params: params.clone(), pending: Vec::new(), mined_spends: Vec::new(), unsure_coins: Default::default(), bonds: Vec::new(),
             mined_staking: Vec::new(), txs_made: 0, model_rival_height: 0, model_tip,
         }
@@ -325,7 +329,11 @@ fn move_mangled_block(g: &mut FuzzGen, c: &mut Choices) {
         bytes.truncate(cut);
     }
     let parses = Block::zcash_deserialize(&bytes[..]).is_ok_and(|b| b.coinbase_height().is_some());
-    if parses && !c.unusual(64) {
+    let claimed_before = g.claimed.contains(&valid.hash());
+    if !parses && claimed_before {
+        return;
+    }
+    if parses && (claimed_before || !c.unusual(64)) {
         // Only loaded, not offered as itself by a peer: a node need not fetch an advertised block
         // (one at a height it holds adds no work), and an offer it ignores costs the
         // instruction's whole wait.
@@ -339,6 +347,7 @@ fn move_mangled_block(g: &mut FuzzGen, c: &mut Choices) {
     // Claimed as the valid block, which is at the next height, so the node asks for it. Bytes
     // that do not hash to the claim, or do not parse, are not that block.
     let claim = StpClaim::of(&valid).expect("a generated block has a coinbase height");
+    g.claimed.push(valid.hash());
     let peer = g.next_fresh_peer;
     g.next_fresh_peer += 1;
     let same = bytes == valid.zcash_serialize_to_vec().expect("a generated block serializes");
