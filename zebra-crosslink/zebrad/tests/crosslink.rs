@@ -2576,12 +2576,17 @@ fn crosslink_honest_block_accepted_after_forged_body_with_its_hash() {
     chain_length += 1;
     tf.push_instr_expect_pow_chain_length(chain_length, 0);
 
-    // the same, both from one peer
+    // the same forger again: the node no longer asks a peer for a hash it served bad bytes
+    // under, so the honest block comes from another peer, but it still asks the forger for
+    // other blocks
     let honest = gen.next_block(&miner);
     let mut forged = honest.as_ref().clone();
     forged.transactions.push(forged.transactions[0].clone());
     tf.push_instr_recv_pow(&forged, 0, SHOULD_FAIL);
-    tf.push_instr_recv_pow(&honest, 0, 0);
+    tf.push_instr_recv_pow(&honest, 4, 0);
+    chain_length += 1;
+    tf.push_instr_expect_pow_chain_length(chain_length, 0);
+    tf.push_instr_recv_pow(&gen.next_block(&miner), 0, 0);
     chain_length += 1;
     tf.push_instr_expect_pow_chain_length(chain_length, 0);
 
@@ -2594,8 +2599,10 @@ fn crosslink_honest_block_accepted_after_forged_body_with_its_hash() {
     chain_length += 1;
     tf.push_instr_expect_pow_chain_length(chain_length, 0);
 
-    // a forged signature: it passes every check keyed by the hash and fails only late
-    for (forged_peer, honest_peer) in [(2, 3), (2, 2)] {
+    // a forged signature: it passes every check keyed by the hash and fails only late. The second
+    // time, the same forger forges another block: it is asked for that one, a hash it has not
+    // served bad bytes under, and the honest block again comes from another peer.
+    for (forged_peer, honest_peer) in [(2, 3), (2, 5)] {
         while gen.mature_coinbase_for(&key).is_none() {
             tf.push_instr_load_pow(&gen.next_block(&miner), 0);
             chain_length += 1;
