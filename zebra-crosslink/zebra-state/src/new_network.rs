@@ -2110,21 +2110,46 @@ fn known_outcome(read_state: &ReadState, hash: Hash) -> Option<IngestOutcome> {
 // A peer-served block that failed verification. Its hash goes unrequested until `retry_at` rather
 // than being banned: the hash covers only the header, and a forged body or forged signatures can
 // sit under an honest block's hash, so a ban would let any peer keep us off the honest block.
+//
+// The peers that served it are not asked for the hash again while the entry lives. Each request
+// holds one of the hash's MAX_REQUEST_DUPLICATES_N places until it is answered or its deadline
+// (minutes) passes, so two peers that serve forged bytes and then go quiet would otherwise hold
+// both places, and the peer with the real block would never be asked.
 struct Rejection {
     strikes: u32,
     retry_at: std::time::Instant,
+    served_by: Vec<ConnectionKey>,
 }
 
-fn note_rejection<K: Eq + std::hash::Hash>(rejections: &mut HashMap<K, Rejection>, key: K) {
+const MAX_REJECTION_SERVERS: usize = 16;
+
+fn note_rejection<K: Eq + std::hash::Hash>(rejections: &mut HashMap<K, Rejection>, key: K) -> &mut Rejection {
     let now = std::time::Instant::now();
-    let rejection = rejections.entry(key).or_insert(Rejection { strikes: 0, retry_at: now });
+    let rejection = rejections.entry(key).or_insert(Rejection { strikes: 0, retry_at: now, served_by: Vec::new() });
     rejection.strikes += 1;
     let backoff = REJECTED_BLOCK_BACKOFF_MIN.saturating_mul(1 << (rejection.strikes - 1).min(16));
     rejection.retry_at = now + backoff.min(REJECTED_BLOCK_BACKOFF_MAX);
+    rejection
+}
+
+fn note_rejected_server(rejection: &mut Rejection, server: ConnectionKey) {
+    if rejection.served_by.contains(&server) {
+        return;
+    }
+    if rejection.served_by.len() >= MAX_REJECTION_SERVERS {
+        rejection.served_by.remove(0);
+    }
+    rejection.served_by.push(server);
 }
 
 fn is_backing_off<K: Eq + std::hash::Hash>(rejections: &HashMap<K, Rejection>, key: K) -> bool {
     rejections.get(&key).is_some_and(|rejection| std::time::Instant::now() < rejection.retry_at)
+}
+
+/// Whether `hash` should not be requested from `server` now: it is backing off, or `server`
+/// already served bytes under it that failed.
+fn is_backing_off_from(rejections: &HashMap<Hash, Rejection>, hash: Hash, server: ConnectionKey) -> bool {
+    rejections.get(&hash).is_some_and(|rejection| std::time::Instant::now() < rejection.retry_at || rejection.served_by.contains(&server))
 }
 
 fn kill_peer(
@@ -3052,7 +3077,7 @@ pub fn sync(
                         break;
                     }
                     let dups = requests_by_hash.entry(hash).or_insert(0);
-                    if *dups >= MAX_REQUEST_DUPLICATES_N || is_backing_off(&rejections, hash) {
+                    if *dups >= MAX_REQUEST_DUPLICATES_N || is_backing_off_from(&rejections, hash, connection_key) {
                         continue;
                     }
                     let request = HeightAndHashOr0 {
@@ -3238,7 +3263,7 @@ pub fn sync(
                                     if TRACE { tracing::info!("Skipped requesting block already in our queue. Peer {connection_address:?}. Hash: {hash}"); }
                                     continue;
                                 }
-                                if is_backing_off(&rejections, hash) {
+                                if is_backing_off_from(&rejections, hash, connection_key) {
                                     continue;
                                 }
 
@@ -4427,10 +4452,11 @@ pub fn sync(
 
             // Only a bad header gets the peer killed: the hash commits to the header and nothing
             // else, so the peer advertised a block that cannot exist. A bad body may be forged
-            // under an honest block's hash, and the same peer may still serve the honest one.
+            // under an honest block's hash, and the same peer may serve the honest one once its
+            // rejection entry expires.
             if let Some(key) = delivered_by {
                 if failed {
-                    note_rejection(&mut rejections, hash);
+                    note_rejected_server(note_rejection(&mut rejections, hash), key);
                 }
                 if let Err(("header", err, _)) = &verdict {
                     if err.misbehavior_score > 0 {
@@ -4618,6 +4644,73 @@ mod tests {
             assert_eq!(initial_peer(&printed), InitialPeer::Dial(address.clone()), "seed {seed} case {case}: {entry} printed as {printed}");
         }
         assert!(dialled > 1000 && updated > 1000 && skipped > 1000, "seed {seed}: {dialled} dialled, {updated} updated, {skipped} skipped");
+    }
+
+    /// Random failed deliveries of a few hashes from a few peers, with backoffs run out at random:
+    /// a hash is never asked of the last `MAX_REJECTION_SERVERS` peers that served it bad bytes
+    /// while its entry lives, and is asked of every other peer once its backoff runs out, so peers
+    /// serving forged bytes can never keep the hash from a peer with the real block.
+    #[test]
+    fn fuzz_rejected_servers() {
+        use rand::{Rng, SeedableRng};
+        let seed: u64 = std::env::var("FUZZ_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| rand::thread_rng().gen());
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
+        let (mut excluded_after_backoff, mut asked_after_backoff, mut evictions) = (0, 0, 0);
+        for case in 0..200 {
+            let hashes: Vec<Hash> = (0..rng.gen_range(1..4u8)).map(|i| Hash([i; 32])).collect();
+            let servers: Vec<ConnectionKey> = (0..rng.gen_range(1..40u16))
+                .map(|port| ConnectionKey { ip: std::net::Ipv6Addr::LOCALHOST, port, key_15_bits: 0 })
+                .collect();
+            let mut rejections: HashMap<Hash, Rejection> = HashMap::new();
+            let mut model: HashMap<Hash, (u32, bool, Vec<ConnectionKey>)> = HashMap::new(); // strikes, backing off, servers
+            for op in 0..rng.gen_range(1..300) {
+                let hash = hashes[rng.gen_range(0..hashes.len())];
+                let server = servers[rng.gen_range(0..servers.len())];
+                match rng.gen_range(0..4) {
+                    0 | 1 => {
+                        note_rejected_server(note_rejection(&mut rejections, hash), server);
+                        let (strikes, backing_off, served) = model.entry(hash).or_default();
+                        *strikes += 1;
+                        *backing_off = true;
+                        if !served.contains(&server) {
+                            if served.len() >= MAX_REJECTION_SERVERS {
+                                served.remove(0);
+                                evictions += 1;
+                            }
+                            served.push(server);
+                        }
+                    }
+                    2 => {
+                        if let (Some(rejection), Some(entry)) = (rejections.get_mut(&hash), model.get_mut(&hash)) {
+                            rejection.retry_at = std::time::Instant::now() - std::time::Duration::from_millis(1);
+                            entry.1 = false;
+                        }
+                    }
+                    _ => {
+                        let asked = !is_backing_off_from(&rejections, hash, server);
+                        let expected = match model.get(&hash) {
+                            None => true,
+                            Some((_, backing_off, served)) => !backing_off && !served.contains(&server),
+                        };
+                        assert_eq!(asked, expected, "seed {seed} case {case} op {op}: hash {hash} server {server:?}");
+                        if model.get(&hash).is_some_and(|m| !m.1) {
+                            if asked { asked_after_backoff += 1 } else { excluded_after_backoff += 1 }
+                        }
+                    }
+                }
+                for (hash, (strikes, _, served)) in &model {
+                    let rejection = &rejections[hash];
+                    assert_eq!(rejection.strikes, *strikes, "seed {seed} case {case} op {op}");
+                    assert_eq!(&rejection.served_by, served, "seed {seed} case {case} op {op}");
+                    assert!(rejection.served_by.len() <= MAX_REJECTION_SERVERS);
+                    assert_eq!(is_backing_off(&rejections, *hash), model[hash].1, "seed {seed} case {case} op {op}");
+                }
+            }
+        }
+        assert!(
+            excluded_after_backoff > 100 && asked_after_backoff > 100 && evictions > 10,
+            "seed {seed}: {excluded_after_backoff} excluded and {asked_after_backoff} asked after a backoff, {evictions} evictions"
+        );
     }
 
     /// Only a peer that has recently answered our requests can hold tenderlink back: a length
