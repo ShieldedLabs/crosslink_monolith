@@ -137,17 +137,19 @@ pub fn conventional_fee_weight_ratio(
 /// as defined by [ZIP-317].
 ///
 /// [ZIP-317]: https://zips.z.cash/zip-0317#fee-calculation
+///
+/// A Crosslink transaction carries a v6 body, so its inputs, outputs and Ironwood actions count
+/// as they do in a v6 transaction. A staking action is one more logical action, outside the
+/// grace allowance, which is the rule the wallet's fee calculation applies
+/// (`zcash_primitives::transaction::fees::zip317::FeeRule::fee_required`).
 pub fn conventional_actions(transaction: &Transaction) -> u32 {
-    if let Transaction::VCrosslink { staking_action, .. } = transaction {
-        // TODO: ensure this is consistent with ZIP-317
-        return if staking_action.is_none() {
-            0
-        } else {
-            // TODO: handle any additional orchard actions
-            1
-        };
-    }
-    // TODO(Sam): FIX FEES
+    let staking_actions: u32 = match transaction {
+        Transaction::VCrosslink {
+            staking_action: Some(_),
+            ..
+        } => 1,
+        _ => 0,
+    };
 
     let tx_in_total_size: usize = transaction
         .inputs()
@@ -181,7 +183,7 @@ pub fn conventional_actions(transaction: &Transaction) -> u32 {
         .try_into()
         .expect("transaction items are limited by serialized size limit");
 
-    max(GRACE_ACTIONS, logical_actions)
+    max(GRACE_ACTIONS, logical_actions) + staking_actions
 }
 
 /// Make ZIP-317 checks before inserting a transaction into the mempool.
