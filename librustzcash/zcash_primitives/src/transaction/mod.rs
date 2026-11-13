@@ -1545,16 +1545,16 @@ mod roster_codec_tests {
 
 /// The number of blocks between the start of one staking day and the start of the next.
 /// A new staking day starts every N blocks. At 25 seconds per block, this is three days.
-// @Nightly @Todo: Nightly builds shrink the staking calendar so that staking and BFT start within
-// hours. Restore both values when dev goes back to the featurenet.
-// pub const STAKING_PERIOD: u32 = 10_368;
-pub const STAKING_PERIOD: u32 = 150;
+// Nightly builds shrink the staking calendar so that staking and BFT start within hours: a build
+// uses either every @Nightly line or every @Featurenet line.
+// pub const STAKING_PERIOD: u32 = 150; // @Nightly
+pub const STAKING_PERIOD: u32 = 10_368; // @Featurenet
 
 /// The window size within each staking day period where staking actions are allowed.
 /// Staking actions are only valid when `block_height % STAKING_PERIOD < STAKING_DAY_WINDOW`.
 /// At 25 seconds per block, this is 24 hours.
-// pub const STAKING_DAY_WINDOW: u32 = 3_456;
-pub const STAKING_DAY_WINDOW: u32 = 70;
+// pub const STAKING_DAY_WINDOW: u32 = 70; // @Nightly
+pub const STAKING_DAY_WINDOW: u32 = 3_456; // @Featurenet
 
 /// The number of blocks a bond must wait after its last action before it can be unbonded (counted
 /// from its creation) or withdrawn (counted from its unbonding).

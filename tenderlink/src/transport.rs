@@ -1964,7 +1964,8 @@ mod tests {
         for (source, count) in [
             (
                 include_str!("../../zebra-crosslink/zebrad/src/config.rs"),
-                2, // @Nightly @Todo: The featurenet build has 3.
+                // 2, // @Nightly
+                3, // @Featurenet
             ),
             (
                 include_str!("../../zebra-crosslink/dilated_regtest/node0.toml.in"),

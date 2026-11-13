@@ -132,8 +132,14 @@ mod tests {
         update_chain_tip_with_delegation_bond,
     };
 
-    // The window is [820, 1050). Activation heights are multiples of the staking period.
-    const ACTIVATION: u32 = 1050;
+    // Heights on the prototype calendar, so the tests follow it when it changes. The window is
+    // [WINDOW_START, ACTIVATION), and activation heights are multiples of the staking period.
+    const PERIOD: u32 = zcash_primitives::bft::PROTOTYPE_STAKING.period;
+    const ACTIVATION: u32 = 7 * PERIOD;
+    const WINDOW_START: u32 = ACTIVATION - WINDOW;
+    const INSIDE: u32 = 6 * PERIOD;
+    const BEFORE: u32 = 5 * PERIOD;
+    const EARLIER: u32 = 4 * PERIOD + 10;
     const SLASHED: [u8; 32] = [7; 32];
     const OTHER: [u8; 32] = [8; 32];
     const BOND_ZATS: u64 = 1000;
@@ -155,7 +161,7 @@ mod tests {
     #[test]
     fn slash_window_is_the_blocks_after_the_window_start_and_below_activation() {
         let heights: Vec<u32> = super::slash_window(Height(ACTIVATION), WINDOW).map(|h| h.0).collect();
-        assert_eq!((heights[0], *heights.last().unwrap()), (821, 1049));
+        assert_eq!((heights[0], *heights.last().unwrap()), (WINDOW_START + 1, ACTIVATION - 1));
     }
     #[test]
     fn bond_created_before_window_and_unbonded_inside_it_is_burned() {
@@ -171,11 +177,11 @@ mod tests {
             &mut HashMap::new(),
             &StakingAction::BeginDelegationUnbonding { unique_pubkey: key, signature: [0; 64], spends: None },
             &transaction::Hash([0; 32]),
-            loc(900),
+            loc(INSIDE),
         )
         .unwrap();
 
-        let unbonding = BondStatusInChain::Unbonding { unbonded_at: loc(900) };
+        let unbonding = BondStatusInChain::Unbonding { unbonded_at: loc(INSIDE) };
         assert_eq!(bonds[&key], (bond(SLASHED, 100), unbonding));
 
         let burned = burn_set(&bonds);
@@ -191,11 +197,11 @@ mod tests {
         let key = [1; 32];
         let chain = Chain::new(
             &Network::Mainnet,
-            Height(950),
+            Height(INSIDE + 50),
             NoteCommitmentTrees::default(),
             Default::default(),
             ValueBalance::zero(),
-            [(key, bond(SLASHED, 100), BondStatus::Unbonding { unbonded_at: loc(900) })],
+            [(key, bond(SLASHED, 100), BondStatus::Unbonding { unbonded_at: loc(INSIDE) })],
             std::iter::empty(),
         );
 
@@ -215,14 +221,14 @@ mod tests {
 
         let bonds = HashMap::from([
             (active, (bond(SLASHED, 100), BondStatusInChain::Active)),
-            (unbonded_just_inside, (bond(SLASHED, 100), BondStatusInChain::Unbonding { unbonded_at: loc(821) })),
-            (unbonded_at_window_start, (bond(SLASHED, 100), BondStatusInChain::Unbonding { unbonded_at: loc(820) })),
-            (unbonded_before_window, (bond(SLASHED, 100), BondStatusInChain::Unbonding { unbonded_at: loc(750) })),
+            (unbonded_just_inside, (bond(SLASHED, 100), BondStatusInChain::Unbonding { unbonded_at: loc(WINDOW_START + 1) })),
+            (unbonded_at_window_start, (bond(SLASHED, 100), BondStatusInChain::Unbonding { unbonded_at: loc(WINDOW_START) })),
+            (unbonded_before_window, (bond(SLASHED, 100), BondStatusInChain::Unbonding { unbonded_at: loc(BEFORE) })),
             (active_elsewhere, (bond(OTHER, 100), BondStatusInChain::Active)),
-            (unbonding_elsewhere, (bond(OTHER, 100), BondStatusInChain::Unbonding { unbonded_at: loc(900) })),
+            (unbonding_elsewhere, (bond(OTHER, 100), BondStatusInChain::Unbonding { unbonded_at: loc(INSIDE) })),
             (
                 withdrawn_before_window,
-                (bond(SLASHED, 100), BondStatusInChain::Withdrawn { withdrawn_at: loc(750), unbonded_at: Some(loc(610)) }),
+                (bond(SLASHED, 100), BondStatusInChain::Withdrawn { withdrawn_at: loc(BEFORE), unbonded_at: Some(loc(EARLIER)) }),
             ),
             (burned_already, (bond(SLASHED, 100), BondStatusInChain::Burned)),
         ]);

@@ -548,17 +548,17 @@ impl ZcashCrosslinkParameters {
 pub const PROTOTYPE_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParameters {
     bc_confirmation_depth_sigma: 4,
     bootstrap: BftBootstrap::FromChain {
-        // @Nightly @Todo: The nightly calendar is too short for the derived heights, whose roster
-        // and activation heights fall within the reorg limit of each other. These give stakers
-        // five staking days (heights 300 to 969) before the roster is fixed, then start BFT. Restore
-        // the derived heights when dev goes back to the featurenet.
-        // staking_height: 2 * crate::transaction::STAKING_PERIOD,
-        // roster_height: 3 * crate::transaction::STAKING_PERIOD
-        //     + crate::transaction::STAKING_DAY_WINDOW,
-        // activation_height: 7 * crate::transaction::STAKING_PERIOD / 2,
-        staking_height: 300,
-        roster_height: 970,
-        activation_height: 1_100,
+        // The nightly calendar is too short for the derived heights, whose roster and activation
+        // heights fall within the reorg limit of each other. The @Nightly heights give stakers five
+        // staking days (heights 300 to 969) before the roster is fixed, then start BFT. A build
+        // uses either every @Nightly line or every @Featurenet line.
+        // staking_height: 300, // @Nightly
+        // roster_height: 970, // @Nightly
+        // activation_height: 1_100, // @Nightly
+        staking_height: 2 * crate::transaction::STAKING_PERIOD, // @Featurenet
+        roster_height: 3 * crate::transaction::STAKING_PERIOD // @Featurenet
+            + crate::transaction::STAKING_DAY_WINDOW,
+        activation_height: 7 * crate::transaction::STAKING_PERIOD / 2, // @Featurenet
     },
     staking: PROTOTYPE_STAKING,
     active_roster_max_n: 12,
