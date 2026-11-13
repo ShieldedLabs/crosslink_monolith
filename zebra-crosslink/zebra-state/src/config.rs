@@ -266,6 +266,28 @@ impl Config {
         }
     }
 
+    /// Whether another process, such as a running node, holds this state's database for
+    /// `network` open. RocksDB takes the database's lock file before anything else when it opens
+    /// one, so an open refused on the lock means a holder; any other refusal (this open names no
+    /// column families), or no database at all, means none.
+    pub fn state_database_in_use(&self, network: &Network) -> bool {
+        let path = self.db_path(STATE_DATABASE_KIND, state_database_format_version_in_code().major, network);
+        if self.ephemeral || !path.exists() {
+            return false;
+        }
+        // RocksDB writes its info log beside the database as it opens one, which would rotate a
+        // running node's log, so the probe's goes to a directory of its own.
+        let log_dir = std::env::temp_dir().join(format!("zebra-state-lock-probe-{}", std::process::id()));
+        let mut options = rocksdb::Options::default();
+        options.set_db_log_dir(&log_dir);
+        let in_use = match rocksdb::DB::open(&options, &path) {
+            Ok(_) => false,
+            Err(err) => crate::constants::LOCK_FILE_ERROR.is_match(&err.to_string()),
+        };
+        let _ = std::fs::remove_dir_all(&log_dir);
+        in_use
+    }
+
     /// Returns the path for the database, based on the kind, major version and network.
     /// Each incompatible database format or network gets its own unique path.
     pub fn db_path(

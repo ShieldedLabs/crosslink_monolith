@@ -186,8 +186,12 @@ impl TFInstr {
     /// - `TF_POW_STP_PEER`: served by synthetic STP peer `val[0]` the way a real peer serves one:
     ///   it advertises the block in a STATUS, waits for the node's BLOCK_REQ, and answers with
     ///   BLOCK_CHUNK packets from the requested offset. Judged as the direct doorway, and rejected
-    ///   too when the node kills the peer or never asks for the block. The bytes are served as
-    ///   they are, parseable or not.
+    ///   too when the node kills the peer or never asks for the block. The STATUS names the
+    ///   block's hash and height, so the bytes must parse to a block with a coinbase height.
+    /// - `TF_POW_STP_CLAIMED`: as `TF_POW_STP_PEER`, but the STATUS advertises the block the
+    ///   data's first 68 bytes claim (its hash, its parent's hash and its height, a little-endian
+    ///   u32), and the chunks carry the bytes after them, whatever they are: the way a peer that
+    ///   lies or corrupts what it serves would. The outcome is the node's for the claimed hash.
     /// - `TF_POW_TEMPLATE`: no data; the node builds the block from its own getblocktemplate
     ///   response, as its miner does, and submits it directly. Also rejected when no template or
     ///   block could be made. A non-zero `val[0]` names a slot that remembers the block's hash,
@@ -392,7 +396,10 @@ impl TFInstr {
                 str += &format!("{} => {amount}", PubKeyID(pub_key))
             }
             Some(TestInstr::ExpectPoolTotals(pools)) => str += &format!("{pools:?}"),
-            Some(TestInstr::RecvPoW { block, peer }) => {
+            Some(TestInstr::RecvPoW { block, peer, claim: Some(claim) }) => {
+                str += &format!("{} bytes claimed as {} @ {} via STP peer {peer}", block.len(), claim.hash, claim.height)
+            }
+            Some(TestInstr::RecvPoW { block, peer, claim: None }) => {
                 str += &match Block::zcash_deserialize(&block[..]) {
                     Ok(parsed) => format!("{} via STP peer {peer}", parsed.hash()),
                     Err(_) => format!("{} unparseable bytes via STP peer {peer}", block.len()),
@@ -490,6 +497,42 @@ pub const TF_POW_DIRECT: u64 = 0;
 pub const TF_POW_STP_PEER: u64 = 1;
 pub const TF_POW_TEMPLATE: u64 = 2;
 pub const TF_POW_CHECK: u64 = 3;
+pub const TF_POW_STP_CLAIMED: u64 = 4;
+
+/// What a synthetic STP peer advertises for the bytes it serves under `TF_POW_STP_CLAIMED`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StpClaim {
+    pub hash: ZebBlockHash,
+    pub parent: ZebBlockHash,
+    pub height: u32,
+}
+
+impl StpClaim {
+    /// How many bytes of a `TF_POW_STP_CLAIMED` instruction's data the claim takes.
+    pub const SIZE: usize = 32 + 32 + 4;
+
+    /// The claim of an honest peer that has `block`.
+    pub fn of(block: &Block) -> Option<StpClaim> {
+        Some(StpClaim { hash: block.hash(), parent: block.header.previous_block_hash, height: block.coinbase_height()?.0 })
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.hash.0);
+        out.extend_from_slice(&self.parent.0);
+        out.extend_from_slice(&self.height.to_le_bytes());
+    }
+
+    /// The claim, and the bytes served under it.
+    fn read(data: &[u8]) -> Option<(StpClaim, &[u8])> {
+        if data.len() < Self::SIZE {
+            return None;
+        }
+        let hash = ZebBlockHash(data[..32].try_into().ok()?);
+        let parent = ZebBlockHash(data[32..64].try_into().ok()?);
+        let height = u32::from_le_bytes(data[64..68].try_into().ok()?);
+        Some((StpClaim { hash, parent, height }, &data[Self::SIZE..]))
+    }
+}
 
 /// SUBMIT_TX's doorways, in `val[1]`.
 pub const TF_TX_LOCAL: u64 = 0;
@@ -776,6 +819,14 @@ impl TF {
     /// Block bytes served as-is, for encodings `Block` would not produce.
     pub fn push_instr_recv_pow_bytes(&mut self, block: &[u8], peer: u64, flags: u32) {
         self.push_instr_ex(TFInstr::LOAD_POW, flags, block, [peer, TF_POW_STP_PEER])
+    }
+
+    /// `bytes`, whatever they are, served by synthetic peer `peer` as the block `claim` names.
+    pub fn push_instr_recv_pow_claimed(&mut self, claim: StpClaim, bytes: &[u8], peer: u64, flags: u32) {
+        let mut data = Vec::with_capacity(StpClaim::SIZE + bytes.len());
+        claim.write(&mut data);
+        data.extend_from_slice(bytes);
+        self.push_instr_ex(TFInstr::LOAD_POW, flags, &data, [peer, TF_POW_STP_CLAIMED])
     }
 
     pub fn push_instr_recv_stp_packet(&mut self, packet: &[u8], peer: u64, flags: u32) {
@@ -1246,7 +1297,11 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
             let data = instr.data_slice(bytes);
             match instr.val[1] {
                 TF_POW_DIRECT => Some(TestInstr::LoadPoW(Block::zcash_deserialize(data).ok()?)),
-                TF_POW_STP_PEER => Some(TestInstr::RecvPoW { block: data.to_vec(), peer: instr.val[0] }),
+                TF_POW_STP_PEER => Some(TestInstr::RecvPoW { block: data.to_vec(), peer: instr.val[0], claim: None }),
+                TF_POW_STP_CLAIMED => {
+                    let (claim, bytes) = StpClaim::read(data)?;
+                    Some(TestInstr::RecvPoW { block: bytes.to_vec(), peer: instr.val[0], claim: Some(claim) })
+                }
                 TF_POW_TEMPLATE => Some(TestInstr::MineFromTemplate { slot: instr.val[0] }),
                 TF_POW_CHECK => Some(TestInstr::CheckPoW { block: Block::zcash_deserialize(data).ok()?, now: instr.val[0] }),
                 _ => None,
@@ -1446,7 +1501,8 @@ pub(crate) enum TestInstr {
     /// [bonded, unbonded, finalizer rewards]
     ExpectPoolTotals([u64; 3]),
     /// Raw bytes: the peer serves exactly what the file holds, parseable or not.
-    RecvPoW { block: Vec<u8>, peer: u64 },
+    /// With a claim, the peer advertises it instead of what the bytes parse to.
+    RecvPoW { block: Vec<u8>, peer: u64, claim: Option<StpClaim> },
     RecvStpPacket { packet: Vec<u8>, peer: u64 },
     RecvTxStp { tx: Transaction, peer: u64 },
     MineFromTemplate { slot: u64 },
@@ -1912,10 +1968,10 @@ pub(crate) async fn handle_instr(
             test_check(flags, accepted, &message);
         }
 
-        TestInstr::RecvPoW { block, peer } => match take_stp_peer(peer) {
+        TestInstr::RecvPoW { block, peer, claim } => match take_stp_peer(peer) {
             Err(err) => check_ingest(flags, "LOAD_POW via STP: ", Err(err)),
             Ok(mut stp) => {
-                let outcome = serve_block(internal_handle, &mut stp, &block).await;
+                let outcome = serve_block(internal_handle, &mut stp, &block, claim).await;
                 put_stp_peer(stp);
                 check_ingest(flags, &format!("LOAD_POW via STP peer {peer}: "), outcome);
             }
@@ -2510,6 +2566,7 @@ async fn serve_block(
     internal_handle: &TFLServiceHandle,
     stp: &mut HarnessStpPeer,
     wire_block: &[u8],
+    claim: Option<StpClaim>,
 ) -> Result<zebra_state::new_network::IngestOutcome, String> {
     use zebra_state::new_network::{
         block_chunk_packets, parse_block_request, status_packet, IngestOutcome, NearTipChains, ShadowBlock,
@@ -2517,12 +2574,17 @@ async fn serve_block(
     };
     let index = stp.index;
     let killed = |reason: String| Ok(IngestOutcome::Failed { reason, misbehavior_score: 0 });
-    let Ok(block) = Block::zcash_deserialize(wire_block) else {
-        return Err("the block does not parse, so no STATUS can advertise it; send its packets with RECV_STP_PACKET".to_string());
-    };
-    let hash = block.hash();
-    let Some(height) = block.coinbase_height().map(|height| height.0) else {
-        return Err(format!("block {hash} has no coinbase height, so no STATUS can advertise it"));
+    let StpClaim { hash, parent, height } = match claim {
+        Some(claim) => claim,
+        None => {
+            let Ok(block) = Block::zcash_deserialize(wire_block) else {
+                return Err("the block does not parse, so no STATUS can advertise it; serve it under a claim (TF_POW_STP_CLAIMED)".to_string());
+            };
+            let Some(claim) = StpClaim::of(&block) else {
+                return Err(format!("block {} has no coinbase height, so no STATUS can advertise it; serve it under a claim (TF_POW_STP_CLAIMED)", block.hash()));
+            };
+            claim
+        }
     };
 
     drain_stp_peer(stp);
@@ -2541,7 +2603,7 @@ async fn serve_block(
     };
 
     let mut chains = NearTipChains::default();
-    chains.push_chain_unchecked(vec![ShadowBlock { this_hash: hash, parent_hash: block.header.previous_block_hash, this_height: height }]);
+    chains.push_chain_unchecked(vec![ShadowBlock { this_hash: hash, parent_hash: parent, this_height: height }]);
     let _ = stp.link.inbound.send(status_packet(&[], &chains, None));
 
     let deadline = tokio::time::Instant::now() + if already_known.is_some() { KNOWN_BLOCK_SETTLE } else { NODE_ANSWER_WAIT };
@@ -2798,6 +2860,7 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
         if let Some(instr) = uhh_option(parsed, on_fail) {
             let height = match &instr {
                 TestInstr::LoadPoW(block) => block.coinbase_height().map(|height| height.0),
+                TestInstr::RecvPoW { claim: Some(claim), .. } => Some(claim.height),
                 TestInstr::RecvPoW { block, .. } => Block::zcash_deserialize(&block[..])
                     .ok()
                     .and_then(|block| block.coinbase_height())

@@ -2,6 +2,7 @@
 //! (#241).
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use abscissa_core::{config, Application, Command, FrameworkError, Runnable};
 use clap::Parser;
@@ -17,8 +18,8 @@ use crate::{commands::StartCmd, config::ZebradConfig, prelude::APPLICATION};
 /// The node keeps running afterwards.
 ///
 /// A new state directory is a new node: its `secret.seed`, and with it the node's network
-/// identity and default finalizer key, is generated fresh. Copy `secret.seed` into the new
-/// directory first to keep the old ones.
+/// identity, wallet and default finalizer key, is generated fresh. `--keep-identity` carries the
+/// configured node's over instead, and refuses while that node is running.
 #[derive(Command, Debug, Default, Parser)]
 pub struct ImportChainCmd {
     /// The file to load.
@@ -51,6 +52,16 @@ pub struct ImportChainCmd {
     )]
     height: Option<u32>,
 
+    /// Run as the configured node.
+    #[clap(
+        long,
+        help = "run as the configured node: copy its secret.seed, and with it its network identity, \
+                wallet and default finalizer key, into the new state. Refused while the configured \
+                node is running, since two nodes with one seed vote as the same finalizer \
+                [default: a new node, with a fresh secret.seed]"
+    )]
+    keep_identity: bool,
+
     /// Keep the configured peers and internal miner.
     #[clap(
         long,
@@ -60,7 +71,33 @@ pub struct ImportChainCmd {
     connect: bool,
 }
 
+/// The configured state, as it was before `override_config` pointed the node at the new one.
+static CONFIGURED_STATE: OnceLock<(zebra_state::Config, zebra_chain::parameters::Network)> = OnceLock::new();
+
+/// The seed file a node keeps in its state directory.
+const SECRET_SEED_FILE: &str = "secret.seed";
+
 impl ImportChainCmd {
+    /// Copies the configured node's `secret.seed` into `target`, or says why it cannot.
+    fn keep_identity(&self, target: &Path) -> Result<(), String> {
+        let (configured, network) = CONFIGURED_STATE.get().expect("override_config runs before run");
+        let seed = configured.cache_dir.join(SECRET_SEED_FILE);
+        if !seed.is_file() {
+            return Err(format!("{} does not exist, so the configured node has no identity to keep", seed.display()));
+        }
+        if configured.state_database_in_use(network) {
+            return Err(format!(
+                "the configured node's state at {} is in use. Stop that node first: two nodes with one \
+                 secret.seed vote as the same finalizer",
+                configured.cache_dir.display(),
+            ));
+        }
+        std::fs::create_dir_all(target).map_err(|err| format!("could not create {}: {err}", target.display()))?;
+        std::fs::copy(&seed, target.join(SECRET_SEED_FILE))
+            .map_err(|err| format!("could not copy {} into {}: {err}", seed.display(), target.display()))?;
+        Ok(())
+    }
+
     /// The state directory the import builds, given the configured one.
     fn target(&self, configured: &Path) -> PathBuf {
         self.cache_dir.clone().unwrap_or_else(|| {
@@ -85,10 +122,18 @@ impl Runnable for ImportChainCmd {
         if occupied {
             eprintln!(
                 "import-chain: {} is not empty. A chain prefix is imported into a new state; \
-                 delete it or choose another directory with --cache-dir.",
+                 delete it or choose another directory with --cache-dir. To keep the configured \
+                 node's identity, use --keep-identity rather than copying its secret.seed in.",
                 target.display(),
             );
             std::process::exit(2);
+        }
+        if self.keep_identity {
+            if let Err(why) = self.keep_identity(&target) {
+                eprintln!("import-chain: --keep-identity: {why}.");
+                std::process::exit(2);
+            }
+            tracing::info!("import-chain: running as the configured node, with its secret.seed");
         }
         tracing::info!("import-chain: building a new state at {}", target.display());
 
@@ -105,6 +150,7 @@ impl Runnable for ImportChainCmd {
 impl config::Override<ZebradConfig> for ImportChainCmd {
     fn override_config(&self, config: ZebradConfig) -> Result<ZebradConfig, FrameworkError> {
         let mut config = StartCmd::default().override_config(config)?;
+        let _ = CONFIGURED_STATE.set((config.state.clone(), config.network.network.clone()));
         config.state.cache_dir = self.target(&config.state.cache_dir);
         // A cookie written where the configured node keeps its own would lock out that node's
         // RPC clients.
