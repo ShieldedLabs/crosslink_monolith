@@ -45,6 +45,9 @@ pub mod router;
 pub mod sync_verify;
 pub mod transaction;
 
+#[cfg(test)]
+mod tests;
+
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use block::check::difficulty_is_valid;
 

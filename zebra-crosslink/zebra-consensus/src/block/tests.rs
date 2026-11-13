@@ -12,17 +12,22 @@ use zebra_chain::{
         tests::generate::{
             large_multi_transaction_block, large_single_transaction_block_many_inputs,
         },
-        Block, Height,
+        Block, Height, MAX_BLOCK_BYTES,
     },
     parameters::{subsidy::block_subsidy, NetworkUpgrade},
-    serialization::{ZcashDeserialize, ZcashDeserializeInto},
+    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     transaction::{arbitrary::transaction_to_fake_v5, LockTime, Transaction},
+    transparent,
     work::difficulty::{ParameterDifficulty as _, INVALID_COMPACT_DIFFICULTY},
 };
 use zebra_script::Sigops;
 use zebra_test::transcript::{ExpectedTranscriptError, Transcript};
 
-use crate::{block::check::subsidy_is_valid, transaction};
+use crate::{
+    block::check::subsidy_is_valid,
+    tests::{all_block_vectors, block_vectors},
+    transaction,
+};
 
 use super::*;
 
@@ -162,7 +167,7 @@ async fn check_transcripts() -> Result<(), Report> {
 fn coinbase_is_first_for_historical_blocks() -> Result<(), Report> {
     let _init_guard = zebra_test::init();
 
-    let block_iter = zebra_test::vectors::BLOCKS.iter();
+    let block_iter = all_block_vectors();
 
     for block in block_iter {
         let block = block
@@ -187,7 +192,7 @@ fn difficulty_is_valid_for_historical_blocks() -> Result<(), Report> {
 }
 
 fn difficulty_is_valid_for_network(network: Network) -> Result<(), Report> {
-    let block_iter = network.block_iter();
+    let block_iter = block_vectors(&network);
 
     for (&height, block) in block_iter {
         let block = block
@@ -266,7 +271,7 @@ fn difficulty_validation_failure() -> Result<(), Report> {
 fn equihash_is_valid_for_historical_blocks() -> Result<(), Report> {
     let _init_guard = zebra_test::init();
 
-    let block_iter = zebra_test::vectors::BLOCKS.iter();
+    let block_iter = all_block_vectors();
 
     for block in block_iter {
         let block = block
@@ -376,9 +381,15 @@ fn coinbase_validation_failure() -> Result<(), Report> {
     let expected = BlockError::Transaction(TransactionError::Subsidy(SubsidyError::NoCoinbase));
     assert_eq!(expected, result);
 
-    // Get another funding stream, and duplicate the coinbase transaction
+    // Get another funding stream block, and duplicate the coinbase transaction.
+    //
+    // This used block 1,180,900. The Crosslink testnet funds a single address that never
+    // rotates, so while `is_crosslink_testnet` is set the subsidy check expects the first
+    // funding stream address on every network, and 1,180,900 pays a later one
+    // (`FundingStreamNotFound`, see `cheap_checks_accept_all_mainnet_vectors`). Block 1,046,401
+    // is in the first address period, so its subsidy is valid under both rules.
     let block =
-        Arc::<Block>::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_1180900_BYTES[..])
+        Arc::<Block>::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_1046401_BYTES[..])
             .expect("block should deserialize");
     let mut block = Arc::try_unwrap(block).expect("block should unwrap");
 
@@ -583,7 +594,7 @@ fn miner_fees_validation_failure() -> Result<(), Report> {
 fn time_is_valid_for_historical_blocks() -> Result<(), Report> {
     let _init_guard = zebra_test::init();
 
-    let block_iter = zebra_test::vectors::BLOCKS.iter();
+    let block_iter = all_block_vectors();
     let now = Utc::now();
 
     for block in block_iter {
@@ -748,13 +759,41 @@ fn legacy_sigops_count_for_large_generated_blocks() {
     assert_eq!(legacy_sigop_count, 0);
 
     let block = large_multi_transaction_block();
+    let transaction_count = block.transactions.len();
     let mut sigops = 0;
     for tx in block.transactions {
         let tx_sigop_count = tx.sigops().expect("unexpected invalid sigop count");
         assert_eq!(tx_sigop_count, 1);
         sigops += tx_sigop_count;
     }
-    // Test that large blocks can actually fail the sigops check.
+    assert_eq!(
+        sigops as usize, transaction_count,
+        "each transaction in this block has one sigop"
+    );
+
+    // Crosslink lowers `MAX_BLOCK_BYTES` to 100 kB (#168), so a block filled with one-sigop
+    // transactions no longer reaches `MAX_BLOCK_SIGOPS`. A script can still hold one sigop per
+    // byte, so test that a block under the size limit can fail the sigops check, with one
+    // transaction whose output script is `MAX_BLOCK_SIGOPS + 1` `OP_CHECKSIG`s.
+    const OP_CHECKSIG: u8 = 0xac;
+    let mut block = large_multi_transaction_block();
+    block.transactions.truncate(1);
+    let tx = Arc::make_mut(&mut block.transactions[0]);
+    tx.outputs_mut()[0].lock_script =
+        transparent::Script::new(&[OP_CHECKSIG; MAX_BLOCK_SIGOPS as usize + 1]);
+
+    assert!(
+        block.zcash_serialized_size() as u64 <= MAX_BLOCK_BYTES,
+        "the block must fit in MAX_BLOCK_BYTES"
+    );
+
+    let sigops: u32 = block
+        .transactions
+        .iter()
+        .map(|tx| tx.sigops().expect("unexpected invalid sigop count"))
+        .sum();
+    // Test that blocks under the size limit can actually fail the sigops check.
+    assert_eq!(sigops, MAX_BLOCK_SIGOPS + 1);
     assert!(sigops > MAX_BLOCK_SIGOPS);
 }
 
@@ -764,7 +803,7 @@ fn legacy_sigops_count_for_historic_blocks() {
 
     // We can't test sigops using the transaction verifier, because it looks up UTXOs.
 
-    for block in zebra_test::vectors::BLOCKS.iter() {
+    for block in all_block_vectors() {
         let mut sigops = 0;
 
         let block: Block = block
