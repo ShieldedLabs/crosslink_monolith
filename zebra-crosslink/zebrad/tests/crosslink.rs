@@ -397,8 +397,9 @@ fn crosslink_featurenet_upgrade_2_height_set_by_the_test_file() {
     test_bytes(tf.write_to_bytes());
 }
 
-/// FeaturenetUpgrade3 is unscheduled by default; a test file's node config schedules it at height
-/// 4, and the node switches to it at exactly that height, as for FeaturenetUpgrade2 above: a block
+/// FeaturenetUpgrade3 is far above the test's heights by default; a test file's node config
+/// schedules it at height 4, and the node switches to it at exactly that height, as for
+/// FeaturenetUpgrade2 above: a block
 /// there built for the default schedule, whose coinbase is still the older upgrade's, is refused,
 /// and one built for the moved schedule is accepted, as is the node's own next block.
 #[test]
@@ -418,8 +419,9 @@ fn crosslink_featurenet_upgrade_3_height_set_by_the_test_file() {
     let default_schedule = regtest_network(&params);
     assert_ne!(NetworkUpgrade::current(&network, BlockHeight(activation - 1)), NetworkUpgrade::FeaturenetUpgrade3);
     assert_eq!(NetworkUpgrade::current(&network, BlockHeight(activation)), NetworkUpgrade::FeaturenetUpgrade3);
-    assert_eq!(NetworkUpgrade::FeaturenetUpgrade3.activation_height(&default_schedule), None);
-    assert_ne!(NetworkUpgrade::current(&default_schedule, BlockHeight::MAX), NetworkUpgrade::FeaturenetUpgrade3);
+    let default_height = NetworkUpgrade::FeaturenetUpgrade3.activation_height(&default_schedule);
+    assert!(default_height.map_or(true, |height| height.0 > 1_000), "FeaturenetUpgrade3 at {default_height:?}");
+    assert_ne!(NetworkUpgrade::current(&default_schedule, BlockHeight(activation + 2)), NetworkUpgrade::FeaturenetUpgrade3);
 
     let key = TestKey::new(b"crosslink test miner");
     let miner = key.address();

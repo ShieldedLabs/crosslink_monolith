@@ -3159,7 +3159,9 @@ mod tests {
         let mut heights = ConfiguredActivationHeights::from(stock_params.activation_heights());
         let last_scheduled = stock_params.activation_heights().keys().last().expect("Testnet has upgrades").0;
         let snapshot_height = Height(last_scheduled.max(400_000));
+        // FeaturenetUpgrade3 must follow FeaturenetUpgrade2, so it is unscheduled here.
         heights.featurenet_upgrade_2 = Some(snapshot_height.0 + 2);
+        heights.featurenet_upgrade_3 = None;
         let exempt = testnet::Parameters::build()
             .with_activation_heights(heights)
             .expect("valid activation heights")

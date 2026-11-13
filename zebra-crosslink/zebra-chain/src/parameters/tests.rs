@@ -408,11 +408,13 @@ fn minimum_difficulty_exemption_follows_start_height_and_featurenet_upgrade_2() 
     }
 
     // Stock Testnet parameters with FeaturenetUpgrade2 moved above every other upgrade and above
-    // the start height, so the exemption holds from the start height up to the upgrade.
+    // the start height, and FeaturenetUpgrade3, which must follow it, unscheduled, so the
+    // exemption holds from the start height up to the upgrade.
     let mut heights = testnet::ConfiguredActivationHeights::from(stock_params.activation_heights());
     let last_scheduled = stock_params.activation_heights().keys().last().expect("Testnet has upgrades").0;
     let activation = block::Height(last_scheduled.max(above.0) + 1);
     heights.featurenet_upgrade_2 = Some(activation.0);
+    heights.featurenet_upgrade_3 = None;
     let upgraded = testnet::Parameters::build()
         .with_activation_heights(heights)
         .expect("valid activation heights")
