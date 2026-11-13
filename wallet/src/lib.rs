@@ -3437,6 +3437,21 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
     }
 }
 
+/// The answer to `wallet_staking_action` and `wallet_basic_send` once the transaction is sent: a
+/// JSON object with the txid and, for a staking action, its kind and its bond key. The bond key is
+/// printed as `wallet_staking_positions` prints `pk`, so a script can take the next action on the
+/// bond it just made without scraping a debug dump. Every value is hex or a variant name, so
+/// nothing needs escaping.
+fn rpc_sent_json(txid: &TxId, staking_action: Option<&StakingAction>) -> String {
+    match staking_action {
+        Some(action) => format!(
+            r#"{{"txid":"{txid}","kind":"{:?}","bond_key":"{}"}}"#,
+            action.kind(),
+            PubKeyID(action.unique_pubkey()),
+        ),
+        None => format!(r#"{{"txid":"{txid}"}}"#),
+    }
+}
 
 pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     fn wallet_from_usk<P: Parameters + 'static>(params: P, name: &'static str, usk: &UnifiedSpendingKey) -> (ManualWallet, ManualAccount) {
@@ -5474,12 +5489,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         rpc_stake = None;
                     }
                     BlockHeight::SENT => {
-                        let res = if let Some(staking_action) = tx_progress.staking_action {
-                            format!("{{ \"txid\": {}, \"staking_action\": {} }}", tx_progress.txid, staking_action)
-                        } else {
-                            format!("{{ \"txid\": {} }}", tx_progress.txid)
-                        };
-                        sender.send(Ok(res));
+                        sender.send(Ok(rpc_sent_json(&tx_progress.txid, tx_progress.staking_action.as_ref())));
                         rpc_stake = None;
                     }
 
@@ -5497,7 +5507,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         let _ = sender.send(Err("failed to build send transaction".to_string()));
                     }
                     BlockHeight::SENT => {
-                        let _ = sender.send(Ok(format!("{{ \"txid\": {} }}", tx_progress.txid)));
+                        let _ = sender.send(Ok(rpc_sent_json(&tx_progress.txid, None)));
                     }
 
                     _ => {
@@ -5998,5 +6008,25 @@ mod tests {
             }
         }
         assert!(paid > 1_000 && hit_cap > 1_000, "paid {paid}, hit the cap {hit_cap}");
+    }
+
+    #[test]
+    fn sent_answers_parse_as_json_and_print_the_bond_key_as_positions_do() {
+        let txid = TxId::from_bytes([0xab; 32]);
+        let mut unique_pubkey = [0u8; 32];
+        unique_pubkey[0] = 0x01;
+        unique_pubkey[31] = 0xff;
+        let action = StakingAction::BeginDelegationUnbonding { unique_pubkey, signature: [0; 64], spends: None };
+        let txid_hex = "ab".repeat(32);
+
+        assert_eq!(rpc_sent_json(&txid, None), format!(r#"{{"txid":"{txid_hex}"}}"#));
+
+        // The key as `wallet_staking_positions` serializes `pk` (PubKeyID, byte-reversed).
+        let pk = format!("ff{}01", "00".repeat(30));
+        assert_eq!(
+            rpc_sent_json(&txid, Some(&action)),
+            format!(r#"{{"txid":"{txid_hex}","kind":"BeginDelegationUnbonding","bond_key":"{pk}"}}"#),
+        );
+        assert_eq!(pk, PubKeyID(unique_pubkey).to_string());
     }
 }
