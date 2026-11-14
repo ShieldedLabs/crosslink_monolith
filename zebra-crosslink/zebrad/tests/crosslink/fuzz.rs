@@ -1169,7 +1169,9 @@ fn generate_bft(c: &mut Choices) -> Vec<u8> {
 // Inputs where the node's own tenderlink engine runs: the bonded four-member roster of the BFT
 // rounds scenes, activated, then PoW growth (direct and over STP, with side branches) between
 // heights the engine decides from the synthetic finalizers' messages, which arrive in any order,
-// with duplicates and wrong-namespace votes among them, and the clock moving between them.
+// with duplicates and wrong-namespace votes among them, and the clock moving between them. Between
+// heights, coinbases are spent through every doorway, some twice, and mined, and bonds are made
+// to the roster's members, so decisions meet a busy mempool and a roster whose stake moves.
 //
 // The writer must know every decided block, to propose the next height on it, and every
 // proposer. The proposer is a pure function of the roster, height and round, and the roster for
@@ -1200,6 +1202,13 @@ struct EngineFuzz {
     /// The chain's staking, replayed through `replayed_to`.
     replay: zebra_state::StakingReplay,
     replayed_to: u32,
+    /// The key the scene mines to, which owns every coinbase.
+    key: TestKey,
+    /// Transactions the mempool holds that no block of `main` has mined yet.
+    pending: Vec<Arc<Transaction>>,
+    /// Coins spent by `pending`, which the generator's own coin tracking does not see until mined.
+    held: Vec<zebra_chain::transparent::OutPoint>,
+    bonds_made: u32,
 }
 
 impl EngineFuzz {
@@ -1251,8 +1260,12 @@ impl EngineFuzz {
     }
 
     fn extend(&mut self, c: &mut Choices) {
+        self.extend_with(c, &[]);
+    }
+
+    fn extend_with(&mut self, c: &mut Choices, txs: &[Arc<Transaction>]) {
         self.gens.push(self.scene.gen.clone());
-        let block = self.scene.gen.next_block(&self.scene.miner.clone());
+        let block = self.scene.gen.next_block_with_txs(&self.scene.miner.clone(), txs);
         self.main.push(Some(block.clone()));
         if c.unusual(64) {
             self.tf.push_instr_recv_pow(&block, self.next_fresh_peer, 0);
@@ -1280,6 +1293,105 @@ impl EngineFuzz {
             self.tf.push_instr_load_pow(&block, 0);
         }
         self.tf.push_instr_expect_pow_tip(&self.scene.gen.tip.hash(), 0);
+    }
+
+    /// The oldest mature coinbase no pending transaction spends.
+    fn coin(&self) -> Option<(zebra_chain::transparent::OutPoint, zebra_chain::transparent::Output)> {
+        let gen = &self.scene.gen;
+        let next_height = gen.tip.coinbase_height().expect("generated blocks have a height").0 + 1;
+        let lock_script = self.key.lock_script();
+        gen.utxos
+            .iter()
+            .filter(|(outpoint, utxo)| {
+                utxo.from_coinbase
+                    && utxo.output.lock_script == lock_script
+                    && next_height >= utxo.height.0 + zebra_chain::transparent::MIN_TRANSPARENT_COINBASE_MATURITY
+                    && !self.held.contains(outpoint)
+            })
+            .min_by_key(|(outpoint, utxo)| (utxo.height, outpoint.hash.0, outpoint.index))
+            .map(|(outpoint, utxo)| (*outpoint, utxo.output.clone()))
+    }
+
+    /// `tx` through a doorway chosen by `c`: local, a peer's wire message, or relayed over STP.
+    fn submit(&mut self, c: &mut Choices, tx: &Transaction, flags: u32) {
+        match c.below(3) {
+            0 => self.tf.push_instr_submit_tx(tx, flags),
+            doorway => {
+                let peer = self.next_fresh_peer;
+                self.next_fresh_peer += 1;
+                if doorway == 1 {
+                    self.tf.push_instr_recv_tx_wire(tx, peer, flags);
+                } else {
+                    self.tf.push_instr_recv_tx_stp(tx, peer, flags);
+                }
+            }
+        }
+    }
+
+    /// A coinbase spent, paying the mempool's fee: taken, and resident until mined.
+    fn spend(&mut self, c: &mut Choices) {
+        let Some(coin) = self.coin() else { return self.extend(c) };
+        let tx = transparent_spend(self.scene.gen.next_upgrade(), &self.key, coin.clone());
+        self.submit(c, &tx, 0);
+        self.tf.push_instr_expect_mempool_contains(&tx, 0);
+        self.held.push(coin.0);
+        self.pending.push(tx);
+    }
+
+    /// Another spend of a coin a pending transaction spends, paying more: refused, through
+    /// whichever doorway, and the pending one stays.
+    fn double_spend(&mut self, c: &mut Choices) {
+        let Some(first) = self.pending.get(c.below(self.pending.len().max(1))).cloned() else { return self.spend(c) };
+        let Some(input) = first.inputs().first().and_then(|input| input.outpoint()) else { return };
+        let Some(utxo) = self.scene.gen.utxos.get(&input).cloned() else { return };
+        let value = utxo.output.value;
+        let fee = (value - first.outputs()[0].value).expect("the first spend pays a fee");
+        let more = (fee + zebra_chain::amount::Amount::try_from(1_000).expect("a small amount")).expect("fees stay small");
+        let output = zebra_chain::transparent::Output::new((value - more).expect("the coin covers the fee"), self.key.lock_script());
+        let second = signed_tx(self.scene.gen.next_upgrade(), Some(&self.key), &[(input, utxo.output.clone())], vec![output], None, 0);
+        self.submit(c, &second, SHOULD_FAIL);
+        self.tf.push_instr_expect_mempool_contains(&first, 0);
+    }
+
+    /// A block mining every pending transaction: each leaves the mempool.
+    fn mine_pending(&mut self, c: &mut Choices) {
+        if self.pending.is_empty() {
+            return self.extend(c);
+        }
+        let txs = std::mem::take(&mut self.pending);
+        self.held.clear();
+        self.extend_with(c, &txs);
+        for tx in &txs {
+            self.tf.push_instr_expect_mempool_absent(tx, 0);
+        }
+    }
+
+    /// A bond of 10^8 zats to a member of the roster, so the roster's stake moves and the
+    /// writer's replay of it must follow. Inside the staking window it goes through the mempool
+    /// and is mined later; outside it, a block holding it is refused.
+    fn bond(&mut self, c: &mut Choices) {
+        let Some(coin) = self.coin() else { return self.extend(c) };
+        let staking = BFT_ROUNDS_PARAMETERS.staking;
+        let target_seed = match c.below(1 + self.scene.finalizers.len()) {
+            0 => TEST_NODE_FINALIZER_SEED.to_string(),
+            k => synthetic_finalizer_seed(self.scene.finalizers[k - 1].into()),
+        };
+        let signing_key = zebra_crosslink::rng_private_public_key_from_address(target_seed.as_bytes()).0;
+        let target = zcash_primitives::bft::FinalizerAddress::create(&signing_key);
+        self.bonds_made += 1;
+        let seed = format!("engine-bond-{}", self.bonds_made);
+        let tx = staking_tx_create_bond_funded(self.scene.gen.next_upgrade(), seed.as_bytes(), target, 100_000_000, &self.key, coin.clone());
+        let next_height = self.tip_height() + 1;
+        if next_height % staking.period < staking.day_window {
+            self.submit(c, &tx, 0);
+            self.tf.push_instr_expect_mempool_contains(&tx, 0);
+            self.held.push(coin.0);
+            self.pending.push(tx);
+        } else {
+            let refused = self.scene.gen.clone().next_block_with_txs(&self.scene.miner.clone(), &[tx]);
+            self.tf.push_instr_load_pow(&refused, SHOULD_FAIL);
+            self.tf.push_instr_expect_rejection_reason("staking window", 0);
+        }
     }
 
     fn votes(&mut self, bits: u64, id: &[u8; 32]) {
@@ -1328,7 +1440,10 @@ impl EngineFuzz {
             self.nil_round();
         }
         let proposer = u16::try_from(self.proposer()).expect("a synthetic finalizer proposes");
-        let snapshot = self.snapshot + 1 + c.below((self.tip_height() - sigma - self.snapshot) as usize) as u32;
+        // Half the time as recent as allowed, so the next roster takes in the latest bonds and
+        // rewards; a snapshot drawn evenly from the whole range mostly falls before any of them.
+        let top = self.tip_height() - sigma;
+        let snapshot = if c.below(2) == 0 { top } else { self.snapshot + 1 + c.below((top - self.snapshot) as usize) as u32 };
         let block = bft_proposal(&BFT_ROUNDS_PARAMETERS, self.height as u32, self.parent.clone(), 0, &self.scene.tail_above(snapshot));
         let value = bft_proposal_value(&block);
         let id = bft_value_id(&value);
@@ -1409,17 +1524,22 @@ fn generate_engine(c: &mut Choices) -> Vec<u8> {
     let mut f = EngineFuzz {
         tf, scene, gens: Vec::new(), height: 1, round: 0, parent, snapshot: roster_height, next_fresh_peer: FRESH_PEERS_FROM, sides: 0,
         main, replay, replayed_to: 0, round_ticks: 0,
+        key: TestKey::new(b"crosslink test miner"), pending: Vec::new(), held: Vec::new(), bonds_made: 0,
     };
     // BFT starts at the activation height the scene loaded up to.
     f.tick();
     for _ in 0..2 + c.below(10) {
-        match c.below(8) {
+        match c.below(12) {
             0..=2 => {
                 for _ in 0..1 + c.below(3) {
                     f.extend(c);
                 }
             }
             3 => f.side_branch(c),
+            4 => f.spend(c),
+            5 => f.double_spend(c),
+            6 => f.mine_pending(c),
+            7 => f.bond(c),
             _ => f.decide(c),
         }
     }
