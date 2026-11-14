@@ -917,11 +917,23 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                                                     } else {
                                                         String::new()
                                                     };
+                                                    // Every shielded transfer since NU6.3 is an Ironwood
+                                                    // action, so this is the tree a wallet's notes are in.
+                                                    let ironwood_tree = match c
+                                                        .read_state
+                                                        .clone()
+                                                        .oneshot(ReadRequest::IronwoodTree(hash.into()))
+                                                        .await
+                                                        .map_err(internal)?
+                                                    {
+                                                        ReadResponse::IronwoodTree(Some(t)) => {
+                                                            hex::encode(t.to_rpc_bytes())
+                                                        }
+                                                        _ => String::new(),
+                                                    };
                                                     Ok(Work::Items(
                                                         [enc(&TreeState {
-                                                            // Crosslink does not build Ironwood
-                                                            // bundles yet, so its tree is empty.
-                                                            ironwood_tree: String::new(),
+                                                            ironwood_tree,
                                                             network: c.network.bip70_network_name(),
                                                             height: height.0 as u64,
                                                             // display-order hex, what the wallet parses
@@ -2104,5 +2116,110 @@ fn compact_block(b: &Block, nulls: bool) -> CompactBlock {
         header: Vec::new(),
         vtx,
         chain_metadata: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tonic::{client::Grpc, codegen::http::uri::PathAndQuery, transport::Channel};
+    use tower::{buffer::Buffer, service_fn};
+    use zebra_chain::serialization::ZcashDeserializeInto;
+    use zebra_chain::transaction::UnminedTx;
+    use zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS;
+
+    use super::*;
+
+    /// The first `count` mainnet test blocks.
+    fn mainnet_blocks(count: u32) -> Vec<Arc<Block>> {
+        CONTINUOUS_MAINNET_BLOCKS
+            .range(0..count)
+            .map(|(_, bytes)| bytes.zcash_deserialize_into().expect("test vector block"))
+            .collect()
+    }
+
+    /// Starts a lightwallet_server over `read_state` and a mempool holding `mempool_txs`
+    /// on free loopback ports, and returns a gRPC client connected to it.
+    async fn serve(
+        read_state: ReadStateService,
+        tip: LatestChainTip,
+        mempool_txs: Vec<Arc<Transaction>>,
+    ) -> Grpc<Channel> {
+        let mempool = Buffer::new(
+            BoxService::new(service_fn(move |req: mempool::Request| {
+                let txs = mempool_txs.clone();
+                async move {
+                    match req {
+                        mempool::Request::TransactionsByMinedId(ids) => Ok(mempool::Response::Transactions(
+                            txs.iter().filter(|tx| ids.contains(&tx.hash())).map(UnminedTx::from).collect(),
+                        )),
+                        _ => Err::<_, BoxError>("not used by these tests".into()),
+                    }
+                }
+            })),
+            1,
+        );
+        let tfl = Buffer::new(
+            BoxService::new(service_fn(|_: TFLServiceRequest| async {
+                Err::<TFLServiceResponse, _>(TFLServiceError::NotImplemented)
+            })),
+            1,
+        );
+        let free_port = || TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr").port();
+        let port = free_port();
+        let ctx = Ctx {
+            rt: tokio::runtime::Handle::current(),
+            read_state,
+            mempool,
+            tfl,
+            tip,
+            mempool_events: MempoolTxSubscriber::new(tokio::sync::broadcast::channel(16).0),
+            network: Network::Mainnet,
+        };
+        let _server = lightwalletd_spawn(ctx, port, free_port(), false);
+
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}")).expect("uri");
+        for _ in 0..100 {
+            if let Ok(channel) = endpoint.connect().await {
+                return Grpc::new(channel);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("lightwallet_server did not start on port {port}");
+    }
+
+    async fn call<Req, Resp>(client: &mut Grpc<Channel>, method: &str, req: Req) -> Result<Resp, tonic::Status>
+    where
+        Req: Message + Send + 'static,
+        Resp: Message + Default + Send + 'static,
+    {
+        client.ready().await.map_err(|e| tonic::Status::unknown(e.to_string()))?;
+        let path = PathAndQuery::try_from(format!("{}{method}", String::from_utf8_lossy(PATH_PREFIX))).expect("path");
+        let codec = tonic_prost::ProstCodec::<Req, Resp>::default();
+        client.unary(tonic::Request::new(req), path, codec).await.map(tonic::Response::into_inner)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_tree_state_serves_the_ironwood_tree() {
+        let _init_guard = zebra_test::init();
+
+        let blocks = mainnet_blocks(6);
+        let hash = blocks[5].hash();
+        let (_state, read_state, tip, _) = zebra_state::populated_state(blocks, &Network::Mainnet).await;
+        let ReadResponse::IronwoodTree(Some(tree)) =
+            read_state.clone().oneshot(ReadRequest::IronwoodTree(hash.into())).await.expect("state")
+        else {
+            panic!("the state holds an Ironwood tree for every block");
+        };
+        let mut client = serve(read_state, tip, Vec::new()).await;
+
+        let tree_state: TreeState = call(&mut client, "GetTreeState", BlockId { height: 5, hash: Vec::new() })
+            .await
+            .expect("tree state");
+        assert_eq!(tree_state.height, 5);
+        assert_eq!(tree_state.ironwood_tree, hex::encode(tree.to_rpc_bytes()), "the state's Ironwood tree");
+        let served = tree_state.ironwood_tree().expect("a tree the wallet can read");
+        assert_eq!(served.root().to_bytes(), <[u8; 32]>::from(tree.root()));
     }
 }
