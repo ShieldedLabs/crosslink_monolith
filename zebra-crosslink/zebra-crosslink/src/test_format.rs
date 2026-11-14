@@ -2608,6 +2608,8 @@ async fn serve_block(
 
     let deadline = tokio::time::Instant::now() + if already_known.is_some() { KNOWN_BLOCK_SETTLE } else { NODE_ANSWER_WAIT };
     let (mut requests, mut chunks) = (0usize, 0usize);
+    // Every offset the node asked from, so a request the peer cannot answer is still reported.
+    let mut offsets: Vec<u32> = Vec::new();
     loop {
         tokio::select! {
             packet = stp.link.outbound.recv() => {
@@ -2618,8 +2620,14 @@ async fn serve_block(
                     continue; // STATUS, address gossip, hole punching: a real peer would handle these, but they don't bear on this block
                 };
                 let asks_for_this = req_hash == hash || (req_hash == ZebBlockHash([0; 32]) && req_height == height);
-                if asks_for_this && (offset as usize) < wire_block.len() {
+                if asks_for_this {
                     requests += 1;
+                    if offsets.len() < 8 {
+                        offsets.push(offset);
+                    }
+                }
+                // A peer holding fewer bytes than the offset asked from has nothing to send.
+                if asks_for_this && (offset as usize) < wire_block.len() {
                     for chunk in block_chunk_packets(wire_block, height, hash, offset as usize) {
                         chunks += 1;
                         let _ = stp.link.inbound.send(chunk);
@@ -2642,7 +2650,8 @@ async fn serve_block(
                     return Ok(IngestOutcome::Known { location: known.location.clone(), height: known.height });
                 }
                 return Err(format!(
-                    "{hash} @ {height} after {NODE_ANSWER_WAIT:?}; the node sent {requests} request(s) for it, answered with {chunks} chunk(s)"
+                    "{hash} @ {height} after {NODE_ANSWER_WAIT:?}; the node sent {requests} request(s) for it (from offsets {offsets:?}, of the {} bytes served), answered with {chunks} chunk(s)",
+                    wire_block.len()
                 ));
             }
         }

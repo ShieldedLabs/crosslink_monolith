@@ -321,7 +321,9 @@ fn move_mangled_block(g: &mut FuzzGen, c: &mut Choices) {
         bytes[i] ^= 1 << c.below(8);
     }
     if c.unusual(64) {
-        let cut = c.below(bytes.len());
+        // At least one byte: a peer claiming a block and holding none of it has nothing to
+        // serve, so the node's request would go unanswered whatever the node does.
+        let cut = 1 + c.below(bytes.len() - 1);
         bytes.truncate(cut);
     }
     let parses = Block::zcash_deserialize(&bytes[..]).is_ok_and(|b| b.coinbase_height().is_some());
