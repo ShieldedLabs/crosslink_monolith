@@ -1658,27 +1658,44 @@ fn seen_verdicts(timings: &std::path::Path) -> std::collections::HashMap<usize, 
 /// `bytes` with up to `DOORWAY_SWAPS_MAX` of its direct block loads and local transaction
 /// submissions sent another way, each expecting the verdict `seen` gives it, or `None` when none
 /// can be. A held block is left alone (a peer is not asked for a block whose parent is missing),
-/// as is one that does not parse or has no coinbase height: a peer's STATUS cannot advertise it,
-/// so it has no other doorway until a raw packet one exists. A reason check after a swapped
+/// as is one that does not parse, has no coinbase height, or claims a height that does not follow
+/// its parent's: a peer's STATUS cannot advertise it so that a node would ask for it. A reason
+/// check after a swapped
 /// instruction is dropped: the doorways word their reasons differently, and only the verdict
 /// has to agree.
 fn swap_doorways(bytes: &[u8], seen: &std::collections::HashMap<usize, bool>, c: &mut Choices) -> Option<(Vec<u8>, usize)> {
     let tf = TF::read_from_bytes(bytes).ok()?;
-    let eligible: Vec<usize> = (0..tf.instrs.len())
-        .filter(|&i| {
-            let instr = &tf.instrs[i];
-            seen.contains_key(&i)
-                && match instr.kind {
-                    TFInstr::LOAD_POW => {
-                        instr.val[1] == TF_POW_DIRECT
-                            && instr.flags & SHOULD_DEFER == 0
-                            && Block::zcash_deserialize(instr.data_slice(bytes)).is_ok_and(|block| block.coinbase_height().is_some())
-                    }
-                    TFInstr::SUBMIT_TX => instr.val[1] == TF_TX_LOCAL,
-                    _ => false,
+    // The heights of the blocks the file holds before each instruction, by hash. A peer's STATUS
+    // places a block by its parent and height, and a node rightly ignores one whose height does
+    // not follow its parent's: a mangled coinbase can claim any height under an unchanged header.
+    let mut heights: std::collections::HashMap<zebra_chain::block::Hash, u32> = Default::default();
+    let mut eligible: Vec<usize> = Vec::new();
+    for (i, instr) in tf.instrs.iter().enumerate() {
+        let block = (instr.kind == TFInstr::LOAD_POW).then(|| Block::zcash_deserialize(instr.data_slice(bytes)).ok()).flatten();
+        let ok = seen.contains_key(&i)
+            && match instr.kind {
+                TFInstr::LOAD_POW => {
+                    instr.val[1] == TF_POW_DIRECT
+                        && instr.flags & SHOULD_DEFER == 0
+                        && block.as_ref().and_then(|block| block.coinbase_height()).is_some_and(|height| {
+                            let parent = block.as_ref().expect("a height comes from a block").header.previous_block_hash;
+                            match heights.get(&parent) {
+                                Some(parent_height) => height.0 == parent_height + 1,
+                                // Only genesis, which no file loads, has no earlier block.
+                                None => height.0 == 1,
+                            }
+                        })
                 }
-        })
-        .collect();
+                TFInstr::SUBMIT_TX => instr.val[1] == TF_TX_LOCAL,
+                _ => false,
+            };
+        if ok {
+            eligible.push(i);
+        }
+        if let Some(height) = block.as_ref().and_then(|block| block.coinbase_height()) {
+            heights.insert(block.expect("a height comes from a block").hash(), height.0);
+        }
+    }
     if eligible.is_empty() {
         return None;
     }
