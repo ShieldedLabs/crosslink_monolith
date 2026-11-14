@@ -1193,6 +1193,8 @@ struct EngineFuzz {
     snapshot: u32,
     next_fresh_peer: u64,
     sides: u8,
+    /// Ticks of the clock since the engine's current round began, as the writer has moved it.
+    round_ticks: u32,
     /// The best chain's blocks by height (genesis, which carries no staking state, as `None`).
     main: Vec<Option<Arc<Block>>>,
     /// The chain's staking, replayed through `replayed_to`.
@@ -1286,22 +1288,37 @@ impl EngineFuzz {
         }
     }
 
+    fn tick(&mut self) {
+        self.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+        self.round_ticks += 1;
+    }
+
+    /// The most ticks the current round may have seen before its proposal arrives: the propose
+    /// timeout (2 s plus 500 ms a round) less two ticks of margin. A proposal any later finds the
+    /// node already prevoting nil, and the synthetic finalizers are not a quorum without it.
+    fn proposal_window_ticks(&self) -> u32 {
+        ((2000 + 500 * u64::from(self.round)) / BFT_TICK_MILLIS) as u32 - 2
+    }
+
     /// Gives up the current round: every synthetic finalizer prevotes and precommits nil, and the
     /// writer moves on to the next round without waiting out the timeouts. How long those take
     /// depends on whether the node had anything to propose, which the writer does not model; the
     /// next round's messages, from more than a third of the stake, pull the engine into that
     /// round at once (tendermint's round catch-up), whatever this one is doing.
     fn nil_round(&mut self) {
-        self.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+        self.tick();
         self.votes(TF_BFT_NIL, &[0; 32]);
         self.votes(TF_BFT_PRECOMMIT | TF_BFT_NIL, &[0; 32]);
         self.round += 1;
+        // The next round begins when its messages pull the engine into it.
+        self.round_ticks = 0;
     }
 
     /// Decides the engine's height on a proposal from the round's synthetic proposer. Its
     /// messages (the proposal, three prevotes, three precommits, some sent twice, some
     /// prevotes under the wrong namespace too) arrive in a random order with up to five ticks
-    /// between them: a proposal and a quorum of precommits decide whatever the order.
+    /// between them, none before the proposal once its window is spent: a proposal and a quorum
+    /// of precommits decide whatever the order.
     fn decide(&mut self, c: &mut Choices) {
         let sigma = BFT_ROUNDS_PARAMETERS.bc_confirmation_depth_sigma as u32;
         while self.tip_height() < self.snapshot + 1 + sigma {
@@ -1331,25 +1348,33 @@ impl EngineFuzz {
                 messages.push(Message::Vote(k, TF_BFT_WRONG_NAMESPACE));
             }
         }
-        let mut ticks = 1;
-        self.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+        let mut ticks = 0;
+        let mut proposed = false;
+        let room = |f: &EngineFuzz, proposed: bool| proposed || f.round_ticks + 1 < f.proposal_window_ticks();
+        if room(self, proposed) {
+            ticks += 1;
+            self.tick();
+        }
         while !messages.is_empty() {
             match messages.remove(c.below(messages.len())) {
                 Message::Proposal => {
+                    proposed = true;
                     self.tf.push_instr_bft_recv_proposal(proposer, self.height, self.round, -1, 0, &value, 0)
                 }
                 Message::Vote(k, bits) => self.tf.push_instr_bft_recv_vote(k, bits, self.height, self.round, &id, 0),
             }
-            if ticks < 6 && c.unusual(48) {
+            if ticks < 6 && room(self, proposed) && c.unusual(48) {
                 ticks += 1;
-                self.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+                self.tick();
             }
         }
         // A decision waits on the node's answer before the engine starts the next height, and
         // the last message may arrive after the engine's own precommit: four ticks see both out.
+        // They fall in the next height's first round, so they count against its proposal.
         for _ in 0..4 {
             self.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
         }
+        self.round_ticks = 4;
 
         let seeds: Vec<String> = self.scene.finalizers.iter().map(|&k| synthetic_finalizer_seed(k.into())).collect();
         let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
@@ -1383,10 +1408,10 @@ fn generate_engine(c: &mut Choices) -> Vec<u8> {
     let replay = zebra_state::StakingReplay::new(&Default::default(), BFT_ROUNDS_PARAMETERS.staking.slash_analysis_window());
     let mut f = EngineFuzz {
         tf, scene, gens: Vec::new(), height: 1, round: 0, parent, snapshot: roster_height, next_fresh_peer: FRESH_PEERS_FROM, sides: 0,
-        main, replay, replayed_to: 0,
+        main, replay, replayed_to: 0, round_ticks: 0,
     };
     // BFT starts at the activation height the scene loaded up to.
-    f.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    f.tick();
     for _ in 0..2 + c.below(10) {
         match c.below(8) {
             0..=2 => {
