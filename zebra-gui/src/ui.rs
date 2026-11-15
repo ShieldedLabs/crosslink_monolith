@@ -1327,7 +1327,7 @@ fn chunkify(bytes: &[u8; 32]) -> [u64; 4] {
 
 /// Text in the memo layout is broken into lines of at most this many characters by hand: wrapped text in these
 /// containers is laid out one line tall and overlaps what follows.
-const MEMO_LAYOUT_LINE_CHARS: usize = 52;
+const MEMO_LAYOUT_LINE_CHARS: usize = 44;
 
 /// `text` broken at spaces into lines of at most `max` characters (longer words get lines of their own).
 fn wrap_lines(text: &str, max: usize) -> Vec<String> {
@@ -1345,7 +1345,7 @@ fn wrap_lines(text: &str, max: usize) -> Vec<String> {
 }
 
 /// The most characters of a memo a history row shows.
-const ROW_MEMO_CHARS: usize = 60;
+const ROW_MEMO_CHARS: usize = 48;
 
 /// How many action rows a memo layout shows before summarising the rest.
 const MEMO_LAYOUT_MAX_ROWS: usize = 12;
@@ -2314,6 +2314,12 @@ pub fn ui_left_pane(ui: &mut Context,
                                     let filler_n = memo_padding.filler_n(layout.actions.len(), data.send_address_ua.is_some());
                                     if let _ = elem().decl(Decl { direction: TopToBottom, child_gap: ui.scale(4.0), width: grow!(), height: fit!(), ..Decl }) {
                                         draw_memo_layout(ui, data, child_gap, &layout, filler_n, None);
+                                        // The amount buttons send a payment too, "Memo only" does not; padding differs.
+                                        if memo_padding != wallet::MemoPadding::None && data.send_address_ua.is_some() {
+                                            let memo_only_n = memo_padding.filler_n(layout.actions.len(), false);
+                                            ui.text(frame_strf!(data, "Padding: {} filler with a payment, {} with Memo only.", filler_n, memo_only_n),
+                                                TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.75), wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
+                                        }
                                     }
                                 }
                                 Some(Err(reason)) => {
@@ -3573,6 +3579,10 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ui.text(icon, TextDecl { font: Icons, colour: icon_colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
                             }
 
+                            // The memo's kind icon and the layout it opens, drawn in the right column so the memo text
+                            // keeps the centre column's full width.
+                            let mut memo_badge: Option<(&'static str, MemoLayoutView)> = None;
+
                             // info
                             if let _elem = elem().decl(Decl {
                                 id: id_index("Centre Info", index as u32),
@@ -3691,33 +3701,22 @@ pub fn ui_left_pane(ui: &mut Context,
                                         } else {
                                             memo_str.clone()
                                         };
-                                        if let _ = elem().decl(Decl { direction: LeftToRight, child_gap: ui.scale(6.0), align: Left, width: grow!(), height: fit!(), ..Decl }) {
-                                            let icon = match magic {
-                                                Some(m) if m.layout.kind == wallet::MemoKind::MagicEncrypted => ICON_LOCK_1,
-                                                Some(_) => ICON_GLOBE_1,
-                                                None => ICON_MAIL_1,
-                                            };
-                                            ui.text(icon, TextDecl { font: Icons, h: transaction_text_h, colour: details_col, align: AlignX::Left, ..TextDecl });
-                                            /* // */ ui.text(frame_strf!(data, "{}", row_memo), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: details_col, ..TextDecl });
+                                        /* // */ ui.text(frame_strf!(data, "{}", row_memo), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: details_col, ..TextDecl });
 
-                                            let layout_id = id_index("Memo Layout Button", index as u32);
-                                            let (layout_clicked, layout_colour, layout_text_colour) = ui.button_ex(true, BUTTON_GREY, layout_id, true, CursorIcon::Pointer);
-                                            if let _ = elem().decl(Decl { id: layout_id, colour: layout_colour, radius: ui.scale(4.0).dup4(), padding: ui.scale(3.0).dup4(), width: fit!(), height: fit!(), ..Decl }) {
-                                                ui.text(ICON_TASKS, TextDecl { font: Icons, h: transaction_text_h, colour: layout_text_colour, align: AlignX::Center, ..TextDecl });
-                                            }
-                                            if layout_clicked {
-                                                data.memo_layout_view = Some(match magic {
-                                                    Some(m) => MemoLayoutView { text: m.text.clone(), how: m.how.clone(), layout: m.layout.clone(), placement: Some((m.first_action_i, m.tx_actions_n)) },
-                                                    None => MemoLayoutView {
-                                                        text: memo_str.clone(),
-                                                        how: "normal memo".to_owned(),
-                                                        layout: wallet::memo_layout(&memo_str, wallet::MemoKind::Normal).unwrap_or_default(),
-                                                        placement: None,
-                                                    },
-                                                });
-                                                ui.modal = Modal::MemoLayout;
-                                            }
-                                        }
+                                        let icon = match magic {
+                                            Some(m) if m.layout.kind == wallet::MemoKind::MagicEncrypted => ICON_LOCK_1,
+                                            Some(_) => ICON_GLOBE_1,
+                                            None => ICON_MAIL_1,
+                                        };
+                                        memo_badge = Some((icon, match magic {
+                                            Some(m) => MemoLayoutView { text: m.text.clone(), how: m.how.clone(), layout: m.layout.clone(), placement: Some((m.first_action_i, m.tx_actions_n)) },
+                                            None => MemoLayoutView {
+                                                text: memo_str.clone(),
+                                                how: "normal memo".to_owned(),
+                                                layout: wallet::memo_layout(&memo_str, wallet::MemoKind::Normal).unwrap_or_default(),
+                                                placement: None,
+                                            },
+                                        }));
                                     }
                                 }
                             }
@@ -3783,6 +3782,19 @@ pub fn ui_left_pane(ui: &mut Context,
                                 }
 
                                 // let _ = elem().decl(Decl { height: grow!(), ..Decl }); // spacer
+
+                                if let Some((icon, view)) = memo_badge.take() {
+                                    let layout_id = id_index("Memo Layout Button", index as u32);
+                                    let (layout_clicked, layout_colour, layout_text_colour) = ui.button_ex(true, BUTTON_GREY, layout_id, true, CursorIcon::Pointer);
+                                    if let _ = elem().decl(Decl { id: layout_id, colour: layout_colour, direction: LeftToRight, child_gap: ui.scale(4.0), radius: ui.scale(4.0).dup4(), padding: ui.scale(3.0).dup4(), width: fit!(), height: fit!(), ..Decl }) {
+                                        ui.text(icon, TextDecl { font: Icons, h: transaction_text_h, colour: layout_text_colour, wrap: Wrap::None, align: AlignX::Center, ..TextDecl });
+                                        ui.text(ICON_TASKS, TextDecl { font: Icons, h: transaction_text_h, colour: layout_text_colour, wrap: Wrap::None, align: AlignX::Center, ..TextDecl });
+                                    }
+                                    if layout_clicked {
+                                        data.memo_layout_view = Some(view);
+                                        ui.modal = Modal::MemoLayout;
+                                    }
+                                }
 
                                 if let _elem = elem().decl(Decl {
                                     id:     id_index("Confirmation Status", index as u32),

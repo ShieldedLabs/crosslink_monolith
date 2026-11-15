@@ -362,9 +362,10 @@ fn attach_magic_memos(txs: &mut Vec<WalletTx>, wallet_name: &'static str) {
             if memo_is_empty(&tx.memo) {
                 tx.memo = memo;
                 tx.memo_count += 1;
+                tx.magic_memo = true;
             }
         } else if m.decrypted_by == Some(wallet_name) && !m.sent {
-            let row = WalletTx { txid: m.txid, h: m.h, part_flags: TxParts::FULL_TX, status: TxStatus::OnBc, memo_count: 1, memo, ..WalletTx::EMPTY };
+            let row = WalletTx { txid: m.txid, h: m.h, part_flags: TxParts::FULL_TX, status: TxStatus::OnBc, memo_count: 1, memo, magic_memo: true, ..WalletTx::EMPTY };
             let at = txs.partition_point(|tx| tx.h <= m.h);
             txs.insert(at, row);
         }
@@ -1099,6 +1100,8 @@ pub struct WalletTx {
     // TODO: keep all memos in single contiguous array as ((txid, index), memo)
     pub memo_count: usize,
     pub memo: [u8; 512],
+    /// Whether `memo` holds a magic memo, set when the history is published.
+    pub magic_memo: bool,
 
     pub status: TxStatus,
     pub staking_action: Option<StakingAction>,
@@ -1118,6 +1121,7 @@ impl WalletTx {
         parts: [WalletTxPart::ZERO; 2],
         memo_count: 0,
         memo: EMPTY_MEMO_BYTES,
+        magic_memo: false,
         staking_action: None,
     };
 
@@ -1159,6 +1163,7 @@ impl WalletTx {
             ],
             memo_count: if memo.len() != 0 { 1 } else { 0 },
             memo: memo_as_bytes,
+            magic_memo: false,
             is_coinbase: false,
             status: if is_outside_bc { TxStatus::SoftFail(BlockHeight(mined_h)) } else { TxStatus::OnBc }, // may need to change...
             staking_action: None,
@@ -1223,7 +1228,7 @@ impl WalletTx {
         }
         let all = self.totals(true);
 
-        if all.spent_zats == Zatoshis::ZERO && all.recv_zats == Zatoshis::ZERO && self.memo_count > 0 {
+        if all.spent_zats == Zatoshis::ZERO && all.recv_zats == Zatoshis::ZERO && self.magic_memo {
             return WalletTxKind::Memo;
         }
 
@@ -1235,7 +1240,7 @@ impl WalletTx {
         // otherwise we assume the self-sent zats are change
         // ALT: only consider it change if a single note is received (per pool?)
         let is_self_send = all.sent_zats == all.recv_zats;
-        if is_self_send && self.memo_count > 0 && all.spent_zats > Zatoshis::ZERO {
+        if is_self_send && self.magic_memo && all.spent_zats > Zatoshis::ZERO {
             return WalletTxKind::MemoSent;
         }
         if is_self_send {
@@ -3511,6 +3516,7 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
         parts: [t, s],
         memo_count,
         memo,
+        magic_memo: false,
         is_coinbase,
         status,
         staking_action: tx.staking_action(),
@@ -3781,6 +3787,7 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
             parts: [ WalletTxPart::ZERO, shielded_part ],
             memo_count: 0,
             memo: EMPTY_MEMO_BYTES,
+            magic_memo: false,
             is_coinbase: false,
             status: TxStatus::OnBc,
             staking_action: None,
