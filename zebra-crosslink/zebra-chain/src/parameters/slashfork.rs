@@ -90,6 +90,34 @@ fn assert_contiguous(tagged: &[TaggedSlashFork], pred: impl Fn(&TaggedSlashFork)
     }
 }
 
+/// Iterates through `rules` and locates the first instance where one `bft_certificate_height` is
+/// followed by a smaller `bft_certificate_height`.
+///
+/// Importantly, it ignores heights set to `SlashForkConfig::NEVER`.
+///
+/// Examples:
+///
+/// 5000, 4000        -> returns (5000, 4000)
+/// 5000, NEVER, 4000 -> returns (5000, 4000)
+/// 1000, NEVER, 4000 -> returns None
+fn bft_height_inversion<'a>(
+    rules: impl IntoIterator<Item = &'a SlashForkConfig>,
+) -> Option<(&'a SlashForkConfig, &'a SlashForkConfig)> {
+    let mut last_real: Option<&SlashForkConfig> = None;
+    for rule in rules {
+        if rule.bft_certificate_height == SlashForkConfig::NEVER {
+            continue;
+        }
+        if let Some(prev) = last_real {
+            if prev.bft_certificate_height > rule.bft_certificate_height {
+                return Some((prev, rule));
+            }
+        }
+        last_real = Some(rule);
+    }
+    None
+}
+
 impl SlashForkSchedule {
     /// Build the canonical schedule by merging `user_slashforks` (typically from
     /// the node config) with the slashfork rules shipped in the executable
@@ -104,7 +132,9 @@ impl SlashForkSchedule {
     /// - Two *different* rules at the same `pow_activation_height`, or
     /// - `bft_certificate_height` decreasing in pow-sorted order (an inversion
     ///   relative to `pow_activation_height`; duplicates are allowed — several
-    ///   rules may share one BFT certificate height), or
+    ///   rules may share one BFT certificate height). PoW-only rules
+    ///   ([`SlashForkConfig::NEVER`]) are skipped: each real height is compared
+    ///   with the previous real height, or
     /// - The two sources interleaving by height. They may only overlap as a
     ///   shared, exactly-matching block (the shipped rules are the assumed past,
     ///   which the user rules may restate exactly and then extend).
@@ -157,10 +187,6 @@ impl SlashForkSchedule {
         tagged.sort_by_key(|t| t.rule.pow_activation_height);
 
         // Two *different* rules at the same pow height are a conflicting overlap.
-        // bft_certificate_height must be non-decreasing in this pow-sorted order, so
-        // the two heights share one coherent order. Unlike pow_activation_height,
-        // duplicates are allowed: several rules may be certified at the same BFT
-        // height (the BFT block then carries them all, in this canonical order).
         for pair in tagged.windows(2) {
             assert!(
                 pair[0].rule.pow_activation_height != pair[1].rule.pow_activation_height,
@@ -169,16 +195,23 @@ impl SlashForkSchedule {
                 pair[0].rule,
                 pair[1].rule,
             );
-            assert!(
-                pair[0].rule.bft_certificate_height <= pair[1].rule.bft_certificate_height,
+        }
+
+        // bft_certificate_height must be non-decreasing in this pow-sorted order, so
+        // the two heights share one coherent order. Unlike pow_activation_height,
+        // duplicates are allowed: several rules may be certified at the same BFT
+        // height (the BFT block then carries them all, in this canonical order).
+        // PoW-only rules (NEVER) are skipped; see bft_height_inversion.
+        if let Some((prev, next)) = bft_height_inversion(tagged.iter().map(|t| &t.rule)) {
+            panic!(
                 "incoherently ordered slashfork rules: the rule at pow_activation_height {} \
-                 has bft_certificate_height {}, but the next rule (pow_activation_height {}) \
+                 has bft_certificate_height {}, but a later rule (pow_activation_height {}) \
                  has bft_certificate_height {}; bft_certificate_height must be non-decreasing \
                  with pow_activation_height",
-                pair[0].rule.pow_activation_height,
-                pair[0].rule.bft_certificate_height,
-                pair[1].rule.pow_activation_height,
-                pair[1].rule.bft_certificate_height,
+                prev.pow_activation_height,
+                prev.bft_certificate_height,
+                next.pow_activation_height,
+                next.bft_certificate_height,
             );
         }
 
@@ -193,10 +226,14 @@ impl SlashForkSchedule {
 
     /// wrap a list that is already canonical; no merging with [`shipped_slashforks`] and no validation
     pub fn from_canonical(rules: Vec<SlashForkConfig>) -> Self {
-        debug_assert!(rules.windows(2).all(|pair| {
-            pair[0].pow_activation_height < pair[1].pow_activation_height
-                && pair[0].bft_certificate_height <= pair[1].bft_certificate_height
-        }));
+        debug_assert!(
+            rules.windows(2).all(|pair| pair[0].pow_activation_height < pair[1].pow_activation_height),
+            "from_canonical: pow_activation_height must be strictly increasing",
+        );
+        debug_assert!(
+            bft_height_inversion(&rules).is_none(),
+            "from_canonical: bft_certificate_height must be non-decreasing",
+        );
         Self { rules }
     }
 
@@ -221,6 +258,8 @@ impl SlashForkSchedule {
 mod tests {
     use super::*;
     use zcash_primitives::bft::PubKeyID;
+
+    const NEVER: u64 = SlashForkConfig::NEVER;
 
     fn rule(pow: u64, bft: u64, finalizer: u8) -> SlashForkConfig {
         SlashForkConfig {
@@ -264,5 +303,44 @@ mod tests {
     fn inverted_bft_height_is_rejected() {
         // pow_activation_height increases but bft_certificate_height decreases.
         SlashForkSchedule::new_without_shipped(vec![rule(150, 20, 1), rule(300, 10, 2)]);
+    }
+
+    #[test]
+    fn pow_only_rule_followed_by_a_bft_height_is_accepted() {
+        let schedule = SlashForkSchedule::new_without_shipped(vec![rule(300, 10, 2), rule(150, NEVER, 1)]);
+        let bfts: Vec<u64> = schedule.rules().iter().map(|r| r.bft_certificate_height).collect();
+        assert_eq!(bfts, vec![NEVER, 10]);
+    }
+
+    #[test]
+    fn bft_height_followed_by_pow_only_rules_is_accepted() {
+        let schedule = SlashForkSchedule::new_without_shipped(vec![
+            rule(150, 10, 1),
+            rule(300, NEVER, 2),
+            rule(450, NEVER, 3),
+        ]);
+        let bfts: Vec<u64> = schedule.rules().iter().map(|r| r.bft_certificate_height).collect();
+        assert_eq!(bfts, vec![10, NEVER, NEVER]);
+    }
+
+    #[test]
+    #[should_panic(expected = "bft_certificate_height must be non-decreasing")]
+    fn pow_only_rule_does_not_hide_an_inversion() {
+        // The real BFT heights around the PoW-only rule decrease: 5000, then 4000.
+        SlashForkSchedule::new_without_shipped(vec![rule(150, 5000, 1), rule(300, NEVER, 2), rule(450, 4000, 3)]);
+    }
+
+    #[test]
+    fn from_canonical_accepts_what_merge_accepts() {
+        let rules = vec![rule(150, NEVER, 1), rule(300, 10, 2), rule(450, NEVER, 3), rule(600, 10, 4)];
+        let merged = SlashForkSchedule::new_without_shipped(rules.clone());
+        assert_eq!(SlashForkSchedule::from_canonical(rules), merged);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "bft_certificate_height must be non-decreasing")]
+    fn from_canonical_rejects_an_inversion_around_a_pow_only_rule() {
+        SlashForkSchedule::from_canonical(vec![rule(150, 5000, 1), rule(300, NEVER, 2), rule(450, 4000, 3)]);
     }
 }

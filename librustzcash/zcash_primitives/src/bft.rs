@@ -33,13 +33,21 @@ pub struct SlashForkConfig {
     /// The PoW block height at which this slashfork activates.
     #[serde(deserialize_with = "deserialize_staking_aligned")]
     pub pow_activation_height: u64,
-    /// The BFT certificate height at which this slashfork activates.
+    /// The BFT certificate height at which this slashfork activates, or
+    /// [`SlashForkConfig::NEVER`] for a PoW-only slashfork.
     pub bft_certificate_height: u64,
     /// Finalizers terminated by this slashfork; must list at least one. Committed
     /// to by hash later, so this list is sorted into a canonical order when the
     /// schedule is built.
     #[serde(deserialize_with = "deserialize_unique_finalizers")]
     pub terminated_finalizers: Vec<PubKeyID>,
+}
+
+impl SlashForkConfig {
+    /// A `bft_certificate_height` of `NEVER` indicates that this is a PoW-only slashfork. A BFT
+    /// height of 2 ** 64 - 1 will never occur even if the BFT block time is 1 second, since that is
+    /// 584.9 billion years.
+    pub const NEVER: u64 = u64::MAX;
 }
 
 fn deserialize_staking_aligned<'de, D>(d: D) -> Result<u64, D::Error> where D: serde::Deserializer<'de> {
