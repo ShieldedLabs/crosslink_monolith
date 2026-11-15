@@ -1264,7 +1264,7 @@ impl<P: consensus::Parameters, U> Builder<P, U> {
             .ok_or(Error::IronwoodBuilderNotAvailable)?
             .outputs()
             .len();
-        for _ in 0..memo.actions_n() {
+        for _ in 0..memo.outputs_n() {
             self.add_ironwood_output(
                 memo.ovk().cloned(),
                 memo.recipient(),
@@ -1982,7 +1982,7 @@ fn build_ironwood_with_magic_memo<FE, R: RngCore>(
     ),
     Error<FE>,
 > {
-    let actions_n = memo.actions_n();
+    let actions_n = memo.outputs_n();
     for _ in 0..MAGIC_MEMO_PLACEMENT_TRIES {
         let mut builder = build_config
             .ironwood_builder()
@@ -2653,7 +2653,7 @@ mod tests {
             )
             .unwrap();
         let memo = memo_for(&fvk, recipient);
-        let chunks_n = memo.actions_n();
+        let chunks_n = memo.outputs_n();
         builder.add_ironwood_magic_memo::<Infallible>(memo).unwrap();
 
         let res = builder
@@ -2766,7 +2766,7 @@ mod tests {
         let bundle = res.transaction().ironwood_bundle().unwrap();
         let ids = action_ids(bundle);
         assert_eq!(
-            magic_memo::decode_public(&compact_views(bundle, &ids)),
+            magic_memo::decode_public(&compact_views(bundle, &ids)).map(magic_memo::ReadMagicMemo::into_content),
             Some(payload)
         );
     }
@@ -2780,9 +2780,9 @@ mod tests {
         ));
         let (res, fvk, chunks_n) = build_and_verify_with_magic_memo(|fvk, recipient| {
             let ovk = fvk.to_ovk(orchard::keys::Scope::External);
-            MagicMemo::encrypted(&payload, recipient, ovk).unwrap()
+            MagicMemo::encrypted(&payload, recipient, ovk).unwrap().with_filler(2)
         });
-        assert_eq!(chunks_n, 3);
+        assert_eq!(chunks_n, 3 + 2, "three memo actions and two of filler");
         assert_memo_actions_consecutive(&res, chunks_n);
         let bundle = res.transaction().ironwood_bundle().unwrap();
         let ids = action_ids(bundle);
@@ -2795,11 +2795,12 @@ mod tests {
         // Found among several of the wallet's addresses, which it names.
         let recipients = MagicMemoRecipients::new([ivk.address_at(1u32), recipient]);
         assert_eq!(
-            magic_memo::decrypt_with_ivk(&prepared_ivk, &recipients, &views),
+            magic_memo::decrypt_with_ivk(&prepared_ivk, &recipients, &views)
+                .map(|(read, to)| (read.into_content(), to)),
             Some((payload.clone(), recipient))
         );
         let ovk = fvk.to_ovk(orchard::keys::Scope::External);
-        assert_eq!(magic_memo::recover_with_ovk(&ovk, bundle), Some(payload));
+        assert_eq!(magic_memo::recover_with_ovk(&ovk, bundle).map(magic_memo::ReadMagicMemo::into_content), Some(payload));
 
         // A wallet that does not know magic memos sees only the ordinary output's note.
         let ordinary_notes = bundle

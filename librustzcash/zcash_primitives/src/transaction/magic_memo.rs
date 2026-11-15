@@ -251,6 +251,8 @@ pub struct MagicMemo {
     recipient:  orchard::Address,
     /// The sender's outgoing viewing key, present exactly when the memo is encrypted.
     ovk:        Option<OutgoingViewingKey>,
+    /// Actions of random-looking filler placed right after the memo's, which readers skip.
+    filler_n:   usize,
 }
 
 impl MagicMemo {
@@ -260,7 +262,7 @@ impl MagicMemo {
     /// Returns `None` if `content` does not fit ([`fits`]).
     pub fn public(content: &MagicMemoContent, outputs_to: orchard::Address) -> Option<Self> {
         let (stored, compressed) = store(content, MagicMemoKind::Public)?;
-        Some(MagicMemo { stored, compressed, recipient: outputs_to, ovk: None })
+        Some(MagicMemo { stored, compressed, recipient: outputs_to, ovk: None, filler_n: 0 })
     }
 
     /// A magic memo carrying `content` that only `recipient`'s incoming viewing key can
@@ -270,7 +272,7 @@ impl MagicMemo {
     /// Returns `None` if `content` does not fit ([`fits`]).
     pub fn encrypted(content: &MagicMemoContent, recipient: orchard::Address, ovk: OutgoingViewingKey) -> Option<Self> {
         let (stored, compressed) = store(content, MagicMemoKind::Encrypted)?;
-        Some(MagicMemo { stored, compressed, recipient, ovk: Some(ovk) })
+        Some(MagicMemo { stored, compressed, recipient, ovk: Some(ovk), filler_n: 0 })
     }
 
     /// Whether this memo is public or encrypted.
@@ -279,14 +281,30 @@ impl MagicMemo {
     /// Whether the payload is stored compressed.
     pub fn is_compressed(&self) -> bool { self.compressed }
 
+    /// How the memo is stored.
+    pub fn plan(&self) -> MagicMemoPlan {
+        let content_len = if self.compressed { decompress(&self.stored).map_or(0, |raw| raw.len()) } else { self.stored.len() };
+        MagicMemoPlan { kind: self.kind(), content_len, stored_len: self.stored.len(), compressed: self.compressed }
+    }
+
     /// The address the memo's zero-value outputs go to: its recipient, if encrypted.
     pub fn recipient(&self) -> orchard::Address { self.recipient }
 
     /// The outgoing viewing key the memo's outputs must be built with, if encrypted.
     pub fn ovk(&self) -> Option<&OutgoingViewingKey> { self.ovk.as_ref() }
 
-    /// The number of consecutive actions, and so zero-value outputs, the memo occupies.
+    /// The number of consecutive actions the memo's content occupies.
     pub fn actions_n(&self) -> usize { actions_for(self.stored.len(), self.kind().first_len()) }
+
+    /// This memo followed by `filler_n` actions of random-looking filler, which pad a transaction's action count
+    /// without revealing how much of it is memo. Readers skip the filler, since the header gives the memo's length.
+    pub fn with_filler(self, filler_n: usize) -> Self { MagicMemo { filler_n, ..self } }
+
+    /// The number of filler actions after the memo's.
+    pub fn filler_n(&self) -> usize { self.filler_n }
+
+    /// The number of consecutive actions, and so zero-value outputs, the memo and its filler occupy.
+    pub fn outputs_n(&self) -> usize { self.actions_n() + self.filler_n }
 
     fn header(&self) -> [u8; HEADER_LEN] {
         let flag = if self.compressed { COMPRESSED_FLAG } else { 0 };
@@ -294,14 +312,16 @@ impl MagicMemo {
         (self.stored.len() as u16 | flag).to_le_bytes()
     }
 
-    /// The bytes for the memo's [`Self::actions_n`] consecutive actions, given the first
+    /// The bytes for the memo's [`Self::outputs_n`] consecutive actions, given the first
     /// of them as the builder made it.
     ///
     /// Returns `None`, with negligible probability, if an action's `epk` bytes admit no
     /// valid point or the first action's `nf` is not a valid `rho`.
     pub fn chunks_for<A, R: RngCore>(&self, first: &orchard::Action<A>, rng: &mut R) -> Option<Vec<MagicMemoChunk>> {
         let Some(ovk) = &self.ovk else {
-            return self.public_chunks();
+            let mut chunks = self.public_chunks()?;
+            chunks.extend(filler_chunks(self.filler_n, rng)?);
+            return Some(chunks);
         };
         let header = self.header();
         let nf = first.nullifier().to_bytes();
@@ -339,6 +359,7 @@ impl MagicMemo {
             let (data, tweak_seed) = buf.split_at(DATA_LEN);
             chunks.push(seal(data.try_into().ok()?, tweak_seed[0])?);
         }
+        chunks.extend(filler_chunks(self.filler_n, rng)?);
         Some(chunks)
     }
 
@@ -357,6 +378,137 @@ impl MagicMemo {
         }
         Some(chunks)
     }
+}
+
+/// What one run of bytes in a magic memo's action holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MagicMemoField {
+    /// The stored length and compression flag (first action only).
+    Header,
+    /// [`MAGIC_MEMO_PLAINTEXT_PREFIX`] (a public memo's first action only).
+    Marker,
+    /// The random salt (an encrypted memo's first action only).
+    Salt,
+    /// Stored payload bytes.
+    Payload,
+    /// Unused bytes after the payload's end.
+    Padding,
+    /// The genuine key-agreement `epk` (an encrypted memo's first action only).
+    KeyAgreement,
+    /// The last byte of `epk`, chosen to make it a valid point.
+    Tweak,
+}
+
+/// The bytes of an action that a magic memo sets: its compact ciphertext, then its `epk`.
+pub const MAGIC_MEMO_ACTION_BYTES: usize = COMPACT_NOTE_SIZE + EPK_LEN;
+
+/// Of [`MAGIC_MEMO_ACTION_BYTES`], how many are compact ciphertext; the rest are `epk`.
+pub const MAGIC_MEMO_CIPHERTEXT_BYTES: usize = COMPACT_NOTE_SIZE;
+
+/// How some content is or would be stored in a magic memo, independent of any keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MagicMemoPlan {
+    kind:        MagicMemoKind,
+    content_len: usize,
+    stored_len:  usize,
+    compressed:  bool,
+}
+
+impl MagicMemoPlan {
+    /// How `content` would be stored in a memo of `kind`, or `None` if it does not fit.
+    pub fn new(content: &MagicMemoContent, kind: MagicMemoKind) -> Option<Self> {
+        let content_len = content.to_bytes().len();
+        let (stored, compressed) = store(content, kind)?;
+        Some(MagicMemoPlan { kind, content_len, stored_len: stored.len(), compressed })
+    }
+
+    /// Whether the memo is public or encrypted.
+    pub fn kind(&self) -> MagicMemoKind { self.kind }
+
+    /// The length of the content's ZIP 302 bytes.
+    pub fn content_len(&self) -> usize { self.content_len }
+
+    /// The length of the stored payload: the content's bytes, compressed if [`Self::is_compressed`].
+    pub fn stored_len(&self) -> usize { self.stored_len }
+
+    /// Whether the payload is stored compressed.
+    pub fn is_compressed(&self) -> bool { self.compressed }
+
+    /// The number of actions the memo occupies.
+    pub fn actions_n(&self) -> usize { actions_for(self.stored_len, self.kind.first_len()) }
+
+    /// For each of the memo's actions, the fields its [`MAGIC_MEMO_ACTION_BYTES`] bytes hold, in order, with
+    /// their lengths in bytes.
+    pub fn layout(&self) -> Vec<Vec<(MagicMemoField, usize)>> {
+        let first_len = self.kind.first_len();
+        let mut remaining = self.stored_len;
+        let mut take = |room: usize| {
+            let n = remaining.min(room);
+            remaining -= n;
+            n
+        };
+        let mut actions = Vec::with_capacity(self.actions_n());
+        let mut first = alloc::vec![(MagicMemoField::Header, HEADER_LEN)];
+        let payload = take(first_len);
+        match self.kind {
+            MagicMemoKind::Encrypted => first.push((MagicMemoField::Salt, SALT_LEN)),
+            MagicMemoKind::Public => first.push((MagicMemoField::Marker, MAGIC_MEMO_PLAINTEXT_PREFIX.len())),
+        }
+        first.push((MagicMemoField::Payload, payload));
+        first.push((MagicMemoField::Padding, first_len - payload));
+        match self.kind {
+            MagicMemoKind::Encrypted => first.push((MagicMemoField::KeyAgreement, EPK_LEN)),
+            MagicMemoKind::Public => first.push((MagicMemoField::Tweak, 1)),
+        }
+        actions.push(first);
+        for _ in 1..self.actions_n() {
+            let payload = take(DATA_LEN);
+            actions.push(alloc::vec![
+                (MagicMemoField::Payload, payload),
+                (MagicMemoField::Padding, DATA_LEN - payload),
+                (MagicMemoField::Tweak, 1),
+            ]);
+        }
+        for action in &mut actions {
+            action.retain(|&(_, len)| len > 0);
+        }
+        actions
+    }
+}
+
+/// A magic memo read from a transaction: its content, how it is stored, and where.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadMagicMemo {
+    content:        MagicMemoContent,
+    plan:           MagicMemoPlan,
+    first_action_i: usize,
+}
+
+impl ReadMagicMemo {
+    /// The memo's content.
+    pub fn content(&self) -> &MagicMemoContent { &self.content }
+
+    /// The memo's content, consuming it.
+    pub fn into_content(self) -> MagicMemoContent { self.content }
+
+    /// How the memo is stored.
+    pub fn plan(&self) -> &MagicMemoPlan { &self.plan }
+
+    /// The index, among the transaction's Ironwood actions, of the memo's first action; the memo occupies
+    /// [`MagicMemoPlan::actions_n`] actions from there.
+    pub fn first_action_i(&self) -> usize { self.first_action_i }
+}
+
+/// `n` actions of uniformly random data, each with a random `epk` tweak seed, as encrypted memo actions look.
+fn filler_chunks<R: RngCore>(n: usize, rng: &mut R) -> Option<Vec<MagicMemoChunk>> {
+    (0..n)
+        .map(|_| {
+            let mut buf = [0u8; DATA_LEN + 1];
+            rng.fill_bytes(&mut buf);
+            let (data, tweak_seed) = buf.split_at(DATA_LEN);
+            seal(data.try_into().ok()?, tweak_seed[0])
+        })
+        .collect()
 }
 
 /// Whether `content` fits in a magic memo of `kind`, compressed if need be.
@@ -391,7 +543,12 @@ fn decompress(stored: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// The content of a stored payload.
-fn unstore(stored: &[u8], compressed: bool) -> Option<MagicMemoContent> { if compressed { MagicMemoContent::from_bytes(&decompress(stored)?) } else { MagicMemoContent::from_bytes(stored) } }
+/// The memo whose stored payload `stored` starts at action `first_action_i`.
+fn unstore(stored: &[u8], compressed: bool, kind: MagicMemoKind, first_action_i: usize) -> Option<ReadMagicMemo> {
+    let raw = if compressed { decompress(stored)? } else { stored.to_vec() };
+    let plan = MagicMemoPlan { kind, content_len: raw.len(), stored_len: stored.len(), compressed };
+    Some(ReadMagicMemo { content: MagicMemoContent::from_bytes(&raw)?, plan, first_action_i })
+}
 
 /// The stored length and compression flag in `header`, if the length is possible.
 fn parse_header(header: [u8; HEADER_LEN], kind: MagicMemoKind) -> Option<(usize, bool)> {
@@ -560,7 +717,7 @@ fn read_rest(first: &[u8], len: usize, rest: &[ActionView<'_>], keystream: Optio
 /// [`MAGIC_MEMO_PLAINTEXT_PREFIX`] opens an ordinary note ciphertext's third to sixth
 /// bytes with probability 2^-32, so callers that act on a memo should also check that it
 /// has the shape they expect (for example, text).
-pub fn decode_public(actions: &[ActionView<'_>]) -> Option<MagicMemoContent> {
+pub fn decode_public(actions: &[ActionView<'_>]) -> Option<ReadMagicMemo> {
     actions.iter().enumerate().find_map(|(j, action)| {
         let data = action.data()?;
         let (header, content) = data.split_at(HEADER_LEN);
@@ -571,7 +728,7 @@ pub fn decode_public(actions: &[ActionView<'_>]) -> Option<MagicMemoContent> {
             return None;
         }
         let stored = read_rest(first, len, &actions[j + 1..j + actions_n], None)?;
-        unstore(&stored, compressed)
+        unstore(&stored, compressed, MagicMemoKind::Public, j)
     })
 }
 
@@ -603,14 +760,14 @@ fn open_encrypted(key: &[u8; 32], j: usize, actions: &[ActionView<'_>]) -> Optio
 
 /// Decrypts the encrypted magic memo carried by a transaction's Ironwood actions that is
 /// addressed to one of `recipients`, whose incoming viewing key is `ivk`, if there is
-/// one, using only what compact actions show. Returns its content and the address it was
+/// one, using only what compact actions show. Returns the memo and the address it was
 /// sent to.
 ///
 /// An action opens only if the `esk` its decrypted salt and payload derive maps its
 /// `epk` to the `g_d` of one of `recipients`. This costs one key agreement per action,
 /// as trial decryption of the actions' notes does, and a scalar multiplication more when
 /// the decrypted length is plausible.
-pub fn decrypt_with_ivk(ivk: &PreparedIncomingViewingKey, recipients: &MagicMemoRecipients, actions: &[ActionView<'_>]) -> Option<(MagicMemoContent, orchard::Address)> {
+pub fn decrypt_with_ivk(ivk: &PreparedIncomingViewingKey, recipients: &MagicMemoRecipients, actions: &[ActionView<'_>]) -> Option<(ReadMagicMemo, orchard::Address)> {
     actions.iter().enumerate().find_map(|(j, action)| {
         let epk = action.epk()?;
         let point = IronwoodDomain::epk(&epk)?;
@@ -620,7 +777,7 @@ pub fn decrypt_with_ivk(ivk: &PreparedIncomingViewingKey, recipients: &MagicMemo
         let inverse = esk_scalar(&opened.seed, action.nf()?)?.invert().into_option()?;
         let epk_point = pallas::Point::from_bytes(&epk.0).into_option()?;
         let address = recipients.by_g_d.get(&(epk_point * inverse).to_bytes())?;
-        Some((unstore(&opened.stored, opened.compressed)?, *address))
+        Some((unstore(&opened.stored, opened.compressed, MagicMemoKind::Encrypted, j)?, *address))
     })
 }
 
@@ -630,7 +787,7 @@ pub fn decrypt_with_ivk(ivk: &PreparedIncomingViewingKey, recipients: &MagicMemo
 ///
 /// An action opens only if its `out_ciphertext` decrypts under `ovk` and the decrypted
 /// salt and payload derive the `esk` that ciphertext holds.
-pub fn recover_with_ovk<A: orchard::bundle::Authorization, V>(ovk: &OutgoingViewingKey, bundle: &orchard::Bundle<A, V>) -> Option<MagicMemoContent> {
+pub fn recover_with_ovk<A: orchard::bundle::Authorization, V>(ovk: &OutgoingViewingKey, bundle: &orchard::Bundle<A, V>) -> Option<ReadMagicMemo> {
     let ids: Vec<([u8; 32], [u8; 32])> = bundle.actions().iter().map(|action| (action.nullifier().to_bytes(), action.cmx().to_bytes())).collect();
     let views: Vec<ActionView<'_>> = bundle.actions().iter().zip(&ids).map(|(action, (nf, cmx))| ActionView::of(action, nf, cmx)).collect();
     // Any valid address will do: the check below compares esk, which depends only on
@@ -653,7 +810,7 @@ pub fn recover_with_ovk<A: orchard::bundle::Authorization, V>(ovk: &OutgoingView
         if !bool::from(derived.ct_eq(&esk)) {
             return None;
         }
-        unstore(&opened.stored, opened.compressed)
+        unstore(&opened.stored, opened.compressed, MagicMemoKind::Encrypted, j)
     })
 }
 
@@ -702,13 +859,16 @@ mod tests {
             for chunk in &chunks {
                 assert!(is_valid_epk(chunk.epk_bytes()));
             }
-            assert_eq!(decode_public(&views(&chunks)), Some(content.clone()));
+            assert_eq!(decode_public(&views(&chunks)).map(ReadMagicMemo::into_content), Some(content.clone()));
 
             // Unrelated actions before and after are skipped.
             let mut wrapped = chunks.clone();
             wrapped.insert(0, junk(&chunks[0]));
             wrapped.push(junk(&chunks[0]));
-            assert_eq!(decode_public(&views(&wrapped)), Some(content.clone()));
+            let read = decode_public(&views(&wrapped)).unwrap();
+            assert_eq!(read.first_action_i(), 1, "after the unrelated action");
+            assert_eq!(read.plan().actions_n(), chunks.len());
+            assert_eq!(read.into_content(), content.clone());
         }
         assert!(!fits(&incompressible(MAGIC_MEMO_PUBLIC_MAX_LEN), MagicMemoKind::Public));
     }
@@ -730,7 +890,10 @@ mod tests {
         let memo = MagicMemo::public(&long, address()).unwrap();
         assert!(memo.is_compressed());
         assert!(memo.actions_n() < actions_for(raw_len, MAGIC_MEMO_PUBLIC_FIRST_LEN));
-        assert_eq!(decode_public(&views(&memo.public_chunks().unwrap())), Some(long));
+        let read = decode_public(&views(&memo.public_chunks().unwrap())).unwrap();
+        assert_eq!(read.plan(), &memo.plan());
+        assert_eq!(read.plan().content_len(), raw_len);
+        assert_eq!(read.into_content(), long);
 
         // Content too long to store raw still fits when it compresses well enough.
         let huge = MagicMemoContent::Text("a".repeat(MAGIC_MEMO_MAX_CONTENT_LEN));
@@ -789,5 +952,22 @@ mod tests {
         let other = orchard::keys::FullViewingKey::from(&orchard::keys::SpendingKey::from_bytes([3; 32]).unwrap()).address_at(1u32, orchard::keys::Scope::External);
         assert_ne!(g_d_bytes(address), g_d_bytes(other));
         assert_eq!(MagicMemoRecipients::new([address, other, address]).len(), 2);
+    }
+
+    #[test]
+    fn layout_accounts_for_every_byte() {
+        for kind in [MagicMemoKind::Public, MagicMemoKind::Encrypted] {
+            for len in [0, 1, kind.first_len(), kind.first_len() + 1, kind.first_len() + 2 * MAGIC_MEMO_NEXT_LEN + 7] {
+                let plan = MagicMemoPlan::new(&incompressible(len), kind).unwrap();
+                let layout = plan.layout();
+                assert_eq!(layout.len(), plan.actions_n());
+                let mut payload = 0;
+                for action in &layout {
+                    assert_eq!(action.iter().map(|&(_, n)| n).sum::<usize>(), MAGIC_MEMO_ACTION_BYTES);
+                    payload += action.iter().filter(|&&(f, _)| f == MagicMemoField::Payload).map(|&(_, n)| n).sum::<usize>();
+                }
+                assert_eq!(payload, plan.stored_len());
+            }
+        }
     }
 }

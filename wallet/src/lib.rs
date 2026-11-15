@@ -70,7 +70,7 @@ use zcash_protocol::value::{ZatBalance, Zatoshis};
 use zcash_protocol::{PoolType, ShieldedProtocol, TxId};
 use zcash_primitives::transaction::builder::BundlePadding;
 #[cfg(feature = "magic-memo")]
-use zcash_primitives::transaction::magic_memo::{self, MagicMemo, MagicMemoContent, MagicMemoKind, MagicMemoRecipients};
+use zcash_primitives::transaction::magic_memo::{self, MagicMemo, MagicMemoContent, MagicMemoField, MagicMemoKind, MagicMemoPlan, MagicMemoRecipients};
 use zcash_primitives::ed25519_zebra::SigningKey;
 use zcash_keys::keys::BondSpendingKey;
 use zcash_transparent::{
@@ -150,7 +150,229 @@ pub struct SeenMagicMemo {
     pub content: MagicMemoContent,
     /// The wallet whose incoming viewing key decrypted it, or `None` for a public memo.
     pub decrypted_by: Option<&'static str>,
+    pub plan: MagicMemoPlan,
+    /// Where the memo's actions start among the tx's Ironwood actions, and how many the tx has.
+    pub first_action_i: usize,
+    pub tx_actions_n: usize,
+    /// Whether `decrypted_by` recovered it as its sender, with its outgoing viewing key.
+    pub sent: bool,
 }
+
+/// How a memo typed into the GUI is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemoKind {
+    /// A standard memo in the recipient's note: at most 512 bytes, read from the full transaction.
+    #[default]
+    Normal,
+    /// A magic memo anyone can read from compact blocks.
+    MagicPublic,
+    /// A magic memo only the recipient (and the sender) can read, from compact blocks.
+    MagicEncrypted,
+}
+
+/// Whether a magic memo's transaction is padded with filler actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemoPadding {
+    #[default]
+    None,
+    /// Up to the next power of two actions, so the action count says less about the memo's size.
+    PowerOfTwo,
+}
+
+impl MemoPadding {
+    /// Filler actions for a memo of `memo_actions_n` actions sent with or without a payment. The transaction's other
+    /// outputs are the payment and the change, which is assumed; when there is no change the count lands one short.
+    pub fn filler_n(self, memo_actions_n: usize, with_payment: bool) -> usize {
+        let others = usize::from(with_payment) + 1;
+        match self {
+            MemoPadding::None => 0,
+            MemoPadding::PowerOfTwo => {
+                let actions_n = memo_actions_n + others;
+                actions_n.next_power_of_two().max(2) - actions_n
+            }
+        }
+    }
+}
+
+/// What one run of bytes in a memo's action holds, for display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoField {
+    /// Length and compression flag.
+    Header,
+    /// "MEMO", which opens a public magic memo.
+    Marker,
+    /// The random salt of an encrypted magic memo.
+    Salt,
+    /// Memo bytes.
+    Payload,
+    /// Unused bytes after the memo's end.
+    Padding,
+    /// A genuine key-agreement `epk`.
+    KeyAgreement,
+    /// The last byte of `epk`, chosen to make it a valid point.
+    Tweak,
+    /// A normal note's compact plaintext (version, diversifier, value, rseed).
+    NotePlaintext,
+    /// The authentication tag closing a normal note's ciphertext.
+    Tag,
+    /// Random-looking filler that pads the action count.
+    Filler,
+}
+
+/// The bytes of each action that light wallets download and a memo can use: the 52-byte compact ciphertext and
+/// the 32-byte `epk`. A normal memo's field and tag come after them, in the full transaction only.
+pub const MEMO_COMPACT_ACTION_BYTES: usize = NOTE_COMPACT_BYTES + EPK_BYTES;
+/// The bytes of a note ciphertext that compact blocks carry.
+const NOTE_COMPACT_BYTES: usize = 52;
+/// The length of an `epk`.
+const EPK_BYTES: usize = 32;
+/// The largest normal memo.
+pub const NORMAL_MEMO_BYTES: usize = 512;
+/// The AEAD tag that closes a note ciphertext.
+const NOTE_TAG_BYTES: usize = 16;
+
+/// How a memo is or would be laid out in the actions of a transaction.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MemoLayout {
+    pub kind: MemoKind,
+    /// The memo's bytes as typed.
+    pub content_len: usize,
+    /// The bytes it occupies: compressed if `compressed`.
+    pub stored_len: usize,
+    pub compressed: bool,
+    /// For each action, its fields in order with their lengths in bytes. A magic memo's actions each total
+    /// `MEMO_COMPACT_ACTION_BYTES`; a normal memo's single action continues past them into the full transaction.
+    pub actions: Vec<Vec<(MemoField, usize)>>,
+}
+
+/// How `text` would be laid out as a memo of `kind`, or why it cannot be.
+pub fn memo_layout(text: &str, kind: MemoKind) -> Result<MemoLayout, String> {
+    match kind {
+        MemoKind::Normal => {
+            let n = text.len();
+            if n > NORMAL_MEMO_BYTES {
+                return Err(format!("{n} bytes; a normal memo holds at most {NORMAL_MEMO_BYTES}"));
+            }
+            let fields = [
+                (MemoField::NotePlaintext, NOTE_COMPACT_BYTES),
+                (MemoField::KeyAgreement, EPK_BYTES),
+                (MemoField::Payload, n),
+                (MemoField::Padding, NORMAL_MEMO_BYTES - n),
+                (MemoField::Tag, NOTE_TAG_BYTES),
+            ];
+            Ok(MemoLayout { kind, content_len: n, stored_len: n, compressed: false, actions: vec![fields.into_iter().filter(|&(_, len)| len > 0).collect()] })
+        }
+        MemoKind::MagicPublic | MemoKind::MagicEncrypted => magic_memo_layout(text, kind),
+    }
+}
+
+#[cfg(feature = "magic-memo")]
+fn magic_memo_layout(text: &str, kind: MemoKind) -> Result<MemoLayout, String> {
+    let magic_kind = if kind == MemoKind::MagicEncrypted { MagicMemoKind::Encrypted } else { MagicMemoKind::Public };
+    MagicMemoPlan::new(&MagicMemoContent::Text(text.to_owned()), magic_kind)
+        .map(|plan| layout_of_plan(&plan))
+        .ok_or_else(|| format!("{} bytes do not fit in a magic memo, even compressed", text.len()))
+}
+
+#[cfg(not(feature = "magic-memo"))]
+fn magic_memo_layout(_text: &str, _kind: MemoKind) -> Result<MemoLayout, String> {
+    Err("this build has no magic memos (build zebrad with --features magic-memo)".to_owned())
+}
+
+#[cfg(feature = "magic-memo")]
+fn layout_of_plan(plan: &MagicMemoPlan) -> MemoLayout {
+    let field = |f: MagicMemoField| match f {
+        MagicMemoField::Header => MemoField::Header,
+        MagicMemoField::Marker => MemoField::Marker,
+        MagicMemoField::Salt => MemoField::Salt,
+        MagicMemoField::Payload => MemoField::Payload,
+        MagicMemoField::Padding => MemoField::Padding,
+        MagicMemoField::KeyAgreement => MemoField::KeyAgreement,
+        MagicMemoField::Tweak => MemoField::Tweak,
+    };
+    MemoLayout {
+        kind: if plan.kind() == MagicMemoKind::Encrypted { MemoKind::MagicEncrypted } else { MemoKind::MagicPublic },
+        content_len: plan.content_len(),
+        stored_len: plan.stored_len(),
+        compressed: plan.is_compressed(),
+        actions: plan.layout().into_iter().map(|action| action.into_iter().map(|(f, len)| (field(f), len)).collect()).collect(),
+    }
+}
+
+/// A magic memo the wallets have seen, for display.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeenMemoView {
+    pub h: u32,
+    pub txid: TxId,
+    /// The memo's text, or a description of non-text content.
+    pub text: String,
+    /// "public", or which wallet decrypted it.
+    pub how: String,
+    /// The wallet that decrypted it ("user" or "miner"), or `None` for a public memo.
+    pub wallet: Option<&'static str>,
+    /// Whether `wallet` sent it rather than received it.
+    pub sent: bool,
+    pub layout: MemoLayout,
+    /// Where the memo's actions start among the tx's Ironwood actions, and how many the tx has.
+    pub first_action_i: usize,
+    pub tx_actions_n: usize,
+}
+
+/// Whether the wallets try to decrypt the encrypted magic memos they scan. Public ones are always read.
+pub static MAGIC_MEMO_DECRYPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[cfg(feature = "magic-memo")]
+fn seen_memo_views() -> Vec<SeenMemoView> {
+    MAGIC_MEMOS_SEEN.lock().unwrap().iter().map(|m| SeenMemoView {
+        h: m.h.0,
+        txid: m.txid,
+        text: match &m.content {
+            MagicMemoContent::Text(text) => text.clone(),
+            other => format!("{} bytes, not text: {other:?}", other.to_bytes().len()),
+        },
+        how: match (m.decrypted_by, m.sent) {
+            (None, _) => "public".to_owned(),
+            (Some(name), true) => format!("sent by {name} wallet"),
+            (Some(name), false) => format!("decrypted by {name} wallet"),
+        },
+        wallet: m.decrypted_by,
+        sent: m.sent,
+        layout: layout_of_plan(&m.plan),
+        first_action_i: m.first_action_i,
+        tx_actions_n: m.tx_actions_n,
+    }).collect()
+}
+
+#[cfg(not(feature = "magic-memo"))]
+fn seen_memo_views() -> Vec<SeenMemoView> { Vec::new() }
+
+/// Puts each magic memo `wallet_name` can read into its history: as the memo of its tx's row when that row has
+/// none, or, for one it received with no payment (so no row), as a row of its own.
+#[cfg(feature = "magic-memo")]
+fn attach_magic_memos(txs: &mut Vec<WalletTx>, wallet_name: &'static str) {
+    for m in MAGIC_MEMOS_SEEN.lock().unwrap().iter() {
+        let readable = m.decrypted_by.map_or(true, |name| name == wallet_name);
+        if !readable { continue; }
+        let mut memo = EMPTY_MEMO_BYTES;
+        let text = match &m.content { MagicMemoContent::Text(text) => text.clone(), other => format!("{other:?}") };
+        let mut end = text.len().min(memo.len());
+        while !text.is_char_boundary(end) { end -= 1; }
+        memo[..end].copy_from_slice(&text.as_bytes()[..end]);
+        if let Some(tx) = txs.iter_mut().find(|tx| tx.txid == m.txid) {
+            if memo_is_empty(&tx.memo) {
+                tx.memo = memo;
+                tx.memo_count += 1;
+            }
+        } else if m.decrypted_by == Some(wallet_name) && !m.sent {
+            let row = WalletTx { txid: m.txid, h: m.h, part_flags: TxParts::FULL_TX, status: TxStatus::OnBc, memo_count: 1, memo, ..WalletTx::EMPTY };
+            let at = txs.partition_point(|tx| tx.h <= m.h);
+            txs.insert(at, row);
+        }
+    }
+}
+
+#[cfg(not(feature = "magic-memo"))]
+fn attach_magic_memos(_txs: &mut Vec<WalletTx>, _wallet_name: &'static str) {}
 
 /// Experimental: every magic memo seen while scanning, in scan order, without repeats from rescans or from
 /// scanning with several wallets.
@@ -398,7 +620,7 @@ struct BuildPrep {
     o_inputs: Vec<ProposedOrchardSpend>,
     o_outputs: Vec<ProposedOrchardOutput>,
     #[cfg(feature = "magic-memo")]
-    o_magic_memos: Vec<MagicMemo>, // each adds `actions_n()` Ironwood outputs
+    o_magic_memos: Vec<MagicMemo>, // each adds `outputs_n()` Ironwood outputs
 
     staking_action: Option<StakingAction>,
     staking_signing_key: Option<SigningKey>,
@@ -411,7 +633,7 @@ impl BuildPrep {
     /// Ironwood outputs, counting each magic memo chunk as one.
     fn o_outputs_n(&self) -> usize {
         #[cfg(feature = "magic-memo")]
-        let magic_n: usize = self.o_magic_memos.iter().map(|memo| memo.actions_n()).sum();
+        let magic_n: usize = self.o_magic_memos.iter().map(|memo| memo.outputs_n()).sum();
         #[cfg(not(feature = "magic-memo"))]
         let magic_n = 0;
         self.o_outputs.len() + magic_n
@@ -582,6 +804,9 @@ enum WalletAction {
     RetargetBond(TxId, bft::FinalizerAddress),
     ClaimBond(TxId),
     SendToAddress(UnifiedAddress, Zatoshis),
+    /// Send `text` as a memo of the given kind, with a payment of the amount to the address if it is nonzero. A
+    /// public magic memo needs no address.
+    SendWithMemo(Option<UnifiedAddress>, Zatoshis, String, MemoKind, MemoPadding),
     /// Convert this node's own finalizer commission into a bond.
     ConvertFinalizerReward(Zatoshis),
 }
@@ -599,6 +824,10 @@ pub enum WalletTxKind {
     ClaimUnstake,
     /// Finalizer commission converted into a bond we own.
     ConvertReward,
+    /// A memo, with no value sent to or from us.
+    Memo,
+    /// A memo we sent with no payment: only the fee left the wallet.
+    MemoSent,
 }
 
 // #[derive(Debug, Clone, Copy, PartialEq)]
@@ -994,6 +1223,10 @@ impl WalletTx {
         }
         let all = self.totals(true);
 
+        if all.spent_zats == Zatoshis::ZERO && all.recv_zats == Zatoshis::ZERO && self.memo_count > 0 {
+            return WalletTxKind::Memo;
+        }
+
         if self.is_coinbase && all.spent_zats == Zatoshis::ZERO && all.recv_zats > Zatoshis::ZERO {
             return WalletTxKind::Mine;
         }
@@ -1002,6 +1235,9 @@ impl WalletTx {
         // otherwise we assume the self-sent zats are change
         // ALT: only consider it change if a single note is received (per pool?)
         let is_self_send = all.sent_zats == all.recv_zats;
+        if is_self_send && self.memo_count > 0 && all.spent_zats > Zatoshis::ZERO {
+            return WalletTxKind::MemoSent;
+        }
         if is_self_send {
             let all_spent_is_t     = self.parts[0].spent_zats == all.spent_zats;
             let all_recv_is_shield = self.parts[1].recv_zats == all.recv_zats;
@@ -1122,6 +1358,9 @@ pub struct WalletState {
     pub stake_positions_unbonded: Vec<(ScanBond, u64 /* latest zats */)>, // withdrawable; no longer finalizer-targeted
 
     pub filters: FinalizerFilters,
+
+    /// The magic memos the wallets have seen, oldest first.
+    pub magic_memos: Vec<SeenMemoView>,
 }
 
 impl WalletState {
@@ -1203,6 +1442,17 @@ impl WalletState {
 
         self.waiting_for_send = true;
         self.actions_in_flight.push_back(WalletAction::SendToAddress(address, Zatoshis::from_u64(amount).expect("send amounts are the GUI's fixed buttons, all far below MAX_MONEY")));
+    }
+
+    /// Sends `text` as a memo of `kind`, paying `amount` to `address` if it is nonzero. `address` comes from
+    /// `decode_send_address`; a public magic memo needs none.
+    pub fn send_with_memo(&mut self, address: Option<UnifiedAddress>, amount: u64, text: String, kind: MemoKind, padding: MemoPadding) {
+        self.send_error.clear();
+        let amount = Zatoshis::from_u64(amount).expect("send amounts are the GUI's fixed buttons, all far below MAX_MONEY");
+        let action = WalletAction::SendWithMemo(address, amount, text, kind, padding);
+        if self.actions_in_flight.contains(&action) { return; }
+        self.waiting_for_send = true;
+        self.actions_in_flight.push_back(action);
     }
 }
 
@@ -2028,7 +2278,7 @@ impl ManualWallet {
                         return None;
                     }
                     prep.o_magic_memos.push(memo.clone());
-                    if DUMP_TX_BUILD { println!("  added magic memo outputs: {}", memo.actions_n()); }
+                    if DUMP_TX_BUILD { println!("  added magic memo outputs: {}", memo.outputs_n()); }
                 }
             }
         }
@@ -2333,6 +2583,24 @@ impl ManualWallet {
         let out = &[TxOutput::IronwoodMagicMemo{ memo }];
         let opts = &TxOptions{ src_pools: &[TxPool::Ironwood(orchard_tree), TxPool::Transparent], ..TxOptions::default() };
         self.send_zats(network, tx, client, out, src_usk, opts)
+    }
+
+    /// Experimental: proposes a transaction carrying `memo`, plus a payment of `amount` to `payment_to` if given.
+    #[cfg(feature = "magic-memo")]
+    pub fn send_with_magic_memo<P: Parameters>(
+        &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
+        src_usk: &UnifiedSpendingKey, orchard_tree: &OrchardShardTree, payment_to: Option<(orchard::Address, Zatoshis)>, memo: MagicMemo
+    ) -> Option<()>
+    {
+        let tz = Timer::scope("send_with_magic_memo");
+        let ovk = PreparedKeys::from_ufvk_all(&self.accounts[0].ufvk).orchard_ovk;
+        let mut out = Vec::new();
+        if let Some((dst, zats)) = payment_to {
+            out.push(TxOutput::Ironwood{ ovk: ovk.clone(), dst, zats, memo: MemoBytes::empty() });
+        }
+        out.push(TxOutput::IronwoodMagicMemo{ memo });
+        let opts = &TxOptions{ src_pools: &[TxPool::Ironwood(orchard_tree), TxPool::Transparent], ..TxOptions::default() };
+        self.send_zats(network, tx, client, &out, src_usk, opts)
     }
 
     /// The signing key for one of our bonds, recovered from the action that created it
@@ -3220,6 +3488,18 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
                 continue;
             };
         }
+
+        // A magic memo we sent: its first action's out_ciphertext is only in the full tx.
+        #[cfg(feature = "magic-memo")]
+        if let Some(ovk) = &keys.orchard_ovk {
+            if let Some(read) = magic_memo::recover_with_ovk(ovk, bundle) {
+                let mut seen = MAGIC_MEMOS_SEEN.lock().unwrap();
+                if !seen.iter().any(|m| m.txid == txid && m.decrypted_by == Some(wallet.name)) {
+                    let (plan, first_action_i) = (*read.plan(), read.first_action_i());
+                    seen.push(SeenMagicMemo{ h: block_h, txid, content: read.into_content(), decrypted_by: Some(wallet.name), plan, first_action_i, tx_actions_n: bundle.actions().len(), sent: true });
+                }
+            }
+        }
     }
 
     let new_tx = WalletTx {
@@ -3338,6 +3618,42 @@ pub fn string_from_t_addr<P: Parameters>(params: P, t_addr: TransparentAddress) 
     t_addr.encode(&params)
 }
 
+/// Builds the GUI's memo send: a normal memo on the payment's note, or a magic memo with an optional payment.
+fn send_gui_memo<P: Parameters>(
+    wallet: &mut ManualWallet, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
+    usk: &UnifiedSpendingKey, orchard_tree: &OrchardShardTree, address: Option<&UnifiedAddress>, amount: Zatoshis, text: &str, kind: MemoKind,
+    padding: MemoPadding,
+) -> Result<(), String> {
+    let build_failed = || "Could not build the send. Check that funds are confirmed and cover the fee.".to_string();
+    let to = address.and_then(|ua| ua.orchard().copied());
+    match kind {
+        MemoKind::Normal => {
+            let to = to.ok_or("A normal memo needs a recipient address.")?;
+            let memo = MemoBytes::from_bytes(text.as_bytes()).map_err(|_| format!("A normal memo holds at most {NORMAL_MEMO_BYTES} bytes."))?;
+            wallet.send_ironwood_to_ironwood_zats(network, tx, client, usk, amount.into_u64(), orchard_tree, to, memo).ok_or_else(build_failed)
+        }
+        #[cfg(feature = "magic-memo")]
+        MemoKind::MagicPublic | MemoKind::MagicEncrypted => {
+            let content = MagicMemoContent::Text(text.to_owned());
+            let memo = if kind == MemoKind::MagicEncrypted {
+                let to = to.ok_or("An encrypted magic memo needs a recipient address.")?;
+                let ovk = PreparedKeys::from_ufvk_all(&wallet.accounts[0].ufvk).orchard_ovk.ok_or("The wallet has no outgoing viewing key.")?;
+                MagicMemo::encrypted(&content, to, ovk)
+            } else {
+                // The outputs are useless to whoever receives them, so our own address is as good as any.
+                let (_t_addr, _p2sh, ua) = addrs_from_account(&wallet.accounts[0], 0).ok_or("The wallet has no address.")?;
+                MagicMemo::public(&content, *ua.orchard().ok_or("The wallet has no Ironwood address.")?)
+            }.ok_or("The memo does not fit in a magic memo, even compressed.")?;
+            let payment = to.filter(|_| amount > Zatoshis::ZERO).map(|to| (to, amount));
+            let filler_n = padding.filler_n(memo.actions_n(), payment.is_some());
+            let memo = memo.with_filler(filler_n);
+            wallet.send_with_magic_memo(network, tx, client, usk, orchard_tree, payment, memo).ok_or_else(build_failed)
+        }
+        #[cfg(not(feature = "magic-memo"))]
+        MemoKind::MagicPublic | MemoKind::MagicEncrypted => Err("This build has no magic memos (build zebrad with --features magic-memo).".to_string()),
+    }
+}
+
 /// Experimental: records the magic memo carried by a compact tx's Ironwood actions, if they carry a public text one
 /// or one encrypted to an address of the scanning wallet `wallet_name`. Everything comes from the compact actions;
 /// the full transaction is never fetched.
@@ -3350,26 +3666,29 @@ fn note_magic_memo(block_h: BlockHeight, txid: &TxId, tx: &CompactTx, keys: &Pre
 
     // Public: every wallet sees it; record it once. MEMO at a fixed place in a random ciphertext has
     // probability 2^-32 per action, and random bytes are almost never text.
-    let public = magic_memo::decode_public(&views).filter(|content| matches!(content, MagicMemoContent::Text(_)));
-    let (content, decrypted_by) = if let Some(content) = public {
+    let public = magic_memo::decode_public(&views).filter(|read| matches!(read.content(), MagicMemoContent::Text(_)));
+    let (read, decrypted_by) = if let Some(read) = public {
         if MAGIC_MEMOS_SEEN.lock().unwrap().iter().any(|m| m.txid == *txid) { return; }
-        (content, None)
+        (read, None)
     } else {
+        if !MAGIC_MEMO_DECRYPT.load(std::sync::atomic::Ordering::Relaxed) { return; }
         // Encrypted: about one key agreement per action, as the note trial decryption that follows costs. Memos to
         // any address in the table are found; this wallet hands out only its default one (diversifier index 0).
         let (Some(ivk), Some(fvk)) = (&keys.orchard_ivk, &keys.orchard_fvk) else { return; };
         if MAGIC_MEMOS_SEEN.lock().unwrap().iter().any(|m| m.txid == *txid && m.decrypted_by == Some(wallet_name)) { return; }
         let recipients = MagicMemoRecipients::new([fvk.address_at(0u32, orchard::keys::Scope::External)]);
-        let Some((content, _address)) = magic_memo::decrypt_with_ivk(ivk, &recipients, &views) else { return; };
-        (content, Some(wallet_name))
+        let Some((read, _address)) = magic_memo::decrypt_with_ivk(ivk, &recipients, &views) else { return; };
+        (read, Some(wallet_name))
     };
+    let (plan, first_action_i) = (*read.plan(), read.first_action_i());
+    let content = read.into_content();
 
     let how = decrypted_by.map_or("public".to_owned(), |name| format!("decrypted by {name} wallet"));
     match &content {
         MagicMemoContent::Text(text) => println!("************** MAGIC MEMO at {block_h:?} in {txid} ({how}, {} bytes): \"{text}\"", text.len()),
         other => println!("************** MAGIC MEMO at {block_h:?} in {txid} ({how}, {} bytes, not text): {other:?}", other.to_bytes().len()),
     }
-    MAGIC_MEMOS_SEEN.lock().unwrap().push(SeenMagicMemo{ h: block_h, txid: *txid, content, decrypted_by });
+    MAGIC_MEMOS_SEEN.lock().unwrap().push(SeenMagicMemo{ h: block_h, txid: *txid, content, decrypted_by, plan, first_action_i, tx_actions_n: views.len(), sent: false });
 }
 
 /// NOTE: this *must* only be called in sequential order without gaps (including after reorg/truncate)
@@ -4949,8 +5268,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             }
 
-            let user_txs = user_wallet.txs.clone();
-            let miner_txs = miner_wallet.txs.clone();
+            let mut user_txs = user_wallet.txs.clone();
+            let mut miner_txs = miner_wallet.txs.clone();
+            attach_magic_memos(&mut user_txs, user_wallet.name);
+            attach_magic_memos(&mut miner_txs, miner_wallet.name);
 
             let mut stake_positions_bonded: Vec<(ScanBond, [u8; 32], u64)> = Vec::new();
             let mut stake_positions_unbonded: Vec<(ScanBond, u64)> = Vec::new();
@@ -5082,8 +5403,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 tip_height: user_wallet.chain_tip_h.0,
             });
 
+            let magic_memos = seen_memo_views();
+
             // DO NOT DO ANY WORK AFTER THIS LOCK IS TAKEN
             let mut lock = wallet_state.lock().unwrap();
+            lock.magic_memos = magic_memos;
             lock.waiting_for_send = waiting_for_send;
             lock.waiting_for_faucet = waiting_for_faucet;
             lock.waiting_for_stake_to_finalizer = waiting_for_stake_to_finalizer;
@@ -5338,6 +5662,16 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     } else {
                         false
                     }
+                }
+
+                WalletAction::SendWithMemo(address, amount, text, kind, padding) => {
+                    let ok = send_gui_memo(&mut user_wallet, network, &mut proposed_send, &mut client, &user_usk, &orchard_tree, address.as_ref(), *amount, text, *kind, *padding);
+                    just_init_new_tx |= ok.is_ok();
+                    if DUMP_ACTIONS { println!("Try user memo send: {ok:?}"); }
+                    if let Err(reason) = ok {
+                        wallet_state.lock().unwrap().send_error = reason;
+                    }
+                    true
                 }
 
                 &WalletAction::UnstakeFromFinalizer(txid) => {

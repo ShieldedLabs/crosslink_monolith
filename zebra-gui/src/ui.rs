@@ -64,6 +64,27 @@ pub struct UiData {
     pub finalizer_banks: Vec<([u8; 32], u64)>,
     /// Text of the amount box in the Convert Commission modal, in cTAZ.
     pub convert_amount: String,
+
+    /// The memo typed in the Send modal, how it is sent, and whether its transaction is padded.
+    pub send_memo: String,
+    pub send_memo_kind: wallet::MemoKind,
+    pub send_memo_pad: bool,
+    /// The memo text and kind last laid out, and the layout, so compression does not rerun every frame.
+    pub send_memo_layout_for: Option<(String, wallet::MemoKind)>,
+    pub send_memo_layout: Option<Result<wallet::MemoLayout, String>>,
+    /// The memo whose layout the Memo Layout modal shows.
+    pub memo_layout_view: Option<MemoLayoutView>,
+}
+
+/// A memo to show the byte layout of.
+#[derive(Debug, Clone, Default)]
+pub struct MemoLayoutView {
+    pub text: String,
+    /// "public", "decrypted by ... wallet", "normal memo", ...
+    pub how: String,
+    pub layout: wallet::MemoLayout,
+    /// The memo's first action and the transaction's action count, for a memo in a transaction.
+    pub placement: Option<(usize, usize)>,
 }
 
 pub fn bank_balance(banks: &[([u8; 32], u64)], pk: &[u8; 32]) -> u64 {
@@ -533,6 +554,7 @@ pub enum Modal {
     Retarget,
     ConvertRewards, // own finalizer commission -> bond
     User, // settings
+    MemoLayout, // byte layout of one memo
 }
 
 pub fn rgba_to_hsva(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8, u8) {
@@ -1303,6 +1325,150 @@ fn chunkify(bytes: &[u8; 32]) -> [u64; 4] {
     chunks
 }
 
+/// Text in the memo layout is broken into lines of at most this many characters by hand: wrapped text in these
+/// containers is laid out one line tall and overlaps what follows.
+const MEMO_LAYOUT_LINE_CHARS: usize = 52;
+
+/// `text` broken at spaces into lines of at most `max` characters (longer words get lines of their own).
+fn wrap_lines(text: &str, max: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > max {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() { line.push(' '); }
+        line.push_str(word);
+    }
+    if !line.is_empty() { lines.push(line); }
+    lines
+}
+
+/// The most characters of a memo a history row shows.
+const ROW_MEMO_CHARS: usize = 60;
+
+/// How many action rows a memo layout shows before summarising the rest.
+const MEMO_LAYOUT_MAX_ROWS: usize = 12;
+/// Actions of the transaction that are not part of the memo.
+const MEMO_OTHER_ACTION_COL: (u8, u8, u8, u8) = (0x34, 0x38, 0x3e, 0xff);
+
+fn memo_field_style(field: wallet::MemoField) -> ((u8, u8, u8, u8), &'static str) {
+    use wallet::MemoField::*;
+    match field {
+        Header        => ((0xe0, 0xa2, 0x5c, 0xff), "header (length, flag)"),
+        Marker        => ((0xc4, 0x7f, 0x34, 0xff), "MEMO marker"),
+        Salt          => ((0xb9, 0x97, 0xdc, 0xff), "salt"),
+        Payload       => ((0x5c, 0xc3, 0x9b, 0xff), "memo bytes"),
+        Padding       => ((0x4c, 0x55, 0x60, 0xff), "unused"),
+        KeyAgreement  => ((0x5f, 0x94, 0xc6, 0xff), "key agreement (epk)"),
+        Tweak         => ((0xe0, 0x78, 0x6b, 0xff), "epk tweak byte"),
+        NotePlaintext => ((0x8e, 0x9a, 0xaa, 0xff), "note (value, rseed)"),
+        Tag           => ((0x9a, 0x6a, 0x4a, 0xff), "auth tag"),
+        Filler        => ((0x3a, 0x70, 0x60, 0xff), "filler"),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MemoRow { Memo(usize), Filler, Other }
+
+/// Draws `layout` as one bar per action, to scale: the memo's actions, then `filler_n` actions of filler, or, with
+/// `placement` (first action, the transaction's action count), every action of its transaction.
+fn draw_memo_layout(ui: &mut Context, data: &mut UiData, child_gap: f32, layout: &wallet::MemoLayout, filler_n: usize, placement: Option<(usize, usize)>) {
+    let text_h = ui.scale(14.0);
+    let note_col = WHITE.mul(0.75);
+    let n = layout.actions.len();
+
+    let summary = match layout.kind {
+        wallet::MemoKind::Normal => format!(
+            "Normal memo: {} of {} bytes, inside the note. Light wallets download only the first {} bytes of each action, so reading it needs the full transaction.",
+            layout.content_len, wallet::NORMAL_MEMO_BYTES, wallet::MEMO_COMPACT_ACTION_BYTES),
+        kind => {
+            let visibility = if kind == wallet::MemoKind::MagicEncrypted { "encrypted" } else { "public" };
+            let compressed = if layout.compressed { format!(" (compressed from {})", layout.content_len) } else { String::new() };
+            let filler = if filler_n > 0 { format!(", plus {filler_n} of filler") } else { String::new() };
+            format!("Magic memo, {visibility}: {} bytes stored{compressed} in {n} action{}{filler}, all readable from compact blocks.",
+                layout.stored_len, if n == 1 { "" } else { "s" })
+        }
+    };
+    for line in wrap_lines(&summary, MEMO_LAYOUT_LINE_CHARS) {
+        ui.text(frame_strf!(data, "{}", line), TextDecl { h: text_h, colour: note_col, wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
+    }
+
+    let mut rows: Vec<(usize, MemoRow)> = Vec::new();
+    let mut focus = 0;
+    match placement {
+        Some((first, total)) => {
+            focus = first;
+            for i in 0..total.max(first + n) {
+                rows.push((i, if i >= first && i < first + n { MemoRow::Memo(i - first) } else { MemoRow::Other }));
+            }
+        }
+        None => {
+            for i in 0..n { rows.push((i, MemoRow::Memo(i))); }
+            for i in 0..filler_n { rows.push((n + i, MemoRow::Filler)); }
+        }
+    }
+    let start = if rows.len() > MEMO_LAYOUT_MAX_ROWS { focus.saturating_sub(1).min(rows.len() - MEMO_LAYOUT_MAX_ROWS) } else { 0 };
+    let end = (start + MEMO_LAYOUT_MAX_ROWS).min(rows.len());
+    if start > 0 {
+        ui.text(frame_strf!(data, "{} earlier action{}", start, if start == 1 { "" } else { "s" }), TextDecl { h: text_h, colour: note_col, align: AlignX::Left, ..TextDecl });
+    }
+    for &(i, row) in &rows[start..end] {
+        if let _ = elem().decl(Decl { direction: LeftToRight, child_gap, align: Left, width: grow!(), height: fit!(), ..Decl }) {
+            if let _ = elem().decl(Decl { width: fixed!(ui.scale(72.0)), height: fit!(), ..Decl }) {
+                ui.text(frame_strf!(data, "action {}", i), TextDecl { font: Mono, h: ui.scale(12.0), colour: WHITE.mul(0.6), wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
+            }
+            if let _ = elem().decl(Decl { direction: LeftToRight, width: grow!(), height: fixed!(ui.scale(16.0)), radius: ui.scale(3.0).dup4(), clip: ClipX, ..Decl }) {
+                match row {
+                    MemoRow::Memo(k) => {
+                        let fields = &layout.actions[k];
+                        let total: usize = fields.iter().map(|&(_, len)| len).sum();
+                        let mut at = 0;
+                        for &(field, len) in fields {
+                            let (colour, _) = memo_field_style(field);
+                            let _ = elem().decl(Decl { colour, width: Sizing::Percent(len as f32 / total as f32), height: grow!(), ..Decl });
+                            at += len;
+                            // Mark where compact blocks stop, inside a normal memo's longer action.
+                            if at == wallet::MEMO_COMPACT_ACTION_BYTES && total > at {
+                                let _ = elem().decl(Decl { colour: WHITE, width: fixed!(ui.scale(2.0)), height: grow!(), ..Decl });
+                            }
+                        }
+                    }
+                    MemoRow::Filler => { let _ = elem().decl(Decl { colour: memo_field_style(wallet::MemoField::Filler).0, width: grow!(), height: grow!(), ..Decl }); }
+                    MemoRow::Other  => { let _ = elem().decl(Decl { colour: MEMO_OTHER_ACTION_COL, width: grow!(), height: grow!(), ..Decl }); }
+                }
+            }
+        }
+    }
+    if end < rows.len() {
+        ui.text(frame_strf!(data, "{} more action{}", rows.len() - end, if rows.len() - end == 1 { "" } else { "s" }), TextDecl { h: text_h, colour: note_col, align: AlignX::Left, ..TextDecl });
+    }
+    if layout.kind == wallet::MemoKind::Normal {
+        ui.text("White line: the end of what compact blocks carry.", TextDecl { h: text_h, colour: note_col, align: AlignX::Left, ..TextDecl });
+    }
+
+    // Legend: the fields that appear, in first-seen order.
+    let mut legend: Vec<((u8, u8, u8, u8), &'static str)> = Vec::new();
+    for action in &layout.actions {
+        for &(field, _) in action {
+            let style = memo_field_style(field);
+            if !legend.contains(&style) { legend.push(style); }
+        }
+    }
+    if rows.iter().any(|&(_, row)| matches!(row, MemoRow::Filler)) { legend.push(memo_field_style(wallet::MemoField::Filler)); }
+    if rows.iter().any(|&(_, row)| matches!(row, MemoRow::Other)) { legend.push((MEMO_OTHER_ACTION_COL, "other actions")); }
+    for chunk in legend.chunks(3) {
+        if let _ = elem().decl(Decl { direction: LeftToRight, child_gap: ui.scale(14.0), align: Left, width: grow!(), height: fit!(), ..Decl }) {
+            for &(colour, name) in chunk {
+                if let _ = elem().decl(Decl { direction: LeftToRight, child_gap: ui.scale(6.0), align: Left, width: fit!(), height: fit!(), ..Decl }) {
+                    let _ = elem().decl(Decl { colour, radius: ui.scale(2.0).dup4(), width: fixed!(ui.scale(10.0)), height: fixed!(ui.scale(10.0)), ..Decl });
+                    ui.text(name, TextDecl { h: ui.scale(12.0), colour: note_col, wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
+                }
+            }
+        }
+    }
+}
+
 fn modal_action_button(
     ui: &mut Context,
     padding: (f32, f32, f32, f32),
@@ -1837,7 +2003,7 @@ pub fn ui_left_pane(ui: &mut Context,
         if ui.modal == Modal::Stake || ui.modal == Modal::Send || ui.modal == Modal::Jump || ui.modal == Modal::ConvertRewards {
             height = fit!();
         }
-        if ui.modal == Modal::Unstake {
+        if ui.modal == Modal::Unstake || ui.modal == Modal::MemoLayout {
             height = percent!(0.9);
         }
 
@@ -2108,6 +2274,56 @@ pub fn ui_left_pane(ui: &mut Context,
                             ui.text(frame_strf!(data, "{}", data.send_address_err), TextDecl { h: ui.scale(16.0), colour: (0xff, 0xaf, 0x0e, 0xff), align: AlignX::Center, ..TextDecl });
                         }
 
+                        // Memo: part of the send, carried by the amount buttons below.
+                        if let _ = elem().decl(Decl { width: grow!(), height: fit!(), ..Decl }) {
+                            data.send_memo = ui.textbox(
+                                data,
+                                id("Send Memo Textbox"),
+                                "Memo (optional)...",
+                                TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
+                            );
+                        }
+                        if let _ = elem().decl(Decl { direction: LeftToRight, child_gap, align: Center, width: fit!(), height: fit!(), ..Decl }) {
+                            let kinds = [
+                                (wallet::MemoKind::Normal,         "Normal memo"),
+                                (wallet::MemoKind::MagicPublic,    "Magic, public"),
+                                (wallet::MemoKind::MagicEncrypted, "Magic, encrypted"),
+                            ];
+                            for (i, (kind, label)) in kinds.into_iter().enumerate() {
+                                let kind_id = id_index("Send Memo Kind", i as u32);
+                                let base = if data.send_memo_kind == kind { BUTTON_BLUE } else { BUTTON_GREY };
+                                let (clicked, colour, text_colour) = ui.button_ex(true, base, kind_id, true, CursorIcon::Pointer);
+                                if let _ = elem().decl(Decl { id: kind_id, colour, radius: ui.scale(14.0).dup4(), padding: ui.scale(8.0).dup4(), align: Center, width: fit!(), height: fit!(), ..Decl }) {
+                                    ui.text(label, TextDecl { h: ui.scale(14.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
+                                }
+                                if clicked { data.send_memo_kind = kind; }
+                            }
+                        }
+                        if data.send_memo_kind != wallet::MemoKind::Normal {
+                            ui.checkbox_pill(id("Send Memo Pad"), &mut data.send_memo_pad, "Pad to a power of 2 actions", fit!());
+                        }
+                        let memo_padding = if data.send_memo_kind != wallet::MemoKind::Normal && data.send_memo_pad { wallet::MemoPadding::PowerOfTwo } else { wallet::MemoPadding::None };
+                        if !data.send_memo.is_empty() {
+                            let key = (data.send_memo.clone(), data.send_memo_kind);
+                            if data.send_memo_layout_for.as_ref() != Some(&key) {
+                                data.send_memo_layout = Some(wallet::memo_layout(&key.0, key.1));
+                                data.send_memo_layout_for = Some(key);
+                            }
+                            match data.send_memo_layout.clone() {
+                                Some(Ok(layout)) => {
+                                    let filler_n = memo_padding.filler_n(layout.actions.len(), data.send_address_ua.is_some());
+                                    if let _ = elem().decl(Decl { direction: TopToBottom, child_gap: ui.scale(4.0), width: grow!(), height: fit!(), ..Decl }) {
+                                        draw_memo_layout(ui, data, child_gap, &layout, filler_n, None);
+                                    }
+                                }
+                                Some(Err(reason)) => {
+                                    ui.text(frame_strf!(data, "{}", reason), TextDecl { h: ui.scale(16.0), colour: (0xff, 0xaf, 0x0e, 0xff), align: AlignX::Center, ..TextDecl });
+                                }
+                                None => {}
+                            }
+                        }
+                        let memo_ok = data.send_memo.is_empty() || matches!(data.send_memo_layout, Some(Ok(_)));
+
                         // spacer
                         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
 
@@ -2154,12 +2370,23 @@ pub fn ui_left_pane(ui: &mut Context,
 
                             if true {
                                 for send in sends {
-                                    if button(ui, send.0, can && (balance as u64) >= send.1) {
+                                    if button(ui, send.0, can && memo_ok && (balance as u64) >= send.1) {
                                         let ua = data.send_address_ua.clone().expect("the button is disabled until the address decodes");
-                                        wallet_state.lock().unwrap().send_to_address(ua, send.1);
+                                        if data.send_memo.is_empty() {
+                                            wallet_state.lock().unwrap().send_to_address(ua, send.1);
+                                        } else {
+                                            wallet_state.lock().unwrap().send_with_memo(Some(ua), send.1, data.send_memo.clone(), data.send_memo_kind, memo_padding);
+                                        }
                                         // The pending row in the history confirms it; a build failure shows on the wallet tab.
                                         ui.modal = Modal::None;
                                     }
+                                }
+                                // A memo with no payment; a public magic memo needs no recipient.
+                                let memo_only_ok = !waiting_for_send && !data.send_memo.is_empty() && memo_ok
+                                    && (data.send_address_ua.is_some() || data.send_memo_kind == wallet::MemoKind::MagicPublic);
+                                if button(ui, "Memo only", memo_only_ok) {
+                                    wallet_state.lock().unwrap().send_with_memo(data.send_address_ua.clone(), 0, data.send_memo.clone(), data.send_memo_kind, memo_padding);
+                                    ui.modal = Modal::None;
                                 }
 
                             } else {
@@ -2953,6 +3180,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
                 Modal::User => {
                     title_bar(ui, true, "User", id("User Title Bar"));
+                    let decrypt_memos_id = id("Decrypt Magic Memos");
 
                     let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("User Scroll Container"), 48.0);
                     let scroll = *scroll;
@@ -2970,6 +3198,28 @@ pub fn ui_left_pane(ui: &mut Context,
                             ui.input().send_to_clipboard(&ufvk);
                         }
 
+                        let mut decrypt = wallet::MAGIC_MEMO_DECRYPT.load(std::sync::atomic::Ordering::Relaxed);
+                        ui.checkbox_pill(decrypt_memos_id, &mut decrypt, "Decrypt magic memos sent to me", fit!());
+                        wallet::MAGIC_MEMO_DECRYPT.store(decrypt, std::sync::atomic::Ordering::Relaxed);
+
+                    }
+                    scroll_container_finish(ui, data, padding, id, clip, scroll, content_h, viewport_h, max);
+                }
+
+                Modal::MemoLayout => {
+                    title_bar(ui, true, "Memo Layout", id("Memo Layout Title Bar"));
+
+                    let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("Memo Layout Scroll Container"), 48.0);
+                    let scroll = *scroll;
+                    scroll_container_begin(ui, data, padding, 0.0, id, clip, scroll, content_h, viewport_h, max);
+                    if let Some(view) = data.memo_layout_view.clone() {
+                        if let _ = elem().decl(Decl { direction: TopToBottom, child_gap, width: grow!(), height: fit!(), ..Decl }) {
+                            for line in wrap_lines(&view.text, MEMO_LAYOUT_LINE_CHARS) {
+                                ui.text(frame_strf!(data, "{}", line), TextDecl { h: ui.scale(16.0), colour: WHITE, wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
+                            }
+                            ui.text(frame_strf!(data, "{}", view.how), TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.6), align: AlignX::Left, ..TextDecl });
+                            draw_memo_layout(ui, data, child_gap, &view.layout, 0, view.placement);
+                        }
                     }
                     scroll_container_finish(ui, data, padding, id, clip, scroll, content_h, viewport_h, max);
                 }
@@ -3109,6 +3359,8 @@ pub fn ui_left_pane(ui: &mut Context,
             txs.reverse();
             txs
         };
+        let magic_memos = wallet_state.lock().unwrap().magic_memos.clone();
+        let tab_wallet = if *tab_id == tab_id_user_wallet { "user" } else { "miner" };
 
         let DOUBLE_ICON_OK_CIRCLED_1  = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED_1,  ICON_OK_CIRCLED_1).as_str()) };
         let DOUBLE_ICON_OK_CIRCLED2_1 = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED2_1, ICON_OK_CIRCLED2_1).as_str()) };
@@ -3306,6 +3558,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                         WalletTxKind::Retarget     => ICON_MOVE,
                                         WalletTxKind::ClaimUnstake => ICON_UNLINK,
                                         WalletTxKind::ConvertReward => ICON_LINK_1,
+                                        WalletTxKind::Memo         => ICON_MAIL_1,
+                                        WalletTxKind::MemoSent     => ICON_UP_SMALL,
                                     }
                                 };
 
@@ -3340,6 +3594,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     WalletTxKind::Retarget      => if tx_is_in_block { "Moved Delegation"  } else { "Moving Delegation..." },
                                     WalletTxKind::ClaimUnstake  => if tx_is_in_block { "Withdrawn"  } else { "Withdrawing..." },
                                     WalletTxKind::ConvertReward => if tx_is_in_block { "Converted To Bond" } else { "Converting To Bond..." },
+                                    WalletTxKind::Memo          => if tx_is_in_block { "Memo" } else { "Receiving memo..." },
+                                    WalletTxKind::MemoSent      => if tx_is_in_block { "Memo sent" } else { "Sending memo..." },
                                 };
 
                                 let label_str = 'get_label: {
@@ -3428,7 +3684,40 @@ pub fn ui_left_pane(ui: &mut Context,
                                             }
                                         }
 
-                                        /* // */ ui.text(frame_strf!(data, "{}", memo_str), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: details_col, ..TextDecl });
+                                        let magic = magic_memos.iter().find(|m| m.txid == tx.txid && m.wallet.map_or(true, |w| w == tab_wallet));
+                                        // Rows have a fixed height; the layout button shows the whole memo.
+                                        let row_memo = if memo_str.chars().count() > ROW_MEMO_CHARS {
+                                            format!("{}...", memo_str.chars().take(ROW_MEMO_CHARS).collect::<String>())
+                                        } else {
+                                            memo_str.clone()
+                                        };
+                                        if let _ = elem().decl(Decl { direction: LeftToRight, child_gap: ui.scale(6.0), align: Left, width: grow!(), height: fit!(), ..Decl }) {
+                                            let icon = match magic {
+                                                Some(m) if m.layout.kind == wallet::MemoKind::MagicEncrypted => ICON_LOCK_1,
+                                                Some(_) => ICON_GLOBE_1,
+                                                None => ICON_MAIL_1,
+                                            };
+                                            ui.text(icon, TextDecl { font: Icons, h: transaction_text_h, colour: details_col, align: AlignX::Left, ..TextDecl });
+                                            /* // */ ui.text(frame_strf!(data, "{}", row_memo), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: details_col, ..TextDecl });
+
+                                            let layout_id = id_index("Memo Layout Button", index as u32);
+                                            let (layout_clicked, layout_colour, layout_text_colour) = ui.button_ex(true, BUTTON_GREY, layout_id, true, CursorIcon::Pointer);
+                                            if let _ = elem().decl(Decl { id: layout_id, colour: layout_colour, radius: ui.scale(4.0).dup4(), padding: ui.scale(3.0).dup4(), width: fit!(), height: fit!(), ..Decl }) {
+                                                ui.text(ICON_TASKS, TextDecl { font: Icons, h: transaction_text_h, colour: layout_text_colour, align: AlignX::Center, ..TextDecl });
+                                            }
+                                            if layout_clicked {
+                                                data.memo_layout_view = Some(match magic {
+                                                    Some(m) => MemoLayoutView { text: m.text.clone(), how: m.how.clone(), layout: m.layout.clone(), placement: Some((m.first_action_i, m.tx_actions_n)) },
+                                                    None => MemoLayoutView {
+                                                        text: memo_str.clone(),
+                                                        how: "normal memo".to_owned(),
+                                                        layout: wallet::memo_layout(&memo_str, wallet::MemoKind::Normal).unwrap_or_default(),
+                                                        placement: None,
+                                                    },
+                                                });
+                                                ui.modal = Modal::MemoLayout;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -3470,6 +3759,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     WalletTxKind::Receive      => (true, "+", all.recv_zats.into_u64()),
                                     WalletTxKind::ClaimUnstake => (true, "+", all.recv_zats.into_u64()),
                                     WalletTxKind::Mine         => (true, "+", all.recv_zats.into_u64()),
+                                    WalletTxKind::Memo | WalletTxKind::MemoSent => (false, "", 0),
                                 };
 
                                 if show_val {
@@ -3481,7 +3771,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                 // We care about fees if we spent any money ourselves.
                                 // If we just received from somewhere else, we don't care about fees.
                                 if tx.kind() != WalletTxKind::Receive &&
-                                   tx.kind() != WalletTxKind::Mine // ALT: if fee != Some(0)
+                                   tx.kind() != WalletTxKind::Mine &&
+                                   tx.kind() != WalletTxKind::Memo // ALT: if fee != Some(0)
                                 {
                                     let fee_str = if let Some(fee) = tx.fee() {
                                         str_from_ctaz(fee.into_u64())
