@@ -629,12 +629,14 @@ pub fn terminated_finalizers_at(
     set
 }
 
-/// Vote-namespacing domain separator for a BFT height: a flat blake3 hash of the prefix of
-/// scheduled slashforks whose `bft_certificate_height <= bft_height` (inclusive of a slashfork at
-/// `bft_height` itself), concatenated in canonical schedule order. An empty prefix yields
+/// Vote-namespacing domain separator for a BFT height: a flat blake3 hash of the scheduled
+/// slashforks whose `bft_certificate_height <= bft_height` (inclusive of a slashfork at
+/// `bft_height` itself), concatenated in canonical schedule order. An empty set yields
 /// `[0; 32]` (nil), so the no-slashfork case is a backwards-compatible no-op in tenderlink's
-/// signing. The schedule is sorted with non-decreasing `bft_certificate_height` (several rules
-/// may share one certificate height), so the filtered set is exactly the prefix.
+/// signing. The real `bft_certificate_height`s in the schedule are non-decreasing (several rules
+/// may share one certificate height), but PoW-only rules (`SlashForkConfig::NEVER`) can come
+/// between them. The filter therefore selects a subsequence, not a prefix, and must not stop at
+/// the first rule that fails it.
 ///
 /// At a height that decides by the strict quorum (`strict_quorum_at`) the FeaturenetUpgrade2
 /// branch ID follows the slashforks. A finalizer still deciding on `2f+1` and one deciding on the
