@@ -1912,6 +1912,77 @@ impl BlockGen {
             .map(|(outpoint, utxo)| (*outpoint, utxo.output.clone()))
     }
 
+    /// The coinbase the production miner path builds. Ironwood v6 removed the old
+    /// `standard_coinbase_outputs` / `Transaction::new_v*_coinbase` helpers, so this goes
+    /// MinerParams -> TransactionTemplate::new_coinbase -> deserialize. It is network-agnostic
+    /// (not regtest-specific), which is what the fuzzer needs too. NU6 onward requires coinbase
+    /// outputs == subsidy + fees exactly, so the caller passes `txs_fee`.
+    fn builder_coinbase(
+        network: &Network,
+        miner_addr: &Address,
+        height: BlockHeight,
+        txs_fee: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    ) -> Transaction {
+        use zebra_rpc::methods::types::transaction::TransactionTemplate;
+        // `data()` is the public derive_getters accessor for the template's serialized bytes; no
+        // rpc-crate change is needed to reach the built coinbase transaction.
+        TransactionTemplate::new_coinbase(network, height, &BlockGen::miner_params(network, miner_addr), txs_fee)
+            .expect("valid coinbase template")
+            .data()
+            .as_ref()
+            .zcash_deserialize_into()
+            .expect("coinbase template deserializes")
+    }
+
+    fn miner_params(network: &Network, miner_addr: &Address) -> zebra_rpc::methods::types::get_block_template::MinerParams {
+        let mining_config = zebra_rpc::config::mining::Config {
+            miner_address: Some(miner_addr.to_zcash_address(network)),
+            ..Default::default()
+        };
+        zebra_rpc::methods::types::get_block_template::MinerParams::new(network, mining_config).expect("valid miner params")
+    }
+
+    /// `builder_coinbase`'s transaction built directly, for a transparent miner at a height that
+    /// pays no funding streams or lockbox disbursements; `None` otherwise. The builder loads the
+    /// Sapling prover's parameters, about 110 ms in every process that builds a block, and works
+    /// through shielded bundles it then leaves out; this takes microseconds.
+    /// `fast_coinbase_is_the_builders` checks that the two are the same bytes.
+    fn fast_coinbase(
+        network: &Network,
+        miner_addr: &Address,
+        height: BlockHeight,
+        txs_fee: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    ) -> Option<Transaction> {
+        use zcash_script::opcode::Evaluable;
+        use zcash_transparent::address::TransparentAddress;
+        use zebra_chain::parameters::subsidy::{block_subsidy, funding_stream_values, miner_subsidy};
+
+        let Address::Transparent(addr) = miner_addr else { return None };
+        if NetworkUpgrade::current(network, height) < NetworkUpgrade::Nu6_3 {
+            return None;
+        }
+        let subsidy = block_subsidy(height, network).ok()?;
+        if !funding_stream_values(height, network, subsidy).ok()?.is_empty() || !network.lockbox_disbursements(height).is_empty() {
+            return None;
+        }
+        let miner_reward = (miner_subsidy(height, network, subsidy).ok()? + txs_fee).ok()?;
+        let lock_script = match addr {
+            TransparentAddress::PublicKeyHash(hash) => [&[0x76, 0xa9, 0x14][..], &hash[..], &[0x88, 0xac]].concat(),
+            TransparentAddress::ScriptHash(hash) => [&[0xa9, 0x14][..], &hash[..], &[0x87]].concat(),
+        };
+        let data = BlockGen::miner_params(network, miner_addr).data().as_ref().map(|data| data.to_bytes()).unwrap_or_default();
+        Some(Transaction::V6 {
+            network_upgrade: NetworkUpgrade::current(network, height),
+            lock_time: LockTime::unlocked(),
+            expiry_height: height,
+            inputs: vec![zebra_chain::transparent::Input::Coinbase { height, data, sequence: u32::MAX }],
+            outputs: vec![zebra_chain::transparent::Output::new(miner_reward, zebra_chain::transparent::Script::new(&lock_script))],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+        })
+    }
+
     pub fn create_block(
         network: &Network,
         miner_addr: &Address,
@@ -1923,31 +1994,8 @@ impl BlockGen {
         extra_txs: &[Arc<Transaction>],
         txs_fee: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
     ) -> Arc<zebra_chain::block::Block> {
-        // Build the coinbase the same way the production miner path does. Ironwood v6 removed
-        // the old `standard_coinbase_outputs` / `Transaction::new_v*_coinbase` helpers, so we go
-        // MinerParams -> TransactionTemplate::new_coinbase -> deserialize. This is
-        // network-agnostic (not regtest-specific), which is what the fuzzer needs too. NU6 onward
-        // requires coinbase outputs == subsidy + fees exactly, so the caller passes `txs_fee`.
-        use zebra_rpc::methods::types::get_block_template::MinerParams;
-        use zebra_rpc::methods::types::transaction::TransactionTemplate;
-        let mining_config = zebra_rpc::config::mining::Config {
-            miner_address: Some(miner_addr.to_zcash_address(network)),
-            ..Default::default()
-        };
-        let miner_params = MinerParams::new(network, mining_config).expect("valid miner params");
-        // `data()` is the public derive_getters accessor for the template's serialized bytes; no
-        // rpc-crate change is needed to reach the built coinbase transaction.
-        let coinbase_tx: Transaction = TransactionTemplate::new_coinbase(
-            network,
-            height,
-            &miner_params,
-            txs_fee,
-        )
-        .expect("valid coinbase template")
-        .data()
-        .as_ref()
-        .zcash_deserialize_into()
-        .expect("coinbase template deserializes");
+        let coinbase_tx = BlockGen::fast_coinbase(network, miner_addr, height, txs_fee)
+            .unwrap_or_else(|| BlockGen::builder_coinbase(network, miner_addr, height, txs_fee));
 
         let mut transactions: Vec<Arc<Transaction>> = Vec::with_capacity(1 + extra_txs.len());
         transactions.push(coinbase_tx.into());

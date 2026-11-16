@@ -2736,3 +2736,49 @@ fn crosslink_fuzz_generator_spends_bonds_from_their_create() {
     eprintln!("inputs with a bond's first spend: {}", counts.join(", "));
     assert!(inputs.iter().all(|&n| n >= 10), "too few inputs with a bond's first spend: {}", counts.join(", "));
 }
+
+/// The generator builds its coinbases directly (`BlockGen::fast_coinbase`) rather than through
+/// the production builder, which is far slower: the two must be the same bytes, on the networks
+/// the fuzzer and the scenes run, across their upgrades, for the miners they use.
+#[test]
+fn fast_coinbase_is_the_builders() {
+    use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
+    let networks = [
+        test_network(&BFT_ROUNDS_PARAMETERS, ""),
+        regtest_network(&HARNESS_PARAMETERS),
+        test_network(&HARNESS_PARAMETERS, &node_config_with_activation_heights(ConfiguredActivationHeights {
+            featurenet_upgrade_2: Some(5),
+            ..Default::default()
+        })),
+        test_network(&HARNESS_PARAMETERS, &node_config_with_activation_heights(ConfiguredActivationHeights {
+            featurenet_upgrade_3: Some(7),
+            ..Default::default()
+        })),
+    ];
+    let miners = [
+        TestKey::new(b"crosslink test miner").address(),
+        Address::Transparent(zcash_transparent::address::TransparentAddress::PublicKeyHash([0x81; 20])),
+    ];
+    let mut compared = 0;
+    for network in &networks {
+        for height in [1u32, 2, 3, 4, 5, 6, 7, 8, 16, 111, 112, 256, 10_000, 55_295, 55_296, 165_000, 189_000] {
+            for miner in &miners {
+                for fee in [0i64, 12_345] {
+                    let height = BlockHeight(height);
+                    let fee = zebra_chain::amount::Amount::try_from(fee).expect("a small fee");
+                    let Some(fast) = BlockGen::fast_coinbase(network, miner, height, fee) else { continue };
+                    let builder = BlockGen::builder_coinbase(network, miner, height, fee);
+                    assert_eq!(
+                        hex::encode(fast.zcash_serialize_to_vec().expect("serializes")),
+                        hex::encode(builder.zcash_serialize_to_vec().expect("serializes")),
+                        "the coinbase at height {} differs from the builder's on {network:?}",
+                        height.0,
+                    );
+                    compared += 1;
+                }
+            }
+        }
+    }
+    // Every case above is a transparent miner on a network with no funding streams.
+    assert_eq!(compared, networks.len() * 17 * miners.len() * 2, "every case was built directly");
+}
