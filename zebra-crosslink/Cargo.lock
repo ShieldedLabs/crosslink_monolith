@@ -8344,14 +8344,12 @@ dependencies = [
  "ed25519-zebra",
  "equihash 0.3.0",
  "ff",
- "group",
  "hex",
  "incrementalmerkletree",
  "jubjub",
  "memuse",
  "nonempty",
  "orchard",
- "pasta_curves",
  "rand 0.8.7",
  "rand_core 0.6.4",
  "redjubjub",
@@ -8366,7 +8364,6 @@ dependencies = [
  "zcash_note_encryption",
  "zcash_protocol",
  "zcash_script",
- "zcash_spec",
  "zcash_transparent",
 ]
 

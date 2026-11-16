@@ -39,8 +39,8 @@
 //!   is rewritten to match. The recipient derives the note encryption key from `epk`
 //!   with their incoming viewing key as usual, and from it the memo key, under which
 //!   every action's data is XORed with a keystream per position. After decrypting, they
-//!   recompute `esk` from the salt and payload and accept only if `[esk⁻¹]·epk` is the
-//!   `g_d` of one of their addresses: a 255-bit check covering the whole memo, with no
+//!   rebuild the note from the salt and payload for each of their addresses and accept
+//!   only if one reproduces the action's `epk`: a 255-bit check covering the whole memo, with no
 //!   magic bytes. Without the keys, or an exact guess of the payload and the 2^128
 //!   salts, nothing distinguishes the actions from others. Wallets that do not know magic
 //!   memos see nothing. The sender recovers the memo with their outgoing viewing key
@@ -56,19 +56,15 @@ use alloc::{collections::BTreeMap, string::String, vec::Vec};
 
 use blake2b_simd::Params;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::AeadInPlace};
-use ff::{Field, FromUniformBytes};
-use group::{Group, GroupEncoding};
 use orchard::{
     keys::{OutgoingViewingKey, PreparedIncomingViewingKey},
     note::{NoteVersion, RandomSeed, Rho},
     note_encryption::{IronwoodDomain, IronwoodNoteEncryption},
     value::NoteValue,
 };
-use pasta_curves::pallas;
 use rand_core::RngCore;
 use subtle::ConstantTimeEq;
 use zcash_note_encryption::{COMPACT_NOTE_SIZE, Domain, EphemeralKeyBytes, OUT_CIPHERTEXT_SIZE, OUT_PLAINTEXT_SIZE, OutPlaintextBytes};
-use zcash_spec::PrfExpand;
 
 /// The bytes that open a public memo's content in its first action, after the header.
 pub const MAGIC_MEMO_PLAINTEXT_PREFIX: [u8; 4] = *b"MEMO";
@@ -138,8 +134,6 @@ const SEED_PERSONALIZATION: &[u8; 16] = b"Zcash_MagicMemoR";
 /// The length of a BLAKE2b keystream block.
 const KEYSTREAM_BLOCK_LEN: usize = 64;
 
-/// Any valid `rho` serves to derive an address's `g_d`; this one is zero.
-const PROBE_RHO: [u8; 32] = [0; 32];
 
 /// Whether a magic memo is public or encrypted to a recipient.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -523,7 +517,7 @@ fn seal(data: &[u8; DATA_LEN], tweak_seed: u8) -> Option<MagicMemoChunk> {
 }
 
 /// Whether `epk` encodes a non-identity Pallas point, as consensus requires.
-fn is_valid_epk(epk: &[u8; EPK_LEN]) -> bool { Option::<pallas::Point>::from(pallas::Point::from_bytes(epk)).is_some_and(|point| !bool::from(point.is_identity())) }
+fn is_valid_epk(epk: &[u8; EPK_LEN]) -> bool { IronwoodDomain::epk(&EphemeralKeyBytes(*epk)).is_some() }
 
 /// Derives the memo key from a note encryption symmetric key.
 fn memo_key(symmetric_key: &[u8]) -> [u8; 32] {
@@ -563,44 +557,35 @@ fn memo_note(recipient: orchard::Address, rho: &Rho, rseed: &[u8; 32]) -> Option
     orchard::Note::from_parts(recipient, NoteValue::from_raw(0), *rho, rseed, NoteVersion::V3).into_option()
 }
 
-/// The scalar of the `esk` that `rseed` derives for `rho`, as ZIP 212 derives it, if it
-/// is nonzero.
-fn esk_scalar(rseed: &[u8; 32], rho: &[u8; 32]) -> Option<pallas::Scalar> {
-    let esk = pallas::Scalar::from_uniform_bytes(&PrfExpand::ORCHARD_ESK.with(rseed, rho));
-    (!bool::from(esk.is_zero())).then_some(esk)
-}
-
-/// The encoding of `address`'s diversified base `g_d`, as `[esk⁻¹]·epk` for a probe note
-/// to it; orchard does not expose `g_d` itself.
-fn g_d_bytes(address: orchard::Address) -> Option<[u8; 32]> {
-    let rho = Rho::from_bytes(&PROBE_RHO).into_option()?;
-    let (rseed, note) = (0..=u8::MAX).find_map(|b| memo_note(address, &rho, &[b; 32]).map(|note| ([b; 32], note)))?;
+/// The `epk` that the memo note to `address` with this `rho` and `rseed` would have, if
+/// `rseed` is valid for `rho`.
+fn memo_epk(address: orchard::Address, rho: &Rho, rseed: &[u8; 32]) -> Option<[u8; EPK_LEN]> {
+    let note = memo_note(address, rho, rseed)?;
     let esk = IronwoodDomain::derive_esk(&note)?;
-    let epk = IronwoodDomain::epk_bytes(&IronwoodDomain::ka_derive_public(&note, &esk));
-    let point = pallas::Point::from_bytes(&epk.0).into_option()?;
-    let inverse = esk_scalar(&rseed, &PROBE_RHO)?.invert().into_option()?;
-    Some((point * inverse).to_bytes())
+    Some(IronwoodDomain::epk_bytes(&IronwoodDomain::ka_derive_public(&note, &esk)).0)
 }
 
-/// The addresses whose encrypted magic memos a wallet reads, looked up by `g_d`.
+/// The addresses whose encrypted magic memos a wallet reads. Checking a memo costs one
+/// scalar multiplication per address.
 #[derive(Clone, Debug)]
 pub struct MagicMemoRecipients {
-    by_g_d: BTreeMap<[u8; 32], orchard::Address>,
+    /// Keyed by the raw address encoding, which also drops repeats.
+    addresses: BTreeMap<[u8; 43], orchard::Address>,
 }
 
 impl MagicMemoRecipients {
     /// The given addresses, which should all belong to the incoming viewing key passed
     /// to [`decrypt_with_ivk`] with them.
     pub fn new(addresses: impl IntoIterator<Item = orchard::Address>) -> Self {
-        let by_g_d = addresses.into_iter().filter_map(|address| Some((g_d_bytes(address)?, address))).collect();
-        MagicMemoRecipients { by_g_d }
+        let addresses = addresses.into_iter().map(|address| (address.to_raw_address_bytes(), address)).collect();
+        MagicMemoRecipients { addresses }
     }
 
     /// The number of distinct addresses.
-    pub fn len(&self) -> usize { self.by_g_d.len() }
+    pub fn len(&self) -> usize { self.addresses.len() }
 
     /// Whether there are no addresses.
-    pub fn is_empty(&self) -> bool { self.by_g_d.is_empty() }
+    pub fn is_empty(&self) -> bool { self.addresses.is_empty() }
 }
 
 /// One action, as a compact block shows it.
@@ -707,10 +692,10 @@ fn open_encrypted(key: &[u8; 32], j: usize, actions: &[ActionView<'_>]) -> Optio
 /// one, using only what compact actions show. Returns the memo and the address it was
 /// sent to.
 ///
-/// An action opens only if the `esk` its decrypted salt and payload derive maps its
-/// `epk` to the `g_d` of one of `recipients`. This costs one key agreement per action,
-/// as trial decryption of the actions' notes does, and a scalar multiplication more when
-/// the decrypted length is plausible.
+/// An action opens only if the note its decrypted salt and payload derive, rebuilt for
+/// one of `recipients`, reproduces its `epk`. This costs one key agreement per action, as
+/// trial decryption of the actions' notes does, and a scalar multiplication per recipient
+/// more when the decrypted length is plausible.
 pub fn decrypt_with_ivk(ivk: &PreparedIncomingViewingKey, recipients: &MagicMemoRecipients, actions: &[ActionView<'_>]) -> Option<(ReadMagicMemo, orchard::Address)> {
     actions.iter().enumerate().find_map(|(j, action)| {
         let epk = action.epk()?;
@@ -718,9 +703,8 @@ pub fn decrypt_with_ivk(ivk: &PreparedIncomingViewingKey, recipients: &MagicMemo
         let shared = IronwoodDomain::ka_agree_dec(ivk, &IronwoodDomain::prepare_epk(point));
         let key = memo_key(IronwoodDomain::kdf(shared, &epk).as_ref());
         let opened = open_encrypted(&key, j, actions)?;
-        let inverse = esk_scalar(&opened.seed, action.nf()?)?.invert().into_option()?;
-        let epk_point = pallas::Point::from_bytes(&epk.0).into_option()?;
-        let address = recipients.by_g_d.get(&(epk_point * inverse).to_bytes())?;
+        let rho = Rho::from_bytes(action.nf()?).into_option()?;
+        let address = recipients.addresses.values().find(|&&address| memo_epk(address, &rho, &opened.seed) == Some(epk.0))?;
         Some((unstore(&opened.stored, MagicMemoKind::Encrypted, j)?, *address))
     })
 }
@@ -865,19 +849,15 @@ mod tests {
     }
 
     #[test]
-    fn esk_scalar_matches_orchard() {
-        let rho = Rho::from_bytes(&PROBE_RHO).unwrap();
-        let address = address();
-        let (rseed, note) = (0..=u8::MAX).find_map(|b| memo_note(address, &rho, &[b; 32]).map(|note| ([b; 32], note))).unwrap();
-        let esk = IronwoodDomain::derive_esk(&note).unwrap();
-        let epk = IronwoodDomain::epk_bytes(&IronwoodDomain::ka_derive_public(&note, &esk));
-        let g_d = pallas::Point::from_bytes(&g_d_bytes(address).unwrap()).unwrap();
-        assert_eq!((g_d * esk_scalar(&rseed, &PROBE_RHO).unwrap()).to_bytes(), epk.0);
-
-        // Distinct addresses of one key have distinct bases.
+    fn memo_epk_depends_on_the_address() {
+        let rho = Rho::from_bytes(&[0; 32]).unwrap();
+        let rseed = (0..=u8::MAX).map(|b| [b; 32]).find(|seed| memo_note(address(), &rho, seed).is_some()).unwrap();
         let other = orchard::keys::FullViewingKey::from(&orchard::keys::SpendingKey::from_bytes([3; 32]).unwrap()).address_at(1u32, orchard::keys::Scope::External);
-        assert_ne!(g_d_bytes(address), g_d_bytes(other));
-        assert_eq!(MagicMemoRecipients::new([address, other, address]).len(), 2);
+        let epk = memo_epk(address(), &rho, &rseed).unwrap();
+        assert!(is_valid_epk(&epk));
+        // Another address of the same key has another diversified base, so another epk.
+        assert_ne!(memo_epk(other, &rho, &rseed), Some(epk));
+        assert_eq!(MagicMemoRecipients::new([address(), other, address()]).len(), 2);
     }
 
     #[test]
