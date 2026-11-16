@@ -61,24 +61,28 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
     let network = ParametersBuilder::default()
         .with_activation_heights(ConfiguredActivationHeights {
             // These are dummy values. The particular values don't matter much,
-            // as long as the nu5 one is smaller than the chains being generated
+            // as long as the block after the nu5 one is in the chains being generated
             // (MAX_PARTIAL_CHAIN_BLOCKS) to make sure that upgrade is exercised
             // in the test below. (The test will fail if that does not happen.)
+            //
+            // MAX_PARTIAL_CHAIN_BLOCKS follows MIN_TRANSPARENT_COINBASE_MATURITY, which Crosslink
+            // lowers to 2, so the chains are 6 blocks (heights 0-5): the upgrades before
+            // Heartwood share height 1, as on Regtest.
             before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
+            overwinter: Some(1),
+            sapling: Some(1),
+            blossom: Some(1),
+            heartwood: Some(2),
+            canopy: Some(3),
+            nu5: Some(4),
+            nu6: Some(6),
+            nu6_1: Some(7),
+            nu6_2: Some(8),
+            nu6_3: Some(9),
             featurenet_upgrade_1: None,
             featurenet_upgrade_2: None,
             featurenet_upgrade_3: None,
-            nu7: Some(50),
+            nu7: Some(10),
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()
@@ -100,6 +104,11 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
             let heartwood_height_plus1 = (heartwood_height + 1).unwrap();
             let nu5_height = NetworkUpgrade::Nu5.activation_height(&network).unwrap();
             let nu5_height_plus1 = (nu5_height + 1).unwrap();
+            prop_assert!(
+                (nu5_height_plus1.0 as usize) < chain.len(),
+                "the generated chain ({} blocks) must reach the block after NU5 activation",
+                chain.len(),
+            );
 
             let mut failure_count = 0;
             for block in chain.iter() {

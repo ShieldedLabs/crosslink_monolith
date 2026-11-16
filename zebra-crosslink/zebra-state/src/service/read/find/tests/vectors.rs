@@ -4,20 +4,23 @@ use zebra_chain::block::Height;
 
 use crate::{constants, service::read::find::block_locator_heights};
 
+/// The reorg limit the cases below are computed against.
+const R: u32 = constants::MAX_BLOCK_REORG_HEIGHT;
+
 /// Block heights, and the expected minimum block locator height.
 ///
-/// Cases are computed against [`constants::MAX_BLOCK_REORG_HEIGHT`].
+/// Cases are computed against [`constants::MAX_BLOCK_REORG_HEIGHT`] (`R`, 99 in Crosslink, from
+/// `zcash_protocol`), so changing the limit (#236) doesn't leave them asserting the old one.
 static BLOCK_LOCATOR_CASES: &[(u32, u32)] = &[
     (0, 0),
     (1, 0),
     (10, 0),
-    (99, 0),
-    (100, 0),
-    (999, 0),
-    (1000, 0),
-    (1001, 1),
-    (2000, 1000),
-    (10000, 9000),
+    (R - 1, 0),
+    (R, 0),
+    (R + 1, 1),
+    (R + 2, 2),
+    (2 * R, R),
+    (10 * R, 9 * R),
 ];
 
 /// Tests that `find_fork_point` returns the most recent locator entry on the best chain.
