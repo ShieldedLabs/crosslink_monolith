@@ -1329,16 +1329,21 @@ fn chunkify(bytes: &[u8; 32]) -> [u64; 4] {
 /// containers is laid out one line tall and overlaps what follows.
 const MEMO_LAYOUT_LINE_CHARS: usize = 44;
 
-/// `text` broken at spaces into lines of at most `max` characters (longer words get lines of their own).
+/// `text` broken at spaces into lines of at most `max` characters; a word longer than that (an address, a hash) is
+/// cut into pieces of `max`, so no line can widen its container.
 fn wrap_lines(text: &str, max: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
     for word in text.split(' ') {
-        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > max {
-            lines.push(std::mem::take(&mut line));
+        let chars: Vec<char> = word.chars().collect();
+        for piece in chars.chunks(max.max(1)) {
+            let piece: String = piece.iter().collect();
+            if !line.is_empty() && line.chars().count() + 1 + piece.chars().count() > max {
+                lines.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() { line.push(' '); }
+            line.push_str(&piece);
         }
-        if !line.is_empty() { line.push(' '); }
-        line.push_str(word);
     }
     if !line.is_empty() { lines.push(line); }
     lines
@@ -3700,7 +3705,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                         } else {
                                             memo_str.clone()
                                         };
-                                        /* // */ ui.text(frame_strf!(data, "{}", row_memo), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: details_col, ..TextDecl });
+                                        // Chars: a long token (an address, a hash) must break rather than widen the pane.
+                                        /* // */ ui.text(frame_strf!(data, "{}", row_memo), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: details_col, wrap: Wrap::Chars, ..TextDecl });
 
                                         let icon = match magic {
                                             Some(m) if m.layout.kind == wallet::MemoKind::MagicEncrypted => ICON_LOCK_1,
