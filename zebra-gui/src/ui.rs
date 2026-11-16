@@ -1329,6 +1329,20 @@ fn chunkify(bytes: &[u8; 32]) -> [u64; 4] {
 /// containers is laid out one line tall and overlaps what follows.
 const MEMO_LAYOUT_LINE_CHARS: usize = 44;
 
+/// Tokens longer than this get a space inserted every this many characters before word wrapping.
+const MEMO_LONG_TOKEN_CHARS: usize = 32;
+
+/// `text` with a space inserted every `max` characters inside any word longer than `max`, so word wrapping can break it.
+fn break_long_tokens(text: &str, max: usize) -> String {
+    text.split(' ')
+        .map(|word| {
+            let chars: Vec<char> = word.chars().collect();
+            chars.chunks(max.max(1)).map(|piece| piece.iter().collect::<String>()).collect::<Vec<_>>().join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// `text` broken at spaces into lines of at most `max` characters; a word longer than that (an address, a hash) is
 /// cut into pieces of `max`, so no line can widen its container.
 fn wrap_lines(text: &str, max: usize) -> Vec<String> {
@@ -3224,9 +3238,9 @@ pub fn ui_left_pane(ui: &mut Context,
                     scroll_container_begin(ui, data, padding, 0.0, id, clip, scroll, content_h, viewport_h, max);
                     if let Some(view) = data.memo_layout_view.clone() {
                         if let _ = elem().decl(Decl { direction: TopToBottom, child_gap, width: grow!(), height: fit!(), ..Decl }) {
-                            for line in wrap_lines(&view.text, MEMO_LAYOUT_LINE_CHARS) {
-                                ui.text(frame_strf!(data, "{}", line), TextDecl { h: ui.scale(16.0), colour: WHITE, wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
-                            }
+                            // The GUI's own word wrap fills the panel's real width; only tokens longer than any line could be
+                            // (addresses, hashes) get break points, so they cannot widen the panel.
+                            ui.text(frame_strf!(data, "{}", break_long_tokens(&view.text, MEMO_LONG_TOKEN_CHARS)), TextDecl { h: ui.scale(16.0), colour: WHITE, wrap: Wrap::Words, align: AlignX::Left, ..TextDecl });
                             ui.text(frame_strf!(data, "{}", view.how), TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.6), align: AlignX::Left, ..TextDecl });
                             draw_memo_layout(ui, data, child_gap, &view.layout, 0, view.placement);
                         }
