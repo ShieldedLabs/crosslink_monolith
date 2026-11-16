@@ -114,6 +114,6 @@ where
         //
         // in practice, transactions arrive every 1-20 seconds,
         // so waiting 6 seconds can delay transaction propagation, in order to reduce peer load
-        tokio::time::sleep(PEER_GOSSIP_DELAY).await;
+        zebra_debug_time::instant_sleep(PEER_GOSSIP_DELAY).await;
     }
 }

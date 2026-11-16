@@ -169,7 +169,7 @@ fn needs_pow_block(hash: Hash) -> (TMStatus, TMStatusReason) {
     if bft_is_dropped() {
         return (TMStatus::Indeterminate, TMStatusReason::None);
     }
-    note_missing_pow_block(&mut MISSING_POW_BLOCKS.lock().unwrap(), hash, std::time::Instant::now());
+    note_missing_pow_block(&mut MISSING_POW_BLOCKS.lock().unwrap(), hash, super::clock());
     (TMStatus::Indeterminate, TMStatusReason::NeedsBlock { hash: hash.0 })
 }
 
@@ -202,7 +202,7 @@ pub(super) fn missing_pow_blocks(read_state: &ReadState) -> Vec<Hash> {
         return Vec::new();
     }
     let mut missing = MISSING_POW_BLOCKS.lock().unwrap();
-    retain_missing_pow_blocks(&mut missing, std::time::Instant::now(), |hash| read_state.known_block(hash).is_some());
+    retain_missing_pow_blocks(&mut missing, super::clock(), |hash| read_state.known_block(hash).is_some());
     let mut decided = DECIDED_MISSING_POW_BLOCKS.lock().unwrap();
     decided.retain(|hash| read_state.known_block(*hash).is_none());
     missing.keys().chain(decided.iter().filter(|hash| !missing.contains_key(*hash))).copied().collect()

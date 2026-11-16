@@ -71,7 +71,6 @@ def main():
         text = text.replace('cache_dir = true', 'cache_dir = false')
         text = text.replace('listen_addr = "[::]:8233"', 'listen_addr = "127.0.0.1:38233"')
         text = text.replace('listen_addr = "127.0.0.1:8232"', 'listen_addr = "127.0.0.1:38232"')
-        text = text.replace('disable_zaino = false', 'disable_zaino = true')
         text = re.sub(r'bft_peers = \[[^\]]*\]', 'bft_peers = []', text)
         config.write_text(text)
         persisted_tip = 0

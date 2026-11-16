@@ -692,7 +692,17 @@ impl Service<Request> for Mempool {
                 //     "re-verifying mempool transactions after a chain fork"
                 // );
 
+                let tip_height = reset_tip_action.best_tip_height();
                 for tx in tx_retries {
+                    // One expired at the new tip (the rule `remove_expired_transactions` applies)
+                    // would only be refused, and until then its in-flight entry would keep any
+                    // spend of its inputs out (`unsourced_conflict`), though it is no longer in
+                    // the mempool.
+                    if let Gossip::Tx(unmined) = &tx {
+                        if unmined.transaction.expiry_height().is_some_and(|expiry| tip_height >= expiry) {
+                            continue;
+                        }
+                    }
                     // This is just an efficiency optimisation, so we don't care if queueing
                     // transaction requests fails.
                     let _result = tx_downloads.download_if_needed_and_verify(tx, None);

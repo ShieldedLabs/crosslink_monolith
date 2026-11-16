@@ -1974,26 +1974,38 @@ impl EngineFuzz {
         }
         // A finalizer the quorum does not need also signs a value nobody proposed (its prevote, its
         // precommit or both), or votes nil instead, splitting the vote. The height is decided as
-        // before.
+        // before, provided the value has its quorum of a step before the dissent of that step
+        // arrives: a dissenting vote can bring a step to two thirds of anything first, which
+        // starts that step's timeout, and once it runs out the node votes nil, as it must. So each
+        // step's dissent joins the messages only after the proposal and every other vote of that
+        // step, and a tick later, when the node has acted on them.
+        let mut dissent: [Vec<Message>; 2] = [Vec::new(), Vec::new()];
         if c.unusual(48) {
             if let Some(k) = self.equivocator(c) {
                 let mut other = id;
                 other[0] ^= 0xff;
                 match c.below(4) {
-                    0 => messages.push(Message::Other(k, 0, other)),
-                    1 => messages.push(Message::Other(k, TF_BFT_PRECOMMIT, other)),
+                    0 => dissent[0].push(Message::Other(k, 0, other)),
+                    1 => dissent[1].push(Message::Other(k, TF_BFT_PRECOMMIT, other)),
                     2 => {
-                        messages.push(Message::Other(k, 0, other));
-                        messages.push(Message::Other(k, TF_BFT_PRECOMMIT, other));
+                        dissent[0].push(Message::Other(k, 0, other));
+                        dissent[1].push(Message::Other(k, TF_BFT_PRECOMMIT, other));
                     }
                     _ => {
                         messages.retain(|m| !matches!(m, Message::Vote(j, _) if *j == k));
-                        messages.push(Message::Vote(k, TF_BFT_NIL));
-                        messages.push(Message::Vote(k, TF_BFT_PRECOMMIT | TF_BFT_NIL));
+                        dissent[0].push(Message::Vote(k, TF_BFT_NIL));
+                        dissent[1].push(Message::Vote(k, TF_BFT_PRECOMMIT | TF_BFT_NIL));
                     }
                 }
             }
         }
+        let step_delivered = |messages: &[Message], proposed: bool, step: usize| {
+            proposed
+                && !messages.iter().any(|m| match m {
+                    Message::Vote(_, bits) => (bits & TF_BFT_PRECOMMIT != 0) == (step == 1) && bits & TF_BFT_WRONG_NAMESPACE == 0,
+                    _ => false,
+                })
+        };
         let mut ticks = 0;
         let room = |f: &EngineFuzz, proposed: bool| proposed || f.round_ticks + 1 < f.proposal_window_ticks();
         if room(self, proposed) {
@@ -2012,6 +2024,12 @@ impl EngineFuzz {
             if ticks < 6 && room(self, proposed) && c.unusual(48) {
                 ticks += 1;
                 self.tick();
+            }
+            for step in 0..2 {
+                if !dissent[step].is_empty() && step_delivered(&messages, proposed, step) {
+                    self.tick();
+                    messages.append(&mut dissent[step]);
+                }
             }
         }
         // A decision waits on the node's answer before the engine starts the next height, and

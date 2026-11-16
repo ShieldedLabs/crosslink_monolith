@@ -54,7 +54,7 @@ impl EvictionList {
         if self.len() >= self.max_size {
             self.pop_front();
         }
-        let value = Instant::now();
+        let value = zebra_debug_time::std_instant_now();
         let old_value = self.unique_entries.insert(key, value);
         // It should be impossible for an already-evicted transaction to be evicted
         // again since transactions are not added to the mempool if they are evicted,
@@ -139,7 +139,7 @@ impl EvictionList {
     /// Returns if `evicted_at` is considered expired considering the current
     /// time and the configured eviction time.
     fn has_expired(&self, evicted_at: &Instant) -> bool {
-        let now = Instant::now();
+        let now = zebra_debug_time::std_instant_now();
         (now - *evicted_at) > self.eviction_memory_time
     }
 }

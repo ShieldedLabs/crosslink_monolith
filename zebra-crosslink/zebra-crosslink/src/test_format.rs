@@ -1786,6 +1786,8 @@ pub(crate) async fn handle_instr(
                 settled = bft_settle().await;
             }
             zebra_debug_time::advance_instant(Duration::from_millis(millis));
+            // The sync loop's deadlines run on the same clock.
+            zebra_state::new_network::wake_sync_loop_now();
             if !bft_engine_running() {
                 test_check(flags, true, &format!("ADVANCE_TIME: the clock moved {millis} ms; BFT is not running"));
             } else {
@@ -2294,6 +2296,11 @@ static TEST_STP_PEERS: Mutex<Vec<HarnessStpPeer>> = Mutex::new(Vec::new());
 /// later. Nothing acknowledges a packet, so this is a bound rather than a handshake.
 const STP_PACKET_SETTLE_PASSES: usize = 3;
 
+/// How long, in real time and in sync passes, an STP delivery waits for a request before a block too
+/// deep to be adopted counts as one the node will not fetch (see `serve_block`).
+const NOT_FETCHED_GRACE: Duration = Duration::from_millis(50);
+const NOT_FETCHED_PASSES: u64 = 10;
+
 /// How long to watch a peer advertise a block the node already has. The node never requests it,
 /// so there is no verdict to wait for, only a kill to rule out; a STATUS naming a new tip brings
 /// the download pass forward to within DL_INIT_WOKEN_MIN_MS, so a request would come well within.
@@ -2550,6 +2557,31 @@ async fn bft_settle() -> Result<(), String> {
     settled
 }
 
+/// When the instruction in hand began, while one runs: the clock driver's cue.
+static TEST_INSTR_RUNNING_SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// An instruction stuck this long, in real time, is waiting on one of the node's timers.
+const AUTO_ADVANCE_GRACE: Duration = Duration::from_millis(50);
+/// How far the clock driver moves the supplied clock each time, and how often.
+const AUTO_ADVANCE_STEP: Duration = Duration::from_millis(250);
+const AUTO_ADVANCE_EVERY: Duration = Duration::from_millis(2);
+
+/// Moves the test's supplied clock (`zebra_debug_time::advance_instant`) while an instruction is
+/// stuck, as tokio's paused clock auto-advances: the node's timers (a retry backoff, the mempool's
+/// verification timeout) run out in milliseconds rather than seconds, and only when nothing else is
+/// left to happen. Never while the BFT engine runs: its rounds run on the same clock, which there
+/// only ADVANCE_TIME moves, so they stay where the file put them.
+async fn drive_clock() {
+    loop {
+        tokio::time::sleep(AUTO_ADVANCE_EVERY).await;
+        let stuck = TEST_INSTR_RUNNING_SINCE.lock().unwrap().is_some_and(|since| since.elapsed() >= AUTO_ADVANCE_GRACE);
+        if stuck && !bft_engine_running() && zebra_debug_time::instant_is_supplied() {
+            zebra_debug_time::advance_instant(AUTO_ADVANCE_STEP);
+            zebra_state::new_network::wake_sync_loop_now();
+        }
+    }
+}
+
 /// Returns once a sync loop tick that began after the call has finished, waking the loop so it does
 /// not wait out its idle time. Bounded for a loop that has stopped, which the check after reports.
 async fn sync_settle() {
@@ -2681,6 +2713,10 @@ async fn serve_block(
 
     let deadline = tokio::time::Instant::now() + if already_known.is_some() { KNOWN_BLOCK_SETTLE } else { NODE_ANSWER_WAIT };
     let (mut requests, mut chunks) = (0usize, 0usize);
+    // Kept across the loop: the node's other packets to this peer would reset a fresh sleep.
+    let mut not_fetched_check = tokio::time::interval(Duration::from_millis(5));
+    let status_sent = std::time::Instant::now();
+    let status_ticks = zebra_state::new_network::SYNC_TICKS_DONE.load(std::sync::atomic::Ordering::Acquire);
     // Every offset the node asked from, so a request the peer cannot answer is still reported.
     let mut offsets: Vec<u32> = Vec::new();
     loop {
@@ -2718,6 +2754,36 @@ async fn serve_block(
                 Some(_) => {}
                 None => return Err("the sync loop is gone".to_string()),
             },
+            // A block at or below the finalized height, or whose parent is below the near-tip
+            // chains a branch must link into (NEAR_TIP_CHAIN_LEN), is a fork's block that can
+            // never be adopted, and the node does not fetch it, unless it is on the decided chain.
+            // A block the node wants it asks for within a pass or two of the STATUS, so one it has
+            // let several passes go by without asking for, and that is that deep, it is not going
+            // to: waiting longer would only run out the bound.
+            _ = not_fetched_check.tick(), if requests == 0
+                && status_sent.elapsed() >= NOT_FETCHED_GRACE
+                && zebra_state::new_network::SYNC_TICKS_DONE.load(std::sync::atomic::Ordering::Acquire) >= status_ticks + NOT_FETCHED_PASSES => {
+                let finalized = (internal_handle.call.read_state)(zebra_state::ReadRequest::FinalizedTip).await;
+                let finalized_height = match finalized {
+                    Ok(zebra_state::ReadResponse::Tip(Some((finalized_height, _)))) => finalized_height.0,
+                    _ => 0,
+                };
+                let tip = (internal_handle.call.state)(StateRequest::Tip).await;
+                let window_start = match tip {
+                    Ok(StateResponse::Tip(Some((tip_height, _)))) => {
+                        tip_height.0.saturating_sub(zebra_state::new_network::NEAR_TIP_CHAIN_LEN - 1)
+                    }
+                    _ => 0,
+                };
+                if finalized_height >= height || height.saturating_sub(1) < window_start {
+                    return Ok(IngestOutcome::Failed {
+                        reason: format!(
+                            "{hash} @ {height} is not fetched: the finalized height is {finalized_height}, and the near-tip chains a branch must link into start at {window_start}"
+                        ),
+                        misbehavior_score: 0,
+                    });
+                }
+            }
             _ = tokio::time::sleep_until(deadline) => {
                 if let (Some(known), 0) = (&already_known, requests) {
                     return Ok(IngestOutcome::Known { location: known.location.clone(), height: known.height });
@@ -3009,7 +3075,9 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
                     _ => None,
                 };
                 if !is_delivery || peer.is_some_and(|peer| racing_peers.contains(&peer)) {
+                    *TEST_INSTR_RUNNING_SINCE.lock().unwrap() = Some(std::time::Instant::now());
                     futures::future::join_all(racing.drain(..)).await;
+                    *TEST_INSTR_RUNNING_SINCE.lock().unwrap() = None;
                     racing_peers.clear();
                 }
                 if is_delivery {
@@ -3038,6 +3106,7 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
             let failed_before = TEST_FAILED_INSTR_IDXS.lock().unwrap().len();
             *TEST_LAST_CHECK.lock().unwrap() = None;
             let start = std::time::Instant::now();
+            *TEST_INSTR_RUNNING_SINCE.lock().unwrap() = Some(start);
 
             handle_instr(
                 &internal_handle,
@@ -3049,6 +3118,7 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
             )
             .await;
 
+            *TEST_INSTR_RUNNING_SINCE.lock().unwrap() = None;
             let outcome = TEST_LAST_CHECK.lock().unwrap().take();
             *TEST_PREV_OUTCOME.lock().unwrap() = outcome.clone();
             let failed = TEST_FAILED_INSTR_IDXS.lock().unwrap().len() > failed_before;
@@ -3114,6 +3184,7 @@ pub(crate) async fn instr_reader(internal_handle: TFLServiceHandle) {
 
     let params = internal_handle.params;
     let options = *crate::TEST_READ_OPTIONS.lock().unwrap();
+    tokio::spawn(drive_clock());
     read_instrs(internal_handle, &bytes, &tf.instrs, options).await;
 
     // Copy everything out and release every lock BEFORE asserting. The panic hook runs before
