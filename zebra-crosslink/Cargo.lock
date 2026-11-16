@@ -8525,7 +8525,6 @@ dependencies = [
  "lewton",
  "num_cpus",
  "png",
- "rand 0.9.5",
  "rustybuzz",
  "softer_gui",
  "swash",

@@ -9,7 +9,6 @@ edition = "2024"
 softer_gui = { git = "https://github.com/ShieldedLabs/softer_gui", rev = "de63f083ea670b4e453710863c83e3d9a03d9906" }
 num_cpus = "1.17.0"
 ahash = "0.8.12"
-rand = "0.9.2"
 rustybuzz = "0.20.1"
 swash = "0.2.6"
 clay-layout = { path = "../clay-rs" }
