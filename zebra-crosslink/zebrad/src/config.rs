@@ -252,7 +252,8 @@ impl ZebradConfig {
         config.state
             .cache_dir
             // .push("crosslink_nightly_20261102"); // @Nightly
-            .push("crosslink_featurenet_20260929_staking3d"); // @Featurenet
+            // .push("crosslink_featurenet_20260929_staking3d"); // @Featurenet
+            .push("crosslink_magic_memo_20261116"); // @MagicMemo
 
         // Merge user-led slashforks with the ones shipped in the executable, validate
         // them, and store the canonical (sorted, deduplicated) list back. Building
@@ -302,9 +303,10 @@ impl ZebradConfig {
                 network_initial_peers: vec![
                     // "[::ffff:45.32.186.234]:12001:-fCmrBqp:dUhGUdCw0vhbhDOKINxDDkk93RHBRRuJuW2EY0zJHyU".to_owned(), // @Nightly
                     // "[::ffff:64.177.122.73]:12001:-fCmrBqp:_DrOHtqUAEtbYadBv2Dt5OzNqbtT07tDZ9iyddSqFgw".to_owned(), // @Nightly
-                    "[::ffff:45.63.75.9]:12001:-fCmrBqp:-w4ArAa4esTUBjgig6xIQJ4N8DlwL5aufGMcDPGzPE4".to_owned(), // @Featurenet
-                    "[::ffff:70.34.220.94]:12001:-fCmrBqp:CgjQzIjxFknQOJfxKP4H5adl3uzGfAN1D0219Q3JSyw".to_owned(), // @Featurenet
-                    "[::ffff:64.177.44.176]:12001:-fCmrBqp:jY7963HX-GzMkOhi1c7kxmeKXC4juGhwY2l4NlQheBs".to_owned(), // @Featurenet
+                    // "[::ffff:45.63.75.9]:12001:-fCmrBqp:-w4ArAa4esTUBjgig6xIQJ4N8DlwL5aufGMcDPGzPE4".to_owned(), // @Featurenet
+                    // "[::ffff:70.34.220.94]:12001:-fCmrBqp:CgjQzIjxFknQOJfxKP4H5adl3uzGfAN1D0219Q3JSyw".to_owned(), // @Featurenet
+                    // "[::ffff:64.177.44.176]:12001:-fCmrBqp:jY7963HX-GzMkOhi1c7kxmeKXC4juGhwY2l4NlQheBs".to_owned(), // @Featurenet
+                    "[::ffff:78.141.216.64]:12001:-fCmrBqp:UHhvYrk3EnTsCbKliZIaWrdSk6BjBluoM7tHZOC4IAc".to_owned(), // @MagicMemo
                 ],
                 ..Default::default()
             },
@@ -314,16 +316,18 @@ impl ZebradConfig {
                     let mut peers = indexmap::IndexSet::new();
                     // peers.insert("45.32.186.234:8233".to_owned()); // @Nightly
                     // peers.insert("64.177.122.73:8233".to_owned()); // @Nightly
-                    peers.insert("45.63.75.9:8233".to_owned()); // @Featurenet
-                    peers.insert("70.34.220.94:8233".to_owned()); // @Featurenet
-                    peers.insert("64.177.44.176:8233".to_owned()); // @Featurenet
+                    // peers.insert("45.63.75.9:8233".to_owned()); // @Featurenet
+                    // peers.insert("70.34.220.94:8233".to_owned()); // @Featurenet
+                    // peers.insert("64.177.44.176:8233".to_owned()); // @Featurenet
+                    peers.insert("78.141.216.64:8233".to_owned()); // @MagicMemo
                     peers
                 },
 
                 network: testnet::Parameters::build()
                     // .with_network_name("Crosslink_Nightly_0")
                     // .with_network_magic(magics::CROSSLINK_NIGHTLYNET) // @Nightly
-                    .with_network_magic(magics::CROSSLINK_FEATURENET) // @Featurenet
+                    // .with_network_magic(magics::CROSSLINK_FEATURENET) // @Featurenet
+                    .with_network_magic(zebra_chain::parameters::Magic(*b"CNi0")) // @MagicMemo
                     .expect("Crosslink testnet magic is not a reserved value")
                     .with_slow_start_interval(Height(0))
                     // Tail Confirmation checks carried headers against ThresholdBits, which a

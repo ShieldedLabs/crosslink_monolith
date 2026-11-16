@@ -1965,7 +1965,8 @@ mod tests {
             (
                 include_str!("../../zebra-crosslink/zebrad/src/config.rs"),
                 // 2, // @Nightly
-                3, // @Featurenet
+                // 3, // @Featurenet
+                1, // @MagicMemo
             ),
             (
                 include_str!("../../zebra-crosslink/dilated_regtest/node0.toml.in"),
