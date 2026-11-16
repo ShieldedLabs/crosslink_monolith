@@ -85,6 +85,9 @@ pub const TF_BFT_PRECOMMIT: u64 = 1 << 32;
 pub const TF_BFT_NIL: u64 = 1 << 33;
 pub const TF_BFT_FOR_NODE_PROPOSAL: u64 = 1 << 34;
 pub const TF_BFT_WRONG_NAMESPACE: u64 = 1 << 35;
+/// A vote for the value of the proposal BFT_RECV_PROPOSAL last delivered at the vote's height and
+/// round, as the harness sent it: with TF_BFT_ON_NODE_TIP that value is known only at run time.
+pub const TF_BFT_FOR_DELIVERED_PROPOSAL: u64 = 1 << 36;
 /// EXPECT_BFT_PROPOSER's name for the node itself.
 pub const TF_BFT_THE_NODE: u64 = u64::MAX;
 /// EXPECT_BFT_STEP's step for any step.
@@ -550,6 +553,10 @@ pub const SHOULD_DEFER: u32 = 1 << 1;
 /// block. What it does not cover is the node giving no verdict at all, which still fails, as do
 /// the expectations that follow. Overrides SHOULD_FAIL and SHOULD_DEFER.
 pub const ANY_OUTCOME: u32 = 1 << 2;
+/// BFT_RECV_PROPOSAL only: the proposal's parent is the node's decided tip, put in place of the
+/// one the value names before it is signed. A writer that let the node's own proposal be decided
+/// cannot name that block, whose certificate holds the precommits the node gathered.
+pub const TF_BFT_ON_NODE_TIP: u32 = 1 << 3;
 
 pub struct TF {
     pub instrs: Vec<TFInstr>,
@@ -1675,6 +1682,15 @@ pub(crate) async fn handle_instr(
                 } else if bits & TF_BFT_FOR_NODE_PROPOSAL != 0 {
                     node_proposal_id(internal_handle, &view, height, round)
                         .ok_or_else(|| format!("the node has sent no proposal at {height}.{round}"))?
+                } else if bits & TF_BFT_FOR_DELIVERED_PROPOSAL != 0 {
+                    TEST_BFT_DELIVERED
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .rev()
+                        .find(|(at, _)| *at == (height, round))
+                        .map(|(_, id)| *id)
+                        .ok_or_else(|| format!("no proposal was delivered at {height}.{round}"))?
                 } else {
                     value_id.map_or(tenderlink::ValueId::NIL, tenderlink::ValueId)
                 };
@@ -1698,7 +1714,19 @@ pub(crate) async fn handle_instr(
                 Err(err) => test_check_outcome(false, false, &format!("BFT_RECV_PROPOSAL: {err}")),
                 Ok(view) => {
                     let key = synthetic_finalizer_key(finalizer);
+                    let value = if flags & TF_BFT_ON_NODE_TIP != 0 {
+                        match BftBlock::zcash_deserialize(&value[..]) {
+                            Ok(mut block) => {
+                                block.previous_block_fat_ptr = zebra_state::new_network::bft::bft_chain().read().unwrap().fat_pointer_to_tip.clone();
+                                block.zcash_serialize_to_vec().expect("a BFT block serializes")
+                            }
+                            Err(_) => value,
+                        }
+                    } else {
+                        value
+                    };
                     let value_id = tenderlink::value_id_of(&view.hash_keys, &value);
+                    TEST_BFT_DELIVERED.lock().unwrap().push(((height, round), value_id));
                     let packets: Vec<Vec<u8>> = tenderlink::proposal_chunk_packets(
                         &key, &value, value_id, height, round, valid_round, &view.vote_namespace, view.roster.len(),
                     )
@@ -2359,6 +2387,8 @@ static TEST_BFT_PEERS: Mutex<Vec<HarnessBftPeer>> = Mutex::new(Vec::new());
 /// The votes and proposal chunks the node has sent any synthetic finalizer during the test, each
 /// once. The node resends what a peer's status asks for on every tick, so most arrive many times.
 static TEST_BFT_SENT: Mutex<Vec<tenderlink::SentConsensus>> = Mutex::new(Vec::new());
+/// The value id of every proposal BFT_RECV_PROPOSAL delivered, by height and round, as sent.
+static TEST_BFT_DELIVERED: Mutex<Vec<((u64, u32), tenderlink::ValueId)>> = Mutex::new(Vec::new());
 
 fn synthetic_finalizer_key(k: u64) -> ed25519_zebra::SigningKey {
     finalizer_key_from_seed(synthetic_finalizer_seed(k).as_bytes()).0

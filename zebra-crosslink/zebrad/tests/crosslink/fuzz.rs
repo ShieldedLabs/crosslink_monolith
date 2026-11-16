@@ -1264,6 +1264,14 @@ struct EngineFuzz {
     /// The next synthetic finalizer index that is on no roster, for packets that may get the
     /// sender disconnected.
     next_stranger: u64,
+    /// Whether `parent` is the node's decided tip. Once the node's own proposal is decided it is
+    /// not: that block's certificate holds the precommits the node gathered, which only the node
+    /// knows, so later proposals ask the harness to build on the node's tip (TF_BFT_ON_NODE_TIP)
+    /// and no later decision is cited.
+    parent_known: bool,
+    /// The PoW tip when the engine entered its current round, which is when the node, if it is the
+    /// round's proposer, makes its proposal.
+    round_start_tip: u32,
 }
 
 /// Synthetic finalizers from here on hold no stake, so the node may disconnect them without the
@@ -1603,6 +1611,51 @@ impl EngineFuzz {
         ((2000 + 500 * u64::from(self.round)) / BFT_TICK_MILLIS) as u32 - 2
     }
 
+    /// The snapshot of the proposal the node makes at the start of its round, as `propose` makes
+    /// it: the tip less sigma, at most 40 above the parent's, and none unless it improves on the
+    /// parent's. Only round 0, which the engine enters as the height before is decided: a later
+    /// round is entered on its own messages, or on timeouts the writer does not model, and the
+    /// node's round has no message before its proposal.
+    fn node_proposal_snapshot(&self) -> Option<u32> {
+        if self.round != 0 {
+            return None;
+        }
+        let sigma = BFT_ROUNDS_PARAMETERS.bc_confirmation_depth_sigma as u32;
+        let candidate = self.round_start_tip.checked_sub(sigma)?;
+        (candidate > self.snapshot).then(|| candidate.min(self.snapshot + 40))
+    }
+
+    /// Decides the engine's height on the node's own proposal: it made it when the round began,
+    /// and the synthetic finalizers prevote and precommit it, in any order, by what the node sent
+    /// (TF_BFT_FOR_NODE_PROPOSAL). From then on the writer knows the decided block's snapshot but
+    /// not its certificate.
+    fn decide_node_proposal(&mut self, c: &mut Choices, snapshot: u32) {
+        self.tick();
+        self.tf.push_instr_expect_bft_sent(2, self.height, self.round, None, 0);
+        let finalizers = self.scene.finalizers;
+        let mut cast: Vec<(u16, u64)> = finalizers.iter().flat_map(|&k| [(k, 0), (k, TF_BFT_PRECOMMIT)]).collect();
+        let mut ticks = 0;
+        while !cast.is_empty() {
+            let (k, bits) = cast.remove(c.below(cast.len()));
+            self.tf.push_instr_bft_recv_vote(k, bits | TF_BFT_FOR_NODE_PROPOSAL, self.height, self.round, &[0; 32], 0);
+            if ticks < 4 && c.unusual(48) {
+                ticks += 1;
+                self.tick();
+            }
+        }
+        for _ in 0..4 {
+            self.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+        }
+        self.round_ticks = 4;
+        self.snapshot = snapshot;
+        self.parent_known = false;
+        self.height += 1;
+        self.round = 0;
+        self.round_start_tip = self.tip_height();
+        self.tf.push_instr_expect_bft_step(self.height, 0, None, 0);
+        self.tf.push_instr_expect_pos_chain_length(self.height as usize, 0);
+    }
+
     /// Gives up the current round: every synthetic finalizer prevotes and precommits nil, and the
     /// writer moves on to the next round without waiting out the timeouts. How long those take
     /// depends on whether the node had anything to propose, which the writer does not model; the
@@ -1615,6 +1668,7 @@ impl EngineFuzz {
         self.round += 1;
         // The next round begins when its messages pull the engine into it.
         self.round_ticks = 0;
+        self.round_start_tip = self.tip_height();
     }
 
     /// Decides the engine's height on a proposal from the round's synthetic proposer. Its
@@ -1629,6 +1683,11 @@ impl EngineFuzz {
         }
         while self.proposer() == TF_BFT_THE_NODE {
             self.tf.push_instr_expect_bft_proposer(TF_BFT_THE_NODE, self.height, self.round, 0);
+            if let Some(snapshot) = self.node_proposal_snapshot() {
+                if c.below(2) == 0 {
+                    return self.decide_node_proposal(c, snapshot);
+                }
+            }
             self.nil_round();
         }
         let proposer = u16::try_from(self.proposer()).expect("a synthetic finalizer proposes");
@@ -1646,7 +1705,14 @@ impl EngineFuzz {
             Proposal,
             Vote(u16, u64),
         }
-        let mut messages = vec![Message::Proposal];
+        // On the node's tip the value is known only once the harness has sent it, so the votes
+        // name it by delivery and come after it.
+        let (proposal_flags, vote_bits) = if self.parent_known { (0, 0) } else { (TF_BFT_ON_NODE_TIP, TF_BFT_FOR_DELIVERED_PROPOSAL) };
+        if !self.parent_known {
+            self.tf.push_instr_bft_recv_proposal(proposer, self.height, self.round, -1, 0, &value, proposal_flags);
+        }
+        let mut messages = if self.parent_known { vec![Message::Proposal] } else { Vec::new() };
+        let mut proposed = !self.parent_known;
         for k in self.scene.finalizers {
             messages.push(Message::Vote(k, 0));
             messages.push(Message::Vote(k, TF_BFT_PRECOMMIT));
@@ -1658,7 +1724,6 @@ impl EngineFuzz {
             }
         }
         let mut ticks = 0;
-        let mut proposed = false;
         let room = |f: &EngineFuzz, proposed: bool| proposed || f.round_ticks + 1 < f.proposal_window_ticks();
         if room(self, proposed) {
             ticks += 1;
@@ -1670,7 +1735,7 @@ impl EngineFuzz {
                     proposed = true;
                     self.tf.push_instr_bft_recv_proposal(proposer, self.height, self.round, -1, 0, &value, 0)
                 }
-                Message::Vote(k, bits) => self.tf.push_instr_bft_recv_vote(k, bits, self.height, self.round, &id, 0),
+                Message::Vote(k, bits) => self.tf.push_instr_bft_recv_vote(k, bits | vote_bits, self.height, self.round, &id, 0),
             }
             if ticks < 6 && room(self, proposed) && c.unusual(48) {
                 ticks += 1;
@@ -1686,7 +1751,7 @@ impl EngineFuzz {
         self.round_ticks = 4;
         // Without the node's stake there is no quorum, so the decision shows it prevoted and
         // precommitted the proposal.
-        if node_needed {
+        if node_needed && self.parent_known {
             self.tf.push_instr_expect_bft_sent(0, self.height, self.round, Some(&id), 0);
             self.tf.push_instr_expect_bft_sent(1, self.height, self.round, Some(&id), 0);
         }
@@ -1695,9 +1760,11 @@ impl EngineFuzz {
         let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
         self.parent = signed_fat_pointer(&block, self.height, self.round, &seeds, &[0; 32]);
         self.snapshot = snapshot;
-        self.decided_any = true;
+        // A decision is cited only while the writer can name it.
+        self.decided_any = self.parent_known;
         self.height += 1;
         self.round = 0;
+        self.round_start_tip = self.tip_height();
         self.tf.push_instr_expect_bft_step(self.height, 0, None, 0);
         self.tf.push_instr_expect_pos_chain_length(self.height as usize, 0);
     }
@@ -1727,8 +1794,9 @@ fn generate_engine(c: &mut Choices) -> Vec<u8> {
         main, replay, replayed_to: 0, round_ticks: 0,
         key: TestKey::new(b"crosslink test miner"), pending: Vec::new(), held: Vec::new(), bonds_made: 0,
         cite: FatPointerToBftBlock::null(), cite_snapshot: 0, gen_cites: Vec::new(), decided_any: false, fin: None,
-        side_blocks: Vec::new(), next_stranger: STRANGERS_FROM,
+        side_blocks: Vec::new(), next_stranger: STRANGERS_FROM, parent_known: true, round_start_tip: 0,
     };
+    f.round_start_tip = f.tip_height();
     // BFT starts at the activation height the scene loaded up to.
     f.tick();
     for _ in 0..2 + c.below(10) {
@@ -1829,14 +1897,87 @@ fn fuzz_dir() -> PathBuf {
     dir
 }
 
-/// One input: CROSSLINK_FUZZ_FILE, or the input for CROSSLINK_FUZZ_SEED. Writes the file it ran
-/// to the fuzz directory first, so a crash still leaves it behind.
+// # Coverage
+//
+// Built with SanitizerCoverage's inline 8-bit edge counters (the RUSTFLAGS are in
+// `crosslink_fuzz`'s doc), every instrumented module registers its counters at startup through
+// the hook below, and a child run given CROSSLINK_FUZZ_COVERAGE writes
+// the indices of the edges it hit there when it exits. Without the instrumentation nothing calls
+// the hook and no edges are written.
+
+/// Each instrumented module's counters, in the order the modules registered them, which is fixed
+/// for a binary, so an edge's index means the same in every run of it.
+static COVERAGE_COUNTERS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Called by every SanitizerCoverage-instrumented module before `main`, with its counters. On
+/// macOS each module passes the whole image's counter section, so a range is kept once.
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "C" fn __sanitizer_cov_8bit_counters_init(start: *mut u8, stop: *mut u8) {
+    if let Ok(mut counters) = COVERAGE_COUNTERS.lock() {
+        let range = (start as usize, stop as usize);
+        if !counters.contains(&range) {
+            counters.push(range);
+        }
+    }
+}
+
+/// The indices of every edge hit so far, ascending.
+#[allow(unsafe_code)]
+fn coverage_edges() -> Vec<u32> {
+    let counters = COVERAGE_COUNTERS.lock().unwrap();
+    let mut edges = Vec::new();
+    let mut base = 0u32;
+    for &(start, stop) in counters.iter() {
+        // SAFETY: each range is a module's counter array, live for the whole process, which
+        // other threads only ever increment.
+        let module = unsafe { std::slice::from_raw_parts(start as *const u8, stop - start) };
+        edges.extend(module.iter().enumerate().filter(|(_, &hits)| hits != 0).map(|(i, _)| base + i as u32));
+        base += module.len() as u32;
+    }
+    edges
+}
+
+extern "C" fn write_coverage_at_exit() {
+    if let Ok(path) = std::env::var("CROSSLINK_FUZZ_COVERAGE") {
+        let edges = coverage_edges();
+        let bytes: Vec<u8> = edges.iter().flat_map(|edge| edge.to_le_bytes()).collect();
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+/// The edges a child run wrote to `path`, empty when it wrote none.
+fn read_coverage(path: &std::path::Path) -> Vec<u32> {
+    std::fs::read(path)
+        .map(|bytes| bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        .unwrap_or_default()
+}
+
+/// One input: CROSSLINK_FUZZ_FILE, the input generated from the choice bytes in
+/// CROSSLINK_FUZZ_CHOICES, or the input for CROSSLINK_FUZZ_SEED. Writes the file it ran to the
+/// fuzz directory first, so a crash still leaves it behind. With CROSSLINK_FUZZ_COVERAGE, writes
+/// the edges it hit there at exit (see # Coverage).
 #[test]
 #[ignore]
+#[allow(unsafe_code)]
 fn crosslink_fuzz_one() {
     set_test_name(function_name!());
+    if std::env::var("CROSSLINK_FUZZ_COVERAGE").is_ok() {
+        extern "C" {
+            fn atexit(callback: extern "C" fn()) -> i32;
+        }
+        // SAFETY: registers a plain function with no captured state.
+        unsafe { atexit(write_coverage_at_exit) };
+    }
     let bytes = match (std::env::var("CROSSLINK_FUZZ_FILE"), std::env::var("CROSSLINK_FUZZ_SEED")) {
         (Ok(path), _) => std::fs::read(&path).expect("CROSSLINK_FUZZ_FILE reads"),
+        _ if std::env::var("CROSSLINK_FUZZ_CHOICES").is_ok() => {
+            let path = std::env::var("CROSSLINK_FUZZ_CHOICES").expect("checked just above");
+            let choices = std::fs::read(&path).expect("CROSSLINK_FUZZ_CHOICES reads");
+            let bytes = generate(&mut Choices { bytes: choices, o: 0 });
+            std::fs::write(PathBuf::from(&path).with_extension("zeccltf"), &bytes).expect("fuzz input writes");
+            bytes
+        }
         (_, Ok(seed)) => {
             let seed: u64 = seed.parse().expect("CROSSLINK_FUZZ_SEED is a number");
             eprintln!("fuzz seed {seed}");
@@ -2079,12 +2220,73 @@ fn swap_doorways(bytes: &[u8], seen: &std::collections::HashMap<usize, bool>, c:
     Some((out.write_to_bytes(), picked.len()))
 }
 
+/// The choice bytes a guided campaign derives from `parent`: a few stacked mutations (bit flips,
+/// random bytes, an overwritten range, a range spliced from `other`, inserted or deleted bytes),
+/// placed within the first `used` bytes, the ones the generator read, so that each changes a
+/// decision. `c` makes the mutation's own decisions and `noise` supplies the bytes it writes.
+fn mutate_choices(parent: &[u8], used: usize, other: &[u8], c: &mut Choices, noise: &mut Choices) -> Vec<u8> {
+    let len = parent.len();
+    let mut out = parent.to_vec();
+    let used = used.clamp(1, len);
+    for _ in 0..1 + c.below(4) {
+        let i = c.below(used);
+        let k = 1 + c.below(32);
+        match c.below(6) {
+            0 => out[i] ^= 1 << c.below(8),
+            1 => out[i] = noise.byte(),
+            2 => (i..(i + k).min(len)).for_each(|j| out[j] = noise.byte()),
+            3 => {
+                let from = c.below(other.len().max(1));
+                for j in 0..k {
+                    if let (Some(&byte), true) = (other.get(from + j), i + j < len) {
+                        out[i + j] = byte;
+                    }
+                }
+            }
+            4 => {
+                let inserted: Vec<u8> = (0..k).map(|_| noise.byte()).collect();
+                out.splice(i..i, inserted);
+                out.truncate(len);
+            }
+            _ => {
+                out.drain(i..(i + k).min(len));
+                while out.len() < len {
+                    out.push(noise.byte());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Guided campaigns salt the iteration number with this for their own decisions, so they are not
+/// those of the input the same number generates.
+const GUIDED_SEED_SALT: u64 = 0x6775_6964_6564_0000;
+
 /// A campaign: CROSSLINK_FUZZ_SEEDS (`a..b`, default 0..20) within CROSSLINK_FUZZ_SECS (default
 /// 300, inside nextest's per-test bound; run the test binary directly to go longer), on
-/// CROSSLINK_FUZZ_JOBS workers (default 1), each running one seed's child processes at a time.
+/// CROSSLINK_FUZZ_JOBS workers (default 1), each running one input's child processes at a time.
 /// Passing inputs are deleted; a failing one is kept with its log, minimized (CROSSLINK_FUZZ_MINIMIZE
 /// attempts, default 40, 0 for none), and the campaign fails listing what it found. Each passing
 /// input also gets a doorway pass (see # Doorways); CROSSLINK_FUZZ_DOORWAYS=0 turns it off.
+///
+/// With CROSSLINK_FUZZ_GUIDED=1 the campaign is coverage-guided: each number in the range is an
+/// iteration that runs either a fresh input or a mutation (`mutate_choices`) of the choice bytes
+/// of one in the corpus, and an input that hits an edge no run before it hit joins the corpus, kept
+/// in CROSSLINK_FUZZ_CORPUS (default `corpus` in the fuzz directory). A corpus left by an earlier
+/// campaign is run again first. It needs a binary built with SanitizerCoverage's 8-bit counters
+/// (see # Coverage), in its own target directory and for an explicit target, so build scripts
+/// and proc macros stay uninstrumented. The `zebrad` binary the tests depend on has no counter
+/// hook, so the link argument (macOS's) leaves the hook to be found at run time, which only the
+/// test binary does:
+///
+/// ```text
+/// CARGO_TARGET_DIR=target/cov RUSTFLAGS="-Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=3 \
+///   -Cllvm-args=-sanitizer-coverage-inline-8bit-counters -Clink-arg=-Wl,-U,___sanitizer_cov_8bit_counters_init" \
+///   cargo test --release --target aarch64-apple-darwin -p zebrad --test crosslink --no-run
+/// ```
+///
+/// Without the counters every run hits no edges and the corpus never grows.
 #[test]
 #[ignore]
 fn crosslink_fuzz() {
@@ -2097,6 +2299,7 @@ fn crosslink_fuzz() {
     let attempts: usize = std::env::var("CROSSLINK_FUZZ_MINIMIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
     let doorways = std::env::var("CROSSLINK_FUZZ_DOORWAYS").map_or(true, |v| v != "0");
     let jobs: usize = std::env::var("CROSSLINK_FUZZ_JOBS").ok().and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+    let guided = std::env::var("CROSSLINK_FUZZ_GUIDED").is_ok_and(|v| v == "1");
     let dir = fuzz_dir();
     let start = std::time::Instant::now();
     let findings = std::sync::Mutex::new(Vec::new());
@@ -2104,26 +2307,26 @@ fn crosslink_fuzz() {
     let ran = AtomicUsize::new(0);
     let swapped_total = AtomicUsize::new(0);
 
-    // One seed: its run, then its doorway pass if it passed; a finding is minimized here, on this
-    // worker, while the others go on.
-    let run_seed = |seed: u64| {
-        let log = dir.join(format!("seed-{seed}.log"));
-        let timings = dir.join(format!("seed-{seed}.timings.jsonl"));
+    // One input, `name`, which the child reads from `input_env` and writes to `input`: its run,
+    // then its doorway pass if it passed; a finding is minimized here, on this worker, while the
+    // others go on. Answers whether the first run passed.
+    let run_input = |name: &str, input_env: (&'static str, String), input: PathBuf, salt: u64, extra_env: &[(&'static str, String)]| -> bool {
+        let log = dir.join(format!("{name}.log"));
+        let timings = dir.join(format!("{name}.timings.jsonl"));
         let _ = std::fs::remove_file(&timings);
+        let mut envs = vec![input_env, ("CROSSLINK_TEST_TIMINGS", timings.display().to_string())];
+        envs.extend(extra_env.iter().cloned());
         let child_start = std::time::Instant::now();
-        let verdict = run_child(
-            &[("CROSSLINK_FUZZ_SEED", seed.to_string()), ("CROSSLINK_TEST_TIMINGS", timings.display().to_string())],
-            &log,
-        );
+        let verdict = run_child(&envs, &log);
         ran.fetch_add(1, Ordering::Relaxed);
-        let input = dir.join(format!("seed-{seed}.zeccltf"));
-        eprintln!("fuzz seed {seed}: {verdict:?} in {:.1?}", child_start.elapsed());
-        let (name, input, verdict) = if verdict != Verdict::Pass {
-            (format!("seed-{seed}"), input, verdict)
+        eprintln!("fuzz {name}: {verdict:?} in {:.1?}", child_start.elapsed());
+        let passed = verdict == Verdict::Pass;
+        let (finding, input, verdict) = if !passed {
+            (name.to_string(), input, verdict)
         } else {
             let swapped = if doorways {
                 let bytes = std::fs::read(&input).expect("the passing input was written");
-                swap_doorways(&bytes, &seen_verdicts(&timings), &mut Choices::from_seed(seed ^ DOORWAY_SEED_SALT, 256))
+                swap_doorways(&bytes, &seen_verdicts(&timings), &mut Choices::from_seed(salt ^ DOORWAY_SEED_SALT, 256))
             } else {
                 None
             };
@@ -2131,35 +2334,118 @@ fn crosslink_fuzz() {
             let _ = std::fs::remove_file(&log);
             let _ = std::fs::remove_file(&timings);
             let Some((swapped, n)) = swapped else {
-                return;
+                return true;
             };
             swapped_total.fetch_add(n, Ordering::Relaxed);
-            let name = format!("seed-{seed}.doorways");
-            let swapped_input = dir.join(format!("{name}.zeccltf"));
+            let finding = format!("{name}.doorways");
+            let swapped_input = dir.join(format!("{finding}.zeccltf"));
             std::fs::write(&swapped_input, &swapped).expect("the doorway input writes");
-            let log = dir.join(format!("{name}.log"));
+            let log = dir.join(format!("{finding}.log"));
             let child_start = std::time::Instant::now();
             let verdict = run_child(
                 &[("CROSSLINK_FUZZ_FILE", swapped_input.display().to_string()), ("CROSSLINK_TEST_TIMINGS", "off".to_string())],
                 &log,
             );
-            eprintln!("fuzz seed {seed}: {n} instruction(s) through other doorways: {verdict:?} in {:.1?}", child_start.elapsed());
+            eprintln!("fuzz {name}: {n} instruction(s) through other doorways: {verdict:?} in {:.1?}", child_start.elapsed());
             if verdict == Verdict::Pass {
                 let _ = std::fs::remove_file(&swapped_input);
                 let _ = std::fs::remove_file(&log);
-                return;
+                return true;
             }
-            (name, swapped_input, verdict)
+            (finding, swapped_input, verdict)
         };
-        let _ = std::fs::remove_file(dir.join(format!("seed-{seed}.timings.jsonl")));
+        let _ = std::fs::remove_file(&timings);
         let bytes = std::fs::read(&input).expect("the failing input was written");
         if attempts > 0 {
             let same = |got: &Verdict, _: &std::path::Path| *got == verdict;
-            let min = minimize(bytes.clone(), &same, &name, attempts);
-            std::fs::write(dir.join(format!("{name}.min.zeccltf")), &min).expect("minimized input writes");
-            eprintln!("fuzz {name}: minimized {} -> {} bytes", bytes.len(), min.len());
+            let min = minimize(bytes.clone(), &same, &finding, attempts);
+            std::fs::write(dir.join(format!("{finding}.min.zeccltf")), &min).expect("minimized input writes");
+            eprintln!("fuzz {finding}: minimized {} -> {} bytes", bytes.len(), min.len());
         }
-        findings.lock().unwrap().push((name, verdict));
+        findings.lock().unwrap().push((finding, verdict));
+        passed
+    };
+
+    let run_seed = |seed: u64| {
+        let name = format!("seed-{seed}");
+        run_input(&name, ("CROSSLINK_FUZZ_SEED", seed.to_string()), dir.join(format!("{name}.zeccltf")), seed, &[]);
+    };
+
+    // The guided campaign's corpus: choice bytes, with how many of them the generator read, and
+    // every edge any run has hit. `pending` is an earlier campaign's corpus, run again first to
+    // learn its edges on this binary.
+    struct Corpus {
+        entries: Vec<(Vec<u8>, usize)>,
+        edges: std::collections::HashSet<u32>,
+        pending: Vec<Vec<u8>>,
+    }
+    let corpus_dir = std::env::var("CROSSLINK_FUZZ_CORPUS").map(PathBuf::from).unwrap_or_else(|_| dir.join("corpus"));
+    let used_of = |choices: &[u8]| {
+        let mut c = Choices { bytes: choices.to_vec(), o: 0 };
+        let _ = generate(&mut c);
+        c.o.min(choices.len())
+    };
+    let corpus = std::sync::Mutex::new(Corpus { entries: Vec::new(), edges: Default::default(), pending: Vec::new() });
+    if guided {
+        let _ = std::fs::create_dir_all(&corpus_dir);
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&corpus_dir)
+            .map(|dir| dir.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "choices")).collect())
+            .unwrap_or_default();
+        files.sort();
+        corpus.lock().unwrap().pending = files.iter().filter_map(|p| std::fs::read(p).ok()).collect();
+        eprintln!("fuzz: guided, {} corpus entries from {} to run first", files.len(), corpus_dir.display());
+    }
+
+    let run_guided = |n: u64| {
+        let mut c = Choices::from_seed(n ^ GUIDED_SEED_SALT, 256);
+        let (choices, known) = {
+            let mut corpus = corpus.lock().unwrap();
+            if let Some(choices) = corpus.pending.pop() {
+                (choices, true)
+            } else if corpus.entries.is_empty() || c.unusual(48) {
+                (Choices::from_seed(n, 4096).bytes, false)
+            } else {
+                let (parent, used) = &corpus.entries[c.below(corpus.entries.len())];
+                let (other, _) = &corpus.entries[c.below(corpus.entries.len())];
+                let mut noise = Choices::from_seed(n ^ GUIDED_SEED_SALT ^ 1, 4096);
+                (mutate_choices(parent, *used, other, &mut c, &mut noise), false)
+            }
+        };
+        let name = format!("guided-{n}");
+        let choices_path = dir.join(format!("{name}.choices"));
+        let coverage_path = dir.join(format!("{name}.cov"));
+        std::fs::write(&choices_path, &choices).expect("the choices write");
+        let _ = std::fs::remove_file(&coverage_path);
+        run_input(
+            &name,
+            ("CROSSLINK_FUZZ_CHOICES", choices_path.display().to_string()),
+            dir.join(format!("{name}.zeccltf")),
+            n,
+            &[("CROSSLINK_FUZZ_COVERAGE", coverage_path.display().to_string())],
+        );
+        let edges = read_coverage(&coverage_path);
+        let _ = std::fs::remove_file(&coverage_path);
+        let _ = std::fs::remove_file(&choices_path);
+        let used = used_of(&choices);
+        let mut corpus = corpus.lock().unwrap();
+        let before = corpus.edges.len();
+        corpus.edges.extend(edges.iter().copied());
+        let new = corpus.edges.len() - before;
+        if new > 0 || known {
+            if !known {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                choices.hash(&mut hasher);
+                let _ = std::fs::write(corpus_dir.join(format!("{:016x}.choices", hasher.finish())), &choices);
+            }
+            corpus.entries.push((choices, used));
+            eprintln!(
+                "fuzz {name}: {} edges, {new} new; corpus {} entries, {} edges",
+                edges.len(),
+                corpus.entries.len(),
+                corpus.edges.len()
+            );
+        }
     };
 
     std::thread::scope(|scope| {
@@ -2172,13 +2458,21 @@ fn crosslink_fuzz() {
                 if seed >= b {
                     break;
                 }
-                run_seed(seed);
+                if guided {
+                    run_guided(seed);
+                } else {
+                    run_seed(seed);
+                }
             });
         }
     });
 
     let findings = findings.into_inner().unwrap();
+    let corpus = corpus.into_inner().unwrap();
     eprintln!("fuzz: {} instruction(s) sent through other doorways", swapped_total.into_inner());
+    if guided {
+        eprintln!("fuzz: corpus {} entries, {} edges, in {}", corpus.entries.len(), corpus.edges.len(), corpus_dir.display());
+    }
     eprintln!(
         "fuzz: {} inputs on {jobs} worker(s), {} findings, in {:?}; files in {}",
         ran.into_inner(),
