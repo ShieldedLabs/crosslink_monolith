@@ -197,7 +197,7 @@ impl MemoPadding {
 /// What one run of bytes in a memo's action holds, for display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoField {
-    /// Length and compression flag.
+    /// The memo's length.
     Header,
     /// "MEMO", which opens a public magic memo.
     Marker,
@@ -235,11 +235,8 @@ const NOTE_TAG_BYTES: usize = 16;
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct MemoLayout {
     pub kind: MemoKind,
-    /// The memo's bytes as typed.
+    /// The memo's bytes as typed, which is what it occupies.
     pub content_len: usize,
-    /// The bytes it occupies: compressed if `compressed`.
-    pub stored_len: usize,
-    pub compressed: bool,
     /// For each action, its fields in order with their lengths in bytes. A magic memo's actions each total
     /// `MEMO_COMPACT_ACTION_BYTES`; a normal memo's single action continues past them into the full transaction.
     pub actions: Vec<Vec<(MemoField, usize)>>,
@@ -260,7 +257,7 @@ pub fn memo_layout(text: &str, kind: MemoKind) -> Result<MemoLayout, String> {
                 (MemoField::Padding, NORMAL_MEMO_BYTES - n),
                 (MemoField::Tag, NOTE_TAG_BYTES),
             ];
-            Ok(MemoLayout { kind, content_len: n, stored_len: n, compressed: false, actions: vec![fields.into_iter().filter(|&(_, len)| len > 0).collect()] })
+            Ok(MemoLayout { kind, content_len: n, actions: vec![fields.into_iter().filter(|&(_, len)| len > 0).collect()] })
         }
         MemoKind::MagicPublic | MemoKind::MagicEncrypted => magic_memo_layout(text, kind),
     }
@@ -271,7 +268,7 @@ fn magic_memo_layout(text: &str, kind: MemoKind) -> Result<MemoLayout, String> {
     let magic_kind = if kind == MemoKind::MagicEncrypted { MagicMemoKind::Encrypted } else { MagicMemoKind::Public };
     MagicMemoPlan::new(&MagicMemoContent::Text(text.to_owned()), magic_kind)
         .map(|plan| layout_of_plan(&plan))
-        .ok_or_else(|| format!("{} bytes do not fit in a magic memo, even compressed", text.len()))
+        .ok_or_else(|| format!("{} bytes do not fit in a magic memo", text.len()))
 }
 
 #[cfg(not(feature = "magic-memo"))]
@@ -292,9 +289,7 @@ fn layout_of_plan(plan: &MagicMemoPlan) -> MemoLayout {
     };
     MemoLayout {
         kind: if plan.kind() == MagicMemoKind::Encrypted { MemoKind::MagicEncrypted } else { MemoKind::MagicPublic },
-        content_len: plan.content_len(),
-        stored_len: plan.stored_len(),
-        compressed: plan.is_compressed(),
+        content_len: plan.stored_len(),
         actions: plan.layout().into_iter().map(|action| action.into_iter().map(|(f, len)| (field(f), len)).collect()).collect(),
     }
 }
@@ -3649,7 +3644,7 @@ fn send_gui_memo<P: Parameters>(
                 // The outputs are useless to whoever receives them, so our own address is as good as any.
                 let (_t_addr, _p2sh, ua) = addrs_from_account(&wallet.accounts[0], 0).ok_or("The wallet has no address.")?;
                 MagicMemo::public(&content, *ua.orchard().ok_or("The wallet has no Ironwood address.")?)
-            }.ok_or("The memo does not fit in a magic memo, even compressed.")?;
+            }.ok_or("The memo does not fit in a magic memo.")?;
             let payment = to.filter(|_| amount > Zatoshis::ZERO).map(|to| (to, amount));
             let filler_n = padding.filler_n(memo.actions_n(), payment.is_some());
             let memo = memo.with_filler(filler_n);
@@ -5573,7 +5568,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     match to {
                         Err(reason) => { let _ = sender.send(Err(reason)); }
                         Ok(_) if !magic_memo::fits(&content, kind) => {
-                            let _ = sender.send(Err(format!("{text_len} bytes of text do not fit in a magic memo, even compressed (it stores at most {} bytes)", kind.max_stored_len())));
+                            let _ = sender.send(Err(format!("{text_len} bytes of text do not fit in a magic memo (it stores at most {} bytes)", kind.max_stored_len())));
                         }
                         Ok(to) => {
                             let staged = StagedMagicMemo{ content, to };

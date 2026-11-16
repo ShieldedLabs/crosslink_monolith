@@ -69,7 +69,7 @@ pub struct UiData {
     pub send_memo: String,
     pub send_memo_kind: wallet::MemoKind,
     pub send_memo_pad: bool,
-    /// The memo text and kind last laid out, and the layout, so compression does not rerun every frame.
+    /// The memo text and kind last laid out, and the layout, so it is not redone every frame.
     pub send_memo_layout_for: Option<(String, wallet::MemoKind)>,
     pub send_memo_layout: Option<Result<wallet::MemoLayout, String>>,
     /// The memo whose layout the Memo Layout modal shows.
@@ -1355,7 +1355,7 @@ const MEMO_OTHER_ACTION_COL: (u8, u8, u8, u8) = (0x34, 0x38, 0x3e, 0xff);
 fn memo_field_style(field: wallet::MemoField) -> ((u8, u8, u8, u8), &'static str) {
     use wallet::MemoField::*;
     match field {
-        Header        => ((0xe0, 0xa2, 0x5c, 0xff), "header (length, flag)"),
+        Header        => ((0xe0, 0xa2, 0x5c, 0xff), "header (length)"),
         Marker        => ((0xc4, 0x7f, 0x34, 0xff), "MEMO marker"),
         Salt          => ((0xb9, 0x97, 0xdc, 0xff), "salt"),
         Payload       => ((0x5c, 0xc3, 0x9b, 0xff), "memo bytes"),
@@ -1384,10 +1384,9 @@ fn draw_memo_layout(ui: &mut Context, data: &mut UiData, child_gap: f32, layout:
             layout.content_len, wallet::NORMAL_MEMO_BYTES, wallet::MEMO_COMPACT_ACTION_BYTES),
         kind => {
             let visibility = if kind == wallet::MemoKind::MagicEncrypted { "encrypted" } else { "public" };
-            let compressed = if layout.compressed { format!(" (compressed from {})", layout.content_len) } else { String::new() };
             let filler = if filler_n > 0 { format!(", plus {filler_n} of filler") } else { String::new() };
-            format!("Magic memo, {visibility}: {} bytes stored{compressed} in {n} action{}{filler}, all readable from compact blocks.",
-                layout.stored_len, if n == 1 { "" } else { "s" })
+            format!("Magic memo, {visibility}: {} bytes in {n} action{}{filler}, all readable from compact blocks.",
+                layout.content_len, if n == 1 { "" } else { "s" })
         }
     };
     for line in wrap_lines(&summary, MEMO_LAYOUT_LINE_CHARS) {

@@ -2718,7 +2718,7 @@ mod tests {
             .collect()
     }
 
-    /// `len` bytes that Brotli cannot shrink, so a memo of them is stored as is.
+    /// `len` random bytes, for a memo of a known size.
     #[cfg(all(feature = "circuits", feature = "unstable-magic-memo"))]
     fn incompressible(len: usize) -> alloc::vec::Vec<u8> {
         let mut bytes = alloc::vec![0u8; len];
