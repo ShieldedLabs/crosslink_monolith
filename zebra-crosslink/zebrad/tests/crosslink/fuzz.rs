@@ -1254,8 +1254,8 @@ struct EngineFuzz {
     cite: FatPointerToBftBlock,
     cite_snapshot: u32,
     gen_cites: Vec<FatPointerToBftBlock>,
-    /// Whether any height has been decided, so `parent` is a decision a block may cite.
-    decided_any: bool,
+    /// The newest decision the writer can name, which a block may cite, with its snapshot.
+    citable: Option<(FatPointerToBftBlock, u32)>,
     /// The height of `fin` the node must hold: the snapshot of the newest decision a best tip
     /// has cited.
     fin: Option<u32>,
@@ -1345,6 +1345,18 @@ impl EngineFuzz {
         synthetic < decision_threshold(total, false).min(decision_threshold(total, true))
     }
 
+    /// A synthetic finalizer without which the rest of the roster is still a quorum under both
+    /// quorum rules, so that what it signs cannot decide the height either way; `None` if none is.
+    fn equivocator(&mut self, c: &mut Choices) -> Option<u16> {
+        let members = self.stakes_at(self.snapshot);
+        let total: u64 = members.iter().map(|&(_, stake)| stake).sum();
+        let threshold = decision_threshold(total, false).max(decision_threshold(total, true));
+        let k = self.scene.finalizers[c.below(self.scene.finalizers.len())];
+        let key = synthetic_finalizer_pub_key(k.into());
+        let stake: u64 = members.iter().filter(|&&(member, _)| member == key).map(|&(_, stake)| stake).sum();
+        (total - stake >= threshold).then_some(k)
+    }
+
     /// A tenderlink packet from a synthetic finalizer on no roster, mostly a real kind of packet
     /// mangled: a status, a vote or a proposal chunk signed under no namespace, a second
     /// ID_HELLO, or bytes at random. Whether the node keeps the sender is its call; it must stay
@@ -1417,9 +1429,11 @@ impl EngineFuzz {
     fn extend_with(&mut self, c: &mut Choices, txs: &[Arc<Transaction>]) {
         self.gens.push(self.scene.gen.clone());
         self.gen_cites.push(self.cite.clone());
-        if self.decided_any && self.cite != self.parent && c.below(4) != 0 {
-            self.cite = self.parent.clone();
-            self.cite_snapshot = self.snapshot;
+        if let Some((pointer, snapshot)) = self.citable.clone() {
+            if self.cite != pointer && c.below(4) != 0 {
+                self.cite = pointer;
+                self.cite_snapshot = snapshot;
+            }
         }
         let block = cited_block(&mut self.scene.gen, &self.scene.miner.clone(), txs, &self.cite);
         self.main.push(Some(block.clone()));
@@ -1700,10 +1714,15 @@ impl EngineFuzz {
         let block = bft_proposal(&BFT_ROUNDS_PARAMETERS, self.height as u32, self.parent.clone(), 0, &self.scene.tail_above(snapshot));
         let value = bft_proposal_value(&block);
         let id = bft_value_id(&value);
+        if self.parent_known && c.below(4) == 0 {
+            return self.lock_then_decide(c, proposer, block, value, id, snapshot, top);
+        }
 
         enum Message {
             Proposal,
             Vote(u16, u64),
+            /// A vote for another value: an equivocation.
+            Other(u16, u64, [u8; 32]),
         }
         // On the node's tip the value is known only once the harness has sent it, so the votes
         // name it by delivery and come after it.
@@ -1723,6 +1742,28 @@ impl EngineFuzz {
                 messages.push(Message::Vote(k, TF_BFT_WRONG_NAMESPACE));
             }
         }
+        // A finalizer the quorum does not need also signs a value nobody proposed (its prevote, its
+        // precommit or both), or votes nil instead, splitting the vote. The height is decided as
+        // before.
+        if c.unusual(48) {
+            if let Some(k) = self.equivocator(c) {
+                let mut other = id;
+                other[0] ^= 0xff;
+                match c.below(4) {
+                    0 => messages.push(Message::Other(k, 0, other)),
+                    1 => messages.push(Message::Other(k, TF_BFT_PRECOMMIT, other)),
+                    2 => {
+                        messages.push(Message::Other(k, 0, other));
+                        messages.push(Message::Other(k, TF_BFT_PRECOMMIT, other));
+                    }
+                    _ => {
+                        messages.retain(|m| !matches!(m, Message::Vote(j, _) if *j == k));
+                        messages.push(Message::Vote(k, TF_BFT_NIL));
+                        messages.push(Message::Vote(k, TF_BFT_PRECOMMIT | TF_BFT_NIL));
+                    }
+                }
+            }
+        }
         let mut ticks = 0;
         let room = |f: &EngineFuzz, proposed: bool| proposed || f.round_ticks + 1 < f.proposal_window_ticks();
         if room(self, proposed) {
@@ -1736,6 +1777,7 @@ impl EngineFuzz {
                     self.tf.push_instr_bft_recv_proposal(proposer, self.height, self.round, -1, 0, &value, 0)
                 }
                 Message::Vote(k, bits) => self.tf.push_instr_bft_recv_vote(k, bits | vote_bits, self.height, self.round, &id, 0),
+                Message::Other(k, bits, other) => self.tf.push_instr_bft_recv_vote(k, bits, self.height, self.round, &other, 0),
             }
             if ticks < 6 && room(self, proposed) && c.unusual(48) {
                 ticks += 1;
@@ -1756,17 +1798,96 @@ impl EngineFuzz {
             self.tf.push_instr_expect_bft_sent(1, self.height, self.round, Some(&id), 0);
         }
 
+        self.decided(&block, snapshot);
+    }
+
+    /// The engine's height decided `block`, at the current round, finalizing `snapshot`: the
+    /// engine moves to the next height, which the writer follows.
+    fn decided(&mut self, block: &BftBlock, snapshot: u32) {
         let seeds: Vec<String> = self.scene.finalizers.iter().map(|&k| synthetic_finalizer_seed(k.into())).collect();
         let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
-        self.parent = signed_fat_pointer(&block, self.height, self.round, &seeds, &[0; 32]);
+        self.parent = signed_fat_pointer(block, self.height, self.round, &seeds, &[0; 32]);
         self.snapshot = snapshot;
         // A decision is cited only while the writer can name it.
-        self.decided_any = self.parent_known;
+        if self.parent_known {
+            self.citable = Some((self.parent.clone(), snapshot));
+        }
         self.height += 1;
         self.round = 0;
         self.round_start_tip = self.tip_height();
         self.tf.push_instr_expect_bft_step(self.height, 0, None, 0);
         self.tf.push_instr_expect_pos_chain_length(self.height as usize, 0);
+    }
+
+    /// Three ticks: what the node does with messages it was just sent. The engine applies its
+    /// rules on a tick, and what one rule does there satisfies another only on the next: entering
+    /// a round its messages pulled it into, then prevoting, then precommitting on the prevotes its
+    /// own completed. Three ticks (750 ms) stay inside a later round's prevote timeout, and in round
+    /// 0, whose timeout is two ticks, the precommit comes a tick after the quorum, before it.
+    fn settle_ticks(&mut self) {
+        self.tick();
+        self.tick();
+        self.tick();
+    }
+
+    /// Locks the node on a value and decides it in a later round, through the valid-round rules.
+    /// In the current round the synthetic proposer's value gets a quorum of prevotes, so the node
+    /// locks it and precommits it, but the synthetic finalizers precommit nil. Each later round is
+    /// entered on its own synthetic prevotes. When the node proposes one, it must re-propose the
+    /// locked value. A synthetic proposer sometimes first offers another valid value, which the
+    /// locked node must prevote nil, and then re-proposes the locked one with the round it got its
+    /// prevotes in as its valid round, which the node must prevote. The locked value is decided.
+    fn lock_then_decide(&mut self, c: &mut Choices, proposer: u16, block: BftBlock, value: Vec<u8>, id: [u8; 32], snapshot: u32, top: u32) {
+        let locked_round = self.round;
+        if self.round_ticks + 1 < self.proposal_window_ticks() {
+            self.tick();
+        }
+        self.tf.push_instr_bft_recv_proposal(proposer, self.height, self.round, -1, 0, &value, 0);
+        self.votes(0, &id);
+        self.settle_ticks();
+        self.tf.push_instr_expect_bft_sent(1, self.height, self.round, Some(&id), 0);
+        self.votes(TF_BFT_PRECOMMIT | TF_BFT_NIL, &[0; 32]);
+
+        let mut offered_other = false;
+        loop {
+            self.round += 1;
+            self.round_ticks = 0;
+            let proposer = self.proposer();
+            self.tf.push_instr_expect_bft_proposer(proposer, self.height, self.round, 0);
+            if proposer == TF_BFT_THE_NODE {
+                // Its prevotes pull the engine into the round, where the node proposes its valid
+                // value: the locked one.
+                self.votes(0, &id);
+                self.settle_ticks();
+                self.tf.push_instr_expect_bft_sent(2, self.height, self.round, Some(&id), 0);
+                self.votes(TF_BFT_PRECOMMIT, &id);
+                break;
+            }
+            let proposer = u16::try_from(proposer).expect("a synthetic finalizer proposes");
+            // Another valid value: the same parent, a different snapshot.
+            let other_snapshot = if snapshot < top { snapshot + 1 } else { snapshot.saturating_sub(1).max(self.snapshot + 1) };
+            if !offered_other && other_snapshot != snapshot && c.below(2) == 0 {
+                offered_other = true;
+                let other = bft_proposal(&BFT_ROUNDS_PARAMETERS, self.height as u32, self.parent.clone(), 0, &self.scene.tail_above(other_snapshot));
+                self.tf.push_instr_bft_recv_proposal(proposer, self.height, self.round, -1, 0, &bft_proposal_value(&other), 0);
+                self.votes(TF_BFT_NIL, &[0; 32]);
+                self.settle_ticks();
+                self.tf.push_instr_expect_bft_sent(0, self.height, self.round, None, 0);
+                self.votes(TF_BFT_PRECOMMIT | TF_BFT_NIL, &[0; 32]);
+                continue;
+            }
+            self.tf.push_instr_bft_recv_proposal(proposer, self.height, self.round, i64::from(locked_round), 0, &value, 0);
+            self.votes(0, &id);
+            self.settle_ticks();
+            self.tf.push_instr_expect_bft_sent(0, self.height, self.round, Some(&id), 0);
+            self.votes(TF_BFT_PRECOMMIT, &id);
+            break;
+        }
+        for _ in 0..4 {
+            self.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+        }
+        self.round_ticks = 4;
+        self.decided(&block, snapshot);
     }
 }
 
@@ -1793,7 +1914,7 @@ fn generate_engine(c: &mut Choices) -> Vec<u8> {
         tf, scene, gens: Vec::new(), height: 1, round: 0, parent, snapshot: roster_height, next_fresh_peer: FRESH_PEERS_FROM, sides: 0,
         main, replay, replayed_to: 0, round_ticks: 0,
         key: TestKey::new(b"crosslink test miner"), pending: Vec::new(), held: Vec::new(), bonds_made: 0,
-        cite: FatPointerToBftBlock::null(), cite_snapshot: 0, gen_cites: Vec::new(), decided_any: false, fin: None,
+        cite: FatPointerToBftBlock::null(), cite_snapshot: 0, gen_cites: Vec::new(), citable: None, fin: None,
         side_blocks: Vec::new(), next_stranger: STRANGERS_FROM, parent_known: true, round_start_tip: 0,
     };
     f.round_start_tip = f.tip_height();
