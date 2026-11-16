@@ -1994,12 +1994,12 @@ pub(crate) async fn handle_instr(
                 let label = format!("SUBMIT_TX {} via STP peer {peer}", tx.hash());
                 let wire_tx = tx.zcash_serialize_to_vec().expect("a parsed transaction serializes");
                 let (served, message) = serve_tx(&mut stp, &wire_tx).await;
-                put_stp_peer(stp);
                 let (accepted, message) = if served {
-                    await_tx_verdict(internal_handle, &tx, &label).await
+                    await_stp_tx_outcome(&mut stp, &tx, &label).await
                 } else {
                     (false, format!("{label}: rejected: {message}"))
                 };
+                put_stp_peer(stp);
                 test_check(flags, accepted, &message);
             }
         },
@@ -2541,7 +2541,7 @@ async fn deliver_stp_packet(stp: &mut HarnessStpPeer, packet: Vec<u8>) -> (bool,
     if let Some(reason) = &stp.killed {
         return (false, format!("RECV_STP_PACKET: peer {index} was already killed: {reason}"));
     }
-    let _ = stp.link.inbound.send(packet);
+    stp.link.send(packet);
 
     let deadline = tokio::time::Instant::now() + STP_PACKET_SETTLE;
     loop {
@@ -2606,7 +2606,7 @@ async fn serve_block(
 
     let mut chains = NearTipChains::default();
     chains.push_chain_unchecked(vec![ShadowBlock { this_hash: hash, parent_hash: parent, this_height: height }]);
-    let _ = stp.link.inbound.send(status_packet(&[], &chains, None));
+    stp.link.send(status_packet(&[], &chains, None));
 
     let deadline = tokio::time::Instant::now() + if already_known.is_some() { KNOWN_BLOCK_SETTLE } else { NODE_ANSWER_WAIT };
     let (mut requests, mut chunks) = (0usize, 0usize);
@@ -2632,7 +2632,7 @@ async fn serve_block(
                 if asks_for_this && (offset as usize) < wire_block.len() {
                     for chunk in block_chunk_packets(wire_block, height, hash, offset as usize) {
                         chunks += 1;
-                        let _ = stp.link.inbound.send(chunk);
+                        stp.link.send(chunk);
                     }
                 }
             }
@@ -2676,7 +2676,7 @@ async fn serve_tx(stp: &mut HarnessStpPeer, wire_tx: &[u8]) -> (bool, String) {
         return (false, format!("peer {index} was already killed: {reason}"));
     }
     // Wire sizes fit u32: a transaction is at most MAX_BLOCK_BYTES.
-    let _ = stp.link.inbound.send(tx_status_packet(1, [(&id, wire_tx.len() as u32)]));
+    stp.link.send(tx_status_packet(1, [(&id, wire_tx.len() as u32)]));
 
     let deadline = tokio::time::Instant::now() + NODE_ANSWER_WAIT;
     loop {
@@ -2688,7 +2688,7 @@ async fn serve_tx(stp: &mut HarnessStpPeer, wire_tx: &[u8]) -> (bool, String) {
                 // HELLO, STATUS, TX_STATUS, MEMPOOL_REQ: not this exchange.
                 if parse_tx_req(&packet).is_some_and(|ids| ids.contains(&id)) {
                     for packet in tx_packets([&tx]) {
-                        let _ = stp.link.inbound.send(packet);
+                        stp.link.send(packet);
                     }
                     return (true, format!("peer {index} was asked for {id} and sent it"));
                 }
@@ -2824,6 +2824,38 @@ async fn mempool_tx_state(internal_handle: &TFLServiceHandle, transaction: &Tran
         other => return Err(format!("mempool {txid}: the mined transaction request answered {other:?}")),
     };
     Ok((resident, in_rejected_set && !mined, mined))
+}
+
+/// The mempool's verdict on a transaction synthetic peer `stp` relayed, as the node reports it to
+/// the peer: taken (accepted, or already held) or not, with the relay's outcome. The relay hears
+/// of every refusal, including one the mempool files nowhere, such as a spend conflict refused at
+/// the queue, which a poll of the mempool could only wait out.
+async fn await_stp_tx_outcome(stp: &mut HarnessStpPeer, transaction: &Transaction, label: &str) -> (bool, String) {
+    use zebra_state::new_network::SyntheticPeerEvent;
+    let id = UnminedTxId::from(transaction);
+    let deadline = tokio::time::Instant::now() + NODE_ANSWER_WAIT;
+    loop {
+        tokio::select! {
+            event = stp.link.events.recv() => match event {
+                Some(SyntheticPeerEvent::TxOutcome { id: got, taken, outcome }) if got == id => {
+                    return if taken {
+                        (true, format!("{label}: accepted into the mempool ({outcome})"))
+                    } else {
+                        (false, format!("{label}: rejected: the relay's outcome is {outcome}"))
+                    };
+                }
+                Some(SyntheticPeerEvent::Killed(reason)) => {
+                    stp.killed = Some(reason.clone());
+                    return (false, format!("{label}: rejected: the node killed the peer: {reason}"));
+                }
+                Some(_) => {}
+                None => return (false, format!("{label}: the sync loop is gone")),
+            },
+            _ = tokio::time::sleep_until(deadline) => {
+                return (false, format!("{label}: no relay outcome within {NODE_ANSWER_WAIT:?}"));
+            }
+        }
+    }
 }
 
 /// Waits, within a bound, for the mempool's verdict on a transaction that reached it from a peer:

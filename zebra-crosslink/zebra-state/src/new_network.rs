@@ -788,6 +788,10 @@ const PEER_RESPOND_MS: u64 = 300;
 
 
 const IDLE_MS: u64 = 100;
+// The least time between download passes that a peer's STATUS brings forward: a STATUS naming a
+// new tip is acted on at once rather than at the next BLOCK_SEND_MS pass, but a peer sending
+// STATUS after STATUS cannot run the pass every tick.
+const DL_INIT_WOKEN_MIN_MS: u64 = 20;
 // The least time from one tick's start to the next when wakes (bft::wake_sync_thread) end the idle
 // wait early, so a stream of them shares ticks instead of spinning the loop.
 const WOKEN_TICK_MIN_MS: u64 = 2;
@@ -1858,6 +1862,15 @@ pub struct SyntheticPeer {
     pub events: tokio::sync::mpsc::UnboundedReceiver<SyntheticPeerEvent>,
 }
 
+impl SyntheticPeer {
+    /// Hands the node `packet` from this peer and wakes the sync loop, as a packet arriving on the
+    /// transport does, so it is read on the next tick rather than after the tick's idle wait.
+    pub fn send(&self, packet: Vec<u8>) {
+        let _ = self.inbound.send(packet);
+        bft::wake_sync_thread();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum SyntheticPeerEvent {
     /// The node disconnected the peer for misbehaving. The peer stays disconnected.
@@ -1865,6 +1878,10 @@ pub enum SyntheticPeerEvent {
     /// What became of a block the peer delivered. A block held in the commit queue reports
     /// `Pending` once, then its final verdict when it leaves.
     Outcome { hash: Hash, outcome: IngestOutcome },
+    /// What the mempool made of a transaction the peer relayed: `taken` when it accepted it or
+    /// already had it, and the relay's outcome by name. A transaction left for a busy mempool to
+    /// look at later has none yet.
+    TxOutcome { id: zebra_chain::transaction::UnminedTxId, taken: bool, outcome: String },
 }
 
 /// The sync loop's end of a `SyntheticPeer`.
@@ -2372,6 +2389,7 @@ pub fn sync(
     // instead of waiting out the heartbeat.
     let mut last_status_tip: Option<Hash> = None;
     let mut next_dl_init      = std::time::Instant::now();
+    let mut last_dl_init      = std::time::Instant::now();
     let mut next_peer_gossip  = std::time::Instant::now();
     let mut next_peer_connect = std::time::Instant::now();
     let mut next_peer_request = std::time::Instant::now();
@@ -2962,6 +2980,8 @@ pub fn sync(
 
         if std::time::Instant::now() >= next_dl_init { 'init_dls: {
             next_dl_init = std::time::Instant::now() + dl_init_interval;
+            last_dl_init = std::time::Instant::now();
+            let dls_before_pass: u32 = peers.values().map(|peer| peer.block_downloads.used_flags.count_ones()).sum();
 
             // An entry outlives its backoff by the max, so a hash failing again soon after keeps
             // its strike count and waits longer.
@@ -3329,6 +3349,13 @@ pub fn sync(
             }
 
             if TRACE { tracing::info!("Started {} new block dls (currently {active_block_dls}/{MAX_BANDWIDTH_BLOCKS_PER_RES})", active_block_dls - prev_active_block_dls); }
+
+            // A new download's first request is due at once (block_request_due), so send it this
+            // tick rather than at the next PEER_REQUEST_MS pass.
+            let dls_after_pass: u32 = peers.values().map(|peer| peer.block_downloads.used_flags.count_ones()).sum();
+            if dls_after_pass > dls_before_pass {
+                next_peer_request = std::time::Instant::now();
+            }
         }}
 
         if std::time::Instant::now() >= next_peer_request {
@@ -3483,7 +3510,15 @@ pub fn sync(
                         }
                         peers_to_kill.push((from, "sent a malformed TX".to_string()));
                     }
-                    tx_relay_bridge::FromBridge::Outcome { from, id, outcome } => tx_state.on_outcome(from, id, outcome, now),
+                    tx_relay_bridge::FromBridge::Outcome { from, id, outcome } => {
+                        if outcome != tx_relay_state::Outcome::Busy {
+                            if let Some(synthetic) = synthetic_peers.iter().find(|p| p.address.connection_key() == from) {
+                                let taken = outcome == tx_relay_state::Outcome::Accepted;
+                                let _ = synthetic.events.send(SyntheticPeerEvent::TxOutcome { id, taken, outcome: format!("{outcome:?}") });
+                            }
+                        }
+                        tx_state.on_outcome(from, id, outcome, now)
+                    }
                     tx_relay_bridge::FromBridge::Bodies { to, txs } => {
                         for packet in tx_relay::tx_packets(txs.iter().map(|tx| &*tx.transaction)) {
                             tx_outs.push(tx_relay_state::Out::Send { to, packet, bulk: true });
@@ -3751,8 +3786,16 @@ pub fn sync(
                         format!("{}..{} ({}..{})", first.this_height, last.this_height, first.this_hash, last.this_hash)
                     }).collect::<Vec<_>>(),
                 );
+                let branch_tips = |tree: &NearTipBranches| tree.branches.iter().filter_map(|b| b.last()).map(|b| (b.this_height, b.this_hash)).collect::<Vec<_>>();
+                let tips_moved = branch_tips(&their_tree) != branch_tips(&peer.their_tree);
                 peer.their_tree = their_tree;
                 peer.their_queue = their_queue;
+                // A peer's new tip is downloaded from as soon as it is heard of, not at the next
+                // BLOCK_SEND_MS pass: on a real network each hop of a block's relay waited for it.
+                if tips_moved {
+                    next_dl_init = next_dl_init.min(last_dl_init + std::time::Duration::from_millis(DL_INIT_WOKEN_MIN_MS));
+                    bft::wake_sync_thread();
+                }
 
                 // A far-behind peer learns what to fetch only from historical windows, 100 hashes
                 // at a time. It sends a STATUS whenever its tip moves, so answering each one with
@@ -4539,8 +4582,11 @@ pub fn sync(
 
         // The remainder of the tick goes to BFT requests, so a round does not wait out the tick.
         // Work that arrives in it, such as a submitted block, starts the next tick early.
+        // A download pass falling due inside the idle wait ends it then, so a STATUS that brought
+        // the pass forward is acted on when the pass is due, not at the next full tick.
         if !zebra_chain::shutdown::is_shutting_down() {
-            bft_runner.wait(loop_start + woken_tick_min, loop_start + tick_duration, &read_state, &mut block_writer);
+            let idle_until = (loop_start + tick_duration).min(next_dl_init.max(loop_start + woken_tick_min));
+            bft_runner.wait(loop_start + woken_tick_min, idle_until, &read_state, &mut block_writer);
         }
     }
     rt.block_on(block_writer.finish_backup());
