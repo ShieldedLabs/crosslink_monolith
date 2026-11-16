@@ -992,9 +992,6 @@ impl StartCmd {
         // service and mempool. This is lightwallet_server; it takes over the
         // legacy port, and the wallet connects to it unchanged.
         let lightwalletd_thread_handle = {
-            if config.crosslink.disable_zaino {
-                warn!("crosslink.disable_zaino is ignored: lightwallet_server always runs, since the node's wallet syncs through it");
-            }
             let zebra_port_base = config.network.listen_addr.port();
             let lwd_port = zebra_port_base + 10001;
             let lwd_ctx = crate::lightwalletd::Ctx {

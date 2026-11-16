@@ -190,10 +190,6 @@ pub mod config {
         pub bft_peers: Vec<String>,
         /// Disable the headless wallet.
         pub disable_the_headless_wallet: bool,
-        /// Ignored (a warning is logged if set to `true`). lightwallet_server always runs, since
-        /// the node's wallet syncs through it. Not written to new configs; kept so older ones load.
-        #[serde(skip_serializing)]
-        pub disable_zaino: bool,
         /// Serve lightwallet_server's gRPC port on every interface instead of loopback only.
         /// It has no authentication or limits, so only enable this behind a firewall or proxy.
         pub public_lightwallet_server: bool,
@@ -217,7 +213,6 @@ pub mod config {
                 bft_peers: Vec::new(),
                 explicit_bft_key_seed: None,
                 disable_the_headless_wallet: false,
-                disable_zaino: false,
                 public_lightwallet_server: false,
                 slashforks: Vec::new(),
                 disable_shipped_slashforks: false,
