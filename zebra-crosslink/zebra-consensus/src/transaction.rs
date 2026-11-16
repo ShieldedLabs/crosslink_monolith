@@ -74,8 +74,14 @@ const MEMPOOL_OUTPUT_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::
 /// transparent outputs before polling the mempool service so that it will try adding the verified
 /// transaction and responding to any potential `AwaitOutput` requests.
 ///
-/// This should be long enough for the mempool service's `Downloads` to finish processing the
-/// response from the transaction verifier.
+/// The last should be long enough for the mempool service's `Downloads` to finish processing the
+/// response from the transaction verifier; the earlier ones catch it sooner, as it usually is.
+/// Each poll is a cheap no-op once the transaction has been taken in.
+const POLL_MEMPOOL_DELAYS: [std::time::Duration; 4] =
+    [Duration::from_millis(1), Duration::from_millis(4), Duration::from_millis(15), Duration::from_millis(30)];
+
+/// How long after a transaction verifies the last of the `POLL_MEMPOOL_DELAYS` polls is made.
+#[cfg(test)]
 const POLL_MEMPOOL_DELAY: std::time::Duration = Duration::from_millis(50);
 
 /// A mempool transaction that embeds a consensus branch ID (v5 onward) reaches its signature,
@@ -599,15 +605,18 @@ where
 
             if let Some(mut mempool) = mempool {
                 tokio::spawn(async move {
-                    // Best-effort poll of the mempool to provide a timely response to
-                    // `sendrawtransaction` RPC calls or `AwaitOutput` mempool calls.
-                    tokio::time::sleep(POLL_MEMPOOL_DELAY).await;
-                    let _ = mempool
-                        .ready()
-                        .await
-                        .expect("mempool poll_ready() method should not return an error")
-                        .call(mempool::Request::CheckForVerifiedTransactions)
-                        .await;
+                    // Best-effort polls of the mempool to provide a timely response to
+                    // `sendrawtransaction` RPC calls or `AwaitOutput` mempool calls: the mempool
+                    // takes a verified transaction in only when it is called.
+                    for delay in POLL_MEMPOOL_DELAYS {
+                        tokio::time::sleep(delay).await;
+                        let _ = mempool
+                            .ready()
+                            .await
+                            .expect("mempool poll_ready() method should not return an error")
+                            .call(mempool::Request::CheckForVerifiedTransactions)
+                            .await;
+                    }
                 });
             }
 

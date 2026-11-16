@@ -2796,7 +2796,7 @@ async fn await_mempool(
                 ),
             );
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
 }
 
@@ -2872,7 +2872,7 @@ async fn await_tx_verdict(internal_handle: &TFLServiceHandle, transaction: &Tran
             Ok(_) if tokio::time::Instant::now() >= deadline => {
                 return (false, format!("{label}: no mempool verdict within {NODE_ANSWER_WAIT:?}"))
             }
-            Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            Ok(_) => tokio::time::sleep(Duration::from_millis(1)).await,
         }
     }
 }

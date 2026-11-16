@@ -148,11 +148,26 @@ async fn everything(mempool: &MempoolService) -> Vec<(UnminedTxId, u32)> {
     }
 }
 
+/// The bridge's end of its answers. The sync loop reads answers once a tick, so each one wakes
+/// it, and is acted on at the next tick rather than after the tick's idle wait: a transaction
+/// relayed over STP crosses the bridge three times on its way to the mempool.
+#[derive(Clone)]
+struct AnswerSender(std::sync::mpsc::Sender<FromBridge>);
+
+impl AnswerSender {
+    fn send(&self, answer: FromBridge) -> Result<(), std::sync::mpsc::SendError<FromBridge>> {
+        let sent = self.0.send(answer);
+        super::bft::wake_sync_thread();
+        sent
+    }
+}
+
 /// Start the bridge on `rt`.
 pub(super) fn spawn(rt: &tokio::runtime::Handle, launch: TxRelayLaunch) -> TxBridge {
     let (to_tx, mut to_rx) = mpsc::channel::<ToBridge>(BRIDGE_QUEUE);
     // Unbounded, but every answer answers a bounded request or a mempool change.
     let (from_tx, from_rx) = std::sync::mpsc::channel::<FromBridge>();
+    let from_tx = AnswerSender(from_tx);
     let queued_body_bytes = Arc::new(AtomicUsize::new(0));
     let TxRelayLaunch { mempool, changes } = launch;
 
@@ -202,7 +217,7 @@ pub(super) fn spawn(rt: &tokio::runtime::Handle, launch: TxRelayLaunch) -> TxBri
     TxBridge { to: to_tx, from: from_rx, queued_body_bytes }
 }
 
-async fn serve(request: ToBridge, mempool: &MempoolService, from_tx: &std::sync::mpsc::Sender<FromBridge>, queued_body_bytes: &AtomicUsize) {
+async fn serve(request: ToBridge, mempool: &MempoolService, from_tx: &AnswerSender, queued_body_bytes: &AtomicUsize) {
     match request {
         ToBridge::Filter { from, entries } => {
             let ids: HashSet<UnminedTxId> = entries.iter().map(|(id, _)| *id).collect();

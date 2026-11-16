@@ -791,7 +791,7 @@ const IDLE_MS: u64 = 100;
 // The least time between download passes that a peer's STATUS brings forward: a STATUS naming a
 // new tip is acted on at once rather than at the next BLOCK_SEND_MS pass, but a peer sending
 // STATUS after STATUS cannot run the pass every tick.
-const DL_INIT_WOKEN_MIN_MS: u64 = 20;
+const DL_INIT_WOKEN_MIN_MS: u64 = 5;
 // The least time from one tick's start to the next when wakes (bft::wake_sync_thread) end the idle
 // wait early, so a stream of them shares ticks instead of spinning the loop.
 const WOKEN_TICK_MIN_MS: u64 = 2;
@@ -2049,7 +2049,7 @@ async fn submit_to_new_network(
 
     let (reply, rx) = tokio::sync::oneshot::channel();
     permit.send(BlockSubmission { block, reply, trusted });
-    bft::wake_sync_thread();
+    bft::wake_sync_thread_now();
 
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(outcome)) => Ok(outcome),

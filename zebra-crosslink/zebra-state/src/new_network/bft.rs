@@ -384,8 +384,12 @@ pub enum BftRequest {
 pub(super) enum SyncWake {
     /// Served where it arrives, without ending the wait.
     Bft(BftRequest),
-    /// Work the next tick takes up, such as a submitted block: the wait ends early for it.
+    /// Work the next tick takes up, such as a packet: the wait ends early for it, though no
+    /// sooner than WOKEN_TICK_MIN_MS after the tick began, so a stream of them shares ticks.
     Work,
+    /// Work a local caller is waiting on, such as a submitted block: the wait ends at once. Local
+    /// callers are this node's own (RPC, miner), not peers, so they cannot spin the loop.
+    Now,
 }
 
 // A std channel rather than a tokio one: the receiver blocks the sync thread in the idle part of
@@ -404,6 +408,13 @@ fn send_request(request: BftRequest) -> bool {
 pub(super) fn wake_sync_thread() {
     if let Some(tx) = SYNC_WAKE_SENDER.get() {
         let _ = tx.send(SyncWake::Work);
+    }
+}
+
+/// As [`wake_sync_thread`], for work a local caller waits on: the next tick starts at once.
+pub(super) fn wake_sync_thread_now() {
+    if let Some(tx) = SYNC_WAKE_SENDER.get() {
+        let _ = tx.send(SyncWake::Now);
     }
 }
 
@@ -1229,6 +1240,8 @@ pub(super) struct BftRunner {
     rx: std::sync::mpsc::Receiver<SyncWake>,
     /// A `SyncWake::Work` arrived and the tick it asks for has not started yet.
     woken: bool,
+    /// The same for a `SyncWake::Now`.
+    woken_now: bool,
     rt: tokio::runtime::Handle,
     network: Network,
     params: ZcashCrosslinkParameters,
@@ -1288,6 +1301,7 @@ impl BftRunner {
         let mut runner = BftRunner {
             rx,
             woken: false,
+            woken_now: false,
             rt,
             network: read_state.network().clone(),
             params: read_state.network().crosslink_parameters(),
@@ -1470,18 +1484,21 @@ impl BftRunner {
     ) {
         loop {
             let now = std::time::Instant::now();
-            let until = if self.woken { earliest.min(deadline) } else { deadline };
+            let until = if self.woken_now { now } else if self.woken { earliest.min(deadline) } else { deadline };
             if now >= until {
                 self.woken = false;
+                self.woken_now = false;
                 return;
             }
             match self.rx.recv_timeout(until - now) {
                 Ok(SyncWake::Bft(request)) => self.handle(request, read_state, block_writer),
                 Ok(SyncWake::Work) => self.woken = true,
+                Ok(SyncWake::Now) => self.woken_now = true,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     std::thread::sleep(until - now);
                     self.woken = false;
+                    self.woken_now = false;
                     return;
                 }
             }
@@ -1495,6 +1512,7 @@ impl BftRunner {
             match self.rx.try_recv() {
                 Ok(SyncWake::Bft(request)) => self.handle(request, read_state, block_writer),
                 Ok(SyncWake::Work) => self.woken = true,
+                Ok(SyncWake::Now) => self.woken_now = true,
                 Err(_) => break,
             }
         }
