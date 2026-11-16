@@ -664,8 +664,7 @@ pub trait Rpc {
     /// A magic memo is carried entirely in the compact-block view of zero-value Ironwood actions, split across as
     /// many as it needs, rather than in a note's memo field. Without `encrypt_to` it is public plaintext; with a
     /// unified address it is encrypted so that only that address's incoming viewing key can read it. It costs only
-    /// the fee. Fails unless the node was built with the `magic-memo` feature. Blocks until the transaction is
-    /// built and submitted.
+    /// the fee. Blocks until the transaction is built and submitted.
     ///
     /// ## Example Usage
     /// ```shell

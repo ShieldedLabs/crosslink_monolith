@@ -11,7 +11,7 @@
 # transaction's actions. User > "Decrypt magic memos sent to me" switches decryption off and on.
 #
 # Same build and ports as run.sh: a debug zebrad built from zebra-crosslink/ with
-#   cargo build -p zebrad --features magic-memo        (or set ZEBRAD=<path to zebrad>)
+#   cargo build -p zebrad        (or set ZEBRAD=<path to zebrad>)
 # State and logs go to out/demo/ (ignored by git) and start fresh each run.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/.." && pwd); OUT=$HERE/out/demo

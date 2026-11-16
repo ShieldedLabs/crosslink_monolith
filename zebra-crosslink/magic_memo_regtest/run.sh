@@ -8,8 +8,8 @@
 # encrypted: the memo is encrypted to the miner wallet's address, and only the miner wallet may report it.
 # public:    the memo is plaintext, reported once however many wallets scan it.
 #
-# Needs curl, jq and a debug zebrad built with the feature, from zebra-crosslink/:
-#   cargo build -p zebrad --features magic-memo        (or set ZEBRAD=<path to zebrad>)
+# Needs curl, jq and a debug zebrad, built from zebra-crosslink/:
+#   cargo build -p zebrad        (or set ZEBRAD=<path to zebrad>)
 # Runs from Git Bash on Windows or a Linux shell. Everything it writes goes to out/ (ignored by git):
 # the rendered config, the node state and the node log of the last mode run. Exit status 0 is a pass.
 # Uses ports 18432 (RPC), 18433 (p2p), 28434 (light wallet), 12101 and 12401, so it can run beside

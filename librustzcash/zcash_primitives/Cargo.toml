@@ -77,13 +77,13 @@ hex.workspace = true
 
 # - Shielded protocols
 redjubjub.workspace = true
-#   - Experimental magic memos: checking `epk` encodings, deriving `esk`, and recovering
+#   - Magic memos: checking `epk` encodings, deriving `esk`, and recovering
 #     encrypted memos with an outgoing viewing key
-chacha20poly1305 = { version = "0.10", default-features = false, optional = true }
-group = { workspace = true, optional = true }
-pasta_curves = { workspace = true, optional = true }
-subtle = { workspace = true, optional = true }
-zcash_spec = { workspace = true, optional = true }
+chacha20poly1305 = { version = "0.10", default-features = false }
+group.workspace = true
+pasta_curves.workspace = true
+subtle.workspace = true
+zcash_spec.workspace = true
 
 # No-std support
 corez.workspace = true
@@ -153,16 +153,6 @@ expensive-tests = []
 
 ## A feature used to ensure that expensive tests do not run when running with --all-features
 no-expensive-tests = []
-
-## Experimental: magic memos, public or encrypted payloads carried in the compact-block
-## view of zero-value Ironwood outputs (`transaction::magic_memo`). Unstable; off by default.
-unstable-magic-memo = [
-    "dep:chacha20poly1305",
-    "dep:group",
-    "dep:pasta_curves",
-    "dep:subtle",
-    "dep:zcash_spec",
-]
 
 ## A feature that provides `FeeRule` implementations and constructors for
 ## non-standard fees.
