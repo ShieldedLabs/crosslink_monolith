@@ -333,7 +333,9 @@ mod tests {
                 bits,
                 nonce,
                 solution,
-                fat_pointer_to_bft_block,
+                // Below logical version 5 a header has no pointer on the wire, so it reads back
+                // null, as zebra reads it.
+                fat_pointer_to_bft_block: if BcBlockHeader::version_has_fat_pointer(version) { fat_pointer_to_bft_block } else { FatPointerToBftBlock::null() },
             },
         )
     }

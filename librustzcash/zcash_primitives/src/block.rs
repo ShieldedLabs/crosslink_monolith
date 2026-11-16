@@ -161,6 +161,20 @@ impl BlockHeaderData {
     pub fn freeze(self) -> io::Result<BlockHeader> {
         Ok(BlockHeader::from_data(self))
     }
+
+    /// Whether a header of this version carries its fat pointer on the wire: from logical
+    /// version 5 on, as zebra encodes and hashes a header (`zebra_chain::block::serialize`). A
+    /// version with any of its high 16 bits set is read bit-reversed, as zebra does for the blocks
+    /// old mining software wrote that way. Below 5 the pointer is null and not encoded.
+    pub fn version_has_fat_pointer(version: i32) -> bool {
+        let version = version as u32;
+        let logical_version = if version & 0xffff_0000 != 0 {
+            version.reverse_bits()
+        } else {
+            version
+        };
+        logical_version >= 5
+    }
 }
 
 impl BlockHeader {
@@ -198,7 +212,11 @@ impl BlockHeader {
 
         let solution = Vector::read(&mut reader, |r| r.read_u8())?;
 
-        let fat_pointer_to_bft_block = bft::FatPointerToBftBlock::zcash_deserialize(&mut reader)?;
+        let fat_pointer_to_bft_block = if BlockHeaderData::version_has_fat_pointer(version) {
+            bft::FatPointerToBftBlock::zcash_deserialize(&mut reader)?
+        } else {
+            bft::FatPointerToBftBlock::null()
+        };
 
         Ok(BlockHeaderData {
             version,
@@ -222,7 +240,9 @@ impl BlockHeader {
         writer.write_u32_le(data.bits)?;
         writer.write_all(&data.nonce)?;
         Vector::write(&mut writer, &data.solution, |w, b| w.write_u8(*b))?; // TODO: is this different from writer.write_a
-        data.fat_pointer_to_bft_block.zcash_serialize(writer)?;
+        if BlockHeaderData::version_has_fat_pointer(data.version) {
+            data.fat_pointer_to_bft_block.zcash_serialize(writer)?;
+        }
 
         Ok(())
     }
