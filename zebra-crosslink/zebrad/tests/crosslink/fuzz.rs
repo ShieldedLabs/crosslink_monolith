@@ -2080,38 +2080,44 @@ fn swap_doorways(bytes: &[u8], seen: &std::collections::HashMap<usize, bool>, c:
 }
 
 /// A campaign: CROSSLINK_FUZZ_SEEDS (`a..b`, default 0..20) within CROSSLINK_FUZZ_SECS (default
-/// 300, inside nextest's per-test bound; run the test binary directly to go longer). Passing
-/// inputs are deleted; a failing one is kept with its log, minimized (CROSSLINK_FUZZ_MINIMIZE
+/// 300, inside nextest's per-test bound; run the test binary directly to go longer), on
+/// CROSSLINK_FUZZ_JOBS workers (default 1), each running one seed's child processes at a time.
+/// Passing inputs are deleted; a failing one is kept with its log, minimized (CROSSLINK_FUZZ_MINIMIZE
 /// attempts, default 40, 0 for none), and the campaign fails listing what it found. Each passing
 /// input also gets a doorway pass (see # Doorways); CROSSLINK_FUZZ_DOORWAYS=0 turns it off.
 #[test]
 #[ignore]
 fn crosslink_fuzz() {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
     let seeds = std::env::var("CROSSLINK_FUZZ_SEEDS").unwrap_or_else(|_| "0..20".to_string());
     let (a, b) = seeds.split_once("..").expect("CROSSLINK_FUZZ_SEEDS is a..b");
     let (a, b): (u64, u64) = (a.parse().expect("seed range start"), b.parse().expect("seed range end"));
     let secs: u64 = std::env::var("CROSSLINK_FUZZ_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
     let attempts: usize = std::env::var("CROSSLINK_FUZZ_MINIMIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
     let doorways = std::env::var("CROSSLINK_FUZZ_DOORWAYS").map_or(true, |v| v != "0");
+    let jobs: usize = std::env::var("CROSSLINK_FUZZ_JOBS").ok().and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
     let dir = fuzz_dir();
     let start = std::time::Instant::now();
-    let mut findings = Vec::new();
-    let mut ran = 0;
-    let mut swapped_n = 0;
-    for seed in a..b {
-        if start.elapsed().as_secs() >= secs {
-            break;
-        }
+    let findings = std::sync::Mutex::new(Vec::new());
+    let next_seed = AtomicU64::new(a);
+    let ran = AtomicUsize::new(0);
+    let swapped_total = AtomicUsize::new(0);
+
+    // One seed: its run, then its doorway pass if it passed; a finding is minimized here, on this
+    // worker, while the others go on.
+    let run_seed = |seed: u64| {
         let log = dir.join(format!("seed-{seed}.log"));
         let timings = dir.join(format!("seed-{seed}.timings.jsonl"));
         let _ = std::fs::remove_file(&timings);
+        let child_start = std::time::Instant::now();
         let verdict = run_child(
             &[("CROSSLINK_FUZZ_SEED", seed.to_string()), ("CROSSLINK_TEST_TIMINGS", timings.display().to_string())],
             &log,
         );
-        ran += 1;
+        ran.fetch_add(1, Ordering::Relaxed);
         let input = dir.join(format!("seed-{seed}.zeccltf"));
-        eprintln!("fuzz seed {seed}: {verdict:?}");
+        eprintln!("fuzz seed {seed}: {verdict:?} in {:.1?}", child_start.elapsed());
         let (name, input, verdict) = if verdict != Verdict::Pass {
             (format!("seed-{seed}"), input, verdict)
         } else {
@@ -2125,22 +2131,23 @@ fn crosslink_fuzz() {
             let _ = std::fs::remove_file(&log);
             let _ = std::fs::remove_file(&timings);
             let Some((swapped, n)) = swapped else {
-                continue;
+                return;
             };
-            swapped_n += n;
+            swapped_total.fetch_add(n, Ordering::Relaxed);
             let name = format!("seed-{seed}.doorways");
             let swapped_input = dir.join(format!("{name}.zeccltf"));
             std::fs::write(&swapped_input, &swapped).expect("the doorway input writes");
             let log = dir.join(format!("{name}.log"));
+            let child_start = std::time::Instant::now();
             let verdict = run_child(
                 &[("CROSSLINK_FUZZ_FILE", swapped_input.display().to_string()), ("CROSSLINK_TEST_TIMINGS", "off".to_string())],
                 &log,
             );
-            eprintln!("fuzz seed {seed}: {n} instruction(s) through other doorways: {verdict:?}");
+            eprintln!("fuzz seed {seed}: {n} instruction(s) through other doorways: {verdict:?} in {:.1?}", child_start.elapsed());
             if verdict == Verdict::Pass {
                 let _ = std::fs::remove_file(&swapped_input);
                 let _ = std::fs::remove_file(&log);
-                continue;
+                return;
             }
             (name, swapped_input, verdict)
         };
@@ -2152,10 +2159,33 @@ fn crosslink_fuzz() {
             std::fs::write(dir.join(format!("{name}.min.zeccltf")), &min).expect("minimized input writes");
             eprintln!("fuzz {name}: minimized {} -> {} bytes", bytes.len(), min.len());
         }
-        findings.push((name, verdict));
-    }
-    eprintln!("fuzz: {swapped_n} instruction(s) sent through other doorways");
-    eprintln!("fuzz: {ran} inputs, {} findings, in {:?}; files in {}", findings.len(), start.elapsed(), dir.display());
+        findings.lock().unwrap().push((name, verdict));
+    };
+
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| loop {
+                if start.elapsed().as_secs() >= secs {
+                    break;
+                }
+                let seed = next_seed.fetch_add(1, Ordering::Relaxed);
+                if seed >= b {
+                    break;
+                }
+                run_seed(seed);
+            });
+        }
+    });
+
+    let findings = findings.into_inner().unwrap();
+    eprintln!("fuzz: {} instruction(s) sent through other doorways", swapped_total.into_inner());
+    eprintln!(
+        "fuzz: {} inputs on {jobs} worker(s), {} findings, in {:?}; files in {}",
+        ran.into_inner(),
+        findings.len(),
+        start.elapsed(),
+        dir.display()
+    );
     assert!(findings.is_empty(), "fuzz findings: {findings:?}");
 }
 
