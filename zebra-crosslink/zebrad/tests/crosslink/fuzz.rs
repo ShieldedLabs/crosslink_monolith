@@ -838,6 +838,39 @@ fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
     if c.unusual(64) {
         g.tf.push_instr_expect_staking_replay_matches(0);
     }
+    if g.tip_known && c.unusual(48) {
+        let blocks: Vec<Arc<Block>> = g.main.iter().map(|gen| gen.tip.clone()).collect();
+        push_staking_totals(&mut g.tf, &g.network, g.params.staking.slash_analysis_window(), &blocks);
+    }
+}
+
+/// Expects every finalizer bank and the staking pool totals at the tip of `blocks`, the best
+/// chain from height 1 on, as replaying its staking from genesis gives them: bonded holds every
+/// active bond, unbonded every unbonding one, and finalizer rewards every bank. A generated input
+/// schedules no slashfork, so nothing is burned.
+fn push_staking_totals(tf: &mut TF, network: &Network, slash_analysis_window: u32, blocks: &[Arc<Block>]) {
+    let mut replay = zebra_state::StakingReplay::new(&Default::default(), slash_analysis_window);
+    for (i, block) in blocks.iter().enumerate() {
+        let block_at = |at: zebra_chain::block::Height| blocks[at.0 as usize - 1].clone();
+        // Every block pays issuance, as on the node (see staking_replay_matches).
+        replay
+            .apply_block(network, zebra_chain::block::Height(i as u32 + 1), block, true, block_at)
+            .expect("the generated chain replays");
+    }
+    let (mut bonded, mut unbonded) = (0, 0);
+    for (bond, status) in replay.delegation_bonds.values() {
+        match status {
+            zebra_state::BondStatusInChain::Active => bonded += u64::from(bond.amount),
+            zebra_state::BondStatusInChain::Unbonding { .. } => unbonded += u64::from(bond.amount),
+            _ => {}
+        }
+    }
+    let banks: std::collections::BTreeMap<[u8; 32], u64> =
+        replay.finalizer_rewards.iter().filter(|&(_, &bank)| bank != 0).map(|(&finalizer, &bank)| (finalizer, bank)).collect();
+    for (&finalizer, &bank) in &banks {
+        tf.push_instr_expect_finalizer_bank(finalizer, bank, 0);
+    }
+    tf.push_instr_expect_pool_totals(bonded, unbonded, banks.values().sum(), 0);
 }
 
 /// The deepest a replayed transaction's first copy sits below the tip while it stays in the
@@ -1172,6 +1205,12 @@ fn generate_bft(c: &mut Choices) -> Vec<u8> {
 // with duplicates and wrong-namespace votes among them, and the clock moving between them. Between
 // heights, coinbases are spent through every doorway, some twice, and mined, and bonds are made
 // to the roster's members, so decisions meet a busy mempool and a roster whose stake moves.
+// Finalizers on no roster send mangled tenderlink packets among them.
+//
+// Each round checks who proposes, and each decision that needed the node's stake checks that the
+// node prevoted and precommitted it. PoW blocks cite the decisions, mostly the newest, and each
+// citation that moves `fin` checks it and the finality of blocks on both sides of it, side
+// branches it excludes among them. The staking pools are checked against a replay of the chain.
 //
 // The writer must know every decided block, to propose the next height on it, and every
 // proposer. The proposer is a pure function of the roster, height and round, and the roster for
@@ -1209,6 +1248,36 @@ struct EngineFuzz {
     /// Coins spent by `pending`, which the generator's own coin tracking does not see until mined.
     held: Vec<zebra_chain::transparent::OutPoint>,
     bonds_made: u32,
+    /// The decision `main`'s tip cites, null until a block cites one, and its snapshot. Once a
+    /// block cites a decision, every block above it cites that one or a later one (the
+    /// Extension rule). `gen_cites[i]` is what `gens[i]`'s tip cites.
+    cite: FatPointerToBftBlock,
+    cite_snapshot: u32,
+    gen_cites: Vec<FatPointerToBftBlock>,
+    /// Whether any height has been decided, so `parent` is a decision a block may cite.
+    decided_any: bool,
+    /// The height of `fin` the node must hold: the snapshot of the newest decision a best tip
+    /// has cited.
+    fin: Option<u32>,
+    /// Side-branch blocks, with the height of the block each branch forks from.
+    side_blocks: Vec<(u32, zebra_chain::block::Hash)>,
+    /// The next synthetic finalizer index that is on no roster, for packets that may get the
+    /// sender disconnected.
+    next_stranger: u64,
+}
+
+/// Synthetic finalizers from here on hold no stake, so the node may disconnect them without the
+/// roster losing a vote.
+const STRANGERS_FROM: u64 = 1000;
+
+/// The next block on `gen`, citing `cite` unless it is null.
+fn cited_block(gen: &mut BlockGen, miner: &Address, txs: &[Arc<Transaction>], cite: &FatPointerToBftBlock) -> Arc<Block> {
+    let block = gen.next_block_with_txs(miner, txs);
+    if *cite == FatPointerToBftBlock::null() {
+        block
+    } else {
+        point_tip_at_bft(gen, cite)
+    }
 }
 
 impl EngineFuzz {
@@ -1255,6 +1324,76 @@ impl EngineFuzz {
             .expect("the proposer is on the roster")
     }
 
+    /// Whether the synthetic finalizers' stake on the roster of the engine's height falls short
+    /// of a quorum under both quorum rules (FeaturenetUpgrade2 picks the strict one), so the
+    /// height is decided only with the node's votes. Bonds and rewards can carry them past it.
+    fn node_needed_for_quorum(&mut self) -> bool {
+        let mut members = self.stakes_at(self.snapshot);
+        members.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        members.truncate(self.scene.active_roster_max_n);
+        let total: u64 = members.iter().map(|&(_, stake)| stake).sum();
+        let node = self.scene.member_pub_keys[0].0;
+        let synthetic: u64 = members.iter().filter(|&&(key, _)| key != node).map(|&(_, stake)| stake).sum();
+        synthetic < decision_threshold(total, false).min(decision_threshold(total, true))
+    }
+
+    /// A tenderlink packet from a synthetic finalizer on no roster, mostly a real kind of packet
+    /// mangled: a status, a vote or a proposal chunk signed under no namespace, a second
+    /// ID_HELLO, or bytes at random. Whether the node keeps the sender is its call; it must stay
+    /// up and go on deciding, which the next decision checks.
+    fn garbage_packet(&mut self, c: &mut Choices) {
+        let k = self.next_stranger;
+        self.next_stranger += 1;
+        let key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k).as_bytes()).0;
+        // Payload bytes come from their own stream, so a long packet does not use up `c`.
+        let noise_seed = (c.below(1 << 16) as u64) << 16 | c.below(1 << 16) as u64;
+        let mut noise = Choices::from_seed(noise_seed, 4096);
+        let roster_n = self.scene.member_pub_keys.len();
+        let mut packet = match c.below(5) {
+            0 => status_packet_needing_everything(self.height, self.round, roster_n),
+            1 => {
+                let value_id = if c.below(2) == 0 { ValueId::NIL } else { ValueId(std::array::from_fn(|_| noise.byte())) };
+                vote_packet(&key, c.below(roster_n) as u16, c.below(2) == 0, self.height, self.round, value_id, &[0; 32])
+            }
+            2 => {
+                let value: Vec<u8> = (0..1 + c.below(3000)).map(|_| noise.byte()).collect();
+                let value_id = ValueId(bft_value_id(&value));
+                let mut chunks = proposal_chunk_packets(&key, &value, value_id, self.height, self.round, -1, &[0; 32], roster_n);
+                chunks.swap_remove(c.below(chunks.len()))
+            }
+            3 => id_hello_packet(&key, &[0x5f; 64]),
+            _ => (0..c.below(1500)).map(|_| noise.byte()).collect(),
+        };
+        match c.below(5) {
+            0 => {}
+            1 => packet.truncate(c.below(packet.len().max(1))),
+            2 => {
+                for _ in 0..1 + c.below(4) {
+                    if !packet.is_empty() {
+                        let i = c.below(packet.len());
+                        packet[i] ^= 1 << c.below(8);
+                    }
+                }
+            }
+            3 => {
+                if let Some(tag) = packet.first_mut() {
+                    *tag = c.below(256) as u8;
+                }
+            }
+            _ => packet.extend((0..1 + c.below(64)).map(|_| noise.byte())),
+        }
+        self.tf.push_instr_bft_recv_packet(k, &packet, ANY_OUTCOME);
+        self.tf.push_instr_expect_node_alive(0);
+    }
+
+    /// Every finalizer bank and the staking pool totals at `main`'s tip, as replaying its staking
+    /// from genesis gives them. The node keeps the pools apart from the bonds, so this checks
+    /// that accounting, which EXPECT_STAKING_REPLAY_MATCHES does not.
+    fn expect_staking_totals(&mut self) {
+        let blocks: Vec<Arc<Block>> = self.main[1..].iter().map(|block| block.clone().expect("only genesis is missing")).collect();
+        push_staking_totals(&mut self.tf, &self.scene.gen.network, BFT_ROUNDS_PARAMETERS.staking.slash_analysis_window(), &blocks);
+    }
+
     fn tip_height(&self) -> u32 {
         self.scene.gen.tip.coinbase_height().expect("generated blocks have a height").0
     }
@@ -1263,9 +1402,18 @@ impl EngineFuzz {
         self.extend_with(c, &[]);
     }
 
+    /// The next block of `main`, which mostly cites the newest decision once there is one, and
+    /// otherwise repeats its parent's citation, as a miner whose template lags would. A tip citing
+    /// a decision moves `fin` to that decision's snapshot, which every decision here buries
+    /// `sigma` deep, so the clamp to `prune_sigma` never binds.
     fn extend_with(&mut self, c: &mut Choices, txs: &[Arc<Transaction>]) {
         self.gens.push(self.scene.gen.clone());
-        let block = self.scene.gen.next_block_with_txs(&self.scene.miner.clone(), txs);
+        self.gen_cites.push(self.cite.clone());
+        if self.decided_any && self.cite != self.parent && c.below(4) != 0 {
+            self.cite = self.parent.clone();
+            self.cite_snapshot = self.snapshot;
+        }
+        let block = cited_block(&mut self.scene.gen, &self.scene.miner.clone(), txs, &self.cite);
         self.main.push(Some(block.clone()));
         if c.unusual(64) {
             self.tf.push_instr_recv_pow(&block, self.next_fresh_peer, 0);
@@ -1275,24 +1423,64 @@ impl EngineFuzz {
         }
         self.scene.pow.push(block);
         self.tf.push_instr_expect_pow_tip(&self.scene.gen.tip.hash(), 0);
+        if self.cite != FatPointerToBftBlock::null() && self.fin.map_or(true, |fin| fin < self.cite_snapshot) {
+            self.fin = Some(self.cite_snapshot);
+            self.expect_finality(c);
+        }
+    }
+
+    fn main_hash(&self, height: u32) -> zebra_chain::block::Hash {
+        self.main[height as usize].as_ref().expect("only genesis is missing").hash()
+    }
+
+    /// `fin` where the writer put it, and the finality the node reports for a few blocks: on
+    /// `main` at and above `fin`, and on a side branch that forks below it, which `fin` excludes.
+    fn expect_finality(&mut self, c: &mut Choices) {
+        let Some(fin) = self.fin else { return };
+        let fin_hash = self.main_hash(fin);
+        self.tf.push_instr_expect_finalized_tip(Some(&fin_hash), 0);
+        self.tf.push_instr_expect_pow_block_finality(&fin_hash, Some(TFLBlockFinality::Finalized), 0);
+        let below = 1 + c.below(fin as usize) as u32;
+        self.tf.push_instr_expect_pow_block_finality(&self.main_hash(below), Some(TFLBlockFinality::Finalized), 0);
+        let above = fin + 1 + c.below((self.tip_height() - fin) as usize) as u32;
+        self.tf.push_instr_expect_pow_block_finality(&self.main_hash(above), Some(TFLBlockFinality::NotYetFinalized), 0);
+        let excluded: Vec<zebra_chain::block::Hash> =
+            self.side_blocks.iter().filter(|&&(fork, _)| fork < fin).map(|&(_, hash)| hash).collect();
+        if !excluded.is_empty() {
+            let hash = excluded[c.below(excluded.len())];
+            self.tf.push_instr_expect_pow_block_finality(&hash, Some(TFLBlockFinality::CantBeFinalized), 0);
+        }
     }
 
     /// A branch from two or more below the tip, shorter than the best chain, so the tip stays.
+    /// Its blocks cite what the block they fork from cites. One forking below `fin` conflicts
+    /// with it: whether the node takes such a block or refuses it, its tip and `fin` stay.
     fn side_branch(&mut self, c: &mut Choices) {
         let n = self.gens.len();
         if n < 3 {
             return self.extend(c);
         }
-        let from = n - 2 - c.below((n - 2).min(4));
+        // Mostly close below the tip; sometimes from anywhere, so a branch can fork below `fin`.
+        let from = if self.fin.is_some() && c.below(2) == 0 { c.below(n - 2) } else { n - 2 - c.below((n - 2).min(4)) };
         let mut side = self.gens[from].clone();
+        let side_cite = self.gen_cites[from].clone();
+        let fork = side.tip.coinbase_height().expect("generated blocks have a height").0;
+        let flags = if self.fin.is_some_and(|fin| fork < fin) { ANY_OUTCOME } else { 0 };
         self.sides = self.sides.wrapping_add(1);
         let miner = Address::Transparent(zcash_transparent::address::TransparentAddress::PublicKeyHash([self.sides | 0x80; 20]));
         // Shorter than main: `from + 1` holds main's block at the same height as side's first.
-        for _ in 0..1 + c.below(n - from - 1) {
-            let block = side.next_block(&miner);
-            self.tf.push_instr_load_pow(&block, 0);
+        for _ in 0..1 + c.below((n - from - 1).min(6)) {
+            let block = cited_block(&mut side, &miner, &[], &side_cite);
+            self.tf.push_instr_load_pow(&block, flags);
+            self.side_blocks.push((fork, block.hash()));
+        }
+        if flags != 0 {
+            self.tf.push_instr_expect_node_alive(0);
         }
         self.tf.push_instr_expect_pow_tip(&self.scene.gen.tip.hash(), 0);
+        if flags != 0 {
+            self.expect_finality(c);
+        }
     }
 
     /// The oldest mature coinbase no pending transaction spends.
@@ -1364,6 +1552,9 @@ impl EngineFuzz {
         for tx in &txs {
             self.tf.push_instr_expect_mempool_absent(tx, 0);
         }
+        if c.below(2) == 0 {
+            self.expect_staking_totals();
+        }
     }
 
     /// A bond of 10^8 zats to a member of the roster, so the roster's stake moves and the
@@ -1388,7 +1579,7 @@ impl EngineFuzz {
             self.held.push(coin.0);
             self.pending.push(tx);
         } else {
-            let refused = self.scene.gen.clone().next_block_with_txs(&self.scene.miner.clone(), &[tx]);
+            let refused = cited_block(&mut self.scene.gen.clone(), &self.scene.miner.clone(), &[tx], &self.cite);
             self.tf.push_instr_load_pow(&refused, SHOULD_FAIL);
             self.tf.push_instr_expect_rejection_reason("staking window", 0);
         }
@@ -1437,9 +1628,12 @@ impl EngineFuzz {
             self.extend(c);
         }
         while self.proposer() == TF_BFT_THE_NODE {
+            self.tf.push_instr_expect_bft_proposer(TF_BFT_THE_NODE, self.height, self.round, 0);
             self.nil_round();
         }
         let proposer = u16::try_from(self.proposer()).expect("a synthetic finalizer proposes");
+        self.tf.push_instr_expect_bft_proposer(proposer.into(), self.height, self.round, 0);
+        let node_needed = self.node_needed_for_quorum();
         // Half the time as recent as allowed, so the next roster takes in the latest bonds and
         // rewards; a snapshot drawn evenly from the whole range mostly falls before any of them.
         let top = self.tip_height() - sigma;
@@ -1490,11 +1684,18 @@ impl EngineFuzz {
             self.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
         }
         self.round_ticks = 4;
+        // Without the node's stake there is no quorum, so the decision shows it prevoted and
+        // precommitted the proposal.
+        if node_needed {
+            self.tf.push_instr_expect_bft_sent(0, self.height, self.round, Some(&id), 0);
+            self.tf.push_instr_expect_bft_sent(1, self.height, self.round, Some(&id), 0);
+        }
 
         let seeds: Vec<String> = self.scene.finalizers.iter().map(|&k| synthetic_finalizer_seed(k.into())).collect();
         let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
         self.parent = signed_fat_pointer(&block, self.height, self.round, &seeds, &[0; 32]);
         self.snapshot = snapshot;
+        self.decided_any = true;
         self.height += 1;
         self.round = 0;
         self.tf.push_instr_expect_bft_step(self.height, 0, None, 0);
@@ -1525,11 +1726,13 @@ fn generate_engine(c: &mut Choices) -> Vec<u8> {
         tf, scene, gens: Vec::new(), height: 1, round: 0, parent, snapshot: roster_height, next_fresh_peer: FRESH_PEERS_FROM, sides: 0,
         main, replay, replayed_to: 0, round_ticks: 0,
         key: TestKey::new(b"crosslink test miner"), pending: Vec::new(), held: Vec::new(), bonds_made: 0,
+        cite: FatPointerToBftBlock::null(), cite_snapshot: 0, gen_cites: Vec::new(), decided_any: false, fin: None,
+        side_blocks: Vec::new(), next_stranger: STRANGERS_FROM,
     };
     // BFT starts at the activation height the scene loaded up to.
     f.tick();
     for _ in 0..2 + c.below(10) {
-        match c.below(12) {
+        match c.below(13) {
             0..=2 => {
                 for _ in 0..1 + c.below(3) {
                     f.extend(c);
@@ -1540,11 +1743,13 @@ fn generate_engine(c: &mut Choices) -> Vec<u8> {
             5 => f.double_spend(c),
             6 => f.mine_pending(c),
             7 => f.bond(c),
+            8 => f.garbage_packet(c),
             _ => f.decide(c),
         }
     }
     f.tf.push_instr_expect_node_alive(0);
     f.tf.push_instr_expect_staking_replay_matches(0);
+    f.expect_staking_totals();
     f.tf.write_to_bytes()
 }
 

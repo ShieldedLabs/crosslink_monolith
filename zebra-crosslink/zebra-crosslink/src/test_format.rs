@@ -7,6 +7,8 @@ use zerocopy_derive::*;
 
 use zcash_primitives::bft::*;
 pub use tenderlink::TMStep;
+/// For writers of BFT_RECV_PACKET payloads and of expectations that turn on the quorum.
+pub use tenderlink::{decision_threshold, id_hello_packet, proposal_chunk_packets, status_packet_needing_everything, vote_packet, ValueId};
 
 pub struct BftBlockAndFatPointerToItWrap(pub BftBlockAndFatPointerToIt);
 impl ZcashDeserialize for BftBlockAndFatPointerToItWrap {
