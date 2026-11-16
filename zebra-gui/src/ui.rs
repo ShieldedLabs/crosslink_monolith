@@ -1329,18 +1329,25 @@ fn chunkify(bytes: &[u8; 32]) -> [u64; 4] {
 /// containers is laid out one line tall and overlaps what follows.
 const MEMO_LAYOUT_LINE_CHARS: usize = 44;
 
-/// Tokens longer than this get a space inserted every this many characters before word wrapping.
+/// Words longer than this (addresses, hashes) are drawn on their own, broken between characters.
 const MEMO_LONG_TOKEN_CHARS: usize = 32;
 
-/// `text` with a space inserted every `max` characters inside any word longer than `max`, so word wrapping can break it.
-fn break_long_tokens(text: &str, max: usize) -> String {
-    text.split(' ')
-        .map(|word| {
-            let chars: Vec<char> = word.chars().collect();
-            chars.chunks(max.max(1)).map(|piece| piece.iter().collect::<String>()).collect::<Vec<_>>().join(" ")
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+/// `text` split into runs to draw one after another: ordinary words, joined by their spaces and word-wrapped, and
+/// each word longer than `max` on its own, wrapped between characters. Nothing is added to the text, so an address
+/// in a memo is shown exactly as sent.
+fn memo_text_runs(text: &str, max: usize) -> Vec<(String, Wrap)> {
+    let mut runs = Vec::new();
+    let mut words: Vec<&str> = Vec::new();
+    for word in text.split(' ') {
+        if word.chars().count() > max {
+            if !words.is_empty() { runs.push((words.join(" "), Wrap::Words)); words.clear(); }
+            runs.push((word.to_owned(), Wrap::Chars));
+        } else {
+            words.push(word);
+        }
+    }
+    if !words.is_empty() { runs.push((words.join(" "), Wrap::Words)); }
+    runs
 }
 
 /// `text` broken at spaces into lines of at most `max` characters; a word longer than that (an address, a hash) is
@@ -3238,9 +3245,13 @@ pub fn ui_left_pane(ui: &mut Context,
                     scroll_container_begin(ui, data, padding, 0.0, id, clip, scroll, content_h, viewport_h, max);
                     if let Some(view) = data.memo_layout_view.clone() {
                         if let _ = elem().decl(Decl { direction: TopToBottom, child_gap, width: grow!(), height: fit!(), ..Decl }) {
-                            // The GUI's own word wrap fills the panel's real width; only tokens longer than any line could be
-                            // (addresses, hashes) get break points, so they cannot widen the panel.
-                            ui.text(frame_strf!(data, "{}", break_long_tokens(&view.text, MEMO_LONG_TOKEN_CHARS)), TextDecl { h: ui.scale(16.0), colour: WHITE, wrap: Wrap::Words, align: AlignX::Left, ..TextDecl });
+                            // Word wrap fills the panel's real width; a long token (an address, a hash) gets its own run that
+                            // breaks between characters, so it cannot widen the panel and is shown without added spaces.
+                            if let _ = elem().decl(Decl { direction: TopToBottom, width: grow!(), height: fit!(), ..Decl }) {
+                                for (run, wrap) in memo_text_runs(&view.text, MEMO_LONG_TOKEN_CHARS) {
+                                    ui.text(frame_strf!(data, "{}", run), TextDecl { h: ui.scale(16.0), colour: WHITE, wrap, align: AlignX::Left, ..TextDecl });
+                                }
+                            }
                             if modal_action_button(ui, padding, child_gap, "Copy", true, true) {
                                 ui.input().send_to_clipboard(&view.text);
                             }
