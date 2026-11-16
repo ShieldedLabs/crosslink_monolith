@@ -231,7 +231,7 @@ pub(crate) async fn run_import(handle: TFLServiceHandle, import: ChainImport) {
         Some(height) => &tf.instrs[..instrs_through_height(&bytes, &tf.instrs, height)],
         None => &tf.instrs[..],
     };
-    let options = ReadOptions { trusted_before: if import.trusted { instrs.len() } else { 0 } };
+    let options = ReadOptions { trusted_before: if import.trusted { instrs.len() } else { 0 }, race: false };
     info!(
         "chain import: loading {} instructions from {}{}{}",
         instrs.len(),

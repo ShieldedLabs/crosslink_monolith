@@ -3910,7 +3910,7 @@ fn chain_prefix_of_scene_2_loads(cutoff: zebra_state::BftCutoff, trusted: bool) 
     tf.push_instr_expect_pow_block_finality(&p5, Some(TFLBlockFinality::NotYetFinalized), 0);
 
     let trusted_before = if trusted { tf.instrs.len() } else { 0 };
-    *zebra_crosslink::TEST_READ_OPTIONS.lock().unwrap() = zebra_crosslink::test_format::ReadOptions { trusted_before };
+    *zebra_crosslink::TEST_READ_OPTIONS.lock().unwrap() = zebra_crosslink::test_format::ReadOptions { trusted_before, race: false };
     test_bytes(tf.write_to_bytes());
 }
 

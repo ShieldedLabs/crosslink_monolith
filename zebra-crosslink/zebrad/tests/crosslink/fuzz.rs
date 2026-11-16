@@ -2083,6 +2083,9 @@ fn read_coverage(path: &std::path::Path) -> Vec<u32> {
 #[allow(unsafe_code)]
 fn crosslink_fuzz_one() {
     set_test_name(function_name!());
+    if std::env::var("CROSSLINK_FUZZ_RACE").is_ok_and(|v| v == "1") {
+        zebra_crosslink::TEST_READ_OPTIONS.lock().unwrap().race = true;
+    }
     if std::env::var("CROSSLINK_FUZZ_COVERAGE").is_ok() {
         extern "C" {
             fn atexit(callback: extern "C" fn()) -> i32;
@@ -2389,7 +2392,9 @@ const GUIDED_SEED_SALT: u64 = 0x6775_6964_6564_0000;
 /// CROSSLINK_FUZZ_JOBS workers (default 1), each running one input's child processes at a time.
 /// Passing inputs are deleted; a failing one is kept with its log, minimized (CROSSLINK_FUZZ_MINIMIZE
 /// attempts, default 40, 0 for none), and the campaign fails listing what it found. Each passing
-/// input also gets a doorway pass (see # Doorways); CROSSLINK_FUZZ_DOORWAYS=0 turns it off.
+/// input also gets a doorway pass (see # Doorways); CROSSLINK_FUZZ_DOORWAYS=0 turns it off. And a race
+/// pass: the input again in race mode (`ReadOptions::race`), whose expectations must hold however
+/// its runs of deliveries interleave; CROSSLINK_FUZZ_RACES=0 turns it off.
 ///
 /// With CROSSLINK_FUZZ_GUIDED=1 the campaign is coverage-guided: each number in the range is an
 /// iteration that runs either a fresh input or a mutation (`mutate_choices`) of the choice bytes
@@ -2419,6 +2424,7 @@ fn crosslink_fuzz() {
     let secs: u64 = std::env::var("CROSSLINK_FUZZ_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
     let attempts: usize = std::env::var("CROSSLINK_FUZZ_MINIMIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
     let doorways = std::env::var("CROSSLINK_FUZZ_DOORWAYS").map_or(true, |v| v != "0");
+    let races = std::env::var("CROSSLINK_FUZZ_RACES").map_or(true, |v| v != "0");
     let jobs: usize = std::env::var("CROSSLINK_FUZZ_JOBS").ok().and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
     let guided = std::env::var("CROSSLINK_FUZZ_GUIDED").is_ok_and(|v| v == "1");
     let dir = fuzz_dir();
@@ -2441,8 +2447,33 @@ fn crosslink_fuzz() {
         let verdict = run_child(&envs, &log);
         ran.fetch_add(1, Ordering::Relaxed);
         eprintln!("fuzz {name}: {verdict:?} in {:.1?}", child_start.elapsed());
-        let passed = verdict == Verdict::Pass;
-        let (finding, input, verdict) = if !passed {
+        let mut passed = verdict == Verdict::Pass;
+        let mut raced = None;
+        if passed && races {
+            let race_input = dir.join(format!("{name}.race.zeccltf"));
+            let _ = std::fs::copy(&input, &race_input);
+            let log = dir.join(format!("{name}.race.log"));
+            let child_start = std::time::Instant::now();
+            let verdict = run_child(
+                &[
+                    ("CROSSLINK_FUZZ_FILE", race_input.display().to_string()),
+                    ("CROSSLINK_FUZZ_RACE", "1".to_string()),
+                    ("CROSSLINK_TEST_TIMINGS", "off".to_string()),
+                ],
+                &log,
+            );
+            eprintln!("fuzz {name}: raced: {verdict:?} in {:.1?}", child_start.elapsed());
+            if verdict == Verdict::Pass {
+                let _ = std::fs::remove_file(&race_input);
+                let _ = std::fs::remove_file(&log);
+            } else {
+                raced = Some((format!("{name}.race"), race_input, verdict));
+            }
+        }
+        let (finding, input, verdict) = if let Some(raced) = raced {
+            passed = false;
+            raced
+        } else if !passed {
             (name.to_string(), input, verdict)
         } else {
             let swapped = if doorways {
@@ -2477,7 +2508,8 @@ fn crosslink_fuzz() {
         };
         let _ = std::fs::remove_file(&timings);
         let bytes = std::fs::read(&input).expect("the failing input was written");
-        if attempts > 0 {
+        // Minimizing runs settle, which a race finding needs not to.
+        if attempts > 0 && !finding.ends_with(".race") {
             let same = |got: &Verdict, _: &std::path::Path| *got == verdict;
             let min = minimize(bytes.clone(), &same, &finding, attempts);
             std::fs::write(dir.join(format!("{finding}.min.zeccltf")), &min).expect("minimized input writes");
@@ -3226,4 +3258,28 @@ fn fast_coinbase_is_the_builders() {
     }
     // Every case above is a transparent miner on a network with no funding streams.
     assert_eq!(compared, networks.len() * 17 * miners.len() * 2, "every case was built directly");
+}
+
+/// A fork's block whose parent has not arrived is held, and committed once the parent comes over
+/// STP: the fork, now longer, becomes the best chain. The parent's verdict comes as it commits,
+/// before the child does in the same pass, so the tip is checked only once the sync loop has
+/// finished that pass (`sync_settle`); fuzz seed 37 in race mode read it in between.
+#[test]
+fn crosslink_fuzz_directed_a_forks_block_waits_for_its_parent_over_stp() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let network = regtest_network(&HARNESS_PARAMETERS);
+    let miner = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    let mut fork = gen.clone();
+    let main_2 = gen.next_block(&miner);
+    tf.push_instr_load_pow(&main_2, 0);
+    let other = Address::Transparent(zcash_transparent::address::TransparentAddress::PublicKeyHash([0x81; 20]));
+    let fork_2 = fork.next_block(&other);
+    let fork_3 = fork.next_block(&other);
+    tf.push_instr_load_pow(&fork_3, SHOULD_DEFER);
+    tf.push_instr_recv_pow(&fork_2, 2, 0);
+    tf.push_instr_expect_pow_tip(&fork_3.hash(), 0);
+    test_bytes(tf.write_to_bytes());
 }

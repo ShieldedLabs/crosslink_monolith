@@ -597,11 +597,17 @@ pub struct ReadOptions {
     /// signatures and scripts are not checked. 0 trusts none. Set only for a chain prefix the
     /// operator has marked trusted (see `chain_prefix`).
     pub trusted_before: usize,
+    /// Race mode: a run of PoW and transaction deliveries (LOAD_POW and SUBMIT_TX, through any
+    /// doorway) is sent all at once, without waiting for each verdict, which is not checked; every
+    /// other instruction first waits for the run to finish, then runs as usual. The deliveries race
+    /// each other and the node's pipelines, and the expectations after them check where it settled.
+    /// EXPECT_REJECTION_REASON, which reads the instruction before it, is skipped.
+    pub race: bool,
 }
 
 impl ReadOptions {
     /// Every check runs.
-    pub const UNTRUSTED: ReadOptions = ReadOptions { trusted_before: 0 };
+    pub const UNTRUSTED: ReadOptions = ReadOptions { trusted_before: 0, race: false };
 }
 
 /// The file magic this build writes. Version 1 always writes the staking calendar in SET_PARAMS
@@ -1557,6 +1563,23 @@ pub(crate) async fn handle_instr(
     );
     if is_bft {
         bft_await_start(internal_handle).await;
+    }
+    // A delivery's verdict can come before the sync loop has done what it leads to, such as
+    // committing a block that was waiting for the one delivered, so what reads the chain waits
+    // for a tick that began after it.
+    let reads_chain = matches!(
+        instr,
+        TestInstr::ExpectPoWTip { .. }
+            | TestInstr::ExpectPoWChainLength(_)
+            | TestInstr::ExpectFinalizedTip { .. }
+            | TestInstr::ExpectPoWBlockFinality(..)
+            | TestInstr::ExpectBond(..)
+            | TestInstr::ExpectFinalizerBank(..)
+            | TestInstr::ExpectPoolTotals(_)
+            | TestInstr::ExpectStakingReplayMatches
+    );
+    if reads_chain {
+        sync_settle().await;
     }
     match instr {
         TestInstr::LoadPoW(block) => {
@@ -2525,6 +2548,20 @@ async fn bft_settle() -> Result<(), String> {
     settled
 }
 
+/// Returns once a sync loop tick that began after the call has finished, waking the loop so it does
+/// not wait out its idle time. Bounded for a loop that has stopped, which the check after reports.
+async fn sync_settle() {
+    use std::sync::atomic::Ordering;
+    let start = zebra_state::new_network::SYNC_TICKS_DONE.load(Ordering::Acquire);
+    let _ = tokio::time::timeout(NODE_ANSWER_WAIT, async {
+        while zebra_state::new_network::SYNC_TICKS_DONE.load(Ordering::Acquire) < start + 2 {
+            zebra_state::new_network::wake_sync_loop_now();
+            tokio::time::sleep(Duration::from_micros(200)).await;
+        }
+    })
+    .await;
+}
+
 /// Records what the node has sent the synthetic finalizers since the last call.
 fn record_bft_sent() {
     let mut sent = TEST_BFT_SENT.lock().unwrap();
@@ -2933,6 +2970,11 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
     // A failed deserialize is a hard error for a normal test but an expected input rejection
     // for the fuzzer; `uhh_option` decides which via TEST_ON_FAIL (PANIC vs recover).
     let on_fail = *TEST_ON_FAIL.lock().unwrap();
+    // Race mode's run of deliveries in flight, and the STP peers they hold: a peer serves one
+    // delivery at a time, so one asked for again ends the run first.
+    let mut racing: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>> = Vec::new();
+    let mut racing_peers: Vec<u64> = Vec::new();
+    let handle = &internal_handle;
     for instr_i in 0..instrs.len() {
         // info!(
         //     "Loading instruction {}: {} ({})",
@@ -2950,6 +2992,33 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
                     TFInstr::str_from_kind(instrs[instr_i].kind),
                     instrs[instr_i].kind
                 );
+            }
+        }
+        if options.race {
+            if let Some(instr) = parsed.clone() {
+                let is_delivery = matches!(
+                    instr,
+                    TestInstr::LoadPoW(_) | TestInstr::RecvPoW { .. } | TestInstr::SubmitTx(_) | TestInstr::RecvTx { .. } | TestInstr::RecvTxStp { .. }
+                );
+                let peer = match &instr {
+                    TestInstr::RecvPoW { peer, .. } | TestInstr::RecvTxStp { peer, .. } => Some(*peer),
+                    _ => None,
+                };
+                if !is_delivery || peer.is_some_and(|peer| racing_peers.contains(&peer)) {
+                    futures::future::join_all(racing.drain(..)).await;
+                    racing_peers.clear();
+                }
+                if is_delivery {
+                    racing_peers.extend(peer);
+                    let trusted = instr_i < options.trusted_before;
+                    racing.push(Box::pin(handle_instr(handle, bytes, instr, ANY_OUTCOME, instr_i, trusted)));
+                    *TEST_INSTR_C.lock().unwrap() = instr_i + 1;
+                    continue;
+                }
+                if matches!(instr, TestInstr::ExpectRejectionReason(_)) {
+                    *TEST_INSTR_C.lock().unwrap() = instr_i + 1;
+                    continue;
+                }
             }
         }
         if let Some(instr) = uhh_option(parsed, on_fail) {
@@ -2999,6 +3068,7 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
 
         *TEST_INSTR_C.lock().unwrap() = instr_i + 1; // accounts for end
     }
+    futures::future::join_all(racing.drain(..)).await;
 }
 
 pub(crate) async fn instr_reader(internal_handle: TFLServiceHandle) {

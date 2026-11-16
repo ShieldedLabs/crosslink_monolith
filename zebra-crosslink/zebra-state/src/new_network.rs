@@ -2006,6 +2006,16 @@ pub static PEER_ATTESTED_BLOCKS: std::sync::Mutex<Vec<ShadowBlock>> = std::sync:
 /// zebra-network syncer is not spawned, so these are the only block-carrying peers.
 pub static POW_PEER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Sync loop ticks finished: each has committed whatever in its queue could be, sent its requests
+/// and handled the packets that reached it. Something waiting to see what the loop makes of work
+/// already queued waits for this to move twice, since the tick in progress may be past its commits.
+pub static SYNC_TICKS_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Starts the sync loop's next tick at once, as a local block submission does.
+pub fn wake_sync_loop_now() {
+    bft::wake_sync_thread_now();
+}
+
 /// Submit a block to new_network and wait for its verdict.
 ///
 /// Applies backpressure rather than dropping: nothing re-submits a miner's solved block, so a
@@ -4592,6 +4602,7 @@ pub fn sync(
         // Work that arrives in it, such as a submitted block, starts the next tick early.
         // A download pass falling due inside the idle wait ends it then, so a STATUS that brought
         // the pass forward is acted on when the pass is due, not at the next full tick.
+        SYNC_TICKS_DONE.fetch_add(1, std::sync::atomic::Ordering::Release);
         if !zebra_chain::shutdown::is_shutting_down() {
             let idle_until = (loop_start + tick_duration).min(next_dl_init.max(loop_start + woken_tick_min));
             bft_runner.wait(loop_start + woken_tick_min, idle_until, &read_state, &mut block_writer);
