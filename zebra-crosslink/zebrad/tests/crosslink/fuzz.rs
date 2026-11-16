@@ -444,6 +444,108 @@ fn mine(g: &mut FuzzGen, c: &mut Choices, txs: &[Arc<Transaction>]) -> bool {
     known && g.tip_known
 }
 
+/// An STP packet a broken or malicious peer might send: mostly one of a real kind (a status with
+/// made-up branches, a block chunk, a transaction status, request or body, a mempool request),
+/// then sometimes mangled, or bytes at random.
+fn garbage_stp_packet(g: &FuzzGen, c: &mut Choices, noise: &mut Choices) -> Vec<u8> {
+    use zebra_state::new_network::tx_relay::{mempool_req_packet, tx_packets, tx_req_packet, tx_status_packet};
+    use zebra_chain::transaction::UnminedTxId;
+    use zebra_state::new_network::{block_chunk_packets, status_packet, NearTipChains, ShadowBlock};
+    let hash = |noise: &mut Choices| BlockHash(std::array::from_fn(|_| noise.byte()));
+    let tx_id = |noise: &mut Choices| UnminedTxId::Legacy(zebra_chain::transaction::Hash(std::array::from_fn(|_| noise.byte())));
+    let near = |c: &mut Choices| g.height().saturating_sub(4) + c.below(12) as u32;
+    let mut packet = match c.below(6) {
+        0 => {
+            let mut chains = NearTipChains::default();
+            let mut parent = g.tip().tip.hash();
+            let mut height = near(c);
+            let mut branch = Vec::new();
+            for _ in 0..1 + c.below(4) {
+                let this = hash(noise);
+                branch.push(ShadowBlock { this_hash: this, parent_hash: parent, this_height: height });
+                parent = this;
+                height += 1;
+            }
+            chains.push_chain_unchecked(branch);
+            let queued: Vec<BlockHash> = (0..c.below(3)).map(|_| hash(noise)).collect();
+            status_packet(&queued, &chains, c.unusual(64).then(|| c.below(1 << 16) as u32))
+        }
+        1 => {
+            let body: Vec<u8> = (0..1 + c.below(2000)).map(|_| noise.byte()).collect();
+            let mut chunks = block_chunk_packets(&body, near(c), hash(noise), 0);
+            chunks.swap_remove(c.below(chunks.len()))
+        }
+        2 => {
+            let ids: Vec<UnminedTxId> = (0..1 + c.below(4)).map(|_| tx_id(noise)).collect();
+            tx_status_packet(ids.len() as u32 + c.below(3) as u32, ids.iter().map(|id| (id, c.below(100_000) as u32)))
+        }
+        3 => {
+            if c.below(2) == 0 {
+                let ids: Vec<UnminedTxId> = (0..1 + c.below(4)).map(|_| tx_id(noise)).collect();
+                tx_req_packet(ids.iter())
+            } else {
+                mempool_req_packet()
+            }
+        }
+        4 => match g.pending.first() {
+            Some(pending) => tx_packets([&*pending.tx]).swap_remove(0),
+            None => (0..c.below(600)).map(|_| noise.byte()).collect(),
+        },
+        _ => (0..c.below(600)).map(|_| noise.byte()).collect(),
+    };
+    match c.below(5) {
+        0 | 1 => {}
+        2 => packet.truncate(c.below(packet.len().max(1))),
+        3 => {
+            for _ in 0..1 + c.below(4) {
+                if !packet.is_empty() {
+                    let i = c.below(packet.len());
+                    packet[i] ^= 1 << c.below(8);
+                }
+            }
+        }
+        _ => packet.extend((0..1 + c.below(64)).map(|_| noise.byte())),
+    }
+    packet
+}
+
+/// A broken or malicious STP peer: one packet from `garbage_stp_packet`, or a flood of them from
+/// one peer, which the node may kill it for and must survive; or a peer that announces the next
+/// block of `main` and never serves it, while another peer serves it, which must be committed.
+fn move_malicious_peer(g: &mut FuzzGen, c: &mut Choices) {
+    use zebra_state::new_network::{status_packet, NearTipChains, ShadowBlock};
+    let noise_seed = (c.below(1 << 16) as u64) << 16 | c.below(1 << 16) as u64;
+    let mut noise = Choices::from_seed(noise_seed, 4096);
+    let peer = g.next_fresh_peer;
+    g.next_fresh_peer += 1;
+    if c.below(3) == 0 {
+        let known = g.tip_known;
+        let mut next = g.tip().clone();
+        let block = next.next_block_with_txs(&g.miner.clone(), &[]);
+        let mut chains = NearTipChains::default();
+        chains.push_chain_unchecked(vec![ShadowBlock {
+            this_hash: block.hash(),
+            parent_hash: block.header.previous_block_hash,
+            this_height: block.coinbase_height().expect("generated blocks have a height").0,
+        }]);
+        // Announcing a block is no offence, whether or not the peer then serves it.
+        g.tf.push_instr_recv_stp_packet(&status_packet(&[], &chains, None), peer, 0);
+        g.main.push(next);
+        let honest = g.next_fresh_peer;
+        g.next_fresh_peer += 1;
+        g.tf.push_instr_recv_pow(&block, honest, if known { 0 } else { ANY_OUTCOME });
+        g.after_main_grew();
+        g.expect_tip();
+        return;
+    }
+    let n = if c.below(2) == 0 { 1 } else { 10 + c.below(40) };
+    for _ in 0..n {
+        let packet = garbage_stp_packet(g, c, &mut noise);
+        g.tf.push_instr_recv_stp_packet(&packet, peer, ANY_OUTCOME);
+    }
+    g.tf.push_instr_expect_node_alive(0);
+}
+
 /// Delivers a block on `main`'s tip that the node must refuse when the tip is known. When it
 /// is not, the node may hold a chain on which the block is valid, and then holds it as a rival.
 fn refuse(g: &mut FuzzGen, c: &mut Choices, block: &Block) {
@@ -2088,7 +2190,7 @@ const FUZZ_UTXO_UPGRADE_FROM: u32 = 4;
 const FUZZ_UTXO_UPGRADE_SPAN: usize = 60;
 
 /// The moves, most ordinary first: choice 0 picks extend.
-const MOVES: &[Move] = &[move_extend, move_fork, move_invalid_block, move_mangled_block, move_spend, move_mine_pending, move_double_spend, move_staking, move_replay, move_retarget_twice];
+const MOVES: &[Move] = &[move_extend, move_fork, move_invalid_block, move_mangled_block, move_spend, move_mine_pending, move_double_spend, move_staking, move_replay, move_retarget_twice, move_malicious_peer];
 
 /// The test file for `c`. Each input enables a subset of the moves, so rare combinations are not
 /// drowned out by common ones. Some inputs are BFT chains instead (`generate_bft`), and some run

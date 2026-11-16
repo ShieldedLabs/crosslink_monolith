@@ -1885,14 +1885,24 @@ impl BlockGen {
     /// one: `value_balance` panics on a missing output, it does not return an error.
     fn fees(&self, txs: &[Arc<Transaction>]) -> zebra_chain::amount::Amount<zebra_chain::amount::NonNegative> {
         let mut total = zebra_chain::amount::Amount::zero();
+        // A transaction may spend an earlier one in the same block, so each one's outputs join
+        // the spendable set before the next is priced.
+        let mut utxos = self.utxos.clone();
+        let height = BlockHeight(self.tip.coinbase_height().expect("generated blocks have a height").0 + 1);
         for tx in txs {
             let spends_an_unheld_output = tx.inputs().iter()
                 .filter_map(|input| input.outpoint())
-                .any(|outpoint| !self.utxos.contains_key(&outpoint));
-            if spends_an_unheld_output { continue; }
-            let Ok(value_balance) = tx.value_balance(&self.utxos) else { continue };
-            let Ok(fee) = value_balance.remaining_transaction_value() else { continue };
-            total = (total + fee).expect("test fees fit in an amount");
+                .any(|outpoint| !utxos.contains_key(&outpoint));
+            if !spends_an_unheld_output {
+                if let Some(fee) = tx.value_balance(&utxos).ok().and_then(|balance| balance.remaining_transaction_value().ok()) {
+                    total = (total + fee).expect("test fees fit in an amount");
+                }
+            }
+            let hash = tx.hash();
+            for (index, output) in tx.outputs().iter().enumerate() {
+                let outpoint = zebra_chain::transparent::OutPoint { hash, index: index as u32 };
+                utxos.insert(outpoint, zebra_chain::transparent::Utxo { output: output.clone(), height, from_coinbase: false });
+            }
         }
         total
     }

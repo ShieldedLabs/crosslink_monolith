@@ -2289,13 +2289,15 @@ struct HarnessStpPeer {
 /// across an await.
 static TEST_STP_PEERS: Mutex<Vec<HarnessStpPeer>> = Mutex::new(Vec::new());
 
-/// How long a packet gets to provoke a kill. The sync loop ticks every 100 ms, and nothing
-/// acknowledges a packet, so this is a bound rather than a handshake.
-const STP_PACKET_SETTLE: Duration = Duration::from_secs(1);
+/// Sync loop passes a packet gets to provoke a kill after the pass that read it: a refusal decided
+/// off the loop, such as a transaction body the relay bridge decodes, comes back a pass or two
+/// later. Nothing acknowledges a packet, so this is a bound rather than a handshake.
+const STP_PACKET_SETTLE_PASSES: usize = 3;
 
 /// How long to watch a peer advertise a block the node already has. The node never requests it,
-/// so there is no verdict to wait for, only a kill to rule out.
-const KNOWN_BLOCK_SETTLE: Duration = Duration::from_secs(2);
+/// so there is no verdict to wait for, only a kill to rule out; a STATUS naming a new tip brings
+/// the download pass forward to within DL_INIT_WOKEN_MIN_MS, so a request would come well within.
+const KNOWN_BLOCK_SETTLE: Duration = Duration::from_millis(100);
 
 /// Replays the best chain's staking from genesis and compares the result with the node's bonds
 /// and finalizer banks. `holds` is false on any difference; a read the node did not answer is a
@@ -2610,19 +2612,21 @@ async fn deliver_stp_packet(stp: &mut HarnessStpPeer, packet: Vec<u8>) -> (bool,
     }
     stp.link.send(packet);
 
-    let deadline = tokio::time::Instant::now() + STP_PACKET_SETTLE;
+    for _ in 0..1 + STP_PACKET_SETTLE_PASSES {
+        sync_settle().await;
+    }
     loop {
-        tokio::select! {
-            event = stp.link.events.recv() => match event {
-                Some(SyntheticPeerEvent::Killed(reason)) => {
-                    stp.killed = Some(reason.clone());
-                    return (false, format!("RECV_STP_PACKET: the node killed peer {index}: {reason}"));
-                }
-                Some(_) => {}
-                None => return (false, "RECV_STP_PACKET: the sync loop is gone".to_string()),
-            },
-            _ = tokio::time::sleep_until(deadline) => {
-                return (true, format!("RECV_STP_PACKET: peer {index} still connected after {STP_PACKET_SETTLE:?}"));
+        match stp.link.events.try_recv() {
+            Ok(SyntheticPeerEvent::Killed(reason)) => {
+                stp.killed = Some(reason.clone());
+                return (false, format!("RECV_STP_PACKET: the node killed peer {index}: {reason}"));
+            }
+            Ok(_) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                return (true, format!("RECV_STP_PACKET: peer {index} still connected {STP_PACKET_SETTLE_PASSES} sync passes after the one that read it"));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                return (false, "RECV_STP_PACKET: the sync loop is gone".to_string());
             }
         }
     }
