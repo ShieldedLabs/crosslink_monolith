@@ -1272,6 +1272,12 @@ struct EngineFuzz {
     /// The PoW tip when the engine entered its current round, which is when the node, if it is the
     /// round's proposer, makes its proposal.
     round_start_tip: u32,
+    /// Pending spends whose first output, to `key`, no other pending transaction spends yet: what
+    /// a chained spend can spend before it is mined.
+    chainable: Vec<Arc<Transaction>>,
+    /// Transactions the mempool holds that are never mined, until their expiry height has passed
+    /// and they must be gone: each with its expiry height and the coin it holds.
+    expiring: Vec<(Arc<Transaction>, u32, zebra_chain::transparent::OutPoint)>,
 }
 
 /// Synthetic finalizers from here on hold no stake, so the node may disconnect them without the
@@ -1445,6 +1451,7 @@ impl EngineFuzz {
         }
         self.scene.pow.push(block);
         self.tf.push_instr_expect_pow_tip(&self.scene.gen.tip.hash(), 0);
+        self.expire();
         if self.cite != FatPointerToBftBlock::null() && self.fin.map_or(true, |fin| fin < self.cite_snapshot) {
             self.fin = Some(self.cite_snapshot);
             self.expect_finality(c);
@@ -1545,6 +1552,7 @@ impl EngineFuzz {
         self.submit(c, &tx, 0);
         self.tf.push_instr_expect_mempool_contains(&tx, 0);
         self.held.push(coin.0);
+        self.chainable.push(tx.clone());
         self.pending.push(tx);
     }
 
@@ -1570,6 +1578,9 @@ impl EngineFuzz {
         }
         let txs = std::mem::take(&mut self.pending);
         self.held.clear();
+        self.chainable.clear();
+        // Expiring ones stay in the mempool, and their coins stay held.
+        self.held.extend(self.expiring.iter().map(|(_, _, coin)| *coin));
         self.extend_with(c, &txs);
         for tx in &txs {
             self.tf.push_instr_expect_mempool_absent(tx, 0);
@@ -1604,6 +1615,123 @@ impl EngineFuzz {
             let refused = cited_block(&mut self.scene.gen.clone(), &self.scene.miner.clone(), &[tx], &self.cite);
             self.tf.push_instr_load_pow(&refused, SHOULD_FAIL);
             self.tf.push_instr_expect_rejection_reason("staking window", 0);
+        }
+    }
+
+    /// A transaction other than a single coin's spend, through any doorway: a chained spend of a
+    /// pending transaction's output, a spend of two coins into three outputs, one expiring a few
+    /// blocks on that is never mined, or one the mempool must refuse (expired, spending an
+    /// immature coinbase, signed by the wrong key, or paying out more than it spends), whose block
+    /// is refused too.
+    fn fancy_tx(&mut self, c: &mut Choices) {
+        use zebra_chain::amount::{Amount, NonNegative};
+        use zebra_chain::transparent::{OutPoint, Output};
+        let upgrade = self.scene.gen.next_upgrade();
+        let next_height = self.tip_height() + 1;
+        let fee_for = |inputs: &[(OutPoint, Output)], outputs: Vec<Output>, key: &TestKey, expiry: u32| {
+            mempool_fee(&signed_tx(upgrade, Some(key), inputs, outputs, None, expiry))
+        };
+        match c.below(4) {
+            0 => {
+                let Some(parent) = (!self.chainable.is_empty()).then(|| self.chainable.remove(c.below(self.chainable.len()))) else {
+                    return self.spend(c);
+                };
+                let input = (OutPoint { hash: parent.hash(), index: 0 }, parent.outputs()[0].clone());
+                let child = transparent_spend(upgrade, &self.key, input);
+                self.submit(c, &child, 0);
+                self.tf.push_instr_expect_mempool_contains(&child, 0);
+                self.chainable.push(child.clone());
+                self.pending.push(child);
+            }
+            1 => {
+                let Some(first) = self.coin() else { return self.extend(c) };
+                self.held.push(first.0);
+                let Some(second) = self.coin() else {
+                    self.held.pop();
+                    return self.extend(c);
+                };
+                self.held.push(second.0);
+                let inputs = [first.clone(), second.clone()];
+                let total = (first.1.value + second.1.value).expect("two coins add up");
+                let split = |fee: Amount<NonNegative>| {
+                    let rest = (total - fee).expect("the coins cover the fee");
+                    let third = Amount::<NonNegative>::try_from(u64::from(rest) / 3).expect("a third is an amount");
+                    let last = ((rest - third).expect("less than the whole") - third).expect("less than the whole");
+                    vec![Output::new(third, self.key.lock_script()), Output::new(third, self.key.lock_script()), Output::new(last, self.key.lock_script())]
+                };
+                let fee = fee_for(&inputs, split(Amount::zero()), &self.key, 0);
+                let tx = signed_tx(upgrade, Some(&self.key), &inputs, split(fee), None, 0);
+                self.submit(c, &tx, 0);
+                self.tf.push_instr_expect_mempool_contains(&tx, 0);
+                self.chainable.push(tx.clone());
+                self.pending.push(tx);
+            }
+            2 => {
+                let Some(coin) = self.coin() else { return self.extend(c) };
+                let expiry = next_height + 1 + c.below(3) as u32;
+                let pay = |fee: Amount<NonNegative>| vec![Output::new((coin.1.value - fee).expect("the coin covers the fee"), self.key.lock_script())];
+                let fee = fee_for(&[coin.clone()], pay(Amount::zero()), &self.key, expiry);
+                let tx = signed_tx(upgrade, Some(&self.key), &[coin.clone()], pay(fee), None, expiry);
+                self.submit(c, &tx, 0);
+                self.tf.push_instr_expect_mempool_contains(&tx, 0);
+                self.held.push(coin.0);
+                self.expiring.push((tx, expiry, coin.0));
+            }
+            _ => {
+                let mature = self.coin();
+                let lock_script = self.key.lock_script();
+                let young = self
+                    .scene
+                    .gen
+                    .utxos
+                    .iter()
+                    .filter(|(_, utxo)| utxo.from_coinbase && utxo.output.lock_script == lock_script)
+                    .max_by_key(|(outpoint, utxo)| (utxo.height, outpoint.hash.0, outpoint.index))
+                    .map(|(outpoint, utxo)| (*outpoint, utxo.output.clone()));
+                let tx = match (c.below(4), mature) {
+                    (0, Some(coin)) => {
+                        let pay = |fee: Amount<NonNegative>| vec![Output::new((coin.1.value - fee).expect("the coin covers the fee"), self.key.lock_script())];
+                        let fee = fee_for(&[coin.clone()], pay(Amount::zero()), &self.key, 0);
+                        // Expired: its expiry height is the tip's, below the next block's.
+                        signed_tx(upgrade, Some(&self.key), &[coin.clone()], pay(fee), None, next_height - 1)
+                    }
+                    (1, Some(coin)) => {
+                        let thief = TestKey::new(b"crosslink fuzz wrong signer");
+                        let pay = |fee: Amount<NonNegative>| vec![Output::new((coin.1.value - fee).expect("the coin covers the fee"), thief.lock_script())];
+                        let fee = fee_for(&[coin.clone()], pay(Amount::zero()), &thief, 0);
+                        signed_tx(upgrade, Some(&thief), &[coin.clone()], pay(fee), None, 0)
+                    }
+                    (2, Some(coin)) => {
+                        let more = (coin.1.value + Amount::<NonNegative>::try_from(1).expect("one zat")).expect("a coin and a zat");
+                        signed_tx(upgrade, Some(&self.key), &[coin], vec![Output::new(more, self.key.lock_script())], None, 0)
+                    }
+                    _ => {
+                        let Some(coin) = young else { return self.extend(c) };
+                        let pay = |fee: Amount<NonNegative>| vec![Output::new((coin.1.value - fee).expect("the coin covers the fee"), self.key.lock_script())];
+                        let fee = fee_for(&[coin.clone()], pay(Amount::zero()), &self.key, 0);
+                        signed_tx(upgrade, Some(&self.key), &[coin.clone()], pay(fee), None, 0)
+                    }
+                };
+                self.submit(c, &tx, SHOULD_FAIL);
+                self.tf.push_instr_expect_mempool_absent(&tx, 0);
+                if c.below(2) == 0 {
+                    let refused = cited_block(&mut self.scene.gen.clone(), &self.scene.miner.clone(), &[tx], &self.cite);
+                    self.tf.push_instr_load_pow(&refused, SHOULD_FAIL);
+                    self.tf.push_instr_expect_pow_tip(&self.scene.gen.tip.hash(), 0);
+                }
+            }
+        }
+    }
+
+    /// Expiring transactions whose expiry height the tip has passed: the mempool must have dropped
+    /// them, and their coins are free again.
+    fn expire(&mut self) {
+        let tip = self.tip_height();
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.expiring).into_iter().partition(|(_, expiry, _)| tip > *expiry);
+        self.expiring = kept;
+        for (tx, _, coin) in gone {
+            self.tf.push_instr_expect_mempool_absent(&tx, 0);
+            self.held.retain(|held| *held != coin);
         }
     }
 
@@ -1912,7 +2040,7 @@ fn generate_engine(c: &mut Choices) -> Vec<u8> {
     let replay = zebra_state::StakingReplay::new(&Default::default(), BFT_ROUNDS_PARAMETERS.staking.slash_analysis_window());
     let mut f = EngineFuzz {
         tf, scene, gens: Vec::new(), height: 1, round: 0, parent, snapshot: roster_height, next_fresh_peer: FRESH_PEERS_FROM, sides: 0,
-        main, replay, replayed_to: 0, round_ticks: 0,
+        main, replay, replayed_to: 0, round_ticks: 0, chainable: Vec::new(), expiring: Vec::new(),
         key: TestKey::new(b"crosslink test miner"), pending: Vec::new(), held: Vec::new(), bonds_made: 0,
         cite: FatPointerToBftBlock::null(), cite_snapshot: 0, gen_cites: Vec::new(), citable: None, fin: None,
         side_blocks: Vec::new(), next_stranger: STRANGERS_FROM, parent_known: true, round_start_tip: 0,
@@ -1921,7 +2049,7 @@ fn generate_engine(c: &mut Choices) -> Vec<u8> {
     // BFT starts at the activation height the scene loaded up to.
     f.tick();
     for _ in 0..2 + c.below(10) {
-        match c.below(13) {
+        match c.below(14) {
             0..=2 => {
                 for _ in 0..1 + c.below(3) {
                     f.extend(c);
@@ -1933,6 +2061,7 @@ fn generate_engine(c: &mut Choices) -> Vec<u8> {
             6 => f.mine_pending(c),
             7 => f.bond(c),
             8 => f.garbage_packet(c),
+            9 => f.fancy_tx(c),
             _ => f.decide(c),
         }
     }
