@@ -203,7 +203,7 @@ where
                     info!("mempool crawl timed out: {timeout:?}");
                     Ok(())
                 })?;
-            sleep(RATE_LIMIT_DELAY).await;
+            zebra_debug_time::instant_sleep(RATE_LIMIT_DELAY).await;
         }
     }
 

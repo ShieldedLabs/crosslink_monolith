@@ -57,7 +57,7 @@ where
         info!("initializing mempool queue checker task");
 
         loop {
-            sleep(RATE_LIMIT_DELAY).await;
+            zebra_debug_time::instant_sleep(RATE_LIMIT_DELAY).await;
             self.check_queue().await?;
         }
     }

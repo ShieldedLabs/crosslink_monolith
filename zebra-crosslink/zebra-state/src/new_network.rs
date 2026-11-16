@@ -788,9 +788,10 @@ const PEER_RESPOND_MS: u64 = 300;
 
 
 const IDLE_MS: u64 = 100;
-// The least time between download passes that a peer's STATUS brings forward: a STATUS naming a
-// new tip is acted on at once rather than at the next BLOCK_SEND_MS pass, but a peer sending
-// STATUS after STATUS cannot run the pass every tick.
+// The least real time between download passes that a peer's STATUS brings forward: a STATUS
+// naming a new tip is acted on at once rather than at the next BLOCK_SEND_MS pass, but a peer
+// sending STATUS after STATUS cannot run the pass every tick. Real time, not `clock()`: it paces
+// the CPU, and a test's supplied clock may stand still.
 const DL_INIT_WOKEN_MIN_MS: u64 = 5;
 // The least time from one tick's start to the next when wakes (bft::wake_sync_thread) end the idle
 // wait early, so a stream of them shares ticks instead of spinning the loop.
@@ -1274,7 +1275,7 @@ impl Default for PeerPowBlockDownload {
         Self {
             height_hash: HeightAndHashOr0::default(),
             reassembly: BlockReassembly::default(),
-            last_modified: std::time::Instant::now(),
+            last_modified: clock(),
             timeout_strikes: 0,
             last_requested: None,
             request_attempts: 0,
@@ -1564,7 +1565,7 @@ impl BlockDownloads {
             self.slots[dl_i] = PeerPowBlockDownload {
                 height_hash,
                 reassembly: BlockReassembly::default(),
-                last_modified: std::time::Instant::now(),
+                last_modified: clock(),
                 timeout_strikes: 0,
                 last_requested: None,
                 request_attempts: 0,
@@ -2006,6 +2007,14 @@ pub static PEER_ATTESTED_BLOCKS: std::sync::Mutex<Vec<ShadowBlock>> = std::sync:
 /// zebra-network syncer is not spawned, so these are the only block-carrying peers.
 pub static POW_PEER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The clock the sync loop's deadlines, backoffs and relay timers run on: the real one on a node,
+/// and a test's supplied one (`zebra_debug_time::advance_instant`), which the BFT engine runs on
+/// too, so one schedule moves both. Waits that only pace the loop, and measurements, stay on the
+/// real clock.
+fn clock() -> std::time::Instant {
+    zebra_debug_time::std_instant_now()
+}
+
 /// Sync loop ticks finished: each has committed whatever in its queue could be, sent its requests
 /// and handled the packets that reached it. Something waiting to see what the loop makes of work
 /// already queued waits for this to move twice, since the tick in progress may be past its commits.
@@ -2087,7 +2096,7 @@ impl BlockFate {
     /// each interval after. The retry itself is silent, so without this a deferral that never
     /// resolves shows only as a tip that stops moving.
     fn warn_if_stalled(&mut self, height: u32, hash: Hash, reason: std::fmt::Arguments) {
-        let now = std::time::Instant::now();
+        let now = clock();
         let since = *self.deferred_since.get_or_insert(now);
         let next = self.next_stall_warning.get_or_insert(since + DEFERRED_BLOCK_WARN_INTERVAL);
         if now >= *next {
@@ -2151,7 +2160,7 @@ struct Rejection {
 const MAX_REJECTION_SERVERS: usize = 16;
 
 fn note_rejection<K: Eq + std::hash::Hash>(rejections: &mut HashMap<K, Rejection>, key: K) -> &mut Rejection {
-    let now = std::time::Instant::now();
+    let now = clock();
     let rejection = rejections.entry(key).or_insert(Rejection { strikes: 0, retry_at: now, served_by: Vec::new() });
     rejection.strikes += 1;
     let backoff = REJECTED_BLOCK_BACKOFF_MIN.saturating_mul(1 << (rejection.strikes - 1).min(16));
@@ -2170,13 +2179,13 @@ fn note_rejected_server(rejection: &mut Rejection, server: ConnectionKey) {
 }
 
 fn is_backing_off<K: Eq + std::hash::Hash>(rejections: &HashMap<K, Rejection>, key: K) -> bool {
-    rejections.get(&key).is_some_and(|rejection| std::time::Instant::now() < rejection.retry_at)
+    rejections.get(&key).is_some_and(|rejection| clock() < rejection.retry_at)
 }
 
 /// Whether `hash` should not be requested from `server` now: it is backing off, or `server`
 /// already served bytes under it that failed.
 fn is_backing_off_from(rejections: &HashMap<Hash, Rejection>, hash: Hash, server: ConnectionKey) -> bool {
-    rejections.get(&hash).is_some_and(|rejection| std::time::Instant::now() < rejection.retry_at || rejection.served_by.contains(&server))
+    rejections.get(&hash).is_some_and(|rejection| clock() < rejection.retry_at || rejection.served_by.contains(&server))
 }
 
 fn kill_peer(
@@ -2374,7 +2383,7 @@ pub fn sync(
     }
     // BFT restores its persisted chain against the bc-chain, so this runs after genesis is in.
     let mut bft_runner = bft::BftRunner::new(bft, config, &read_state, &mut block_writer, rt.clone());
-    let mut bft_startup_hold_until = bft_runner.held_at_startup().then(|| std::time::Instant::now() + BFT_STARTUP_HOLD);
+    let mut bft_startup_hold_until = bft_runner.held_at_startup().then(|| clock() + BFT_STARTUP_HOLD);
     let crosslink_params = read_state.network().crosslink_parameters();
 
     // Sync state
@@ -2402,17 +2411,20 @@ pub fn sync(
     #[allow(non_snake_case)] // temporary counter, named so a later grep finds it
     let mut XXX_tick_loop_counter = 0usize;
 
-    let mut next_status       = std::time::Instant::now();
+    let mut next_status       = clock();
     // The tip hash in the last STATUS we sent, so a new one can be advertised immediately
     // instead of waiting out the heartbeat.
     let mut last_status_tip: Option<Hash> = None;
-    let mut next_dl_init      = std::time::Instant::now();
+    let mut next_dl_init      = clock();
+    // When the last download pass ran, in real time (see DL_INIT_WOKEN_MIN_MS), and whether a
+    // STATUS has asked for one since.
     let mut last_dl_init      = std::time::Instant::now();
-    let mut next_peer_gossip  = std::time::Instant::now();
-    let mut next_peer_connect = std::time::Instant::now();
-    let mut next_peer_request = std::time::Instant::now();
-    let mut next_console_status_print = std::time::Instant::now();
-    let mut next_attested_publish = std::time::Instant::now();
+    let mut dl_init_wanted    = false;
+    let mut next_peer_gossip  = clock();
+    let mut next_peer_connect = clock();
+    let mut next_peer_request = clock();
+    let mut next_console_status_print = clock();
+    let mut next_attested_publish = clock();
 
 
     // Lite checkpoint: enforced at the commit-queue push, and stays armed forever.
@@ -2455,13 +2467,13 @@ pub fn sync(
     while !zebra_chain::shutdown::is_shutting_down() {
         let loop_start = std::time::Instant::now();
 
-        bft_peer_rejections.retain(|_, rejection| std::time::Instant::now() < rejection.retry_at + REJECTED_BLOCK_BACKOFF_MAX);
-        if bft_startup_hold_until.is_some_and(|until| !bft_startup_holding(&peers, bft::decided_len(), until, std::time::Instant::now())) {
+        bft_peer_rejections.retain(|_, rejection| clock() < rejection.retry_at + REJECTED_BLOCK_BACKOFF_MAX);
+        if bft_startup_hold_until.is_some_and(|until| !bft_startup_holding(&peers, bft::decided_len(), until, clock())) {
             bft_startup_hold_until = None;
         }
         let catching_up = !bft::bft_is_dropped()
             && (bft_startup_hold_until.is_some()
-                || bft_catching_up(&peers, &bft_peer_rejections, bft::decided_len(), std::time::Instant::now()));
+                || bft_catching_up(&peers, &bft_peer_rejections, bft::decided_len(), clock()));
         bft_runner.set_catching_up(catching_up);
         bft_runner.tick(&read_state, &mut block_writer);
         feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer, &mut peers_to_kill, &mut bft_peer_rejections);
@@ -2608,7 +2620,7 @@ pub fn sync(
 
         use rand::seq::IteratorRandom;
 
-        if std::time::Instant::now() >= next_peer_connect {
+        if clock() >= next_peer_connect {
             let mut connection_attempts = 0;
 
             let rng = &mut rand::thread_rng();
@@ -2632,7 +2644,7 @@ pub fn sync(
 
                 connection_attempts += 1;
 
-                pending_selected_addresses.insert(address.connection_key(), std::time::Instant::now());
+                pending_selected_addresses.insert(address.connection_key(), clock());
 
                 // Hole punch
                 let (mut buf, mut o) = ([0u8; 1 + STP_ADDRESS_SERIALIZED_SIZE], 0);
@@ -2677,10 +2689,10 @@ pub fn sync(
                 }
             }
 
-            next_peer_connect = std::time::Instant::now() + peer_connect_interval;
+            next_peer_connect = clock() + peer_connect_interval;
         }
 
-        if std::time::Instant::now() >= next_peer_gossip {
+        if clock() >= next_peer_gossip {
 
             let rng = &mut rand::thread_rng();
 
@@ -2721,7 +2733,7 @@ pub fn sync(
                 packets_to_send.push((addr.connection_key(), gossip_packet.clone()));
             }
 
-            next_peer_gossip = std::time::Instant::now() + peer_gossip_interval;
+            next_peer_gossip = clock() + peer_gossip_interval;
         }
 
 
@@ -2863,12 +2875,12 @@ pub fn sync(
 
         // Peers catching up from far behind get their next historical window as soon as they
         // report progress; everyone else waits for news or the heartbeat.
-        let heartbeat_due = tip_is_news || std::time::Instant::now() >= next_status;
+        let heartbeat_due = tip_is_news || clock() >= next_status;
         let history_due = peers.values().any(|peer| peer.history_wanted);
 
         if heartbeat_due || history_due { 'send_status: {
             if heartbeat_due {
-                next_status = std::time::Instant::now() + status_interval;
+                next_status = clock() + status_interval;
                 last_status_tip = tip_for_status;
             }
 
@@ -2996,14 +3008,16 @@ pub fn sync(
         // Discard statuses of disconnected peers
         peers.retain(|connection_key, _| current_connections.iter().any(|(addr, _)| addr.connection_key() == *connection_key));
 
-        if std::time::Instant::now() >= next_dl_init { 'init_dls: {
-            next_dl_init = std::time::Instant::now() + dl_init_interval;
+        let dl_init_floor_passed = std::time::Instant::now() >= last_dl_init + std::time::Duration::from_millis(DL_INIT_WOKEN_MIN_MS);
+        if clock() >= next_dl_init || (dl_init_wanted && dl_init_floor_passed) { 'init_dls: {
+            next_dl_init = clock() + dl_init_interval;
             last_dl_init = std::time::Instant::now();
+            dl_init_wanted = false;
             let dls_before_pass: u32 = peers.values().map(|peer| peer.block_downloads.used_flags.count_ones()).sum();
 
             // An entry outlives its backoff by the max, so a hash failing again soon after keeps
             // its strike count and waits longer.
-            rejections.retain(|_, rejection| std::time::Instant::now() < rejection.retry_at + REJECTED_BLOCK_BACKOFF_MAX);
+            rejections.retain(|_, rejection| clock() < rejection.retry_at + REJECTED_BLOCK_BACKOFF_MAX);
 
             // Same deal as the STATUS block: built here, used here, dropped here.
             let Some(near_tip_chains) = near_tip_chains_from_state(&read_state) else {
@@ -3033,7 +3047,7 @@ pub fn sync(
                             if TRACE { tracing::info!("Cancelling download request for block @ {}, {} - <= finalized @ {}", height, hash_or_0, near_tip_chains.finalized_height); }
                             peer.block_downloads.remove(dl_i);
 
-                        } else if block_download_expired(&mut peer.block_downloads.slots[dl_i], std::time::Instant::now(), block_response_deadline) {
+                        } else if block_download_expired(&mut peer.block_downloads.slots[dl_i], clock(), block_response_deadline) {
                             if TRACE { tracing::info!("Cancelling download request for block @ {}, {} - timed out", height, hash_or_0); }
                             peer.block_downloads.remove(dl_i);
                             // TODO: lower weighting on this peer?
@@ -3372,11 +3386,11 @@ pub fn sync(
             // tick rather than at the next PEER_REQUEST_MS pass.
             let dls_after_pass: u32 = peers.values().map(|peer| peer.block_downloads.used_flags.count_ones()).sum();
             if dls_after_pass > dls_before_pass {
-                next_peer_request = std::time::Instant::now();
+                next_peer_request = clock();
             }
         }}
 
-        if std::time::Instant::now() >= next_peer_request {
+        if clock() >= next_peer_request {
             for (connection_key, peer) in peers.iter_mut() {
                 // TODO: can we pack these into packlets now?
                 let dls_n = peer.block_downloads.used_flags.count_ones();
@@ -3394,7 +3408,7 @@ pub fn sync(
                             continue 'downloads;
                         }
 
-                        if !block_request_due(&mut peer.block_downloads.slots[dl_i], std::time::Instant::now(), block_response_deadline) {
+                        if !block_request_due(&mut peer.block_downloads.slots[dl_i], clock(), block_response_deadline) {
                             continue 'downloads;
                         }
                         let dl = &peer.block_downloads.slots[dl_i];
@@ -3412,10 +3426,10 @@ pub fn sync(
                 }
             }
 
-            next_peer_request = std::time::Instant::now() + peer_request_interval;
+            next_peer_request = clock() + peer_request_interval;
         }
 
-        pending_selected_addresses.retain(|_addr, time| std::time::Instant::now().saturating_duration_since(*time).as_secs() < 30);
+        pending_selected_addresses.retain(|_addr, time| clock().saturating_duration_since(*time).as_secs() < 30);
 
         use rand::seq::SliceRandom;
 
@@ -3437,7 +3451,7 @@ pub fn sync(
         // downloads, slowness is no fault: an unanswered request is sent again after
         // BFT_REQUEST_TIMEOUT, and stays open for its answer until the block-response deadline,
         // since BFT_DECISIONS queue behind block responses on Bulk.
-        let now = std::time::Instant::now();
+        let now = clock();
         bft_requests.retain(|&(key, .., sent)| peers.contains_key(&key) && now.saturating_duration_since(sent) < block_response_deadline);
         let request_fresh = bft_requests.iter().any(|&(.., sent)| now.saturating_duration_since(sent) < BFT_REQUEST_TIMEOUT);
         if !request_fresh && !bft::bft_is_dropped() {
@@ -3466,7 +3480,7 @@ pub fn sync(
 
         // Transaction relay: the bridge's answers, then what relay wants done, carried out.
         if let Some(bridge) = &tx_bridge {
-            let now = std::time::Instant::now();
+            let now = clock();
             let live_now: HashSet<ConnectionKey> = current_connections.iter().map(|(a, _)| a.connection_key()).collect();
             let () = tx_relay_bridge::ASSUME_PEER_GONE_FOR_EVERY_KEY;
             for gone in tx_live.difference(&live_now) {
@@ -3811,7 +3825,7 @@ pub fn sync(
                 // A peer's new tip is downloaded from as soon as it is heard of, not at the next
                 // BLOCK_SEND_MS pass: on a real network each hop of a block's relay waited for it.
                 if tips_moved {
-                    next_dl_init = next_dl_init.min(last_dl_init + std::time::Duration::from_millis(DL_INIT_WOKEN_MIN_MS));
+                    dl_init_wanted = true;
                     bft::wake_sync_thread();
                 }
 
@@ -3995,7 +4009,7 @@ pub fn sync(
                     kill!("overlapping/out-of-bounds block fragment");
                     continue 'process_packets;
                 }
-                note_block_fragment(&mut peer.block_downloads.slots[dl_i], std::time::Instant::now());
+                note_block_fragment(&mut peer.block_downloads.slots[dl_i], clock());
 
                 if !complete {
                     if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: fragment at offset {} ({} bytes); awaiting more", hdr.offset, msg.len()); }
@@ -4153,14 +4167,14 @@ pub fn sync(
                 };
                 // Heard only while relay is active: it is listed again within a heartbeat.
                 if tx_bridge.is_some() && tx_relay_active {
-                    tx_outs.extend(tx_state.on_status(connection_key, entries, std::time::Instant::now()));
+                    tx_outs.extend(tx_state.on_status(connection_key, entries, clock()));
                 }
             } else if packet_type == PACKET_TYPE_TX_REQ {
                 let Some(ids) = some_or_kill!(tx_relay::read_tx_req(msg), "Malformed TX_REQ") else {
                     continue 'process_packets;
                 };
                 if tx_bridge.is_some() {
-                    tx_outs.extend(tx_state.on_request(connection_key, ids, std::time::Instant::now()));
+                    tx_outs.extend(tx_state.on_request(connection_key, ids, clock()));
                 }
             } else if packet_type == PACKET_TYPE_TX {
                 // Decoded on the bridge, and only if we are waiting on this peer; a malformed
@@ -4177,7 +4191,7 @@ pub fn sync(
                             if bridge.send(tx_relay_bridge::ToBridge::Decode { from: connection_key, body: msg.to_vec() }) {
                                 *queued += msg.len() as u64;
                             } else {
-                                tx_state.on_body_dropped(connection_key, std::time::Instant::now());
+                                tx_state.on_body_dropped(connection_key, clock());
                             }
                         }
                     }
@@ -4188,7 +4202,7 @@ pub fn sync(
                     continue 'process_packets;
                 }
                 if tx_bridge.is_some() {
-                    tx_outs.extend(tx_state.on_mempool_req(connection_key, std::time::Instant::now()));
+                    tx_outs.extend(tx_state.on_mempool_req(connection_key, clock()));
                 }
             } else if packet_type == PACKET_TYPE_BFT_STATUS {
                 let Some(their_bft_len) = some_or_kill!(bft_sync::read_bft_status(msg), "Malformed BFT_STATUS") else {
@@ -4224,7 +4238,7 @@ pub fn sync(
                             bft_fetched.insert(height, (connection_key, decision));
                         }
                     }
-                    peer.bft_answered_at = Some(std::time::Instant::now());
+                    peer.bft_answered_at = Some(clock());
                 } else {
                     // Not asked for: a decision for our next height that can be stored at once is
                     // as good as one we asked for, since its certificate vouches for it. Nothing
@@ -4604,7 +4618,14 @@ pub fn sync(
         // the pass forward is acted on when the pass is due, not at the next full tick.
         SYNC_TICKS_DONE.fetch_add(1, std::sync::atomic::Ordering::Release);
         if !zebra_chain::shutdown::is_shutting_down() {
-            let idle_until = (loop_start + tick_duration).min(next_dl_init.max(loop_start + woken_tick_min));
+            // The periodic pass is due on `clock()`, one a STATUS wants once the real-time floor has
+            // passed; the wait is in real time.
+            let dl_due_at = if dl_init_wanted {
+                last_dl_init + std::time::Duration::from_millis(DL_INIT_WOKEN_MIN_MS)
+            } else {
+                std::time::Instant::now() + next_dl_init.saturating_duration_since(clock())
+            };
+            let idle_until = (loop_start + tick_duration).min(dl_due_at.max(loop_start + woken_tick_min));
             bft_runner.wait(loop_start + woken_tick_min, idle_until, &read_state, &mut block_writer);
         }
     }

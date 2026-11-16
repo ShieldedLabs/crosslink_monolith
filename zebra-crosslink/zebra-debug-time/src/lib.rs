@@ -239,6 +239,7 @@ pub fn advance_instant(by: std::time::Duration) {
     let _ = SUPPLIED_INSTANT_NANOS.fetch_update(Ordering::Release, Ordering::Relaxed, |nanos| {
         Some(if nanos == u64::MAX { by } else { nanos.saturating_add(by).min(u64::MAX - 1) })
     });
+    INSTANT_ADVANCED.notify_waiters();
 }
 
 /// Whether a test supplies the monotonic clock.
@@ -246,6 +247,67 @@ pub fn advance_instant(by: std::time::Duration) {
 pub fn instant_is_supplied() -> bool {
     SUPPLIED_INSTANT_NANOS.load(Ordering::Relaxed) != u64::MAX
 }
+
+/// Woken whenever the supplied instant moves, for the waits below.
+#[cfg(feature = "timers")]
+static INSTANT_ADVANCED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// [`instant_now`] as a `std` instant, for code that keeps its deadlines in those.
+#[cfg(feature = "timers")]
+pub fn std_instant_now() -> std::time::Instant {
+    instant_now().into_std()
+}
+
+/// Sleeps until [`instant_now`] reaches `deadline`: in real time on a node, and on a test's
+/// supplied clock until the test moves it there. For timers that are part of what the node does
+/// (protocol and policy timeouts), not bounds on a service that might have died.
+#[cfg(feature = "timers")]
+pub async fn instant_sleep_until(deadline: tokio::time::Instant) {
+    if !instant_is_supplied() {
+        return tokio::time::sleep_until(deadline).await;
+    }
+    loop {
+        let advanced = INSTANT_ADVANCED.notified();
+        tokio::pin!(advanced);
+        // Registered before the check, so an advance between the check and the await still wakes it.
+        advanced.as_mut().enable();
+        if instant_now() >= deadline {
+            return;
+        }
+        advanced.await;
+    }
+}
+
+/// Sleeps for `duration` of [`instant_now`]'s time. See [`instant_sleep_until`].
+#[cfg(feature = "timers")]
+pub async fn instant_sleep(duration: std::time::Duration) {
+    instant_sleep_until(instant_now() + duration).await
+}
+
+/// `future`, unless `duration` of [`instant_now`]'s time passes first. See [`instant_sleep_until`].
+#[cfg(feature = "timers")]
+pub async fn instant_timeout<F: std::future::Future>(duration: std::time::Duration, future: F) -> Result<F::Output, InstantElapsed> {
+    let deadline = instant_now() + duration;
+    tokio::select! {
+        output = future => Ok(output),
+        () = instant_sleep_until(deadline) => Err(InstantElapsed(duration)),
+    }
+}
+
+/// An [`instant_timeout`] that ran out.
+#[cfg(feature = "timers")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstantElapsed(pub std::time::Duration);
+
+#[cfg(feature = "timers")]
+impl std::fmt::Display for InstantElapsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "timed out after {:?}", self.0)
+    }
+}
+
+#[cfg(feature = "timers")]
+impl std::error::Error for InstantElapsed {}
 
 #[cfg(all(test, feature = "timers"))]
 mod tests {

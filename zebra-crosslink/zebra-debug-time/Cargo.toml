@@ -22,4 +22,4 @@ timers = ["dep:tokio"]
 [dependencies]
 chrono = { workspace = true, features = ["clock", "std"] }
 serde = { workspace = true, features = ["serde_derive"] }
-tokio = { workspace = true, features = ["time"], optional = true }
+tokio = { workspace = true, features = ["time", "sync", "macros"], optional = true }

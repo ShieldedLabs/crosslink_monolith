@@ -258,7 +258,7 @@ where
                     ),
                     Box<(TransactionDownloadVerifyError, UnminedTxId)>,
                 >,
-                (UnminedTxId, tokio::time::error::Elapsed),
+                (UnminedTxId, zebra_debug_time::InstantElapsed),
             >,
         >,
     >,
@@ -309,7 +309,7 @@ where
             ),
             Box<(UnminedTxId, TransactionDownloadVerifyError)>,
         >,
-        (UnminedTxId, tokio::time::error::Elapsed),
+        (UnminedTxId, zebra_debug_time::InstantElapsed),
     >;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
@@ -634,7 +634,8 @@ where
         .in_current_span();
 
         let task = tokio::spawn(async move {
-            let fut = tokio::time::timeout(RATE_LIMIT_DELAY, fut);
+            // On the instant clock, so a test can run this policy timeout out without waiting for it.
+            let fut = zebra_debug_time::instant_timeout(RATE_LIMIT_DELAY, fut);
 
             // Prefer the cancel handle if both are ready.
             //
