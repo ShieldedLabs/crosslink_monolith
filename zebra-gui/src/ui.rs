@@ -3241,6 +3241,9 @@ pub fn ui_left_pane(ui: &mut Context,
                             // The GUI's own word wrap fills the panel's real width; only tokens longer than any line could be
                             // (addresses, hashes) get break points, so they cannot widen the panel.
                             ui.text(frame_strf!(data, "{}", break_long_tokens(&view.text, MEMO_LONG_TOKEN_CHARS)), TextDecl { h: ui.scale(16.0), colour: WHITE, wrap: Wrap::Words, align: AlignX::Left, ..TextDecl });
+                            if modal_action_button(ui, padding, child_gap, "Copy", true, true) {
+                                ui.input().send_to_clipboard(&view.text);
+                            }
                             ui.text(frame_strf!(data, "{}", view.how), TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.6), align: AlignX::Left, ..TextDecl });
                             draw_memo_layout(ui, data, child_gap, &view.layout, 0, view.placement);
                         }
