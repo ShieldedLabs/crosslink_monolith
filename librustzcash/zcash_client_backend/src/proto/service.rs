@@ -208,7 +208,7 @@ pub struct BondInfoRequest {
     pub bond_key: ::prost::alloc::vec::Vec<u8>,
 }
 /// Response for GetBondInfo RPC
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BondInfoResponse {
     /// Bond amount in zatoshis
     #[prost(uint64, tag = "1")]
@@ -219,6 +219,9 @@ pub struct BondInfoResponse {
     /// Block height of last staking action on this bond
     #[prost(uint32, tag = "3")]
     pub last_action_height: u32,
+    /// 32 bytes: the version an action on this bond must spend from FeaturenetUpgrade3
+    #[prost(bytes = "vec", tag = "4")]
+    pub version: ::prost::alloc::vec::Vec<u8>,
 }
 /// RequestFaucetDonation RPC
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

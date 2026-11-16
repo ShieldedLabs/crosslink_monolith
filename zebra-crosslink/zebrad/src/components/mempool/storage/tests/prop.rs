@@ -27,7 +27,7 @@ use crate::components::mempool::{
     config::Config,
     storage::{
         eviction_list::EvictionList, MempoolError, RejectionError, SameEffectsTipRejectionError,
-        Storage, MAX_EVICTION_MEMORY_ENTRIES,
+        transactions_conflict, Storage, MAX_EVICTION_MEMORY_ENTRIES,
     },
     SameEffectsChainRejectionError,
 };
@@ -298,6 +298,28 @@ proptest! {
             prop_assert!(storage.contains_rejected(&id_to_reject));
 
             storage.clear();
+        }
+    }
+
+    /// The conflict check between two transactions, which guards transactions still being
+    /// verified after a chain reset, agrees with the mempool's own check, both ways round, on
+    /// conflicting and unconflicting pairs alike.
+    #[test]
+    fn transactions_conflict_agrees_with_storage(input in any::<SpendConflictTestInput>(), conflicting in any::<bool>()) {
+        let (first, second) = if conflicting { input.conflicting_transactions() } else { input.unconflicting_transactions() };
+        for (held, newcomer) in [(&first, &second), (&second, &first)] {
+            let mut storage: Storage = Storage::new(&Config {
+                tx_cost_limit: 160_000_000,
+                eviction_memory_time: EVICTION_MEMORY_TIME,
+                ..Default::default()
+            });
+            prop_assert_eq!(storage.insert(held.clone(), Vec::new(), None), Ok(held.transaction.id));
+            let expected = storage.conflict(&newcomer.transaction);
+            prop_assert_eq!(transactions_conflict(&held.transaction, &newcomer.transaction), expected.clone());
+            prop_assert_eq!(transactions_conflict(&newcomer.transaction, &held.transaction), expected.clone());
+            if conflicting {
+                prop_assert!(expected.is_some());
+            }
         }
     }
 

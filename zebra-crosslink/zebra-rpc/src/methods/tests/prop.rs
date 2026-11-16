@@ -69,7 +69,7 @@ proptest! {
             let unmined_transaction = UnminedTx::from(transaction);
             let expected_request = mempool::Request::Queue(vec![unmined_transaction.into()]);
             let (rsp_tx, rsp_rx) = oneshot::channel();
-            let _ = rsp_tx.send(Ok(()));
+            let _ = rsp_tx.send(mempool::Verdict::Accepted);
             let response = mempool::Response::Queued(vec![Ok(rsp_rx)]);
 
             mempool
@@ -131,7 +131,7 @@ proptest! {
             let expected_request = mempool::Request::Queue(vec![unmined_transaction.clone().into()]);
 
             let (rsp_tx, rsp_rx) = oneshot::channel();
-            let _ = rsp_tx.send(Err("any verification error".into()));
+            let _ = rsp_tx.send(mempool::Verdict::Invalid { error: "any verification error".to_string(), state_dependent: false });
             mempool
                 .expect_request(expected_request)
                 .await?
@@ -163,7 +163,7 @@ proptest! {
         runtime.block_on(async move {
             let tx = hex::encode(&transaction.zcash_serialize_to_vec()?);
             let req = mempool::Request::Queue(vec![UnminedTx::from(transaction).into()]);
-            let rsp = mempool::Response::Queued(vec![Err(DummyError.into())]);
+            let rsp = mempool::Response::Queued(vec![Err(mempool::QueueRefusal::Full)]);
             let mempool_query = mempool.expect_request(req).map_ok(|r| r.respond(rsp));
 
             let (rpc_rsp, _) = tokio::join!(rpc.send_raw_transaction(tx, None), mempool_query);
@@ -781,7 +781,7 @@ proptest! {
             let expected_request =
                 mempool::Request::Queue(vec![mempool::Gossip::Tx(tx_unmined.clone())]);
             let (rsp_tx, rsp_rx) = oneshot::channel();
-            let _ = rsp_tx.send(Ok(()));
+            let _ = rsp_tx.send(mempool::Verdict::Accepted);
             let response = mempool::Response::Queued(vec![Ok(rsp_rx)]);
 
             mempool
@@ -869,7 +869,7 @@ proptest! {
                 let expected_request =
                     mempool::Request::Queue(vec![mempool::Gossip::Tx(UnminedTx::from(tx))]);
                 let (rsp_tx, rsp_rx) = oneshot::channel();
-                let _ = rsp_tx.send(Ok(()));
+                let _ = rsp_tx.send(mempool::Verdict::Accepted);
                 let response = mempool::Response::Queued(vec![Ok(rsp_rx)]);
 
                 mempool

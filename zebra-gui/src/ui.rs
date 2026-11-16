@@ -5846,7 +5846,7 @@ mod roster_identity_tests {
 
     #[test]
     fn roster_labels_and_copy_values_distinguish_verified_and_unknown_addresses() {
-        let (_, key, pk) = wallet::bft::finalizer_key_from_seed(b"gui-roster-identity");
+        let (key, pk) = wallet::bft::finalizer_key_from_seed(b"gui-roster-identity");
         let address = wallet::bft::FinalizerAddress::create(&key);
         let mut member = WalletRosterMember { pub_key: pk.0, voting_power: 1, txids: Vec::new(), finalizer_address: Some(address) };
         let (prefix, label, copy, tooltip) = roster_member_identity(&member);
@@ -5948,12 +5948,12 @@ mod claim_lookup_tests {
 
     #[test]
     fn claim_for_bond_matches_the_bond_key() {
-        let (_, key, _) = wallet::bft::finalizer_key_from_seed(b"gui-claim-lookup");
+        let (key, _) = wallet::bft::finalizer_key_from_seed(b"gui-claim-lookup");
         let f = wallet::bft::FinalizerAddress::create(&key);
         let (a, b) = ([0xaa; 32], [0xbb; 32]);
         let stake    = |k, amount_zats, h| tx(StakingAction::CreateNewDelegationBond { amount_zats, unique_pubkey: k, bond_salt: [0; 32], target_finalizer: f, signature: [0; 64] }, h);
-        let unstake  = |k, h| tx(StakingAction::BeginDelegationUnbonding { unique_pubkey: k, signature: [0; 64] }, h);
-        let withdraw = |k, amount_zats, h| tx(StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey: k, signature: [0; 64] }, h);
+        let unstake  = |k, h| tx(StakingAction::BeginDelegationUnbonding { unique_pubkey: k, signature: [0; 64], spends: None }, h);
+        let withdraw = |k, amount_zats, h| tx(StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey: k, signature: [0; 64], spends: None }, h);
 
         // Newest first, as the history shows it: bond A's whole life, then bond B's.
         let mut txs = vec![

@@ -65,16 +65,15 @@ fn check_version(version: u32) -> Result<(), &'static str> {
     }
 }
 
-impl ZcashSerialize for Header {
+impl Header {
+    /// Writes every field of the header but the fat pointer: the version through the Equihash
+    /// solution, the bytes a standard Equihash miner hashes.
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    pub(crate) fn zcash_serialize_without_fat_pointer<W: io::Write>(
+        &self,
+        mut writer: W,
+    ) -> Result<(), io::Error> {
         check_version(self.version).map_err(io::Error::other)?;
-
-        let logical_version = if self.version & 0xffff_0000 != 0 {
-            self.version.reverse_bits()
-        } else {
-            self.version
-        };
 
         writer.write_u32::<LittleEndian>(self.version)?;
         self.previous_block_hash.zcash_serialize(&mut writer)?;
@@ -89,6 +88,19 @@ impl ZcashSerialize for Header {
         writer.write_u32::<LittleEndian>(self.difficulty_threshold.0)?;
         writer.write_all(&self.nonce[..])?;
         self.solution.zcash_serialize(&mut writer)?;
+        Ok(())
+    }
+}
+
+impl ZcashSerialize for Header {
+    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+        self.zcash_serialize_without_fat_pointer(&mut writer)?;
+
+        let logical_version = if self.version & 0xffff_0000 != 0 {
+            self.version.reverse_bits()
+        } else {
+            self.version
+        };
         if logical_version >= 5 {
             self.fat_pointer_to_bft_block.zcash_serialize(&mut writer)?;
         }

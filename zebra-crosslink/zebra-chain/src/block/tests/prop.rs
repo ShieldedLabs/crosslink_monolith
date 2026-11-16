@@ -1,6 +1,9 @@
 //! Randomised property tests for Zcash blocks.
 
-use std::{env, io::ErrorKind};
+use std::{
+    env,
+    io::{ErrorKind, Write as _},
+};
 
 use proptest::{prelude::*, test_runner::Config};
 
@@ -9,12 +12,16 @@ use hex::{FromHex, ToHex};
 use zebra_test::prelude::*;
 
 use crate::{
-    parameters::GENESIS_PREVIOUS_BLOCK_HASH,
-    serialization::{SerializationError, ZcashDeserializeInto, ZcashSerialize},
+    parameters::{
+        testnet::{ConfiguredActivationHeights, RegtestParameters},
+        GENESIS_PREVIOUS_BLOCK_HASH,
+    },
+    serialization::{sha256d, SerializationError, ZcashDeserializeInto, ZcashSerialize},
+    work::equihash::Solution,
 };
 
 use super::super::{
-    arbitrary::{allow_all_transparent_coinbase_spends, PREVOUTS_CHAIN_HEIGHT},
+    arbitrary::{allow_all_transparent_coinbase_spends, any_fat_pointer, PREVOUTS_CHAIN_HEIGHT},
     *,
 };
 
@@ -84,6 +91,59 @@ proptest! {
 
             prop_assert_eq![bytes, other_bytes];
         }
+    }
+
+    /// The header bytes before the fat pointer are a standard Zcash header, what a standard
+    /// Equihash miner hashes. From FeaturenetUpgrade2 the proof-of-work hash is their `sha256d`,
+    /// so the pointer moves the block hash but not the proof-of-work hash; below it the
+    /// proof-of-work hash is the block hash. A header without a pointer, such as any version 4
+    /// header, has the two hashes agree.
+    #[test]
+    fn proof_of_work_hash_omits_the_fat_pointer_from_featurenet_upgrade_2(
+        header in any::<Header>(),
+        version in prop_oneof![Just(4u32), 5u32..(i32::MAX as u32)],
+        pointer in any_fat_pointer(),
+        other_pointer in any_fat_pointer(),
+        height in 0u32..20,
+    ) {
+        let _init_guard = zebra_test::init();
+
+        let network = Network::new_regtest(RegtestParameters::from(ConfiguredActivationHeights {
+            nu5: Some(1),
+            featurenet_upgrade_2: Some(10),
+            ..Default::default()
+        }));
+        let mut header = header;
+        header.version = version;
+        header.fat_pointer_to_bft_block = pointer;
+        let mut moved = header.clone();
+        moved.fat_pointer_to_bft_block = other_pointer;
+
+        let mut prefix = Vec::new();
+        header.zcash_serialize_without_fat_pointer(&mut prefix)?;
+        let bytes = header.zcash_serialize_to_vec()?;
+        prop_assert_eq!(prefix.len(), Solution::INPUT_LENGTH + 32 + Solution::SERIALIZED_SIZE);
+        prop_assert!(bytes.starts_with(&prefix));
+
+        let mut writer = sha256d::Writer::default();
+        writer.write_all(&prefix)?;
+        prop_assert_eq!(header.hash_without_fat_pointer(), Hash(writer.finish()));
+        prop_assert_eq!(header.hash_without_fat_pointer(), moved.hash_without_fat_pointer());
+        if version == 4 {
+            prop_assert_eq!(bytes.len(), prefix.len());
+        }
+        if bytes.len() == prefix.len() {
+            prop_assert_eq!(header.hash(), header.hash_without_fat_pointer());
+        } else {
+            prop_assert_ne!(header.hash(), header.hash_without_fat_pointer());
+        }
+
+        let expected = if height >= 10 {
+            header.hash_without_fat_pointer()
+        } else {
+            header.hash()
+        };
+        prop_assert_eq!(header.proof_of_work_hash(&network, Height(height)), expected);
     }
 }
 

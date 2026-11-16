@@ -147,7 +147,13 @@ where
     S::Future: Send + 'static,
     C: ChainTip + Clone + Send + Sync + 'static,
 {
-    let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
+    // With the legacy network off, nothing is bound: no inbound peers, and the port stays free.
+    let listener = if config.legacy_network {
+        Some(open_listener(&config.clone()).await)
+    } else {
+        None
+    };
+    let listen_addr = listener.as_ref().map_or(config.listen_addr, |(_, addr)| *addr);
 
     let (
         address_book,
@@ -267,6 +273,24 @@ where
         None,
     );
     let peer_set = Buffer::new(BoxService::new(peer_set), constants::PEERSET_BUFFER_SIZE);
+
+    // The legacy network is off: no peer source runs, so the peer set stays empty. Its senders and
+    // the demand receiver are held open, so the peer set sees no closed source, and the peer cache
+    // is left as it was.
+    let Some((tcp_listener, _)) = listener else {
+        info!("legacy Zcash network off (network.legacy_network = false): not listening or connecting");
+        let hold_open = tokio::spawn(
+            async move {
+                let _open = (peerset_tx, demand_tx, demand_rx, listen_handshaker, outbound_connector);
+                std::future::pending::<Result<(), BoxError>>().await
+            }
+            .in_current_span(),
+        );
+        handle_tx
+            .send(vec![hold_open, address_book_updater_guard])
+            .unwrap();
+        return (peer_set, address_book, misbehavior_tx);
+    };
 
     // Connect peerset_tx to the 3 peer sources:
     //

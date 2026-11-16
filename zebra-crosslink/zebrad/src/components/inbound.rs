@@ -536,7 +536,7 @@ impl Service<zn::Request> for Inbound {
                 let request = match sender {
                     Some(peer_addr) => mempool::Request::QueueFromPeer {
                         candidates: vec![transaction.into()],
-                        source: *peer_addr,
+                        source: mempool::PeerSource::Legacy(*peer_addr),
                     },
                     None => mempool::Request::Queue(vec![transaction.into()]),
                 };
@@ -554,7 +554,7 @@ impl Service<zn::Request> for Inbound {
                 let request = match advertiser {
                     Some(peer_addr) => mempool::Request::QueueFromPeer {
                         candidates: transactions.into_iter().map(Into::into).collect(),
-                        source: *peer_addr,
+                        source: mempool::PeerSource::Legacy(*peer_addr),
                     },
                     None => mempool::Request::Queue(
                         transactions.into_iter().map(Into::into).collect(),

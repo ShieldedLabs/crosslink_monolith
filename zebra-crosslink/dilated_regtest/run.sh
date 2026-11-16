@@ -23,7 +23,7 @@ BOND=10000000; STAKING_HEIGHT=150; ROSTER_HEIGHT=300; ACTIVATION_HEIGHT=450
 PORT=(8232 8242); PID=(); FAIL=0
 # A run gets two minutes of wall clock, pass or fail. The signal is only handled between
 # commands, so no RPC may outlast the deadline.
-TIMEOUT=120; DEADLINE=$(( $(date +%s) + TIMEOUT ))
+TIMEOUT=${TIMEOUT:-120}; DEADLINE=$(( $(date +%s) + TIMEOUT ))
 trap 'echo "FAILED: timed out after $TIMEOUT s; logs in $OUT"; exit 1' TERM
 ( sleep $TIMEOUT; kill -TERM $$ ) >/dev/null 2>&1 & WATCHDOG=$!
 
@@ -163,7 +163,7 @@ for k in 0 1; do
   L=$(logs $k)
   echo "$L" | grep -q "panicked" && fail "node$k panicked"
   echo "$L" | grep -q "empty roster" && fail "node$k has an empty bootstrap roster"
-  bad=$(echo "$L" | grep ' ERROR ' | grep -vc 'not yet implemented: all the documented validations')
+  bad=$(echo "$L" | grep -c ' ERROR ')
   [ "$bad" = 0 ] || fail "node$k logged $bad unexpected ERROR lines"
   dec=$(echo "$L" | grep -c 'Successfully decided BFT block'); need=$(( (TARGET - ACTIVATION_HEIGHT) / 4 ))
   [ "$dec" -ge "$need" ] || fail "node$k decided $dec BFT blocks, expected at least $need"

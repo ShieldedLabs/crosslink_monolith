@@ -1547,6 +1547,7 @@ async fn banned_connected_inbound_peer_is_dropped_from_peer_set() {
         initial_testnet_peers: IndexSet::new(),
         cache_dir: CacheDir::disabled(),
 
+        legacy_network: true,
         ..Config::default()
     };
 
@@ -2139,6 +2140,7 @@ async fn add_initial_peers_deadlock() {
         network: Network::Mainnet,
         listen_addr: unused_v4,
 
+        legacy_network: true,
         ..Config::default()
     };
 
@@ -2157,6 +2159,38 @@ async fn add_initial_peers_deadlock() {
 }
 
 /// Open a local listener on `listen_addr` for `network`.
+/// With the legacy network off (the default), init binds nothing and dials no initial peer,
+/// and the peer set it returns still answers, with no peers.
+#[tokio::test]
+async fn legacy_network_off_neither_listens_nor_connects() {
+    let _init_guard = zebra_test::init();
+
+    // A peer we control, listed as an initial peer: it must never be dialled.
+    let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let listen_port = random_known_port();
+    let config = Config {
+        listen_addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), listen_port),
+        network: Network::Mainnet,
+        initial_mainnet_peers: [peer_addr.to_string()].into_iter().collect(),
+        cache_dir: CacheDir::disabled(),
+        ..Config::default()
+    };
+    assert!(!config.legacy_network, "off by default");
+
+    let inbound_service = service_fn(|_| async { unreachable!("no peer can reach us") });
+    let (_peer_set, _address_book, _misbehavior) =
+        init(config, inbound_service, NoChainTip, "Test user agent".to_string()).await;
+
+    // Nothing holds our listen port.
+    tokio::net::TcpListener::bind(("127.0.0.1", listen_port))
+        .await
+        .expect("the legacy listen port is left free");
+    // The initial peer is never dialled.
+    let dialled = tokio::time::timeout(Duration::from_secs(2), peer.accept()).await;
+    assert!(dialled.is_err(), "the initial peer was dialled: {dialled:?}");
+}
+
 /// Asserts that the local listener address works as expected.
 async fn local_listener_port_with(listen_addr: SocketAddr, network: Network) {
     let config = Config {
@@ -2168,6 +2202,7 @@ async fn local_listener_port_with(listen_addr: SocketAddr, network: Network) {
         initial_testnet_peers: IndexSet::new(),
         cache_dir: CacheDir::disabled(),
 
+        legacy_network: true,
         ..Config::default()
     };
     let inbound_service =
@@ -2236,6 +2271,7 @@ where
         network,
         listen_addr: force_listen_addr.into().unwrap_or(unused_v4),
 
+        legacy_network: true,
         ..default_config
     };
 

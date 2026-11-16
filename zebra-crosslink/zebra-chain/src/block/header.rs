@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::{
     fmt::HexDebug,
     parameters::Network,
-    serialization::{TrustedPreallocate, MAX_HEADERS_PER_MESSAGE},
+    serialization::{sha256d, TrustedPreallocate, MAX_HEADERS_PER_MESSAGE},
     work::{difficulty::CompactDifficulty, equihash::Solution},
 };
 
@@ -167,6 +167,33 @@ impl Header {
     /// Compute the hash of this header.
     pub fn hash(&self) -> Hash {
         Hash::from(self)
+    }
+
+    /// `sha256d` over the header without its fat pointer: the hash a standard Equihash miner
+    /// computes, since its firmware knows nothing past the solution.
+    pub fn hash_without_fat_pointer(&self) -> Hash {
+        let mut writer = sha256d::Writer::default();
+        self.zcash_serialize_without_fat_pointer(&mut writer)
+            .expect("Sha256dWriter is infallible");
+        Hash(writer.finish())
+    }
+
+    /// Whether the difficulty filter at `height` compares [`Self::hash_without_fat_pointer`]
+    /// instead of the block hash. It does from FeaturenetUpgrade2, where the block commitment
+    /// binds the fat pointer (`fat_pointer_digest_at`): the pointer is then inside the Equihash
+    /// input, so leaving it out of the filter's hash frees no grinding.
+    pub fn proof_of_work_omits_fat_pointer(network: &Network, height: Height) -> bool {
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+        network.is_nu_active(NetworkUpgrade::FeaturenetUpgrade2, height.0.into())
+    }
+
+    /// The hash the difficulty filter compares with this header's threshold at `height`.
+    pub fn proof_of_work_hash(&self, network: &Network, height: Height) -> Hash {
+        if Self::proof_of_work_omits_fat_pointer(network, height) {
+            self.hash_without_fat_pointer()
+        } else {
+            self.hash()
+        }
     }
 
     /// The serialized size of a block header on Mainnet and Testnet (except Regtest), in bytes:

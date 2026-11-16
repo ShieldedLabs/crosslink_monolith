@@ -106,7 +106,8 @@ pub fn difficulty_threshold_is_valid(
 ///   - the target difficulty limit for `network` (PoWLimit), and
 ///   - the difficulty filter,
 ///
-/// based on the fields in `header`.
+/// based on the fields in `header`. From FeaturenetUpgrade2 the filter compares
+/// `header.hash_without_fat_pointer()` instead of `hash` (`Header::proof_of_work_omits_fat_pointer`).
 ///
 /// If the block is invalid, returns an error containing `height` and `hash`.
 pub fn difficulty_is_valid(
@@ -127,7 +128,12 @@ pub fn difficulty_is_valid(
     // https://zips.z.cash/protocol/protocol.pdf#blockheader
     //
     // The difficulty filter is also context-free.
-    if hash > &difficulty_threshold {
+    let proof_of_work_hash = if Header::proof_of_work_omits_fat_pointer(network, *height) {
+        header.hash_without_fat_pointer()
+    } else {
+        *hash
+    };
+    if proof_of_work_hash > difficulty_threshold {
         Err(BlockError::DifficultyFilter(
             *height,
             *hash,

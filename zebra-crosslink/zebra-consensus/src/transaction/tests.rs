@@ -506,9 +506,9 @@ async fn mempool_rejects_oversized_staking_amount() {
         ironwood_shielded_data: None,
         staking_action: Some(StakingAction::CreateNewDelegationBond {
             amount_zats: zebra_chain::amount::MAX_MONEY as u64 + 1,
-            unique_pubkey: finalizer_key_from_seed(b"bond").2 .0,
+            unique_pubkey: finalizer_key_from_seed(b"bond").1 .0,
             bond_salt: [0; 32],
-            target_finalizer: FinalizerAddress::create(&finalizer_key_from_seed(b"target").1),
+            target_finalizer: FinalizerAddress::create(&finalizer_key_from_seed(b"target").0),
             signature: [0; 64],
         }),
     };
@@ -4891,6 +4891,54 @@ mod staking_signature {
         assert!(matches!(err, TransactionError::StakingActionSignatureInvalid { .. }));
     }
 
+    fn coinbase_with(staking_action: Option<StakingAction>) -> Transaction {
+        Transaction::VCrosslink {
+            network_upgrade: NU,
+            lock_time: LockTime::Height(block::Height(0)),
+            expiry_height: block::Height(1),
+            inputs: vec![zebra_chain::transparent::Input::Coinbase {
+                height: block::Height(1),
+                data: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+            staking_action,
+        }
+    }
+
+    /// The coinbase balance leaves staking value out, so any staking action in a coinbase is
+    /// refused: a bond created there would be paid for by nothing. The rule comes first in
+    /// `check_block_transaction`, so a coinbase outside the staking window gets this error too.
+    #[test]
+    fn coinbase_with_a_staking_action_is_rejected() {
+        let network = zebra_chain::parameters::Network::new_regtest(Default::default());
+        let (create, key) = create_action([0xa1; 32]);
+        let unique_pubkey = create.unique_pubkey();
+        let actions = [
+            create,
+            StakingAction::BeginDelegationUnbonding { unique_pubkey, signature: [0; 64], spends: None },
+            StakingAction::WithdrawDelegationBond { amount_zats: AMOUNT, unique_pubkey, signature: [0; 64], spends: None },
+        ];
+
+        for action in actions {
+            let coinbase = coinbase_with(Some(action));
+            assert!(matches!(
+                check::coinbase_has_no_staking_action(&coinbase),
+                Err(TransactionError::CoinbaseHasStakingAction)
+            ));
+            assert!(matches!(
+                crate::transaction::check_block_transaction(&coinbase, block::Height(1), chrono::Utc::now(), &network),
+                Err(TransactionError::CoinbaseHasStakingAction)
+            ));
+        }
+
+        assert!(check::coinbase_has_no_staking_action(&coinbase_with(None)).is_ok());
+        assert!(check::coinbase_has_no_staking_action(&signed_with(create, &key)).is_ok());
+    }
+
     /// The mempool admits a staking action only if the bond at the tip allows it, which is what
     /// keeps a second unbonding of the same bond out of the mempool and out of block templates.
     #[test]
@@ -4911,6 +4959,7 @@ mod staking_signature {
                 status,
                 last_action_height: LAST_ACTION,
                 target_finalizer: TARGET,
+                version: KEY,
             })
         };
         let ready = Height(LAST_ACTION + STAKING.action_delay);
@@ -4950,6 +4999,47 @@ mod staking_signature {
         assert!(convert(500, 500, bond(0)).is_err());
     }
 
+    /// Sweeps every combination of upgrade state, spent version and bond: the mempool admits an
+    /// action on a bond only in the form the upgrade asks for, and from FeaturenetUpgrade3 only
+    /// when it spends the bond's current version, so a replayed or stale action stays out.
+    #[test]
+    fn mempool_staking_action_spends_rules() {
+        use zebra_chain::amount::Amount;
+        use zebra_state::BondInfoResponse;
+
+        use crate::transaction::check_staking_action_spends;
+
+        const KEY: [u8; 32] = [1; 32];
+        let versions = [KEY, [2; 32], [3; 32]];
+
+        for version in versions {
+            let info = BondInfoResponse {
+                amount: Amount::try_from(500u64).unwrap(),
+                status: 0,
+                last_action_height: 0,
+                target_finalizer: [7; 32],
+                version,
+            };
+            for bond_info in [None, Some(&info)] {
+                for spends in std::iter::once(None).chain(versions.map(Some)) {
+                    for spends_versions in [false, true] {
+                        let accepted = check_staking_action_spends(KEY, spends, spends_versions, bond_info).is_ok();
+                        let expected = match (spends_versions, spends) {
+                            (false, spends) => spends.is_none(),
+                            (true, None) => false,
+                            (true, Some(spends)) => bond_info.is_none_or(|info| info.version == spends),
+                        };
+                        assert_eq!(
+                            accepted, expected,
+                            "spends_versions {spends_versions}, spends {spends:?}, bond version {:?}",
+                            bond_info.map(|info| info.version)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// ZIP 215 accepts small-order keys, and under one the all-zero signature verifies over
     /// any message, so a bond with such a key could be spent by anyone. Both halves are
     /// asserted: the premise, so the check cannot silently stop firing, and the rejection.
@@ -4974,6 +5064,49 @@ mod staking_signature {
             let err = check(&tx).unwrap_err();
             assert!(matches!(err, TransactionError::StakingActionBondKeyInvalid { .. }));
         }
+    }
+
+    /// The same holds for a finalizer key: the identity key with the signature R = identity,
+    /// s = 0 is a finalizer address that verifies, and that signature authorizes any reward
+    /// conversion. From FeaturenetUpgrade3 the transaction verifier refuses both; before it they
+    /// pass, as they always did.
+    #[test]
+    fn small_order_finalizer_keys_are_refused_from_featurenet_upgrade_3() {
+        use zebra_chain::parameters::{testnet::ConfiguredActivationHeights, Network};
+
+        let network = Network::new_regtest(
+            ConfiguredActivationHeights { featurenet_upgrade_3: Some(150), ..Default::default() }.into(),
+        );
+        let activation = NetworkUpgrade::FeaturenetUpgrade3.activation_height(&network).expect("scheduled on this regtest");
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut forged = [0u8; 64];
+        forged[0] = 1;
+
+        let (create, _) = create_action([0xa1; 32]);
+        let StakingAction::CreateNewDelegationBond { amount_zats, unique_pubkey, bond_salt, signature, .. } = create else {
+            unreachable!("create_action builds a create")
+        };
+        let to_small_order = tx_with(Some(StakingAction::CreateNewDelegationBond {
+            amount_zats, unique_pubkey, bond_salt, signature,
+            target_finalizer: FinalizerAddress { pub_key: PubKeyID(identity), sig: TMSig(forged) },
+        }));
+        let converted_by_anyone = tx_with(Some(StakingAction::ConvertFinalizerRewardToDelegationBond {
+            unique_pubkey, signature, bond_salt, this_finalizer: identity, amount_zats, finalizer_signature: forged,
+        }));
+
+        let before = block::Height(activation.0 - 1);
+        for tx in [&to_small_order, &converted_by_anyone] {
+            assert!(crate::transaction::check_staking_target_capability(tx, before, &network).is_ok());
+        }
+        assert!(matches!(
+            crate::transaction::check_staking_target_capability(&to_small_order, activation, &network),
+            Err(TransactionError::StakingActionInvalidFinalizerAddress { pub_key }) if pub_key == identity
+        ));
+        assert!(matches!(
+            crate::transaction::check_staking_target_capability(&converted_by_anyone, activation, &network),
+            Err(TransactionError::StakingActionFinalizerAuthorizationInvalid { finalizer }) if finalizer == identity
+        ));
     }
 
     #[test]

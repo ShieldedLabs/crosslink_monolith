@@ -39,6 +39,9 @@ use crate::service::finalized_state::ZebraDb;
 use crate::service::write::WriteBlockWorkerTask;
 use crate::CrosslinkVerdict;
 
+/// The highest BFT block version this node understands, and the one it proposes.
+pub const BFT_BLOCK_VERSION_LATEST: u32 = 2;
+
 /// While set, this node proposes no new BFT blocks.
 pub static BFT_PAUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -268,16 +271,20 @@ pub(crate) fn drop_bft(reason: String, decided: (Height, Hash), db: &ZebraDb) {
 }
 
 fn stop_bft(reason: String, db_path: &std::path::Path) {
-    let mut dropped = DROPPED_BFT.lock().unwrap();
-    if dropped.is_some() {
-        return;
-    }
-    let message = format!(
+    halt_bft(format!(
         "crosslink: BFT is stopped on this node. {reason} Following that decision needs a \
          reorganization deeper than {} blocks. The node keeps running as proof of work, without \
          finality. Delete {} and resync to rejoin BFT.",
         crate::constants::MAX_BLOCK_REORG_HEIGHT, db_path.display(),
-    );
+    ));
+}
+
+/// Stop BFT on this node with `message` as the standing report.
+fn halt_bft(message: String) {
+    let mut dropped = DROPPED_BFT.lock().unwrap();
+    if dropped.is_some() {
+        return;
+    }
     tracing::error!("{message}");
     *dropped = Some((message, std::time::Instant::now()));
     metrics::gauge!("state.crosslink.bft_dropped").set(1.0);
@@ -331,6 +338,15 @@ pub fn bft_recency_status() -> TFLRecencyStatus {
     RECENCY_STATUS.borrow().clone()
 }
 
+// The sync thread parks a decision while tenderlink waits on its answer, so the engine cannot
+// republish the status then: the sync thread publishes this part itself, and the engine copies it.
+static PARKED_DECISION_HEIGHT: Mutex<Option<u64>> = Mutex::new(None);
+
+fn publish_parked_decision_height(height: Option<u64>) {
+    *PARKED_DECISION_HEIGHT.lock().unwrap() = height;
+    RECENCY_STATUS.send_modify(|status| status.parked_decision_height = height);
+}
+
 /// What tenderlink (and the test harness) ask the sync thread.
 pub enum BftRequest {
     Propose {
@@ -354,22 +370,51 @@ pub enum BftRequest {
         fat_pointer: FatPointerToBftBlock,
         proposal_sigs: Vec<TMSig>,
         /// The proposal's valid round, which its chunk signatures cover; -1 for none. Checked,
-        /// not stored: the database has no place for it yet, so `restore` rebuilds every decided
-        /// round with -1, and chunks of a re-proposed value re-served after a restart carry the
-        /// wrong valid round for their signatures.
+        /// not stored: `restore` reads it back from the signatures (`proposal_valid_round`).
         valid_round: i64,
+        /// Require the certificate to carry a quorum of the height's roster even before
+        /// FeaturenetUpgrade2: set for decisions fetched from peers, where nothing else vouches
+        /// for them. Imports keep the rule of the height they were decided at.
+        require_certificate: bool,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
 }
 
+/// What reaches the sync thread while it waits out the idle part of its tick.
+pub(super) enum SyncWake {
+    /// Served where it arrives, without ending the wait.
+    Bft(BftRequest),
+    /// Work the next tick takes up, such as a packet: the wait ends early for it, though no
+    /// sooner than WOKEN_TICK_MIN_MS after the tick began, so a stream of them shares ticks.
+    Work,
+    /// Work a local caller is waiting on, such as a submitted block: the wait ends at once. Local
+    /// callers are this node's own (RPC, miner), not peers, so they cannot spin the loop.
+    Now,
+}
+
 // A std channel rather than a tokio one: the receiver blocks the sync thread in the idle part of
 // its tick (`BftRunner::wait`), which a tokio receiver cannot do.
-static BFT_REQUEST_SENDER: OnceLock<std::sync::mpsc::Sender<BftRequest>> = OnceLock::new();
+static SYNC_WAKE_SENDER: OnceLock<std::sync::mpsc::Sender<SyncWake>> = OnceLock::new();
 
 fn send_request(request: BftRequest) -> bool {
-    match BFT_REQUEST_SENDER.get() {
-        Some(tx) => tx.send(request).is_ok(),
+    match SYNC_WAKE_SENDER.get() {
+        Some(tx) => tx.send(SyncWake::Bft(request)).is_ok(),
         None => false,
+    }
+}
+
+/// Start the sync thread's next tick now rather than at the end of its idle wait, for work it
+/// takes up only at the top of a tick. Wakes that arrive together share one tick.
+pub(super) fn wake_sync_thread() {
+    if let Some(tx) = SYNC_WAKE_SENDER.get() {
+        let _ = tx.send(SyncWake::Work);
+    }
+}
+
+/// As [`wake_sync_thread`], for work a local caller waits on: the next tick starts at once.
+pub(super) fn wake_sync_thread_now() {
+    if let Some(tx) = SYNC_WAKE_SENDER.get() {
+        let _ = tx.send(SyncWake::Now);
     }
 }
 
@@ -383,7 +428,7 @@ pub async fn force_feed_bft_block(
     valid_round: i64,
 ) -> Result<(), String> {
     let (reply, rx) = tokio::sync::oneshot::channel();
-    let request = BftRequest::ForceFeed { block, fat_pointer, proposal_sigs, valid_round, reply };
+    let request = BftRequest::ForceFeed { block, fat_pointer, proposal_sigs, valid_round, require_certificate: false, reply };
     if !send_request(request) {
         return Err("new_network is not running".to_string());
     }
@@ -405,7 +450,7 @@ pub async fn validate_bft_block(block: BftBlock) -> Result<(TMStatus, TMStatusRe
 /// Tenderlink certifies a hash of a proposal's raw bytes, but `decide` checks the hash of the
 /// block re-serialized. A proposal that parses but is not canonical (trailing bytes, for one)
 /// would be certified and then abort every node that reaches `decide`, so validation refuses it.
-fn bft_block_from_canonical_bytes(bytes: &[u8]) -> Option<BftBlock> {
+pub(super) fn bft_block_from_canonical_bytes(bytes: &[u8]) -> Option<BftBlock> {
     let block = BftBlock::zcash_deserialize(bytes).ok()?;
     let canonical = block.zcash_serialize_to_vec().ok()?;
     (canonical == bytes).then_some(block)
@@ -415,8 +460,23 @@ fn bft_block_from_canonical_bytes(bytes: &[u8]) -> Option<BftBlock> {
 /// and who to connect to. The decided chain is persisted in the finalized database.
 pub struct BftLaunch {
     pub signing_key: ed25519_zebra::SigningKey,
+    /// `ip:port`. Once `network` is set, tenderlink speaks with the node's key on the node's
+    /// port, and this matters only in that it must parse: tenderlink uses its endpoint's port
+    /// alone.
     pub public_address: String,
+    /// `bft_peers`. Unused once `network` is set, whose seeds are the node's initial peers.
     pub peer_addresses: Vec<String>,
+    /// The node's own transport, key, port and initial peers, which tenderlink shares with the
+    /// base protocol. Filled in by `new_network::sync`; `None` gives tenderlink a transport of
+    /// its own, keyed by `public_address` as before.
+    pub network: Option<BftNetwork>,
+}
+
+pub struct BftNetwork {
+    pub transport: tenderlink::transport::SharedTransport,
+    pub keypair: tenderlink::stp::IdentityKeyPair,
+    pub port: u16,
+    pub seeds: Vec<tenderlink::stp::STPAddress>,
 }
 
 pub fn bc_hdr_to_lrz(header: &Header) -> BcBlockHeader {
@@ -426,11 +486,17 @@ pub fn bc_hdr_to_lrz(header: &Header) -> BcBlockHeader {
 }
 
 /// The context-free proof-of-work checks for a carried bc-header: a well-formed difficulty
-/// threshold within the network's PoWLimit, a block hash under that threshold, and a valid
+/// threshold within the network's PoWLimit, a proof-of-work hash under that threshold, and a valid
 /// Equihash solution. These are the same checks Zebra's block verifier applies to a header before
 /// it has the block's ancestry, including its exemption: on a network with PoW disabled it checks
-/// only the threshold, so a header here must not have to meet more than its block did.
-fn header_pow_is_valid(header: &BcBlockHeader, network: &zebra_chain::parameters::Network) -> Result<(), String> {
+/// only the threshold, so a header here must not have to meet more than its block did. The hash
+/// the filter compares depends on the header's height, unknown until the snapshot is, so this
+/// lets through a header either hash meets, and [`header_meets_filter_at`] settles it once the
+/// height is known.
+fn header_pow_is_valid(
+    header: &BcBlockHeader,
+    network: &zebra_chain::parameters::Network,
+) -> Result<(), String> {
     use zebra_chain::work::difficulty::ParameterDifficulty as _;
     let header = header_from_lrz(header)?;
     let hash = header.hash();
@@ -444,10 +510,33 @@ fn header_pow_is_valid(header: &BcBlockHeader, network: &zebra_chain::parameters
     if network.disable_pow() {
         return Ok(());
     }
-    if hash > threshold {
+    if hash > threshold && header.hash_without_fat_pointer() > threshold {
         return Err(format!("hash {hash} does not meet difficulty threshold {threshold:?}"));
     }
     header.solution.check(&header).map_err(|e| e.to_string())
+}
+
+/// The difficulty filter for a carried bc-header at `height`, its position on its chain, which
+/// picks the hash the filter compares (`Header::proof_of_work_hash`). The header's other proof-of-
+/// work checks are [`header_pow_is_valid`]'s.
+fn header_meets_filter_at(
+    header: &BcBlockHeader,
+    network: &zebra_chain::parameters::Network,
+    height: Height,
+) -> Result<(), String> {
+    if network.disable_pow() {
+        return Ok(());
+    }
+    let header = header_from_lrz(header)?;
+    let threshold = header
+        .difficulty_threshold
+        .to_expanded()
+        .ok_or_else(|| format!("invalid difficulty threshold {:?}", header.difficulty_threshold))?;
+    let hash = header.proof_of_work_hash(network, height);
+    if hash > threshold {
+        return Err(format!("proof-of-work hash {hash} at {height:?} does not meet difficulty threshold {threshold:?}"));
+    }
+    Ok(())
 }
 
 fn header_from_lrz(header: &BcBlockHeader) -> Result<Header, String> {
@@ -551,12 +640,14 @@ pub fn terminated_finalizers_at(
     set
 }
 
-/// Vote-namespacing domain separator for a BFT height: a flat blake3 hash of the prefix of
-/// scheduled slashforks whose `bft_certificate_height <= bft_height` (inclusive of a slashfork at
-/// `bft_height` itself), concatenated in canonical schedule order. An empty prefix yields
+/// Vote-namespacing domain separator for a BFT height: a flat blake3 hash of the scheduled
+/// slashforks whose `bft_certificate_height <= bft_height` (inclusive of a slashfork at
+/// `bft_height` itself), concatenated in canonical schedule order. An empty set yields
 /// `[0; 32]` (nil), so the no-slashfork case is a backwards-compatible no-op in tenderlink's
-/// signing. The schedule is sorted with non-decreasing `bft_certificate_height` (several rules
-/// may share one certificate height), so the filtered set is exactly the prefix.
+/// signing. The real `bft_certificate_height`s in the schedule are non-decreasing (several rules
+/// may share one certificate height), but PoW-only rules (`SlashForkConfig::NEVER`) can come
+/// between them. The filter therefore selects a subsequence, not a prefix, and must not stop at
+/// the first rule that fails it.
 ///
 /// At a height that decides by the strict quorum (`strict_quorum_at`) the FeaturenetUpgrade2
 /// branch ID follows the slashforks. A finalizer still deciding on `2f+1` and one deciding on the
@@ -701,6 +792,69 @@ pub fn fat_pointer_to_block_at_height(
     }
 }
 
+/// The valid round a decided height's proposal signatures were made in. The database keeps the
+/// signatures but not that round, and tenderlink re-serves each chunk signed over it, so restoring
+/// it as -1 re-serves a re-proposed value with signatures that do not verify. With the height's
+/// voting roster the proposer and namespace are known exactly, and a valid round lies below the
+/// decided round: round 0 and a round with no proposer need no search.
+///
+/// `None` when no valid round makes every signature verify.
+fn proposal_valid_round(
+    block: &BftBlock,
+    fat_pointer: &FatPointerToBftBlock,
+    proposal_sigs: &[TMSig],
+    voting: &VotingRoster,
+    active_roster_max_n: usize,
+) -> Option<i64> {
+    let round = fat_pointer.get_vote_template().round;
+    if proposal_sigs.is_empty() || round <= 0 {
+        return Some(-1);
+    }
+    // A positive i32 round fits u32.
+    let round_u32 = round as u32;
+    let height = u64::from(block.height);
+    // An empty roster (the genesis height) has no proposer; tenderlink would log asking it for one.
+    let proposer_i = if voting.roster.is_empty() { None } else { tenderlink::proposer_index(&HashKeys::default(), &voting.roster, active_roster_max_n, height, round_u32) };
+    let Some(proposer_i) = proposer_i else {
+        return Some(-1);
+    };
+    let proposer = voting.roster[proposer_i].pub_key;
+    let value = block.zcash_serialize_to_vec().ok()?;
+    let value_id = tenderlink::ValueId(fat_pointer.points_at_block_hash().0);
+    (-1..i64::from(round)).find(|&valid_round| {
+        tenderlink::first_bad_proposal_chunk_sig(proposer, &value, value_id, height, round_u32, valid_round, &voting.vote_namespace, proposal_sigs).is_none()
+    })
+}
+
+/// A fetched decision's proposal signatures, kept if they verify as the round proposer's over
+/// a fresh proposal (valid round -1, which every round-0 decision is), else none. One check,
+/// never a search over valid rounds: the database does not store the valid round, and a peer
+/// chooses the round. Without them the decision stands, but tenderlink cannot re-serve that
+/// height's proposal chunks.
+///
+/// TODO: store the valid round with each decision and send it in BFT_DECISIONS, so the
+/// signatures of re-proposed values are kept too. That is a database format change, deferred
+/// while this branch already changes the network format (network merge plan, open items).
+fn fresh_proposal_sigs(block: &BftBlock, fat_pointer: &FatPointerToBftBlock, sigs: Vec<TMSig>, voting: &VotingRoster, active_roster_max_n: usize) -> Vec<TMSig> {
+    let Ok(round) = u32::try_from(fat_pointer.get_vote_template().round) else { return Vec::new(); };
+    if sigs.is_empty() || voting.roster.is_empty() {
+        return Vec::new();
+    }
+    let height = u64::from(block.height);
+    let Some(proposer_i) = tenderlink::proposer_index(&HashKeys::default(), &voting.roster, active_roster_max_n, height, round) else {
+        return Vec::new();
+    };
+    let value = block.zcash_serialize_to_vec().expect("a BFT block serializes");
+    if sigs.len() != tenderlink::proposal_chunks_n(value.len()) {
+        return Vec::new();
+    }
+    let value_id = tenderlink::ValueId(fat_pointer.points_at_block_hash().0);
+    match tenderlink::first_bad_proposal_chunk_sig(voting.roster[proposer_i].pub_key, &value, value_id, height, round, -1, &voting.vote_namespace, &sigs) {
+        None => sigs,
+        Some(_) => Vec::new(),
+    }
+}
+
 /// The round data tenderlink keeps for an already-decided height, as the live path would have
 /// left it: precommit signatures placed by roster index, counts from the fat pointer.
 fn decided_round_data(
@@ -734,6 +888,7 @@ fn decided_round_data(
     round_data.roster = roster;
     round_data.counts.precommits = fat_pointer.signatures.len() as u64;
     round_data.counts.yes_precommits = fat_pointer.signatures.len() as u64;
+    round_data.proposal_valid_round = proposal_valid_round(block, fat_pointer, &proposal_sigs, voting, active_roster_max_n).unwrap_or(-1);
     round_data.proposal_sigs_n = proposal_sigs.len();
     round_data.proposal_sigs = proposal_sigs;
     round_data.proposal = BlockValue(block.zcash_serialize_to_vec().unwrap());
@@ -1023,8 +1178,70 @@ enum DecisionReply {
 
 /// The BFT side of the sync thread: answers tenderlink's requests against the writer's chains,
 /// bootstraps BFT from the bc-chain, and persists decisions.
+/// What [`BftRunner::feed_fetched`] did with a decision.
+pub(super) enum FeedOutcome {
+    Fed,
+    /// Not the next height, its snapshot is not committed yet, a decision is parked, or
+    /// validation cannot settle it yet: handed back to keep.
+    NotReady(super::bft_sync::WireDecision),
+    /// Not stored. `peer_fault`: the decision is wrong whatever this node's state (its
+    /// certificate names another block, or it is labelled with the wrong height), which no honest
+    /// peer sends. Otherwise the refusal may be this node's own state disagreeing.
+    Refused { why: String, peer_fault: bool },
+}
+
+/// A supplied decision that passed `BftRunner::check_force_fed`.
+enum ForceFed {
+    New,
+    AlreadyDecided,
+}
+
+/// Why a force-fed decision was not stored.
+struct FeedRefusal {
+    why: String,
+    kind: RefusalKind,
+}
+
+enum RefusalKind {
+    /// The decision is wrong whatever this node's state (its certificate names another block):
+    /// no honest peer sends it.
+    Fault,
+    /// Refused here, but the reason depends on this node's own state (its decided chain, roster,
+    /// slashfork schedule), so the sender may be honest and this node the odd one out.
+    Refused,
+    /// Cannot be settled yet (BFT dropped, a decision parked, validation indeterminate).
+    NotYet,
+}
+
+impl FeedRefusal {
+    fn fault(why: String) -> Self {
+        Self { why, kind: RefusalKind::Fault }
+    }
+    fn refused(why: String) -> Self {
+        Self { why, kind: RefusalKind::Refused }
+    }
+    fn not_yet(why: String) -> Self {
+        Self { why, kind: RefusalKind::NotYet }
+    }
+}
+
+/// Set once the zero-stake roster failure has been reported (`BftRunner::feed_fetched`).
+static ZERO_STAKE_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How many decided BFT heights this node holds. `validate` admits only the next height, so the
+/// decided chain has no gaps and its length is the next height to decide.
+pub(super) fn decided_len() -> u64 {
+    let chain = BFT_CHAIN.read().unwrap();
+    debug_assert_eq!(chain.voting_rosters.len(), chain.blocks.len(), "voting_rosters is indexed like blocks");
+    chain.blocks.len() as u64
+}
+
 pub(super) struct BftRunner {
-    rx: std::sync::mpsc::Receiver<BftRequest>,
+    rx: std::sync::mpsc::Receiver<SyncWake>,
+    /// A `SyncWake::Work` arrived and the tick it asks for has not started yet.
+    woken: bool,
+    /// The same for a `SyncWake::Now`.
+    woken_now: bool,
     rt: tokio::runtime::Handle,
     network: Network,
     params: ZcashCrosslinkParameters,
@@ -1048,6 +1265,12 @@ pub(super) struct BftRunner {
     /// Set while `tick` retries the parked decision, so only the first park is a warning.
     retrying_parked_decision: bool,
     next_diagnostic: std::time::Instant,
+    /// Set by the sync loop while peers hold many more decided heights than this node. It fetches
+    /// them as data then, and tenderlink would only crawl after them one height per exchange.
+    catching_up: bool,
+    /// Tenderlink was due to start while catching up. It starts from the stored chain once the
+    /// node has caught up.
+    spawn_deferred: bool,
 }
 
 struct ParkedDecision {
@@ -1074,9 +1297,11 @@ impl BftRunner {
         rt: tokio::runtime::Handle,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
-        let _ = BFT_REQUEST_SENDER.set(tx);
+        let _ = SYNC_WAKE_SENDER.set(tx);
         let mut runner = BftRunner {
             rx,
+            woken: false,
+            woken_now: false,
             rt,
             network: read_state.network().clone(),
             params: read_state.network().crosslink_parameters(),
@@ -1087,17 +1312,124 @@ impl BftRunner {
             parked_decision: None,
             retrying_parked_decision: false,
             next_diagnostic: std::time::Instant::now(),
+            catching_up: false,
+            spawn_deferred: false,
         };
         metrics::gauge!("state.crosslink.bft_dropped").set(0.0);
         crate::new_network::fin::load(&block_writer.finalized_state.db);
         if runner.launch.is_some() {
+            // A chain-bootstrapped node restarting with a stored chain holds tenderlink back until
+            // the sync loop has heard from peers whether it is behind (`set_catching_up`); it is
+            // started by `tick` then. A supplied-BFT network starts it here, as it always has.
+            runner.catching_up = !runner.fetches_genesis();
             runner.restore(read_state, block_writer);
         }
         runner
     }
 
+    /// Whether tenderlink is held back at startup: a chain was restored and is waiting for the
+    /// sync loop to say whether we are behind.
+    pub(super) fn held_at_startup(&self) -> bool {
+        self.spawn_deferred
+    }
+
+    /// Whether a decided block is waiting for its snapshot PoW block before it can be stored.
+    pub(super) fn has_parked_decision(&self) -> bool {
+        self.parked_decision.is_some()
+    }
+
+    /// Tell BFT whether the node is catching up on decided heights it fetches from peers.
+    pub(super) fn set_catching_up(&mut self, catching_up: bool) {
+        self.catching_up = catching_up;
+    }
+
+    /// Whether this network's BFT genesis comes from peers. On a chain-bootstrapped network every
+    /// node derives genesis itself (`bootstrap`), so it is never fetched.
+    pub(super) fn fetches_genesis(&self) -> bool {
+        !matches!(self.params.bootstrap, BftBootstrap::FromChain { .. })
+    }
+
+    /// Store a decided height fetched from a peer, if it is the next one and its snapshot is
+    /// committed. It is checked as a force-fed decision, and its certificate must carry a quorum
+    /// of the height's roster whatever the upgrade: no tenderlink round vouches for it.
+    pub(super) fn feed_fetched(&mut self, decision: super::bft_sync::WireDecision, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) -> FeedOutcome {
+        // A parked decision holds this height until its snapshot is back, and a dropped BFT for
+        // good. Neither says anything about the decision.
+        if bft_is_dropped() || self.parked_decision.is_some() {
+            return FeedOutcome::NotReady(decision);
+        }
+        // Judged by our bootstrap config, so not the peer's fault.
+        if decision.height == 0 && !self.fetches_genesis() {
+            return FeedOutcome::Refused { why: "genesis is derived from the chain, never fetched".to_string(), peer_fault: false };
+        }
+        let voting = {
+            let chain = BFT_CHAIN.read().unwrap();
+            if decision.height != chain.blocks.len() as u64 {
+                return FeedOutcome::NotReady(decision);
+            }
+            if decision.block.height as u64 != decision.height {
+                return FeedOutcome::Refused {
+                    why: format!("a block for BFT height {} sent as height {}", decision.block.height, decision.height),
+                    peer_fault: true,
+                };
+            }
+            let () = super::bft_sync::ASSUME_BFT_BLOCK_HAS_HEADERS;
+            debug_assert!(!decision.block.headers.is_empty());
+            if read_state.known_block(Hash(decision.block.snapshot_block_hash().0)).is_none() {
+                return FeedOutcome::NotReady(decision);
+            }
+            self.next_voting_roster(&chain)
+        };
+        // Past genesis, a roster with no stake has no honest decision to accept: the chain has
+        // failed, and only an operator can move it on (an import). Hold the decision, say so once.
+        if decision.height > 0 && voting.roster.iter().map(|member| member.stake).sum::<u64>() == 0 {
+            if !ZERO_STAKE_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::error!(
+                    "crosslink: BFT height {} has no stake in its roster, so no decision there is accepted from peers. \
+                     BFT cannot continue without manual intervention.",
+                    decision.height,
+                );
+            }
+            return FeedOutcome::NotReady(decision);
+        }
+        // Proposal signatures are not checked here: the certificate is what makes a decision
+        // decided. They are kept only if they verify as a fresh proposal's, below.
+        match self.check_force_fed(&decision.block, &decision.fat_pointer, &decision.proposal_sigs, -1, true, false, read_state, block_writer) {
+            Err(FeedRefusal { why, kind: RefusalKind::Fault }) => FeedOutcome::Refused { why, peer_fault: true },
+            Err(FeedRefusal { why, kind: RefusalKind::Refused }) => FeedOutcome::Refused { why, peer_fault: false },
+            Err(FeedRefusal { kind: RefusalKind::NotYet, .. }) => FeedOutcome::NotReady(decision),
+            Ok(ForceFed::AlreadyDecided) => FeedOutcome::Fed,
+            Ok(ForceFed::New) => {
+                let proposal_sigs = fresh_proposal_sigs(&decision.block, &decision.fat_pointer, decision.proposal_sigs, &voting, self.params.active_roster_max_n);
+                let (reply, mut rx) = tokio::sync::oneshot::channel();
+                self.decide(decision.block, decision.fat_pointer, proposal_sigs, DecisionReply::ForceFeed(reply), read_state, block_writer);
+                match rx.try_recv() {
+                    Ok(Ok(())) => FeedOutcome::Fed,
+                    Ok(Err(why)) => FeedOutcome::Refused { why, peer_fault: false },
+                    // Parked: stored once its snapshot is back, like tenderlink's own decisions.
+                    Err(_) => FeedOutcome::Fed,
+                }
+            }
+        }
+    }
+
     /// Work that runs at the start of every tick.
     pub(super) fn tick(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
+        // Tenderlink is not running but decisions are stored: held back while catching up, or the
+        // genesis (or more) arrived from peers or an import before bootstrap could decide it, so
+        // bootstrap never starts it. Start it from everything stored once not catching up. Only
+        // on chain-bootstrapped networks: where BFT is supplied, tenderlink starts at
+        // construction, and starting it here would race later imports.
+        if self.launch.is_some()
+            && !self.fetches_genesis()
+            && !self.catching_up
+            && self.pending_bootstrap.is_none()
+            && decided_len() > 0
+        {
+            self.spawn_deferred = false;
+            self.restore(read_state, block_writer);
+        }
+
         // Crosslink bootstrap: the first accepted PoW block at the activation height (h2)
         // finalizes h1 through a deterministic genesis decision, and BFT starts at height 1 with
         // h1's roster. A network whose BFT is supplied has no activation height and never
@@ -1122,6 +1454,7 @@ impl BftRunner {
                 self.decide(block, fat_pointer, proposal_sigs, reply, read_state, block_writer);
                 self.retrying_parked_decision = false;
             }
+            publish_parked_decision_height(self.parked_decision.as_ref().map(|parked| u64::from(parked.block.height)));
         }
 
         if self.next_diagnostic.elapsed() >= DIAGNOSTIC_INTERVAL {
@@ -1140,28 +1473,46 @@ impl BftRunner {
     }
 
     /// Serve requests until `deadline`: the idle part of the tick, so a BFT round does not wait
-    /// out the whole tick for its answer.
-    pub(super) fn wait(&mut self, deadline: std::time::Instant, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
+    /// out the whole tick for its answer. A wake for other work ends it sooner, at `earliest`
+    /// or once it arrives, whichever is later, so a stream of wakes cannot spin the tick.
+    pub(super) fn wait(
+        &mut self,
+        earliest: std::time::Instant,
+        deadline: std::time::Instant,
+        read_state: &ReadState,
+        block_writer: &mut WriteBlockWorkerTask,
+    ) {
         loop {
             let now = std::time::Instant::now();
-            if now >= deadline {
+            let until = if self.woken_now { now } else if self.woken { earliest.min(deadline) } else { deadline };
+            if now >= until {
+                self.woken = false;
+                self.woken_now = false;
                 return;
             }
-            match self.rx.recv_timeout(deadline - now) {
-                Ok(request) => self.handle(request, read_state, block_writer),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return,
+            match self.rx.recv_timeout(until - now) {
+                Ok(SyncWake::Bft(request)) => self.handle(request, read_state, block_writer),
+                Ok(SyncWake::Work) => self.woken = true,
+                Ok(SyncWake::Now) => self.woken_now = true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    std::thread::sleep(deadline - now);
+                    std::thread::sleep(until - now);
+                    self.woken = false;
+                    self.woken_now = false;
                     return;
                 }
             }
         }
     }
 
-    fn drain(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
+    /// Serve every request already waiting, without blocking. A wake met here is kept for the
+    /// next `wait`, since the work it announces may have arrived after the tick looked for it.
+    pub(super) fn drain(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
         loop {
             match self.rx.try_recv() {
-                Ok(request) => self.handle(request, read_state, block_writer),
+                Ok(SyncWake::Bft(request)) => self.handle(request, read_state, block_writer),
+                Ok(SyncWake::Work) => self.woken = true,
+                Ok(SyncWake::Now) => self.woken_now = true,
                 Err(_) => break,
             }
         }
@@ -1187,60 +1538,96 @@ impl BftRunner {
                 }
                 self.decide(block, fat_pointer, proposal_sigs, DecisionReply::Tenderlink(reply), read_state, block_writer);
             }
-            BftRequest::ForceFeed { block, fat_pointer, proposal_sigs, valid_round, reply } => {
-                if bft_is_dropped() {
-                    let _ = reply.send(Err("BFT is dropped on this node".to_string()));
-                    return;
-                }
-                // A decision at this height is already final and waits only for its snapshot;
-                // storing another one here would fork the chain under it.
-                if self.parked_decision.is_some() {
-                    let _ = reply.send(Err("a decided BFT block is waiting for its snapshot".to_string()));
-                    return;
-                }
-                if fat_pointer.points_at_block_hash() != block.blake3_hash() {
-                    let _ = reply.send(Err(format!(
-                        "Fat Pointer hash does not match block hash. fp: {} block: {}",
-                        fat_pointer.points_at_block_hash(), block.blake3_hash(),
-                    )));
-                    return;
-                }
-                if !fat_pointer.fits_active_roster(&self.params) {
-                    let _ = reply.send(Err(format!(
-                        "the fat pointer has {} signatures, more than the {} seats of the active roster",
-                        fat_pointer.signatures.len(), self.params.active_roster_max_n,
-                    )));
-                    return;
-                }
-                let (status, reason) = {
-                    let chain = BFT_CHAIN.read().unwrap();
-                    self.validate(&chain, read_state, &block)
-                };
-                if status != TMStatus::Pass {
-                    let _ = reply.send(Err(format!("PoS validation = {status:?}: {reason:?}")));
-                    return;
-                }
-                // Tenderlink decides only on a quorum, so from FeaturenetUpgrade2 a force-fed
-                // decision carries one too. Without this the node would hand miners, as the tip's
-                // certificate, a pointer its own admission refuses.
-                {
-                    let chain = BFT_CHAIN.read().unwrap();
-                    let voting = self.next_voting_roster(&chain);
-                    if voting.strict_quorum && !certificate_is_valid(&fat_pointer, u64::from(block.height), &voting) {
-                        let _ = reply.send(Err(format!(
-                            "the fat pointer is not a valid certificate for BFT height {}", block.height,
-                        )));
-                        return;
+            BftRequest::ForceFeed { block, fat_pointer, proposal_sigs, valid_round, require_certificate, reply } => {
+                match self.check_force_fed(&block, &fat_pointer, &proposal_sigs, valid_round, require_certificate, true, read_state, block_writer) {
+                    Err(refusal) => {
+                        let _ = reply.send(Err(refusal.why));
+                    }
+                    Ok(ForceFed::AlreadyDecided) => {
+                        // An import is accepted once; saying so beats a roster check of the wrong
+                        // height that would refuse it for a reason that is not true.
+                        let _ = reply.send(Err(format!("BFT height {} is decided already with this block", block.height)));
+                    }
+                    Ok(ForceFed::New) => {
+                        let block = Arc::unwrap_or_clone(block);
+                        self.decide(block, fat_pointer, proposal_sigs, DecisionReply::ForceFeed(reply), read_state, block_writer);
                     }
                 }
-                if let Err(why) = self.check_decision_roster(&block, &fat_pointer, &proposal_sigs, valid_round, block_writer) {
-                    let _ = reply.send(Err(why));
-                    return;
-                }
-                let block = Arc::unwrap_or_clone(block);
-                self.decide(block, fat_pointer, proposal_sigs, DecisionReply::ForceFeed(reply), read_state, block_writer);
             }
         }
+    }
+
+    /// Every check a decision supplied from outside gets before it is decided: an import's, or a
+    /// peer's. A block already decided at its height needs none: it is reported as such.
+    fn check_force_fed(
+        &self,
+        block: &BftBlock,
+        fat_pointer: &FatPointerToBftBlock,
+        proposal_sigs: &[TMSig],
+        valid_round: i64,
+        require_certificate: bool,
+        verify_proposal_sigs: bool,
+        read_state: &ReadState,
+        block_writer: &WriteBlockWorkerTask,
+    ) -> Result<ForceFed, FeedRefusal> {
+        if bft_is_dropped() {
+            return Err(FeedRefusal::not_yet("BFT is dropped on this node".to_string()));
+        }
+        // Hashing re-serializes the block, so it is done once here.
+        let block_hash = block.blake3_hash();
+        if BFT_CHAIN.read().unwrap().hash_to_height.get(&block_hash) == Some(&u64::from(block.height)) {
+            return Ok(ForceFed::AlreadyDecided);
+        }
+        // A decision at this height is already final and waits only for its snapshot;
+        // storing another one here would fork the chain under it.
+        if self.parked_decision.is_some() {
+            return Err(FeedRefusal::not_yet("a decided BFT block is waiting for its snapshot".to_string()));
+        }
+        if fat_pointer.points_at_block_hash() != block_hash {
+            return Err(FeedRefusal::fault(format!(
+                "Fat Pointer hash does not match block hash. fp: {} block: {}",
+                fat_pointer.points_at_block_hash(), block_hash,
+            )));
+        }
+        if !fat_pointer.fits_active_roster(&self.params) {
+            return Err(FeedRefusal::refused(format!(
+                "the fat pointer has {} signatures, more than the {} seats of the active roster",
+                fat_pointer.signatures.len(), self.params.active_roster_max_n,
+            )));
+        }
+        let (status, reason) = {
+            let chain = BFT_CHAIN.read().unwrap();
+            self.validate_with_hash(&chain, read_state, block, block_hash)
+        };
+        match status {
+            TMStatus::Pass => {}
+            TMStatus::Fail => return Err(FeedRefusal::refused(format!("PoS validation = {status:?}: {reason:?}"))),
+            _ => return Err(FeedRefusal::not_yet(format!("PoS validation = {status:?}: {reason:?}"))),
+        }
+        // Tenderlink decides only on a quorum, so from FeaturenetUpgrade2 a force-fed
+        // decision carries one too. Without this the node would hand miners, as the tip's
+        // certificate, a pointer its own admission refuses.
+        {
+            let chain = BFT_CHAIN.read().unwrap();
+            let voting = self.next_voting_roster(&chain);
+            // decide() treats a signature that does not verify as impossible and panics,
+            // as it is for tenderlink's own decisions. A fed decision can carry one, so
+            // refuse it here: before FeaturenetUpgrade2 nothing else checks first.
+            if !fat_pointer.validate_signatures(&voting.vote_namespace) {
+                return Err(FeedRefusal::refused(format!(
+                    "the fat pointer for BFT height {} carries a signature that does not verify", block.height,
+                )));
+            }
+            if (voting.strict_quorum || require_certificate) && !certificate_is_valid(fat_pointer, u64::from(block.height), &voting) {
+                return Err(FeedRefusal::refused(format!(
+                    "the fat pointer is not a valid certificate for BFT height {}", block.height,
+                )));
+            }
+        }
+        if verify_proposal_sigs {
+            self.check_decision_roster(block, fat_pointer, proposal_sigs, valid_round, block_writer).map_err(FeedRefusal::refused)?;
+        }
+        Ok(ForceFed::New)
     }
 
     /// A force-fed decision against the roster, as a real network has one. The genesis decision is
@@ -1270,7 +1657,9 @@ impl BftRunner {
             return Err(format!("the fat pointer's round {round} is negative"));
         };
         let voting = self.next_voting_roster(&BFT_CHAIN.read().unwrap());
-        let Some(proposer_i) = tenderlink::proposer_index(&HashKeys::default(), &voting.roster, self.params.active_roster_max_n, height, round) else {
+        // An empty roster has no proposer; tenderlink would log asking it for one.
+        let proposer_i = if voting.roster.is_empty() { None } else { tenderlink::proposer_index(&HashKeys::default(), &voting.roster, self.params.active_roster_max_n, height, round) };
+        let Some(proposer_i) = proposer_i else {
             return Err(format!("BFT height {height} has no proposer: its roster has no stake"));
         };
         let value = block.zcash_serialize_to_vec().expect("a BFT block serializes");
@@ -1430,24 +1819,16 @@ impl BftRunner {
             .cloned()
             .collect();
 
-        match BftBlock::try_from(params, bft_height as u32, fat_ptr, headers) {
-            Ok(mut block) => {
-                // Always propose v2 blocks: existing v1 blocks remain v1 (so their hashes and
-                // signatures are untouched), and v2 >= any parent's version satisfies the
-                // monotonic-version check.
-                block.version = 2;
-                // A slashfork block sets do_not_include to the greatest activation height it
-                // carries (pointing at this block commits to every certificate in it, so the
-                // strictest one governs); otherwise the parent's carries forward so it never
-                // regresses (both as `validate` requires).
-                if let Some(last) = scheduled_slashforks.last() {
-                    block.do_not_include_until_bc_height = last.pow_activation_height;
-                    block.slashforks = scheduled_slashforks;
-                } else {
-                    block.do_not_include_until_bc_height = parent_do_not_include;
-                }
-                Some(block)
-            }
+        // A slashfork block sets do_not_include to the greatest activation height it carries
+        // (pointing at this block commits to every certificate in it, so the strictest one
+        // governs); otherwise the parent's carries forward so it never regresses (both as
+        // `validate` requires).
+        let do_not_include = scheduled_slashforks.last().map_or(parent_do_not_include, |last| last.pow_activation_height);
+        // Always propose the latest version: existing v1 blocks remain v1 (so their hashes and
+        // signatures are untouched), and `validate` caps every block at the latest version, so
+        // it is >= any parent's.
+        match BftBlock::new(params, BFT_BLOCK_VERSION_LATEST, bft_height as u32, fat_ptr, headers, scheduled_slashforks, do_not_include) {
+            Ok(block) => Some(block),
             Err(e) => {
                 tracing::warn!("Unable to create BftBlock to propose, Error={:?}", e);
                 None
@@ -1456,7 +1837,32 @@ impl BftRunner {
     }
 
     fn validate(&self, chain: &BftChain, read_state: &ReadState, new_block: &BftBlock) -> (TMStatus, TMStatusReason) {
+        self.validate_with_hash(chain, read_state, new_block, new_block.blake3_hash())
+    }
+
+    /// `validate`, for a caller that already has the block's hash: hashing re-serializes it.
+    fn validate_with_hash(&self, chain: &BftChain, read_state: &ReadState, new_block: &BftBlock, new_block_hash: Blake3Hash) -> (TMStatus, TMStatusReason) {
         let fail = (TMStatus::Fail, TMStatusReason::None);
+
+        // A block already decided at its height is valid there. Tenderlink asks this while it
+        // catches up behind decisions the sync loop fetched from peers.
+        if chain.hash_to_height.get(&new_block_hash) == Some(&u64::from(new_block.height)) {
+            return (TMStatus::Pass, TMStatusReason::None);
+        }
+
+        // On a chain-bootstrapped network genesis is the one block every node derives from its
+        // own chain. Its nil roster lets any empty certificate pass, so nothing else would tell
+        // a different height-0 block from it.
+        if new_block.height == 0 && !self.fetches_genesis() {
+            match self.build_bootstrap_genesis(read_state) {
+                None => return (TMStatus::Indeterminate, TMStatusReason::None),
+                Some((genesis, _)) if genesis.blake3_hash() != new_block_hash => {
+                    tracing::warn!("refusing a BFT genesis {} that is not this chain's {}", new_block_hash, genesis.blake3_hash());
+                    return fail;
+                }
+                Some(_) => {}
+            }
+        }
 
         if !new_block.previous_block_fat_ptr.fits_active_roster(&self.params) {
             tracing::warn!(
@@ -1509,6 +1915,13 @@ impl BftRunner {
         // version 1, so this holds trivially for existing history.)
         if new_block.version < parent_version {
             tracing::warn!("BFT block version {} is below its parent's version {}", new_block.version, parent_version);
+            return fail;
+        }
+
+        // Without this cap one proposer could get a block above the version honest nodes
+        // propose decided, after which every honest proposal fails the check above.
+        if new_block.version > BFT_BLOCK_VERSION_LATEST {
+            tracing::warn!("BFT block version {} is above the latest known version {}", new_block.version, BFT_BLOCK_VERSION_LATEST);
             return fail;
         }
 
@@ -1568,12 +1981,14 @@ impl BftRunner {
             }
         }
 
-        // do_not_include_until_bc_height must be monotonic non-decreasing. (v1 blocks use the
-        // implicit value 0, so this holds for existing history.) In the slashfork case the checks
-        // above already guarantee this passes.
-        if new_block.do_not_include_until_bc_height < parent_do_not_include {
+        // Without a scheduled slashfork, do_not_include_until_bc_height must equal the parent's,
+        // as honest proposers set it. Allowing it only to rise would let one proposer raise it
+        // to u64::MAX, after which no PoW block could point at BFT again and the next slashfork
+        // block would fail as a regression. (v1 blocks use the implicit value 0, so this holds
+        // for existing history.)
+        if scheduled_slashforks.is_empty() && new_block.do_not_include_until_bc_height != parent_do_not_include {
             tracing::warn!(
-                "BFT block do_not_include_until_bc_height {} is below its parent's {}",
+                "BFT block do_not_include_until_bc_height {} differs from its parent's {} with no slashfork scheduled",
                 new_block.do_not_include_until_bc_height, parent_do_not_include,
             );
             return fail;
@@ -1633,6 +2048,14 @@ impl BftRunner {
             return needs_pow_block(new_final_hash);
         };
 
+        for (i, header) in new_block.headers.iter().enumerate() {
+            let height = Height(snapshot.height.0 + 1 + i as u32);
+            if let Err(reason) = header_meets_filter_at(header, network, height) {
+                tracing::warn!("BFT block header {i} fails proof of work: {reason}");
+                return fail;
+            }
+        }
+
         // From FeaturenetUpgrade2 each header must also carry the difficulty its position
         // requires, read from the snapshot's own ancestry, so the check stays objective.
         {
@@ -1683,12 +2106,63 @@ impl BftRunner {
         read_state: &ReadState,
         block_writer: &mut WriteBlockWorkerTask,
     ) {
-        if fat_pointer.points_at_block_hash() != new_block.blake3_hash() {
+        // Hashing re-serializes the block, so it is done once here.
+        let new_block_hash = new_block.blake3_hash();
+        if fat_pointer.points_at_block_hash() != new_block_hash {
             panic!(
                 "Fat Pointer hash does not match block hash. fp: {} block: {}",
-                fat_pointer.points_at_block_hash(), new_block.blake3_hash(),
+                fat_pointer.points_at_block_hash(), new_block_hash,
             );
         }
+
+        // A height decided already: the sync loop fed it from peers while tenderlink lagged.
+        // Answer as that decision did, so tenderlink moves on. Another block at a decided height
+        // needs a conflicting quorum: finalizers equivocated, and BFT stops.
+        {
+            let chain = BFT_CHAIN.read().unwrap();
+            let height = new_block.height as usize;
+            if chain.blocks.get(height).is_some_and(|stored| !stored.headers.is_empty()) {
+                let same = chain.hash_to_height.get(&new_block_hash) == Some(&(height as u64));
+                // Only the conflict, which ends BFT, needs the stored block's hash.
+                let chain_block_hash = (!same).then(|| chain.blocks[height].blake3_hash());
+                let next = match chain.voting_rosters.get(height + 1) {
+                    Some(voting) => (voting.roster.clone(), voting.vote_namespace, voting.strict_quorum),
+                    None => {
+                        let voting = self.next_voting_roster(&chain);
+                        (voting.roster, voting.vote_namespace, voting.strict_quorum)
+                    }
+                };
+                drop(chain);
+                if !same {
+                    // Two blocks at one height, each with a quorum certificate this node verified:
+                    // finalizers equivocated. Stop BFT, as for any decision this node cannot follow.
+                    halt_bft(format!(
+                        "crosslink: BFT is stopped on this node. BFT height {height} is decided with block {}, and a \
+                         quorum certificate also names block {}: finalizers voted for both. The node keeps running \
+                         as proof of work, without finality.",
+                        chain_block_hash.expect("computed when the blocks differ"), new_block_hash,
+                    ));
+                    match reply {
+                        // Tenderlink treats a closed reply as fatal; it is being aborted anyway.
+                        DecisionReply::Tenderlink(reply) => self.unanswered_decisions.push(reply),
+                        DecisionReply::ForceFeed(reply) => {
+                            let _ = reply.send(Err(format!("BFT height {height} is decided already with another block")));
+                        }
+                    }
+                    return;
+                }
+                match reply {
+                    DecisionReply::Tenderlink(reply) => {
+                        let _ = reply.send(next);
+                    }
+                    DecisionReply::ForceFeed(reply) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                }
+                return;
+            }
+        }
+
         let mut chain = BFT_CHAIN.write().unwrap();
         // Who voted at this height, read before the decision moves the chain on.
         let voting = self.next_voting_roster(&chain);
@@ -1698,7 +2172,7 @@ impl BftRunner {
             panic!("Signatures are not valid. Rejecting block.");
         }
 
-        match self.validate(&chain, read_state, &new_block) {
+        match self.validate_with_hash(&chain, read_state, &new_block, new_block_hash) {
             (TMStatus::Pass, _) => {}
             (TMStatus::Indeterminate, reason) => {
                 // Tenderlink decides only on a Pass from this node, so the block this
@@ -1708,11 +2182,11 @@ impl BftRunner {
                 // validator set, which is the stake at a snapshot this node does not hold.
                 drop(chain);
                 if self.retrying_parked_decision {
-                    tracing::debug!("decided BFT block {} at height {} is still parked: {reason:?}", new_block.blake3_hash(), new_block.height);
+                    tracing::debug!("decided BFT block {} at height {} is still parked: {reason:?}", new_block_hash, new_block.height);
                 } else {
                     tracing::warn!(
                         "parking decided BFT block {} at height {}: {reason:?}",
-                        new_block.blake3_hash(), new_block.height,
+                        new_block_hash, new_block.height,
                     );
                 }
                 if let (DecisionReply::Tenderlink(_), TMStatusReason::NeedsBlock { hash }) = (&reply, &reason) {
@@ -1721,13 +2195,14 @@ impl BftRunner {
                     // dropped if it turns out to conflict with a committed block.
                     DECIDED_MISSING_POW_BLOCKS.lock().unwrap().insert(Hash(*hash));
                 }
+                publish_parked_decision_height(Some(u64::from(new_block.height)));
                 self.parked_decision = Some(ParkedDecision { block: new_block, fat_pointer, proposal_sigs, reply });
                 return;
             }
             (TMStatus::Fail, reason) => panic!(
                 "decided BFT block {} at height {} failed re-validation after this node validated it: \
                  an immutable fact changed ({reason:?})",
-                new_block.blake3_hash(), new_block.height,
+                new_block_hash, new_block.height,
             ),
         }
 
@@ -1741,20 +2216,7 @@ impl BftRunner {
         // `height` is the 0-based canonical height, i.e. the chain index directly.
         let insert_i = new_block.height as usize;
 
-        // @Hack: Ensure there are enough blocks to overwrite this at the correct index.
-        for i in chain.blocks.len()..=insert_i {
-            chain.blocks.push(BftBlock {
-                version: 0,
-                height: i as u32,
-                previous_block_fat_ptr: FatPointerToBftBlock {
-                    vote_for_block_without_finalizer_public_key: [0u8; 76 - 32],
-                    signatures: Vec::new(),
-                },
-                headers: Vec::new(),
-                slashforks: Vec::new(),
-                do_not_include_until_bc_height: 0,
-            });
-        }
+        assert_eq!(insert_i, chain.blocks.len(), "validate passed, so the block extends the tip");
         if insert_i > 0 {
             assert_eq!(
                 chain.blocks[insert_i - 1].blake3_hash(),
@@ -1762,12 +2224,11 @@ impl BftRunner {
             );
         }
         assert!(insert_i == 0 || new_block.previous_block_hash() != Blake3Hash([0u8; 32]));
-        assert!(chain.blocks[insert_i].headers.is_empty(), "{:?}", chain.blocks[insert_i]);
         assert!(!new_block.headers.is_empty());
         assert_eq!(chain.voting_rosters.len(), insert_i, "voting_rosters is indexed like blocks");
         push_voting_roster(&mut chain.voting_rosters, voting);
-        chain.hash_to_height.insert(new_block.blake3_hash(), insert_i as u64);
-        chain.blocks[insert_i] = new_block.clone();
+        chain.hash_to_height.insert(new_block_hash, insert_i as u64);
+        chain.blocks.push(new_block.clone());
         chain.fat_pointer_to_tip = fat_pointer.clone();
         chain.bft_final_snapshot = Some((new_final_height, new_final_hash));
         drop(chain);
@@ -2056,14 +2517,6 @@ impl BftRunner {
             let (header, ..) = read_state.block_header(Height(h).into())?;
             headers.push(bc_hdr_to_lrz(&header));
         }
-        let mut block = match BftBlock::try_from(params, 0, FatPointerToBftBlock::null(), headers) {
-            Ok(block) => block,
-            Err(e) => {
-                tracing::error!("Unable to build the bootstrap genesis BFT block: {:?}", e);
-                return None;
-            }
-        };
-        block.version = 2;
         let scheduled_slashforks: Vec<SlashForkConfig> = self
             .slashforks
             .rules()
@@ -2071,10 +2524,14 @@ impl BftRunner {
             .filter(|hf| hf.bft_certificate_height == 0)
             .cloned()
             .collect();
-        if let Some(last) = scheduled_slashforks.last() {
-            block.do_not_include_until_bc_height = last.pow_activation_height;
-            block.slashforks = scheduled_slashforks;
-        }
+        let do_not_include = scheduled_slashforks.last().map_or(0, |last| last.pow_activation_height);
+        let block = match BftBlock::new(params, BFT_BLOCK_VERSION_LATEST, 0, FatPointerToBftBlock::null(), headers, scheduled_slashforks, do_not_include) {
+            Ok(block) => block,
+            Err(e) => {
+                tracing::error!("Unable to build the bootstrap genesis BFT block: {:?}", e);
+                return None;
+            }
+        };
         let fat_pointer = FatPointerToBftBlock::from_parts(block.blake3_hash(), 0, 0, &[]);
         Some((block, fat_pointer))
     }
@@ -2145,22 +2602,41 @@ impl BftRunner {
             self.launch = None;
             return;
         }
+        if self.catching_up {
+            if !self.spawn_deferred {
+                tracing::info!("holding tenderlink back until the decided BFT chain is caught up with peers");
+            }
+            self.spawn_deferred = true;
+            return;
+        }
         let Some(launch) = self.launch.take() else { return; };
         tracing::info!("starting tenderlink at BFT height {} with {} finalizer(s)", ingest.len(), roster.len());
         BFT_CHAIN.write().unwrap().is_activated = true;
 
-        let (static_keypair, endpoint) = addr_string_to_stuff(&launch.public_address);
-        // `peer_addresses` is only a list of addresses to seed connections from. Keys are
-        // learned on connect (tenderlink verifies the peer's key and rewrites its address map),
-        // so the hint here is deliberately nil: the roster comes from the chain, never from
-        // this list.
-        let finalizer_peer_addresses: Vec<FinalizerPeerAddress> = launch
-            .peer_addresses
-            .iter()
-            .map(|peer| FinalizerPeerAddress { bft_pk: PubKeyID::NIL, address: addr_string_to_stuff(peer).1 })
-            .collect();
+        // The seeds are only addresses to start connections from. A finalizer's BFT key is
+        // learned on connect (tenderlink verifies it and rewrites its address map), so the hint
+        // here is deliberately nil: the roster comes from the chain, never from this list.
+        let (shared_transport, static_keypair, endpoint, seeds) = match launch.network {
+            Some(network) => {
+                // One key and port per node: tenderlink speaks as the node, at its public IP.
+                let ip = addr_string_to_stuff(&launch.public_address).1.ip;
+                if !launch.peer_addresses.is_empty() {
+                    tracing::warn!("bft_peers is ignored: BFT runs over the node's own connections, seeded from network_initial_peers");
+                }
+                let endpoint = tenderlink::stp::STPAddress::from(ip, network.port, &network.keypair);
+                (Some(network.transport), network.keypair, endpoint, network.seeds)
+            }
+            None => {
+                let (static_keypair, endpoint) = addr_string_to_stuff(&launch.public_address);
+                let seeds = launch.peer_addresses.iter().map(|peer| addr_string_to_stuff(peer).1).collect();
+                (None, static_keypair, endpoint, seeds)
+            }
+        };
+        let finalizer_peer_addresses: Vec<FinalizerPeerAddress> =
+            seeds.into_iter().map(|address| FinalizerPeerAddress { bft_pk: PubKeyID::NIL, address }).collect();
         let task = self.rt.spawn(tenderlink::entry_point(
             launch.signing_key,
+            shared_transport,
             Some(static_keypair),
             Some(endpoint),
             roster,
@@ -2284,6 +2760,7 @@ fn recency_status_from(bft_state: &TMState, bft_key_address_map: &BftAddressMap)
         my_locked_round: bft_state.locked_value_round.1,
         my_valid_round: bft_state.valid_value_round.1,
         finalizer_statuses,
+        parked_decision_height: *PARKED_DECISION_HEIGHT.lock().unwrap(),
     }
 }
 
@@ -2377,6 +2854,67 @@ mod tests {
         template
     }
 
+    /// A restored decision gets back the valid round its proposal signatures were made in, which
+    /// tenderlink signs every re-served chunk over.
+    #[test]
+    fn proposal_valid_round_is_read_back_from_the_signatures() {
+        let (keys, voting) = four_finalizers(false, [0; 32]);
+        let block = test_block(2);
+        let height = u64::from(block.height);
+        let value = block.zcash_serialize_to_vec().unwrap();
+        let fat_pointer = certificate(template(height, 2 | 0x8000_0000), &keys, &[0, 1, 2], &voting.vote_namespace);
+        let value_id = tenderlink::ValueId(fat_pointer.points_at_block_hash().0);
+        let proposer = tenderlink::proposer_index(&HashKeys::default(), &voting.roster, 4, height, 2).unwrap();
+        let sign = |key: &ed25519_zebra::SigningKey, valid_round: i64| {
+            tenderlink::proposal_chunk_sigs(key, &value, value_id, height, 2, valid_round, &voting.vote_namespace)
+        };
+
+        for valid_round in [-1, 0, 1] {
+            let sigs = sign(&keys[proposer], valid_round);
+            assert_eq!(proposal_valid_round(&block, &fat_pointer, &sigs, &voting, 4), Some(valid_round));
+        }
+
+        // Another finalizer's signatures verify under no valid round.
+        let other = (proposer + 1) % keys.len();
+        assert_eq!(proposal_valid_round(&block, &fat_pointer, &sign(&keys[other], 1), &voting, 4), None);
+
+        // Round 0 has no earlier round to have locked a value in.
+        let round_0 = certificate(template(height, 0x8000_0000), &keys, &[0, 1, 2], &voting.vote_namespace);
+        assert_eq!(proposal_valid_round(&block, &round_0, &sign(&keys[proposer], -1), &voting, 4), Some(-1));
+
+        let round_data = decided_round_data(&block, &fat_pointer, voting.roster.clone(), &voting, sign(&keys[proposer], 1), height, 4);
+        assert_eq!(round_data.proposal_valid_round, 1);
+    }
+
+    /// A fetched decision keeps its proposal signatures only if they verify as a fresh proposal's,
+    /// with one check whatever round it names: never a search over valid rounds.
+    #[test]
+    fn fetched_proposal_sigs_are_kept_only_as_a_fresh_proposals() {
+        let (keys, voting) = four_finalizers(false, [0; 32]);
+        let block = test_block(2);
+        let height = u64::from(block.height);
+        let value = block.zcash_serialize_to_vec().unwrap();
+        let sign = |fat_pointer: &FatPointerToBftBlock, round: u32, valid_round: i64| {
+            let value_id = tenderlink::ValueId(fat_pointer.points_at_block_hash().0);
+            let proposer = tenderlink::proposer_index(&HashKeys::default(), &voting.roster, 4, height, round).unwrap();
+            tenderlink::proposal_chunk_sigs(&keys[proposer], &value, value_id, height, round, valid_round, &voting.vote_namespace)
+        };
+
+        let round_2 = certificate(template(height, 2 | 0x8000_0000), &keys, &[0, 1, 2], &voting.vote_namespace);
+        let fresh = sign(&round_2, 2, -1);
+        assert_eq!(fresh_proposal_sigs(&block, &round_2, fresh.clone(), &voting, 4), fresh);
+        // A re-proposal's signatures would need the valid round: dropped, not searched for.
+        assert!(fresh_proposal_sigs(&block, &round_2, sign(&round_2, 2, 1), &voting, 4).is_empty());
+        // A wrong count never reaches tenderlink's chunk check.
+        assert!(fresh_proposal_sigs(&block, &round_2, fresh[..fresh.len() - 1].to_vec(), &voting, 4).is_empty());
+
+        // The largest round a peer can name costs the same one check.
+        let huge = certificate(template(height, 0x7fff_ffff | 0x8000_0000), &keys, &[0, 1, 2], &voting.vote_namespace);
+        let started = std::time::Instant::now();
+        assert!(fresh_proposal_sigs(&block, &huge, fresh, &voting, 4).is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
     /// Every way a certificate can fail, each alone on an otherwise valid one, at a height that
     /// decides by the strict quorum (three of four) and at one that decides by 2f+1 (also three
     /// of four here, so the stake case differs only in namespace).
@@ -2461,8 +2999,12 @@ mod tests {
         assert!(!strict_quorum_at(&network, None));
         assert!(!strict_quorum_at(&network, Some(Height(49))));
         assert!(strict_quorum_at(&network, Some(Height(50))));
-        let unscheduled = Network::new_regtest(Default::default());
-        assert!(!strict_quorum_at(&unscheduled, Some(Height(1_000_000))));
+        let default = Network::new_regtest(Default::default());
+        let default_height =
+            zcash_protocol::consensus::Parameters::activation_height(&default, NetworkUpgrade::FeaturenetUpgrade2)
+                .expect("Regtest schedules FeaturenetUpgrade2 by default");
+        assert!(!strict_quorum_at(&default, Some(Height(u32::from(default_height) - 1))));
+        assert!(strict_quorum_at(&default, Some(Height(u32::from(default_height)))));
 
         assert_eq!(namespace_for_bft_height(&[], 7, false), [0; 32]);
         assert_ne!(namespace_for_bft_height(&[], 7, true), [0; 32]);
@@ -2623,8 +3165,8 @@ mod tests {
 
     /// A carried header declaring PoWLimit more than six spacings after the snapshot, above the
     /// minimum-difficulty start height: a legitimate minimum-difficulty header on stock Testnet
-    /// parameters, refused on parameters that switch the exemption off and once
-    /// FeaturenetUpgrade2 is active.
+    /// parameters with FeaturenetUpgrade2 moved above it, refused on parameters that switch the
+    /// exemption off and once FeaturenetUpgrade2 is active, as it is on stock Testnet itself.
     #[test]
     fn a_minimum_difficulty_carried_header_passes_only_where_the_exemption_holds() {
         use zebra_chain::parameters::testnet::{self, ConfiguredActivationHeights};
@@ -2637,6 +3179,14 @@ mod tests {
         let mut heights = ConfiguredActivationHeights::from(stock_params.activation_heights());
         let last_scheduled = stock_params.activation_heights().keys().last().expect("Testnet has upgrades").0;
         let snapshot_height = Height(last_scheduled.max(400_000));
+        // FeaturenetUpgrade3 must follow FeaturenetUpgrade2, so it is unscheduled here.
+        heights.featurenet_upgrade_2 = Some(snapshot_height.0 + 2);
+        heights.featurenet_upgrade_3 = None;
+        let exempt = testnet::Parameters::build()
+            .with_activation_heights(heights)
+            .expect("valid activation heights")
+            .to_network()
+            .expect("valid parameters");
         heights.featurenet_upgrade_2 = Some(snapshot_height.0);
         let upgraded = testnet::Parameters::build()
             .with_activation_heights(heights)
@@ -2659,8 +3209,8 @@ mod tests {
             headers_meet_required_difficulty(network, snapshot_height, context, &[bc_hdr_to_lrz(&gapped)])
         };
 
-        assert_eq!(check(&stock), Ok(()));
-        for network in [&featurenet, &upgraded] {
+        assert_eq!(check(&exempt), Ok(()));
+        for network in [&stock, &featurenet, &upgraded] {
             let err = check(network).expect_err("no minimum-difficulty exemption applies");
             assert!(err.contains("is not equal to the expected difficulty"), "{err}");
         }

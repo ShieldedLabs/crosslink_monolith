@@ -1661,13 +1661,15 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::BondInfo(bond_key) => {
-                let bond_info = read::delegation::delegation_bond(&state.db, state.latest_best_chain().as_deref(), &bond_key);
-                Ok(ReadResponse::BondInfo(bond_info.map(bond_info_response)))
+                let chain = state.latest_best_chain();
+                let bond_info = read::delegation::delegation_bond(&state.db, chain.as_deref(), &bond_key);
+                Ok(ReadResponse::BondInfo(bond_info.map(|info| bond_info_response(info, chain.as_deref(), &state.db))))
             }
 
             ReadRequest::BondInfoForBlock { bond_key, height } => {
-                let bond_info = read::delegation::delegation_bond(&state.db, state.chain_for_block_at(height).as_deref(), &bond_key);
-                Ok(ReadResponse::BondInfo(bond_info.map(bond_info_response)))
+                let chain = state.chain_for_block_at(height);
+                let bond_info = read::delegation::delegation_bond(&state.db, chain.as_deref(), &bond_key);
+                Ok(ReadResponse::BondInfo(bond_info.map(|info| bond_info_response(info, chain.as_deref(), &state.db))))
             }
 
             // Used by the visualizer to render forks alongside the best chain: it follows each
@@ -1908,7 +1910,7 @@ pub fn update_chain_tip_with_delegation_bond(
     bond_retargets: &mut Vec<HashMap<finalized_state::disk_format::BondKey, [u8; 32]>>,
     finalizer_rewards: &mut HashMap<[u8; 32], u64>,
     staking_action: &zcash_primitives::transaction::StakingAction,
-    _transaction_hash: &zebra_chain::transaction::Hash,
+    transaction_hash: &zebra_chain::transaction::Hash,
     transaction_location: finalized_state::disk_format::TransactionLocation,
 ) -> Result<(), ValidateContextError> {
     use zcash_primitives::transaction::StakingActionKind;
@@ -2023,6 +2025,12 @@ pub fn update_chain_tip_with_delegation_bond(
         StakingActionKind::Null => {}
     }
 
+    if staking_action.spends().is_some() {
+        let (bond, _status) = delegation_bonds.get_mut(&bond_key)
+            .expect("a spent bond must exist in chain (should have been validated)");
+        bond.version = Some(transaction_hash.0);
+    }
+
     Ok(())
 }
 
@@ -2030,9 +2038,14 @@ use finalized_state::disk_format::{BondKey, DelegationBond};
 use non_finalized_state::BondStatusInChain;
 use std::collections::BTreeSet;
 
-fn bond_info_response((bond, status): (DelegationBond, finalized_state::disk_format::BondStatus)) -> BondInfoResponse {
+fn bond_info_response(
+    (bond, status): (DelegationBond, finalized_state::disk_format::BondStatus),
+    chain: Option<&non_finalized_state::Chain>,
+    finalized_state: &ZebraDb,
+) -> BondInfoResponse {
     use finalized_state::disk_format::BondStatus;
     BondInfoResponse {
+        version: check::delegation::bond_version(&bond, chain, finalized_state),
         amount: bond.amount,
         status: match status {
             BondStatus::Active => 0,

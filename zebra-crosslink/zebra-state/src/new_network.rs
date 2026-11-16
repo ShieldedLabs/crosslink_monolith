@@ -18,12 +18,16 @@ use zebra_chain::serialization::ZcashSerialize;
 
 use tenderlink::stp::*;
 use tenderlink::native_sockets::*;
-use tenderlink::transport::{new_network_thread, service_connections, Channel, NetworkThreadPush};
+use tenderlink::transport::{service_connections, Channel, Consumer, NetworkThreadPush, SharedTransport};
 use tenderlink::{SliceWrite, SliceRead};
 use tenderlink::{dbg_panic, dbg_verify};
 
 mod checkpoint;
 pub mod bft;
+mod bft_sync;
+pub mod tx_relay;
+mod tx_relay_bridge;
+mod tx_relay_state;
 pub mod fin;
 use checkpoint::Checkpoint;
 
@@ -33,37 +37,84 @@ use checkpoint::Checkpoint;
 
 const JUMBO_FRAG_SIZE: usize = max_single_datagram_message_size(CRYPTO_MAGIC).unwrap();
 
-// STP 2.0 replaced the magic1 selectors, so 1.x (11Q8bpGo) and 0.x (1fgEw5Nx) peer addresses
-// are refused at config parse below and by the handshake; this one prints as -fCmrBqp.
+// STP 2.0 replaced the magic1 selectors: the handshake refuses 1.x (11Q8bpGo) and 0.x (1fgEw5Nx),
+// and `initial_peer` rewrites config entries that use them. This one prints as -fCmrBqp.
 const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
 //const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
-// @Todo: more of these, merge with Tenderlink, etc.
-const PACKET_TYPE_STATUS:            u8 = 1;
-const PACKET_TYPE_BLOCK_CHUNK:       u8 = 2;
-const PACKET_TYPE_BLOCK_REQ:         u8 = 3;
-const PACKET_TYPE_PEER_ADDRESS_LIST: u8 = 4;
-const PACKET_TYPE_WANT_HOLE_PUNCH:   u8 = 5;
-const PACKET_TYPE_TRY_HOLE_PUNCH:    u8 = 6;
-const PACKET_TYPE_COUNT:             u8 = 7;
+// Base-family message types (see `tenderlink::transport::MESSAGE_FAMILY_BASE`). 0x00..=0x3F
+// is the base protocol, which does not depend on BFT; 0x40..=0x7F holds Crosslink's extensions
+// to it, which a node without BFT ignores. Both are handled by this sync loop.
+const PACKET_TYPE_STATUS:            u8 = 0x01;
+const PACKET_TYPE_BLOCK_CHUNK:       u8 = 0x02;
+const PACKET_TYPE_BLOCK_REQ:         u8 = 0x03;
+const PACKET_TYPE_PEER_ADDRESS_LIST: u8 = 0x04;
+const PACKET_TYPE_WANT_HOLE_PUNCH:   u8 = 0x05;
+const PACKET_TYPE_TRY_HOLE_PUNCH:    u8 = 0x06;
+const PACKET_TYPE_HELLO:             u8 = 0x07;
+// Transaction relay (`tx_relay`); 0x0C..=0x0F reserved for it too.
+const PACKET_TYPE_TX_STATUS:         u8 = 0x08;
+const PACKET_TYPE_TX_REQ:            u8 = 0x09;
+const PACKET_TYPE_TX:                u8 = 0x0A;
+const PACKET_TYPE_MEMPOOL_REQ:       u8 = 0x0B;
 
+/// Transaction relay runs while our tip is within this many blocks of the best a peer reports.
+const TX_RELAY_NEAR_TIP: u32 = 2;
+/// Control-channel bytes a transaction status leaves free for PoW's status and requests.
+const TX_STATUS_CONTROL_HEADROOM: u64 = 32 << 10;
+
+/// This node's protocol version and capabilities, sent once per connection (`HELLO`), so a
+/// peer can tell a message from a newer protocol apart from a malformed one.
+const PROTOCOL_VERSION: u16 = 1;
+/// Speaks Crosslink's extensions to the base protocol (types 0x40..=0x7F).
+const CAPABILITY_CROSSLINK: u64 = 1 << 0;
+const OUR_CAPABILITIES: u64 = CAPABILITY_CROSSLINK;
+
+fn hello_packet() -> Vec<u8> {
+    let mut out = vec![PACKET_TYPE_HELLO];
+    out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    out.extend_from_slice(&OUR_CAPABILITIES.to_le_bytes());
+    out
+}
+
+/// A HELLO body: (version, capabilities). A newer version may append fields, so trailing
+/// bytes are allowed.
+fn read_hello(body: &[u8]) -> Option<(u16, u64)> {
+    let version = u16::from_le_bytes(body.get(0..2)?.try_into().ok()?);
+    let capabilities = u64::from_le_bytes(body.get(2..10)?.try_into().ok()?);
+    Some((version, capabilities))
+}
+
+const PACKET_TYPE_CROSSLINK_FIRST:   u8 = 0x40;
+const PACKET_TYPE_BFT_STATUS:        u8 = 0x40;
+const PACKET_TYPE_BFT_REQ:           u8 = 0x41;
+const PACKET_TYPE_BFT_DECISIONS:     u8 = 0x42;
+const_assert!(PACKET_TYPE_BFT_DECISIONS >= PACKET_TYPE_CROSSLINK_FIRST);
+const_assert!(PACKET_TYPE_BFT_DECISIONS & tenderlink::transport::MESSAGE_FAMILY_MASK == tenderlink::transport::MESSAGE_FAMILY_BASE);
+
+// Indexed by the whole type byte, so every byte has an entry.
 #[allow(dead_code)] // looked up by the commented packet-type log in the recv loop
-const PACKET_TYPE_NAMES: [&str; PACKET_TYPE_COUNT as usize] = {
-    let mut names = ["<UNKNOWN>"; PACKET_TYPE_COUNT as usize];
+const PACKET_TYPE_NAMES: [&str; 256] = {
+    let mut names = ["<UNKNOWN>"; 256];
     names[PACKET_TYPE_STATUS            as usize] = "STATUS";
     names[PACKET_TYPE_BLOCK_CHUNK       as usize] = "BLOCK_CHUNK";
     names[PACKET_TYPE_BLOCK_REQ         as usize] = "BLOCK_REQ";
     names[PACKET_TYPE_PEER_ADDRESS_LIST as usize] = "PEER_ADDRESS_LIST";
     names[PACKET_TYPE_WANT_HOLE_PUNCH   as usize] = "WANT_HOLE_PUNCH";
     names[PACKET_TYPE_TRY_HOLE_PUNCH    as usize] = "TRY_HOLE_PUNCH";
-    const_assert!(PACKET_TYPE_COUNT == 7); // keep names array updated when adding other types
+    names[PACKET_TYPE_HELLO             as usize] = "HELLO";
+    names[PACKET_TYPE_TX_STATUS         as usize] = "TX_STATUS";
+    names[PACKET_TYPE_TX_REQ            as usize] = "TX_REQ";
+    names[PACKET_TYPE_TX                as usize] = "TX";
+    names[PACKET_TYPE_MEMPOOL_REQ       as usize] = "MEMPOOL_REQ";
+    names[PACKET_TYPE_BFT_STATUS        as usize] = "BFT_STATUS";
+    names[PACKET_TYPE_BFT_REQ           as usize] = "BFT_REQ";
+    names[PACKET_TYPE_BFT_DECISIONS     as usize] = "BFT_DECISIONS";
     names
 };
 #[allow(dead_code)] // looked up by the commented packet-type log in the recv loop
 fn packet_name_from_type(packet_type: u8) -> &'static str {
-    let string_maybe = PACKET_TYPE_NAMES.get(packet_type as usize);
-    let string       = string_maybe.unwrap_or(&"<UNKNOWN>");
-    string
+    PACKET_TYPE_NAMES[packet_type as usize]
 }
 
 
@@ -737,6 +788,251 @@ const PEER_RESPOND_MS: u64 = 300;
 
 
 const IDLE_MS: u64 = 100;
+// The least time between download passes that a peer's STATUS brings forward: a STATUS naming a
+// new tip is acted on at once rather than at the next BLOCK_SEND_MS pass, but a peer sending
+// STATUS after STATUS cannot run the pass every tick.
+const DL_INIT_WOKEN_MIN_MS: u64 = 5;
+// The least time from one tick's start to the next when wakes (bft::wake_sync_thread) end the idle
+// wait early, so a stream of them shares ticks instead of spinning the loop.
+const WOKEN_TICK_MIN_MS: u64 = 2;
+
+const SYNC_PROFILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How many decided BFT heights past our own the sync loop keeps fetched and waiting: two
+/// requests' worth. A decision is stored only once its snapshot is committed, and PoW holds at
+/// most `MAX_DEFERRED_BLOCKS` queued blocks at about one BFT height each, so a larger window only
+/// holds what cannot be used yet.
+const BFT_FETCH_AHEAD: u64 = 2 * bft_sync::MAX_DECISIONS_PER_MESSAGE as u64;
+/// A peer this many decided heights ahead of us means we are catching up: decisions are fetched
+/// as data, and tenderlink is held back until we are within it.
+const BFT_CATCH_UP_SLACK: u64 = 3;
+/// A BFT_REQ unanswered for this long is sent again, to another peer if one has the heights. The
+/// first stays open for its answer until the block-response deadline: a slow answer is no fault.
+const BFT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// A peer's advertised BFT length counts towards holding tenderlink back only if it answered a
+/// BFT_REQ of ours this recently: a length nobody serves holds nothing.
+const BFT_EVIDENCE_WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
+/// A node restarting with a stored BFT chain holds tenderlink back at most this long, waiting to
+/// hear from peers whether it is behind.
+const BFT_STARTUP_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The peers that hold decided height `want` and are not backing off, in a stable order for the
+/// round-robin that picks which one to ask.
+fn bft_holders(peers: &HashMap<ConnectionKey, Peer>, rejections: &HashMap<ConnectionKey, Rejection>, want: u64) -> Vec<ConnectionKey> {
+    let mut holders: Vec<ConnectionKey> = peers
+        .iter()
+        .filter(|(key, peer)| peer.their_bft_len > want && !is_backing_off(rejections, **key))
+        .map(|(key, _)| *key)
+        .collect();
+    holders.sort();
+    holders
+}
+
+/// Whether we are catching up on decided BFT heights: a peer that has recently served us and is
+/// not backing off holds more than `BFT_CATCH_UP_SLACK` heights beyond ours.
+fn bft_catching_up(peers: &HashMap<ConnectionKey, Peer>, rejections: &HashMap<ConnectionKey, Rejection>, our_len: u64, now: std::time::Instant) -> bool {
+    peers
+        .iter()
+        .filter(|(key, peer)| {
+            peer.bft_answered_at.is_some_and(|at| now.saturating_duration_since(at) < BFT_EVIDENCE_WINDOW)
+                && !is_backing_off(rejections, **key)
+        })
+        .any(|(_, peer)| peer.their_bft_len > our_len + BFT_CATCH_UP_SLACK)
+}
+
+/// Whether a restarted node's startup hold on tenderlink still applies: until `until`, and only
+/// while no peer has answered a BFT_REQ of ours (then `bft_catching_up` decides) and no peer has
+/// reported a BFT length without being more than `BFT_CATCH_UP_SLACK` ahead of us.
+fn bft_startup_holding(peers: &HashMap<ConnectionKey, Peer>, our_len: u64, until: std::time::Instant, now: std::time::Instant) -> bool {
+    let reported: Vec<&Peer> = peers.values().filter(|peer| peer.their_bft_len > 0).collect();
+    now < until
+        && !peers.values().any(|peer| peer.bft_answered_at.is_some())
+        && !(!reported.is_empty() && reported.iter().all(|peer| peer.their_bft_len <= our_len + BFT_CATCH_UP_SLACK))
+}
+
+/// STP connect selectors of earlier releases for the same Noise IK handshake over an X25519 key:
+/// 0.x's `1fgEw5Nx`, which `zebrad generate` of v16 and v17 wrote into every config's
+/// `network_initial_peers`, and 1.0's `11Q8bpGo`. A node's key comes from its seed alone, so it
+/// kept the same key across them, and a peer written with one of them is the same peer under
+/// `CRYPTO_MAGIC`.
+const OLD_CRYPTO_MAGIC1S: [u64; 2] = [0x7193_c304_f8d5, 0xa891_6e3c_54d7];
+
+/// What startup does with one `network_initial_peers` entry.
+#[derive(Debug, PartialEq)]
+enum InitialPeer {
+    Dial(STPAddress),
+    /// Written with an older release's selector for this node's handshake: dialled with the
+    /// current one.
+    Updated(STPAddress),
+    /// Not dialled, and why.
+    Skipped(String),
+}
+
+fn initial_peer(peer_str: &str) -> InitialPeer {
+    let Some(mut address) = STPAddress::parse(peer_str) else {
+        return InitialPeer::Skipped("not an STP address".to_string());
+    };
+    if address.magic1 == CRYPTO_MAGIC {
+        return InitialPeer::Dial(address);
+    }
+    if OLD_CRYPTO_MAGIC1S.contains(&address.magic1) {
+        address.magic1 = CRYPTO_MAGIC;
+        return InitialPeer::Updated(address);
+    }
+    InitialPeer::Skipped(format!(
+        "its selector {} ({}) is not this node's {} ({})",
+        tenderlink::stp::b64(&address.magic1.to_le_bytes()[..6]),
+        tenderlink::stp::crypto_string_from_connect_magic1(address.magic1).unwrap_or("unknown"),
+        tenderlink::stp::b64(&CRYPTO_MAGIC.to_le_bytes()[..6]),
+        tenderlink::stp::crypto_string_from_connect_magic1(CRYPTO_MAGIC).unwrap_or("unknown"),
+    ))
+}
+
+/// Store every fetched decision that is ready: the next height, its snapshot committed. Called
+/// between PoW commits, so a decision lands as soon as its snapshot does and the PoW blocks
+/// citing it find it decided.
+fn feed_ready_decisions(
+    fetched: &mut std::collections::BTreeMap<u64, (ConnectionKey, bft_sync::WireDecision)>,
+    bft_runner: &mut bft::BftRunner,
+    read_state: &ReadState,
+    block_writer: &mut crate::service::write::WriteBlockWorkerTask,
+    peers_to_kill: &mut Vec<(ConnectionKey, String)>,
+    bft_peer_rejections: &mut HashMap<ConnectionKey, Rejection>,
+) -> u64 {
+    if bft::bft_is_dropped() {
+        fetched.clear();
+        return 0;
+    }
+    let mut fed = 0;
+    loop {
+        let next = bft::decided_len();
+        // Heights decided meanwhile, by tenderlink or an earlier feed, are no longer wanted.
+        while fetched.first_key_value().is_some_and(|(&height, _)| height < next) {
+            fetched.pop_first();
+        }
+        let Some((from, decision)) = fetched.remove(&next) else { return fed; };
+        match bft_runner.feed_fetched(decision, read_state, block_writer) {
+            bft::FeedOutcome::Fed => fed += 1,
+            bft::FeedOutcome::NotReady(decision) => {
+                fetched.insert(decision.height, (from, decision));
+                return fed;
+            }
+            bft::FeedOutcome::Refused { why, peer_fault } => {
+                tracing::warn!("NewNet: refused a fetched BFT decision at height {next}: {why}");
+                if peer_fault {
+                    // Wrong whatever our state: not something an honest peer serves. Drop the peer
+                    // and everything else it sent.
+                    fetched.retain(|_, (sender, _)| *sender != from);
+                    peers_to_kill.push((from, format!("served a malformed BFT decision for height {next}: {why}")));
+                } else {
+                    // Possibly our own state disagreeing (decided chain, roster, slashforks): ask
+                    // others for a while rather than drop a peer that may be honest.
+                    note_rejection(bft_peer_rejections, from);
+                }
+                return fed;
+            }
+        }
+    }
+}
+
+/// What the lowest queued block did in one pass of the commit loop: the block every later one
+/// waits behind, so the reason it did not commit is the reason the sync did not advance.
+#[derive(Clone, Copy)]
+enum CommitHead {
+    Committed,
+    ParentMissing,
+    /// `admit_fat_pointer` could not resolve the BFT block the PoW block cites.
+    BftGate,
+    DeferredOther,
+    Failed,
+}
+
+/// Where the sync's time goes, counted per tick and logged every `SYNC_PROFILE_INTERVAL` as one
+/// `key=value` line, so a run's log can be read back into a table.
+struct SyncProfile {
+    since: std::time::Instant,
+    ticks: u64,
+    committed: u64,
+    ticks_committing: u64,
+    ticks_queue_empty: u64,
+    ticks_parent_missing: u64,
+    ticks_bft_gate: u64,
+    ticks_deferred_other: u64,
+    ticks_failed: u64,
+    ticks_bft_parked: u64,
+    commit_time: std::time::Duration,
+}
+
+impl SyncProfile {
+    fn new() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            ticks: 0,
+            committed: 0,
+            ticks_committing: 0,
+            ticks_queue_empty: 0,
+            ticks_parent_missing: 0,
+            ticks_bft_gate: 0,
+            ticks_deferred_other: 0,
+            ticks_failed: 0,
+            ticks_bft_parked: 0,
+            commit_time: std::time::Duration::ZERO,
+        }
+    }
+
+    fn record_tick(&mut self, head: Option<CommitHead>, committed: u64, commit_time: std::time::Duration, bft_parked: bool) {
+        self.ticks += 1;
+        self.committed += committed;
+        self.commit_time += commit_time;
+        self.ticks_bft_parked += u64::from(bft_parked);
+        if committed > 0 {
+            self.ticks_committing += 1;
+            return;
+        }
+        match head {
+            None => self.ticks_queue_empty += 1,
+            Some(CommitHead::Committed) => self.ticks_committing += 1,
+            Some(CommitHead::ParentMissing) => self.ticks_parent_missing += 1,
+            Some(CommitHead::BftGate) => self.ticks_bft_gate += 1,
+            Some(CommitHead::DeferredOther) => self.ticks_deferred_other += 1,
+            Some(CommitHead::Failed) => self.ticks_failed += 1,
+        }
+    }
+
+    /// `lock_times` is asked only when the report is due, and resets the transport's maxima.
+    fn report_if_due(&mut self, tip_height: u32, bft_height: usize, bft_waiting: usize, queued: usize, downloads: u32, peers: usize, lock_times: impl FnOnce() -> [tenderlink::transport::LockTimes; 2]) {
+        let elapsed = self.since.elapsed();
+        if elapsed < SYNC_PROFILE_INTERVAL {
+            return;
+        }
+        let [base, bft] = lock_times();
+        tracing::info!(
+            "NewNet: sync profile: seconds={:.1} tip={tip_height} bft_height={bft_height} committed={} blocks_per_s={:.2} \
+             ticks={} committing={} queue_empty={} parent_missing={} bft_gate={} deferred_other={} failed={} \
+             bft_parked={} commit_ms={} queued={queued} downloads={downloads} peers={peers} bft_waiting={bft_waiting} \
+             lock_wait_us_base={} lock_hold_us_base={} lock_wait_us_bft={} lock_hold_us_bft={}",
+            elapsed.as_secs_f64(),
+            self.committed,
+            self.committed as f64 / elapsed.as_secs_f64(),
+            self.ticks,
+            self.ticks_committing,
+            self.ticks_queue_empty,
+            self.ticks_parent_missing,
+            self.ticks_bft_gate,
+            self.ticks_deferred_other,
+            self.ticks_failed,
+            self.ticks_bft_parked,
+            self.commit_time.as_millis(),
+            base.wait_max.as_micros(),
+            base.hold_max.as_micros(),
+            bft.wait_max.as_micros(),
+            bft.hold_max.as_micros(),
+        );
+        *self = Self::new();
+    }
+}
+
+const DEFERRED_BLOCK_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 const MAX_BANDWIDTH_BYTES_PER_MS: usize = 7_000; // 7 MB/s
 const MAX_BANDWIDTH_BYTES_PER_RES: usize = MAX_BANDWIDTH_BYTES_PER_MS * PEER_RESPOND_MS as usize;
@@ -1133,6 +1429,9 @@ const MAX_QUEUED_BLOCK_RESPONSES_PER_PEER: usize = 32;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct QueuedBlockResponses {
     queued: Vec<(Hash, u32)>, // at most MAX_QUEUED_BLOCK_RESPONSES_PER_PEER
+    /// The first height of the BFT_DECISIONS response queued, by the same rule: a requester
+    /// re-asks every `BFT_REQUEST_TIMEOUT` while a 2 MiB answer may take far longer to drain.
+    bft_decisions_from: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1153,6 +1452,7 @@ impl QueuedBlockResponses {
     fn forget_if_drained(&mut self, bulk_backlog_bytes: Option<u64>) {
         if bulk_backlog_bytes.is_none_or(|bytes| bytes == 0) {
             self.queued.clear();
+            self.bft_decisions_from = None;
         }
     }
 
@@ -1350,6 +1650,23 @@ pub struct Peer {
 
     // block responses queued to this peer and not yet known transmitted (duplicate guard)
     queued_block_responses: QueuedBlockResponses,
+
+    // their last STATUS showed them wholly below our near-tip window: send them the next
+    // historical window on the next tick rather than at the heartbeat
+    history_wanted: bool,
+
+    // how many decided BFT heights they hold, from their last BFT_STATUS
+    their_bft_len: u64,
+
+    // from their HELLO: None until it arrives
+    protocol_version: Option<u16>,
+    capabilities: u64,
+    // message types of theirs we did not know and have logged, one bit per type byte
+    unknown_types_logged: [u64; 4],
+
+    // when they last answered a BFT_REQ of ours: only then is their_bft_len evidence enough to
+    // hold tenderlink back (`bft_catching_up`)
+    bft_answered_at: Option<std::time::Instant>,
 }
 
 #[derive(Debug)]
@@ -1545,6 +1862,15 @@ pub struct SyntheticPeer {
     pub events: tokio::sync::mpsc::UnboundedReceiver<SyntheticPeerEvent>,
 }
 
+impl SyntheticPeer {
+    /// Hands the node `packet` from this peer and wakes the sync loop, as a packet arriving on the
+    /// transport does, so it is read on the next tick rather than after the tick's idle wait.
+    pub fn send(&self, packet: Vec<u8>) {
+        let _ = self.inbound.send(packet);
+        bft::wake_sync_thread();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum SyntheticPeerEvent {
     /// The node disconnected the peer for misbehaving. The peer stays disconnected.
@@ -1552,6 +1878,10 @@ pub enum SyntheticPeerEvent {
     /// What became of a block the peer delivered. A block held in the commit queue reports
     /// `Pending` once, then its final verdict when it leaves.
     Outcome { hash: Hash, outcome: IngestOutcome },
+    /// What the mempool made of a transaction the peer relayed: `taken` when it accepted it or
+    /// already had it, and the relay's outcome by name. A transaction left for a busy mempool to
+    /// look at later has none yet.
+    TxOutcome { id: zebra_chain::transaction::UnminedTxId, taken: bool, outcome: String },
 }
 
 /// The sync loop's end of a `SyntheticPeer`.
@@ -1676,6 +2006,16 @@ pub static PEER_ATTESTED_BLOCKS: std::sync::Mutex<Vec<ShadowBlock>> = std::sync:
 /// zebra-network syncer is not spawned, so these are the only block-carrying peers.
 pub static POW_PEER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Sync loop ticks finished: each has committed whatever in its queue could be, sent its requests
+/// and handled the packets that reached it. Something waiting to see what the loop makes of work
+/// already queued waits for this to move twice, since the tick in progress may be past its commits.
+pub static SYNC_TICKS_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Starts the sync loop's next tick at once, as a local block submission does.
+pub fn wake_sync_loop_now() {
+    bft::wake_sync_thread_now();
+}
+
 /// Submit a block to new_network and wait for its verdict.
 ///
 /// Applies backpressure rather than dropping: nothing re-submits a miner's solved block, so a
@@ -1719,6 +2059,7 @@ async fn submit_to_new_network(
 
     let (reply, rx) = tokio::sync::oneshot::channel();
     permit.send(BlockSubmission { block, reply, trusted });
+    bft::wake_sync_thread_now();
 
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(outcome)) => Ok(outcome),
@@ -1737,9 +2078,27 @@ struct BlockFate {
     pending_told: bool,
     /// Submitted with [`submit_trusted_block_to_new_network`]: `verify_expensive` is skipped.
     trusted: bool,
+    deferred_since: Option<std::time::Instant>,
+    next_stall_warning: Option<std::time::Instant>,
 }
 
 impl BlockFate {
+    /// Warns once the block has stayed deferred for `DEFERRED_BLOCK_WARN_INTERVAL`, and again
+    /// each interval after. The retry itself is silent, so without this a deferral that never
+    /// resolves shows only as a tip that stops moving.
+    fn warn_if_stalled(&mut self, height: u32, hash: Hash, reason: std::fmt::Arguments) {
+        let now = std::time::Instant::now();
+        let since = *self.deferred_since.get_or_insert(now);
+        let next = self.next_stall_warning.get_or_insert(since + DEFERRED_BLOCK_WARN_INTERVAL);
+        if now >= *next {
+            *next = now + DEFERRED_BLOCK_WARN_INTERVAL;
+            tracing::warn!(
+                "NewNet: block @ {height}, {hash} has been deferred for {}s, and the chain cannot advance past it until it commits: {reason}",
+                since.elapsed().as_secs(),
+            );
+        }
+    }
+
     fn tell(&mut self, synthetic_peers: &[SyntheticPeerLink], hash: Hash, outcome: IngestOutcome) {
         if let Some(reply) = self.reply.take() {
             let _ = reply.send(outcome.clone());
@@ -1778,21 +2137,46 @@ fn known_outcome(read_state: &ReadState, hash: Hash) -> Option<IngestOutcome> {
 // A peer-served block that failed verification. Its hash goes unrequested until `retry_at` rather
 // than being banned: the hash covers only the header, and a forged body or forged signatures can
 // sit under an honest block's hash, so a ban would let any peer keep us off the honest block.
+//
+// The peers that served it are not asked for the hash again while the entry lives. Each request
+// holds one of the hash's MAX_REQUEST_DUPLICATES_N places until it is answered or its deadline
+// (minutes) passes, so two peers that serve forged bytes and then go quiet would otherwise hold
+// both places, and the peer with the real block would never be asked.
 struct Rejection {
     strikes: u32,
     retry_at: std::time::Instant,
+    served_by: Vec<ConnectionKey>,
 }
 
-fn note_rejection(rejections: &mut HashMap<Hash, Rejection>, hash: Hash) {
+const MAX_REJECTION_SERVERS: usize = 16;
+
+fn note_rejection<K: Eq + std::hash::Hash>(rejections: &mut HashMap<K, Rejection>, key: K) -> &mut Rejection {
     let now = std::time::Instant::now();
-    let rejection = rejections.entry(hash).or_insert(Rejection { strikes: 0, retry_at: now });
+    let rejection = rejections.entry(key).or_insert(Rejection { strikes: 0, retry_at: now, served_by: Vec::new() });
     rejection.strikes += 1;
     let backoff = REJECTED_BLOCK_BACKOFF_MIN.saturating_mul(1 << (rejection.strikes - 1).min(16));
     rejection.retry_at = now + backoff.min(REJECTED_BLOCK_BACKOFF_MAX);
+    rejection
 }
 
-fn is_backing_off(rejections: &HashMap<Hash, Rejection>, hash: Hash) -> bool {
-    rejections.get(&hash).is_some_and(|rejection| std::time::Instant::now() < rejection.retry_at)
+fn note_rejected_server(rejection: &mut Rejection, server: ConnectionKey) {
+    if rejection.served_by.contains(&server) {
+        return;
+    }
+    if rejection.served_by.len() >= MAX_REJECTION_SERVERS {
+        rejection.served_by.remove(0);
+    }
+    rejection.served_by.push(server);
+}
+
+fn is_backing_off<K: Eq + std::hash::Hash>(rejections: &HashMap<K, Rejection>, key: K) -> bool {
+    rejections.get(&key).is_some_and(|rejection| std::time::Instant::now() < rejection.retry_at)
+}
+
+/// Whether `hash` should not be requested from `server` now: it is backing off, or `server`
+/// already served bytes under it that failed.
+fn is_backing_off_from(rejections: &HashMap<Hash, Rejection>, hash: Hash, server: ConnectionKey) -> bool {
+    rejections.get(&hash).is_some_and(|rejection| std::time::Instant::now() < rejection.retry_at || rejection.served_by.contains(&server))
 }
 
 fn kill_peer(
@@ -1805,6 +2189,8 @@ fn kill_peer(
 ) {
     tracing::error!("NewNet: Killing peer {:?}: {}", address, reason);
     let key = address.connection_key();
+    // Leaving it out of the next wanted list is how the shared transport hears of the kill.
+    let () = tenderlink::transport::ASSUME_WANTED_OMITS_ONLY_KILLS;
     current_connections.retain(|(addr, _)| addr.connection_key() != key);
     let kill_bucket = address_bucket(local_addresses_secret, address) & (MAX_RECENT_BUCKETS - 1);
     if let Some(recents) = recent_peer_addresses.get_mut(&(kill_bucket as u16)) {
@@ -1851,7 +2237,18 @@ pub fn sync(
     // this thread, in a known order, with the result available synchronously.
     mut block_writer: crate::service::write::WriteBlockWorkerTask,
     genesis: std::sync::Arc<Block>,
+    // The mempool, for relaying transactions over our own connections; `None` relays none.
+    tx_relay: Option<tx_relay::TxRelayLaunch>,
 ) {
+    // Transaction relay over our own connections: the mempool bridge, relay's bookkeeping,
+    // the connections it knows of, what it wants done, and whether it is active this tick.
+    let tx_bridge = tx_relay.map(|launch| tx_relay_bridge::spawn(&rt, launch));
+    let mut tx_state = tx_relay_state::TxRelay::default();
+    let mut tx_live: HashSet<ConnectionKey> = HashSet::new();
+    let mut tx_outs: Vec<tx_relay_state::Out> = Vec::new();
+    let mut tx_relay_active = false;
+    // Bytes of each peer's TX bodies queued to the bridge to decode.
+    let mut tx_decoding: HashMap<ConnectionKey, u64> = HashMap::new();
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::channel(BLOCK_SUBMISSION_QUEUE_LEN);
     let _ = BLOCK_SUBMISSION_SENDER.set(submit_tx);
 
@@ -1874,9 +2271,6 @@ pub fn sync(
         assert!(finalized_tip_height <= tip_height);
     }
 
-    // BFT restores its persisted chain against the bc-chain, so this runs after genesis is in.
-    let mut bft_runner = bft::BftRunner::new(bft, config, &read_state, &mut block_writer, rt.clone());
-    let crosslink_params = read_state.network().crosslink_parameters();
 
     // Keypair setup
     let network_keypair;
@@ -1897,22 +2291,36 @@ pub fn sync(
 
     let actual_network_local_port : u16 = {
         if config.network_local_port == 0 {
+            // A random port that a probe could bind: another process, or another node on this
+            // machine, may hold any one of them, and the transport aborts on a port it cannot
+            // bind. The probe and the transport's bind can still race, but rarely.
             use rand::RngCore;
-            rand::thread_rng().next_u32() as u16 % 45869 + 2000
+            let free = |port: u16| {
+                std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, port)).is_ok()
+                    && std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_ok()
+            };
+            let random_port = || rand::thread_rng().next_u32() as u16 % 45869 + 2000;
+            (0..64).map(|_| random_port()).find(|&port| free(port)).unwrap_or_else(random_port)
         } else {
             config.network_local_port
         }
     };
 
     let my_keypairs = vec![network_keypair.clone()];
+    // One endpoint, key and port for the node: tenderlink attaches to the same transport when
+    // it starts (`bft::BftNetwork`).
     // small min keeps the send buffer rate-adaptive (clamp(1s * rate, 512KiB, 256MiB)) instead of a flat 256MiB/conn
-    let mut network_thread_handle = new_network_thread(my_keypairs.clone(), actual_network_local_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
+    let shared_transport = SharedTransport::new(my_keypairs.clone(), actual_network_local_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
+    // Packets that arrive between ticks start the next tick (WOKEN_TICK_MIN_MS apart), rather
+    // than waiting out the tick's idle part.
+    let mut network_thread_handle = shared_transport.attach_with_waker(Consumer::Base, std::sync::Arc::new(bft::wake_sync_thread));
     // Sized from the per-(peer, channel) byte cap the transport actually enforces, which is
     // what bounds the responder's Bulk backlog ahead of our block (see `block_response_deadline`).
     let block_response_deadline = block_response_deadline(network_thread_handle.limits().peer_outbox_bytes as u64);
     tracing::info!("NewNet: Bound to port {}", actual_network_local_port);
     // A fresh peer string for other nodes' network_initial_peers (replace the IP with this
-    // node's reachable one). STP 2.0 addresses cannot be reused from 1.x or 0.x configs.
+    // node's reachable one). 1.x and 0.x configs name peers with older selectors, which
+    // `initial_peer` replaces with this one.
     tracing::info!("NewNet: PEER ADDRESS: {:?}", STPAddress::from(std::net::Ipv6Addr::LOCALHOST, actual_network_local_port, &network_keypair));
 
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
@@ -1922,32 +2330,56 @@ pub fn sync(
     // requests to the same peer are not queued behind them.
     let mut bulk_packets_to_send: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
     let mut synthetic_peers: Vec<SyntheticPeerLink> = Vec::new();
+    // Sessions (key, handshake hash) that have had our HELLO.
+    let mut hello_sent: HashSet<(ConnectionKey, [u8; 64])> = HashSet::new();
 
     // Parse and connect to initial peers
     let mut initial_peer_addresses: Vec<STPAddress> = Vec::new();
     for peer_str in &config.network_initial_peers {
-        if let Some(address) = STPAddress::parse(peer_str) {
-            if address.magic1 != CRYPTO_MAGIC {
-                // @Dev
-                panic!("The magic in the config toml - {} ({}) is different from the crypto magic - {} ({})! Modify one or the other!",
-                        tenderlink::stp::b64(&address.magic1.to_le_bytes()[..6]),
-                        tenderlink::stp::crypto_string_from_connect_magic1(address.magic1).unwrap_or("<invalid>"),
-                        tenderlink::stp::b64(&CRYPTO_MAGIC  .to_le_bytes()[..6]),
-                        tenderlink::stp::crypto_string_from_connect_magic1(CRYPTO_MAGIC).unwrap(),
-                        );
+        let address = match initial_peer(peer_str) {
+            InitialPeer::Dial(address) => address,
+            InitialPeer::Updated(address) => {
+                tracing::warn!(
+                    "NewNet: Initial peer {peer_str} uses an older STP selector; dialling it as {address:?}. \
+                     Update network_initial_peers in your zebrad.toml."
+                );
+                address
             }
-            tracing::info!("NewNet: Connecting to peer: {:?}", address);
-            initiate_connections.push(address.clone());
-            initial_peer_addresses.push(address);
-        } else {
-            tracing::warn!("NewNet: Failed to parse peer address: {}", peer_str);
-        }
+            InitialPeer::Skipped(why) => {
+                tracing::warn!("NewNet: Not dialling initial peer {peer_str}: {why}");
+                continue;
+            }
+        };
+        tracing::info!("NewNet: Connecting to peer: {:?}", address);
+        initiate_connections.push(address.clone());
+        initial_peer_addresses.push(address);
+    }
+
+    if config.network_connect_only {
+        shared_transport.dial_only(initial_peer_addresses.iter().map(|address| address.connection_key()).collect());
+        tracing::info!("NewNet: Dialling only the {} initial peers (network_connect_only)", initial_peer_addresses.len());
     }
 
     tracing::info!("NewNet: STP setup complete, port={}, peers={}", actual_network_local_port, initial_peer_addresses.len());
 
+    // Tenderlink shares this node's transport, key and port, and starts from its initial peers.
+    let mut bft = bft;
+    if let Some(launch) = bft.as_mut() {
+        launch.network = Some(bft::BftNetwork {
+            transport: shared_transport.clone(),
+            keypair: network_keypair.clone(),
+            port: actual_network_local_port,
+            seeds: initial_peer_addresses.clone(),
+        });
+    }
+    // BFT restores its persisted chain against the bc-chain, so this runs after genesis is in.
+    let mut bft_runner = bft::BftRunner::new(bft, config, &read_state, &mut block_writer, rt.clone());
+    let mut bft_startup_hold_until = bft_runner.held_at_startup().then(|| std::time::Instant::now() + BFT_STARTUP_HOLD);
+    let crosslink_params = read_state.network().crosslink_parameters();
+
     // Sync state
     let tick_duration = std::time::Duration::from_millis(IDLE_MS);
+    let woken_tick_min = std::time::Duration::from_millis(WOKEN_TICK_MIN_MS);
     let status_interval = std::time::Duration::from_millis(STATUS_MS);
     let dl_init_interval = std::time::Duration::from_millis(BLOCK_SEND_MS);
     let peer_gossip_interval = std::time::Duration::from_millis(PEER_GOSSIP_MS);
@@ -1975,6 +2407,7 @@ pub fn sync(
     // instead of waiting out the heartbeat.
     let mut last_status_tip: Option<Hash> = None;
     let mut next_dl_init      = std::time::Instant::now();
+    let mut last_dl_init      = std::time::Instant::now();
     let mut next_peer_gossip  = std::time::Instant::now();
     let mut next_peer_connect = std::time::Instant::now();
     let mut next_peer_request = std::time::Instant::now();
@@ -1983,7 +2416,7 @@ pub fn sync(
 
 
     // Lite checkpoint: enforced at the commit-queue push, and stays armed forever.
-    let checkpoint = Checkpoint::from_config(&config.network_checkpoint);
+    let checkpoint = Checkpoint::from_config(&config.network_checkpoint_for(&read_state.network()));
     // while false we need to filter out peers who do not have the checkpoint
     let mut checkpoint_committed_locally = match &checkpoint {
         None => true,
@@ -2006,12 +2439,32 @@ pub fn sync(
         short.to_string()
     };
 
+    let mut sync_profile = SyncProfile::new();
+
+    // Decided BFT heights fetched from peers and waiting for their snapshot, and the BFT_REQs still
+    // open for an answer: (peer, first height asked for, count, when).
+    let mut bft_fetched: std::collections::BTreeMap<u64, (ConnectionKey, bft_sync::WireDecision)> = std::collections::BTreeMap::new();
+    let mut bft_requests: Vec<(ConnectionKey, u64, u16, std::time::Instant)> = Vec::new();
+    let mut bft_request_cursor = 0usize;
+    let mut bft_peer_rejections: HashMap<ConnectionKey, Rejection> = HashMap::new();
+    // BFT_REQs received, served under the block-response backpressure: at most one per peer.
+    let mut bft_requests_to_serve: Vec<(ConnectionKey, u64, u16)> = Vec::new();
+
     // Stop only between writes. A commit and its chain/BFT bookkeeping finish
     // together on this thread; dropping it mid-commit is never a shutdown path.
     while !zebra_chain::shutdown::is_shutting_down() {
         let loop_start = std::time::Instant::now();
 
+        bft_peer_rejections.retain(|_, rejection| std::time::Instant::now() < rejection.retry_at + REJECTED_BLOCK_BACKOFF_MAX);
+        if bft_startup_hold_until.is_some_and(|until| !bft_startup_holding(&peers, bft::decided_len(), until, std::time::Instant::now())) {
+            bft_startup_hold_until = None;
+        }
+        let catching_up = !bft::bft_is_dropped()
+            && (bft_startup_hold_until.is_some()
+                || bft_catching_up(&peers, &bft_peer_rejections, bft::decided_len(), std::time::Instant::now()));
+        bft_runner.set_catching_up(catching_up);
         bft_runner.tick(&read_state, &mut block_writer);
+        feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer, &mut peers_to_kill, &mut bft_peer_rejections);
 
         if loop_start > next_console_status_print {
             let mut my_peers_to_print = Vec::new();
@@ -2358,6 +2811,39 @@ pub fn sync(
                 bulk_packets_to_send.push((*connection_key, packet));
             }
         }
+        // Decided BFT heights asked for, under the same backpressure: a response is built only
+        // when the peer's backlog leaves room for the largest one. A skipped request is not lost:
+        // the requester asks again, or another peer, after its timeout.
+        for (connection_key, from, count) in bft_requests_to_serve.drain(..) {
+            if !current_connections.iter().any(|(addr, _)| addr.connection_key() == connection_key) {
+                continue;
+            }
+            let reserved = reserved_send_bytes.get(&connection_key).copied().unwrap_or(0);
+            let is_synthetic = synthetic_peers.iter().any(|p| p.address.connection_key() == connection_key);
+            if !is_synthetic && network_thread_handle.send_budget(connection_key, Channel::Bulk) < reserved.saturating_add(bft_sync::DECISIONS_MESSAGE_BUDGET as u64) {
+                deferred_block_responses += 1;
+                continue;
+            }
+            // A retry of the answer still queued to this peer: a second copy would only queue
+            // behind the first (see `QueuedBlockResponses`).
+            let Some(peer) = peers.get_mut(&connection_key) else { continue };
+            if peer.queued_block_responses.bft_decisions_from == Some(from) {
+                duplicate_block_responses += 1;
+                continue;
+            }
+            // Heights past u32 cannot be stored, so nothing is there to send.
+            let Ok(from_u32) = u32::try_from(from) else { continue };
+            let decisions = block_writer.finalized_state.db.bft_decisions(from_u32, count.into(), bft_sync::DECISIONS_MESSAGE_BUDGET);
+            if decisions.is_empty() {
+                continue;
+            }
+            let packet = bft_sync::bft_decisions_packet(decisions.iter().enumerate().map(|(i, d)| {
+                (from + i as u64, &d.block, &d.fat_pointer, d.proposal_sigs.as_slice())
+            }));
+            *reserved_send_bytes.entry(connection_key).or_insert(0) += packet.len() as u64;
+            bulk_packets_to_send.push((connection_key, packet));
+            peer.queued_block_responses.bft_decisions_from = Some(from);
+        }
         if deferred_block_responses > 0 {
             tracing::debug!("NewNet: deferred {deferred_block_responses} block responses: peer send backlog full");
         }
@@ -2375,9 +2861,16 @@ pub fn sync(
         let tip_for_status = read_state.best_tip().map(|(_, hash)| hash);
         let tip_is_news = tip_for_status.is_some() && tip_for_status != last_status_tip;
 
-        if tip_is_news || std::time::Instant::now() >= next_status { 'send_status: {
-            next_status = std::time::Instant::now() + status_interval;
-            last_status_tip = tip_for_status;
+        // Peers catching up from far behind get their next historical window as soon as they
+        // report progress; everyone else waits for news or the heartbeat.
+        let heartbeat_due = tip_is_news || std::time::Instant::now() >= next_status;
+        let history_due = peers.values().any(|peer| peer.history_wanted);
+
+        if heartbeat_due || history_due { 'send_status: {
+            if heartbeat_due {
+                next_status = std::time::Instant::now() + status_interval;
+                last_status_tip = tip_for_status;
+            }
 
             // Our chain tree, as of right now. Built here and dropped at the end of the block, so
             // it cannot go stale and nothing has to keep it up to date.
@@ -2392,10 +2885,18 @@ pub fn sync(
             for (address, _) in &current_connections {
                 let key = address.connection_key();
 
-                let Some(peer) = peers.get(&key) else {
+                let Some(peer) = peers.get_mut(&key) else {
                     if TRACE { tracing::info!("Trying to send a STATUS to {:?} but they haven't finished being created", address); }
                     continue;
                 };
+                if !heartbeat_due && !peer.history_wanted {
+                    continue;
+                }
+                peer.history_wanted = false;
+                let peer = &*peer;
+                if heartbeat_due {
+                    packets_to_send.push((key, bft_sync::bft_status_packet(bft::decided_len())));
+                }
 
                 let mut send_tip_chains = near_tip_chains.finalized_height < peer.their_tree.finalized_height;
                 if ! send_tip_chains {
@@ -2497,6 +2998,8 @@ pub fn sync(
 
         if std::time::Instant::now() >= next_dl_init { 'init_dls: {
             next_dl_init = std::time::Instant::now() + dl_init_interval;
+            last_dl_init = std::time::Instant::now();
+            let dls_before_pass: u32 = peers.values().map(|peer| peer.block_downloads.used_flags.count_ones()).sum();
 
             // An entry outlives its backoff by the max, so a hash failing again soon after keeps
             // its strike count and waits longer.
@@ -2612,7 +3115,7 @@ pub fn sync(
                         break;
                     }
                     let dups = requests_by_hash.entry(hash).or_insert(0);
-                    if *dups >= MAX_REQUEST_DUPLICATES_N || is_backing_off(&rejections, hash) {
+                    if *dups >= MAX_REQUEST_DUPLICATES_N || is_backing_off_from(&rejections, hash, connection_key) {
                         continue;
                     }
                     let request = HeightAndHashOr0 {
@@ -2798,7 +3301,7 @@ pub fn sync(
                                     if TRACE { tracing::info!("Skipped requesting block already in our queue. Peer {connection_address:?}. Hash: {hash}"); }
                                     continue;
                                 }
-                                if is_backing_off(&rejections, hash) {
+                                if is_backing_off_from(&rejections, hash, connection_key) {
                                     continue;
                                 }
 
@@ -2864,6 +3367,13 @@ pub fn sync(
             }
 
             if TRACE { tracing::info!("Started {} new block dls (currently {active_block_dls}/{MAX_BANDWIDTH_BLOCKS_PER_RES})", active_block_dls - prev_active_block_dls); }
+
+            // A new download's first request is due at once (block_request_due), so send it this
+            // tick rather than at the next PEER_REQUEST_MS pass.
+            let dls_after_pass: u32 = peers.values().map(|peer| peer.block_downloads.used_flags.count_ones()).sum();
+            if dls_after_pass > dls_before_pass {
+                next_peer_request = std::time::Instant::now();
+            }
         }}
 
         if std::time::Instant::now() >= next_peer_request {
@@ -2915,7 +3425,196 @@ pub fn sync(
         // Synthetic peers are served here instead of by the network thread, which never hears of
         // them: their packets leave and arrive around it, and they are re-added to the connection
         // list it hands back each tick until the node kills them.
+        // (Their packets are diverted just before the service call, after every step that sends.)
         synthetic_peers.extend(SYNTHETIC_PEERS_TO_ATTACH.lock().unwrap().drain(..));
+
+        // Service STP connections (send/recv). `None` means the network thread
+        // did not answer in time because it died or wedged: keep our connection
+        // list as it was instead of replacing it with an empty answer, so this
+        // tick loop -- and with it Zebra's shutdown -- can continue.
+        // Fetch decided BFT heights ahead of our own from a peer that holds them, one fresh request
+        // at a time, so the decisions PoW blocks cite are here when those blocks are. As with block
+        // downloads, slowness is no fault: an unanswered request is sent again after
+        // BFT_REQUEST_TIMEOUT, and stays open for its answer until the block-response deadline,
+        // since BFT_DECISIONS queue behind block responses on Bulk.
+        let now = std::time::Instant::now();
+        bft_requests.retain(|&(key, .., sent)| peers.contains_key(&key) && now.saturating_duration_since(sent) < block_response_deadline);
+        let request_fresh = bft_requests.iter().any(|&(.., sent)| now.saturating_duration_since(sent) < BFT_REQUEST_TIMEOUT);
+        if !request_fresh && !bft::bft_is_dropped() {
+            let our_len = bft::decided_len();
+            // On a chain-bootstrapped network genesis is derived, never fetched.
+            let mut want = our_len.max(if bft_runner.fetches_genesis() { 0 } else { 1 });
+            while bft_fetched.contains_key(&want) {
+                want += 1;
+            }
+            let room = (our_len + BFT_FETCH_AHEAD).saturating_sub(want);
+            // Round-robin among the peers that hold them and are not backing off, preferring one
+            // not already waited on, so a silent or slow peer cannot hold up the fetch. With no
+            // other, a waited-on peer is asked again: delivery is best-effort, the ask may be lost.
+            let holders = bft_holders(&peers, &bft_peer_rejections, want);
+            let unasked: Vec<ConnectionKey> = holders.iter().copied().filter(|key| !bft_requests.iter().any(|(asked, ..)| asked == key)).collect();
+            let holders = if unasked.is_empty() { holders } else { unasked };
+            if let (false, true) = (holders.is_empty(), room > 0) {
+                let key = holders[bft_request_cursor % holders.len()];
+                bft_request_cursor = bft_request_cursor.wrapping_add(1);
+                // A u16 count, at most the per-message cap.
+                let count = room.min(u64::from(bft_sync::MAX_DECISIONS_PER_MESSAGE)) as u16;
+                packets_to_send.push((key, bft_sync::bft_req_packet(want, count)));
+                bft_requests.push((key, want, count, now));
+            }
+        }
+
+        // Transaction relay: the bridge's answers, then what relay wants done, carried out.
+        if let Some(bridge) = &tx_bridge {
+            let now = std::time::Instant::now();
+            let live_now: HashSet<ConnectionKey> = current_connections.iter().map(|(a, _)| a.connection_key()).collect();
+            let () = tx_relay_bridge::ASSUME_PEER_GONE_FOR_EVERY_KEY;
+            for gone in tx_live.difference(&live_now) {
+                tx_state.on_peer_gone(*gone);
+                tx_decoding.remove(gone);
+            }
+            tx_live = live_now;
+            // Near the PoW tip and not catching up on BFT: otherwise our mempool is judged
+            // against a stale chain, and so would everything peers send. Peers' tips are their
+            // unverified claims, so the lower median is used, of the peers we chose from our
+            // address map if there are any (inbound connections are cheap to multiply), and only
+            // of peers that have sent a status: a minority claiming a higher tip cannot turn
+            // relay off.
+            let our_tip = read_state.best_tip().map_or(0, |(height, _)| height.0);
+            let reported = |peer: &&Peer| peer.their_tree.tip_height > 0;
+            let any_selected = peers.values().filter(reported).any(|peer| peer.origin == PeerOrigin::Selected);
+            let mut peer_tips: Vec<u32> = peers
+                .values()
+                .filter(reported)
+                .filter(|peer| !any_selected || peer.origin == PeerOrigin::Selected)
+                .map(|peer| peer.their_tree.tip_height)
+                .collect();
+            let middle = peer_tips.len().saturating_sub(1) / 2;
+            let peer_tip = if peer_tips.is_empty() { 0 } else { *peer_tips.select_nth_unstable(middle).1 };
+            tx_relay_active = !catching_up && our_tip.saturating_add(TX_RELAY_NEAR_TIP) >= peer_tip;
+
+            for answer in bridge.answers() {
+                match answer {
+                    tx_relay_bridge::FromBridge::Added(entries) => tx_state.on_added(entries),
+                    tx_relay_bridge::FromBridge::Removed(ids) => tx_state.on_removed(ids),
+                    tx_relay_bridge::FromBridge::Reset(entries) => tx_state.on_reset(entries),
+                    tx_relay_bridge::FromBridge::Filtered { from, keep } => tx_outs.extend(tx_state.on_filtered(from, keep, now)),
+                    tx_relay_bridge::FromBridge::Decoded { from, body_len, txs } => {
+                        if let Some(queued) = tx_decoding.get_mut(&from) {
+                            *queued = queued.saturating_sub(body_len as u64);
+                        }
+                        let delivered: Vec<(zebra_chain::transaction::UnminedTxId, u32)> = txs.iter().map(|(id, len, _)| (*id, *len)).collect();
+                        let take = tx_state.on_delivered(from, &delivered, now);
+                        if take.is_empty() {
+                            continue;
+                        }
+                        // The mempool knows an STP peer by its static key.
+                        let source: Option<[u8; 32]> = current_connections
+                            .iter()
+                            .find(|(address, _)| address.connection_key() == from)
+                            .and_then(|(address, _)| address.key.as_slice().try_into().ok());
+                        let submit = txs.into_iter().filter(|(id, _, _)| take.contains(id)).map(|(_, _, tx)| tx).collect();
+                        let submitted = source.is_some_and(|source| bridge.send(tx_relay_bridge::ToBridge::Submit { from, source, txs: submit }));
+                        if !submitted {
+                            let () = tx_relay_bridge::ASSUME_ONE_OUTCOME_PER_SUBMITTED;
+                            for id in take {
+                                tx_state.on_outcome(from, id, tx_relay_state::Outcome::Busy, now);
+                            }
+                        }
+                    }
+                    tx_relay_bridge::FromBridge::Malformed { from, body_len } => {
+                        if let Some(queued) = tx_decoding.get_mut(&from) {
+                            *queued = queued.saturating_sub(body_len as u64);
+                        }
+                        peers_to_kill.push((from, "sent a malformed TX".to_string()));
+                    }
+                    tx_relay_bridge::FromBridge::Outcome { from, id, outcome } => {
+                        if outcome != tx_relay_state::Outcome::Busy {
+                            if let Some(synthetic) = synthetic_peers.iter().find(|p| p.address.connection_key() == from) {
+                                let taken = outcome == tx_relay_state::Outcome::Accepted;
+                                let _ = synthetic.events.send(SyntheticPeerEvent::TxOutcome { id, taken, outcome: format!("{outcome:?}") });
+                            }
+                        }
+                        tx_state.on_outcome(from, id, outcome, now)
+                    }
+                    tx_relay_bridge::FromBridge::Bodies { to, txs } => {
+                        for packet in tx_relay::tx_packets(txs.iter().map(|tx| &*tx.transaction)) {
+                            tx_outs.push(tx_relay_state::Out::Send { to, packet, bulk: true });
+                        }
+                    }
+                }
+            }
+
+            if tx_relay_active {
+                let live: Vec<ConnectionKey> = tx_live.iter().copied().collect();
+                tx_outs.extend(tx_state.poll(&live, now));
+            }
+
+            // Relay sends only what each peer's channel takes now. A status leaves room on the
+            // control channel for PoW's own status and requests. An ask or a MEMPOOL_REQ that
+            // does not fit is rolled back, so it is made again rather than waited on.
+            let mut reserved: HashMap<(ConnectionKey, bool), u64> = HashMap::new();
+            let mut try_send = |to: ConnectionKey, packet: Vec<u8>, bulk: bool| -> bool {
+                let is_synthetic = synthetic_peers.iter().any(|p| p.address.connection_key() == to);
+                let channel = if bulk { Channel::Bulk } else { Channel::Control };
+                let budget = if is_synthetic { u64::MAX } else { network_thread_handle.send_budget(to, channel) };
+                let headroom = if packet[0] == PACKET_TYPE_TX_STATUS { TX_STATUS_CONTROL_HEADROOM } else { 0 };
+                let used = reserved.entry((to, bulk)).or_insert(0);
+                if budget < *used + packet.len() as u64 + headroom {
+                    return false;
+                }
+                *used += packet.len() as u64;
+                if bulk {
+                    bulk_packets_to_send.push((to, packet));
+                } else {
+                    packets_to_send.push((to, packet));
+                }
+                true
+            };
+            for out in tx_outs.drain(..) {
+                match out {
+                    tx_relay_state::Out::Send { to, packet, bulk } => {
+                        try_send(to, packet, bulk);
+                    }
+                    tx_relay_state::Out::Ask { to, ids, packet } => {
+                        if !try_send(to, packet, false) {
+                            tx_state.on_ask_unsent(to, &ids);
+                        }
+                    }
+                    tx_relay_state::Out::MempoolReq { to } => {
+                        if !try_send(to, tx_relay::mempool_req_packet(), false) {
+                            tx_state.on_mempool_req_unsent(to);
+                        }
+                    }
+                    tx_relay_state::Out::Filter { from, entries } => {
+                        bridge.send(tx_relay_bridge::ToBridge::Filter { from, entries });
+                    }
+                    tx_relay_state::Out::Fetch { to, ids } => {
+                        bridge.send(tx_relay_bridge::ToBridge::Fetch { to, ids });
+                    }
+                }
+            }
+        }
+
+        // Every session hears our version and capabilities, once. (STP does not keep order, so
+        // it is not necessarily the first message a peer gets from us.) Synthetic peers sit
+        // above the transport, which would drop a message to them.
+        {
+            let live: HashSet<(ConnectionKey, [u8; 64])> = current_connections
+                .iter()
+                .filter(|(addr, _)| !synthetic_peers.iter().any(|p| p.address == *addr))
+                .map(|(a, hash)| (a.connection_key(), *hash))
+                .collect();
+            hello_sent.retain(|session| live.contains(session));
+            for session in live {
+                if hello_sent.insert(session) {
+                    packets_to_send.push((session.0, hello_packet()));
+                }
+            }
+        }
+
+        // Packets for synthetic peers go to them, not to the network thread. Last, so every
+        // step above that sends (BFT requests, transaction relay) is covered.
         for queue in [&mut packets_to_send, &mut bulk_packets_to_send] {
             queue.retain(|(key, packet)| {
                 let Some(synthetic) = synthetic_peers.iter().find(|p| p.address.connection_key() == *key) else {
@@ -2926,15 +3625,12 @@ pub fn sync(
             });
         }
 
-        // Service STP connections (send/recv). `None` means the network thread
-        // did not answer in time because it died or wedged: keep our connection
-        // list as it was instead of replacing it with an empty answer, so this
-        // tick loop -- and with it Zebra's shutdown -- can continue.
         let mut packets_received = match service_connections(&mut network_thread_handle, NetworkThreadPush {
             initiate_connections,
             wanted_connections: current_connections.iter().filter(|(addr, _)| !synthetic_peers.iter().any(|p| p.address == *addr)).cloned().collect(),
             send_unreliable: packets_to_send,
             send_bulk: std::mem::take(&mut bulk_packets_to_send),
+            ..Default::default()
         }) {
             Some(resp) => {
                 current_connections = resp.current_connections;
@@ -3108,8 +3804,23 @@ pub fn sync(
                         format!("{}..{} ({}..{})", first.this_height, last.this_height, first.this_hash, last.this_hash)
                     }).collect::<Vec<_>>(),
                 );
+                let branch_tips = |tree: &NearTipBranches| tree.branches.iter().filter_map(|b| b.last()).map(|b| (b.this_height, b.this_hash)).collect::<Vec<_>>();
+                let tips_moved = branch_tips(&their_tree) != branch_tips(&peer.their_tree);
                 peer.their_tree = their_tree;
                 peer.their_queue = their_queue;
+                // A peer's new tip is downloaded from as soon as it is heard of, not at the next
+                // BLOCK_SEND_MS pass: on a real network each hop of a block's relay waited for it.
+                if tips_moved {
+                    next_dl_init = next_dl_init.min(last_dl_init + std::time::Duration::from_millis(DL_INIT_WOKEN_MIN_MS));
+                    bft::wake_sync_thread();
+                }
+
+                // A far-behind peer learns what to fetch only from historical windows, 100 hashes
+                // at a time. It sends a STATUS whenever its tip moves, so answering each one with
+                // the next window moves it on once per round trip instead of once per heartbeat.
+                let their_height = peer.their_tree.branches.iter().filter_map(|b| b.last()).map(|b| b.this_height).max().unwrap_or(peer.their_tree.finalized_height);
+                let our_height = read_state.best_tip().map_or(0, |(h, _)| h.0);
+                peer.history_wanted = their_height < near_tip_start_height(our_height);
 
             } else if packet_type == PACKET_TYPE_BLOCK_REQ {
 
@@ -3427,8 +4138,130 @@ pub fn sync(
                 println!("Queueing for commit: {}", hash);
                 blocks_to_commit.push((hash, std::sync::Arc::new(block)));
                 fates.insert(hash, BlockFate { delivered_by: Some(connection_key), ..Default::default() });
+            } else if packet_type == PACKET_TYPE_HELLO {
+                let Some((version, capabilities)) = some_or_kill!(read_hello(msg), "Malformed HELLO") else {
+                    continue 'process_packets;
+                };
+                if version != PROTOCOL_VERSION {
+                    tracing::info!("NewNet: Peer {connection_address:?} speaks protocol version {version} (ours is {PROTOCOL_VERSION}), capabilities {capabilities:#x}");
+                }
+                peer.protocol_version = Some(version);
+                peer.capabilities = capabilities;
+            } else if packet_type == PACKET_TYPE_TX_STATUS {
+                let Some((_total, entries)) = some_or_kill!(tx_relay::read_tx_status(msg), "Malformed TX_STATUS") else {
+                    continue 'process_packets;
+                };
+                // Heard only while relay is active: it is listed again within a heartbeat.
+                if tx_bridge.is_some() && tx_relay_active {
+                    tx_outs.extend(tx_state.on_status(connection_key, entries, std::time::Instant::now()));
+                }
+            } else if packet_type == PACKET_TYPE_TX_REQ {
+                let Some(ids) = some_or_kill!(tx_relay::read_tx_req(msg), "Malformed TX_REQ") else {
+                    continue 'process_packets;
+                };
+                if tx_bridge.is_some() {
+                    tx_outs.extend(tx_state.on_request(connection_key, ids, std::time::Instant::now()));
+                }
+            } else if packet_type == PACKET_TYPE_TX {
+                // Decoded on the bridge, and only if we are waiting on this peer; a malformed
+                // body comes back as Malformed and kills it.
+                // A peer's undecoded bodies are capped at what it was asked for plus one message,
+                // so one peer cannot fill the bridge's queue; past it, bodies are dropped (the
+                // asks go unanswered and are re-made, or made of someone else).
+                if let Some(bridge) = &tx_bridge {
+                    if tx_state.has_requested(connection_key) {
+                        let () = tx_relay_bridge::ASSUME_UNASKED_TX_NOT_DECODED;
+                        let queued = tx_decoding.entry(connection_key).or_insert(0);
+                        let cap = tx_state.requested_bytes(connection_key) + tx_relay::TX_MESSAGE_BUDGET as u64;
+                        if *queued + msg.len() as u64 <= cap {
+                            if bridge.send(tx_relay_bridge::ToBridge::Decode { from: connection_key, body: msg.to_vec() }) {
+                                *queued += msg.len() as u64;
+                            } else {
+                                tx_state.on_body_dropped(connection_key, std::time::Instant::now());
+                            }
+                        }
+                    }
+                }
+            } else if packet_type == PACKET_TYPE_MEMPOOL_REQ {
+                if !msg.is_empty() {
+                    kill!("Malformed MEMPOOL_REQ");
+                    continue 'process_packets;
+                }
+                if tx_bridge.is_some() {
+                    tx_outs.extend(tx_state.on_mempool_req(connection_key, std::time::Instant::now()));
+                }
+            } else if packet_type == PACKET_TYPE_BFT_STATUS {
+                let Some(their_bft_len) = some_or_kill!(bft_sync::read_bft_status(msg), "Malformed BFT_STATUS") else {
+                    continue 'process_packets;
+                };
+                peer.their_bft_len = their_bft_len;
+
+            } else if packet_type == PACKET_TYPE_BFT_REQ {
+                let Some((from, count)) = some_or_kill!(bft_sync::read_bft_req(msg), "Malformed BFT_REQ") else {
+                    continue 'process_packets;
+                };
+                // Served after this tick's block responses, under the same backpressure; a newer
+                // request from the same peer replaces an unserved one.
+                bft_requests_to_serve.retain(|(key, ..)| *key != connection_key);
+                bft_requests_to_serve.push((connection_key, from, count));
+
+            } else if packet_type == PACKET_TYPE_BFT_DECISIONS {
+                let Some(decisions) = some_or_kill!(bft_sync::read_bft_decisions(msg), "Malformed BFT_DECISIONS") else {
+                    continue 'process_packets;
+                };
+                if bft::bft_is_dropped() {
+                    continue 'process_packets;
+                }
+                let next = bft::decided_len();
+                let first_fetchable = if bft_runner.fetches_genesis() { 0 } else { 1 };
+                let requested = bft_requests.iter().position(|&(key, from, ..)| key == connection_key && decisions.first().is_some_and(|d| d.height == from));
+                if let Some((_, from, count, _)) = requested.map(|i| bft_requests.swap_remove(i)) {
+                    // The answer to a request still open, however late: keep the heights asked
+                    // for, and who sent them.
+                    for decision in decisions {
+                        let height = decision.height;
+                        if height >= from.max(first_fetchable) && height < from + u64::from(count) && height >= next && height < next + BFT_FETCH_AHEAD {
+                            bft_fetched.insert(height, (connection_key, decision));
+                        }
+                    }
+                    peer.bft_answered_at = Some(std::time::Instant::now());
+                } else {
+                    // Not asked for: a decision for our next height that can be stored at once is
+                    // as good as one we asked for, since its certificate vouches for it. Nothing
+                    // else is kept, so no peer can occupy the fetch window with what it chooses.
+                    // A peer we are backing off is not heard: checking a decision costs PoW and
+                    // signature checks on this thread.
+                    if is_backing_off(&bft_peer_rejections, connection_key) {
+                        continue 'process_packets;
+                    }
+                    for decision in decisions {
+                        if decision.height != bft::decided_len() || decision.height < first_fetchable {
+                            continue;
+                        }
+                        match bft_runner.feed_fetched(decision, &read_state, &mut block_writer) {
+                            bft::FeedOutcome::Fed => {}
+                            bft::FeedOutcome::NotReady(_) => break,
+                            bft::FeedOutcome::Refused { why, peer_fault } => {
+                                if peer_fault {
+                                    kill!("Sent a malformed BFT decision: {why}");
+                                    continue 'process_packets;
+                                }
+                                // Possibly our own state disagreeing, as for a fetched decision.
+                                note_rejection(&mut bft_peer_rejections, connection_key);
+                                break;
+                            }
+                        }
+                    }
+                }
+
             } else {
-                warning!("NewNet: Got unknown msg type={} len={}, ignoring.", packet_type, msg.len());
+                // Logged once per peer and type: a newer peer sends what we do not know on
+                // every tick, and that is not news after the first time.
+                let (word, bit) = (usize::from(packet_type) / 64, 1u64 << (packet_type % 64));
+                if peer.unknown_types_logged[word] & bit == 0 {
+                    peer.unknown_types_logged[word] |= bit;
+                    warning!("NewNet: Got unknown msg type={packet_type:#04x} len={} from a peer of protocol version {:?}, ignoring it from them from now on.", msg.len(), peer.protocol_version);
+                }
                 continue 'process_packets;
             }
 
@@ -3468,8 +4301,16 @@ pub fn sync(
 
         // @Temporary: just pull one and wait to commit it.
         let mut any_blocks_in_the_queue_can_make_progress = false;
+        let commit_start = std::time::Instant::now();
+        let mut commit_head: Option<CommitHead> = None;
+        let mut committed_this_tick = 0u64;
         blocks_to_commit.retain(|(hash, block_arc)| {
             if zebra_chain::shutdown::is_shutting_down() { return true; }
+            // A pass can verify many blocks, and tenderlink waits on this thread for every
+            // Validate and Decided answer. Serve it between blocks, not only between ticks; a
+            // decision stored here can also let the next block's fat pointer resolve.
+            bft_runner.drain(&read_state, &mut block_writer);
+            feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer, &mut peers_to_kill, &mut bft_peer_rejections);
             let hash = *hash;
             let block_arc = block_arc.clone();
 
@@ -3477,6 +4318,7 @@ pub fn sync(
             let fate = fates.get_mut(&hash).expect("every queued block has a fate");
 
             if read_state.known_block(parent_hash).is_none() {
+                commit_head.get_or_insert(CommitHead::ParentMissing);
                 fate.tell_pending(&synthetic_peers, hash, format_args!("parent {parent_hash} is not committed yet"));
                 return true; // keep
             }
@@ -3609,7 +4451,9 @@ pub fn sync(
             // A deferrable verdict means "not yet", not "no": keep the block so the next tick
             // can retry it, instead of dropping it and paying for another download.
             if let Err((phase, err, true)) = &verdict {
+                commit_head.get_or_insert(if *phase == "crosslink" { CommitHead::BftGate } else { CommitHead::DeferredOther });
                 if first_attempt { println!("Deferring: @ {height}, {hash}: {phase}: {}", err.msg); }
+                fate.warn_if_stalled(height, hash, format_args!("{phase}: {}", err.msg));
                 fate.tell_pending(&synthetic_peers, hash, format_args!("{phase}: {}", err.msg));
                 return true; // keep
             }
@@ -3661,14 +4505,19 @@ pub fn sync(
                 },
             };
             let failed = matches!(outcome, IngestOutcome::Failed { .. });
+            if res.is_ok() {
+                committed_this_tick += 1;
+            }
+            commit_head.get_or_insert(if failed { CommitHead::Failed } else { CommitHead::Committed });
             let delivered_by = settle_fate(&mut fates, &synthetic_peers, hash, outcome);
 
             // Only a bad header gets the peer killed: the hash commits to the header and nothing
             // else, so the peer advertised a block that cannot exist. A bad body may be forged
-            // under an honest block's hash, and the same peer may still serve the honest one.
+            // under an honest block's hash, and the same peer may serve the honest one once its
+            // rejection entry expires.
             if let Some(key) = delivered_by {
                 if failed {
-                    note_rejection(&mut rejections, hash);
+                    note_rejected_server(note_rejection(&mut rejections, hash), key);
                 }
                 if let Err(("header", err, _)) = &verdict {
                     if err.misbehavior_score > 0 {
@@ -3696,6 +4545,18 @@ pub fn sync(
                 }
             }
         });
+
+        feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer, &mut peers_to_kill, &mut bft_peer_rejections);
+        sync_profile.record_tick(commit_head, committed_this_tick, commit_start.elapsed(), bft_runner.has_parked_decision());
+        sync_profile.report_if_due(
+            read_state.best_tip().map_or(0, |(h, _)| h.0),
+            bft::bft_chain().read().unwrap().blocks.len(),
+            bft_fetched.len(),
+            blocks_to_commit.len(),
+            peers.iter().map(|(_, peer)| peer.block_downloads.used_flags.count_ones()).sum(),
+            current_connections.len(),
+            || network_thread_handle.take_lock_times(),
+        );
 
         // Blocks at or below the finalized height can never commit, so holding them is pure
         // waste. This replaces a blanket clear() that used to throw away the whole cache --
@@ -3738,8 +4599,13 @@ pub fn sync(
         let _ = any_blocks_in_the_queue_can_make_progress;
 
         // The remainder of the tick goes to BFT requests, so a round does not wait out the tick.
+        // Work that arrives in it, such as a submitted block, starts the next tick early.
+        // A download pass falling due inside the idle wait ends it then, so a STATUS that brought
+        // the pass forward is acted on when the pass is due, not at the next full tick.
+        SYNC_TICKS_DONE.fetch_add(1, std::sync::atomic::Ordering::Release);
         if !zebra_chain::shutdown::is_shutting_down() {
-            bft_runner.wait(loop_start + tick_duration, &read_state, &mut block_writer);
+            let idle_until = (loop_start + tick_duration).min(next_dl_init.max(loop_start + woken_tick_min));
+            bft_runner.wait(loop_start + woken_tick_min, idle_until, &read_state, &mut block_writer);
         }
     }
     rt.block_on(block_writer.finish_backup());
@@ -3751,11 +4617,277 @@ mod tests {
     use super::*;
 
     #[cfg(test)]
+    fn bft_peer(port: u16, their_bft_len: u64, answered_ago: Option<std::time::Duration>, now: std::time::Instant) -> (ConnectionKey, Peer) {
+        let key = ConnectionKey { ip: std::net::Ipv6Addr::LOCALHOST, port, key_15_bits: 0 };
+        let peer = Peer { their_bft_len, bft_answered_at: answered_ago.map(|ago| now - ago), ..Default::default() };
+        (key, peer)
+    }
+
+    /// A config written by v16 or v17 names its peers with the 0.x selector. Each is dialled
+    /// with the current selector and the same key, and any other selector is skipped, so the
+    /// node starts either way.
+    #[test]
+    fn initial_peers_with_an_older_selector_are_dialled_with_the_current_one() {
+        // The same feature-net node as `zebrad generate` of v17 wrote it and as dev lists it.
+        let v17 = "[::ffff:45.63.75.9]:12001:1fgEw5Nx:-w4ArAa4esTUBjgig6xIQJ4N8DlwL5aufGMcDPGzPE4";
+        let current = "[::ffff:45.63.75.9]:12001:-fCmrBqp:-w4ArAa4esTUBjgig6xIQJ4N8DlwL5aufGMcDPGzPE4";
+        let address = STPAddress::parse(current).unwrap();
+        assert_eq!(initial_peer(current), InitialPeer::Dial(address.clone()));
+        assert_eq!(initial_peer(v17), InitialPeer::Updated(address.clone()));
+        assert_eq!(initial_peer(&v17.replace("1fgEw5Nx", "11Q8bpGo")), InitialPeer::Updated(address.clone()));
+        assert_eq!(format!("{address:?}"), current);
+
+        // Plaintext, of 1.0 or now, and a selector no release used.
+        for selector in ["Gwn4skNt", "qzmupjQf", "AQAAAAAA"] {
+            let peer = v17.replace("1fgEw5Nx", selector);
+            assert!(matches!(initial_peer(&peer), InitialPeer::Skipped(_)), "{peer}");
+        }
+        assert_eq!(initial_peer("45.63.75.9:12001"), InitialPeer::Skipped("not an STP address".to_string()));
+    }
+
+    /// Any `network_initial_peers` entry, well-formed or mangled, with any selector and key: startup
+    /// never panics, dials only with `CRYPTO_MAGIC`, rewrites exactly the older selectors keeping
+    /// the address and key, and the dialled address prints as an entry that dials itself.
+    #[test]
+    fn fuzz_initial_peers() {
+        use rand::{Rng, SeedableRng};
+        let seed: u64 = std::env::var("FUZZ_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| rand::thread_rng().gen());
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
+        let b64 = |bytes: &[u8]| tenderlink::stp::b64(bytes);
+        let selectors = ["-fCmrBqp", "1fgEw5Nx", "11Q8bpGo", "Gwn4skNt", "qzmupjQf", "AQAAAAAA"];
+        let (mut dialled, mut updated, mut skipped) = (0, 0, 0);
+        for case in 0..20_000 {
+            let ip = match rng.gen_range(0..3) {
+                0 => format!("[::ffff:{}.{}.{}.{}]", rng.gen::<u8>(), rng.gen::<u8>(), rng.gen::<u8>(), rng.gen::<u8>()),
+                1 => format!("[{}]", std::net::Ipv6Addr::from(rng.gen::<u128>())),
+                _ => format!("{}.{}.{}.{}", rng.gen::<u8>(), rng.gen::<u8>(), rng.gen::<u8>(), rng.gen::<u8>()),
+            };
+            let selector = if rng.gen_bool(0.8) {
+                selectors[rng.gen_range(0..selectors.len())].to_string()
+            } else {
+                b64(&rng.gen::<[u8; 6]>())
+            };
+            let key_len = if rng.gen_bool(0.9) { 32 } else { rng.gen_range(0..40) };
+            let key: Vec<u8> = (0..key_len).map(|_| rng.gen::<u8>()).collect();
+            let mut entry = format!("{ip}:{}:{selector}:{}", rng.gen::<u16>(), b64(&key));
+            if rng.gen_bool(0.3) {
+                let mut bytes = entry.into_bytes();
+                for _ in 0..rng.gen_range(1..4) {
+                    let i = rng.gen_range(0..=bytes.len());
+                    match rng.gen_range(0..3) {
+                        0 => bytes.truncate(i),
+                        1 => bytes.insert(i, b":[]-_.0aZ"[rng.gen_range(0..9)]),
+                        _ => if i < bytes.len() { bytes[i] = rng.gen_range(0x20..0x7f); },
+                    }
+                }
+                entry = String::from_utf8(bytes).unwrap();
+            }
+
+            let parsed = STPAddress::parse(&entry);
+            let outcome = initial_peer(&entry);
+            let address = match (&parsed, &outcome) {
+                (None, InitialPeer::Skipped(_)) => { skipped += 1; continue; }
+                (None, _) => panic!("unparsable entry dialled; seed {seed} case {case}: {entry} -> {outcome:?}"),
+                (Some(p), InitialPeer::Dial(a)) => {
+                    assert!(p.magic1 == CRYPTO_MAGIC && a == p, "seed {seed} case {case}: {entry} -> {outcome:?}");
+                    dialled += 1;
+                    a
+                }
+                (Some(p), InitialPeer::Updated(a)) => {
+                    assert!(OLD_CRYPTO_MAGIC1S.contains(&p.magic1), "seed {seed} case {case}: {entry} -> {outcome:?}");
+                    assert_eq!((a.ip, a.port, a.magic1, &a.key), (p.ip, p.port, CRYPTO_MAGIC, &p.key), "seed {seed} case {case}: {entry}");
+                    updated += 1;
+                    a
+                }
+                (Some(p), InitialPeer::Skipped(_)) => {
+                    assert!(p.magic1 != CRYPTO_MAGIC && !OLD_CRYPTO_MAGIC1S.contains(&p.magic1), "seed {seed} case {case}: {entry} -> {outcome:?}");
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let printed = format!("{address:?}");
+            assert_eq!(initial_peer(&printed), InitialPeer::Dial(address.clone()), "seed {seed} case {case}: {entry} printed as {printed}");
+        }
+        assert!(dialled > 1000 && updated > 1000 && skipped > 1000, "seed {seed}: {dialled} dialled, {updated} updated, {skipped} skipped");
+    }
+
+    /// Random failed deliveries of a few hashes from a few peers, with backoffs run out at random:
+    /// a hash is never asked of the last `MAX_REJECTION_SERVERS` peers that served it bad bytes
+    /// while its entry lives, and is asked of every other peer once its backoff runs out, so peers
+    /// serving forged bytes can never keep the hash from a peer with the real block.
+    #[test]
+    fn fuzz_rejected_servers() {
+        use rand::{Rng, SeedableRng};
+        let seed: u64 = std::env::var("FUZZ_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| rand::thread_rng().gen());
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
+        let (mut excluded_after_backoff, mut asked_after_backoff, mut evictions) = (0, 0, 0);
+        for case in 0..200 {
+            let hashes: Vec<Hash> = (0..rng.gen_range(1..4u8)).map(|i| Hash([i; 32])).collect();
+            let servers: Vec<ConnectionKey> = (0..rng.gen_range(1..40u16))
+                .map(|port| ConnectionKey { ip: std::net::Ipv6Addr::LOCALHOST, port, key_15_bits: 0 })
+                .collect();
+            let mut rejections: HashMap<Hash, Rejection> = HashMap::new();
+            let mut model: HashMap<Hash, (u32, bool, Vec<ConnectionKey>)> = HashMap::new(); // strikes, backing off, servers
+            for op in 0..rng.gen_range(1..300) {
+                let hash = hashes[rng.gen_range(0..hashes.len())];
+                let server = servers[rng.gen_range(0..servers.len())];
+                match rng.gen_range(0..4) {
+                    0 | 1 => {
+                        note_rejected_server(note_rejection(&mut rejections, hash), server);
+                        let (strikes, backing_off, served) = model.entry(hash).or_default();
+                        *strikes += 1;
+                        *backing_off = true;
+                        if !served.contains(&server) {
+                            if served.len() >= MAX_REJECTION_SERVERS {
+                                served.remove(0);
+                                evictions += 1;
+                            }
+                            served.push(server);
+                        }
+                    }
+                    2 => {
+                        if let (Some(rejection), Some(entry)) = (rejections.get_mut(&hash), model.get_mut(&hash)) {
+                            rejection.retry_at = std::time::Instant::now() - std::time::Duration::from_millis(1);
+                            entry.1 = false;
+                        }
+                    }
+                    _ => {
+                        let asked = !is_backing_off_from(&rejections, hash, server);
+                        let expected = match model.get(&hash) {
+                            None => true,
+                            Some((_, backing_off, served)) => !backing_off && !served.contains(&server),
+                        };
+                        assert_eq!(asked, expected, "seed {seed} case {case} op {op}: hash {hash} server {server:?}");
+                        if model.get(&hash).is_some_and(|m| !m.1) {
+                            if asked { asked_after_backoff += 1 } else { excluded_after_backoff += 1 }
+                        }
+                    }
+                }
+                for (hash, (strikes, _, served)) in &model {
+                    let rejection = &rejections[hash];
+                    assert_eq!(rejection.strikes, *strikes, "seed {seed} case {case} op {op}");
+                    assert_eq!(&rejection.served_by, served, "seed {seed} case {case} op {op}");
+                    assert!(rejection.served_by.len() <= MAX_REJECTION_SERVERS);
+                    assert_eq!(is_backing_off(&rejections, *hash), model[hash].1, "seed {seed} case {case} op {op}");
+                }
+            }
+        }
+        assert!(
+            excluded_after_backoff > 100 && asked_after_backoff > 100 && evictions > 10,
+            "seed {seed}: {excluded_after_backoff} excluded and {asked_after_backoff} asked after a backoff, {evictions} evictions"
+        );
+    }
+
+    /// Only a peer that has recently answered our requests can hold tenderlink back: a length
+    /// advertised by a peer that never serves holds nothing, nor does one from a peer backing off.
+    #[test]
+    fn bft_catch_up_hold_needs_a_peer_that_serves() {
+        let now = std::time::Instant::now();
+        let mut peers = HashMap::new();
+        let no_rejections = HashMap::new();
+
+        let (liar, peer) = bft_peer(1, u64::MAX, None, now);
+        peers.insert(liar, peer);
+        assert!(!bft_catching_up(&peers, &no_rejections, 10, now), "an advertised length alone holds nothing");
+
+        let (stale, peer) = bft_peer(2, 1_000, Some(BFT_EVIDENCE_WINDOW * 2), now);
+        peers.insert(stale, peer);
+        assert!(!bft_catching_up(&peers, &no_rejections, 10, now), "an answer long ago holds nothing");
+
+        let (server, peer) = bft_peer(3, 10 + BFT_CATCH_UP_SLACK, Some(std::time::Duration::from_secs(1)), now);
+        peers.insert(server, peer);
+        assert!(!bft_catching_up(&peers, &no_rejections, 10, now), "within the slack is caught up");
+
+        peers.get_mut(&server).unwrap().their_bft_len = 10 + BFT_CATCH_UP_SLACK + 1;
+        assert!(bft_catching_up(&peers, &no_rejections, 10, now));
+
+        let mut rejections = HashMap::new();
+        note_rejection(&mut rejections, server);
+        assert!(!bft_catching_up(&peers, &rejections, 10, now), "a peer backing off holds nothing");
+    }
+
+    /// A restarted node holds tenderlink until a peer answers, every peer that reported is within
+    /// the slack, or the hold runs out.
+    #[test]
+    fn bft_startup_hold_ends_on_an_answer_on_peers_level_with_us_or_on_time() {
+        let now = std::time::Instant::now();
+        let until = now + BFT_STARTUP_HOLD;
+        let mut peers = HashMap::new();
+        assert!(bft_startup_holding(&peers, 10, until, now), "no peer heard from yet");
+        assert!(!bft_startup_holding(&peers, 10, until, until), "the hold runs out");
+
+        let (ahead, peer) = bft_peer(1, 100, None, now);
+        peers.insert(ahead, peer);
+        assert!(bft_startup_holding(&peers, 10, until, now), "a peer ahead that has not answered yet");
+
+        peers.get_mut(&ahead).unwrap().bft_answered_at = Some(now);
+        assert!(!bft_startup_holding(&peers, 10, until, now), "an answer hands over to bft_catching_up");
+
+        let mut peers = HashMap::new();
+        let (level, peer) = bft_peer(2, 10 + BFT_CATCH_UP_SLACK, None, now);
+        peers.insert(level, peer);
+        let (silent, peer) = bft_peer(3, 0, None, now);
+        peers.insert(silent, peer);
+        assert!(!bft_startup_holding(&peers, 10, until, now), "every peer that reported is level with us");
+    }
+
+    /// Requests go round all the peers that hold the wanted height, skipping those backing off.
+    #[test]
+    fn bft_holders_are_every_peer_with_the_height_and_not_backing_off() {
+        let now = std::time::Instant::now();
+        let mut peers = HashMap::new();
+        for (port, len) in [(1, 50), (2, 80), (3, 80), (4, 20)] {
+            let (key, peer) = bft_peer(port, len, None, now);
+            peers.insert(key, peer);
+        }
+        let ports = |holders: Vec<ConnectionKey>| holders.iter().map(|key| key.port).collect::<Vec<_>>();
+        assert_eq!(ports(bft_holders(&peers, &HashMap::new(), 30)), vec![1, 2, 3]);
+
+        let mut rejections = HashMap::new();
+        note_rejection(&mut rejections, ConnectionKey { ip: std::net::Ipv6Addr::LOCALHOST, port: 2, key_15_bits: 0 });
+        assert_eq!(ports(bft_holders(&peers, &rejections, 30)), vec![1, 3]);
+        assert_eq!(ports(bft_holders(&peers, &rejections, 60)), vec![3]);
+    }
+
+    #[cfg(test)]
     fn parse_chunk(packet: &[u8]) -> (PeerPowBlockResponseChunkHdr, &[u8]) {
         assert_eq!(packet[0], PACKET_TYPE_BLOCK_CHUNK);
         let mut msg = &packet[1..];
         let hdr = PeerPowBlockResponseChunkHdr::read_from(&mut msg).unwrap();
         (hdr, msg)
+    }
+
+    #[test]
+    fn hello_round_trips_and_a_newer_longer_one_still_reads() {
+        let hello = hello_packet();
+        assert_eq!(hello[0], PACKET_TYPE_HELLO);
+        assert_eq!(read_hello(&hello[1..]), Some((PROTOCOL_VERSION, OUR_CAPABILITIES)));
+        let mut newer = hello.clone();
+        newer.extend_from_slice(&[9; 5]);
+        assert_eq!(read_hello(&newer[1..]), Some((PROTOCOL_VERSION, OUR_CAPABILITIES)));
+        assert_eq!(read_hello(&hello[1..hello.len() - 1]), None);
+    }
+
+    // This module is compiled outside tests too, and proptest is a dev-dependency.
+    #[cfg(test)]
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2048))]
+
+        /// Any 10 bytes are a HELLO, whatever follows (a newer version's fields); fewer are not.
+        #[test]
+        fn a_hello_reads_its_first_ten_bytes_and_ignores_the_rest(body in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64)) {
+            let expected = (body.len() >= 10).then(|| (u16::from_le_bytes([body[0], body[1]]), u64::from_le_bytes(body[2..10].try_into().unwrap())));
+            proptest::prop_assert_eq!(read_hello(&body), expected);
+        }
+
+        /// Ours, with anything a newer version might append, reads as ours.
+        #[test]
+        fn our_hello_reads_back_whatever_a_newer_version_appends(appended in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64)) {
+            let mut hello = hello_packet();
+            proptest::prop_assert_eq!(hello.len(), 1 + 2 + 8);
+            hello.extend_from_slice(&appended);
+            proptest::prop_assert_eq!(read_hello(&hello[1..]), Some((PROTOCOL_VERSION, OUR_CAPABILITIES)));
+        }
     }
 
     #[test]

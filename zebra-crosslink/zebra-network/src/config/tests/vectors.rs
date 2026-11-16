@@ -46,6 +46,20 @@ fn parse_config_listen_addr() {
     }
 }
 
+/// The legacy network is off unless a config turns it on, and the setting survives a round trip.
+#[test]
+fn legacy_network_is_opt_in() {
+    let _init_guard = zebra_test::init();
+
+    assert!(!Config::default().legacy_network);
+    let unset: Config = toml::from_str("listen_addr = '[::]:8233'").unwrap();
+    assert!(!unset.legacy_network, "a config written before the option leaves it off");
+    let on: Config = toml::from_str("legacy_network = true").unwrap();
+    assert!(on.legacy_network);
+    let round_trip: Config = toml::from_str(&toml::to_string(&on).unwrap()).unwrap();
+    assert!(round_trip.legacy_network);
+}
+
 /// Make sure the peer connection limits are consistent with each other.
 #[test]
 fn ensure_peer_connection_limits_consistent() {

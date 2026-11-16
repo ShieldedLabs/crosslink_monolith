@@ -81,7 +81,7 @@ pub fn test_start() {
                 base.crosslink.explicit_bft_key_seed = Some(zebra_crosslink::test_format::TEST_NODE_FINALIZER_SEED.to_string());
             }
             base.state.ephemeral = true;
-            // getblocktemplate refuses to build a coinbase without one (MINE_FROM_TEMPLATE). The
+            // getblocktemplate refuses to build a coinbase without one (LOAD_POW from the template). The
             // test miner's key, so scenarios can spend what the node's templates pay out.
             base.mining.miner_address = Some(
                 TestKey::new(b"crosslink test miner")
@@ -349,10 +349,11 @@ fn crosslink_upgrade_height_set_by_the_test_file() {
     test_bytes(tf.write_to_bytes());
 }
 
-/// FeaturenetUpgrade2 is unscheduled by default; a test file's node config schedules it at height
-/// 4, and the node switches to it at exactly that height, as for FeaturenetUpgrade1 above: a block
-/// there built for the default schedule, whose coinbase is still the older upgrade's, is refused,
-/// and one built for the moved schedule is accepted, as is the node's own next block.
+/// FeaturenetUpgrade2 activates far beyond any scenario by default; a test file's node config
+/// moves it to height 4, and the node switches to it at exactly that height, as for
+/// FeaturenetUpgrade1 above: a block there built for the default schedule, whose coinbase is still
+/// the older upgrade's, is refused, and one built for the moved schedule is accepted, as is the
+/// node's own next block.
 #[test]
 fn crosslink_featurenet_upgrade_2_height_set_by_the_test_file() {
     use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
@@ -370,8 +371,7 @@ fn crosslink_featurenet_upgrade_2_height_set_by_the_test_file() {
     let default_schedule = regtest_network(&params);
     assert_ne!(NetworkUpgrade::current(&network, BlockHeight(activation - 1)), NetworkUpgrade::FeaturenetUpgrade2);
     assert_eq!(NetworkUpgrade::current(&network, BlockHeight(activation)), NetworkUpgrade::FeaturenetUpgrade2);
-    assert_eq!(NetworkUpgrade::FeaturenetUpgrade2.activation_height(&default_schedule), None);
-    assert_ne!(NetworkUpgrade::current(&default_schedule, BlockHeight::MAX), NetworkUpgrade::FeaturenetUpgrade2);
+    assert_featurenet_upgrade_2_beyond_scenarios(&default_schedule);
 
     let key = TestKey::new(b"crosslink test miner");
     let miner = key.address();
@@ -397,15 +397,72 @@ fn crosslink_featurenet_upgrade_2_height_set_by_the_test_file() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// FeaturenetUpgrade3 is far above the test's heights by default; a test file's node config
+/// schedules it at height 4, and the node switches to it at exactly that height, as for
+/// FeaturenetUpgrade2 above: a block
+/// there built for the default schedule, whose coinbase is still the older upgrade's, is refused,
+/// and one built for the moved schedule is accepted, as is the node's own next block.
+#[test]
+fn crosslink_featurenet_upgrade_3_height_set_by_the_test_file() {
+    use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
+
+    set_test_name(function_name!());
+    let params = HARNESS_PARAMETERS;
+    let activation = 4;
+    let node_config = node_config_with_activation_heights(ConfiguredActivationHeights {
+        featurenet_upgrade_3: Some(activation),
+        ..Default::default()
+    });
+    let mut tf = TF::new_with_node_config(&params, &node_config);
+
+    let network = test_network(&params, &node_config);
+    let default_schedule = regtest_network(&params);
+    assert_ne!(NetworkUpgrade::current(&network, BlockHeight(activation - 1)), NetworkUpgrade::FeaturenetUpgrade3);
+    assert_eq!(NetworkUpgrade::current(&network, BlockHeight(activation)), NetworkUpgrade::FeaturenetUpgrade3);
+    let default_height = NetworkUpgrade::FeaturenetUpgrade3.activation_height(&default_schedule);
+    assert!(default_height.map_or(true, |height| height.0 > 1_000), "FeaturenetUpgrade3 at {default_height:?}");
+    assert_ne!(NetworkUpgrade::current(&default_schedule, BlockHeight(activation + 2)), NetworkUpgrade::FeaturenetUpgrade3);
+
+    let key = TestKey::new(b"crosslink test miner");
+    let miner = key.address();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    for _ in 2..activation {
+        tf.push_instr_load_pow(&gen.next_block(&miner), 0);
+    }
+
+    // the same chain, continued by a generator that does not know the upgrade
+    let mut default_gen = gen.clone();
+    default_gen.network = default_schedule;
+    tf.push_instr_load_pow(&default_gen.next_block(&miner), SHOULD_FAIL);
+
+    let first_after = gen.next_block(&miner);
+    tf.push_instr_load_pow(&first_after, 0);
+    tf.push_instr_expect_pow_tip(&first_after.hash(), 0);
+    tf.push_instr_mine_from_template_into(1, 0);
+    tf.push_instr_expect_pow_tip_slot(1, 0);
+    tf.push_instr_expect_pow_chain_length(activation as usize + 2, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// FeaturenetUpgrade2's default height is above every scenario, so a scenario on the default
+/// schedule runs entirely before it.
+fn assert_featurenet_upgrade_2_beyond_scenarios(network: &Network) {
+    let height = NetworkUpgrade::FeaturenetUpgrade2.activation_height(network);
+    assert!(height.map_or(true, |height| height.0 > 1_000), "FeaturenetUpgrade2 at {height:?}");
+}
+
 /// The node and the network for a fat pointer binding scenario: FeaturenetUpgrade2 at
-/// `activation`, or unscheduled as by default.
+/// `activation`, or at its default height beyond the scenario.
 fn fat_pointer_binding_node(activation: Option<u32>) -> (TF, Network) {
     use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
 
     let params = HARNESS_PARAMETERS;
     let Some(activation) = activation else {
         let network = regtest_network(&params);
-        assert_eq!(NetworkUpgrade::FeaturenetUpgrade2.activation_height(&network), None);
+        assert_featurenet_upgrade_2_beyond_scenarios(&network);
         return (TF::new(&params), network);
     };
     let node_config = node_config_with_activation_heights(ConfiguredActivationHeights {
@@ -493,9 +550,9 @@ fn crosslink_fat_pointer_changed_after_the_commitment_is_refused_from_featurenet
     test_bytes(tf.write_to_bytes());
 }
 
-/// The other side of the upgrade boundary: with FeaturenetUpgrade2 unscheduled the commitment
-/// binds no pointer, so the same changed copy is a valid sibling of the honest block, accepted as
-/// it is today.
+/// The other side of the upgrade boundary: below FeaturenetUpgrade2 the commitment binds no
+/// pointer, so the same changed copy is a valid sibling of the honest block, accepted as it is
+/// today.
 #[test]
 fn crosslink_fat_pointer_changed_after_the_commitment_is_accepted_without_featurenet_upgrade_2() {
     set_test_name(function_name!());
@@ -513,7 +570,7 @@ fn crosslink_fat_pointer_changed_after_the_commitment_is_accepted_without_featur
     test_bytes(tf.write_to_bytes());
 }
 
-/// With FeaturenetUpgrade2 unscheduled a block's hash is what it was before the pointer was bound:
+/// Below FeaturenetUpgrade2 a block's hash is what it was before the pointer was bound:
 /// the regtest genesis, and the ten blocks of finality diagram scene 1, the last four of which
 /// cite BFT blocks. The hashes were recorded from the scene as the node loaded it before the
 /// binding existed (commit 32a059c6). Needs no node.
@@ -524,10 +581,7 @@ fn crosslink_fat_pointer_changed_after_the_commitment_is_accepted_without_featur
 /// against output from before the binding.
 #[test]
 fn crosslink_block_hashes_without_featurenet_upgrade_2_are_unchanged() {
-    assert_eq!(
-        NetworkUpgrade::FeaturenetUpgrade2.activation_height(&regtest_network(&HARNESS_PARAMETERS)),
-        None
-    );
+    assert_featurenet_upgrade_2_beyond_scenarios(&regtest_network(&HARNESS_PARAMETERS));
     assert_eq!(zebra_chain::block::genesis::regtest_genesis_block().hash(), BlockGen::REGTEST_GENESIS_HASH);
     assert_eq!(
         BlockGen::REGTEST_GENESIS_HASH.to_string(),
@@ -1030,7 +1084,7 @@ fn crosslink_test_basic_finality() {
     test_bytes(tf.write_to_bytes());
 }
 
-/// A BFT block assembled straight from PoW blocks, bypassing `BftBlock::try_from` and the header
+/// A BFT block assembled straight from PoW blocks, bypassing `BftBlock::new` and the header
 /// count it enforces, with the fat pointer recomputed from the result so that the only thing wrong
 /// with the block is what the test made wrong. The Tail Confirmation tests need blocks
 /// `create_pos_and_ptr_to_finalize_pow` will not build.
@@ -1153,6 +1207,68 @@ fn crosslink_reject_pos_block_that_regresses_the_snapshot() {
     let regressed = next_signed_pos(&mut pos_h.clone(), &mut fat_ptr.clone(), &pow[3..6]);
     push_decided_pos(&mut tf, &regressed, SHOULD_FAIL);
     tf.push_instr_expect_pos_chain_length(1, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// A BFT block above the latest version is refused. Were one decided, every honest proposal after
+/// it would be below its parent's version, and only its proposer could extend BFT. The same block
+/// at the latest version is accepted, so the version is the only thing wrong with it.
+#[test]
+fn crosslink_reject_pos_block_above_the_latest_version() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let (_gen, _miner_addr, pow) = bonded_pow_chain_for(&mut tf, 8);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+    let bft0 = next_signed_pos(pos_h, fat_ptr, &pow[4..7]);
+    push_decided_pos(&mut tf, &bft0, 0);
+
+    let at_version = |version: u32| {
+        let mut block = create_pos_and_ptr_to_finalize_pow_at_round(*pos_h, fat_ptr.clone(), &pow[5..8], 1, &[]).0.block;
+        block.version = version;
+        let seed = synthetic_finalizer_seed(SUPPLIED_FINALIZER);
+        let fat_ptr = signed_fat_pointer(&block, u64::from(*pos_h), 1, &[seed.as_bytes()], &[0; 32]);
+        BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr })
+    };
+    push_decided_pos(&mut tf, &at_version(3), SHOULD_FAIL);
+    tf.push_instr_expect_pos_chain_length(1, 0);
+    push_decided_pos(&mut tf, &at_version(2), 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// With no slashfork scheduled, a BFT block's `do_not_include_until_bc_height` must equal its
+/// parent's. Were a raised one decided, every honest block after it would inherit the value, and
+/// at `u64::MAX` no PoW block could point at BFT again. The same block with the parent's value is
+/// accepted, so the raise is the only thing wrong with it.
+#[test]
+fn crosslink_reject_pos_block_that_raises_do_not_include_without_a_slashfork() {
+    use zebra_state::new_network::bft::BFT_BLOCK_VERSION_LATEST as LATEST;
+
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let (_gen, _miner_addr, pow) = bonded_pow_chain_for(&mut tf, 8);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+    let bft0 = next_signed_pos(pos_h, fat_ptr, &pow[4..7]);
+    push_decided_pos(&mut tf, &bft0, 0);
+
+    let with_do_not_include = |do_not_include: u64| {
+        let mut block = create_pos_and_ptr_to_finalize_pow_at_round(*pos_h, fat_ptr.clone(), &pow[5..8], 1, &[]).0.block;
+        block.version = LATEST;
+        block.do_not_include_until_bc_height = do_not_include;
+        let seed = synthetic_finalizer_seed(SUPPLIED_FINALIZER);
+        let fat_ptr = signed_fat_pointer(&block, u64::from(*pos_h), 1, &[seed.as_bytes()], &[0; 32]);
+        BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr })
+    };
+    for raised in [1, u64::MAX] {
+        push_decided_pos(&mut tf, &with_do_not_include(raised), SHOULD_FAIL);
+        tf.push_instr_expect_pos_chain_length(1, 0);
+    }
+    push_decided_pos(&mut tf, &with_do_not_include(0), 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
 
     test_bytes(tf.write_to_bytes());
 }
@@ -1522,8 +1638,7 @@ fn pos_on_a_snapshot_nobody_holds(tail: &[Arc<Block>], snapshot: [u8; 32], bits:
         }
         headers[i].prev_block = if i == 0 { BcBlockHash(snapshot) } else { BcBlockHash::from_header_data(&headers[i - 1]) };
     }
-    let mut block = BftBlock::try_from(&HARNESS_PARAMETERS, 0, FatPointerToBftBlock::null(), headers).expect("sigma linked headers");
-    block.version = 2;
+    let block = BftBlock::new(&HARNESS_PARAMETERS, 2, 0, FatPointerToBftBlock::null(), headers, Vec::new(), 0).expect("sigma linked headers");
     BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt::from_parts(block, 0, 0, &[]))
 }
 
@@ -1770,14 +1885,24 @@ impl BlockGen {
     /// one: `value_balance` panics on a missing output, it does not return an error.
     fn fees(&self, txs: &[Arc<Transaction>]) -> zebra_chain::amount::Amount<zebra_chain::amount::NonNegative> {
         let mut total = zebra_chain::amount::Amount::zero();
+        // A transaction may spend an earlier one in the same block, so each one's outputs join
+        // the spendable set before the next is priced.
+        let mut utxos = self.utxos.clone();
+        let height = BlockHeight(self.tip.coinbase_height().expect("generated blocks have a height").0 + 1);
         for tx in txs {
             let spends_an_unheld_output = tx.inputs().iter()
                 .filter_map(|input| input.outpoint())
-                .any(|outpoint| !self.utxos.contains_key(&outpoint));
-            if spends_an_unheld_output { continue; }
-            let Ok(value_balance) = tx.value_balance(&self.utxos) else { continue };
-            let Ok(fee) = value_balance.remaining_transaction_value() else { continue };
-            total = (total + fee).expect("test fees fit in an amount");
+                .any(|outpoint| !utxos.contains_key(&outpoint));
+            if !spends_an_unheld_output {
+                if let Some(fee) = tx.value_balance(&utxos).ok().and_then(|balance| balance.remaining_transaction_value().ok()) {
+                    total = (total + fee).expect("test fees fit in an amount");
+                }
+            }
+            let hash = tx.hash();
+            for (index, output) in tx.outputs().iter().enumerate() {
+                let outpoint = zebra_chain::transparent::OutPoint { hash, index: index as u32 };
+                utxos.insert(outpoint, zebra_chain::transparent::Utxo { output: output.clone(), height, from_coinbase: false });
+            }
         }
         total
     }
@@ -1797,6 +1922,77 @@ impl BlockGen {
             .map(|(outpoint, utxo)| (*outpoint, utxo.output.clone()))
     }
 
+    /// The coinbase the production miner path builds. Ironwood v6 removed the old
+    /// `standard_coinbase_outputs` / `Transaction::new_v*_coinbase` helpers, so this goes
+    /// MinerParams -> TransactionTemplate::new_coinbase -> deserialize. It is network-agnostic
+    /// (not regtest-specific), which is what the fuzzer needs too. NU6 onward requires coinbase
+    /// outputs == subsidy + fees exactly, so the caller passes `txs_fee`.
+    fn builder_coinbase(
+        network: &Network,
+        miner_addr: &Address,
+        height: BlockHeight,
+        txs_fee: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    ) -> Transaction {
+        use zebra_rpc::methods::types::transaction::TransactionTemplate;
+        // `data()` is the public derive_getters accessor for the template's serialized bytes; no
+        // rpc-crate change is needed to reach the built coinbase transaction.
+        TransactionTemplate::new_coinbase(network, height, &BlockGen::miner_params(network, miner_addr), txs_fee)
+            .expect("valid coinbase template")
+            .data()
+            .as_ref()
+            .zcash_deserialize_into()
+            .expect("coinbase template deserializes")
+    }
+
+    fn miner_params(network: &Network, miner_addr: &Address) -> zebra_rpc::methods::types::get_block_template::MinerParams {
+        let mining_config = zebra_rpc::config::mining::Config {
+            miner_address: Some(miner_addr.to_zcash_address(network)),
+            ..Default::default()
+        };
+        zebra_rpc::methods::types::get_block_template::MinerParams::new(network, mining_config).expect("valid miner params")
+    }
+
+    /// `builder_coinbase`'s transaction built directly, for a transparent miner at a height that
+    /// pays no funding streams or lockbox disbursements; `None` otherwise. The builder loads the
+    /// Sapling prover's parameters, about 110 ms in every process that builds a block, and works
+    /// through shielded bundles it then leaves out; this takes microseconds.
+    /// `fast_coinbase_is_the_builders` checks that the two are the same bytes.
+    fn fast_coinbase(
+        network: &Network,
+        miner_addr: &Address,
+        height: BlockHeight,
+        txs_fee: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    ) -> Option<Transaction> {
+        use zcash_script::opcode::Evaluable;
+        use zcash_transparent::address::TransparentAddress;
+        use zebra_chain::parameters::subsidy::{block_subsidy, funding_stream_values, miner_subsidy};
+
+        let Address::Transparent(addr) = miner_addr else { return None };
+        if NetworkUpgrade::current(network, height) < NetworkUpgrade::Nu6_3 {
+            return None;
+        }
+        let subsidy = block_subsidy(height, network).ok()?;
+        if !funding_stream_values(height, network, subsidy).ok()?.is_empty() || !network.lockbox_disbursements(height).is_empty() {
+            return None;
+        }
+        let miner_reward = (miner_subsidy(height, network, subsidy).ok()? + txs_fee).ok()?;
+        let lock_script = match addr {
+            TransparentAddress::PublicKeyHash(hash) => [&[0x76, 0xa9, 0x14][..], &hash[..], &[0x88, 0xac]].concat(),
+            TransparentAddress::ScriptHash(hash) => [&[0xa9, 0x14][..], &hash[..], &[0x87]].concat(),
+        };
+        let data = BlockGen::miner_params(network, miner_addr).data().as_ref().map(|data| data.to_bytes()).unwrap_or_default();
+        Some(Transaction::V6 {
+            network_upgrade: NetworkUpgrade::current(network, height),
+            lock_time: LockTime::unlocked(),
+            expiry_height: height,
+            inputs: vec![zebra_chain::transparent::Input::Coinbase { height, data, sequence: u32::MAX }],
+            outputs: vec![zebra_chain::transparent::Output::new(miner_reward, zebra_chain::transparent::Script::new(&lock_script))],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+        })
+    }
+
     pub fn create_block(
         network: &Network,
         miner_addr: &Address,
@@ -1808,31 +2004,8 @@ impl BlockGen {
         extra_txs: &[Arc<Transaction>],
         txs_fee: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
     ) -> Arc<zebra_chain::block::Block> {
-        // Build the coinbase the same way the production miner path does. Ironwood v6 removed
-        // the old `standard_coinbase_outputs` / `Transaction::new_v*_coinbase` helpers, so we go
-        // MinerParams -> TransactionTemplate::new_coinbase -> deserialize. This is
-        // network-agnostic (not regtest-specific), which is what the fuzzer needs too. NU6 onward
-        // requires coinbase outputs == subsidy + fees exactly, so the caller passes `txs_fee`.
-        use zebra_rpc::methods::types::get_block_template::MinerParams;
-        use zebra_rpc::methods::types::transaction::TransactionTemplate;
-        let mining_config = zebra_rpc::config::mining::Config {
-            miner_address: Some(miner_addr.to_zcash_address(network)),
-            ..Default::default()
-        };
-        let miner_params = MinerParams::new(network, mining_config).expect("valid miner params");
-        // `data()` is the public derive_getters accessor for the template's serialized bytes; no
-        // rpc-crate change is needed to reach the built coinbase transaction.
-        let coinbase_tx: Transaction = TransactionTemplate::new_coinbase(
-            network,
-            height,
-            &miner_params,
-            txs_fee,
-        )
-        .expect("valid coinbase template")
-        .data()
-        .as_ref()
-        .zcash_deserialize_into()
-        .expect("coinbase template deserializes");
+        let coinbase_tx = BlockGen::fast_coinbase(network, miner_addr, height, txs_fee)
+            .unwrap_or_else(|| BlockGen::builder_coinbase(network, miner_addr, height, txs_fee));
 
         let mut transactions: Vec<Arc<Transaction>> = Vec::with_capacity(1 + extra_txs.len());
         transactions.push(coinbase_tx.into());
@@ -1893,6 +2066,26 @@ impl BlockGen {
                 .bytes_in_serialized_order()
             }
         }
+    }
+
+    /// `block`, which must be this generator's tip, with its coinbase replaced and its merkle root
+    /// and commitment rebuilt, so the header stays consistent with the new transaction.
+    fn tip_with_coinbase(&self, block: &Block, coinbase: Transaction) -> Arc<Block> {
+        let mut block = block.clone();
+        block.transactions[0] = Arc::new(coinbase);
+
+        let height = block.coinbase_height().expect("generated blocks have a height");
+        let mut header = block.header.as_ref().clone();
+        header.merkle_root = block.transactions.iter().collect();
+        header.commitment_bytes = HexDebug(BlockGen::commitment_bytes(
+            &self.network,
+            height,
+            &self.history_tree,
+            &block.transactions,
+            &header.fat_pointer_to_bft_block,
+        ));
+        block.header = Arc::new(header);
+        Arc::new(block)
     }
 
     pub fn next_block(&mut self, miner_addr: &Address) -> Arc<zebra_chain::block::Block> {
@@ -2286,9 +2479,50 @@ fn crosslink_tx_spending_chain_and_mempool_outputs_in_mixed_order() {
     test_bytes(tf.write_to_bytes());
 }
 
-/// The instructions no scenario used before: RECV_TX, EXPECT_MEMPOOL_REJECTED (including that a
-/// mined transaction is not "rejected"), EXPECT_POOL_TOTALS, EXPECT_FINALIZER_BANK, and the
-/// load-rejected helper.
+/// Transactions relayed over our own connections: a peer lists one, the node asks for it and the
+/// mempool takes it. A forged one is asked for and refused, and its peer is backed off, not
+/// killed: failing verification is not malformed bytes.
+#[test]
+fn crosslink_tx_relayed_over_stp_reaches_the_mempool() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+
+    let network = regtest_network(&HARNESS_PARAMETERS);
+    let key = TestKey::new(b"crosslink test miner");
+    let miner = key.address();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network.clone(), BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    let mature = |gen: &mut BlockGen, tf: &mut TF| {
+        while gen.mature_coinbase_for(&key).is_none() {
+            tf.push_instr_load_pow(&gen.next_block(&miner), 0);
+        }
+        gen.mature_coinbase_for(&key).expect("matured above")
+    };
+
+    let spend = transparent_spend(gen.next_upgrade(), &key, mature(&mut gen, &mut tf));
+    tf.push_instr_recv_tx_stp(&spend, 0, 0);
+    tf.push_instr_expect_mempool_contains(&spend, 0);
+    // Mined, so the next spend's input is not one a mempool transaction already spends (that
+    // would be refused before verification, as a spend conflict).
+    tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &[spend.clone()]), 0);
+
+    let forged = forged_signature(&transparent_spend(gen.next_upgrade(), &key, mature(&mut gen, &mut tf)));
+    tf.push_instr_recv_tx_stp(&forged, 1, SHOULD_FAIL);
+    tf.push_instr_expect_mempool_rejected(&forged, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    // The forger was backed off, not killed: once the backoff ends it is asked again, and an
+    // honest transaction from it is taken.
+    let honest = transparent_spend(gen.next_upgrade(), &key, mature(&mut gen, &mut tf));
+    tf.push_instr_recv_tx_stp(&honest, 1, 0);
+    tf.push_instr_expect_mempool_contains(&honest, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// The instructions no scenario used before: SUBMIT_TX via the wire, EXPECT_MEMPOOL_REJECTED
+/// (including that a mined transaction is not "rejected"), EXPECT_POOL_TOTALS,
+/// EXPECT_FINALIZER_BANK, and the load-rejected helper.
 #[test]
 fn crosslink_mempool_and_staking_state_instructions() {
     set_test_name(function_name!());
@@ -2309,9 +2543,7 @@ fn crosslink_mempool_and_staking_state_instructions() {
     // a spend arriving from a peer reaches the mempool and leaves it when mined, and a mined
     // transaction is not a rejected one
     let spend = transparent_spend(gen.next_upgrade(), &key, mature(&mut gen, &mut tf));
-    let wire = zebra_network::wire::tx_message_bytes(&network, zebra_chain::transaction::UnminedTx::from(spend.clone()))
-        .expect("a transaction frames");
-    tf.push_instr_recv_tx_wire(&wire, 0, 0);
+    tf.push_instr_recv_tx_wire(&spend, 0, 0);
     tf.push_instr_expect_mempool_contains(&spend, 0);
     tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &[spend.clone()]), 0);
     tf.push_instr_expect_mempool_absent(&spend, 0);
@@ -2325,7 +2557,7 @@ fn crosslink_mempool_and_staking_state_instructions() {
     // before any bond the staking pools and the target's bank are empty; a funded bond makes
     // the bonded pool non-empty. The amounts after it depend on the issuance rules, which pay a
     // new bond in its own block, so this checks only that the pool moved.
-    let target_key = zebra_crosslink::rng_private_public_key_from_address(b"staking-target").1;
+    let target_key = zebra_crosslink::rng_private_public_key_from_address(b"staking-target").0;
     let target = zcash_primitives::bft::FinalizerAddress::create(&target_key);
     let target_pub_key = target.pub_key.0;
     let input = mature(&mut gen, &mut tf);
@@ -2402,12 +2634,17 @@ fn crosslink_honest_block_accepted_after_forged_body_with_its_hash() {
     chain_length += 1;
     tf.push_instr_expect_pow_chain_length(chain_length, 0);
 
-    // the same, both from one peer
+    // the same forger again: the node no longer asks a peer for a hash it served bad bytes
+    // under, so the honest block comes from another peer, but it still asks the forger for
+    // other blocks
     let honest = gen.next_block(&miner);
     let mut forged = honest.as_ref().clone();
     forged.transactions.push(forged.transactions[0].clone());
     tf.push_instr_recv_pow(&forged, 0, SHOULD_FAIL);
-    tf.push_instr_recv_pow(&honest, 0, 0);
+    tf.push_instr_recv_pow(&honest, 4, 0);
+    chain_length += 1;
+    tf.push_instr_expect_pow_chain_length(chain_length, 0);
+    tf.push_instr_recv_pow(&gen.next_block(&miner), 0, 0);
     chain_length += 1;
     tf.push_instr_expect_pow_chain_length(chain_length, 0);
 
@@ -2420,8 +2657,10 @@ fn crosslink_honest_block_accepted_after_forged_body_with_its_hash() {
     chain_length += 1;
     tf.push_instr_expect_pow_chain_length(chain_length, 0);
 
-    // a forged signature: it passes every check keyed by the hash and fails only late
-    for (forged_peer, honest_peer) in [(2, 3), (2, 2)] {
+    // a forged signature: it passes every check keyed by the hash and fails only late. The second
+    // time, the same forger forges another block: it is asked for that one, a hash it has not
+    // served bad bytes under, and the honest block again comes from another peer.
+    for (forged_peer, honest_peer) in [(2, 3), (2, 5)] {
         while gen.mature_coinbase_for(&key).is_none() {
             tf.push_instr_load_pow(&gen.next_block(&miner), 0);
             chain_length += 1;
@@ -2774,7 +3013,7 @@ fn signed_tx(
             })
             .collect();
         let staking_action = staking.map(|(bond_seed, action)| {
-            let bond_pub_key = zebra_crosslink::rng_private_public_key_from_address(bond_seed).2;
+            let bond_pub_key = zebra_crosslink::rng_private_public_key_from_address(bond_seed).1;
             action(bond_pub_key.0, staking_signature)
         });
         Arc::new(Transaction::VCrosslink {
@@ -2797,7 +3036,7 @@ fn signed_tx(
     // sighash.rs), so signing what the unsigned transaction hashes to leaves that hash unchanged.
     let staking_signature = match staking {
         Some((bond_seed, _)) => {
-            let bond_signing_key = zebra_crosslink::rng_private_public_key_from_address(bond_seed).1;
+            let bond_signing_key = zebra_crosslink::rng_private_public_key_from_address(bond_seed).0;
             let sighash = build(&blank_scripts, [0; 64])
                 .sighash(network_upgrade, HashType::ALL, previous_outputs.clone(), None)
                 .expect("a VCrosslink transaction has a sighash");
@@ -2899,6 +3138,7 @@ fn staking_tx_unbond(upgrade: NetworkUpgrade, bond_seed: &[u8]) -> Arc<Transacti
     signed_staking_tx(upgrade, bond_seed, 0, |unique_pubkey, signature| StakingAction::BeginDelegationUnbonding {
         unique_pubkey,
         signature,
+        spends: None,
     })
 }
 
@@ -2909,6 +3149,7 @@ fn staking_tx_withdraw(upgrade: NetworkUpgrade, bond_seed: &[u8], amount_zats: u
         amount_zats,
         unique_pubkey,
         signature,
+        spends: None,
     })
 }
 
@@ -2925,6 +3166,7 @@ fn staking_tx_retarget(
         signature,
         from_finalizer,
         to_finalizer,
+        spends: None,
     })
 }
 
@@ -2941,7 +3183,7 @@ fn crosslink_pow_block_with_staking_tx() {
 
     // A validly-minted finalizer target (its embedded signature must verify in consensus).
     let target = zcash_primitives::bft::FinalizerAddress::create(
-        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").1,
+        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").0,
     );
 
     // height 2 is the first height whose commitment is the ZIP-244 hashBlockCommitments
@@ -2998,7 +3240,7 @@ fn create_pos_and_ptr_to_finalize_pow_at_round(
 
     let mut hdrs = Vec::with_capacity(pow_blocks.len());
     for pow_block in pow_blocks {
-        // BftBlock::try_from takes BcBlockHeader (zcash_primitives), not zebra's
+        // BftBlock::new takes BcBlockHeader (zcash_primitives), not zebra's
         // Header; convert via the same helper production code uses (lib.rs).
         hdrs.push(zebra_crosslink::bc_hdr_to_lrz(pow_block.header.as_ref()));
     }
@@ -3007,11 +3249,14 @@ fn create_pos_and_ptr_to_finalize_pow_at_round(
     // carried header: the sigma carried headers are the confirmations built on top of it, and
     // the snapshot is not carried. The PoW-side fat-pointer check resolves its height from the
     // chain to enforce `pow_height >= snapshot + sigma + 1`.
-    let block = BftBlock::try_from(
+    let block = BftBlock::new(
         &HARNESS_PARAMETERS,
+        1,
         bft_height,
         parent_fat_ptr,
         hdrs,
+        Vec::new(),
+        0,
     )
     .expect("valid PoS block");
 
@@ -3063,10 +3308,7 @@ fn bft_proposal(
     tail: &[Arc<Block>],
 ) -> BftBlock {
     let headers = tail.iter().map(|b| zebra_crosslink::bc_hdr_to_lrz(b.header.as_ref())).collect();
-    let mut block = BftBlock::try_from(params, bft_height, parent, headers).expect("a proposal over sigma linked headers");
-    block.version = 2;
-    block.do_not_include_until_bc_height = parent_do_not_include;
-    block
+    BftBlock::new(params, 2, bft_height, parent, headers, Vec::new(), parent_do_not_include).expect("a proposal over sigma linked headers")
 }
 
 /// The bytes a proposer sends for `block`: what tenderlink carries as the proposal value.
@@ -3097,7 +3339,7 @@ fn certificate_over(template: [u8; 44], finalizer_seeds: &[&[u8]], vote_namespac
     let signatures: Vec<FatPointerSignature> = finalizer_seeds
         .iter()
         .map(|seed| {
-            let (_, key, pub_key) = zebra_crosslink::rng_private_public_key_from_address(seed);
+            let (key, pub_key) = zebra_crosslink::rng_private_public_key_from_address(seed);
             let mut signed = pub_key.0.to_vec();
             signed.extend_from_slice(&template);
             if *vote_namespace != [0; 32] {
@@ -3206,7 +3448,7 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
     let network = regtest_network(&HARNESS_PARAMETERS);
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
 
-    let (_, prv_key, pub_key) =
+    let (prv_key, pub_key) =
         zebra_crosslink::rng_private_public_key_from_address("some_pub_key".as_bytes());
     // The roster is keyed on the finalizer address's pub_key (target_finalizer_pk), which is
     // pub_key here, so EXPECT_ROSTER_INCLUDES(pub_key) below matches.
@@ -3677,7 +3919,8 @@ fn chain_prefix_of_scene_2_loads(cutoff: zebra_state::BftCutoff, trusted: bool) 
     tf.push_instr_expect_pow_block_finality(&p4, Some(TFLBlockFinality::Finalized), 0);
     tf.push_instr_expect_pow_block_finality(&p5, Some(TFLBlockFinality::NotYetFinalized), 0);
 
-    zebra_crosslink::test_format::TRUSTED_LOAD_POW.store(trusted, std::sync::atomic::Ordering::Relaxed);
+    let trusted_before = if trusted { tf.instrs.len() } else { 0 };
+    *zebra_crosslink::TEST_READ_OPTIONS.lock().unwrap() = zebra_crosslink::test_format::ReadOptions { trusted_before, race: false };
     test_bytes(tf.write_to_bytes());
 }
 
@@ -3748,7 +3991,7 @@ fn crosslink_reject_pow_block_with_oversized_staking_amount() {
     tf.push_instr_load_pow(&gen.tip, 0);
 
     let target = zcash_primitives::bft::FinalizerAddress::create(
-        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").1,
+        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").0,
     );
     let oversized = zebra_chain::amount::MAX_MONEY as u64 + 1;
     let block = gen.next_block_with_txs(
@@ -3759,6 +4002,76 @@ fn crosslink_reject_pow_block_with_oversized_staking_amount() {
 
     // Answering this needs the node still running, with its chain unchanged.
     tf.push_instr_expect_pow_chain_length(2, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// `coinbase` rebuilt as a VCrosslink transaction that also creates a bond of `amount_zats`, signed
+/// by the bond key. Its outputs are unchanged, so nothing pays for the bond.
+fn coinbase_creating_bond(
+    coinbase: &Transaction,
+    upgrade: NetworkUpgrade,
+    bond_seed: &[u8],
+    target_finalizer: zcash_primitives::bft::FinalizerAddress,
+    amount_zats: u64,
+) -> Transaction {
+    use zebra_chain::transaction::HashType;
+    use zcash_primitives::transaction::StakingAction;
+
+    let (bond_signing_key, bond_pub_key) = zebra_crosslink::rng_private_public_key_from_address(bond_seed);
+    let build = |signature: [u8; 64]| Transaction::VCrosslink {
+        network_upgrade: upgrade,
+        lock_time: LockTime::unlocked(),
+        expiry_height: coinbase.expiry_height().expect("a coinbase expires at its own height"),
+        inputs: coinbase.inputs().to_vec(),
+        outputs: coinbase.outputs().to_vec(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+        staking_action: Some(StakingAction::CreateNewDelegationBond {
+            amount_zats,
+            unique_pubkey: bond_pub_key.0,
+            bond_salt: [0; 32],
+            target_finalizer,
+            signature,
+        }),
+    };
+
+    let sighash = build([0; 64])
+        .sighash(upgrade, HashType::ALL, Arc::new(Vec::new()), None)
+        .expect("a VCrosslink transaction has a sighash");
+    build(bond_signing_key.sign(sighash.as_ref()).into())
+}
+
+/// A coinbase that creates a bond, with its outputs still paying the full subsidy, is rejected.
+/// Coinbase balance leaves staking value out, so this used to mint the bond from nothing. The bad
+/// block is built on a copy of the generator, so the good block at the same height follows it.
+#[test]
+fn crosslink_reject_pow_block_with_staking_action_in_coinbase() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+
+    let network = regtest_network(&HARNESS_PARAMETERS);
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    tf.push_instr_load_pow(&gen.tip, 0);
+
+    let target = zcash_primitives::bft::FinalizerAddress::create(
+        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").0,
+    );
+    const BOND_ZATS: u64 = 1_000_000_000_000;
+    let upgrade = gen.next_upgrade();
+    let mut bad_gen = gen.clone();
+    let honest = bad_gen.next_block(&miner_addr);
+    let coinbase = coinbase_creating_bond(&honest.transactions[0], upgrade, b"coinbase-bond", target, BOND_ZATS);
+    tf.push_instr_load_pow(&bad_gen.tip_with_coinbase(&honest, coinbase), SHOULD_FAIL);
+
+    // Answering this needs the node still running, with its chain unchanged.
+    tf.push_instr_expect_pow_chain_length(2, 0);
+
+    tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
+    tf.push_instr_expect_pow_chain_length(3, 0);
 
     test_bytes(tf.write_to_bytes());
 }
@@ -3781,7 +4094,7 @@ fn crosslink_reject_action_on_a_bond_after_it_unbonds_or_withdraws_in_the_block(
     let network = regtest_network(&params);
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
     let finalizer = |seed: &[u8]| {
-        zcash_primitives::bft::FinalizerAddress::create(&zebra_crosslink::rng_private_public_key_from_address(seed).1)
+        zcash_primitives::bft::FinalizerAddress::create(&zebra_crosslink::rng_private_public_key_from_address(seed).0)
     };
     let (target, other) = (finalizer(b"finalizer-a"), finalizer(b"finalizer-b"));
 
@@ -3878,7 +4191,7 @@ fn crosslink_spend_matured_coinbase_with_a_fee() {
         tf.push_instr_load_pow(&gen.next_block(&miner), 0);
     }
     let target = zcash_primitives::bft::FinalizerAddress::create(
-        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").1,
+        &zebra_crosslink::rng_private_public_key_from_address(b"staking-target").0,
     );
     let bond_seed = b"funded-bond";
     let bond = staking_tx_create_bond_funded(
@@ -3897,7 +4210,7 @@ fn crosslink_spend_matured_coinbase_with_a_fee() {
     tf.push_instr_expect_mempool_absent(&bond, 0);
     // Stakers are paid every block, so the bond's amount moves on from the one bonded; the block
     // being accepted is what shows the value balanced.
-    let bond_key = zebra_crosslink::rng_private_public_key_from_address(bond_seed).2 .0;
+    let bond_key = zebra_crosslink::rng_private_public_key_from_address(bond_seed).1 .0;
     tf.push_instr_expect_bond(bond_key, TF_BOND_ACTIVE, TEST_STAKE_IGNORED, 0);
 
     test_bytes(tf.write_to_bytes());
@@ -4098,7 +4411,7 @@ fn crosslink_payout_changes_rule_at_featurenet_upgrade_1() {
     let mut bonds = Vec::new();
     for (index, input) in inputs.into_iter().enumerate() {
         let finalizer = zcash_primitives::bft::FinalizerAddress::create(
-            &zebra_crosslink::rng_private_public_key_from_address(format!("payout-finalizer-{index}").as_bytes()).1,
+            &zebra_crosslink::rng_private_public_key_from_address(format!("payout-finalizer-{index}").as_bytes()).0,
         );
         let amount = if index + 1 == FINALIZERS { 10_000_000 } else { 100_000_000 };
         let bond = staking_tx_create_bond_funded(
@@ -4153,7 +4466,7 @@ fn crosslink_new_bonds_must_be_a_power_of_10_from_featurenet_upgrade_1() {
         tf.push_instr_load_pow(&gen.next_block(&miner), 0);
     }
     let target = zcash_primitives::bft::FinalizerAddress::create(
-        &zebra_crosslink::rng_private_public_key_from_address(b"power-of-10-target").1,
+        &zebra_crosslink::rng_private_public_key_from_address(b"power-of-10-target").0,
     );
     let mut bond = |gen: &BlockGen, seed: &[u8], amount: u64| {
         staking_tx_create_bond_funded(gen.next_upgrade(), seed, target, amount, &key, inputs.next().expect("three inputs matured"))
@@ -4206,15 +4519,15 @@ fn bft_rounds_scene(tf: &mut TF, node_proposes: &[bool]) -> BftRoundsScene {
             (0..n).flat_map(move |a| (a + 1..n).flat_map(move |b| (b + 1..n).map(move |c| (factor * STAKE, [a, b, c]))))
         })
         .find(|(node_stake, finalizers)| {
-            let members: Vec<([u8; 32], u64)> = std::iter::once((node.2 .0, *node_stake))
+            let members: Vec<([u8; 32], u64)> = std::iter::once((node.1 .0, *node_stake))
                 .chain(finalizers.iter().map(|&k| (pub_keys[usize::from(k)], STAKE)))
                 .collect();
-            node_proposes.iter().enumerate().all(|(round, &is_node)| (bft_proposer(&members, BFT_ROUNDS_PARAMETERS.active_roster_max_n, 1, round as u32) == Some(node.2 .0)) == is_node)
+            node_proposes.iter().enumerate().all(|(round, &is_node)| (bft_proposer(&members, BFT_ROUNDS_PARAMETERS.active_roster_max_n, 1, round as u32) == Some(node.1 .0)) == is_node)
         })
         .expect("some stakes and three synthetic finalizers put the proposer where asked");
 
-    let members = std::iter::once((node.1, node_stake)).chain(finalizers.iter().map(|&k| {
-        (zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k.into()).as_bytes()).1, STAKE)
+    let members = std::iter::once((node.0, node_stake)).chain(finalizers.iter().map(|&k| {
+        (zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k.into()).as_bytes()).0, STAKE)
     }));
     let inputs = matured_coinbases(tf, &mut gen, &key, 4);
     let bonds: Vec<Arc<Transaction>> = inputs
@@ -4235,7 +4548,7 @@ fn bft_rounds_scene(tf: &mut TF, node_proposes: &[bool]) -> BftRoundsScene {
         tf.push_instr_load_pow(&block, 0);
         pow.push(block);
     }
-    let member_pub_keys: Vec<([u8; 32], u64)> = std::iter::once((node.2 .0, node_stake))
+    let member_pub_keys: Vec<([u8; 32], u64)> = std::iter::once((node.1 .0, node_stake))
         .chain(finalizers.iter().map(|&k| (pub_keys[usize::from(k)], STAKE)))
         .collect();
     BftRoundsScene { finalizers, node_stake, total_stake: node_stake + 3 * STAKE, member_pub_keys, active_roster_max_n: BFT_ROUNDS_PARAMETERS.active_roster_max_n, pow, gen, miner }
@@ -4443,12 +4756,14 @@ fn crosslink_bft_decision_whose_snapshot_was_dropped_is_parked_not_aborted() {
     }
     tf.push_instr_expect_pow_chain_length(213, 0);
 
-    // The rest of the roster precommits it, which decides it on the engine's next tick. The
-    // engine then waits on the node's answer, so from there it never settles.
+    // The rest of the roster precommits it, which decides it on the engine's next tick. The node
+    // parks the decision, and its status says so, and the engine waits on the node's answer, so
+    // from there it never settles. The reason pins that it is the park, not a stopped engine.
     for k in scene.finalizers {
         tf.push_instr_bft_recv_vote(k, TF_BFT_PRECOMMIT, 1, 0, &id, 0);
     }
     tf.push_instr_advance_time(BFT_TICK_MILLIS, SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("holds back its decision at height 1", 0);
     tf.push_instr_expect_node_alive(0);
     tf.push_instr_expect_bft_dropped(false, None, 0);
 
@@ -4535,6 +4850,9 @@ fn crosslink_bft_node_locked_on_a_value_proposes_it_again() {
 #[path = "crosslink/fuzz.rs"]
 mod fuzz;
 
+#[path = "crosslink/stale_race.rs"]
+mod stale_race;
+
 /// Crosslink parameters for twelve seats, the deployed roster cap: a dozen funded bonds land by
 /// the roster height, 20, and BFT starts at 121, the first height more than
 /// MAX_BLOCK_REORG_HEIGHT above it.
@@ -4547,8 +4865,8 @@ const TWELVE_SEATS_PARAMETERS: zcash_primitives::bft::ZcashCrosslinkParameters =
 /// exactly this much per seat.
 const SEAT_STAKE: u64 = 100_000_000;
 
-/// A regtest network with FeaturenetUpgrade2 at `height`, or unscheduled, and the node config
-/// that gives the node the same schedule.
+/// A regtest network with FeaturenetUpgrade2 at `height`, or at its default height beyond the
+/// scenario, and the node config that gives the node the same schedule.
 fn network_with_featurenet_upgrade_2_at(params: &zcash_primitives::bft::ZcashCrosslinkParameters, height: Option<u32>) -> (Network, String) {
     let Some(height) = height else {
         return (regtest_network(params), String::new());
@@ -4594,7 +4912,7 @@ fn twelve_seats_scene(tf: &mut TF, network: Network, node_proposes: &[((u64, u32
 
     let node = zebra_crosslink::rng_private_public_key_from_address(TEST_NODE_FINALIZER_SEED.as_bytes());
     let members_with = |finalizers: &[u16]| -> Vec<([u8; 32], u64)> {
-        std::iter::once((node.2 .0, SEAT_STAKE))
+        std::iter::once((node.1 .0, SEAT_STAKE))
             .chain(finalizers.iter().map(|&k| (synthetic_finalizer_pub_key(k.into()), SEAT_STAKE)))
             .collect()
     };
@@ -4613,7 +4931,7 @@ fn twelve_seats_scene(tf: &mut TF, network: Network, node_proposes: &[((u64, u32
             let members = members_with(&picked);
             node_proposes
                 .iter()
-                .all(|&((height, round), is_node)| (bft_proposer(&members, active_roster_max_n, height, round) == Some(node.2 .0)) == is_node)
+                .all(|&((height, round), is_node)| (bft_proposer(&members, active_roster_max_n, height, round) == Some(node.1 .0)) == is_node)
                 .then_some(picked)
         })
         .expect("some eleven synthetic finalizers put the proposer where asked");
@@ -4622,8 +4940,8 @@ fn twelve_seats_scene(tf: &mut TF, network: Network, node_proposes: &[((u64, u32
     let mut finalizers = finalizers;
     finalizers.sort_by_key(|&k| roster_order.iter().position(|pub_key| *pub_key == synthetic_finalizer_pub_key(k.into())));
 
-    let signing_keys = std::iter::once(node.1).chain(finalizers.iter().map(|&k| {
-        zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k.into()).as_bytes()).1
+    let signing_keys = std::iter::once(node.0).chain(finalizers.iter().map(|&k| {
+        zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k.into()).as_bytes()).0
     }));
     let inputs = matured_coinbases(tf, &mut gen, &key, 12);
     let bonds: Vec<Arc<Transaction>> = inputs
@@ -4770,7 +5088,7 @@ fn crosslink_bft_quorum_turns_strict_where_the_roster_snapshot_reaches_featurene
 }
 
 #[test]
-fn crosslink_bft_quorum_stays_2f_plus_1_with_featurenet_upgrade_2_unscheduled() {
+fn crosslink_bft_quorum_stays_2f_plus_1_below_featurenet_upgrade_2() {
     set_test_name(function_name!());
     bft_quorum_across_featurenet_upgrade_2(None);
 }
@@ -4779,7 +5097,7 @@ fn crosslink_bft_quorum_stays_2f_plus_1_with_featurenet_upgrade_2_unscheduled() 
 /// names, and a BFT proposal's previous-block pointer one for its parent. The node decides BFT
 /// height 1 through its own engine on nine of twelve precommits; then one PoW block per malformed
 /// certificate for that block is offered at the same height, each refused with the upgrade below
-/// the scenario and accepted with it unscheduled, beside an honest certificate accepted either
+/// the scenario and accepted with it above, beside an honest certificate accepted either
 /// way. A height-2 proposal whose previous-block pointer carries forged signatures is refused and
 /// accepted the same way.
 fn fat_pointer_certificates_across_featurenet_upgrade_2(upgrade: Option<u32>) {
@@ -4881,7 +5199,7 @@ fn crosslink_fat_pointer_certificates_are_checked_from_featurenet_upgrade_2() {
 }
 
 #[test]
-fn crosslink_fat_pointer_certificates_are_hash_only_with_featurenet_upgrade_2_unscheduled() {
+fn crosslink_fat_pointer_certificates_are_hash_only_below_featurenet_upgrade_2() {
     set_test_name(function_name!());
     fat_pointer_certificates_across_featurenet_upgrade_2(None);
 }
@@ -4898,7 +5216,7 @@ fn crosslink_fat_pointer_certificates_are_hash_only_with_featurenet_upgrade_2_un
 /// it passes the certificate check (`admit_fat_pointer`) and every other rule, and only the
 /// commitment check, which runs after it, can refuse it: that is what makes these copies isolate
 /// the binding. With the upgrade below the scenario the honest block is accepted and each copy
-/// refused with the commitment error; with it unscheduled all three are accepted as siblings.
+/// refused with the commitment error; with it above, all three are accepted as siblings.
 fn fat_pointer_binding_on_a_roster_across_featurenet_upgrade_2(upgrade: Option<u32>) {
     let (network, node_config) = network_with_featurenet_upgrade_2_at(&TWELVE_SEATS_PARAMETERS, upgrade);
     let mut tf = TF::new_with_node_config(&TWELVE_SEATS_PARAMETERS, &node_config);
@@ -4968,7 +5286,7 @@ fn crosslink_fat_pointer_binding_covers_the_signature_list_from_featurenet_upgra
 }
 
 #[test]
-fn crosslink_fat_pointer_binding_leaves_the_signature_list_free_with_featurenet_upgrade_2_unscheduled() {
+fn crosslink_fat_pointer_binding_leaves_the_signature_list_free_below_featurenet_upgrade_2() {
     set_test_name(function_name!());
     fat_pointer_binding_on_a_roster_across_featurenet_upgrade_2(None);
 }
@@ -5027,7 +5345,7 @@ fn signed_decision_scene(signer: Option<SignerOf>, signed_valid_round: i64, vali
                 SignerOf::Proposer => proposer,
                 SignerOf::Another => scene.finalizers.iter().map(|&k| u64::from(k)).find(|&k| k != proposer).unwrap(),
             };
-            let key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k).as_bytes()).1;
+            let key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k).as_bytes()).0;
             bft_proposal_sigs(&key, &block, 0, signed_valid_round, &[0; 32])
         }
     };
@@ -5080,6 +5398,90 @@ fn crosslink_load_pos_refuses_a_decision_with_no_signatures() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// A certificate carrying a signature that does not verify is refused. `decide` treats one as
+/// impossible and stops the node, so a fed decision must be turned away before it gets there.
+#[test]
+fn crosslink_load_pos_refuses_a_certificate_with_a_bad_signature() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene(&mut tf, &[false]);
+    let proposer = scene.proposer(1, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+
+    let block = scene.height_1_proposal(20);
+    let seeds: Vec<String> = scene.finalizers.iter().map(|&k| synthetic_finalizer_seed(k.into())).collect();
+    let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
+    let mut fat_ptr = signed_fat_pointer(&block, 1, 0, &seeds, &[0; 32]);
+    fat_ptr.signatures[0].vote_signature[0] ^= 1;
+    let key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(proposer).as_bytes()).0;
+    let sigs = bft_proposal_sigs(&key, &block, 0, -1, &[0; 32]);
+
+    let data = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr });
+    tf.push_instr_load_pos_signed(&data, &sigs, -1, SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("does not verify", 0);
+    tf.push_instr_expect_pos_chain_length(1, 0);
+    test_bytes(tf.write_to_bytes());
+}
+
+/// A decision already decided at its height is refused as exactly that, not by a check against
+/// the next height's roster, and changes nothing.
+#[test]
+fn crosslink_load_pos_of_an_already_decided_height_is_refused_as_decided() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene(&mut tf, &[false]);
+    let proposer = scene.proposer(1, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+
+    let block = scene.height_1_proposal(20);
+    let seeds: Vec<String> = scene.finalizers.iter().map(|&k| synthetic_finalizer_seed(k.into())).collect();
+    let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
+    let fat_ptr = signed_fat_pointer(&block, 1, 0, &seeds, &[0; 32]);
+    let key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(proposer).as_bytes()).0;
+    let sigs = bft_proposal_sigs(&key, &block, 0, -1, &[0; 32]);
+    let data = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr });
+
+    tf.push_instr_load_pos_signed(&data, &sigs, -1, 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+    tf.push_instr_load_pos_signed(&data, &sigs, -1, SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("decided already with this block", 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+    test_bytes(tf.write_to_bytes());
+}
+
+/// On a network that bootstraps BFT from the chain, genesis is the block every node derives:
+/// one finalizing any other height is refused, however well its headers chain. Its nil roster
+/// lets any empty certificate pass, so nothing else would tell it apart.
+#[test]
+fn crosslink_load_pos_refuses_a_genesis_that_is_not_the_chains() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let network = regtest_network(&BFT_ROUNDS_PARAMETERS);
+    let miner = TestKey::new(b"crosslink test miner").address();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    // Short of the activation height, so the node has not derived genesis itself yet.
+    let mut pow = Vec::new();
+    while gen.tip.coinbase_height().expect("generated blocks have a height").0 < 40 {
+        let block = gen.next_block(&miner);
+        tf.push_instr_load_pow(&block, 0);
+        pow.push(block);
+    }
+    // Well-formed sigma headers, but above height 30 rather than the roster height.
+    let sigma = BFT_ROUNDS_PARAMETERS.bc_confirmation_depth_sigma as u32;
+    let tail: Vec<Arc<Block>> = (31..=30 + sigma)
+        .map(|h| pow.iter().find(|b| b.coinbase_height().map(|bh| bh.0) == Some(h)).expect("loaded").clone())
+        .collect();
+    let fake = bft_proposal(&BFT_ROUNDS_PARAMETERS, 0, FatPointerToBftBlock::null(), 0, &tail);
+    let fat_ptr = FatPointerToBftBlock::from_parts(fake.blake3_hash(), 0, 0, &[]);
+    let data = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block: fake, fat_ptr });
+
+    tf.push_instr_load_pos_signed(&data, &[], -1, SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason("PoS validation = Fail", 0);
+    tf.push_instr_expect_pos_chain_length(0, 0);
+    test_bytes(tf.write_to_bytes());
+}
+
 // # Supplied BFT with a roster
 //
 // A scene that supplies its BFT blocks (HARNESS_PARAMETERS) still has a roster from the BFT
@@ -5112,7 +5514,7 @@ fn bonded_start(tf: &mut TF, network: Network) -> BlockGen {
     let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
     tf.push_instr_load_pow(&gen.tip, 0);
     let [input] = <[_; 1]>::try_from(matured_coinbases(tf, &mut gen, &key, 1)).expect("one matured coinbase");
-    let signing_key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(SUPPLIED_FINALIZER).as_bytes()).1;
+    let signing_key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(SUPPLIED_FINALIZER).as_bytes()).0;
     let finalizer = zcash_primitives::bft::FinalizerAddress::create(&signing_key);
     let bond = staking_tx_create_bond_funded(gen.next_upgrade(), b"supplied-bond", finalizer, SUPPLIED_STAKE, &key, input);
     tf.push_instr_load_pow(&gen.next_block_with_txs(&miner, &[bond]), 0);
@@ -5155,7 +5557,7 @@ fn push_decided_pos(tf: &mut TF, bft: &BftBlockAndFatPointerToItWrap, flags: u32
         0 => Vec::new(),
         _ => {
             let round = u32::try_from(bft.0.fat_ptr.get_vote_template().round).expect("a decided round is not negative");
-            let signing_key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(SUPPLIED_FINALIZER).as_bytes()).1;
+            let signing_key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(SUPPLIED_FINALIZER).as_bytes()).0;
             bft_proposal_sigs(&signing_key, &bft.0.block, round, -1, &[0; 32])
         }
     };

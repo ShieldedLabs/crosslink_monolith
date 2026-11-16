@@ -280,6 +280,8 @@ const NETWORK_UPGRADES_IN_ORDER: &[NetworkUpgrade] = &[
     #[cfg(any(test, feature = "zebra-test"))]
     FeaturenetUpgrade2,
     #[cfg(any(test, feature = "zebra-test"))]
+    FeaturenetUpgrade3,
+    #[cfg(any(test, feature = "zebra-test"))]
     Nu7,
 ];
 
@@ -299,7 +301,42 @@ fn full_activation_list_contains_all_upgrades() {
     // The featurenet upgrades and NU7 are unscheduled on Mainnet (no activation height committed),
     // so they are absent from the full activation list even though they are always present in the
     // iter.
-    assert_eq!(full_list.len(), NetworkUpgrade::iter().count() - 3);
+    assert_eq!(full_list.len(), NetworkUpgrade::iter().count() - 4);
+}
+
+/// FeaturenetUpgrade3's branch ID is the bytes `FNU3`, and Zebra and zcash_protocol both map it
+/// back to the upgrade, so a transaction signed under it is read as FeaturenetUpgrade3's.
+#[test]
+fn featurenet_upgrade_3_branch_id_round_trips() {
+    let _init_guard = zebra_test::init();
+
+    let branch_id = FeaturenetUpgrade3
+        .branch_id()
+        .expect("FeaturenetUpgrade3 has a consensus branch ID");
+    assert_eq!(u32::from(branch_id).to_be_bytes(), *b"FNU3");
+
+    let upgrade = NetworkUpgrade::try_from(u32::from(branch_id))
+        .expect("Zebra knows the FeaturenetUpgrade3 branch ID");
+    assert_eq!(upgrade, FeaturenetUpgrade3);
+
+    let lrz_branch_id = zcash_protocol::consensus::BranchId::try_from(branch_id)
+        .expect("zcash_protocol knows the FeaturenetUpgrade3 branch ID");
+    assert_eq!(
+        lrz_branch_id,
+        zcash_protocol::consensus::BranchId::FeaturenetUpgrade3
+    );
+    assert_eq!(u32::from(lrz_branch_id), u32::from(branch_id));
+    let lrz_upgrade = lrz_branch_id
+        .network_upgrade()
+        .expect("a featurenet branch ID has a network upgrade");
+    assert_eq!(NetworkUpgrade::from(lrz_upgrade), FeaturenetUpgrade3);
+    assert_eq!(lrz_upgrade.branch_id(), lrz_branch_id);
+
+    let hex_branch_id: String = branch_id.encode_hex();
+    assert_eq!(
+        ConsensusBranchId::from_hex(hex_branch_id).expect("hex branch ID parses"),
+        branch_id
+    );
 }
 
 /// FeaturenetUpgrade2's branch ID is the bytes `FTU2`, and Zebra and zcash_protocol both map it
@@ -361,10 +398,32 @@ fn minimum_difficulty_exemption_follows_start_height_and_featurenet_upgrade_2() 
         unreachable!("the default testnet is a Testnet");
     };
     assert_eq!(stock_params.minimum_difficulty_start_height(), Some(start));
-    assert_eq!(NetworkUpgrade::minimum_difficulty_spacing_for_height(&stock, block::Height(start.0 - 1)), None);
-    assert_eq!(NetworkUpgrade::minimum_difficulty_spacing_for_height(&stock, start), Some(gap(&stock, start)));
-    assert!(gapped(&stock, above, 1));
-    assert!(!gapped(&stock, above, 0), "the gap must be strictly greater than six spacings");
+
+    // Stock Testnet schedules FeaturenetUpgrade2 below the start height, so no block gets the
+    // exemption there.
+    let stock_upgrade = NetworkUpgrade::FeaturenetUpgrade2.activation_height(&stock).expect("Testnet schedules FeaturenetUpgrade2");
+    assert!(stock_upgrade < start);
+    for height in [start, above] {
+        assert_eq!(NetworkUpgrade::minimum_difficulty_spacing_for_height(&stock, height), None);
+    }
+
+    // Stock Testnet parameters with FeaturenetUpgrade2 moved above every other upgrade and above
+    // the start height, and FeaturenetUpgrade3, which must follow it, unscheduled, so the
+    // exemption holds from the start height up to the upgrade.
+    let mut heights = testnet::ConfiguredActivationHeights::from(stock_params.activation_heights());
+    let last_scheduled = stock_params.activation_heights().keys().last().expect("Testnet has upgrades").0;
+    let activation = block::Height(last_scheduled.max(above.0) + 1);
+    heights.featurenet_upgrade_2 = Some(activation.0);
+    heights.featurenet_upgrade_3 = None;
+    let upgraded = testnet::Parameters::build()
+        .with_activation_heights(heights)
+        .expect("valid activation heights")
+        .to_network()
+        .expect("valid parameters");
+    assert_eq!(NetworkUpgrade::minimum_difficulty_spacing_for_height(&upgraded, block::Height(start.0 - 1)), None);
+    assert_eq!(NetworkUpgrade::minimum_difficulty_spacing_for_height(&upgraded, start), Some(gap(&upgraded, start)));
+    assert!(gapped(&upgraded, above, 1));
+    assert!(!gapped(&upgraded, above, 0), "the gap must be strictly greater than six spacings");
 
     let featurenet = testnet::Parameters::build()
         .with_minimum_difficulty_start_height(None)
@@ -375,17 +434,6 @@ fn minimum_difficulty_exemption_follows_start_height_and_featurenet_upgrade_2() 
     }
     assert!(!gapped(&featurenet, above, 1));
 
-    // Stock Testnet parameters with FeaturenetUpgrade2 scheduled above every other upgrade and
-    // above the start height.
-    let mut heights = testnet::ConfiguredActivationHeights::from(stock_params.activation_heights());
-    let last_scheduled = stock_params.activation_heights().keys().last().expect("Testnet has upgrades").0;
-    let activation = block::Height(last_scheduled.max(above.0) + 1);
-    heights.featurenet_upgrade_2 = Some(activation.0);
-    let upgraded = testnet::Parameters::build()
-        .with_activation_heights(heights)
-        .expect("valid activation heights")
-        .to_network()
-        .expect("valid parameters");
     let below = block::Height(activation.0 - 1);
     assert_eq!(NetworkUpgrade::current(&upgraded, activation), FeaturenetUpgrade2);
     assert_eq!(NetworkUpgrade::minimum_difficulty_spacing_for_height(&upgraded, below), Some(gap(&upgraded, below)));

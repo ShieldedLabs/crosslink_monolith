@@ -181,10 +181,19 @@ pub struct Config {
     pub network_local_port: u16,
     /// Addresses of peers to connect to on startup.
     pub network_initial_peers: Vec<String>,
+    /// Dial only `network_initial_peers`, for both protocols: addresses learned from peers, and
+    /// hole-punch requests, are not dialled. Peers may still dial us. For fixed test topologies,
+    /// and for a node kept behind its own relays.
+    ///
+    /// A finalizer set this way must list at least one other finalizer: tenderlink passes live
+    /// votes only between finalizers, so one whose every path to the others runs through
+    /// non-finalizers cannot vote, and can stall BFT if the rest are short of a quorum.
+    pub network_connect_only: bool,
 
     /// Lite checkpoint: the synced chain must contain `hash` at `height`
     /// see `new_network/checkpoint.rs`
-    /// see `Default for Config`
+    /// defaults to the featurenet's [`featurenet_checkpoint`], which applies only on the
+    /// featurenet (see [`Config::network_checkpoint_for`])
     /// disable by specifying `height = 0` with `hash = ""` (exactly that pair)
     #[serde(with = "network_checkpoint_toml")]
     pub network_checkpoint: Option<NetworkCheckpoint>,
@@ -196,6 +205,11 @@ pub struct Config {
 
 /// Lite checkpoint pin: `(height, hash)`. `None` means disabled.
 pub type NetworkCheckpoint = (u32, block::Hash);
+
+/// The built-in lite checkpoint: a featurenet block, the default for `network_checkpoint`.
+pub fn featurenet_checkpoint() -> NetworkCheckpoint {
+    (125202, "000055cc297557ecec82269320a987d4431a16e05e6f86878c9ef90028eda120".parse().expect("valid checkpoint hash"))
+}
 
 // the on-disk shape; `height = 0, hash = ""` (exactly that pair) means disabled.
 // `hash` is hex, display order. anything else invalid rejects the whole config.
@@ -240,6 +254,40 @@ fn gen_temp_path(prefix: &str) -> PathBuf {
 }
 
 impl Config {
+    /// The lite checkpoint to enforce on `network`. The built-in [`featurenet_checkpoint`] names
+    /// a featurenet block, so it can only hold there: on any other network it is ignored, or no
+    /// peer could prove it holds the block and nothing would be downloaded. A checkpoint set in
+    /// the config applies on any network, and an explicit disable everywhere.
+    pub fn network_checkpoint_for(&self, network: &Network) -> Option<NetworkCheckpoint> {
+        use zebra_chain::parameters::constants::magics;
+        match self.network_checkpoint {
+            Some(checkpoint) if checkpoint == featurenet_checkpoint() && network.magic() != magics::CROSSLINK_FEATURENET => None,
+            other => other,
+        }
+    }
+
+    /// Whether another process, such as a running node, holds this state's database for
+    /// `network` open. RocksDB takes the database's lock file before anything else when it opens
+    /// one, so an open refused on the lock means a holder; any other refusal (this open names no
+    /// column families), or no database at all, means none.
+    pub fn state_database_in_use(&self, network: &Network) -> bool {
+        let path = self.db_path(STATE_DATABASE_KIND, state_database_format_version_in_code().major, network);
+        if self.ephemeral || !path.exists() {
+            return false;
+        }
+        // RocksDB writes its info log beside the database as it opens one, which would rotate a
+        // running node's log, so the probe's goes to a directory of its own.
+        let log_dir = std::env::temp_dir().join(format!("zebra-state-lock-probe-{}", std::process::id()));
+        let mut options = rocksdb::Options::default();
+        options.set_db_log_dir(&log_dir);
+        let in_use = match rocksdb::DB::open(&options, &path) {
+            Ok(_) => false,
+            Err(err) => crate::constants::LOCK_FILE_ERROR.is_match(&err.to_string()),
+        };
+        let _ = std::fs::remove_dir_all(&log_dir);
+        in_use
+    }
+
     /// Returns the path for the database, based on the kind, major version and network.
     /// Each incompatible database format or network gets its own unique path.
     pub fn db_path(
@@ -319,7 +367,8 @@ impl Default for Config {
             network_identity_seed_string: None,
             network_local_port: 0,
             network_initial_peers: Vec::new(),
-            network_checkpoint: None,
+            network_connect_only: false,
+            network_checkpoint: Some(featurenet_checkpoint()),
             slashfork_schedule: Default::default(),
         }
     }

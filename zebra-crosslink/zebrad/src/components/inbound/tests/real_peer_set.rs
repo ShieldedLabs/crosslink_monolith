@@ -664,6 +664,7 @@ async fn setup(
         initial_testnet_peers: IndexSet::new(),
         cache_dir: CacheDir::disabled(),
 
+        legacy_network: true,
         ..NetworkConfig::default()
     };
     let (mut peer_set, address_book, _) = zebra_network::init(
@@ -860,6 +861,7 @@ mod submitblock_test {
             initial_testnet_peers: IndexSet::new(),
             cache_dir: CacheDir::disabled(),
 
+            legacy_network: true,
             ..NetworkConfig::default()
         };
 

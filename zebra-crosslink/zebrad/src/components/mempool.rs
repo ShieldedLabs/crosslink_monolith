@@ -40,7 +40,8 @@ use zebra_chain::{
 use zebra_consensus::{error::TransactionError, transaction};
 use zebra_network::{self as zn, PeerSocketAddr};
 use zebra_node_services::mempool::{
-    CreatedOrSpent, Gossip, MempoolChange, MempoolTxSubscriber, Request, Response,
+    CreatedOrSpent, Gossip, MempoolChange, MempoolTxSubscriber, PeerSource, QueueRefusal, Request,
+    Response, Verdict,
 };
 use zebra_state as zs;
 use zebra_state::{ChainTipChange, TipAction};
@@ -70,11 +71,9 @@ pub use storage::{
     ExactTipRejectionError, SameEffectsChainRejectionError, SameEffectsTipRejectionError, Storage,
 };
 
-#[cfg(test)]
-pub use self::tests::UnboxMempoolError;
-
 use downloads::{
-    Downloads as TxDownloads, TransactionDownloadVerifyError, TRANSACTION_DOWNLOAD_TIMEOUT,
+    Downloads as TxDownloads, TransactionDownloadVerifyError,
+    DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER, TRANSACTION_DOWNLOAD_TIMEOUT,
     TRANSACTION_VERIFY_TIMEOUT,
 };
 
@@ -101,6 +100,7 @@ fn adjusted_mempool_misbehavior_score(
             (NetworkUpgrade::Nu6_2, NetworkUpgrade::Nu6_3),
             (NetworkUpgrade::Nu6_3, NetworkUpgrade::FeaturenetUpgrade1),
             (NetworkUpgrade::FeaturenetUpgrade1, NetworkUpgrade::FeaturenetUpgrade2),
+            (NetworkUpgrade::FeaturenetUpgrade2, NetworkUpgrade::FeaturenetUpgrade3),
         ]
         .into_iter()
         .any(|(old, new)| {
@@ -402,6 +402,7 @@ impl Mempool {
             Timeout::new(self.outbound.clone(), TRANSACTION_DOWNLOAD_TIMEOUT),
             Timeout::new(self.tx_verifier.clone(), TRANSACTION_VERIFY_TIMEOUT),
             self.state.clone(),
+            DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER,
         ));
         self.active_state = ActiveState::Enabled {
             storage: storage::Storage::new(&self.config),
@@ -476,6 +477,37 @@ impl Mempool {
             .filter(|id| !expired_transactions.contains(id))
             .copied()
             .collect()
+    }
+
+    /// Queues `candidate` for download (if needed) and verification, returning a receiver for
+    /// its verdict, or why it was refused.
+    ///
+    /// `source` is the peer it came from, if any, which caps how many of that peer's
+    /// candidates are in flight.
+    ///
+    /// # Security
+    ///
+    /// A full transaction that conflicts with a mempool transaction is refused before it is
+    /// verified. Otherwise anyone who can spend one real note could make us verify any number
+    /// of valid but conflicting transactions, only to refuse each at insertion. Transaction IDs
+    /// can't be checked until they are downloaded, so they are only checked at insertion.
+    fn queue_candidate(
+        storage: &mut Storage,
+        tx_downloads: &mut Pin<Box<InboundTxDownloads>>,
+        candidate: Gossip,
+        source: Option<PeerSource>,
+    ) -> Result<oneshot::Receiver<Verdict>, QueueRefusal> {
+        storage.should_download_or_verify(candidate.id())?;
+
+        if let Gossip::Tx(tx) = &candidate {
+            if let Some(conflict) = storage.conflict(tx).or_else(|| tx_downloads.unsourced_conflict(tx)) {
+                trace!(txid = ?tx.id, ?conflict, "refused a conflicting candidate before verifying it");
+                metrics::counter!("mempool.refused.conflict.total").increment(1);
+                return Err(QueueRefusal::SpendConflict);
+            }
+        }
+
+        Ok(tx_downloads.download_if_needed_and_verify(candidate, source)?)
     }
 
     /// Update metrics for the mempool.
@@ -663,7 +695,7 @@ impl Service<Request> for Mempool {
                 for tx in tx_retries {
                     // This is just an efficiency optimisation, so we don't care if queueing
                     // transaction requests fails.
-                    let _result = tx_downloads.download_if_needed_and_verify(tx, None, None);
+                    let _result = tx_downloads.download_if_needed_and_verify(tx, None);
                 }
             }
 
@@ -712,20 +744,19 @@ impl Service<Request> for Mempool {
                                 invalidated_ids.insert(tx_id);
                             }
 
-                            // Send the result to responder channel if one was provided.
-                            if let Some(rsp_tx) = rsp_tx {
-                                let _ = rsp_tx
-                                    .send(insert_result.map(|_| ()).map_err(|err| err.into()));
-                            }
+                            rsp_tx.send(match insert_result {
+                                Ok(_) => Verdict::Accepted,
+                                Err(MempoolError::InMempool) => Verdict::AlreadyKnown,
+                                // Spend conflicts with transactions that won the race to the
+                                // mempool, evictions, cached rejections, and policy.
+                                Err(error) => Verdict::Dropped {
+                                    reason: error.to_string(),
+                                },
+                            });
                         } else {
                             tracing::trace!("chain grew during tx verification, retrying ..",);
 
-                            // We don't care if re-queueing the transaction request fails.
-                            let _result = tx_downloads.download_if_needed_and_verify(
-                                tx.transaction.into(),
-                                None,
-                                rsp_tx,
-                            );
+                            tx_downloads.requeue(tx.transaction.into(), rsp_tx);
                         }
                     }
                     Ok(Err(boxed_err)) => {
@@ -744,6 +775,8 @@ impl Service<Request> for Mempool {
                                 &self.network,
                             );
 
+                            // Only legacy sources have an `advertiser_addr`. STP peers are judged
+                            // by the relay from their verdicts.
                             if score != 0 {
                                 let _ = self.misbehavior_sender.try_send((*advertiser_addr, score));
                             }
@@ -793,7 +826,7 @@ impl Service<Request> for Mempool {
                 for tx in storage.remove_staking_transactions() {
                     let tx_id = tx.id;
                     if tx_downloads
-                        .download_if_needed_and_verify(tx.into(), None, None)
+                        .download_if_needed_and_verify(tx.into(), None)
                         .is_err()
                     {
                         invalidated_ids.insert(tx_id);
@@ -873,6 +906,11 @@ impl Service<Request> for Mempool {
                 last_seen_tip_hash,
             } => match req {
                 // Queries
+                Request::InFlightTransactionIds => {
+                    let res: HashSet<_> = tx_downloads.transaction_requests().map(|gossip| gossip.id()).collect();
+                    async move { Ok(Response::TransactionIds(res)) }.boxed()
+                }
+
                 Request::TransactionIds => {
                     trace!(?req, "got mempool request");
 
@@ -968,27 +1006,12 @@ impl Service<Request> for Mempool {
                 Request::Queue(gossiped_txs) => {
                     trace!(req_count = ?gossiped_txs.len(), "got mempool Queue request");
 
-                    let rsp: Vec<Result<oneshot::Receiver<Result<(), BoxError>>, BoxError>> =
-                        gossiped_txs
-                            .into_iter()
-                            .map(
-                                |gossiped_tx| -> Result<
-                                    oneshot::Receiver<Result<(), BoxError>>,
-                                    MempoolError,
-                                > {
-                                    let (rsp_tx, rsp_rx) = oneshot::channel();
-                                    storage.should_download_or_verify(gossiped_tx.id())?;
-                                    tx_downloads.download_if_needed_and_verify(
-                                        gossiped_tx,
-                                        None,
-                                        Some(rsp_tx),
-                                    )?;
-
-                                    Ok(rsp_rx)
-                                },
-                            )
-                            .map(|result| result.map_err(BoxError::from))
-                            .collect();
+                    let rsp: Vec<_> = gossiped_txs
+                        .into_iter()
+                        .map(|gossiped_tx| {
+                            Self::queue_candidate(storage, tx_downloads, gossiped_tx, None)
+                        })
+                        .collect();
 
                     // We've added transactions to the queue
                     self.update_metrics();
@@ -1002,20 +1025,16 @@ impl Service<Request> for Mempool {
                 Request::QueueFromPeer { candidates, source } => {
                     trace!(req_count = ?candidates.len(), ?source, "got mempool QueueFromPeer request");
 
-                    for candidate in candidates {
-                        if storage.should_download_or_verify(candidate.id()).is_err() {
-                            continue;
-                        }
-                        let _ = tx_downloads.download_if_needed_and_verify(
-                            candidate,
-                            Some(source),
-                            None,
-                        );
-                    }
+                    let rsp: Vec<_> = candidates
+                        .into_iter()
+                        .map(|candidate| {
+                            Self::queue_candidate(storage, tx_downloads, candidate, Some(source))
+                        })
+                        .collect();
 
                     self.update_metrics();
 
-                    async move { Ok(Response::Queued(Vec::new())) }.boxed()
+                    async move { Ok(Response::Queued(rsp)) }.boxed()
                 }
 
                 // Store successfully downloaded and verified transactions in the mempool
@@ -1104,7 +1123,7 @@ impl Service<Request> for Mempool {
 
                 let resp = match req {
                     // Return empty responses for queries.
-                    Request::TransactionIds => Response::TransactionIds(Default::default()),
+                    Request::TransactionIds | Request::InFlightTransactionIds => Response::TransactionIds(Default::default()),
 
                     Request::TransactionsById(_) => Response::Transactions(Default::default()),
                     Request::TransactionsByMinedId(_) => Response::Transactions(Default::default()),
@@ -1129,17 +1148,15 @@ impl Service<Request> for Mempool {
                     }
 
                     // Don't queue mempool candidates, because there is no queue.
-                    Request::Queue(gossiped_txs) => Response::Queued(
-                        // Special case; we can signal the error inside the response,
-                        // because the inbound service ignores inner errors.
-                        iter::repeat_n(MempoolError::Disabled, gossiped_txs.len())
-                            .map(BoxError::from)
-                            .map(Err)
-                            .collect(),
-                    ),
-
-                    // Drop peer-advertised txids when the mempool is disabled.
-                    Request::QueueFromPeer { .. } => Response::Queued(Vec::new()),
+                    // We can signal the refusal inside the response,
+                    // because the inbound service ignores inner errors.
+                    Request::Queue(candidates) | Request::QueueFromPeer { candidates, .. } => {
+                        Response::Queued(
+                            iter::repeat_n(QueueRefusal::Disabled, candidates.len())
+                                .map(Err)
+                                .collect(),
+                        )
+                    }
 
                     // Check if the mempool should be enabled.
                     // This request makes sure mempools are debug-enabled in the acceptance tests.

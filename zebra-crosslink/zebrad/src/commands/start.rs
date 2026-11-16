@@ -369,6 +369,12 @@ impl StartCmd {
             &config.network.network,
         );
 
+        if config.zcashd_compat.enabled && !config.network.legacy_network {
+            warn!(
+                "zcashd_compat is enabled but the legacy network is off: the zcashd sidecar connects \
+                 over it, so set network.legacy_network = true"
+            );
+        }
         let zcashd_compat_block_gossip_peer_ips = if config.zcashd_compat.enabled {
             if config.zcashd_compat.block_gossip_peer_ips.is_empty() {
                 // The sidecar privileges (pinned gossip, reserved slot, stall
@@ -628,8 +634,11 @@ impl StartCmd {
             let _sync_block_verifier = block_verifier_router.clone();
 
             // The finalizer identity: derived from the node seed unless the config names one.
+            // @Todo: On the next featurenet's new chain, derive the default identity with
+            // `finalizer_key_from_node_secret(&global_seed)` (#254). Doing it on a live chain
+            // moves every default-identity finalizer to a new address.
             let bft_key_seed = config.crosslink.explicit_bft_key_seed.clone().unwrap_or_else(|| format!("Crosslink default finalizer identity seed {:?}", global_seed));
-            let (_, bft_signing_key, bft_public_key) = wallet::bft::finalizer_key_from_seed(bft_key_seed.as_bytes());
+            let (bft_signing_key, bft_public_key) = wallet::bft::finalizer_key_from_seed(bft_key_seed.as_bytes());
             *wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap() = bft_public_key;
             let finalizer_address = wallet::bft::FinalizerAddress::create(&bft_signing_key);
             info!("finalizer address: {}", finalizer_address.encode());
@@ -644,6 +653,13 @@ impl StartCmd {
                 signing_key: bft_signing_key,
                 public_address,
                 peer_addresses: config.crosslink.bft_peers.clone(),
+                // new_network::sync fills this in with the node's shared transport.
+                network: None,
+            };
+            // Transactions relay over the node's own connections, through the mempool.
+            let tx_relay_launch = zebra_state::new_network::tx_relay::TxRelayLaunch {
+                mempool: mempool.clone(),
+                changes: mempool_transaction_subscriber.clone(),
             };
             tokio::task::spawn_blocking(move || {
 
@@ -657,7 +673,7 @@ impl StartCmd {
                     check_cheap: zebra_consensus::sync_verify::block_check_cheap,
                     verify_expensive: zebra_consensus::sync_verify::block_verify_expensive,
                 };
-                zebra_state::new_network::sync(&config.state, sync_read_state, tokio::runtime::Handle::current(), verify_fns, Some(bft_launch), block_writer, genesis_block_for_new_network)
+                zebra_state::new_network::sync(&config.state, sync_read_state, tokio::runtime::Handle::current(), verify_fns, Some(bft_launch), block_writer, genesis_block_for_new_network, Some(tx_relay_launch))
             })
         };
 
@@ -987,7 +1003,7 @@ impl StartCmd {
                 mempool_events: mempool_transaction_subscriber.clone(),
                 network: config.network.network.clone(),
             };
-            let thread = crate::lightwalletd::lightwalletd_spawn(lwd_ctx, lwd_port, zebra_port_base + 10000);
+            let thread = crate::lightwalletd::lightwalletd_spawn(lwd_ctx, lwd_port, zebra_port_base + 10000, config.crosslink.public_lightwallet_server);
             *zebra_crosslink::wallet::wallet_main_lightwalletd_port.lock().unwrap() = lwd_port;
             thread
         };

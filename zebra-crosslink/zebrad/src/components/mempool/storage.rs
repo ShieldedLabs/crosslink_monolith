@@ -945,6 +945,46 @@ impl Storage {
         unmined_tx_ids
     }
 
+    /// Returns how `tx` conflicts with a transaction in the mempool, if it does: it spends the
+    /// same transparent outpoint, reveals the same Sprout, Sapling, Orchard or Ironwood
+    /// nullifier, acts on the same bond, or converts the same finalizer's reward bank.
+    ///
+    /// This is the same check [`Self::insert`] makes, and needs no verification, so a full
+    /// transaction can be refused before its proofs are verified. The answer depends on which
+    /// transaction reached the mempool first, so it is never cached as a rejection.
+    pub fn conflict(&self, tx: &UnminedTx) -> Option<SameEffectsTipRejectionError> {
+        self.verified.conflict(tx)
+    }
+}
+
+/// Returns how `a` and `b` conflict, if they do: the same check as [`Storage::conflict`], between
+/// two transactions instead of one and the mempool.
+pub fn transactions_conflict(a: &UnminedTx, b: &UnminedTx) -> Option<SameEffectsTipRejectionError> {
+    fn overlap<T: Eq + std::hash::Hash>(a: impl Iterator<Item = T>, mut b: impl Iterator<Item = T>) -> bool {
+        let a: HashSet<T> = a.collect();
+        !a.is_empty() && b.any(|item| a.contains(&item))
+    }
+    let (a, b) = (&a.transaction, &b.transaction);
+    if overlap(a.spent_outpoints(), b.spent_outpoints())
+        || overlap(a.sprout_nullifiers(), b.sprout_nullifiers())
+        || overlap(a.sapling_nullifiers(), b.sapling_nullifiers())
+        || overlap(a.orchard_nullifiers(), b.orchard_nullifiers())
+        || overlap(a.ironwood_nullifiers(), b.ironwood_nullifiers())
+    {
+        return Some(SameEffectsTipRejectionError::SpendConflict);
+    }
+    let (a, b) = (a.staking_action()?, b.staking_action()?);
+    if a.bond_key() == b.bond_key() {
+        return Some(SameEffectsTipRejectionError::BondActionConflict);
+    }
+    if a.reward_bank_finalizer().is_some() && a.reward_bank_finalizer() == b.reward_bank_finalizer() {
+        return Some(SameEffectsTipRejectionError::RewardBankConflict);
+    }
+    None
+}
+
+impl Storage {
+
     /// Check if transaction should be downloaded and/or verified.
     ///
     /// If it is already in the mempool (or in its rejected list)

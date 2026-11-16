@@ -74,9 +74,33 @@ const MEMPOOL_OUTPUT_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::
 /// transparent outputs before polling the mempool service so that it will try adding the verified
 /// transaction and responding to any potential `AwaitOutput` requests.
 ///
-/// This should be long enough for the mempool service's `Downloads` to finish processing the
-/// response from the transaction verifier.
+/// The last should be long enough for the mempool service's `Downloads` to finish processing the
+/// response from the transaction verifier; the earlier ones catch it sooner, as it usually is.
+/// Each poll is a cheap no-op once the transaction has been taken in.
+const POLL_MEMPOOL_DELAYS: [std::time::Duration; 4] =
+    [Duration::from_millis(1), Duration::from_millis(4), Duration::from_millis(15), Duration::from_millis(30)];
+
+/// How long after a transaction verifies the last of the `POLL_MEMPOOL_DELAYS` polls is made.
+#[cfg(test)]
 const POLL_MEMPOOL_DELAY: std::time::Duration = Duration::from_millis(50);
+
+/// A mempool transaction that embeds a consensus branch ID (v5 onward) reaches its signature,
+/// script and proof checks only once that branch ID equals the one our upgrade schedule has
+/// active at the verification height. So those checks run over the sighash and circuit the
+/// transaction's author chose, and their failures don't depend on our upgrade schedule.
+///
+/// Established in [`MempoolTxVerifier`]'s `call`, which runs
+/// [`check_structure_and_network_rules`] (and so [`check::consensus_branch_id`]) before
+/// building the sighasher. Relied on by [`TransactionError::is_state_dependent`].
+pub(crate) const ASSUME_EMBEDDED_BRANCH_ID_CHECKED_BEFORE_CRYPTO: () = ();
+
+/// The spent outputs a mempool transaction's sighash and scripts are checked against are in the
+/// order of its inputs, whether each came from the best chain or the mempool. An outpoint fixes
+/// its output, so those checks don't depend on where we found the outputs.
+///
+/// Established in `MempoolTxVerifier::mempool_spent_utxos`, which fills one slot per input.
+/// Relied on by [`TransactionError::is_state_dependent`].
+pub(crate) const ASSUME_SPENT_OUTPUTS_IN_INPUT_ORDER: () = ();
 
 /// Asynchronous verification of block transactions.
 ///
@@ -470,6 +494,10 @@ where
             tracing::trace!(?tx_id, ?req, "got tx verify request");
 
             // Do quick checks first
+            //
+            // This includes the consensus branch ID check, which must stay ahead of the
+            // sighasher and the crypto checks below.
+            let () = ASSUME_EMBEDDED_BRANCH_ID_CHECKED_BEFORE_CRYPTO;
             check_structure_and_network_rules(tx.as_ref(), height, &network)?;
 
             // Validate the coinbase input consensus rules
@@ -491,11 +519,14 @@ where
             let params = network.crosslink_parameters();
             let staking = params.staking;
             check_staking_day_window(&tx, height, &params)?;
-            check_staking_target_capability(&tx)?;
+            check_staking_target_capability(&tx, height, &network)?;
 
             tracing::trace!(?tx_id, "passed quick checks");
 
-            Self::check_mempool_staking_action_bond_state(&tx, height, staking, state.clone()).await?;
+            let spends_versions = NetworkUpgrade::FeaturenetUpgrade3
+                .activation_height(&network)
+                .is_some_and(|activation_height| height >= activation_height);
+            Self::check_mempool_staking_action_bond_state(&tx, height, staking, spends_versions, state.clone()).await?;
 
             // Mempool transactions are checked against the next median-time-past from state.
             Self::verify_mempool_lock_time(tx.as_ref(), height, state.clone()).await?;
@@ -561,11 +592,7 @@ where
 
             let sigops = tx.sigops().map_err(zebra_script::Error::from)?;
 
-            // TODO: `spent_outputs` may not align with `tx.inputs()` when a transaction
-            // spends both chain and mempool UTXOs (mempool outputs are appended last by
-            // `mempool_spent_utxos()`), causing policy checks to pair the wrong input with
-            // the wrong spent output.
-            // https://github.com/ZcashFoundation/zebra/issues/10346
+            // `spent_outputs` is in input order, see `ASSUME_SPENT_OUTPUTS_IN_INPUT_ORDER`.
             let spent_outputs = cached_ffi_transaction.all_previous_outputs().clone();
 
             let transaction = VerifiedUnminedTx::new(
@@ -578,15 +605,18 @@ where
 
             if let Some(mut mempool) = mempool {
                 tokio::spawn(async move {
-                    // Best-effort poll of the mempool to provide a timely response to
-                    // `sendrawtransaction` RPC calls or `AwaitOutput` mempool calls.
-                    tokio::time::sleep(POLL_MEMPOOL_DELAY).await;
-                    let _ = mempool
-                        .ready()
-                        .await
-                        .expect("mempool poll_ready() method should not return an error")
-                        .call(mempool::Request::CheckForVerifiedTransactions)
-                        .await;
+                    // Best-effort polls of the mempool to provide a timely response to
+                    // `sendrawtransaction` RPC calls or `AwaitOutput` mempool calls: the mempool
+                    // takes a verified transaction in only when it is called.
+                    for delay in POLL_MEMPOOL_DELAYS {
+                        tokio::time::sleep(delay).await;
+                        let _ = mempool
+                            .ready()
+                            .await
+                            .expect("mempool poll_ready() method should not return an error")
+                            .call(mempool::Request::CheckForVerifiedTransactions)
+                            .await;
+                    }
                 });
             }
 
@@ -619,6 +649,7 @@ where
         tx: &Transaction,
         height: block::Height,
         staking: StakingParameters,
+        spends_versions: bool,
         state: Timeout<ZS>,
     ) -> Result<(), TransactionError> {
         use zcash_primitives::transaction::StakingActionKind;
@@ -652,6 +683,10 @@ where
         } else {
             0
         };
+
+        if staking_action.acts_on_existing_bond() {
+            check_staking_action_spends(bond_key, staking_action.spends(), spends_versions, bond_info.as_ref())?;
+        }
 
         check_staking_action_bond_state(
             staking_action.kind(),
@@ -739,6 +774,7 @@ where
         let mut spent_utxos = HashMap::new();
         // Pre-allocate with None so we can fill each slot by input index, preserving input order
         // even when chain and mempool UTXOs are fetched in separate passes.
+        let () = ASSUME_SPENT_OUTPUTS_IN_INPUT_ORDER;
         let mut spent_outputs: Vec<Option<transparent::Output>> = vec![None; inputs.len()];
         // Stores (input_idx, outpoint) for UTXOs not found in the best chain (fetched from mempool later).
         let mut spent_mempool_outpoints: Vec<(usize, transparent::OutPoint)> = Vec::new();
@@ -881,6 +917,26 @@ fn check_staking_action_bond_state(
     }
 }
 
+/// From FeaturenetUpgrade3 an action on an existing bond must spend the bond's current version,
+/// so a replayed or stale action never enters the mempool; before it, the spending form is
+/// refused. Blocks get the same rule from contextual validation in the state. A missing bond is
+/// left to `check_staking_action_bond_state`, which reports it.
+fn check_staking_action_spends(
+    bond_key: [u8; 32],
+    spends: Option<[u8; 32]>,
+    spends_versions: bool,
+    bond_info: Option<&zs::BondInfoResponse>,
+) -> Result<(), TransactionError> {
+    let invalid = |reason: &str| Err(TransactionError::StakingActionBondStateInvalid { bond_key, reason: reason.to_string() });
+    match (spends_versions, spends, bond_info) {
+        (false, None, _) => Ok(()),
+        (false, Some(_), _) => invalid("an action cannot spend a bond version before FeaturenetUpgrade3"),
+        (true, None, _) => invalid("from FeaturenetUpgrade3 an action on a bond must spend its version"),
+        (true, Some(spends), Some(info)) if spends != info.version => invalid("the action spends a stale bond version"),
+        (true, Some(_), _) => Ok(()),
+    }
+}
+
 /// Rejects an action on a bond at `height` when the bond's previous action, at
 /// `last_action_height`, is less than `action_delay` blocks earlier.
 fn check_staking_action_delay(
@@ -902,15 +958,16 @@ fn check_staking_action_delay(
 
 /// Checks that a staking action's target finalizer address, when it carries one,
 /// is a valid capability: the address embeds the finalizer key's signature over
-/// the standard message. Stateless, so it runs for mempool and block paths alike.
-fn check_staking_target_capability(tx: &Transaction) -> Result<(), TransactionError> {
+/// the standard message, and from FeaturenetUpgrade3 its key is not one anyone can sign for.
+/// Needs only the height, so it runs for mempool and block paths alike.
+fn check_staking_target_capability(tx: &Transaction, height: block::Height, network: &Network) -> Result<(), TransactionError> {
     if let Some(staking_action) = tx.staking_action() {
         // Retarget's claimed current target must be a valid capability too;
         // whether it matches the bond's actual target is a contextual check
         // in zebra-state (validate_delegation_bonds).
         for addr in [staking_action.target_finalizer_address(), staking_action.from_finalizer_address()] {
             if let Some(addr) = addr {
-                if !addr.verify() {
+                if !addr.verify_at(network, height.0) {
                     return Err(TransactionError::StakingActionInvalidFinalizerAddress {
                         pub_key: addr.pub_key.0,
                     });
@@ -926,8 +983,8 @@ fn check_staking_target_capability(tx: &Transaction) -> Result<(), TransactionEr
         if let zcash_primitives::transaction::StakingAction::ConvertFinalizerRewardToDelegationBond {
             unique_pubkey, this_finalizer, amount_zats, finalizer_signature, ..
         } = staking_action {
-            let ok = zcash_primitives::bft::verify_finalizer_reward_conversion(
-                zcash_primitives::bft::PubKeyID(*this_finalizer), unique_pubkey, *amount_zats, finalizer_signature);
+            let ok = zcash_primitives::bft::verify_finalizer_reward_conversion_at(
+                network, height.0, zcash_primitives::bft::PubKeyID(*this_finalizer), unique_pubkey, *amount_zats, finalizer_signature);
             if !ok {
                 return Err(TransactionError::StakingActionFinalizerAuthorizationInvalid {
                     finalizer: *this_finalizer,
@@ -1012,12 +1069,14 @@ pub fn check_block_transaction(
     time: DateTime<Utc>,
     network: &Network,
 ) -> Result<(), TransactionError> {
+    check::coinbase_has_no_staking_action(tx)?;
+
     // Staking actions are only allowed during specific block ranges.
     check_staking_day_window(tx, height, &network.crosslink_parameters())?;
 
     // The target finalizer address must be a valid capability (its embedded
     // signature verifies); the state contextual check enforces the same rule on blocks.
-    check_staking_target_capability(tx)?;
+    check_staking_target_capability(tx, height, network)?;
 
     check_structure_and_network_rules(tx, height, network)?;
 
@@ -1475,7 +1534,8 @@ fn verify_v4_transaction_network_upgrade(
         | NetworkUpgrade::Nu6_2
         | NetworkUpgrade::Nu6_3
         | NetworkUpgrade::FeaturenetUpgrade1
-        | NetworkUpgrade::FeaturenetUpgrade2 => Ok(()),
+        | NetworkUpgrade::FeaturenetUpgrade2
+        | NetworkUpgrade::FeaturenetUpgrade3 => Ok(()),
 
         #[cfg(zcash_unstable = "zfuture")]
         NetworkUpgrade::ZFuture => Ok(()),
@@ -1516,6 +1576,7 @@ fn verify_v5_transaction_network_upgrade(
         | NetworkUpgrade::Nu6_3
         | NetworkUpgrade::FeaturenetUpgrade1
         | NetworkUpgrade::FeaturenetUpgrade2
+        | NetworkUpgrade::FeaturenetUpgrade3
         | NetworkUpgrade::Nu7 => Ok(()),
 
         #[cfg(zcash_unstable = "zfuture")]
@@ -1546,6 +1607,7 @@ fn verify_v6_transaction_network_upgrade(
         NetworkUpgrade::Nu6_3
         | NetworkUpgrade::FeaturenetUpgrade1
         | NetworkUpgrade::FeaturenetUpgrade2
+        | NetworkUpgrade::FeaturenetUpgrade3
         | NetworkUpgrade::Nu7 => Ok(()),
 
         #[cfg(zcash_unstable = "zfuture")]

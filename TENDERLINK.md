@@ -5,110 +5,139 @@ Everything outstanding on the BFT engine (`tenderlink/src/lib.rs`) and its trans
 
 | # | topic | state |
 |---|---|---|
-| 1 | Out-of-range proposal chunk index crashes the receiver | not fixed |
-| 2 | Gossip scheduler replacing the resend storm | written, uncommitted, unreviewed |
+| 1 | Out-of-range proposal chunk index crashes the receiver | fixed (`5a6577e2`) |
+| 2 | Gossip by HAVE bitmaps under a per-peer byte budget, replacing the resend storm | committed; fuzz tests pass; not measured on a network |
 | 3 | Receive-side overload and backpressure | hard cap and duplicate skip shipped; the rest waits on a measurement |
 | 4 | Line 28 checks the cited round | fixed and deployed (`b150bec0`); expert review not recorded |
 
 ## 1. An out-of-range proposal chunk index crashes the receiver
 
-Found 2026-09-23 as a test panic and confirmed by reading the code. Not reproduced over the network.
+A chunk whose `chunk_i` lay past the end of its proposal underflowed a subtraction on receive and
+indexed past `proposal_sigs` in `check_and_incorporate_msg`; either could kill a node. Both places
+now refuse a chunk unless `chunk_i < proposal_size.div_ceil(PROPOSAL_CHUNK_DATA_SIZE)`.
 
-A proposal chunk packet carries its own `chunk_i` and `proposal_size`. Nothing checks that `chunk_i`
-lies inside the proposal.
-
-1. **Receive loop, the `PACKET_TYPE_PROPOSAL_CHUNK` branch:**
-   `chunk_size = min(PROPOSAL_CHUNK_DATA_SIZE, proposal_size - chunk_i * PROPOSAL_CHUNK_DATA_SIZE)`.
-   A `chunk_i` past the end of the proposal underflows the subtraction.
-   - Without overflow checks (release, which the nodes run) the value wraps, `min` turns it into a
-     full chunk size, the length check on the next line passes, and the packet reaches
-     `check_and_incorporate_msg`.
-   - With overflow checks (the `dev` profile) the subtraction panics before any signature check, so
-     **any connected peer** can crash such a build.
-2. **`check_and_incorporate_msg`:** `round_data.proposal_sigs[chunk_i]` indexes past the end and
-   panics. The chunk's signature is checked before this point, so in release builds only that
-   round's proposer gets here, but **that proposer can crash every node it reaches.**
-
-The build uses `panic = "abort"`, so a panic kills the node. The duplicate-chunk shortcut is not
-affected: it tests `chunk_i < round_data.proposal_sigs.len()` before indexing.
-
-**Fix.** Drop the packet on receive unless `chunk_i * PROPOSAL_CHUNK_DATA_SIZE < proposal_size`.
-That removes both panics and the underflow. A size check in `check_and_incorporate_msg` as well
-protects every other caller.
-
-**Test.** Build a validly signed chunk for a 2-chunk proposal with `chunk_i = 5` and pass it to
-`check_and_incorporate_msg`. It should return `Fail` and leave the round data unchanged.
-
-## 2. Gossip scheduler
+## 2. Gossip
 
 ### The problem it replaces
 
-`send_round_data_to_peer` re-sent every round at the current height to every peer on every tick,
-with no memory of what it had sent and no rate limit. Rounds at a height are pruned only on commit,
-and the round timeout backs off linearly, so a height stalled for time `t` holds about `√t` rounds:
-roughly 44 after an hour, 235 after a day, 630 after a week. In the September 2026 featurenet stall
-this measured about 12.3 MB/s of inbound BFT traffic per node (8,864 packets/s) against 0.1 MB/s of
-block sync, and with an unbounded receive queue it killed nodes repeatedly. That this loop produced
-the traffic was never confirmed by decoding a capture.
+The old sender re-sent every round at the current height to every peer on every tick, with no
+memory of what it had sent and no rate limit. Rounds at a height are pruned only on commit, and the
+round timeout backs off linearly, so a height stalled for time `t` holds about `√t` rounds: roughly
+44 after an hour, 235 after a day, 630 after a week. In the September 2026 featurenet stall this
+measured about 12.3 MB/s of inbound BFT traffic per node (8,864 packets/s) against 0.1 MB/s of
+block sync, and with an unbounded receive queue it killed nodes repeatedly. It also dropped votes:
+a vote packet carried one value, so a vote for anything but the proposal a node held was counted
+and never passed on.
 
-### What is in the working tree
+### What Tendermint needs from it
 
-An uncommitted change to `tenderlink/src/lib.rs` (+374 −208) removes `send_round_data_to_peer` and
-sends through per-peer cursors:
+The proofs in the Tendermint paper (Buchman, Kwon, Milosevic, *The latest gossip on BFT
+consensus*) assume its Gossip property: a message a correct process sends or receives by time `t`
+reaches every correct process by `max(t, GST) + Δ`. So gossip may drop nothing a node holds for its
+height for good: not a vote for another value, not a faulty finalizer's second vote. It may only
+delay, and only by a bounded amount once the network is synchronous. Two things narrow what it must
+carry:
 
-- Three focus cursors per peer: our round, the peer's round from its last status, and the
-  `valid_round` our proposal cites. They share `GOSSIP_BYTES_PER_PEER_TICK` (20 KB) less the repair
-  share.
-- One repair cursor per peer that walks every other round at the height in turn, with
-  `GOSSIP_REPAIR_BYTES_PER_TICK` (3 KB) plus whatever the focus rounds left unused.
-- A round whose content has not changed is re-sent only every `GOSSIP_REFRESH_TICKS` (4) ticks. A
-  `GossipFingerprint` of its proposal and vote counts detects change.
-- A peer asking for an older height is served that height's committed round, without prevotes.
-- Peers that are neither validators nor catching up get nothing.
-- `bft_update` runs again after a receive pass that incorporated new evidence, and the loop yields
-  instead of sleeping when messages arrived.
-- Tests: `gossip_chunks_continue_while_votes_change`,
-  `gossip_unchanged_round_refreshes_after_four_ticks`, `gossip_chunk_header_keeps_status_bytes`,
-  `gossip_repair_cursor_reaches_every_nonfocus_round`.
+- Once a height is decided, its proposal and 2f+1 precommits are all a node still at that height
+  needs (line 49), so a node ahead serves a node behind only those.
+- Line 28 reads round `vr`, so the prevotes of the round a proposal cites must reach everyone; the
+  repair rotation below carries them, and they are also near the front of the priority order.
 
-It compiles (`pheck.bat zebra-crosslink`). Its tests have not been run, and nobody has reviewed it.
+Lemma 5 needs each timeout to exceed a small multiple of `Δ`, which timeouts that grow with the
+round eventually do; this change leaves them as they are. The budget adds to `Δ` at most the time
+one tick's budget takes to drain to a peer, per hop: 0.16 s at 1 Mbit/s.
 
-### What the review has to check it against
+### How it works
 
-These were settled on 2026-09-23 and are the requirements, whatever the code does today.
+All of it is in the gossip section of `tenderlink/src/lib.rs`, from `GOSSIP_BYTES_PER_PEER_TICK` to
+`take_consensus_packet`.
 
-1. **A hard byte budget per peer per tick**, so no consensus bug can flood the network again.
-2. **Every old round stays reachable.** A node may hold round `r`'s proposal while others hold its
-   precommits, and without the proposal a peer cannot decide on `r`. The repair cursor covers all
-   rounds at the height on a fixed budget, and may visit rounds holding value precommits more often.
-   *Today it is a plain rotation.*
-3. **Decisive votes and status go before proposal chunks and repair traffic.** STP's send queue
-   shuffles and drops oldest, treating everything alike, so the ordering has to be made here.
-   *Today a cursor sends a round's chunks first, then precommits, then prevotes. Every packet does
-   carry the status.*
-4. **Round data is signed items, not per-round streams.** `PacketVotes` repacks up to 18 signatures,
-   so packet boundaries are not item boundaries. Back off per item. *Today the backoff is per
-   round.*
-5. **Status need-ranges are hints, never proof of what a peer holds.** As sent today they mislead:
-   `need_vote_rngs` defaults to `[0, roster_n]` and is overwritten only when something is missing,
-   so a peer holding every value vote says "need all"; it looks only at value-vote slots, not nil
-   slots; and `gen_mostly_empty_rngs` lets single filled gaps through. An exact `[0, roster_n]` from
-   an old peer means "unknown". *The scheduler ignores the ranges, which is safe. The misleading
-   default in the statuses new nodes send is not fixed.*
-6. **A transport ACK means "received by STP"**, never that the application has the item. It may
-   bring the next resend decision forward. It never suppresses repair for good.
+- **HAVE** (packet type 10) says which chunks and votes a node has validated and stored, round by
+  round, for its height: the proposal id, a chunk bitmap, and a bitmap of finalizers per step for
+  nil and for each value voted. A node sends each peer a HAVE in a tick when a round's holdings
+  changed since it last told that peer, and every `HAVE_REFRESH_TICKS` (4) ticks a rotation over
+  all its rounds, as many as fit one datagram, in case one was lost. A HAVE carries a sequence
+  number taken from the clock, and a peer drops one no newer than the last it took.
+- **What is sent.** Each tick, after the HAVE, a node sends a peer every chunk and vote its newest
+  HAVE does not list and that was not sent to it, or received from it, in the last retry interval.
+  The interval is `GOSSIP_RETRY_MIN_TICKS` (4) ticks per round and doubles, up to
+  `GOSSIP_RETRY_MAX_TICKS` (16), while the peer reports nothing new. Votes for any value go,
+  including both values of a finalizer that signed two.
+- **The budget.** A peer gets at most `GOSSIP_BYTES_PER_PEER_TICK` (20 KB) a tick, less the bytes
+  the transport still has queued for it on the BFT channel, less its HAVE. A slow peer therefore gets
+  less, and what waits for it never grows much past one tick's budget. Three quarters go in priority
+  order and the rest, plus whatever that left, to a rotation over every round of the height.
+- **Priority:** precommits of rounds holding precommits for a value, newest first; precommits then
+  prevotes of our round and of the peer's; prevotes of the rounds their proposals cite; chunks of
+  those two rounds; chunks of rounds holding value precommits. The pass stops at the first step that
+  does not fit, so nothing later overtakes it.
+- **A peer at another height.** One behind gets the precommits and chunks of the round that decided
+  its height, from `recent_commit_round_cache`. One ahead gets only HAVEs, from which it catches this
+  node up. A peer outside the active roster at our height gets only HAVEs, as before.
+- **Packets.** A vote packet holds at most `VOTES_PER_PACKET` (16) votes, so it fits one datagram,
+  and votes for one value plus nil votes. Every consensus packet keeps its status header, with the
+  need-ranges zeroed, since peers read heights and rounds from it. A peer that sends no HAVE within
+  `GOSSIP_FIRST_HAVE_WAIT_TICKS` (8) ticks is served from its status as if it held nothing.
 
-Line 28 reads round `vr` (section 4), so that round's prevotes must be deliverable. That is why
-the cited `valid_round` is a focus round.
+`tenderlink::status_packet_needing_everything`, which the test harness sends its synthetic peers,
+is now a HAVE listing no rounds.
+
+### Against the requirements of 2026-09-23
+
+1. **A hard byte budget per peer per tick:** yes, less what the transport has queued. HAVEs, at most
+   one datagram per peer per tick, come on top.
+2. **Every old round stays reachable:** the rotation covers every round on at least a quarter of the
+   budget, and rounds holding value precommits come early in the priority order.
+3. **Decisive votes and status before chunks and repair:** the priority order.
+4. **Back off per item:** HAVE bitmaps and the sent marks are per item. The retry timer is per peer
+   and round.
+5. **Need-ranges are hints:** nothing reads them, and the statuses nodes send now carry none.
+6. **A transport ACK is not application receipt:** nothing uses ACKs.
+
+### Tests
+
+- `gossip_have_rounds_read_back_as_written` fuzzes the HAVE encoding, its truncation, and the
+  reader against cut, bent and random bytes.
+- `gossip_reaches_every_node_within_budget_and_then_goes_quiet` runs real engines over simulated
+  links that queue at a byte rate, delay, and lose packets before GST, over partial meshes, slow
+  links, and a finalizer voting for two values in every step. It asserts that a precommit made at
+  GST reaches every node within a bound of a few ticks plus queue drain plus latency per hop, that
+  every node ends up holding everything any node held, that no tick's data to a peer exceeds its
+  budget less what is queued to it, and that once all hold everything only HAVEs are sent.
+- `gossip_brings_a_node_behind_the_decision_and_then_goes_quiet` does the same for a node a height
+  behind.
+- `gossip_lets_the_state_machine_decide_heights` runs the real state machine (`bft_update`) on
+  each node over the same links, its step timeouts on the sim's ticks, with finalizers that never
+  run, partial meshes, slow links, heavy loss before GST, or a partition before GST with no quorum
+  on either side. It asserts that every finalizer that runs decides three more heights within
+  `LIVE_TICKS_PER_HEIGHT` ticks each after GST, that all decide the same value at every height,
+  and the same budget.
+
+`CROSSLINK_FUZZ_SEED` replays a run and `CROSSLINK_FUZZ_CASES` sets its size (default 8). Run them
+with `phest.bat tenderlink Debug Win64 gossip_`. For the whole suite, add `-- --skip single_rt`:
+that test never ends, and its nodes all bind port 23485, so they crash the test process.
+
+### Known limits
+
+- A finalizer that signs three or more values in one step: a node keeps two of them, the newest
+  replacing the other, so nodes can hold different pairs and resend each other the missing one
+  every retry interval. That traffic is bounded and never settles; the votes prove a fault anyway.
+- A round's HAVE entry fits about ten values at 256 finalizers. Votes for the values left out look
+  missing to peers, which resend them every retry interval.
+- A node holding one proposal for a round is never sent another proposal's chunks for it. A decided
+  one reaches it once its precommits make the node take that proposal (`adopt_if_certified`); a
+  proposal with a quorum of prevotes comes back re-proposed in a later round, which line 28 accepts.
+- Gossip tracks at most `VOTE_BITS_MAX` (256) active finalizers; past that it prints an error and
+  the rest's votes are not gossiped.
+- Receive-side CPU is still unbounded (section 3).
+- Rounds at a stalled height still accumulate (`prune_unnecessary_data` is `todo!()`). The budget
+  holds regardless, but the HAVE rotation takes longer to cover them.
+- Nothing has been measured on a network.
 
 ### Still to do
 
-- Review the diff against the six points, then run the `gossip_` tests:
-  `phest.bat tenderlink Debug Win64 gossip_`. Never run the suite unfiltered; `single_rt` is
-  long-running.
-- Measure on a stalled height: the `receive loop processed … messages/s` line the node prints every
-  10 s, before and after. `PRINT_SENDS` and `PRINT_SEND_CS` report per-tick send counts.
-- Commit it apart from everything else in `lib.rs`.
+- Measure on a stalled height: bytes per second per peer and the `receive loop processed …
+  messages/s` line the node prints every 10 s. `PRINT_SEND_CS` reports per-peer sends each tick.
 
 ## 3. Receive-side overload and backpressure
 
@@ -141,11 +170,10 @@ the cited `valid_round` is a focus round.
    - a fair share per connection, with a minimum accepted rate so ACKs and RTT samples keep flowing;
    - deliberate drops reported to the application and counted apart from path loss, on both sides;
    - the 64 MiB cap stays as the backstop for a peer that does not cooperate.
-5. Later and optional, for upgraded pairs only: packet type 10 carrying session-scoped
-   `HAVE`/`WANT` and receive credit, enabled only after receiving it from the peer. Old nodes ignore
-   unknown types. `HAVE` means validated and incorporated. Do not change `MAGIC2_APP_CROSSLINK` or
-   renumber the vote types. The magic2 negotiation is a list, so offering `[V2, V1]` is the
-   backwards-compatible route for a future STP-level change.
+5. Packet type 10 is now the `HAVE` of section 2, sent to every peer without negotiation, and it
+   means validated and incorporated. `WANT` and receive credit are not built. Do not change
+   `MAGIC2_APP_CROSSLINK` or renumber the vote types. The magic2 negotiation is a list, so offering
+   `[V2, V1]` is the backwards-compatible route for a future STP-level change.
 6. Later and optional: STP reports per-message ACK and loss to the sender as a faster "maybe
    delivered" signal.
 7. ECN echo on queue pressure is at most a hint, counted apart from real congestion. NewNet needs

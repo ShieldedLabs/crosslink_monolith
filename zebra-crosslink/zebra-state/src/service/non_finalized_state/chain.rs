@@ -176,6 +176,11 @@ pub struct ChainInner {
     /// Stores the target finalizer BEFORE the retarget, so we can restore it on revert.
     pub(crate) bond_retargets: Vec<HashMap<disk_format::BondKey, [u8; 32]>>,
 
+    /// Pre-block versions of bonds whose version an action spent at each block height.
+    /// Indexed by block position in the chain (0 = first non-finalized block).
+    /// Stores the stored version BEFORE the block's first spend, so we can restore it on revert.
+    pub(crate) bond_versions: Vec<HashMap<disk_format::BondKey, Option<[u8; 32]>>>,
+
     /// Pre-burn (key, status) per bond burned at each block height, to restore on revert.
     /// Indexed by block position in the chain (0 = first non-finalized block).
     pub(crate) bond_burns: Vec<Vec<(disk_format::BondKey, BondStatusInChain)>>,
@@ -371,6 +376,7 @@ impl Chain {
             finalizer_commissions: Vec::new(),
             aggregated_stakes: Vec::new(),
             bond_retargets: Vec::new(),
+            bond_versions: Vec::new(),
             bond_burns: Vec::new(),
             sprout_anchors: MultiSet::new(),
             sprout_anchors_by_height: Default::default(),
@@ -515,6 +521,9 @@ impl Chain {
         // Discard bond retargets for this block (not needed for finalized state)
         if !self.bond_retargets.is_empty() {
             self.bond_retargets.remove(0);
+        }
+        if !self.bond_versions.is_empty() {
+            self.bond_versions.remove(0);
         }
 
         // Extract burned bond keys BEFORE revert_chain_with discards them (the burn is now permanent on finalization)
@@ -1920,7 +1929,16 @@ impl Chain {
         _transaction_hash: &transaction::Hash,
         transaction_location: disk_format::TransactionLocation,
     ) -> Result<(), ValidateContextError> {
-        let ChainInner { chain_value_pools, delegation_bonds, bond_retargets, finalizer_rewards, .. } = &mut self.inner;
+        let ChainInner { chain_value_pools, delegation_bonds, bond_retargets, bond_versions, finalizer_rewards, .. } = &mut self.inner;
+        if staking_action.spends().is_some() {
+            if let Some((bond, _status)) = delegation_bonds.get(&staking_action.bond_key()) {
+                bond_versions
+                    .last_mut()
+                    .expect("bond_versions should have been initialized for this block")
+                    .entry(staking_action.bond_key())
+                    .or_insert(bond.version);
+            }
+        }
         crate::service::update_chain_tip_with_delegation_bond(
             chain_value_pools,
             delegation_bonds,
@@ -2045,6 +2063,7 @@ impl Chain {
 
         // Initialize empty retargets map for this block (will be populated if any retargets occur)
         self.bond_retargets.push(HashMap::new());
+        self.bond_versions.push(HashMap::new());
         self.bond_burns.push(Vec::new());
 
         // for each transaction in block
@@ -2370,6 +2389,14 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                 let (bond, _status) = self.delegation_bonds.get_mut(&bond_key)
                     .expect("bond must exist if it was retargeted");
                 bond.target_finalizer = old_target;
+            }
+
+            // Revert bond versions - restore the stored version from before the block's spends
+            let versions = self.bond_versions.pop().expect("versions must exist for tip block");
+            for (bond_key, old_version) in versions {
+                let (bond, _status) = self.delegation_bonds.get_mut(&bond_key)
+                    .expect("bond must exist if its version was spent");
+                bond.version = old_version;
             }
 
             // Revert slash burns - restore each bond's pre-burn status
@@ -3176,8 +3203,8 @@ mod bond_status_tests {
             std::iter::empty(),
         );
 
-        let unbond = StakingAction::BeginDelegationUnbonding { unique_pubkey: key, signature: [0; 64] };
-        let withdraw = StakingAction::WithdrawDelegationBond { amount_zats: 1000, unique_pubkey: key, signature: [0; 64] };
+        let unbond = StakingAction::BeginDelegationUnbonding { unique_pubkey: key, signature: [0; 64], spends: None };
+        let withdraw = StakingAction::WithdrawDelegationBond { amount_zats: 1000, unique_pubkey: key, signature: [0; 64], spends: None };
         let hash = transaction::Hash([0; 32]);
 
         chain.update_chain_tip_with_delegation_bond(&unbond, &hash, loc(200)).unwrap();

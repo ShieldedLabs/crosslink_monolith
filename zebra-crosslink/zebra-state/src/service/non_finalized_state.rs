@@ -504,6 +504,9 @@ impl NonFinalizedState {
         let height = prepared.height;
 
         // Reads from disk
+        check::transactions_are_new_to_chain(&prepared, &self.network, &new_chain, finalized_state)?;
+
+        // Reads from disk
         //
         // TODO: if these disk reads show up in profiles, run them in parallel, using std::thread::spawn()
         let spent_utxos = check::utxo::transparent_spend(

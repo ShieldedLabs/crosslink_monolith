@@ -628,8 +628,9 @@ fn fat_pointer_digest_of_null_reproduces_the_zip_244_commitment() {
     }
 }
 
-/// The digest a block binds is zero below FeaturenetUpgrade2 and on a network that does not
-/// schedule it, whatever the pointer, and the pointer's digest from its activation height on.
+/// The digest a block binds is zero below FeaturenetUpgrade2, whatever the pointer, and the
+/// pointer's digest from its activation height on, both where a network moves the upgrade and
+/// at its default height.
 #[test]
 fn fat_pointer_digest_at_switches_on_at_featurenet_upgrade_2() {
     use crate::{
@@ -640,14 +641,18 @@ fn fat_pointer_digest_at_switches_on_at_featurenet_upgrade_2() {
     let _init_guard = zebra_test::init();
 
     let pointer = sample_fat_pointer();
-    let unscheduled = Network::new_regtest(RegtestParameters::default());
+    let default = Network::new_regtest(RegtestParameters::default());
+    let default_height = crate::parameters::NetworkUpgrade::FeaturenetUpgrade2
+        .activation_height(&default)
+        .expect("Regtest schedules FeaturenetUpgrade2 by default");
     let scheduled = Network::new_regtest(RegtestParameters::from(ConfiguredActivationHeights {
         nu5: Some(1),
         featurenet_upgrade_2: Some(10),
         ..Default::default()
     }));
-    assert_eq!(fat_pointer_digest_at(&unscheduled, Height(10), &pointer), [0; 32]);
-    assert_eq!(fat_pointer_digest_at(&unscheduled, Height::MAX, &pointer), [0; 32]);
+    assert_eq!(fat_pointer_digest_at(&default, Height(10), &pointer), [0; 32]);
+    assert_eq!(fat_pointer_digest_at(&default, Height(default_height.0 - 1), &pointer), [0; 32]);
+    assert_eq!(fat_pointer_digest_at(&default, default_height, &pointer), fat_pointer_digest(&pointer));
     assert_eq!(fat_pointer_digest_at(&scheduled, Height(9), &pointer), [0; 32]);
     assert_eq!(fat_pointer_digest_at(&scheduled, Height(10), &pointer), fat_pointer_digest(&pointer));
     assert_eq!(fat_pointer_digest_at(&scheduled, Height(11), &pointer), fat_pointer_digest(&pointer));

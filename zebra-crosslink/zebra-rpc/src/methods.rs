@@ -727,7 +727,7 @@ pub trait Rpc {
     /// # Parameters
     ///
     /// - `ufvk_strs`: (array of strings, required) Unified full viewing keys to scan.
-    /// - `first_height`: (numeric, required) The first block height to scan, inclusive.
+    /// - `first_height`: (numeric, required) The first block height to scan, inclusive. Must be 0 for now (#292).
     /// - `last_height`: (numeric, required) The last block height to scan, inclusive.
     #[method(name = "get_total_issuance")]
     async fn get_total_issuance(&self, ufvk_strs: UfvkList, first_height: u32, last_height: u32) -> Result<Vec<ScanInfo>>;
@@ -1914,17 +1914,29 @@ where
             "mempool service returned more results than expected"
         );
 
-        let queue_result = queue_results
+        let verdict = match queue_results
             .pop()
             .expect("there should be exactly one item in Vec")
-            .inspect_err(|err| tracing::debug!("sent transaction to mempool: {:?}", &err))
-            .map_misc_error()?
-            .await
-            .map_misc_error()?;
+        {
+            Ok(verdict) => verdict,
+            Err(refusal) => {
+                tracing::debug!("sent transaction to mempool: {:?}", &refusal);
+                // A conflict is now found before verification, but it is still a verification
+                // failure to the caller, as it was when found on insertion.
+                let code = match refusal {
+                    mempool::QueueRefusal::SpendConflict => server::error::LegacyCode::Verify,
+                    _ => server::error::LegacyCode::Misc,
+                };
+                return Err(refusal).map_error(code);
+            }
+        }
+        .await
+        .map_misc_error()?;
 
-        tracing::debug!("sent transaction to mempool: {:?}", &queue_result);
+        tracing::debug!("sent transaction to mempool: {:?}", &verdict);
 
-        queue_result
+        verdict
+            .into_result()
             .map(|_| SendRawTransactionResponse(transaction_hash))
             // Reference for the legacy error code:
             // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/rawtransaction.cpp#L1290-L1301>
@@ -2809,6 +2821,11 @@ where
     }
 
     async fn get_total_issuance(&self, ufvk_strs: UfvkList, first_height: u32, last_height: u32) -> Result<Vec<ScanInfo>> {
+        // The staking replay starts with no bonds, so a later start meets actions on bonds it
+        // never saw and panics (#292).
+        if first_height != 0 {
+            return Err("first_height must be 0").map_error(server::error::LegacyCode::InvalidParameter);
+        }
         let ufvk_strs = ufvk_strs.0;
         // TODO: @Prod @Testnet
         let network = &zcash_protocol::consensus::TEST_NETWORK;
@@ -3869,8 +3886,9 @@ where
             .iter()
             .enumerate()
             .filter_map(|(i, selected)| {
-                let staking_action = selected_transaction(selected).transaction.transaction.staking_action()?;
-                Some((i, *staking_action))
+                let unmined = &selected_transaction(selected).transaction;
+                let staking_action = unmined.transaction.staking_action()?;
+                Some((i, (*staking_action, unmined.id.mined_id())))
             })
             .unzip();
         let mempool_txs = if staking_actions.is_empty() {

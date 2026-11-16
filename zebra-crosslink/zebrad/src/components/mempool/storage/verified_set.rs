@@ -170,19 +170,13 @@ impl VerifiedSet {
         pending_outputs: &mut PendingOutputs,
         height: Option<Height>,
     ) -> Result<(), SameEffectsTipRejectionError> {
-        if self.has_spend_conflicts(&transaction.transaction) {
-            return Err(SameEffectsTipRejectionError::SpendConflict);
+        if let Some(conflict) = self.conflict(&transaction.transaction) {
+            return Err(conflict);
         }
 
         let staking_action = transaction.transaction.transaction.staking_action();
         let bond_key = staking_action.map(|staking_action| staking_action.bond_key());
-        if bond_key.is_some_and(|bond_key| self.bond_keys.contains(&bond_key)) {
-            return Err(SameEffectsTipRejectionError::BondActionConflict);
-        }
         let converting_finalizer = staking_action.and_then(|staking_action| staking_action.reward_bank_finalizer());
-        if converting_finalizer.is_some_and(|finalizer| self.converting_finalizers.contains(&finalizer)) {
-            return Err(SameEffectsTipRejectionError::RewardBankConflict);
-        }
 
         // This likely only needs to check that the transaction hash of the outpoint is still in the mempool,
         // but it's likely rare that a transaction spends multiple transparent outputs of
@@ -348,6 +342,31 @@ impl VerifiedSet {
 
         self.update_metrics();
         removed_transactions
+    }
+
+    /// Returns how `unmined_tx` conflicts with a transaction in the set, if it does: it spends
+    /// the same UTXO or reveals the same nullifier, acts on the same bond, or converts the same
+    /// finalizer's reward bank.
+    ///
+    /// Needs only the transaction's own fields, not its verification, so the mempool checks it
+    /// both before verifying a pushed transaction and when inserting a verified one.
+    pub fn conflict(&self, unmined_tx: &UnminedTx) -> Option<SameEffectsTipRejectionError> {
+        if self.has_spend_conflicts(unmined_tx) {
+            return Some(SameEffectsTipRejectionError::SpendConflict);
+        }
+
+        let staking_action = unmined_tx.transaction.staking_action()?;
+        if self.bond_keys.contains(&staking_action.bond_key()) {
+            return Some(SameEffectsTipRejectionError::BondActionConflict);
+        }
+        if staking_action
+            .reward_bank_finalizer()
+            .is_some_and(|finalizer| self.converting_finalizers.contains(&finalizer))
+        {
+            return Some(SameEffectsTipRejectionError::RewardBankConflict);
+        }
+
+        None
     }
 
     /// Returns `true` if the given `transaction` has any spend conflicts with transactions in the

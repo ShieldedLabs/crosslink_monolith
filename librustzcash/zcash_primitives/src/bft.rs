@@ -9,7 +9,6 @@ use ed25519_zebra::{Signature, SigningKey, VerificationKeyBytes, VerificationKey
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::vec::Vec;
-use tracing::error;
 use crate::block::{ BlockHeaderData as BcBlockHeader, BlockHeader as BcBlockHeaderWrap };
 
 // use zebra_chain::serialization::{
@@ -34,13 +33,21 @@ pub struct SlashForkConfig {
     /// The PoW block height at which this slashfork activates.
     #[serde(deserialize_with = "deserialize_staking_aligned")]
     pub pow_activation_height: u64,
-    /// The BFT certificate height at which this slashfork activates.
+    /// The BFT certificate height at which this slashfork activates, or
+    /// [`SlashForkConfig::NEVER`] for a PoW-only slashfork.
     pub bft_certificate_height: u64,
     /// Finalizers terminated by this slashfork; must list at least one. Committed
     /// to by hash later, so this list is sorted into a canonical order when the
     /// schedule is built.
     #[serde(deserialize_with = "deserialize_unique_finalizers")]
     pub terminated_finalizers: Vec<PubKeyID>,
+}
+
+impl SlashForkConfig {
+    /// A `bft_certificate_height` of `NEVER` indicates that this is a PoW-only slashfork. A BFT
+    /// height of 2 ** 64 - 1 will never occur even if the BFT block time is 1 second, since that is
+    /// 584.9 billion years.
+    pub const NEVER: u64 = u64::MAX;
 }
 
 fn deserialize_staking_aligned<'de, D>(d: D) -> Result<u64, D::Error> where D: serde::Deserializer<'de> {
@@ -116,30 +123,13 @@ impl SlashForkConfig {
 ///
 /// # Constructing [BftBlock]s
 ///
-/// A [BftBlock] may be constructed from a node's local view in order to create a new BFT proposal, or they may be constructed from unknown sources across a network protocol.
+/// A proposer builds one with [BftBlock::new] from exactly `bc_confirmation_depth_sigma` consecutive [BcBlockHeader] values in ascending height order, so that element zero is the deepest. The carried headers are the σ confirmations above the block being finalized (the `snapshot`): the snapshot is element zero's parent and is not carried, it is named by that parent hash. The specification requires these to be the tail of a bc-valid chain. The Zebra prototype does not always satisfy that: it clamps how far the snapshot may advance in a single step, and under that clamp it carries a mid-chain window instead of a tail.
 ///
-/// To construct a [BftBlock] for a new BFT proposal, build a [Vec] of exactly `bc_confirmation_depth_sigma` consecutive [BcBlockHeader] values in ascending height order, so that element zero is the deepest, then pass this to [BftBlock::try_from]. The carried headers are the σ confirmations above the block being finalized (the `snapshot`): the snapshot is element zero's parent and is not carried, it is named by that parent hash. The specification requires these to be the tail of a bc-valid chain. The Zebra prototype does not always satisfy that: it clamps how far the snapshot may advance in a single step, and under that clamp it carries a mid-chain window instead of a tail.
+/// A block from an unknown source comes from [BftBlock::zcash_deserialize], which checks only that it parses.
 ///
-/// To construct from an untrusted source, call the same [BftBlock::try_from].
+/// ## Validity
 ///
-/// ## Validation and Limitations
-///
-/// The [BftBlock::try_from] method is the only way to construct [BftBlock] values and performs the following validation internally:
-///
-/// 1. The number of headers matches the expected protocol confirmation depth, `bc_confirmation_depth_sigma`; see [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma).
-/// 2. The [version](BcBlockHeader::version) field is a known expected value.
-/// 3. The headers are in the correct order given the [previous_block_hash](BcBlockHeader::previous_block_hash) fields.
-/// 4. The PoW solutions validate.
-///
-/// These validations use *immediate data* and are *stateless*, and in particular the following stateful validations are **NOT** performed:
-///
-/// 1. The [difficulty_threshold](BcBlockHeader::difficulty_threshold) is within correct bounds for the Difficulty Adjustment Algorithm.
-/// 2. The [time](BcBlockHeader::time) field is within correct bounds.
-/// 3. The [merkle_root](BcBlockHeader::merkle_root) field is sensible.
-///
-/// No other validations are performed.
-///
-/// **TODO:** Ensure deserialization delegates to [BftBlock::try_from].
+/// This type holds no validity invariant: its fields are public, and neither [BftBlock::new] nor deserialization checks the headers. Validity is decided by the node's BFT validation (`validate_with_hash` in `zebra-state`'s `new_network::bft`), which every proposal and decided block passes before it is voted on or committed.
 ///
 /// ## Versioning
 ///
@@ -159,9 +149,7 @@ impl SlashForkConfig {
 ///
 /// > Each bft‑proposal has, in addition to origbft‑proposal fields, a headers_bc field containing a sequence of exactly σ bc‑headers (zero‑indexed, deepest first).
 ///
-/// That order is a property of the honest producer, not of this type. Nothing establishes it for a block from an unknown source: [BftBlock::try_from] checks only the header count, and the deserialization path does not call it.
-///
-/// The [TryFrom] impl performs internal validations and is intended to be the only way to construct a [BftBlock], whether locally generated or from an unknown source. This is the safest design, though potentially less efficient.
+/// That order is a property of the honest producer, not of this type; BFT validation checks it for every received block.
 ///
 /// # References
 ///
@@ -315,28 +303,37 @@ impl BftBlock {
         self.headers.first().expect("Vec should never be empty").prev_block
     }
 
-    /// Attempt to construct a [BftBlock] from headers while performing immediate validations; see [BftBlock] type docs
-    pub fn try_from(
+    /// Builds a [BftBlock], checking only that it carries exactly
+    /// [bc_confirmation_depth_sigma](ZcashCrosslinkParameters::bc_confirmation_depth_sigma) headers.
+    ///
+    /// For `version < 2`, `slashforks` must be empty and `do_not_include_until_bc_height` must be
+    /// `0`, since those versions do not serialize them.
+    ///
+    /// # Errors
+    ///
+    /// [InvalidBftBlock::IncorrectConfirmationDepth] if the header count is not σ.
+    pub fn new(
         params: &ZcashCrosslinkParameters,
+        version: u32,
         height: u32,
         previous_block_fat_ptr: FatPointerToBftBlock,
         headers: Vec<BcBlockHeader>,
+        slashforks: Vec<SlashForkConfig>,
+        do_not_include_until_bc_height: u64,
     ) -> Result<Self, InvalidBftBlock> {
         let expected = params.bc_confirmation_depth_sigma;
         let actual = headers.len() as u64;
         if actual != expected {
             return Err(InvalidBftBlock::IncorrectConfirmationDepth { expected, actual });
         }
-
-        error!("not yet implemented: all the documented validations");
-
+        assert!(version >= 2 || (slashforks.is_empty() && do_not_include_until_bc_height == 0));
         Ok(BftBlock {
-            version: 1,
+            version,
             height,
             previous_block_fat_ptr,
             headers,
-            slashforks: Vec::new(),
-            do_not_include_until_bc_height: 0,
+            slashforks,
+            do_not_include_until_bc_height,
         })
     }
 
@@ -559,10 +556,17 @@ impl ZcashCrosslinkParameters {
 pub const PROTOTYPE_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParameters {
     bc_confirmation_depth_sigma: 4,
     bootstrap: BftBootstrap::FromChain {
-        staking_height: 2 * crate::transaction::STAKING_PERIOD,
-        roster_height: 3 * crate::transaction::STAKING_PERIOD
+        // The nightly calendar is too short for the derived heights, whose roster and activation
+        // heights fall within the reorg limit of each other. The @Nightly heights give stakers five
+        // staking days (heights 300 to 969) before the roster is fixed, then start BFT. A build
+        // uses either every @Nightly line or every @Featurenet line.
+        // staking_height: 300, // @Nightly
+        // roster_height: 970, // @Nightly
+        // activation_height: 1_100, // @Nightly
+        staking_height: 2 * crate::transaction::STAKING_PERIOD, // @Featurenet
+        roster_height: 3 * crate::transaction::STAKING_PERIOD // @Featurenet
             + crate::transaction::STAKING_DAY_WINDOW,
-        activation_height: 7 * crate::transaction::STAKING_PERIOD / 2,
+        activation_height: 7 * crate::transaction::STAKING_PERIOD / 2, // @Featurenet
     },
     staking: PROTOTYPE_STAKING,
     active_roster_max_n: 12,
@@ -711,7 +715,25 @@ pub fn fmt_prefixed_byte_str_rev(f: &mut std::fmt::Formatter<'_>, pre: &str, byt
 /// equivalent to [ed25519_zebra::VerificationKeyBytes]
 #[derive(Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PubKeyID(pub [u8; 32]);
-impl PubKeyID { pub const NIL: Self = Self([0; 32]); }
+impl PubKeyID {
+    pub const NIL: Self = Self([0; 32]);
+
+    /// Whether anyone can sign for this key. ed25519-zebra verifies as ZIP 215 does, which
+    /// accepts small-order keys, and under such a key the all-zero signature verifies over every
+    /// message. That property is the test, as consensus tests bond keys
+    /// (`staking_action_signature`). A key that does not decode is not one: nothing verifies
+    /// under it.
+    pub fn is_small_order(&self) -> bool {
+        TMSig::NIL.verify(*self, FINALIZER_ADDRESS_MSG).is_ok()
+    }
+}
+
+/// Whether consensus at `height` refuses a finalizer key anyone can sign for
+/// ([PubKeyID::is_small_order]) as a stake target or a reward-conversion authorizer: from
+/// FeaturenetUpgrade3 on. Before it such a key passed like any other.
+pub fn small_order_finalizer_keys_refused_at<P: zcash_protocol::consensus::Parameters>(params: &P, height: u32) -> bool {
+    params.is_nu_active(zcash_protocol::consensus::NetworkUpgrade::FeaturenetUpgrade3, zcash_protocol::consensus::BlockHeight::from_u32(height))
+}
 impl std::fmt::Display for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str_rev(f, &self.0) } }
 impl std::fmt::Debug   for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str_rev(f, "Pub{", &self.0[..2])?; write!(f, "}}") } }
 
@@ -817,8 +839,18 @@ impl FinalizerAddress {
         Self { pub_key, sig }
     }
 
+    /// Whether the signature verifies. A small-order key passes with a signature anyone can
+    /// make; consensus uses [FinalizerAddress::verify_at], which refuses those keys from
+    /// FeaturenetUpgrade3.
     pub fn verify(&self) -> bool {
         self.sig.verify(self.pub_key, FINALIZER_ADDRESS_MSG).is_ok()
+    }
+
+    /// [FinalizerAddress::verify] as consensus applies it at `height`: from FeaturenetUpgrade3 an
+    /// address whose key is small order is refused too, since everyone can sign for that key, so
+    /// stake pointed at it could be voted with and its commission converted by anyone.
+    pub fn verify_at<P: zcash_protocol::consensus::Parameters>(&self, params: &P, height: u32) -> bool {
+        self.verify() && !(small_order_finalizer_keys_refused_at(params, height) && self.pub_key.is_small_order())
     }
 
     /// `zfinv1` + 128 base64url chars = 134 chars, always. The payload is 96 bytes:
@@ -927,19 +959,98 @@ pub fn verify_finalizer_reward_conversion(finalizer: PubKeyID, bond_key: &[u8; 3
     TMSig(*sig).verify(finalizer, &finalizer_reward_conversion_msg(bond_key, amount_zats)).is_ok()
 }
 
-/// The node's finalizer key from its `explicit_bft_key_seed` string (or a bootstrap
-/// peer address). Lives here rather than in the node so a wallet holding the same
-/// seed derives the same key. `DefaultHasher::new()` is SipHash-1-3 with fixed zero
-/// keys, so this is stable across processes and builds.
-pub fn finalizer_key_from_seed(seed: &[u8]) -> (rand::rngs::StdRng, SigningKey, PubKeyID) {
-    use rand::SeedableRng;
-    use std::hash::Hasher;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hasher.write(seed);
-    let mut rng = rand::rngs::StdRng::seed_from_u64(hasher.finish());
-    let private_key = SigningKey::new(&mut rng);
+/// [verify_finalizer_reward_conversion] as consensus applies it at `height`: from
+/// FeaturenetUpgrade3 a finalizer key that is small order authorizes nothing, since anyone can
+/// make its signature.
+pub fn verify_finalizer_reward_conversion_at<P: zcash_protocol::consensus::Parameters>(params: &P, height: u32, finalizer: PubKeyID, bond_key: &[u8; 32], amount_zats: u64, sig: &[u8; 64]) -> bool {
+    verify_finalizer_reward_conversion(finalizer, bond_key, amount_zats, sig)
+        && !(small_order_finalizer_keys_refused_at(params, height) && finalizer.is_small_order())
+}
+
+/// A finalizer key from an `explicit_bft_key_seed` string, the node's default identity string,
+/// or a test fixture name. Lives here rather than in the node so a wallet holding the same seed
+/// derives the same key.
+///
+/// The seed is squeezed through one u64, so these keys have only 64 bits of entropy (#254).
+/// Explicit seeds are a development feature due for removal; default identities move to
+/// [finalizer_key_from_node_secret] on the next featurenet's new chain.
+///
+/// This was once `DefaultHasher::new()` feeding `rand` 0.8's `StdRng::seed_from_u64`, then
+/// `SigningKey::new`. Neither std nor rand promises those outputs across versions, and a change
+/// would silently move every existing finalizer to a key nobody holds, so the three steps are
+/// copied here: SipHash-1-3 with zero keys, PCG32 expanding the u64 into a ChaCha12 key, and the
+/// first 32 bytes of ChaCha12 keystream (block 0, zero nonce) as the signing key.
+pub fn finalizer_key_from_seed(seed: &[u8]) -> (SigningKey, PubKeyID) {
+    let mut state = siphash13_zero_keys(seed);
+    let mut chacha_key = [0u32; 8];
+    for word in chacha_key.iter_mut() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(11634580027462260723);
+        let xorshifted = (((state >> 18) ^ state) >> 27) as u32;
+        *word = xorshifted.rotate_right((state >> 59) as u32);
+    }
+    let block = chacha12_block_zero(&chacha_key);
+    let mut secret = [0u8; 32];
+    for (dst, word) in secret.chunks_exact_mut(4).zip(block.iter()) {
+        dst.copy_from_slice(&word.to_le_bytes());
+    }
+    finalizer_key_from_bytes(secret)
+}
+
+/// The default finalizer identity from the next featurenet's chain on: the 256-bit node secret
+/// (`secret.seed`) through BLAKE2b-256, personalized so the key is unrelated to anything else
+/// derived from the same secret.
+pub fn finalizer_key_from_node_secret(secret: &[u8; 32]) -> (SigningKey, PubKeyID) {
+    let hash = blake2b_simd::Params::new().hash_length(32).personal(b"Crosslink_FinKey").hash(secret);
+    finalizer_key_from_bytes(hash.as_bytes().try_into().expect("hash_length is 32"))
+}
+
+fn finalizer_key_from_bytes(secret: [u8; 32]) -> (SigningKey, PubKeyID) {
+    let private_key = SigningKey::from(secret);
     let pub_key = PubKeyID(<[u8; 32]>::from(VerificationKeyBytes::from(&private_key)));
-    (rng, private_key, pub_key)
+    (private_key, pub_key)
+}
+
+fn siphash13_zero_keys(data: &[u8]) -> u64 {
+    let mut v = [0x736f6d6570736575u64, 0x646f72616e646f6d, 0x6c7967656e657261, 0x7465646279746573];
+    fn round(v: &mut [u64; 4]) {
+        v[0] = v[0].wrapping_add(v[1]); v[1] = v[1].rotate_left(13); v[1] ^= v[0]; v[0] = v[0].rotate_left(32);
+        v[2] = v[2].wrapping_add(v[3]); v[3] = v[3].rotate_left(16); v[3] ^= v[2];
+        v[0] = v[0].wrapping_add(v[3]); v[3] = v[3].rotate_left(21); v[3] ^= v[0];
+        v[2] = v[2].wrapping_add(v[1]); v[1] = v[1].rotate_left(17); v[1] ^= v[2]; v[2] = v[2].rotate_left(32);
+    }
+    let mut blocks = data.chunks_exact(8);
+    for block in &mut blocks {
+        let m = u64::from_le_bytes(block.try_into().unwrap());
+        v[3] ^= m; round(&mut v); v[0] ^= m;
+    }
+    let mut tail = [0u8; 8];
+    tail[..blocks.remainder().len()].copy_from_slice(blocks.remainder());
+    let b = ((data.len() as u64) << 56) | u64::from_le_bytes(tail);
+    v[3] ^= b; round(&mut v); v[0] ^= b;
+    v[2] ^= 0xff;
+    round(&mut v); round(&mut v); round(&mut v);
+    v[0] ^ v[1] ^ v[2] ^ v[3]
+}
+
+fn chacha12_block_zero(key: &[u32; 8]) -> [u32; 16] {
+    let mut s = [0u32; 16];
+    s[..4].copy_from_slice(&[0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]);
+    s[4..12].copy_from_slice(key);
+    let mut x = s;
+    fn quarter(x: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+        x[a] = x[a].wrapping_add(x[b]); x[d] = (x[d] ^ x[a]).rotate_left(16);
+        x[c] = x[c].wrapping_add(x[d]); x[b] = (x[b] ^ x[c]).rotate_left(12);
+        x[a] = x[a].wrapping_add(x[b]); x[d] = (x[d] ^ x[a]).rotate_left(8);
+        x[c] = x[c].wrapping_add(x[d]); x[b] = (x[b] ^ x[c]).rotate_left(7);
+    }
+    for _ in 0..6 {
+        quarter(&mut x, 0, 4, 8, 12); quarter(&mut x, 1, 5, 9, 13); quarter(&mut x, 2, 6, 10, 14); quarter(&mut x, 3, 7, 11, 15);
+        quarter(&mut x, 0, 5, 10, 15); quarter(&mut x, 1, 6, 11, 12); quarter(&mut x, 2, 7, 8, 13); quarter(&mut x, 3, 4, 9, 14);
+    }
+    for (xi, si) in x.iter_mut().zip(s.iter()) {
+        *xi = xi.wrapping_add(*si);
+    }
+    x
 }
 
 // Serde uses the zfin string form, so JSON carrying a finalizer address (e.g. a
@@ -1271,6 +1382,11 @@ pub struct TFLRecencyStatus {
 
     // TODO: pub proposal_parts: Vec<bool>,
     pub finalizer_statuses: Vec<(PubKeyID, FinalizerRecencyStatus)>,
+    /// A decided BFT height this node holds back, and BFT with it, until the PoW block its next
+    /// roster comes from is back: that block was dropped from the non-finalized state after this
+    /// node validated the proposal.
+    #[serde(default)]
+    pub parked_decision_height: Option<u64>,
     // pub round_step_utc_rngs: Vec<[(u32, u32); 3]>,
 }
 
@@ -1345,6 +1461,39 @@ pub struct ScanInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The Nightly network's live finalizers, from their `explicit_bft_key_seed` strings.
+    #[test]
+    fn finalizer_key_from_seed_keeps_live_identities() {
+        for (seed, address) in [
+            ("64.177.122.73:12301", "zfinv13U71PPf2nfFvxajjRIbWoq7Cdn5lqOopH_CbP-hJCZTVX5seDeXU-SroOi2arJQ3IMiGkFq00vg-_fw6C5DdMdsbbGD5yrP7o9Yz3RpJsc6uzh9DP1u1jY1Ro2nDFVwJ"),
+            ("45.32.186.234:12301", "zfinv1XyBqy7TI36OmthAnK2sgFNjuSOEqTMkUziDbyY_p_-sONTrwkIetPKETwa3c8Xhkbg2ej_ToChbjEDl8cHuwX5mdQKCIdMCXx1bFhLWonMWyo12nOFxq3QYutz5M84UM"),
+        ] {
+            assert_eq!(FinalizerAddress::create(&finalizer_key_from_seed(seed.as_bytes()).0).encode(), address);
+        }
+    }
+
+    // Holds only while the toolchain's std and rand 0.8 still compute what the copied steps
+    // were taken from. If it fails while the pinned vectors above pass, std or rand changed.
+    proptest::proptest! {
+        #[test]
+        fn finalizer_key_from_seed_matches_its_std_rand_origin(seed in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..80)) {
+            use rand::SeedableRng;
+            use std::hash::Hasher;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hasher.write(&seed);
+            let original = SigningKey::new(rand::rngs::StdRng::seed_from_u64(hasher.finish()));
+            proptest::prop_assert_eq!(finalizer_key_from_seed(&seed).0, original);
+        }
+    }
+
+    #[test]
+    fn finalizer_key_from_node_secret_is_personalized_blake2b() {
+        assert_eq!(
+            hex::encode(finalizer_key_from_node_secret(&[7; 32]).1 .0),
+            "cd73fdc2dd5a7a359c663a999c66a977b4af46c3698e2522325933d6f692a954"
+        );
+    }
 
     fn signed_fat_pointer(typ: bool) -> FatPointerToBftBlock {
         let template = Vote {

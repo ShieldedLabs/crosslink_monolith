@@ -99,6 +99,7 @@ fn stale_branch_id_at_max_nu6_3_height_has_no_mempool_score() {
             nu6_3: Some(Height::MAX.0),
             featurenet_upgrade_1: None,
             featurenet_upgrade_2: None,
+            featurenet_upgrade_3: None,
             nu7: None,
         })
         .expect("activation heights at Height::MAX are valid")
@@ -396,13 +397,14 @@ async fn mempool_queue_single() -> Result<(), Report> {
     // Check if the responses are consistent
     let mut in_mempool_count = 0;
     let mut evicted_count = 0;
+    let evicted = QueueRefusal::from(MempoolError::StorageEffectsChain(
+        SameEffectsChainRejectionError::RandomlyEvicted,
+    ));
     for response in queued_responses {
-        match response.unbox_mempool_error() {
-            MempoolError::StorageEffectsChain(SameEffectsChainRejectionError::RandomlyEvicted) => {
-                evicted_count += 1
-            }
-            MempoolError::InMempool => in_mempool_count += 1,
-            error => panic!("transaction should not be rejected with reason {error:?}"),
+        match response.expect_err("transaction should be refused") {
+            refusal if refusal == evicted => evicted_count += 1,
+            QueueRefusal::AlreadyKnown => in_mempool_count += 1,
+            refusal => panic!("transaction should not be refused with reason {refusal:?}"),
         }
     }
     assert_eq!(in_mempool_count, transactions.len() - 1);
@@ -686,11 +688,11 @@ async fn mempool_cancel_mined() -> Result<(), Report> {
     // Check if download was cancelled.
     assert_eq!(mempool.tx_downloads().in_flight(), 0);
 
-    assert!(
+    assert_eq!(
         queued_response
             .await
-            .expect("channel should not be closed")
-            .is_err(),
+            .expect("channel should not be closed"),
+        Verdict::Cancelled,
         "queued tx should fail to download and verify due to chain tip change"
     );
 
@@ -735,6 +737,7 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
             nu6_3: Some(11),
             featurenet_upgrade_1: None,
             featurenet_upgrade_2: None,
+            featurenet_upgrade_3: None,
             nu7: Some(12),
         })
         .expect("activation heights are valid")
@@ -859,6 +862,7 @@ async fn mempool_reset_keeps_active_state_when_sync_status_falls_behind() -> Res
             nu6_3: Some(11),
             featurenet_upgrade_1: None,
             featurenet_upgrade_2: None,
+            featurenet_upgrade_3: None,
             nu7: Some(12),
         })
         .expect("activation heights are valid")
@@ -1057,12 +1061,9 @@ async fn mempool_failed_verification_is_rejected() -> Result<(), Report> {
     };
     assert_eq!(queued_responses.len(), 1);
     assert!(matches!(
-        queued_responses
-            .into_iter()
-            .next()
-            .unwrap()
-            .unbox_mempool_error(),
-        MempoolError::StorageExactTip(ExactTipRejectionError::FailedVerification(_))
+        queued_responses.into_iter().next().unwrap(),
+        Err(QueueRefusal::Rejected { reason })
+            if reason.contains("did not pass consensus validation")
     ));
 
     let mempool_change = timeout(Duration::from_secs(3), mempool_transaction_receiver.recv())
@@ -1395,6 +1396,7 @@ async fn mempool_responds_to_await_output() -> Result<(), Report> {
         .await
         .expect("should not time out")
         .expect("mempool tx verification result channel should not be closed")
+        .into_result()
         .expect("mocked verification should be successful");
 
     assert_eq!(
@@ -2114,6 +2116,32 @@ async fn setup_with_mempool_config(
     tokio::sync::broadcast::Receiver<MempoolChange>,
     zebra_state::WriteBlockWorkerTask,
 ) {
+    let (setup, _misbehavior_rx) =
+        setup_with_misbehavior_receiver(network, mempool_config, should_commit_genesis_block)
+            .await;
+    setup
+}
+
+/// Like [`setup_with_mempool_config`], but also returns the receiver for the mempool's
+/// misbehaviour reports.
+#[allow(clippy::type_complexity)]
+async fn setup_with_misbehavior_receiver(
+    network: &Network,
+    mempool_config: mempool::Config,
+    should_commit_genesis_block: bool,
+) -> (
+    (
+        Mempool,
+        MockPeerSet,
+        StateService,
+        ChainTipChange,
+        MockTxVerifier,
+        RecentSyncLengths,
+        tokio::sync::broadcast::Receiver<MempoolChange>,
+        zebra_state::WriteBlockWorkerTask,
+    ),
+    tokio::sync::mpsc::Receiver<(PeerSocketAddr, u32)>,
+) {
     let peer_set = MockService::build().for_unit_tests();
 
     // UTXO verification doesn't matter here.
@@ -2125,7 +2153,7 @@ async fn setup_with_mempool_config(
     let tx_verifier = MockService::build().for_unit_tests();
 
     let (sync_status, recent_syncs) = SyncStatus::new();
-    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let (misbehavior_tx, misbehavior_rx) = tokio::sync::mpsc::channel(10);
     let (mempool, mempool_transaction_subscriber) = Mempool::new(
         network,
         &mempool_config,
@@ -2159,14 +2187,17 @@ async fn setup_with_mempool_config(
     }
 
     (
-        mempool,
-        peer_set,
-        state_service,
-        chain_tip_change,
-        tx_verifier,
-        recent_syncs,
-        mempool_transaction_subscriber.subscribe(),
-        block_writer,
+        (
+            mempool,
+            peer_set,
+            state_service,
+            chain_tip_change,
+            tx_verifier,
+            recent_syncs,
+            mempool_transaction_subscriber.subscribe(),
+            block_writer,
+        ),
+        misbehavior_rx,
     )
 }
 
@@ -2186,7 +2217,10 @@ async fn cancel_handles_drained_after_verification_timeout() {
 
     use crate::components::mempool::{
         crawler::RATE_LIMIT_DELAY,
-        downloads::{Downloads, TRANSACTION_DOWNLOAD_TIMEOUT, TRANSACTION_VERIFY_TIMEOUT},
+        downloads::{
+            Downloads, DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER, TRANSACTION_DOWNLOAD_TIMEOUT,
+            TRANSACTION_VERIFY_TIMEOUT,
+        },
     };
 
     let _init_guard = zebra_test::init();
@@ -2200,6 +2234,7 @@ async fn cancel_handles_drained_after_verification_timeout() {
         Timeout::new(peer_set, TRANSACTION_DOWNLOAD_TIMEOUT),
         Timeout::new(tx_verifier, TRANSACTION_VERIFY_TIMEOUT),
         state,
+        DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER,
     ));
 
     let mut iter = Network::Mainnet.unmined_transactions_in_blocks(1..=10);
@@ -2209,15 +2244,15 @@ async fn cancel_handles_drained_after_verification_timeout() {
 
     downloads
         .as_mut()
-        .download_if_needed_and_verify(Gossip::Tx(v1), None, None)
+        .download_if_needed_and_verify(Gossip::Tx(v1), None)
         .expect("queue tx 1");
     downloads
         .as_mut()
-        .download_if_needed_and_verify(Gossip::Tx(v2), None, None)
+        .download_if_needed_and_verify(Gossip::Tx(v2), None)
         .expect("queue tx 2");
     downloads
         .as_mut()
-        .download_if_needed_and_verify(Gossip::Tx(v3), None, None)
+        .download_if_needed_and_verify(Gossip::Tx(v3), None)
         .expect("queue tx 3");
 
     assert_eq!(downloads.in_flight(), 3);
@@ -2252,4 +2287,580 @@ async fn cancel_handles_drained_after_verification_timeout() {
         leaked, 0,
         "regression GHSA-65jj-fmw8-468q: cancel_handles must be drained after timeout"
     );
+}
+
+/// STP peers together take at most `MAX_INBOUND_CONCURRENCY_ALL_STP_PEERS` download slots, so
+/// many STP peers at their own cap leave room for RPC submissions and legacy gossip.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn stp_peers_together_leave_room_in_the_download_queue() {
+    use tower::timeout::Timeout;
+    use zebra_chain::transaction::{self, UnminedTxId};
+    use zebra_node_services::mempool::Gossip;
+
+    use crate::components::mempool::downloads::{
+        Downloads, DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER,
+        MAX_INBOUND_CONCURRENCY_ALL_STP_PEERS, TRANSACTION_DOWNLOAD_TIMEOUT,
+        TRANSACTION_VERIFY_TIMEOUT,
+    };
+
+    let _init_guard = zebra_test::init();
+
+    let peer_set: MockPeerSet = MockService::build().for_unit_tests();
+    let state: MockService<zs::Request, zs::Response, PanicAssertion> =
+        MockService::build().for_unit_tests();
+    let tx_verifier: MockTxVerifier = MockService::build().for_unit_tests();
+    let mut downloads = Box::pin(Downloads::new(
+        Timeout::new(peer_set, TRANSACTION_DOWNLOAD_TIMEOUT),
+        Timeout::new(tx_verifier, TRANSACTION_VERIFY_TIMEOUT),
+        state,
+        DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER,
+    ));
+
+    let mut next_id = 0u32;
+    let mut candidate = || {
+        next_id += 1;
+        let mut hash = [0u8; 32];
+        hash[..4].copy_from_slice(&next_id.to_le_bytes());
+        Gossip::Id(UnminedTxId::Legacy(transaction::Hash(hash)))
+    };
+
+    let peers =
+        MAX_INBOUND_CONCURRENCY_ALL_STP_PEERS / DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER;
+    for peer in 0..peers {
+        for _ in 0..DEFAULT_MAX_INBOUND_CONCURRENCY_PER_STP_PEER {
+            downloads
+                .as_mut()
+                .download_if_needed_and_verify(candidate(), Some(PeerSource::Stp([peer as u8; 32])))
+                .expect("within both caps");
+        }
+    }
+    assert!(
+        downloads
+            .as_mut()
+            .download_if_needed_and_verify(candidate(), Some(PeerSource::Stp([0xff; 32])))
+            .is_err(),
+        "a further STP peer is refused once STP peers hold their share"
+    );
+    downloads
+        .as_mut()
+        .download_if_needed_and_verify(candidate(), None)
+        .expect("an RPC submission still has room");
+}
+
+/// Queues `candidates`, from `source` if it is `Some`, and returns the per-candidate results.
+async fn queue_candidates(
+    mempool: &mut Mempool,
+    candidates: Vec<Gossip>,
+    source: Option<PeerSource>,
+) -> Vec<Result<oneshot::Receiver<Verdict>, QueueRefusal>> {
+    let request = match source {
+        Some(source) => Request::QueueFromPeer { candidates, source },
+        None => Request::Queue(candidates),
+    };
+
+    match mempool
+        .ready()
+        .await
+        .expect("mempool is always ready")
+        .call(request)
+        .await
+        .expect("queue requests always succeed")
+    {
+        Response::Queued(results) => results,
+        response => panic!("unexpected response to a queue request: {response:?}"),
+    }
+}
+
+/// Polls `mempool` until `verdict` arrives, and returns it.
+async fn verdict_after_polling(
+    mempool: &mut Mempool,
+    mut verdict: oneshot::Receiver<Verdict>,
+) -> Verdict {
+    for _ in 0..100 {
+        mempool.dummy_call().await;
+        match verdict.try_recv() {
+            Ok(verdict) => return verdict,
+            Err(oneshot::error::TryRecvError::Empty) => {
+                time::sleep(Duration::from_millis(20)).await
+            }
+            Err(oneshot::error::TryRecvError::Closed) => panic!("verdict channel closed"),
+        }
+    }
+
+    panic!("no verdict within the polling limit")
+}
+
+/// Answers the next verification request with `result`.
+async fn respond_to_verification(
+    tx_verifier: &mut MockTxVerifier,
+    result: Result<VerifiedUnminedTx, TransactionError>,
+) {
+    tx_verifier
+        .expect_request_that(|_| true)
+        .await
+        .respond(result.map(|transaction| tx::MempoolResponse {
+            transaction,
+            spent_mempool_outpoints: Vec::new(),
+        }));
+}
+
+/// A candidate from a peer gets a verdict once it is verified and stored, and a candidate the
+/// mempool already has or is already verifying is refused as already known.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_from_peer_reports_accepted_and_known_candidates() -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+        _block_writer,
+    ) = setup(&network, u64::MAX, true).await;
+    mempool.enable(&mut recent_syncs).await;
+
+    let mut transactions = network.unmined_transactions_in_blocks(1..=10);
+    let accepted = transactions.next().expect("test transaction");
+    let verifying = transactions.next().expect("test transaction");
+    let source = PeerSource::Stp([1; 32]);
+
+    let mut results = queue_candidates(
+        &mut mempool,
+        vec![accepted.transaction.clone().into()],
+        Some(source),
+    )
+    .await;
+    let verdict = results.remove(0).expect("a new candidate is queued");
+    respond_to_verification(&mut tx_verifier, Ok(accepted.clone())).await;
+    assert_eq!(
+        verdict_after_polling(&mut mempool, verdict).await,
+        Verdict::Accepted
+    );
+
+    let results = queue_candidates(
+        &mut mempool,
+        vec![
+            accepted.transaction.clone().into(),
+            verifying.transaction.clone().into(),
+            verifying.transaction.clone().into(),
+        ],
+        Some(source),
+    )
+    .await;
+    assert!(
+        matches!(results[0], Err(QueueRefusal::AlreadyKnown)),
+        "a candidate in the mempool is already known"
+    );
+    assert!(results[1].is_ok(), "a new candidate is queued");
+    assert!(
+        matches!(results[2], Err(QueueRefusal::AlreadyKnown)),
+        "a candidate being verified is already known"
+    );
+
+    Ok(())
+}
+
+/// Candidates are refused while the mempool is disabled, and once a legacy peer has
+/// `MAX_INBOUND_CONCURRENCY_PER_PEER` candidates in flight its next one is refused as full,
+/// rather than silently dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_from_peer_refuses_when_disabled_or_full() -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+        _block_writer,
+    ) = setup(&network, u64::MAX, true).await;
+
+    let candidates: Vec<Gossip> = network
+        .unmined_transactions_in_blocks(1..=10)
+        .take(downloads::MAX_INBOUND_CONCURRENCY_PER_PEER + 1)
+        .map(|tx| tx.transaction.into())
+        .collect();
+    let source = PeerSource::Legacy("203.0.113.9:8233".parse().expect("valid address"));
+
+    let results = queue_candidates(&mut mempool, candidates.clone(), Some(source)).await;
+    assert_eq!(results.len(), candidates.len(), "one result per candidate");
+    assert!(
+        results
+            .iter()
+            .all(|result| matches!(result, Err(QueueRefusal::Disabled))),
+        "a disabled mempool refuses every candidate"
+    );
+
+    mempool.enable(&mut recent_syncs).await;
+
+    let results = queue_candidates(&mut mempool, candidates, Some(source)).await;
+    let (last, admitted) = results.split_last().expect("candidates");
+    assert!(
+        admitted.iter().all(Result::is_ok),
+        "candidates below the cap are queued"
+    );
+    assert!(
+        matches!(last, Err(QueueRefusal::Full)),
+        "the candidate over the legacy cap is refused as full"
+    );
+
+    Ok(())
+}
+
+/// An invalid candidate's verdict says whether the failure could depend on our state. A legacy
+/// peer is reported as misbehaving and its transaction's cached rejection refuses it again; an
+/// STP peer is never reported.
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_verdicts_report_state_dependence_and_legacy_misbehavior() -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let (
+        (
+            mut mempool,
+            _peer_set,
+            _state_service,
+            _chain_tip_change,
+            mut tx_verifier,
+            mut recent_syncs,
+            _mempool_transaction_receiver,
+            _block_writer,
+        ),
+        mut misbehavior_rx,
+    ) = setup_with_misbehavior_receiver(&network, mempool::Config::default(), true).await;
+    mempool.enable(&mut recent_syncs).await;
+
+    let mut transactions = network.unmined_transactions_in_blocks(1..=10);
+    let legacy_addr: std::net::SocketAddr = "203.0.113.10:8233".parse().expect("valid address");
+    let legacy = PeerSource::Legacy(legacy_addr);
+    let stp = PeerSource::Stp([2; 32]);
+
+    // A legacy peer's bad proof: state-independent, and reported.
+    let legacy_tx = transactions.next().expect("test transaction");
+    let mut results = queue_candidates(
+        &mut mempool,
+        vec![legacy_tx.transaction.clone().into()],
+        Some(legacy),
+    )
+    .await;
+    let verdict = results.remove(0).expect("queued");
+    respond_to_verification(
+        &mut tx_verifier,
+        Err(TransactionError::Groth16("bad".into())),
+    )
+    .await;
+    assert!(matches!(
+        verdict_after_polling(&mut mempool, verdict).await,
+        Verdict::Invalid {
+            state_dependent: false,
+            ..
+        }
+    ));
+
+    let mut report = None;
+    for _ in 0..50 {
+        mempool.dummy_call().await;
+        if let Ok(received) = misbehavior_rx.try_recv() {
+            report = Some(received);
+            break;
+        }
+        time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        report,
+        Some((PeerSocketAddr::from(legacy_addr), 100)),
+        "a legacy peer is reported for an invalid proof"
+    );
+
+    // The cached rejection refuses the same transaction at queue time.
+    let results = queue_candidates(
+        &mut mempool,
+        vec![legacy_tx.transaction.clone().into()],
+        Some(legacy),
+    )
+    .await;
+    assert!(matches!(results[0], Err(QueueRefusal::Rejected { .. })));
+
+    // An STP peer's bad proof: state-independent, and never reported.
+    let stp_tx = transactions.next().expect("test transaction");
+    let mut results = queue_candidates(
+        &mut mempool,
+        vec![stp_tx.transaction.clone().into()],
+        Some(stp),
+    )
+    .await;
+    let verdict = results.remove(0).expect("queued");
+    respond_to_verification(
+        &mut tx_verifier,
+        Err(TransactionError::Groth16("bad".into())),
+    )
+    .await;
+    assert!(matches!(
+        verdict_after_polling(&mut mempool, verdict).await,
+        Verdict::Invalid {
+            state_dependent: false,
+            ..
+        }
+    ));
+
+    // A lock time that our tip hasn't reached: state-dependent.
+    let locked_tx = transactions.next().expect("test transaction");
+    let mut results = queue_candidates(
+        &mut mempool,
+        vec![locked_tx.transaction.clone().into()],
+        Some(stp),
+    )
+    .await;
+    let verdict = results.remove(0).expect("queued");
+    respond_to_verification(
+        &mut tx_verifier,
+        Err(TransactionError::LockedUntilAfterBlockHeight(Height(10))),
+    )
+    .await;
+    assert!(matches!(
+        verdict_after_polling(&mut mempool, verdict).await,
+        Verdict::Invalid {
+            state_dependent: true,
+            ..
+        }
+    ));
+
+    for _ in 0..5 {
+        mempool.dummy_call().await;
+        time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        misbehavior_rx.try_recv().is_err(),
+        "an STP peer is never reported to the legacy address book"
+    );
+
+    Ok(())
+}
+
+/// A verified candidate that storage refuses, here because it spends an output no mempool
+/// transaction creates any more, is dropped, not accepted or invalid.
+#[tokio::test(flavor = "multi_thread")]
+async fn verified_candidate_refused_by_storage_is_dropped() -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+        _block_writer,
+    ) = setup(&network, u64::MAX, true).await;
+    mempool.enable(&mut recent_syncs).await;
+
+    let transaction = network
+        .unmined_transactions_in_blocks(1..=10)
+        .next()
+        .expect("test transaction");
+    let mut results = queue_candidates(
+        &mut mempool,
+        vec![transaction.transaction.clone().into()],
+        Some(PeerSource::Stp([3; 32])),
+    )
+    .await;
+    let verdict = results.remove(0).expect("queued");
+
+    tx_verifier
+        .expect_request_that(|_| true)
+        .await
+        .respond(tx::MempoolResponse {
+            transaction,
+            spent_mempool_outpoints: vec![OutPoint::from_usize(
+                zebra_chain::transaction::Hash([9; 32]),
+                0,
+            )],
+        });
+
+    assert!(matches!(
+        verdict_after_polling(&mut mempool, verdict).await,
+        Verdict::Dropped { .. }
+    ));
+
+    Ok(())
+}
+
+/// A full transaction that spends an outpoint a mempool transaction already spends is refused
+/// as a spend conflict before it is verified, whether it comes from a peer or not. A
+/// transaction ID can't be checked until it is downloaded, so it is still queued.
+#[tokio::test(flavor = "multi_thread")]
+async fn conflicting_pushed_transaction_is_refused_before_verification() -> Result<(), Report> {
+    use zebra_chain::transaction::UnminedTx;
+
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+        _block_writer,
+    ) = setup(&network, u64::MAX, true).await;
+    mempool.enable(&mut recent_syncs).await;
+
+    let in_mempool = network
+        .unmined_transactions_in_blocks(..)
+        .find(|transaction| {
+            let transaction = &transaction.transaction.transaction;
+            !transaction.outputs().is_empty()
+                && transaction
+                    .inputs()
+                    .iter()
+                    .any(|input| matches!(input, transparent::Input::PrevOut { .. }))
+        })
+        .expect("a test transaction that spends an outpoint and has an output");
+    mempool
+        .storage()
+        .insert(in_mempool.clone(), Vec::new(), None)
+        .expect("the first spender is inserted");
+
+    // The same inputs, but a different output value, so a different transaction.
+    let mut conflicting = (*in_mempool.transaction.transaction).clone();
+    let new_value: i64 = if i64::from(conflicting.outputs()[0].value) == 1 {
+        2
+    } else {
+        1
+    };
+    conflicting.outputs_mut()[0].value = Amount::try_from(new_value)?;
+    let conflicting = UnminedTx::from(conflicting);
+    assert_ne!(conflicting.id, in_mempool.transaction.id);
+
+    for source in [Some(PeerSource::Stp([5; 32])), None] {
+        let results =
+            queue_candidates(&mut mempool, vec![conflicting.clone().into()], source).await;
+        assert!(
+            matches!(results[0], Err(QueueRefusal::SpendConflict)),
+            "a conflicting transaction is refused before verification"
+        );
+    }
+    tx_verifier.expect_no_requests().await;
+
+    let results = queue_candidates(
+        &mut mempool,
+        vec![Gossip::Id(conflicting.id)],
+        Some(PeerSource::Legacy("203.0.113.11:8233".parse()?)),
+    )
+    .await;
+    assert!(
+        results[0].is_ok(),
+        "a transaction ID is queued, and checked for conflicts on insertion"
+    );
+
+    Ok(())
+}
+
+/// A chain reset empties the mempool and verifies its transactions again. Until one of them is
+/// verified, a full transaction conflicting with it is refused, from a peer or not, so the
+/// transaction the mempool held keeps its place whichever verification would finish first. A
+/// transaction a peer sent that is still being verified holds no place: a peer can forge a
+/// spend of anyone's outputs.
+#[tokio::test(flavor = "multi_thread")]
+async fn transaction_verified_again_after_a_reset_keeps_out_conflicts() -> Result<(), Report> {
+    use zebra_chain::transaction::UnminedTx;
+
+    // As in `mempool_cancel_downloads_after_network_upgrade`: Overwinter activates at height 2,
+    // so committing block 1 resets the mempool.
+    let network = ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(2),
+            sapling: Some(3),
+            blossom: Some(4),
+            heartwood: Some(5),
+            canopy: Some(6),
+            nu5: Some(7),
+            nu6: Some(8),
+            nu6_1: Some(9),
+            nu6_2: Some(10),
+            nu6_3: Some(11),
+            featurenet_upgrade_1: None,
+            featurenet_upgrade_2: None,
+            featurenet_upgrade_3: None,
+            nu7: Some(12),
+        })
+        .expect("activation heights are valid")
+        .extend_funding_streams()
+        .to_network()
+        .expect("configured network is valid");
+    // Mainnet's, as `setup` commits Mainnet's genesis block on any network.
+    let block1: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into().unwrap();
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        mut chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+        mut block_writer,
+    ) = setup(&network, u64::MAX, true).await;
+    mempool.enable(&mut recent_syncs).await;
+    mempool.dummy_call().await;
+
+    // Not from block 1, or committing it would cancel the transaction as mined.
+    let spends_and_pays = |transaction: &VerifiedUnminedTx| {
+        let transaction = &transaction.transaction.transaction;
+        !transaction.outputs().is_empty()
+            && transaction.inputs().iter().any(|input| matches!(input, transparent::Input::PrevOut { .. }))
+    };
+    // From Mainnet's vectors: a later Testnet vector no longer parses.
+    let mut candidates = Network::Mainnet.unmined_transactions_in_blocks(2..).filter(spends_and_pays);
+    let held = candidates.next().expect("a test transaction that spends an outpoint and has an output");
+    let from_peer = candidates.next().expect("a second such test transaction");
+    let conflict_with = |transaction: &VerifiedUnminedTx| {
+        let mut conflicting = (*transaction.transaction.transaction).clone();
+        let new_value: i64 = if i64::from(conflicting.outputs()[0].value) == 1 { 2 } else { 1 };
+        conflicting.outputs_mut()[0].value = Amount::try_from(new_value).expect("a valid value");
+        let conflicting = UnminedTx::from(conflicting);
+        assert_ne!(conflicting.id, transaction.transaction.id);
+        conflicting
+    };
+
+    mempool.storage().insert(held.clone(), Vec::new(), None).expect("the held transaction is inserted");
+
+    block_writer.commit_checkpoint_verified(block1.into()).unwrap();
+    chain_tip_change.wait_for_tip_change().await.expect("the tip changes");
+    mempool.dummy_call().await;
+    assert_eq!(mempool.storage().transaction_count(), 0, "the reset empties the mempool");
+    assert_eq!(mempool.tx_downloads().in_flight(), 1, "and verifies the held transaction again");
+    let reverify = tx_verifier.expect_request_that(|_| true).await;
+
+    let conflicting = conflict_with(&held);
+    for source in [Some(PeerSource::Stp([5; 32])), Some(PeerSource::Legacy("203.0.113.12:8233".parse()?)), None] {
+        let results = queue_candidates(&mut mempool, vec![conflicting.clone().into()], source).await;
+        assert!(
+            matches!(results[0], Err(QueueRefusal::SpendConflict)),
+            "a transaction conflicting with one being verified again is refused, from {source:?}"
+        );
+    }
+    tx_verifier.expect_no_requests().await;
+
+    reverify.respond(tx::MempoolResponse { transaction: held.clone(), spent_mempool_outpoints: Vec::new() });
+    for _ in 0..100 {
+        mempool.dummy_call().await;
+        if mempool.storage().transaction_count() == 1 {
+            break;
+        }
+        time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(mempool.storage().contains_transaction_exact(&held.transaction.id.mined_id()), "the held transaction is back");
+    let results = queue_candidates(&mut mempool, vec![conflicting.into()], None).await;
+    assert!(matches!(results[0], Err(QueueRefusal::SpendConflict)), "and still keeps the conflict out");
+
+    // A peer's transaction being verified does not keep a conflicting one out.
+    let results = queue_candidates(&mut mempool, vec![from_peer.transaction.clone().into()], Some(PeerSource::Stp([6; 32]))).await;
+    assert!(results[0].is_ok(), "the peer's transaction is queued");
+    let results = queue_candidates(&mut mempool, vec![conflict_with(&from_peer).into()], None).await;
+    assert!(results[0].is_ok(), "a transaction conflicting with a peer's unverified one is queued");
+
+    Ok(())
 }

@@ -153,6 +153,8 @@ impl Ingest {
                     None,
                     block_writer,
                     genesis,
+                    // No transaction relay: the fuzzer feeds blocks only.
+                    None,
                 );
             });
 

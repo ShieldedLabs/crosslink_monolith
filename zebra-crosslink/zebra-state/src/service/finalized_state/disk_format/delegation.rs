@@ -35,6 +35,12 @@ pub struct DelegationBond {
 
     /// The location where this bond was created
     pub created_at: TransactionLocation,
+
+    /// The txid, in internal byte order, of the last action that spent this bond's version,
+    /// or `None` when no action has, and the version is the txid of the transaction at
+    /// `created_at`, which created the bond. See
+    /// [`zcash_primitives::transaction::StakingAction::spends`].
+    pub version: Option<[u8; 32]>,
 }
 
 impl DelegationBond {
@@ -48,7 +54,14 @@ impl DelegationBond {
             amount,
             target_finalizer,
             created_at,
+            version: None,
         }
+    }
+
+    /// The bond version the next action on the bond must spend. `creation_txid` gives the txid
+    /// of the transaction at a location, and is only called when no action has spent the bond.
+    pub fn current_version(&self, creation_txid: impl FnOnce(TransactionLocation) -> [u8; 32]) -> [u8; 32] {
+        self.version.unwrap_or_else(|| creation_txid(self.created_at))
     }
 
     /// Returns the amount of this bond
@@ -131,6 +144,11 @@ const TRANSACTION_LOCATION_DISK_BYTES: usize = 5;
 const DELEGATION_BOND_DISK_BYTES: usize =
     AMOUNT_DISK_BYTES + TARGET_FINALIZER_DISK_BYTES + TRANSACTION_LOCATION_DISK_BYTES;
 
+/// A spent bond's version is 32 bytes after the rest of the bond, and absent while no action has
+/// spent it. Every record written before versions existed is the version-less form, so it reads
+/// back unchanged without a database upgrade.
+const VERSION_DISK_BYTES: usize = 32;
+
 impl IntoDisk for BondKey {
     type Bytes = [u8; BOND_KEY_DISK_BYTES];
 
@@ -162,6 +180,10 @@ impl IntoDisk for DelegationBond {
 
         // Serialize created_at location (5 bytes via IntoDisk)
         bytes.extend_from_slice(self.created_at.as_bytes().as_ref());
+
+        if let Some(version) = &self.version {
+            bytes.extend_from_slice(version);
+        }
 
         bytes
     }
@@ -196,11 +218,19 @@ impl FromDisk for DelegationBond {
 
         // Deserialize created_at location (5 bytes)
         let created_at = TransactionLocation::from_bytes(&bytes[offset..offset + TRANSACTION_LOCATION_DISK_BYTES]);
+        offset += TRANSACTION_LOCATION_DISK_BYTES;
+
+        let version = match bytes.len() - offset {
+            0 => None,
+            VERSION_DISK_BYTES => Some(bytes[offset..].try_into().expect("length was checked above")),
+            n => panic!("DelegationBond version must be absent or {VERSION_DISK_BYTES} bytes, got {n}"),
+        };
 
         Self {
             amount,
             target_finalizer,
             created_at,
+            version,
         }
     }
 }

@@ -90,6 +90,42 @@ impl ZebraDb {
         chain
     }
 
+    /// Up to `count` decided heights from `from` on, ascending, stopping at the first gap like
+    /// [`Self::bft_chain`]: what a peer catching up asks for. Read one height at a time, and no
+    /// further once the decisions read reach `byte_budget` (the last one may cross it), so a
+    /// request costs what its answer can carry, not `count` reads.
+    pub fn bft_decisions(&self, from: u32, count: u32, byte_budget: usize) -> Vec<StoredDecision> {
+        /// Counts the bytes a serializer writes, without keeping them.
+        struct ByteCount(usize);
+        impl std::io::Write for ByteCount {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0 += buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (blocks, fat_pointers, sigs) =
+            (self.bft_block_by_height_cf(), self.bft_fat_pointer_by_height_cf(), self.bft_proposal_sigs_by_height_cf());
+        let mut decisions = Vec::new();
+        let mut bytes = 0usize;
+        for height in (from..from.saturating_add(count)).map(BftHeight) {
+            if bytes >= byte_budget {
+                break;
+            }
+            let (Some(block), Some(fat_pointer)) = (blocks.zs_get(&height), fat_pointers.zs_get(&height)) else { break };
+            let proposal_sigs = sigs.zs_get(&height).map(|s| s.0).unwrap_or_default();
+            let mut size = ByteCount(proposal_sigs.len() * std::mem::size_of::<TMSig>());
+            block.0.zcash_serialize(&mut size).expect("counting bytes cannot fail");
+            fat_pointer.0.zcash_serialize(&mut size).expect("counting bytes cannot fail");
+            bytes += size.0;
+            decisions.push(StoredDecision { block: block.0, fat_pointer: fat_pointer.0, proposal_sigs });
+        }
+        decisions
+    }
+
     /// Write one decided BFT height. The roster is not stored: it is recomputed from the bonds
     /// at the block's snapshot on every load (FINALITY.md §8.1).
     pub fn write_bft_decision(

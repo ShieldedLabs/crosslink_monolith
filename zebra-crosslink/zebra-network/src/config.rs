@@ -194,6 +194,15 @@ pub struct Config {
     /// after the handshake, but before adding them to the peer set. The total numbers of inbound and
     /// outbound connections are also limited to a multiple of `peerset_initial_target_size`.
     pub max_connections_per_ip: usize,
+
+    /// Run the legacy Zcash peer-to-peer network: listen on `listen_addr`, connect to the
+    /// initial and cached peers, and crawl for more. Off by default: Crosslink nodes sync blocks
+    /// and relay transactions over their own network (`state.network_initial_peers`).
+    ///
+    /// Off, the node neither listens nor connects, so legacy peers get nothing from it and it
+    /// gets nothing from them; everything else runs unchanged against an empty peer set.
+    /// zcashd compatibility (`zcashd_compat`) needs it on.
+    pub legacy_network: bool,
 }
 
 impl Config {
@@ -586,6 +595,7 @@ impl Default for Config {
             // so that idle peers don't use too many connection slots.
             peerset_initial_target_size: DEFAULT_PEERSET_INITIAL_TARGET_SIZE,
             max_connections_per_ip: DEFAULT_MAX_CONNS_PER_IP,
+            legacy_network: false,
         }
     }
 }
@@ -740,6 +750,7 @@ struct DConfig {
     #[serde(alias = "new_peer_interval", with = "humantime_serde")]
     crawl_new_peer_interval: Duration,
     max_connections_per_ip: Option<usize>,
+    legacy_network: bool,
 }
 
 impl Default for DConfig {
@@ -756,6 +767,7 @@ impl Default for DConfig {
             peerset_initial_target_size: config.peerset_initial_target_size,
             crawl_new_peer_interval: config.crawl_new_peer_interval,
             max_connections_per_ip: Some(config.max_connections_per_ip),
+            legacy_network: config.legacy_network,
         }
     }
 }
@@ -829,6 +841,7 @@ impl From<Config> for DConfig {
             peerset_initial_target_size,
             crawl_new_peer_interval,
             max_connections_per_ip,
+            legacy_network,
         }: Config,
     ) -> Self {
         let dnetwork = match network.kind() {
@@ -863,6 +876,7 @@ impl From<Config> for DConfig {
             peerset_initial_target_size,
             crawl_new_peer_interval,
             max_connections_per_ip: Some(max_connections_per_ip),
+            legacy_network,
         }
     }
 }
@@ -883,6 +897,7 @@ impl<'de> Deserialize<'de> for Config {
             peerset_initial_target_size,
             crawl_new_peer_interval,
             max_connections_per_ip,
+            legacy_network,
         } = DConfig::deserialize(deserializer)?;
 
         let network = match (dnetwork, testnet_parameters) {
@@ -962,6 +977,7 @@ impl<'de> Deserialize<'de> for Config {
             peerset_initial_target_size,
             crawl_new_peer_interval,
             max_connections_per_ip,
+            legacy_network,
         })
     }
 }

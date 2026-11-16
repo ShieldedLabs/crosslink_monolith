@@ -225,7 +225,10 @@ impl TxVersion {
             BranchId::Nu6 => TxVersion::V5,
             BranchId::Nu6_1 => TxVersion::V5,
             BranchId::Nu6_2 => TxVersion::V5,
-            BranchId::Nu6_3 | BranchId::FeaturenetUpgrade1 | BranchId::FeaturenetUpgrade2 => TxVersion::V6,
+            BranchId::Nu6_3
+            | BranchId::FeaturenetUpgrade1
+            | BranchId::FeaturenetUpgrade2
+            | BranchId::FeaturenetUpgrade3 => TxVersion::V6,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => TxVersion::V6,
         }
@@ -239,25 +242,28 @@ impl TxVersion {
         match self {
             TxVersion::Sprout(_) => consensus_branch_id == Sprout,
             TxVersion::V3 => consensus_branch_id == Overwinter,
-            TxVersion::VCrosslink => matches!(consensus_branch_id, Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2),
+            TxVersion::VCrosslink => matches!(
+                consensus_branch_id,
+                Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3
+            ),
             TxVersion::V4 => match consensus_branch_id {
                 Sprout | Overwinter => false,
                 Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
-                Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 => true,
+                Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3 => true,
                 #[cfg(zcash_unstable = "nu7")]
                 Nu7 => false, // ZIP 2003
             },
             TxVersion::V5 => match consensus_branch_id {
                 Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy => false,
                 Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
-                Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 => true,
+                Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3 => true,
                 #[cfg(zcash_unstable = "nu7")]
                 Nu7 => true,
             },
             TxVersion::V6 => match consensus_branch_id {
                 Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6
                 | Nu6_1 | Nu6_2 => false,
-                Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 => true, // Ironwood / NU6.3
+                Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3 => true, // Ironwood / NU6.3
                 #[cfg(zcash_unstable = "nu7")]
                 Nu7 => true, // ZIP 230 or ZIP 248, whichever is chosen for activation
             },
@@ -1508,7 +1514,7 @@ mod roster_codec_tests {
 
     #[test]
     fn tagged_addresses_round_trip_and_invalid_signatures_are_downgraded() {
-        let (_, key, pk) = crate::bft::finalizer_key_from_seed(b"roster-codec");
+        let (key, pk) = crate::bft::finalizer_key_from_seed(b"roster-codec");
         let address = FinalizerAddress::create(&key);
         assert_eq!(address.pub_key, pk);
         let member = RosterMember { pub_key: pk.0, voting_power: 7, txids: vec![StakeTxId { txid: [3; 32], zats: 7 }], finalizer_address: Some(address) };
@@ -1540,12 +1546,16 @@ mod roster_codec_tests {
 
 /// The number of blocks between the start of one staking day and the start of the next.
 /// A new staking day starts every N blocks. At 25 seconds per block, this is three days.
-pub const STAKING_PERIOD: u32 = 10_368;
+// Nightly builds shrink the staking calendar so that staking and BFT start within hours: a build
+// uses either every @Nightly line or every @Featurenet line.
+// pub const STAKING_PERIOD: u32 = 150; // @Nightly
+pub const STAKING_PERIOD: u32 = 10_368; // @Featurenet
 
 /// The window size within each staking day period where staking actions are allowed.
 /// Staking actions are only valid when `block_height % STAKING_PERIOD < STAKING_DAY_WINDOW`.
 /// At 25 seconds per block, this is 24 hours.
-pub const STAKING_DAY_WINDOW: u32 = 3_456;
+// pub const STAKING_DAY_WINDOW: u32 = 70; // @Nightly
+pub const STAKING_DAY_WINDOW: u32 = 3_456; // @Featurenet
 
 /// The number of blocks a bond must wait after its last action before it can be unbonded (counted
 /// from its creation) or withdrawn (counted from its unbonding).
@@ -1576,6 +1586,23 @@ pub const SLASH_ANALYSIS_WINDOW: u32 = 2 * STAKING_PERIOD - STAKING_DAY_WINDOW;
 /// hash tree (also used by the txid/auth digests in `txid.rs`).
 pub const ZCASH_CROSSLINK_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxCrosslinkHash"; // ALT: "Stake"
 
+/// The wire tag of a [StakingAction::BeginDelegationUnbonding] that carries
+/// [StakingAction::spends]. Its body is the old one followed by the 32-byte spent version.
+pub const SPENDING_UNBOND_TAG: u8 = 6;
+/// The wire tag of a [StakingAction::WithdrawDelegationBond] that carries
+/// [StakingAction::spends]. Its body is the old one followed by the 32-byte spent version.
+pub const SPENDING_WITHDRAW_TAG: u8 = 7;
+/// The wire tag of a [StakingAction::RetargetDelegationBond] that carries
+/// [StakingAction::spends]. Its body is the old one followed by the 32-byte spent version.
+pub const SPENDING_RETARGET_TAG: u8 = 8;
+
+fn write_spends<W: Write>(mut writer: W, spends: &Option<[u8; 32]>) -> io::Result<()> {
+    match spends {
+        Some(spends) => writer.write_all(spends),
+        None => Ok(()),
+    }
+}
+
 // TODO(code org): should this be under zcash_protocol?
 //
 // `target_finalizer` is a full [FinalizerAddress] capability, not a bare key:
@@ -1599,12 +1626,16 @@ pub enum StakingAction {
         unique_pubkey: [u8; 32],
         #[serde(with = "serde_big_array::BigArray")]
         signature: [u8; 64],
+        /// See [StakingAction::spends].
+        spends: Option<[u8; 32]>,
     },
     WithdrawDelegationBond {
         amount_zats: u64,
         unique_pubkey: [u8; 32],
         #[serde(with = "serde_big_array::BigArray")]
         signature: [u8; 64],
+        /// See [StakingAction::spends].
+        spends: Option<[u8; 32]>,
     },
     // Retarget names both endpoints, and consensus validates `from_finalizer`
     // against the bond's current target. With both ends in the transaction, the
@@ -1616,6 +1647,8 @@ pub enum StakingAction {
         signature: [u8; 64],
         from_finalizer: FinalizerAddress,
         to_finalizer: FinalizerAddress,
+        /// See [StakingAction::spends].
+        spends: Option<[u8; 32]>,
     },
     // Moves `amount_zats` out of `this_finalizer`'s reward bank into a brand new
     // bond keyed by `unique_pubkey` and targeting `this_finalizer`. Two parties
@@ -1792,6 +1825,47 @@ impl StakingAction {
         }
     }
 
+    /// The bond version this action spends, for an action on an existing bond.
+    ///
+    /// From [`NetworkUpgrade::FeaturenetUpgrade3`] a bond is a single unspent output: an
+    /// unbond, withdraw or retarget must name the bond's current version, and becomes its new
+    /// version. The version is the txid of the last action that spent the bond, or of the
+    /// transaction that created it when no action has. Each version can be spent once, so an
+    /// action can never be mined twice, as a Zcash spend can't. Before the upgrade the field
+    /// must be absent, and the action is carried under its old wire tag.
+    pub fn spends(&self) -> Option<[u8; 32]> {
+        match self {
+            StakingAction::BeginDelegationUnbonding { spends, .. }
+            | StakingAction::WithdrawDelegationBond { spends, .. }
+            | StakingAction::RetargetDelegationBond { spends, .. } => *spends,
+            StakingAction::CreateNewDelegationBond { .. }
+            | StakingAction::ConvertFinalizerRewardToDelegationBond { .. } => None,
+        }
+    }
+
+    /// Whether this action operates on an existing bond, and so must spend its version from
+    /// [`NetworkUpgrade::FeaturenetUpgrade3`]. Create and Convert mint the bond instead.
+    pub fn acts_on_existing_bond(&self) -> bool {
+        matches!(
+            self,
+            StakingAction::BeginDelegationUnbonding { .. }
+                | StakingAction::WithdrawDelegationBond { .. }
+                | StakingAction::RetargetDelegationBond { .. }
+        )
+    }
+
+    /// The wire tag: the kind's tag, or the spending form's tag when the action carries
+    /// [StakingAction::spends].
+    pub fn wire_tag(&self) -> u8 {
+        match (self.kind(), self.spends()) {
+            (kind, None) => u8::from(kind),
+            (StakingActionKind::BeginDelegationUnbonding, Some(_)) => SPENDING_UNBOND_TAG,
+            (StakingActionKind::WithdrawDelegationBond, Some(_)) => SPENDING_WITHDRAW_TAG,
+            (StakingActionKind::RetargetDelegationBond, Some(_)) => SPENDING_RETARGET_TAG,
+            (kind, Some(_)) => unreachable!("{kind:?} carries no spent version"),
+        }
+    }
+
     /// Retarget's claimed current target. Consensus validates it two ways: the
     /// capability itself must verify, and its key must equal the bond's actual
     /// current target in state.
@@ -1814,20 +1888,23 @@ impl StakingAction {
                 target_finalizer.write(&mut writer)?;
                 writer.write_u64_le(*amount_zats)
             }
-            StakingAction::BeginDelegationUnbonding { unique_pubkey, signature } => {
-                writer.write_all(unique_pubkey)?;
-                writer.write_all(signature)
-            }
-            StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey, signature } => {
+            StakingAction::BeginDelegationUnbonding { unique_pubkey, signature, spends } => {
                 writer.write_all(unique_pubkey)?;
                 writer.write_all(signature)?;
-                writer.write_u64_le(*amount_zats)
+                write_spends(&mut writer, spends)
             }
-            StakingAction::RetargetDelegationBond { unique_pubkey, signature, from_finalizer, to_finalizer } => {
+            StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey, signature, spends } => {
+                writer.write_all(unique_pubkey)?;
+                writer.write_all(signature)?;
+                writer.write_u64_le(*amount_zats)?;
+                write_spends(&mut writer, spends)
+            }
+            StakingAction::RetargetDelegationBond { unique_pubkey, signature, from_finalizer, to_finalizer, spends } => {
                 writer.write_all(unique_pubkey)?;
                 writer.write_all(signature)?;
                 from_finalizer.write(&mut writer)?;
-                to_finalizer.write(&mut writer)
+                to_finalizer.write(&mut writer)?;
+                write_spends(&mut writer, spends)
             }
             StakingAction::ConvertFinalizerRewardToDelegationBond { unique_pubkey, signature, bond_salt, this_finalizer, amount_zats, finalizer_signature } => {
                 writer.write_all(unique_pubkey)?;
@@ -1849,7 +1926,7 @@ impl StakingAction {
             .hash_length(32)
             .personal(ZCASH_CROSSLINK_HASH_PERSONALIZATION)
             .to_state();
-        h.write_u8(u8::from(self.kind())).expect("hashing never fails");
+        h.write_u8(self.wire_tag()).expect("hashing never fails");
         self.write_body(&mut h).expect("hashing never fails");
         h.finalize()
     }
@@ -1860,11 +1937,27 @@ impl StakingAction {
             return Ok(None);
         }
 
-        let Ok(kind) = StakingActionKind::try_from(tag) else {
-            return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unexpected staking action tag: {tag}"),
-            ));
+        let (kind, is_spending) = match tag {
+            SPENDING_UNBOND_TAG => (StakingActionKind::BeginDelegationUnbonding, true),
+            SPENDING_WITHDRAW_TAG => (StakingActionKind::WithdrawDelegationBond, true),
+            SPENDING_RETARGET_TAG => (StakingActionKind::RetargetDelegationBond, true),
+            _ => match StakingActionKind::try_from(tag) {
+                Ok(kind) => (kind, false),
+                Err(()) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unexpected staking action tag: {tag}"),
+                    ))
+                }
+            },
+        };
+        let read_spends = |reader: &mut R| -> io::Result<Option<[u8; 32]>> {
+            if !is_spending {
+                return Ok(None);
+            }
+            let mut spends = [0u8; 32];
+            reader.read_exact(&mut spends)?;
+            Ok(Some(spends))
         };
 
         let mut b32_0 = [0u8; 32];
@@ -1883,21 +1976,24 @@ impl StakingAction {
                 }))
             }
             StakingActionKind::BeginDelegationUnbonding => {
+                let spends = read_spends(&mut reader)?;
                 Ok(Some(StakingAction::BeginDelegationUnbonding {
-                    unique_pubkey: b32_0, signature: b64_0,
+                    unique_pubkey: b32_0, signature: b64_0, spends,
                 }))
             }
             StakingActionKind::WithdrawDelegationBond => {
                 let amount_zats = reader.read_u64_le()?;
+                let spends = read_spends(&mut reader)?;
                 Ok(Some(StakingAction::WithdrawDelegationBond {
-                    amount_zats, unique_pubkey: b32_0, signature: b64_0,
+                    amount_zats, unique_pubkey: b32_0, signature: b64_0, spends,
                 }))
             }
             StakingActionKind::RetargetDelegationBond => {
                 let from_finalizer = FinalizerAddress::read(&mut reader)?;
                 let to_finalizer = FinalizerAddress::read(&mut reader)?;
+                let spends = read_spends(&mut reader)?;
                 Ok(Some(StakingAction::RetargetDelegationBond {
-                    unique_pubkey: b32_0, signature: b64_0, from_finalizer, to_finalizer,
+                    unique_pubkey: b32_0, signature: b64_0, from_finalizer, to_finalizer, spends,
                 }))
             }
             StakingActionKind::ConvertFinalizerRewardToDelegationBond => {
@@ -1921,7 +2017,7 @@ impl StakingAction {
         mut writer: W,
     ) -> io::Result<()> {
         if let Some(staking_action) = staking_action {
-            writer.write_u8(u8::from(staking_action.kind()))?;
+            writer.write_u8(staking_action.wire_tag())?;
             staking_action.write_body(writer)
         } else {
             writer.write_u8(0)
@@ -1953,23 +2049,26 @@ impl std::fmt::Display for StakingAction {
                 fmter.field("target_finalizer", &target_finalizer.encode());
                 fmter.field("amount_zats", amount_zats);
             }
-            StakingAction::BeginDelegationUnbonding { unique_pubkey, signature } => {
+            StakingAction::BeginDelegationUnbonding { unique_pubkey, signature, spends } => {
                 fmter.field("kind", &"BeginDelegationUnbonding");
                 fmt_le_bytes(fmter, "unique_public_key", unique_pubkey);
                 fmt_le_bytes(fmter, "signature", signature);
+                if let Some(spends) = spends { fmt_le_bytes(fmter, "spends", spends); }
             }
-            StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey, signature } => {
+            StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey, signature, spends } => {
                 fmter.field("kind", &"WithdrawDelegationBond");
                 fmt_le_bytes(fmter, "unique_public_key", unique_pubkey);
                 fmt_le_bytes(fmter, "signature", signature);
                 fmter.field("amount_zats", amount_zats);
+                if let Some(spends) = spends { fmt_le_bytes(fmter, "spends", spends); }
             }
-            StakingAction::RetargetDelegationBond { unique_pubkey, signature, from_finalizer, to_finalizer } => {
+            StakingAction::RetargetDelegationBond { unique_pubkey, signature, from_finalizer, to_finalizer, spends } => {
                 fmter.field("kind", &"RetargetDelegationBond");
                 fmt_le_bytes(fmter, "unique_public_key", unique_pubkey);
                 fmt_le_bytes(fmter, "signature", signature);
                 fmter.field("from_finalizer", &from_finalizer.encode());
                 fmter.field("to_finalizer", &to_finalizer.encode());
+                if let Some(spends) = spends { fmt_le_bytes(fmter, "spends", spends); }
             }
             StakingAction::ConvertFinalizerRewardToDelegationBond { unique_pubkey, signature, bond_salt, this_finalizer, amount_zats, finalizer_signature } => {
                 fmter.field("kind", &"ConvertFinalizerRewardToDelegationBond");
@@ -2032,9 +2131,10 @@ pub mod testing {
             BranchId::Nu6 => Just(TxVersion::V5).boxed(),
             BranchId::Nu6_1 => Just(TxVersion::V5).boxed(),
             BranchId::Nu6_2 => Just(TxVersion::V5).boxed(),
-            BranchId::Nu6_3 | BranchId::FeaturenetUpgrade1 | BranchId::FeaturenetUpgrade2 => {
-                Just(TxVersion::V6).boxed()
-            }
+            BranchId::Nu6_3
+            | BranchId::FeaturenetUpgrade1
+            | BranchId::FeaturenetUpgrade2
+            | BranchId::FeaturenetUpgrade3 => Just(TxVersion::V6).boxed(),
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => Just(TxVersion::V6).boxed(),
             #[cfg(zcash_unstable = "zfuture")]

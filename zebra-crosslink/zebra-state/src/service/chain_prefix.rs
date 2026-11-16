@@ -396,8 +396,8 @@ mod tests {
     #[test]
     fn the_valid_round_is_read_back_from_the_proposal_signatures() {
         use crate::new_network::bft::namespace_for_bft_height;
-        let (_, key, pub_key) = finalizer_key_from_seed(b"chain prefix proposer");
-        let (_, other_key, other_pub_key) = finalizer_key_from_seed(b"chain prefix bystander");
+        let (key, pub_key) = finalizer_key_from_seed(b"chain prefix proposer");
+        let (other_key, other_pub_key) = finalizer_key_from_seed(b"chain prefix bystander");
 
         // Re-proposed in round 2 from a value locked in round 1, under either namespace.
         for strict in [false, true] {

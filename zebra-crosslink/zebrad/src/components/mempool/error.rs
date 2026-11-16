@@ -5,6 +5,8 @@
 
 use thiserror::Error;
 
+use zebra_node_services::mempool::QueueRefusal;
+
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 
@@ -79,4 +81,20 @@ pub enum MempoolError {
     /// The transaction is non-standard.
     #[error("transaction is non-standard")]
     NonStandardTransaction(#[from] NonStandardTransactionError),
+}
+
+impl From<MempoolError> for QueueRefusal {
+    fn from(error: MempoolError) -> Self {
+        match error {
+            MempoolError::InMempool | MempoolError::AlreadyQueued => QueueRefusal::AlreadyKnown,
+            MempoolError::FullQueue => QueueRefusal::Full,
+            MempoolError::Disabled => QueueRefusal::Disabled,
+            MempoolError::StorageExactTip(_)
+            | MempoolError::StorageEffectsTip(_)
+            | MempoolError::StorageEffectsChain(_)
+            | MempoolError::NonStandardTransaction(_) => QueueRefusal::Rejected {
+                reason: error.to_string(),
+            },
+        }
+    }
 }

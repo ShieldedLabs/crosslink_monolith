@@ -1,12 +1,14 @@
 use static_assertions::*;
 use std::{io::Write, mem::align_of, mem::size_of};
 use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize, SerializationError};
-use zebra_chain::transaction::{Transaction, UnminedTxId};
+use zebra_chain::transaction::{Transaction, UnminedTx, UnminedTxId};
 use zerocopy::*;
 use zerocopy_derive::*;
 
 use zcash_primitives::bft::*;
 pub use tenderlink::TMStep;
+/// For writers of BFT_RECV_PACKET payloads and of expectations that turn on the quorum.
+pub use tenderlink::{decision_threshold, id_hello_packet, proposal_chunk_packets, status_packet_needing_everything, vote_packet, ValueId};
 
 pub struct BftBlockAndFatPointerToItWrap(pub BftBlockAndFatPointerToIt);
 impl ZcashDeserialize for BftBlockAndFatPointerToItWrap {
@@ -83,6 +85,9 @@ pub const TF_BFT_PRECOMMIT: u64 = 1 << 32;
 pub const TF_BFT_NIL: u64 = 1 << 33;
 pub const TF_BFT_FOR_NODE_PROPOSAL: u64 = 1 << 34;
 pub const TF_BFT_WRONG_NAMESPACE: u64 = 1 << 35;
+/// A vote for the value of the proposal BFT_RECV_PROPOSAL last delivered at the vote's height and
+/// round, as the harness sent it: with TF_BFT_ON_NODE_TIP that value is known only at run time.
+pub const TF_BFT_FOR_DELIVERED_PROPOSAL: u64 = 1 << 36;
 /// EXPECT_BFT_PROPOSER's name for the node itself.
 pub const TF_BFT_THE_NODE: u64 = u64::MAX;
 /// EXPECT_BFT_STEP's step for any step.
@@ -122,7 +127,7 @@ pub fn bft_proposer(members: &[([u8; 32], u64)], active_roster_max_n: usize, hei
 
 /// The public key of synthetic finalizer `k`.
 pub fn synthetic_finalizer_pub_key(k: u64) -> [u8; 32] {
-    finalizer_key_from_seed(synthetic_finalizer_seed(k).as_bytes()).2 .0
+    finalizer_key_from_seed(synthetic_finalizer_seed(k).as_bytes()).1 .0
 }
 
 /// `height << 32 | round`, as the BFT instructions take them.
@@ -142,7 +147,6 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::EXPECT_ROSTER_INCLUDES as usize] = "EXPECT_ROSTER_INCLUDES";
     strs[TFInstr::EXPECT_REJECTION_REASON as usize] = "EXPECT_REJECTION_REASON";
     strs[TFInstr::EXPECT_NODE_ALIVE as usize] = "EXPECT_NODE_ALIVE";
-    strs[TFInstr::RECV_TX as usize] = "RECV_TX";
     strs[TFInstr::SUBMIT_TX as usize] = "SUBMIT_TX";
     strs[TFInstr::EXPECT_MEMPOOL_CONTAINS as usize] = "EXPECT_MEMPOOL_CONTAINS";
     strs[TFInstr::EXPECT_MEMPOOL_ABSENT as usize] = "EXPECT_MEMPOOL_ABSENT";
@@ -150,12 +154,9 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::EXPECT_BOND as usize] = "EXPECT_BOND";
     strs[TFInstr::EXPECT_FINALIZER_BANK as usize] = "EXPECT_FINALIZER_BANK";
     strs[TFInstr::EXPECT_POOL_TOTALS as usize] = "EXPECT_POOL_TOTALS";
-    strs[TFInstr::RECV_POW as usize] = "RECV_POW";
     strs[TFInstr::RECV_STP_PACKET as usize] = "RECV_STP_PACKET";
-    strs[TFInstr::MINE_FROM_TEMPLATE as usize] = "MINE_FROM_TEMPLATE";
     strs[TFInstr::EXPECT_POW_TIP as usize] = "EXPECT_POW_TIP";
     strs[TFInstr::EXPECT_FINALIZED_TIP as usize] = "EXPECT_FINALIZED_TIP";
-    strs[TFInstr::CHECK_POW as usize] = "CHECK_POW";
     strs[TFInstr::CHECK_POS as usize] = "CHECK_POS";
     strs[TFInstr::SET_TIME as usize] = "SET_TIME";
     strs[TFInstr::CALL_RPC as usize] = "CALL_RPC";
@@ -169,7 +170,13 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::EXPECT_BFT_PROPOSER as usize] = "EXPECT_BFT_PROPOSER";
     strs[TFInstr::EXPECT_BFT_DROPPED as usize] = "EXPECT_BFT_DROPPED";
 
-    const_assert!(TFInstr::COUNT == 36);
+    let mut retired_i = 0;
+    while retired_i < TFInstr::RETIRED.len() {
+        strs[TFInstr::RETIRED[retired_i] as usize] = "<retired>";
+        retired_i += 1;
+    }
+
+    const_assert!(TFInstr::COUNT == 37);
     strs
 };
 
@@ -177,6 +184,27 @@ impl TFInstr {
     // NOTE: we want to deal with unknown values at the *application* layer, not the
     // (de)serialization layer.
     // TODO: there may be a crate that makes an enum feasible here
+
+    /// A PoW block (the data, serialized) reaching the node through the doorway in `val[1]`:
+    /// - `TF_POW_DIRECT`: the ingest queue submitblock and the miner use. Accepted, rejected or
+    ///   pending (SHOULD_DEFER) as the node answers.
+    /// - `TF_POW_STP_PEER`: served by synthetic STP peer `val[0]` the way a real peer serves one:
+    ///   it advertises the block in a STATUS, waits for the node's BLOCK_REQ, and answers with
+    ///   BLOCK_CHUNK packets from the requested offset. Judged as the direct doorway, and rejected
+    ///   too when the node kills the peer or never asks for the block. The STATUS names the
+    ///   block's hash and height, so the bytes must parse to a block with a coinbase height.
+    /// - `TF_POW_STP_CLAIMED`: as `TF_POW_STP_PEER`, but the STATUS advertises the block the
+    ///   data's first 68 bytes claim (its hash, its parent's hash and its height, a little-endian
+    ///   u32), and the chunks carry the bytes after them, whatever they are: the way a peer that
+    ///   lies or corrupts what it serves would. The outcome is the node's for the claimed hash.
+    /// - `TF_POW_TEMPLATE`: no data; the node builds the block from its own getblocktemplate
+    ///   response, as its miner does, and submits it directly. Also rejected when no template or
+    ///   block could be made. A non-zero `val[0]` names a slot that remembers the block's hash,
+    ///   for instructions that take a slot in place of a hash.
+    /// - `TF_POW_CHECK`: only the node's header and body checks, run at once with the current
+    ///   time taken to be `val[0]` (UNIX seconds). Nothing is queued or stored, so it covers the
+    ///   rules a block can break by itself (its timestamp against the clock, its merkle root, its
+    ///   coinbase), not the ones that need its ancestors. The message says which stage refused.
     pub const LOAD_POW: TFInstrKind = 0;
     /// A decided BFT height, force-fed as tenderlink would have decided it. The data is the
     /// block and its fat pointer, then the proposer's chunk signatures, 64 bytes each in chunk
@@ -198,14 +226,17 @@ impl TFInstr {
     /// The node still answers: the state service returns its tip within a bound, and
     /// re-submitting the tip block through the ingest path answers `Known`.
     pub const EXPECT_NODE_ALIVE: TFInstrKind = 9;
-    /// A wire message (the data, header included) arriving from synthetic peer `val[0]`: decoded
-    /// with the peer codec and routed through the inbound service exactly as a connection routes
-    /// an unsolicited message. A `tx` message reaches the mempool as that peer's transaction.
-    /// Checks only that it was delivered; verification is asynchronous, so follow it with an
-    /// EXPECT_MEMPOOL_* instruction.
-    pub const RECV_TX: TFInstrKind = 10;
-    /// A transaction (the data) submitted locally, the doorway the wallet and RPC use. Checks the
-    /// mempool's verdict, and its message is the rejection reason when rejected.
+    /// A transaction (the data, serialized) reaching the mempool through the doorway in
+    /// `val[1]`, judged by the mempool's verdict through every doorway: accepted once it is
+    /// resident (or mined), rejected once it is in the rejected set or could not be delivered.
+    /// - `TF_TX_LOCAL`: submitted locally, the doorway the wallet and RPC use; the message is
+    ///   the mempool's rejection reason when rejected.
+    /// - `TF_TX_WIRE`: a `tx` wire message from synthetic peer `val[0]`, framed and decoded with
+    ///   the peer codec and routed through the inbound service exactly as a connection routes an
+    ///   unsolicited message.
+    /// - `TF_TX_STP_PEER`: relayed over STP by synthetic peer `val[0]`: the peer lists it
+    ///   (TX_STATUS) and answers the node's TX_REQ for it with a TX. Also rejected when the node
+    ///   kills the peer or never asks.
     pub const SUBMIT_TX: TFInstrKind = 11;
     /// The transaction (the data) becomes resident in the mempool within a bound. Fails early if
     /// it is rejected instead.
@@ -225,32 +256,15 @@ impl TFInstr {
     /// The best chain tip's staking pools: the data is bonded, unbonded and finalizer rewards,
     /// three little-endian u64 zatoshi amounts, each skipped when `TEST_STAKE_IGNORED`.
     pub const EXPECT_POOL_TOTALS: TFInstrKind = 17;
-    /// A PoW block (the data, serialized) served by synthetic STP peer `val[0]` the way a real
-    /// peer serves one: the peer advertises it in a STATUS, waits for the node's BLOCK_REQ, and
-    /// answers with BLOCK_CHUNK packets from the requested offset. Accepted and rejected as
-    /// LOAD_POW is, and rejected too when the node kills the peer or never asks for the block.
-    pub const RECV_POW: TFInstrKind = 18;
     /// An STP application packet (the data, type byte first) arriving from synthetic peer
     /// `val[0]`. Fails when the node kills the peer for it; any other handling passes.
     pub const RECV_STP_PACKET: TFInstrKind = 19;
-    /// The node builds a block from its own getblocktemplate response, as its miner does, and
-    /// the block is submitted through the LOAD_POW doorway. Accepted and rejected as LOAD_POW is;
-    /// also rejected when no template or block could be made. A non-zero `val[0]` names a slot
-    /// that remembers the block's hash, for instructions that take a slot in place of a hash:
-    /// the hash of a block the node builds is not known when the file is written.
-    pub const MINE_FROM_TEMPLATE: TFInstrKind = 20;
     /// The best chain's tip is the block whose hash is the data, or, with no data, the block
     /// remembered in slot `val[0]`. Says which of two equally long branches the node is on.
     pub const EXPECT_POW_TIP: TFInstrKind = 21;
     /// `fin`, the finalized tip, is the block named as for EXPECT_POW_TIP. With no data and
     /// slot 0, nothing is finalized yet.
     pub const EXPECT_FINALIZED_TIP: TFInstrKind = 22;
-    /// The node's header and body checks, run on the PoW block in the data at once, with the
-    /// current time taken to be `val[0]` (UNIX seconds). Nothing is queued or stored, so the
-    /// answer needs no wait and no chain context: it covers the rules a block can break by
-    /// itself (its timestamp against the clock, its merkle root, its coinbase), not the ones
-    /// that need its ancestors. The message says which stage refused.
-    pub const CHECK_POW: TFInstrKind = 23;
     /// Whether the PoS block in the data (a LOAD_POS payload) is valid on the node's current BFT
     /// chain: the check a proposal gets, answered at once, with nothing stored or decided. An
     /// indeterminate answer (a PoW block it needs is missing) is pending, as for SHOULD_DEFER.
@@ -296,7 +310,8 @@ impl TFInstr {
     /// first sends the node a status that needs everything at the engine's height and round, and
     /// the instruction returns once the engine has acted on the new time and everything it sent
     /// is recorded. With SHOULD_FAIL, that the engine does not catch up: it is waiting on the
-    /// node, as it does on a decision the node has not answered.
+    /// node, as it does on a decision the node has parked (shown at once, by the node's status) or
+    /// otherwise not answered (shown by no pass within the bound).
     pub const ADVANCE_TIME: TFInstrKind = 31;
     /// The engine is at height `val[0]`, round `val[1] >> 8`, step `val[1] & 0xff` (0 propose,
     /// 1 prevote, 2 precommit, 0xff any).
@@ -311,7 +326,11 @@ impl TFInstr {
     /// The node has stopped taking part in BFT (`val[0]` 1) or has not (0), and its database
     /// records it the same way: with the data a block hash, the record names that block.
     pub const EXPECT_BFT_DROPPED: TFInstrKind = 35;
-    pub const COUNT: TFInstrKind = 36;
+    /// Kinds folded into LOAD_POW and SUBMIT_TX as doorways: RECV_TX (10), RECV_POW (18),
+    /// MINE_FROM_TEMPLATE (20), CHECK_POW (23) and RECV_TX_STP (36). Never reused, so an old file
+    /// holding one fails to parse rather than meaning something else.
+    pub const RETIRED: [TFInstrKind; 5] = [10, 18, 20, 23, 36];
+    pub const COUNT: TFInstrKind = 37;
 
     pub fn str_from_kind(kind: TFInstrKind) -> &'static str {
         let kind = kind as usize;
@@ -370,9 +389,7 @@ impl TFInstr {
             }
             Some(TestInstr::ExpectRejectionReason(reason)) => str += &format!("{reason:?}"),
             Some(TestInstr::ExpectNodeAlive) => {}
-            Some(TestInstr::RecvTx { wire, peer }) => {
-                str += &format!("{} bytes from peer {peer}", wire.len())
-            }
+            Some(TestInstr::RecvTx { tx, peer }) => str += &format!("{} via wire peer {peer}", tx.hash()),
             Some(TestInstr::SubmitTx(tx))
             | Some(TestInstr::ExpectMempoolContains(tx))
             | Some(TestInstr::ExpectMempoolAbsent(tx))
@@ -384,18 +401,22 @@ impl TFInstr {
                 str += &format!("{} => {amount}", PubKeyID(pub_key))
             }
             Some(TestInstr::ExpectPoolTotals(pools)) => str += &format!("{pools:?}"),
-            Some(TestInstr::RecvPoW { block, peer }) => {
+            Some(TestInstr::RecvPoW { block, peer, claim: Some(claim) }) => {
+                str += &format!("{} bytes claimed as {} @ {} via STP peer {peer}", block.len(), claim.hash, claim.height)
+            }
+            Some(TestInstr::RecvPoW { block, peer, claim: None }) => {
                 str += &match Block::zcash_deserialize(&block[..]) {
-                    Ok(parsed) => format!("{} from peer {peer}", parsed.hash()),
-                    Err(_) => format!("{} unparseable bytes from peer {peer}", block.len()),
+                    Ok(parsed) => format!("{} via STP peer {peer}", parsed.hash()),
+                    Err(_) => format!("{} unparseable bytes via STP peer {peer}", block.len()),
                 }
             }
             Some(TestInstr::MineFromTemplate { slot }) => {
+                str += "from the node's template";
                 if slot != 0 {
-                    str += &format!("into slot {slot}")
+                    str += &format!(", into slot {slot}")
                 }
             }
-            Some(TestInstr::CheckPoW { block, now }) => str += &format!("{} at time {now}", block.hash()),
+            Some(TestInstr::CheckPoW { block, now }) => str += &format!("{}, checks only, at time {now}", block.hash()),
             Some(TestInstr::CheckPoS(block)) => str += &block.blake3_hash().to_string(),
             Some(TestInstr::SetTime(unix_time)) => str += &unix_time.to_string(),
             Some(TestInstr::CallRpc { method, params }) => str += &format!("{method} {params}"),
@@ -442,6 +463,7 @@ impl TFInstr {
             Some(TestInstr::RecvStpPacket { packet, peer }) => {
                 str += &format!("type {:?}, {} bytes from peer {peer}", packet.first(), packet.len())
             }
+            Some(TestInstr::RecvTxStp { tx, peer }) => str += &format!("{} via STP peer {peer}", tx.hash()),
             Some(TestInstr::ExpectBftDropped { dropped, hash }) => {
                 str += &format!("{dropped}");
                 if let Some(hash) = hash {
@@ -475,6 +497,53 @@ impl TFInstr {
     }
 }
 
+/// LOAD_POW's doorways, in `val[1]`.
+pub const TF_POW_DIRECT: u64 = 0;
+pub const TF_POW_STP_PEER: u64 = 1;
+pub const TF_POW_TEMPLATE: u64 = 2;
+pub const TF_POW_CHECK: u64 = 3;
+pub const TF_POW_STP_CLAIMED: u64 = 4;
+
+/// What a synthetic STP peer advertises for the bytes it serves under `TF_POW_STP_CLAIMED`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StpClaim {
+    pub hash: ZebBlockHash,
+    pub parent: ZebBlockHash,
+    pub height: u32,
+}
+
+impl StpClaim {
+    /// How many bytes of a `TF_POW_STP_CLAIMED` instruction's data the claim takes.
+    pub const SIZE: usize = 32 + 32 + 4;
+
+    /// The claim of an honest peer that has `block`.
+    pub fn of(block: &Block) -> Option<StpClaim> {
+        Some(StpClaim { hash: block.hash(), parent: block.header.previous_block_hash, height: block.coinbase_height()?.0 })
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.hash.0);
+        out.extend_from_slice(&self.parent.0);
+        out.extend_from_slice(&self.height.to_le_bytes());
+    }
+
+    /// The claim, and the bytes served under it.
+    fn read(data: &[u8]) -> Option<(StpClaim, &[u8])> {
+        if data.len() < Self::SIZE {
+            return None;
+        }
+        let hash = ZebBlockHash(data[..32].try_into().ok()?);
+        let parent = ZebBlockHash(data[32..64].try_into().ok()?);
+        let height = u32::from_le_bytes(data[64..68].try_into().ok()?);
+        Some((StpClaim { hash, parent, height }, &data[Self::SIZE..]))
+    }
+}
+
+/// SUBMIT_TX's doorways, in `val[1]`.
+pub const TF_TX_LOCAL: u64 = 0;
+pub const TF_TX_WIRE: u64 = 1;
+pub const TF_TX_STP_PEER: u64 = 2;
+
 // Flags
 pub const SHOULD_FAIL: u32 = 1 << 0;
 /// The block is held pending (an unknown parent, or a wait on BFT) rather than accepted or
@@ -484,6 +553,10 @@ pub const SHOULD_DEFER: u32 = 1 << 1;
 /// block. What it does not cover is the node giving no verdict at all, which still fails, as do
 /// the expectations that follow. Overrides SHOULD_FAIL and SHOULD_DEFER.
 pub const ANY_OUTCOME: u32 = 1 << 2;
+/// BFT_RECV_PROPOSAL only: the proposal's parent is the node's decided tip, put in place of the
+/// one the value names before it is signed. A writer that let the node's own proposal be decided
+/// cannot name that block, whose certificate holds the precommits the node gathered.
+pub const TF_BFT_ON_NODE_TIP: u32 = 1 << 3;
 
 pub struct TF {
     pub instrs: Vec<TFInstr>,
@@ -516,12 +589,29 @@ pub fn val_from_finality(val: Option<TFLBlockFinality>) -> [u64; 2] {
     }
 }
 
+/// How [`read_instrs`] runs a file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadOptions {
+    /// The instructions before this index submit their PoW blocks through
+    /// [`zebra_state::new_network::submit_trusted_block_to_new_network`]: the blocks' proofs,
+    /// signatures and scripts are not checked. 0 trusts none. Set only for a chain prefix the
+    /// operator has marked trusted (see `chain_prefix`).
+    pub trusted_before: usize,
+    /// Race mode: a run of PoW and transaction deliveries (LOAD_POW and SUBMIT_TX, through any
+    /// doorway) is sent all at once, without waiting for each verdict, which is not checked; every
+    /// other instruction first waits for the run to finish, then runs as usual. The deliveries race
+    /// each other and the node's pipelines, and the expectations after them check where it settled.
+    /// EXPECT_REJECTION_REASON, which reads the instruction before it, is skipped.
+    pub race: bool,
+}
+
+impl ReadOptions {
+    /// Every check runs.
+    pub const UNTRUSTED: ReadOptions = ReadOptions { trusted_before: 0, race: false };
+}
+
 /// The file magic this build writes. Version 1 always writes the staking calendar in SET_PARAMS
 /// and may follow it with a node config fragment; version 0 files are still read.
-/// While set, `LOAD_POW` submits through [`zebra_state::new_network::submit_trusted_block_to_new_network`]:
-/// the block's proofs, signatures and scripts are not checked. Set only by a chain prefix import
-/// the operator has marked trusted (see `chain_prefix`).
-pub static TRUSTED_LOAD_POW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub const TF_MAGIC: &[u8; 8] = b"ZECCLTF1";
 const TF_MAGIC_V0: &[u8; 8] = b"ZECCLTF0";
@@ -625,10 +715,10 @@ impl TF {
     }
 
     pub fn push_instr_load_pow(&mut self, data: &Block, flags: u32) {
-        self.push_instr_serialize_ex(TFInstr::LOAD_POW, flags, data, [0; 2])
+        self.push_instr_serialize_ex(TFInstr::LOAD_POW, flags, data, [0, TF_POW_DIRECT])
     }
     pub fn push_instr_load_pow_bytes(&mut self, data: &[u8], flags: u32) {
-        self.push_instr_ex(TFInstr::LOAD_POW, flags, data, [0; 2])
+        self.push_instr_ex(TFInstr::LOAD_POW, flags, data, [0, TF_POW_DIRECT])
     }
 
     /// A decision with no proposal signatures, for a round with no proposer. See `push_instr_load_pos_signed`.
@@ -697,14 +787,13 @@ impl TF {
         self.push_instr_ex(TFInstr::EXPECT_NODE_ALIVE, flags, &[0; 0], [0; 2])
     }
 
-    /// A wire message delivered as if synthetic peer `peer` sent it. For a transaction, frame it
-    /// with `zebra_network::wire::tx_message_bytes`.
-    pub fn push_instr_recv_tx_wire(&mut self, wire: &[u8], peer: u64, flags: u32) {
-        self.push_instr_ex(TFInstr::RECV_TX, flags, wire, [peer, 0])
+    /// `tx` in a `tx` wire message from synthetic peer `peer`.
+    pub fn push_instr_recv_tx_wire(&mut self, tx: &Transaction, peer: u64, flags: u32) {
+        self.push_instr_serialize_ex(TFInstr::SUBMIT_TX, flags, tx, [peer, TF_TX_WIRE])
     }
 
     pub fn push_instr_submit_tx(&mut self, tx: &Transaction, flags: u32) {
-        self.push_instr_serialize_ex(TFInstr::SUBMIT_TX, flags, tx, [0; 2])
+        self.push_instr_serialize_ex(TFInstr::SUBMIT_TX, flags, tx, [0, TF_TX_LOCAL])
     }
 
     pub fn push_instr_expect_mempool_contains(&mut self, tx: &Transaction, flags: u32) {
@@ -739,25 +828,37 @@ impl TF {
 
     /// A block served over the STP block-sync exchange by synthetic peer `peer`.
     pub fn push_instr_recv_pow(&mut self, block: &Block, peer: u64, flags: u32) {
-        self.push_instr_serialize_ex(TFInstr::RECV_POW, flags, block, [peer, 0])
+        self.push_instr_serialize_ex(TFInstr::LOAD_POW, flags, block, [peer, TF_POW_STP_PEER])
     }
 
     /// Block bytes served as-is, for encodings `Block` would not produce.
     pub fn push_instr_recv_pow_bytes(&mut self, block: &[u8], peer: u64, flags: u32) {
-        self.push_instr_ex(TFInstr::RECV_POW, flags, block, [peer, 0])
+        self.push_instr_ex(TFInstr::LOAD_POW, flags, block, [peer, TF_POW_STP_PEER])
+    }
+
+    /// `bytes`, whatever they are, served by synthetic peer `peer` as the block `claim` names.
+    pub fn push_instr_recv_pow_claimed(&mut self, claim: StpClaim, bytes: &[u8], peer: u64, flags: u32) {
+        let mut data = Vec::with_capacity(StpClaim::SIZE + bytes.len());
+        claim.write(&mut data);
+        data.extend_from_slice(bytes);
+        self.push_instr_ex(TFInstr::LOAD_POW, flags, &data, [peer, TF_POW_STP_CLAIMED])
     }
 
     pub fn push_instr_recv_stp_packet(&mut self, packet: &[u8], peer: u64, flags: u32) {
         self.push_instr_ex(TFInstr::RECV_STP_PACKET, flags, packet, [peer, 0])
     }
 
+    pub fn push_instr_recv_tx_stp(&mut self, tx: &Transaction, peer: u64, flags: u32) {
+        self.push_instr_serialize_ex(TFInstr::SUBMIT_TX, flags, tx, [peer, TF_TX_STP_PEER])
+    }
+
     pub fn push_instr_mine_from_template(&mut self, flags: u32) {
-        self.push_instr_ex(TFInstr::MINE_FROM_TEMPLATE, flags, &[0; 0], [0; 2])
+        self.push_instr_ex(TFInstr::LOAD_POW, flags, &[0; 0], [0, TF_POW_TEMPLATE])
     }
 
     /// As push_instr_mine_from_template, remembering the mined block's hash in `slot` (non-zero).
     pub fn push_instr_mine_from_template_into(&mut self, slot: u64, flags: u32) {
-        self.push_instr_ex(TFInstr::MINE_FROM_TEMPLATE, flags, &[0; 0], [slot, 0])
+        self.push_instr_ex(TFInstr::LOAD_POW, flags, &[0; 0], [slot, TF_POW_TEMPLATE])
     }
 
     pub fn push_instr_expect_pow_tip(&mut self, hash: &ZebBlockHash, flags: u32) {
@@ -782,7 +883,7 @@ impl TF {
 
     /// The header and body checks on `block`, taking the current time to be `now_unix_time`.
     pub fn push_instr_check_pow(&mut self, block: &Block, now_unix_time: u64, flags: u32) {
-        self.push_instr_serialize_ex(TFInstr::CHECK_POW, flags, block, [now_unix_time, 0])
+        self.push_instr_serialize_ex(TFInstr::LOAD_POW, flags, block, [now_unix_time, TF_POW_CHECK])
     }
 
     /// Whether the node would accept this PoS block as a proposal now, without storing it.
@@ -1205,11 +1306,21 @@ pub fn read_load_pos(bytes: &[u8], instr: &TFInstr) -> Option<(BftBlock, FatPoin
 }
 
 pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> {
-    const_assert!(TFInstr::COUNT == 36);
+    const_assert!(TFInstr::COUNT == 37);
     match instr.kind {
         TFInstr::LOAD_POW => {
-            let block = Block::zcash_deserialize(instr.data_slice(bytes)).ok()?;
-            Some(TestInstr::LoadPoW(block))
+            let data = instr.data_slice(bytes);
+            match instr.val[1] {
+                TF_POW_DIRECT => Some(TestInstr::LoadPoW(Block::zcash_deserialize(data).ok()?)),
+                TF_POW_STP_PEER => Some(TestInstr::RecvPoW { block: data.to_vec(), peer: instr.val[0], claim: None }),
+                TF_POW_STP_CLAIMED => {
+                    let (claim, bytes) = StpClaim::read(data)?;
+                    Some(TestInstr::RecvPoW { block: bytes.to_vec(), peer: instr.val[0], claim: Some(claim) })
+                }
+                TF_POW_TEMPLATE => Some(TestInstr::MineFromTemplate { slot: instr.val[0] }),
+                TF_POW_CHECK => Some(TestInstr::CheckPoW { block: Block::zcash_deserialize(data).ok()?, now: instr.val[0] }),
+                _ => None,
+            }
         }
 
         TFInstr::LOAD_POS => {
@@ -1273,13 +1384,15 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
             String::from_utf8(instr.data_slice(bytes).to_vec()).ok()?,
         )),
         TFInstr::EXPECT_NODE_ALIVE => Some(TestInstr::ExpectNodeAlive),
-        TFInstr::RECV_TX => Some(TestInstr::RecvTx {
-            wire: instr.data_slice(bytes).to_vec(),
-            peer: instr.val[0],
-        }),
-        TFInstr::SUBMIT_TX => Some(TestInstr::SubmitTx(
-            Transaction::zcash_deserialize(instr.data_slice(bytes)).ok()?,
-        )),
+        TFInstr::SUBMIT_TX => {
+            let tx = Transaction::zcash_deserialize(instr.data_slice(bytes)).ok()?;
+            match instr.val[1] {
+                TF_TX_LOCAL => Some(TestInstr::SubmitTx(tx)),
+                TF_TX_WIRE => Some(TestInstr::RecvTx { tx, peer: instr.val[0] }),
+                TF_TX_STP_PEER => Some(TestInstr::RecvTxStp { tx, peer: instr.val[0] }),
+                _ => None,
+            }
+        }
         TFInstr::EXPECT_MEMPOOL_CONTAINS => Some(TestInstr::ExpectMempoolContains(
             Transaction::zcash_deserialize(instr.data_slice(bytes)).ok()?,
         )),
@@ -1303,15 +1416,6 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
             let amount = |i: usize| u64::from_le_bytes(data[8 * i..8 * i + 8].try_into().expect("eight bytes"));
             Some(TestInstr::ExpectPoolTotals([amount(0), amount(1), amount(2)]))
         }
-        TFInstr::RECV_POW => Some(TestInstr::RecvPoW {
-            block: instr.data_slice(bytes).to_vec(),
-            peer: instr.val[0],
-        }),
-        TFInstr::MINE_FROM_TEMPLATE => Some(TestInstr::MineFromTemplate { slot: instr.val[0] }),
-        TFInstr::CHECK_POW => Some(TestInstr::CheckPoW {
-            block: Block::zcash_deserialize(instr.data_slice(bytes)).ok()?,
-            now: instr.val[0],
-        }),
         TFInstr::CHECK_POS => {
             let block_and_fat_ptr = BftBlockAndFatPointerToItWrap::zcash_deserialize(instr.data_slice(bytes)).ok()?;
             Some(TestInstr::CheckPoS(block_and_fat_ptr.0.block))
@@ -1399,7 +1503,9 @@ pub(crate) enum TestInstr {
     ExpectPoWBlockFinality(ZebBlockHash, Option<TFLBlockFinality>),
     ExpectRejectionReason(String),
     ExpectNodeAlive,
-    RecvTx { wire: Vec<u8>, peer: u64 },
+    // The doorways of LOAD_POW and SUBMIT_TX stay separate variants: each drives the node its
+    // own way.
+    RecvTx { tx: Transaction, peer: u64 },
     SubmitTx(Transaction),
     ExpectMempoolContains(Transaction),
     ExpectMempoolAbsent(Transaction),
@@ -1410,8 +1516,10 @@ pub(crate) enum TestInstr {
     /// [bonded, unbonded, finalizer rewards]
     ExpectPoolTotals([u64; 3]),
     /// Raw bytes: the peer serves exactly what the file holds, parseable or not.
-    RecvPoW { block: Vec<u8>, peer: u64 },
+    /// With a claim, the peer advertises it instead of what the bytes parse to.
+    RecvPoW { block: Vec<u8>, peer: u64, claim: Option<StpClaim> },
     RecvStpPacket { packet: Vec<u8>, peer: u64 },
+    RecvTxStp { tx: Transaction, peer: u64 },
     MineFromTemplate { slot: u64 },
     /// The block named by `hash`, or by `slot` when there is no hash.
     ExpectPoWTip { hash: Option<ZebBlockHash>, slot: u64 },
@@ -1441,6 +1549,7 @@ pub(crate) async fn handle_instr(
     instr: TestInstr,
     flags: u32,
     instr_i: usize,
+    trusted: bool,
 ) {
     let is_bft = matches!(
         instr,
@@ -1455,6 +1564,23 @@ pub(crate) async fn handle_instr(
     if is_bft {
         bft_await_start(internal_handle).await;
     }
+    // A delivery's verdict can come before the sync loop has done what it leads to, such as
+    // committing a block that was waiting for the one delivered, so what reads the chain waits
+    // for a tick that began after it.
+    let reads_chain = matches!(
+        instr,
+        TestInstr::ExpectPoWTip { .. }
+            | TestInstr::ExpectPoWChainLength(_)
+            | TestInstr::ExpectFinalizedTip { .. }
+            | TestInstr::ExpectPoWBlockFinality(..)
+            | TestInstr::ExpectBond(..)
+            | TestInstr::ExpectFinalizerBank(..)
+            | TestInstr::ExpectPoolTotals(_)
+            | TestInstr::ExpectStakingReplayMatches
+    );
+    if reads_chain {
+        sync_settle().await;
+    }
     match instr {
         TestInstr::LoadPoW(block) => {
             // let path = format!("../crosslink-test-data/test_pow_block_{}.bin", instr_i);
@@ -1464,7 +1590,7 @@ pub(crate) async fn handle_instr(
 
             // Through new_network's ingest queue, the doorway submitblock uses, so blocks take
             // the production admission path rather than a parallel one.
-            let outcome = if TRUSTED_LOAD_POW.load(std::sync::atomic::Ordering::Relaxed) {
+            let outcome = if trusted {
                 zebra_state::new_network::submit_trusted_block_to_new_network(Arc::new(block), NODE_ANSWER_WAIT).await
             } else {
                 zebra_state::new_network::submit_block_to_new_network(Arc::new(block), NODE_ANSWER_WAIT).await
@@ -1475,14 +1601,14 @@ pub(crate) async fn handle_instr(
         TestInstr::MineFromTemplate { slot } => match internal_handle.call.block_from_template.get() {
             None => check_ingest(
                 flags,
-                "MINE_FROM_TEMPLATE: ",
+                "LOAD_POW from the template: ",
                 Err("the node has no RPC implementation to take a template from".to_string()),
             ),
             Some(block_from_template) => match block_from_template().await {
-                Err(err) => check_ingest(flags, "MINE_FROM_TEMPLATE: ", Err(err)),
+                Err(err) => check_ingest(flags, "LOAD_POW from the template: ", Err(err)),
                 Ok(block) => {
                     let label = format!(
-                        "MINE_FROM_TEMPLATE {} @ {:?}, {} transaction(s): ",
+                        "LOAD_POW from the template {} @ {:?}, {} transaction(s): ",
                         block.hash(),
                         block.coinbase_height().map(|height| height.0),
                         block.transactions.len()
@@ -1501,7 +1627,7 @@ pub(crate) async fn handle_instr(
         TestInstr::CheckPoW { block, now } => {
             use zebra_consensus::sync_verify::{block_check_body, block_check_header};
             let network = &internal_handle.network;
-            let label = format!("CHECK_POW {} at time {now}", block.hash());
+            let label = format!("LOAD_POW checks only {} at time {now}", block.hash());
             let (Some(height), Some(time)) = (block.coinbase_height(), chrono::DateTime::from_timestamp(now as i64, 0)) else {
                 test_check(flags, false, &format!("{label}: rejected: no coinbase height, or a time out of range"));
                 return;
@@ -1579,6 +1705,15 @@ pub(crate) async fn handle_instr(
                 } else if bits & TF_BFT_FOR_NODE_PROPOSAL != 0 {
                     node_proposal_id(internal_handle, &view, height, round)
                         .ok_or_else(|| format!("the node has sent no proposal at {height}.{round}"))?
+                } else if bits & TF_BFT_FOR_DELIVERED_PROPOSAL != 0 {
+                    TEST_BFT_DELIVERED
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .rev()
+                        .find(|(at, _)| *at == (height, round))
+                        .map(|(_, id)| *id)
+                        .ok_or_else(|| format!("no proposal was delivered at {height}.{round}"))?
                 } else {
                     value_id.map_or(tenderlink::ValueId::NIL, tenderlink::ValueId)
                 };
@@ -1602,7 +1737,19 @@ pub(crate) async fn handle_instr(
                 Err(err) => test_check_outcome(false, false, &format!("BFT_RECV_PROPOSAL: {err}")),
                 Ok(view) => {
                     let key = synthetic_finalizer_key(finalizer);
+                    let value = if flags & TF_BFT_ON_NODE_TIP != 0 {
+                        match BftBlock::zcash_deserialize(&value[..]) {
+                            Ok(mut block) => {
+                                block.previous_block_fat_ptr = zebra_state::new_network::bft::bft_chain().read().unwrap().fat_pointer_to_tip.clone();
+                                block.zcash_serialize_to_vec().expect("a BFT block serializes")
+                            }
+                            Err(_) => value,
+                        }
+                    } else {
+                        value
+                    };
                     let value_id = tenderlink::value_id_of(&view.hash_keys, &value);
+                    TEST_BFT_DELIVERED.lock().unwrap().push(((height, round), value_id));
                     let packets: Vec<Vec<u8>> = tenderlink::proposal_chunk_packets(
                         &key, &value, value_id, height, round, valid_round, &view.vote_namespace, view.roster.len(),
                     )
@@ -1855,15 +2002,18 @@ pub(crate) async fn handle_instr(
             );
         }
 
-        TestInstr::RecvTx { wire, peer } => {
+        TestInstr::RecvTx { tx, peer } => {
             let sender = synthetic_peer(peer);
-            let delivery = tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.inbound_wire)(sender, wire)).await;
-            let (delivered, message) = match delivery {
-                Ok(Ok(())) => (true, format!("RECV_TX: delivered from peer {sender}")),
-                Ok(Err(err)) => (false, format!("RECV_TX: the message from peer {sender} was refused: {err}")),
-                Err(_) => (false, format!("RECV_TX: no answer delivering from peer {sender} within {NODE_ANSWER_WAIT:?}")),
+            let label = format!("SUBMIT_TX {} via wire peer {sender}", tx.hash());
+            let (accepted, message) = match zebra_network::wire::tx_message_bytes(&internal_handle.network, UnminedTx::from(tx.clone())) {
+                Err(err) => (false, format!("{label}: does not frame: {err}")),
+                Ok(wire) => match tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.inbound_wire)(sender, wire)).await {
+                    Ok(Ok(())) => await_tx_verdict(internal_handle, &tx, &label).await,
+                    Ok(Err(err)) => (false, format!("{label}: rejected: the message was refused: {err}")),
+                    Err(_) => (false, format!("{label}: no answer delivering it within {NODE_ANSWER_WAIT:?}")),
+                },
             };
-            test_check(flags, delivered, &message);
+            test_check(flags, accepted, &message);
         }
 
         TestInstr::SubmitTx(transaction) => {
@@ -1871,12 +2021,12 @@ pub(crate) async fn handle_instr(
             test_check(flags, accepted, &message);
         }
 
-        TestInstr::RecvPoW { block, peer } => match take_stp_peer(peer) {
-            Err(err) => check_ingest(flags, "RECV_POW: ", Err(err)),
+        TestInstr::RecvPoW { block, peer, claim } => match take_stp_peer(peer) {
+            Err(err) => check_ingest(flags, "LOAD_POW via STP: ", Err(err)),
             Ok(mut stp) => {
-                let outcome = serve_block(internal_handle, &mut stp, &block).await;
+                let outcome = serve_block(internal_handle, &mut stp, &block, claim).await;
                 put_stp_peer(stp);
-                check_ingest(flags, "RECV_POW: ", outcome);
+                check_ingest(flags, &format!("LOAD_POW via STP peer {peer}: "), outcome);
             }
         },
 
@@ -1886,6 +2036,22 @@ pub(crate) async fn handle_instr(
                 let (survived, message) = deliver_stp_packet(&mut stp, packet).await;
                 put_stp_peer(stp);
                 test_check(flags, survived, &message);
+            }
+        },
+
+        TestInstr::RecvTxStp { tx, peer } => match take_stp_peer(peer) {
+            Err(err) => test_check_outcome(false, false, &format!("SUBMIT_TX via STP: {err}")),
+            Ok(mut stp) => {
+                let label = format!("SUBMIT_TX {} via STP peer {peer}", tx.hash());
+                let wire_tx = tx.zcash_serialize_to_vec().expect("a parsed transaction serializes");
+                let (served, message) = serve_tx(&mut stp, &wire_tx).await;
+                let (accepted, message) = if served {
+                    await_stp_tx_outcome(&mut stp, &tx, &label).await
+                } else {
+                    (false, format!("{label}: rejected: {message}"))
+                };
+                put_stp_peer(stp);
+                test_check(flags, accepted, &message);
             }
         },
 
@@ -2123,13 +2289,15 @@ struct HarnessStpPeer {
 /// across an await.
 static TEST_STP_PEERS: Mutex<Vec<HarnessStpPeer>> = Mutex::new(Vec::new());
 
-/// How long a packet gets to provoke a kill. The sync loop ticks every 100 ms, and nothing
-/// acknowledges a packet, so this is a bound rather than a handshake.
-const STP_PACKET_SETTLE: Duration = Duration::from_secs(1);
+/// Sync loop passes a packet gets to provoke a kill after the pass that read it: a refusal decided
+/// off the loop, such as a transaction body the relay bridge decodes, comes back a pass or two
+/// later. Nothing acknowledges a packet, so this is a bound rather than a handshake.
+const STP_PACKET_SETTLE_PASSES: usize = 3;
 
 /// How long to watch a peer advertise a block the node already has. The node never requests it,
-/// so there is no verdict to wait for, only a kill to rule out.
-const KNOWN_BLOCK_SETTLE: Duration = Duration::from_secs(2);
+/// so there is no verdict to wait for, only a kill to rule out; a STATUS naming a new tip brings
+/// the download pass forward to within DL_INIT_WOKEN_MIN_MS, so a request would come well within.
+const KNOWN_BLOCK_SETTLE: Duration = Duration::from_millis(100);
 
 /// Replays the best chain's staking from genesis and compares the result with the node's bonds
 /// and finalizer banks. `holds` is false on any difference; a read the node did not answer is a
@@ -2171,16 +2339,25 @@ async fn staking_replay_matches(internal_handle: &TFLServiceHandle) -> (bool, St
             BondStatusInChain::Withdrawn { .. } => 2,
             BondStatusInChain::Burned => 3,
         };
+        let replayed_version = bond.current_version(|created_at| {
+            blocks[created_at.height.0 as usize].transactions[created_at.index.as_usize()].hash().0
+        });
         let answer = tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.state)(StateRequest::BondInfo(*key))).await;
         match answer {
             Ok(Ok(StateResponse::BondInfo(Some(info)))) => {
-                if info.amount != bond.amount || info.status != replayed_status || info.target_finalizer != bond.target_finalizer {
+                if info.amount != bond.amount
+                    || info.status != replayed_status
+                    || info.target_finalizer != bond.target_finalizer
+                    || info.version != replayed_version
+                {
                     differences.push(format!(
-                        "bond {}: replay has amount {} status {replayed_status}, node has amount {} status {}",
+                        "bond {}: replay has amount {} status {replayed_status} version {}, node has amount {} status {} version {}",
                         hex32(key),
                         u64::from(bond.amount),
+                        hex32(&replayed_version),
                         u64::from(info.amount),
-                        info.status
+                        info.status,
+                        hex32(&info.version)
                     ));
                 }
             }
@@ -2211,7 +2388,7 @@ async fn staking_replay_matches(internal_handle: &TFLServiceHandle) -> (bool, St
     }
 }
 
-/// Hashes of blocks the node built during the test, by the slot MINE_FROM_TEMPLATE put them in.
+/// Hashes of blocks the node built during the test, by the slot LOAD_POW from the template put them in.
 static TEST_BLOCK_SLOTS: Mutex<Vec<(u64, ZebBlockHash)>> = Mutex::new(Vec::new());
 
 /// The block an instruction names: its hash, else the one remembered in its slot, else none.
@@ -2221,7 +2398,7 @@ fn named_block(hash: Option<ZebBlockHash>, slot: u64) -> Result<Option<ZebBlockH
     }
     match TEST_BLOCK_SLOTS.lock().unwrap().iter().find(|(taken, _)| *taken == slot) {
         Some((_, hash)) => Ok(Some(*hash)),
-        None => Err(format!("slot {slot} holds no block; MINE_FROM_TEMPLATE fills slots")),
+        None => Err(format!("slot {slot} holds no block; LOAD_POW from the template fills slots")),
     }
 }
 
@@ -2235,9 +2412,11 @@ static TEST_BFT_PEERS: Mutex<Vec<HarnessBftPeer>> = Mutex::new(Vec::new());
 /// The votes and proposal chunks the node has sent any synthetic finalizer during the test, each
 /// once. The node resends what a peer's status asks for on every tick, so most arrive many times.
 static TEST_BFT_SENT: Mutex<Vec<tenderlink::SentConsensus>> = Mutex::new(Vec::new());
+/// The value id of every proposal BFT_RECV_PROPOSAL delivered, by height and round, as sent.
+static TEST_BFT_DELIVERED: Mutex<Vec<((u64, u32), tenderlink::ValueId)>> = Mutex::new(Vec::new());
 
 fn synthetic_finalizer_key(k: u64) -> ed25519_zebra::SigningKey {
-    finalizer_key_from_seed(synthetic_finalizer_seed(k).as_bytes()).1
+    finalizer_key_from_seed(synthetic_finalizer_seed(k).as_bytes()).0
 }
 
 fn roster_index(roster: &[tenderlink::SortedRosterMember], key: &ed25519_zebra::SigningKey) -> Option<usize> {
@@ -2247,7 +2426,7 @@ fn roster_index(roster: &[tenderlink::SortedRosterMember], key: &ed25519_zebra::
 
 fn node_roster_index(internal_handle: &TFLServiceHandle, view: &tenderlink::EngineView) -> Option<usize> {
     let seed = internal_handle.config.explicit_bft_key_seed.as_deref().unwrap_or(TEST_NODE_FINALIZER_SEED);
-    roster_index(&view.roster, &finalizer_key_from_seed(seed.as_bytes()).1)
+    roster_index(&view.roster, &finalizer_key_from_seed(seed.as_bytes()).0)
 }
 
 fn view_proposer(view: &tenderlink::EngineView, height: u64, round: u32) -> Option<usize> {
@@ -2341,19 +2520,52 @@ async fn bft_deliver(k: u64, packets: Vec<Vec<u8>>) -> (bool, String) {
 
 /// Returns once the engine has run the loop passes that take in, read and act on whatever reached
 /// it before the call, then records what the node sent. The bound is for an engine that has
-/// stopped; a running one passes in milliseconds.
+/// stopped; a running one passes in milliseconds. The passes are woken rather than waited for:
+/// the engine ticks by the test's clock, so an early pass only moves packets sooner.
+///
+/// A decision the node has parked (its status names the height) ends the wait at once: the engine
+/// waits on the node's answer to it, which the node gives only once the decision's snapshot is
+/// back, so no pass will come until a later instruction brings it.
 async fn bft_settle() -> Result<(), String> {
     use std::sync::atomic::Ordering;
     let start = tenderlink::LOOP_PASSES.load(Ordering::Acquire);
     let waited = tokio::time::timeout(NODE_ANSWER_WAIT, async {
-        while tenderlink::LOOP_PASSES.load(Ordering::Acquire) < start + 3 {
+        loop {
+            if let Some(height) = zebra_state::new_network::bft::bft_recency_status().parked_decision_height {
+                return Err(format!("the BFT engine waits on the node, which holds back its decision at height {height} until that decision's snapshot is back"));
+            }
+            if tenderlink::LOOP_PASSES.load(Ordering::Acquire) >= start + 3 {
+                return Ok(());
+            }
+            tenderlink::wake_engine();
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
     .await;
-    if waited.is_err() {
-        return Err(format!("the BFT engine ran no loop passes within {NODE_ANSWER_WAIT:?}"));
-    }
+    let settled = match waited {
+        Ok(settled) => settled,
+        Err(_) => Err(format!("the BFT engine ran no loop passes within {NODE_ANSWER_WAIT:?}")),
+    };
+    record_bft_sent();
+    settled
+}
+
+/// Returns once a sync loop tick that began after the call has finished, waking the loop so it does
+/// not wait out its idle time. Bounded for a loop that has stopped, which the check after reports.
+async fn sync_settle() {
+    use std::sync::atomic::Ordering;
+    let start = zebra_state::new_network::SYNC_TICKS_DONE.load(Ordering::Acquire);
+    let _ = tokio::time::timeout(NODE_ANSWER_WAIT, async {
+        while zebra_state::new_network::SYNC_TICKS_DONE.load(Ordering::Acquire) < start + 2 {
+            zebra_state::new_network::wake_sync_loop_now();
+            tokio::time::sleep(Duration::from_micros(200)).await;
+        }
+    })
+    .await;
+}
+
+/// Records what the node has sent the synthetic finalizers since the last call.
+fn record_bft_sent() {
     let mut sent = TEST_BFT_SENT.lock().unwrap();
     for peer in TEST_BFT_PEERS.lock().unwrap().iter() {
         while let Ok(packet) = peer.link.outbound.try_recv() {
@@ -2364,7 +2576,6 @@ async fn bft_settle() -> Result<(), String> {
             }
         }
     }
-    Ok(())
 }
 
 fn take_stp_peer(index: u64) -> Result<HarnessStpPeer, String> {
@@ -2399,21 +2610,23 @@ async fn deliver_stp_packet(stp: &mut HarnessStpPeer, packet: Vec<u8>) -> (bool,
     if let Some(reason) = &stp.killed {
         return (false, format!("RECV_STP_PACKET: peer {index} was already killed: {reason}"));
     }
-    let _ = stp.link.inbound.send(packet);
+    stp.link.send(packet);
 
-    let deadline = tokio::time::Instant::now() + STP_PACKET_SETTLE;
+    for _ in 0..1 + STP_PACKET_SETTLE_PASSES {
+        sync_settle().await;
+    }
     loop {
-        tokio::select! {
-            event = stp.link.events.recv() => match event {
-                Some(SyntheticPeerEvent::Killed(reason)) => {
-                    stp.killed = Some(reason.clone());
-                    return (false, format!("RECV_STP_PACKET: the node killed peer {index}: {reason}"));
-                }
-                Some(_) => {}
-                None => return (false, "RECV_STP_PACKET: the sync loop is gone".to_string()),
-            },
-            _ = tokio::time::sleep_until(deadline) => {
-                return (true, format!("RECV_STP_PACKET: peer {index} still connected after {STP_PACKET_SETTLE:?}"));
+        match stp.link.events.try_recv() {
+            Ok(SyntheticPeerEvent::Killed(reason)) => {
+                stp.killed = Some(reason.clone());
+                return (false, format!("RECV_STP_PACKET: the node killed peer {index}: {reason}"));
+            }
+            Ok(_) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                return (true, format!("RECV_STP_PACKET: peer {index} still connected {STP_PACKET_SETTLE_PASSES} sync passes after the one that read it"));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                return (false, "RECV_STP_PACKET: the sync loop is gone".to_string());
             }
         }
     }
@@ -2426,6 +2639,7 @@ async fn serve_block(
     internal_handle: &TFLServiceHandle,
     stp: &mut HarnessStpPeer,
     wire_block: &[u8],
+    claim: Option<StpClaim>,
 ) -> Result<zebra_state::new_network::IngestOutcome, String> {
     use zebra_state::new_network::{
         block_chunk_packets, parse_block_request, status_packet, IngestOutcome, NearTipChains, ShadowBlock,
@@ -2433,12 +2647,17 @@ async fn serve_block(
     };
     let index = stp.index;
     let killed = |reason: String| Ok(IngestOutcome::Failed { reason, misbehavior_score: 0 });
-    let Ok(block) = Block::zcash_deserialize(wire_block) else {
-        return Err("the block does not parse, so no STATUS can advertise it; send its packets with RECV_STP_PACKET".to_string());
-    };
-    let hash = block.hash();
-    let Some(height) = block.coinbase_height().map(|height| height.0) else {
-        return Err(format!("block {hash} has no coinbase height, so no STATUS can advertise it"));
+    let StpClaim { hash, parent, height } = match claim {
+        Some(claim) => claim,
+        None => {
+            let Ok(block) = Block::zcash_deserialize(wire_block) else {
+                return Err("the block does not parse, so no STATUS can advertise it; serve it under a claim (TF_POW_STP_CLAIMED)".to_string());
+            };
+            let Some(claim) = StpClaim::of(&block) else {
+                return Err(format!("block {} has no coinbase height, so no STATUS can advertise it; serve it under a claim (TF_POW_STP_CLAIMED)", block.hash()));
+            };
+            claim
+        }
     };
 
     drain_stp_peer(stp);
@@ -2457,11 +2676,13 @@ async fn serve_block(
     };
 
     let mut chains = NearTipChains::default();
-    chains.push_chain_unchecked(vec![ShadowBlock { this_hash: hash, parent_hash: block.header.previous_block_hash, this_height: height }]);
-    let _ = stp.link.inbound.send(status_packet(&[], &chains, None));
+    chains.push_chain_unchecked(vec![ShadowBlock { this_hash: hash, parent_hash: parent, this_height: height }]);
+    stp.link.send(status_packet(&[], &chains, None));
 
     let deadline = tokio::time::Instant::now() + if already_known.is_some() { KNOWN_BLOCK_SETTLE } else { NODE_ANSWER_WAIT };
     let (mut requests, mut chunks) = (0usize, 0usize);
+    // Every offset the node asked from, so a request the peer cannot answer is still reported.
+    let mut offsets: Vec<u32> = Vec::new();
     loop {
         tokio::select! {
             packet = stp.link.outbound.recv() => {
@@ -2472,11 +2693,17 @@ async fn serve_block(
                     continue; // STATUS, address gossip, hole punching: a real peer would handle these, but they don't bear on this block
                 };
                 let asks_for_this = req_hash == hash || (req_hash == ZebBlockHash([0; 32]) && req_height == height);
-                if asks_for_this && (offset as usize) < wire_block.len() {
+                if asks_for_this {
                     requests += 1;
+                    if offsets.len() < 8 {
+                        offsets.push(offset);
+                    }
+                }
+                // A peer holding fewer bytes than the offset asked from has nothing to send.
+                if asks_for_this && (offset as usize) < wire_block.len() {
                     for chunk in block_chunk_packets(wire_block, height, hash, offset as usize) {
                         chunks += 1;
-                        let _ = stp.link.inbound.send(chunk);
+                        stp.link.send(chunk);
                     }
                 }
             }
@@ -2496,8 +2723,57 @@ async fn serve_block(
                     return Ok(IngestOutcome::Known { location: known.location.clone(), height: known.height });
                 }
                 return Err(format!(
-                    "{hash} @ {height} after {NODE_ANSWER_WAIT:?}; the node sent {requests} request(s) for it, answered with {chunks} chunk(s)"
+                    "{hash} @ {height} after {NODE_ANSWER_WAIT:?}; the node sent {requests} request(s) for it (from offsets {offsets:?}, of the {} bytes served), answered with {chunks} chunk(s)",
+                    wire_block.len()
                 ));
+            }
+        }
+    }
+}
+
+/// Plays a peer that has `wire_tx` in its mempool: lists it, then answers the node's TX_REQ for
+/// it with a TX. `true` once it was asked for and sent; a kill or no ask is `false`.
+async fn serve_tx(stp: &mut HarnessStpPeer, wire_tx: &[u8]) -> (bool, String) {
+    use zebra_chain::transaction::UnminedTxId;
+    use zebra_state::new_network::tx_relay::{parse_tx_req, tx_packets, tx_status_packet};
+    use zebra_state::new_network::SyntheticPeerEvent;
+    let index = stp.index;
+    let Ok(tx) = Transaction::zcash_deserialize(wire_tx) else {
+        return (false, "the transaction does not parse; send its packets with RECV_STP_PACKET".to_string());
+    };
+    let id = UnminedTxId::from(&tx);
+    drain_stp_peer(stp);
+    if let Some(reason) = &stp.killed {
+        return (false, format!("peer {index} was already killed: {reason}"));
+    }
+    // Wire sizes fit u32: a transaction is at most MAX_BLOCK_BYTES.
+    stp.link.send(tx_status_packet(1, [(&id, wire_tx.len() as u32)]));
+
+    let deadline = tokio::time::Instant::now() + NODE_ANSWER_WAIT;
+    loop {
+        tokio::select! {
+            packet = stp.link.outbound.recv() => {
+                let Some(packet) = packet else {
+                    return (false, "the sync loop is gone".to_string());
+                };
+                // HELLO, STATUS, TX_STATUS, MEMPOOL_REQ: not this exchange.
+                if parse_tx_req(&packet).is_some_and(|ids| ids.contains(&id)) {
+                    for packet in tx_packets([&tx]) {
+                        stp.link.send(packet);
+                    }
+                    return (true, format!("peer {index} was asked for {id} and sent it"));
+                }
+            }
+            event = stp.link.events.recv() => match event {
+                Some(SyntheticPeerEvent::Killed(reason)) => {
+                    stp.killed = Some(reason.clone());
+                    return (false, format!("the node killed peer {index}: {reason}"));
+                }
+                Some(_) => {}
+                None => return (false, "the sync loop is gone".to_string()),
+            },
+            _ = tokio::time::sleep_until(deadline) => {
+                return (false, format!("the node never asked peer {index} for {id} within {NODE_ANSWER_WAIT:?}"));
             }
         }
     }
@@ -2516,7 +2792,7 @@ fn synthetic_peer(index: u64) -> std::net::SocketAddr {
 /// Submits `transaction` locally, as the wallet and RPC do, and returns the mempool's verdict:
 /// accepted, or rejected with its reason.
 async fn submit_tx(internal_handle: &TFLServiceHandle, transaction: Transaction) -> (bool, String) {
-    use zebra_node_services::mempool::{Gossip, Request, Response};
+    use zebra_node_services::mempool::{Gossip, Request, Response, Verdict};
 
     let txid = transaction.hash();
     let queued = tokio::time::timeout(
@@ -2534,8 +2810,8 @@ async fn submit_tx(internal_handle: &TFLServiceHandle, transaction: Transaction)
         Err(_) => return (false, format!("SUBMIT_TX {txid}: no answer from the mempool within {NODE_ANSWER_WAIT:?}")),
     };
     match tokio::time::timeout(NODE_ANSWER_WAIT, verdict).await {
-        Ok(Ok(Ok(()))) => (true, format!("SUBMIT_TX {txid}: accepted into the mempool")),
-        Ok(Ok(Err(err))) => (false, format!("SUBMIT_TX {txid}: rejected: {err}")),
+        Ok(Ok(Verdict::Accepted)) => (true, format!("SUBMIT_TX {txid}: accepted into the mempool")),
+        Ok(Ok(verdict)) => (false, format!("SUBMIT_TX {txid}: rejected: {verdict:?}")),
         Ok(Err(_)) => (false, format!("SUBMIT_TX {txid}: the mempool dropped the verdict")),
         Err(_) => (false, format!("SUBMIT_TX {txid}: no verdict within {NODE_ANSWER_WAIT:?}")),
     }
@@ -2556,30 +2832,13 @@ async fn await_mempool(
     transaction: &Transaction,
     expect: MempoolExpect,
 ) -> (bool, String) {
-    use zebra_node_services::mempool::{Request, Response};
-
-    let id = UnminedTxId::from(transaction);
     let txid = transaction.hash();
-    let ask = |request: Request| {
-        tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.mempool)(request))
-    };
     let deadline = tokio::time::Instant::now() + NODE_ANSWER_WAIT;
     loop {
-        let resident = match ask(Request::TransactionIds).await {
-            Ok(Ok(Response::TransactionIds(ids))) => ids.contains(&id),
-            other => return (false, format!("mempool {txid}: the transaction ids request answered {other:?}")),
+        let (resident, rejected, mined) = match mempool_tx_state(internal_handle, transaction).await {
+            Ok(state) => state,
+            Err(err) => return (false, err),
         };
-        let in_rejected_set = match ask(Request::RejectedTransactionIds([id].into_iter().collect())).await {
-            Ok(Ok(Response::RejectedTransactionIds(ids))) => !ids.is_empty(),
-            other => return (false, format!("mempool {txid}: the rejected ids request answered {other:?}")),
-        };
-        // The mempool files a mined transaction under its rejected ids too (as Mined), and does
-        // not say which reason applies, so the best chain decides: mined is not rejected.
-        let mined = match tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.state)(StateRequest::Transaction(txid))).await {
-            Ok(Ok(StateResponse::Transaction(found))) => found.is_some(),
-            other => return (false, format!("mempool {txid}: the mined transaction request answered {other:?}")),
-        };
-        let rejected = in_rejected_set && !mined;
         let state = format!("resident {resident}, rejected {rejected}, mined {mined}");
         let reached = match expect {
             MempoolExpect::Resident => resident,
@@ -2608,14 +2867,118 @@ async fn await_mempool(
                 ),
             );
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
 }
 
-pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs: &[TFInstr]) {
+/// Whether `transaction` is resident in the mempool, rejected by it, and mined on the best chain.
+async fn mempool_tx_state(internal_handle: &TFLServiceHandle, transaction: &Transaction) -> Result<(bool, bool, bool), String> {
+    use zebra_node_services::mempool::{Request, Response};
+
+    let id = UnminedTxId::from(transaction);
+    let txid = transaction.hash();
+    let ask = |request: Request| {
+        tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.mempool)(request))
+    };
+    let resident = match ask(Request::TransactionIds).await {
+        Ok(Ok(Response::TransactionIds(ids))) => ids.contains(&id),
+        other => return Err(format!("mempool {txid}: the transaction ids request answered {other:?}")),
+    };
+    let in_rejected_set = match ask(Request::RejectedTransactionIds([id].into_iter().collect())).await {
+        Ok(Ok(Response::RejectedTransactionIds(ids))) => !ids.is_empty(),
+        other => return Err(format!("mempool {txid}: the rejected ids request answered {other:?}")),
+    };
+    // The mempool files a mined transaction under its rejected ids too (as Mined), and does not
+    // say which reason applies, so the best chain decides: mined is not rejected.
+    let mined = match tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.state)(StateRequest::Transaction(txid))).await {
+        Ok(Ok(StateResponse::Transaction(found))) => found.is_some(),
+        other => return Err(format!("mempool {txid}: the mined transaction request answered {other:?}")),
+    };
+    Ok((resident, in_rejected_set && !mined, mined))
+}
+
+/// The mempool's verdict on a transaction synthetic peer `stp` relayed, as the node reports it to
+/// the peer: taken (accepted, or already held) or not, with the relay's outcome. The relay hears
+/// of every refusal, including one the mempool files nowhere, such as a spend conflict refused at
+/// the queue, which a poll of the mempool could only wait out.
+async fn await_stp_tx_outcome(stp: &mut HarnessStpPeer, transaction: &Transaction, label: &str) -> (bool, String) {
+    use zebra_state::new_network::SyntheticPeerEvent;
+    let id = UnminedTxId::from(transaction);
+    let deadline = tokio::time::Instant::now() + NODE_ANSWER_WAIT;
+    loop {
+        tokio::select! {
+            event = stp.link.events.recv() => match event {
+                Some(SyntheticPeerEvent::TxOutcome { id: got, taken, outcome }) if got == id => {
+                    return if taken {
+                        (true, format!("{label}: accepted into the mempool ({outcome})"))
+                    } else {
+                        (false, format!("{label}: rejected: the relay's outcome is {outcome}"))
+                    };
+                }
+                Some(SyntheticPeerEvent::Killed(reason)) => {
+                    stp.killed = Some(reason.clone());
+                    return (false, format!("{label}: rejected: the node killed the peer: {reason}"));
+                }
+                Some(_) => {}
+                None => return (false, format!("{label}: the sync loop is gone")),
+            },
+            _ = tokio::time::sleep_until(deadline) => {
+                return (false, format!("{label}: no relay outcome within {NODE_ANSWER_WAIT:?}"));
+            }
+        }
+    }
+}
+
+/// Waits, within a bound, for the mempool's verdict on a transaction that reached it from a peer:
+/// accepted once it is resident or mined, rejected once it is in the rejected set. Peer-sent
+/// transactions are downloaded and verified asynchronously, so the delivery alone says nothing.
+async fn await_tx_verdict(internal_handle: &TFLServiceHandle, transaction: &Transaction, label: &str) -> (bool, String) {
+    use zebra_node_services::mempool::{Request, Response};
+    let id = UnminedTxId::from(transaction);
+    let deadline = tokio::time::Instant::now() + NODE_ANSWER_WAIT;
+    loop {
+        match mempool_tx_state(internal_handle, transaction).await {
+            Err(err) => return (false, format!("{label}: {err}")),
+            Ok((true, _, _)) => return (true, format!("{label}: accepted into the mempool")),
+            Ok((_, _, true)) => return (true, format!("{label}: accepted: already mined")),
+            Ok((_, true, _)) => return (false, format!("{label}: rejected: in the mempool's rejected set")),
+            // The mempool takes a finished transaction out of flight and stores or rejects it in
+            // one step, so one in none of the four states was refused when it was queued.
+            Ok(_) => {
+                let in_flight = tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.mempool)(Request::InFlightTransactionIds)).await;
+                match in_flight {
+                    Ok(Ok(Response::TransactionIds(ids))) if !ids.contains(&id) => {
+                        // The states were read before the in-flight ids, so it may have finished
+                        // in between: read them once more.
+                        match mempool_tx_state(internal_handle, transaction).await {
+                            Ok((true, _, _)) => return (true, format!("{label}: accepted into the mempool")),
+                            Ok((_, _, true)) => return (true, format!("{label}: accepted: already mined")),
+                            Ok((_, true, _)) => return (false, format!("{label}: rejected: in the mempool's rejected set")),
+                            Ok(_) => return (false, format!("{label}: rejected: refused when queued (not in flight, resident, rejected or mined)")),
+                            Err(err) => return (false, format!("{label}: {err}")),
+                        }
+                    }
+                    Ok(Ok(Response::TransactionIds(_))) => {}
+                    other => return (false, format!("{label}: the in-flight ids request answered {other:?}")),
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return (false, format!("{label}: no mempool verdict within {NODE_ANSWER_WAIT:?}"));
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs: &[TFInstr], options: ReadOptions) {
     // A failed deserialize is a hard error for a normal test but an expected input rejection
     // for the fuzzer; `uhh_option` decides which via TEST_ON_FAIL (PANIC vs recover).
     let on_fail = *TEST_ON_FAIL.lock().unwrap();
+    // Race mode's run of deliveries in flight, and the STP peers they hold: a peer serves one
+    // delivery at a time, so one asked for again ends the run first.
+    let mut racing: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>> = Vec::new();
+    let mut racing_peers: Vec<u64> = Vec::new();
+    let handle = &internal_handle;
     for instr_i in 0..instrs.len() {
         // info!(
         //     "Loading instruction {}: {} ({})",
@@ -2635,9 +2998,37 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
                 );
             }
         }
+        if options.race {
+            if let Some(instr) = parsed.clone() {
+                let is_delivery = matches!(
+                    instr,
+                    TestInstr::LoadPoW(_) | TestInstr::RecvPoW { .. } | TestInstr::SubmitTx(_) | TestInstr::RecvTx { .. } | TestInstr::RecvTxStp { .. }
+                );
+                let peer = match &instr {
+                    TestInstr::RecvPoW { peer, .. } | TestInstr::RecvTxStp { peer, .. } => Some(*peer),
+                    _ => None,
+                };
+                if !is_delivery || peer.is_some_and(|peer| racing_peers.contains(&peer)) {
+                    futures::future::join_all(racing.drain(..)).await;
+                    racing_peers.clear();
+                }
+                if is_delivery {
+                    racing_peers.extend(peer);
+                    let trusted = instr_i < options.trusted_before;
+                    racing.push(Box::pin(handle_instr(handle, bytes, instr, ANY_OUTCOME, instr_i, trusted)));
+                    *TEST_INSTR_C.lock().unwrap() = instr_i + 1;
+                    continue;
+                }
+                if matches!(instr, TestInstr::ExpectRejectionReason(_)) {
+                    *TEST_INSTR_C.lock().unwrap() = instr_i + 1;
+                    continue;
+                }
+            }
+        }
         if let Some(instr) = uhh_option(parsed, on_fail) {
             let height = match &instr {
                 TestInstr::LoadPoW(block) => block.coinbase_height().map(|height| height.0),
+                TestInstr::RecvPoW { claim: Some(claim), .. } => Some(claim.height),
                 TestInstr::RecvPoW { block, .. } => Block::zcash_deserialize(&block[..])
                     .ok()
                     .and_then(|block| block.coinbase_height())
@@ -2654,6 +3045,7 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
                 instr,
                 instrs[instr_i].flags,
                 instr_i,
+                instr_i < options.trusted_before,
             )
             .await;
 
@@ -2680,6 +3072,7 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
 
         *TEST_INSTR_C.lock().unwrap() = instr_i + 1; // accounts for end
     }
+    futures::future::join_all(racing.drain(..)).await;
 }
 
 pub(crate) async fn instr_reader(internal_handle: TFLServiceHandle) {
@@ -2695,7 +3088,8 @@ pub(crate) async fn instr_reader(internal_handle: TFLServiceHandle) {
             if before_time.elapsed().as_secs() > 30 {
                 panic!("Timeout waiting for test to start.");
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            // Short, since every test waits here once: the node is usually up within milliseconds.
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
     println!("Starting test!");
@@ -2719,7 +3113,8 @@ pub(crate) async fn instr_reader(internal_handle: TFLServiceHandle) {
     *TEST_INSTRS.lock().unwrap() = tf.instrs.clone();
 
     let params = internal_handle.params;
-    read_instrs(internal_handle, &bytes, &tf.instrs).await;
+    let options = *crate::TEST_READ_OPTIONS.lock().unwrap();
+    read_instrs(internal_handle, &bytes, &tf.instrs, options).await;
 
     // Copy everything out and release every lock BEFORE asserting. The panic hook runs before
     // unwinding, while anything the failing statement holds is still held, and it calls

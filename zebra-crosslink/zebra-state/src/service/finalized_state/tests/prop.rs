@@ -77,6 +77,7 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
             nu6_3: Some(48),
             featurenet_upgrade_1: None,
             featurenet_upgrade_2: None,
+            featurenet_upgrade_3: None,
             nu7: Some(50),
         })
         .expect("failed to set activation heights")

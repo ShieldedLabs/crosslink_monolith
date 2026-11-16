@@ -30,7 +30,6 @@ use crate::{
         },
         sync::RecentSyncLengths,
     },
-    BoxError,
 };
 
 /// The number of iterations to crawl while testing.
@@ -347,18 +346,19 @@ async fn respond_to_queue_request(
     expected_transaction_ids: HashSet<UnminedTxId>,
     response: impl IntoIterator<Item = Result<(), MempoolError>>,
 ) -> Result<(), TestCaseError> {
-    let response: Vec<Result<oneshot::Receiver<Result<(), BoxError>>, BoxError>> = response
-        .into_iter()
-        .map(|result| {
-            result
-                .map(|_| {
-                    let (rsp_tx, rsp_rx) = oneshot::channel();
-                    let _ = rsp_tx.send(Ok(()));
-                    rsp_rx
-                })
-                .map_err(BoxError::from)
-        })
-        .collect();
+    let response: Vec<Result<oneshot::Receiver<mempool::Verdict>, mempool::QueueRefusal>> =
+        response
+            .into_iter()
+            .map(|result| {
+                result
+                    .map(|_| {
+                        let (rsp_tx, rsp_rx) = oneshot::channel();
+                        let _ = rsp_tx.send(mempool::Verdict::Accepted);
+                        rsp_rx
+                    })
+                    .map_err(mempool::QueueRefusal::from)
+            })
+            .collect();
 
     mempool
         .expect_request_that(|req| {

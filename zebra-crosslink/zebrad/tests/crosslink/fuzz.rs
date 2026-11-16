@@ -11,7 +11,9 @@
 //! is always the most ordinary option, so any prefix of an input is itself an input.
 //!
 //! Run a campaign with `crosslink_fuzz` (CROSSLINK_FUZZ_SEEDS=a..b, CROSSLINK_FUZZ_SECS); replay
-//! one with `crosslink_fuzz_one` and CROSSLINK_FUZZ_SEED or CROSSLINK_FUZZ_FILE.
+//! one with `crosslink_fuzz_one` and CROSSLINK_FUZZ_SEED or CROSSLINK_FUZZ_FILE. The directed
+//! scenarios draw their choices from CROSSLINK_FUZZ_SEED too, and from a fresh random seed each
+//! run when it is unset.
 
 use super::*;
 
@@ -59,7 +61,7 @@ impl Choices {
     }
 }
 
-/// A peer index RECV_POW has not used yet. A peer that served a bad block may have been
+/// A peer index LOAD_POW via STP has not used yet. A peer that served a bad block may have been
 /// disconnected, so each such delivery gets its own.
 const FRESH_PEERS_FROM: u64 = 100;
 
@@ -98,6 +100,8 @@ pub(crate) struct FuzzGen {
     pub unsure_coins: std::collections::HashSet<zebra_chain::transparent::OutPoint>,
     /// Every bond the generator has tried to create, whether or not the node took it.
     pub bonds: Vec<FuzzBond>,
+    /// Staking actions mined on `main`, for replays of them.
+    pub mined_staking: Vec<FuzzMinedStaking>,
     /// For distinct transactions: conflicting spends and bond seeds are numbered by this.
     pub txs_made: u64,
     /// `rival_height` and `main`'s tip when the transaction model was last brought up to date: a
@@ -132,7 +136,11 @@ pub(crate) enum FuzzBondState {
 }
 
 /// A bond and what the generator believes the node holds for it: `state`, entered at `at`
-/// (height and block hash on `main`).
+/// (height and block hash on `main`), and the index of the `fuzz_finalizer` it targets, which
+/// its last retarget, if any, set at `target_at`. A retarget does not move `at`, since the
+/// staking action delay counts from the bond's creation and its unbonding only. `version` is
+/// the bond version its next action spends under FeaturenetUpgrade3: the txid of the create or
+/// of the last action that spent it, which also moved `at` or `target_at`.
 #[derive(Clone)]
 pub(crate) struct FuzzBond {
     pub seed: Vec<u8>,
@@ -140,21 +148,40 @@ pub(crate) struct FuzzBond {
     pub state: FuzzBondState,
     pub at: (u32, BlockHash),
     pub known: bool,
+    pub target: usize,
+    pub target_at: (u32, BlockHash),
+    pub version: [u8; 32],
+}
+
+/// A staking action on bond `bond_i`, mined on `main` at `height` in the block with hash
+/// `block`. `retarget` holds the finalizers a retarget moves the bond from and to.
+#[derive(Clone)]
+pub(crate) struct FuzzMinedStaking {
+    pub tx: Arc<Transaction>,
+    pub bond_i: usize,
+    pub height: u32,
+    pub block: BlockHash,
+    pub retarget: Option<(usize, usize)>,
 }
 
 impl FuzzGen {
     pub(crate) fn new(params: &zcash_primitives::bft::ZcashCrosslinkParameters) -> FuzzGen {
-        let network = regtest_network(params);
+        FuzzGen::new_with_node_config(params, "")
+    }
+
+    /// A generator for a node that also takes `node_config`, as `TF::new_with_node_config`.
+    pub(crate) fn new_with_node_config(params: &zcash_primitives::bft::ZcashCrosslinkParameters, node_config: &str) -> FuzzGen {
+        let network = test_network(params, node_config);
         let key = TestKey::new(b"crosslink test miner");
         let miner = key.address();
         let gen = BlockGen::init_at_genesis_plus_1(network.clone(), BlockGen::REGTEST_GENESIS_HASH, &miner);
-        let mut tf = TF::new(params);
+        let mut tf = TF::new_with_node_config(params, node_config);
         tf.push_instr_load_pow(&gen.tip, 0);
         let model_tip = (1, gen.tip.hash());
         FuzzGen {
             tf, network, key, miner, main: vec![gen], tip_known: true, rival_height: 0, next_fresh_peer: FRESH_PEERS_FROM, forks_made: 0,
             params: params.clone(), pending: Vec::new(), mined_spends: Vec::new(), unsure_coins: Default::default(), bonds: Vec::new(),
-            txs_made: 0, model_rival_height: 0, model_tip,
+            mined_staking: Vec::new(), txs_made: 0, model_rival_height: 0, model_tip,
         }
     }
 
@@ -213,6 +240,12 @@ fn move_fork(g: &mut FuzzGen, c: &mut Choices) {
     }
     let depth = 1 + c.below(max_depth);
     let len = 1 + c.below(depth + 2);
+    fork(g, c, depth, len);
+}
+
+/// Delivers a branch from `depth` blocks below the tip, `len` blocks long, mined to its own
+/// address, and makes it `main` if it is longer.
+fn fork(g: &mut FuzzGen, c: &mut Choices, depth: usize, len: usize) {
     g.forks_made += 1;
     let fork_miner = TestKey::new(format!("crosslink fuzz fork {}", g.forks_made).as_bytes()).address();
 
@@ -274,6 +307,10 @@ fn move_invalid_block(g: &mut FuzzGen, c: &mut Choices) {
 }
 
 /// The next block with random bytes flipped: the node may take it or not, but must keep running.
+/// Bytes that still parse to a block with a coinbase height are loaded as they are, or sometimes
+/// served by a peer that claims they are the valid block; bytes that do not are always served
+/// that way, which is the only way they reach a node. Either way the valid block comes later
+/// through the ordinary moves, so a lie told about it must not keep it out.
 fn move_mangled_block(g: &mut FuzzGen, c: &mut Choices) {
     let mut scratch = g.tip().clone();
     let valid = scratch.next_block(&g.miner.clone());
@@ -283,20 +320,32 @@ fn move_mangled_block(g: &mut FuzzGen, c: &mut Choices) {
         let i = c.below(bytes.len());
         bytes[i] ^= 1 << c.below(8);
     }
-    // A synthetic peer advertises a block by its coinbase height and LOAD_POW hands the node a
-    // parsed block, so bytes that no longer parse to a block with one have no doorway.
-    // TODO: a raw wire doorway (RECV_STP_PACKET with BLOCK_CHUNKs) for bytes that don't parse.
-    // Only loaded, not offered by a peer: a node need not fetch an advertised block (one at a
-    // height it holds adds no work), and an offer it ignores costs the instruction's whole wait.
+    if c.unusual(64) {
+        // At least one byte: a peer claiming a block and holding none of it has nothing to
+        // serve, so the node's request would go unanswered whatever the node does.
+        let cut = 1 + c.below(bytes.len() - 1);
+        bytes.truncate(cut);
+    }
     let parses = Block::zcash_deserialize(&bytes[..]).is_ok_and(|b| b.coinbase_height().is_some());
-    if !parses {
+    if parses && !c.unusual(64) {
+        // Only loaded, not offered as itself by a peer: a node need not fetch an advertised block
+        // (one at a height it holds adds no work), and an offer it ignores costs the
+        // instruction's whole wait.
+        g.tf.push_instr_load_pow_bytes(&bytes, ANY_OUTCOME);
+        g.tf.push_instr_expect_node_alive(0);
+        // Taken, it is a block at the tip's next height that `main` does not have.
+        g.tip_known = false;
+        g.rival_height = g.rival_height.max(g.height() + 1);
         return;
     }
-    g.tf.push_instr_load_pow_bytes(&bytes, ANY_OUTCOME);
+    // Claimed as the valid block, which is at the next height, so the node asks for it. Bytes
+    // that do not hash to the claim, or do not parse, are not that block.
+    let claim = StpClaim::of(&valid).expect("a generated block has a coinbase height");
+    let peer = g.next_fresh_peer;
+    g.next_fresh_peer += 1;
+    let same = bytes == valid.zcash_serialize_to_vec().expect("a generated block serializes");
+    g.tf.push_instr_recv_pow_claimed(claim, &bytes, peer, if same { ANY_OUTCOME } else { SHOULD_FAIL });
     g.tf.push_instr_expect_node_alive(0);
-    // Taken, it is a block at the tip's next height that `main` does not have.
-    g.tip_known = false;
-    g.rival_height = g.rival_height.max(g.height() + 1);
 }
 
 // ---- Transaction and staking moves ----
@@ -324,13 +373,23 @@ fn refresh_model(g: &mut FuzzGen) {
             p.known = false;
         }
     }
+    // A spend made under an earlier network upgrade can no longer be mined, and the mempool
+    // clears it at the activation (ZIP-200).
+    let upgrade = g.tip().next_upgrade();
+    let (current, stale): (Vec<FuzzPending>, Vec<FuzzPending>) =
+        std::mem::take(&mut g.pending).into_iter().partition(|p| p.tx.network_upgrade() == Some(upgrade));
+    g.pending = current;
+    g.unsure_coins.extend(stale.into_iter().map(|p| p.coin.0));
     let (kept, dropped): (Vec<FuzzMinedSpend>, Vec<FuzzMinedSpend>) =
         std::mem::take(&mut g.mined_spends).into_iter().partition(|s| on_main(g, (s.height, s.block)));
     g.mined_spends = kept;
     g.unsure_coins.extend(dropped.into_iter().map(|s| s.coin.0));
+    let mined_staking: Vec<FuzzMinedStaking> =
+        std::mem::take(&mut g.mined_staking).into_iter().filter(|m| on_main(g, (m.height, m.block))).collect();
+    g.mined_staking = mined_staking;
     for i in 0..g.bonds.len() {
         let bond = &g.bonds[i];
-        if bond.at.0 != 0 && !on_main(g, bond.at) {
+        if (bond.at.0 != 0 && !on_main(g, bond.at)) || (bond.target_at.0 != 0 && !on_main(g, bond.target_at)) {
             g.bonds[i].known = false;
         }
     }
@@ -385,6 +444,108 @@ fn mine(g: &mut FuzzGen, c: &mut Choices, txs: &[Arc<Transaction>]) -> bool {
     known && g.tip_known
 }
 
+/// An STP packet a broken or malicious peer might send: mostly one of a real kind (a status with
+/// made-up branches, a block chunk, a transaction status, request or body, a mempool request),
+/// then sometimes mangled, or bytes at random.
+fn garbage_stp_packet(g: &FuzzGen, c: &mut Choices, noise: &mut Choices) -> Vec<u8> {
+    use zebra_state::new_network::tx_relay::{mempool_req_packet, tx_packets, tx_req_packet, tx_status_packet};
+    use zebra_chain::transaction::UnminedTxId;
+    use zebra_state::new_network::{block_chunk_packets, status_packet, NearTipChains, ShadowBlock};
+    let hash = |noise: &mut Choices| BlockHash(std::array::from_fn(|_| noise.byte()));
+    let tx_id = |noise: &mut Choices| UnminedTxId::Legacy(zebra_chain::transaction::Hash(std::array::from_fn(|_| noise.byte())));
+    let near = |c: &mut Choices| g.height().saturating_sub(4) + c.below(12) as u32;
+    let mut packet = match c.below(6) {
+        0 => {
+            let mut chains = NearTipChains::default();
+            let mut parent = g.tip().tip.hash();
+            let mut height = near(c);
+            let mut branch = Vec::new();
+            for _ in 0..1 + c.below(4) {
+                let this = hash(noise);
+                branch.push(ShadowBlock { this_hash: this, parent_hash: parent, this_height: height });
+                parent = this;
+                height += 1;
+            }
+            chains.push_chain_unchecked(branch);
+            let queued: Vec<BlockHash> = (0..c.below(3)).map(|_| hash(noise)).collect();
+            status_packet(&queued, &chains, c.unusual(64).then(|| c.below(1 << 16) as u32))
+        }
+        1 => {
+            let body: Vec<u8> = (0..1 + c.below(2000)).map(|_| noise.byte()).collect();
+            let mut chunks = block_chunk_packets(&body, near(c), hash(noise), 0);
+            chunks.swap_remove(c.below(chunks.len()))
+        }
+        2 => {
+            let ids: Vec<UnminedTxId> = (0..1 + c.below(4)).map(|_| tx_id(noise)).collect();
+            tx_status_packet(ids.len() as u32 + c.below(3) as u32, ids.iter().map(|id| (id, c.below(100_000) as u32)))
+        }
+        3 => {
+            if c.below(2) == 0 {
+                let ids: Vec<UnminedTxId> = (0..1 + c.below(4)).map(|_| tx_id(noise)).collect();
+                tx_req_packet(ids.iter())
+            } else {
+                mempool_req_packet()
+            }
+        }
+        4 => match g.pending.first() {
+            Some(pending) => tx_packets([&*pending.tx]).swap_remove(0),
+            None => (0..c.below(600)).map(|_| noise.byte()).collect(),
+        },
+        _ => (0..c.below(600)).map(|_| noise.byte()).collect(),
+    };
+    match c.below(5) {
+        0 | 1 => {}
+        2 => packet.truncate(c.below(packet.len().max(1))),
+        3 => {
+            for _ in 0..1 + c.below(4) {
+                if !packet.is_empty() {
+                    let i = c.below(packet.len());
+                    packet[i] ^= 1 << c.below(8);
+                }
+            }
+        }
+        _ => packet.extend((0..1 + c.below(64)).map(|_| noise.byte())),
+    }
+    packet
+}
+
+/// A broken or malicious STP peer: one packet from `garbage_stp_packet`, or a flood of them from
+/// one peer, which the node may kill it for and must survive; or a peer that announces the next
+/// block of `main` and never serves it, while another peer serves it, which must be committed.
+fn move_malicious_peer(g: &mut FuzzGen, c: &mut Choices) {
+    use zebra_state::new_network::{status_packet, NearTipChains, ShadowBlock};
+    let noise_seed = (c.below(1 << 16) as u64) << 16 | c.below(1 << 16) as u64;
+    let mut noise = Choices::from_seed(noise_seed, 4096);
+    let peer = g.next_fresh_peer;
+    g.next_fresh_peer += 1;
+    if c.below(3) == 0 {
+        let known = g.tip_known;
+        let mut next = g.tip().clone();
+        let block = next.next_block_with_txs(&g.miner.clone(), &[]);
+        let mut chains = NearTipChains::default();
+        chains.push_chain_unchecked(vec![ShadowBlock {
+            this_hash: block.hash(),
+            parent_hash: block.header.previous_block_hash,
+            this_height: block.coinbase_height().expect("generated blocks have a height").0,
+        }]);
+        // Announcing a block is no offence, whether or not the peer then serves it.
+        g.tf.push_instr_recv_stp_packet(&status_packet(&[], &chains, None), peer, 0);
+        g.main.push(next);
+        let honest = g.next_fresh_peer;
+        g.next_fresh_peer += 1;
+        g.tf.push_instr_recv_pow(&block, honest, if known { 0 } else { ANY_OUTCOME });
+        g.after_main_grew();
+        g.expect_tip();
+        return;
+    }
+    let n = if c.below(2) == 0 { 1 } else { 10 + c.below(40) };
+    for _ in 0..n {
+        let packet = garbage_stp_packet(g, c, &mut noise);
+        g.tf.push_instr_recv_stp_packet(&packet, peer, ANY_OUTCOME);
+    }
+    g.tf.push_instr_expect_node_alive(0);
+}
+
 /// Delivers a block on `main`'s tip that the node must refuse when the tip is known. When it
 /// is not, the node may hold a chain on which the block is valid, and then holds it as a rival.
 fn refuse(g: &mut FuzzGen, c: &mut Choices, block: &Block) {
@@ -407,9 +568,7 @@ fn refuse(g: &mut FuzzGen, c: &mut Choices, block: &Block) {
 /// Hands the node a transaction it must take, through SUBMIT_TX or a peer's relay.
 fn offer_tx(g: &mut FuzzGen, c: &mut Choices, tx: &Arc<Transaction>) {
     if c.unusual(96) {
-        let wire = zebra_network::wire::tx_message_bytes(&g.network, zebra_chain::transaction::UnminedTx::from(tx.clone()))
-            .expect("a transaction frames");
-        g.tf.push_instr_recv_tx_wire(&wire, 0, 0);
+        g.tf.push_instr_recv_tx_wire(tx, 0, 0);
     } else {
         g.tf.push_instr_submit_tx(tx, 0);
     }
@@ -545,32 +704,147 @@ fn move_double_spend(g: &mut FuzzGen, c: &mut Choices) {
 /// The finalizers bonds are made to: a few, so retargets and shared targets happen.
 fn fuzz_finalizer(i: usize) -> zcash_primitives::bft::FinalizerAddress {
     zcash_primitives::bft::FinalizerAddress::create(
-        &zebra_crosslink::rng_private_public_key_from_address(format!("crosslink fuzz finalizer {i}").as_bytes()).1,
+        &zebra_crosslink::rng_private_public_key_from_address(format!("crosslink fuzz finalizer {i}").as_bytes()).0,
     )
 }
 
-/// A bond action in the next block: create, unbond or withdraw, on a new bond or one made
-/// before, valid or not. Whether it is valid follows from the bond's state and the staking
-/// calendar, the rules the node applies: actions only on staking days, and each action at least
-/// `action_delay` after the bond's last one. Sometimes first mines up to the next height where
-/// that action could be valid, so valid actions are common rather than rare.
+/// Expiry heights of retargets start here. A retarget has no spend to make it unique, so two
+/// retargets between the same finalizers would be one transaction, the second a replay; each
+/// gets its own expiry height instead, far above any height a run reaches.
+const RETARGET_EXPIRY_FROM: u32 = 1_000_000;
+
+/// A retarget of the bond `bond_seed` names, from `fuzz_finalizer(from)` to `fuzz_finalizer(to)`,
+/// spending `spends`, for the next block of `main`. Each call makes a distinct transaction.
+fn fuzz_retarget(g: &mut FuzzGen, bond_seed: &[u8], from: usize, to: usize, spends: Option<[u8; 32]>) -> Arc<Transaction> {
+    use zcash_primitives::transaction::StakingAction;
+
+    g.txs_made += 1;
+    let expiry_height = RETARGET_EXPIRY_FROM + g.txs_made as u32;
+    let (from_finalizer, to_finalizer) = (fuzz_finalizer(from), fuzz_finalizer(to));
+    signed_staking_tx(g.tip().next_upgrade(), bond_seed, expiry_height, |unique_pubkey, signature| {
+        StakingAction::RetargetDelegationBond { unique_pubkey, signature, from_finalizer, to_finalizer, spends }
+    })
+}
+
+/// Mines `tx`, a valid staking action on bond `bond_i`, in the next block of `main`, and records
+/// what it did: the bond is in `state` and targets `target` after it.
+fn mine_staking(
+    g: &mut FuzzGen,
+    c: &mut Choices,
+    bond_i: usize,
+    tx: Arc<Transaction>,
+    state: FuzzBondState,
+    target: usize,
+    retarget: Option<(usize, usize)>,
+) {
+    let h = g.height() + 1;
+    let known = mine(g, c, &[tx.clone()]);
+    let at = (h, g.main[h as usize - 1].tip.hash());
+    let bond = &mut g.bonds[bond_i];
+    bond.state = state;
+    bond.target = target;
+    if retarget.is_some() {
+        bond.target_at = at;
+    } else {
+        bond.at = at;
+    }
+    bond.known = known;
+    let action = tx.staking_action().expect("a staking transaction");
+    if !action.acts_on_existing_bond() || action.spends().is_some() {
+        bond.version = tx.hash().0;
+    }
+    g.mined_staking.push(FuzzMinedStaking { tx, bond_i, height: at.0, block: at.1, retarget });
+}
+
+/// Whether the next block of `main` is under FeaturenetUpgrade3, where an action on a bond must
+/// spend the bond's version.
+fn spends_versions(g: &FuzzGen) -> bool {
+    NetworkUpgrade::FeaturenetUpgrade3
+        .activation_height(&g.network)
+        .is_some_and(|activation_height| BlockHeight(g.height() + 1) >= activation_height)
+}
+
+/// Whether the next block of `main` still allows the fuzzer's unfunded zero-zat create. From
+/// FeaturenetUpgrade1 a create must bond a power of 10 zats, and an upgrade left unscheduled
+/// activates with the next one, so scheduling FeaturenetUpgrade3 alone also activates it.
+fn zero_create_allowed(g: &FuzzGen) -> bool {
+    NetworkUpgrade::FeaturenetUpgrade1
+        .activation_height(&g.network)
+        .map_or(true, |activation_height| BlockHeight(g.height() + 1) < activation_height)
+}
+
+/// The version an action on `bond` in the next block spends, and whether that is the one the
+/// node requires: mostly the bond's version under FeaturenetUpgrade3 and none before it, and
+/// sometimes the wrong one, for the refusal: none, the bond's key, which is never a version, a
+/// made-up version, or the right one too early.
+fn fuzz_spends(g: &FuzzGen, c: &mut Choices, bond: &FuzzBond) -> (Option<[u8; 32]>, bool) {
+    let required = spends_versions(g).then_some(bond.version);
+    if !c.unusual(32) {
+        return (required, true);
+    }
+    let wrong = match (required, c.below(3)) {
+        (Some(_), 0) => None,
+        (Some(_), 1) => Some(bond.key),
+        (None, 0) => Some(bond.version),
+        _ => Some([0xee; 32]),
+    };
+    (wrong, wrong == required)
+}
+
+/// An unbond of the bond `bond_seed` names, spending `spends`.
+fn fuzz_unbond(g: &FuzzGen, bond_seed: &[u8], spends: Option<[u8; 32]>) -> Arc<Transaction> {
+    use zcash_primitives::transaction::StakingAction;
+
+    signed_staking_tx(g.tip().next_upgrade(), bond_seed, 0, |unique_pubkey, signature| {
+        StakingAction::BeginDelegationUnbonding { unique_pubkey, signature, spends }
+    })
+}
+
+/// A withdrawal of `amount_zats` from the bond `bond_seed` names, spending `spends`.
+fn fuzz_withdraw(g: &FuzzGen, bond_seed: &[u8], amount_zats: u64, spends: Option<[u8; 32]>) -> Arc<Transaction> {
+    use zcash_primitives::transaction::StakingAction;
+
+    signed_staking_tx(g.tip().next_upgrade(), bond_seed, 0, |unique_pubkey, signature| {
+        StakingAction::WithdrawDelegationBond { amount_zats, unique_pubkey, signature, spends }
+    })
+}
+
+/// A bond not yet created, added to `g.bonds`. Returns its index.
+fn new_fuzz_bond(g: &mut FuzzGen) -> usize {
+    g.txs_made += 1;
+    let seed = format!("crosslink fuzz bond {}", g.txs_made).into_bytes();
+    let key = staking_tx_create_bond(g.tip().next_upgrade(), &seed, fuzz_finalizer(0), 0)
+        .staking_action()
+        .expect("a staking transaction")
+        .bond_key();
+    let none = (0, BlockHash([0; 32]));
+    g.bonds.push(FuzzBond { seed, key, state: FuzzBondState::Absent, at: none, known: true, target: 0, target_at: none, version: [0; 32] });
+    g.bonds.len() - 1
+}
+
+/// A bond action in the next block: create, unbond, withdraw or retarget, on a new bond or one
+/// made before, valid or not. Whether it is valid follows from the bond's state and the staking
+/// calendar, the rules the node applies: create, unbond and withdraw only on staking days, each at
+/// least `action_delay` after the bond's last one, and a retarget only from the bond's current
+/// target. Sometimes first mines up to the next height where that action could be valid, so
+/// valid actions are common rather than rare.
 fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
     refresh_model(g);
     let staking = g.params.staking;
     // Mostly an action on a bond in the state it needs, so bonds move through their whole life;
     // sometimes a bond in any state, or one never created, for the refusals.
-    let needs = |action: usize| [FuzzBondState::Absent, FuzzBondState::Active, FuzzBondState::Unbonding][action];
+    let needs = |action: usize| [FuzzBondState::Absent, FuzzBondState::Active, FuzzBondState::Unbonding, FuzzBondState::Active][action];
     let fitting = |g: &FuzzGen, action: usize| -> Vec<usize> {
         (0..g.bonds.len()).filter(|&i| g.bonds[i].known && g.bonds[i].state == needs(action)).collect()
     };
     // Advancing a bond that exists is the ordinary choice: a whole life takes three actions, and
-    // staking is one move in eight.
+    // staking is one move in nine. An active bond is retargeted some of the time instead.
     let mut action = if !fitting(g, 2).is_empty() && !c.unusual(128) {
         2
     } else if !fitting(g, 1).is_empty() && !c.unusual(128) {
-        1
+        if c.unusual(96) { 3 } else { 1 }
     } else {
-        c.below(3)
+        c.below(4)
     };
     if action != 0 && fitting(g, action).is_empty() && !c.unusual(64) {
         action = 0;
@@ -581,19 +855,13 @@ fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
     } else if !g.bonds.is_empty() && action != 0 && !c.unusual(64) {
         c.below(g.bonds.len())
     } else {
-        g.txs_made += 1;
-        let seed = format!("crosslink fuzz bond {}", g.txs_made).into_bytes();
-        let key = staking_tx_create_bond(g.tip().next_upgrade(), &seed, fuzz_finalizer(0), 0)
-            .staking_action()
-            .expect("a staking transaction")
-            .bond_key();
-        g.bonds.push(FuzzBond { seed, key, state: FuzzBondState::Absent, at: (0, BlockHash([0; 32])), known: true });
-        g.bonds.len() - 1
+        new_fuzz_bond(g)
     };
 
     let is_staking_day = |h: u32| h % staking.period < staking.day_window;
     let bond = g.bonds[bond_i].clone();
-    if !c.unusual(96) {
+    // A retarget is exempt from the calendar, so it has nothing to wait for.
+    if action != 3 && !c.unusual(96) {
         let earliest = if bond.at.0 == 0 { 0 } else { bond.at.0 + staking.action_delay };
         while g.height() + 1 < earliest || !is_staking_day(g.height() + 1) {
             mine(g, c, &[]);
@@ -603,21 +871,40 @@ fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
     let h = g.height() + 1;
     let upgrade = g.tip().next_upgrade();
     let wrong_amount = action == 2 && c.unusual(32);
-    let (tx, valid, after) = match action {
-        0 => (
-            staking_tx_create_bond(upgrade, &bond.seed, fuzz_finalizer(c.below(3)), 0),
-            bond.state == FuzzBondState::Absent,
-            FuzzBondState::Active,
-        ),
-        1 => (staking_tx_unbond(upgrade, &bond.seed), bond.state == FuzzBondState::Active, FuzzBondState::Unbonding),
-        _ => (
-            staking_tx_withdraw(upgrade, &bond.seed, u64::from(wrong_amount), 0),
-            bond.state == FuzzBondState::Unbonding && !wrong_amount,
+    let (spends, spends_right) = fuzz_spends(g, c, &bond);
+    let mut retarget = None;
+    let (tx, valid, after, target) = match action {
+        0 => {
+            let target = c.below(3);
+            (
+                staking_tx_create_bond(upgrade, &bond.seed, fuzz_finalizer(target), 0),
+                bond.state == FuzzBondState::Absent && zero_create_allowed(g),
+                FuzzBondState::Active,
+                target,
+            )
+        }
+        1 => (fuzz_unbond(g, &bond.seed, spends), bond.state == FuzzBondState::Active && spends_right, FuzzBondState::Unbonding, bond.target),
+        2 => (
+            fuzz_withdraw(g, &bond.seed, u64::from(wrong_amount), spends),
+            bond.state == FuzzBondState::Unbonding && !wrong_amount && spends_right,
             FuzzBondState::Withdrawn,
+            bond.target,
         ),
+        _ => {
+            // To another finalizer; sometimes from one the bond does not target, for the refusal.
+            let to = (bond.target + 1 + c.below(2)) % 3;
+            let from = if c.unusual(32) { (bond.target + 1 + c.below(2)) % 3 } else { bond.target };
+            retarget = Some((from, to));
+            (
+                fuzz_retarget(g, &bond.seed, from, to, spends),
+                bond.state == FuzzBondState::Active && from == bond.target && spends_right,
+                FuzzBondState::Active,
+                to,
+            )
+        }
     };
     let delay_met = bond.at.0 == 0 || h >= bond.at.0 + staking.action_delay;
-    let valid = valid && delay_met && is_staking_day(h);
+    let valid = valid && (action == 3 || (delay_met && is_staking_day(h)));
 
     if !bond.known {
         // The node may hold this bond in another state: the action may or may not apply. If it
@@ -630,11 +917,7 @@ fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
         return;
     }
     if valid {
-        let known = mine(g, c, &[tx]);
-        let bond = &mut g.bonds[bond_i];
-        bond.state = after;
-        bond.at = (h, g.main[h as usize - 1].tip.hash());
-        bond.known = known;
+        mine_staking(g, c, bond_i, tx, after, target, retarget);
     } else {
         let block = g.tip().clone().next_block_with_txs(&g.miner.clone(), &[tx]);
         refuse(g, c, &block);
@@ -657,23 +940,1301 @@ fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
     if c.unusual(64) {
         g.tf.push_instr_expect_staking_replay_matches(0);
     }
+    if g.tip_known && c.unusual(48) {
+        let blocks: Vec<Arc<Block>> = g.main.iter().map(|gen| gen.tip.clone()).collect();
+        push_staking_totals(&mut g.tf, &g.network, g.params.staking.slash_analysis_window(), &blocks);
+    }
+}
+
+/// Expects every finalizer bank and the staking pool totals at the tip of `blocks`, the best
+/// chain from height 1 on, as replaying its staking from genesis gives them: bonded holds every
+/// active bond, unbonded every unbonding one, and finalizer rewards every bank. A generated input
+/// schedules no slashfork, so nothing is burned.
+fn push_staking_totals(tf: &mut TF, network: &Network, slash_analysis_window: u32, blocks: &[Arc<Block>]) {
+    let mut replay = zebra_state::StakingReplay::new(&Default::default(), slash_analysis_window);
+    for (i, block) in blocks.iter().enumerate() {
+        let block_at = |at: zebra_chain::block::Height| blocks[at.0 as usize - 1].clone();
+        // Every block pays issuance, as on the node (see staking_replay_matches).
+        replay
+            .apply_block(network, zebra_chain::block::Height(i as u32 + 1), block, true, block_at)
+            .expect("the generated chain replays");
+    }
+    let (mut bonded, mut unbonded) = (0, 0);
+    for (bond, status) in replay.delegation_bonds.values() {
+        match status {
+            zebra_state::BondStatusInChain::Active => bonded += u64::from(bond.amount),
+            zebra_state::BondStatusInChain::Unbonding { .. } => unbonded += u64::from(bond.amount),
+            _ => {}
+        }
+    }
+    let banks: std::collections::BTreeMap<[u8; 32], u64> =
+        replay.finalizer_rewards.iter().filter(|&(_, &bank)| bank != 0).map(|(&finalizer, &bank)| (finalizer, bank)).collect();
+    for (&finalizer, &bank) in &banks {
+        tf.push_instr_expect_finalizer_bank(finalizer, bank, 0);
+    }
+    tf.push_instr_expect_pool_totals(bonded, unbonded, banks.values().sum(), 0);
+}
+
+/// The deepest a replayed transaction's first copy sits below the tip while it stays in the
+/// non-finalized chain, where a replay is refused under any network upgrade.
+const REPLAY_DEPTH_MAX: u32 = zebra_state::MAX_BLOCK_REORG_HEIGHT / 2;
+
+/// Blocks enough for what was mined before them to be finalized.
+const FINALIZED_BETWEEN: u32 = zebra_state::MAX_BLOCK_REORG_HEIGHT + 10;
+
+/// Extends `main` by `n` empty blocks, loaded without drawing choices, which a long run would
+/// use up the input on.
+fn load_empty_blocks(g: &mut FuzzGen, n: u32) {
+    for _ in 0..n {
+        let mut next = g.tip().clone();
+        let block = next.next_block(&g.miner.clone());
+        g.main.push(next);
+        g.tf.push_instr_load_pow(&block, if g.tip_known { 0 } else { ANY_OUTCOME });
+        g.after_main_grew();
+    }
+    // A mempool that misses tips while blocks arrive this fast resets, dropping what it held.
+    for p in &mut g.pending {
+        p.known = false;
+    }
+    g.expect_tip();
+}
+
+/// A staking action, empty blocks until it is finalized, then a replay. A bond is made first if
+/// none is active, while the network upgrade may still allow a zero-zat create, and is sometimes
+/// finalized first; then any activation the run would cross is passed before the action, since a
+/// replay made under another upgrade is refused for that alone. Many actions are refused on
+/// purpose, so a few are tried until one is mined.
+fn move_finalize(g: &mut FuzzGen, c: &mut Choices) {
+    refresh_model(g);
+    if !g.bonds.iter().any(|bond| bond.known && bond.state == FuzzBondState::Active) {
+        move_staking(g, c);
+    }
+    // Half the time the bonds are finalized before the action too, so under FeaturenetUpgrade3
+    // the node finds a bond's first version in the finalized state.
+    if c.unusual(128) {
+        load_empty_blocks(g, FINALIZED_BETWEEN + c.below(8) as u32);
+    }
+    let n = FINALIZED_BETWEEN + c.below(8) as u32;
+    let upgrade_after_run = |g: &FuzzGen| NetworkUpgrade::current(&g.network, BlockHeight(g.height() + 2 + n));
+    while g.tip().next_upgrade() != upgrade_after_run(g) {
+        load_empty_blocks(g, 1);
+    }
+    let before = g.height();
+    for _ in 0..4 {
+        move_staking(g, c);
+        if g.mined_staking.last().is_some_and(|s| s.height > before) {
+            break;
+        }
+    }
+    load_empty_blocks(g, n);
+    move_replay(g, c);
+}
+
+/// Bonds made before FeaturenetUpgrade3 and acted on after it, so a bond's first action spends
+/// its create's txid. Ordinary moves seldom reach that before a run ends, since the fuzzer's
+/// zero-zat create is refused from the activation on. A bond is made on a staking day before
+/// the activation if none is active, then `main` grows past it, sometimes until the bond is
+/// finalized. Sometimes a retarget naming the bond's key comes first, which must be refused, and
+/// sometimes a heavier branch from below the first spend undoes it.
+fn move_cross_featurenet_upgrade_3(g: &mut FuzzGen, c: &mut Choices) {
+    refresh_model(g);
+    let ahead = NetworkUpgrade::FeaturenetUpgrade3.activation_height(&g.network).filter(|&h| BlockHeight(g.height() + 1) < h);
+    let Some(activation) = ahead else {
+        return move_staking(g, c);
+    };
+    let staking = g.params.staking;
+    let active_bonds = |g: &FuzzGen| -> Vec<usize> {
+        (0..g.bonds.len()).filter(|&i| g.bonds[i].known && g.bonds[i].state == FuzzBondState::Active).collect()
+    };
+    if active_bonds(g).is_empty() {
+        while (g.height() + 1) % staking.period >= staking.day_window {
+            mine(g, c, &[]);
+        }
+        if zero_create_allowed(g) && g.tip_known {
+            let bond_i = new_fuzz_bond(g);
+            let target = c.below(3);
+            let create = staking_tx_create_bond(g.tip().next_upgrade(), &g.bonds[bond_i].seed, fuzz_finalizer(target), 0);
+            mine_staking(g, c, bond_i, create, FuzzBondState::Active, target, None);
+        }
+    }
+    let mut past = c.below(8) as u32;
+    if c.unusual(128) {
+        past += FINALIZED_BETWEEN;
+    }
+    load_empty_blocks(g, (activation.0 - 1).saturating_sub(g.height()) + past);
+    refresh_model(g);
+
+    let active = active_bonds(g);
+    if g.tip_known && !active.is_empty() && c.unusual(128) {
+        let bond = g.bonds[active[c.below(active.len())]].clone();
+        let wrong = fuzz_retarget(g, &bond.seed, bond.target, (bond.target + 1 + c.below(2)) % 3, Some(bond.key));
+        let block = g.tip().clone().next_block_with_txs(&g.miner.clone(), &[wrong]);
+        refuse(g, c, &block);
+    }
+    let before = g.height();
+    for _ in 0..4 {
+        move_staking(g, c);
+        if g.mined_staking.last().is_some_and(|s| s.height > before) {
+            break;
+        }
+    }
+    let spent_at_tip = g.mined_staking.last().is_some_and(|s| s.height > before && s.height == g.height());
+    if spent_at_tip && c.unusual(128) {
+        let depth = 1 + c.below((g.height() as usize - 1).min(FORK_DEPTH_MAX));
+        let len = depth + 1 + c.below(2);
+        fork(g, c, depth, len);
+    }
+}
+
+/// Whether the next block of `main` must refuse `tx` mined again after it was finalized: from
+/// FeaturenetUpgrade2 any repeat, and from FeaturenetUpgrade3 an action whose spent version is gone.
+fn refuses_finalized_repeat(g: &FuzzGen, tx: &Transaction) -> bool {
+    let active = |nu: NetworkUpgrade| nu.activation_height(&g.network).is_some_and(|h| BlockHeight(g.height() + 1) >= h);
+    active(NetworkUpgrade::FeaturenetUpgrade2)
+        || (active(NetworkUpgrade::FeaturenetUpgrade3) && tx.staking_action().and_then(|action| action.spends()).is_some())
+}
+
+/// A staking action mined on `main`, mined again in the next block. Most often a retarget whose
+/// bond is first moved back to the finalizer the retarget leaves, so the replay passes every
+/// staking rule and only its hash tells it apart. The node must refuse it while the first copy is
+/// not finalized; once it is, only where `refuses_finalized_repeat` says so.
+fn move_replay(g: &mut FuzzGen, c: &mut Choices) {
+    refresh_model(g);
+    // A finalized first copy under another network upgrade would be refused for that alone.
+    let next_upgrade = g.tip().next_upgrade();
+    let recent: Vec<usize> = (0..g.mined_staking.len())
+        .filter(|&i| {
+            let depth = g.height() + 1 - g.mined_staking[i].height;
+            depth < REPLAY_DEPTH_MAX || (depth > FINALIZED_BETWEEN && g.mined_staking[i].tx.network_upgrade() == Some(next_upgrade))
+        })
+        .collect();
+    if recent.is_empty() {
+        return move_staking(g, c);
+    }
+    let retargets: Vec<usize> = recent
+        .iter()
+        .copied()
+        .filter(|&i| {
+            let bond = &g.bonds[g.mined_staking[i].bond_i];
+            g.mined_staking[i].retarget.is_some() && bond.known && bond.state == FuzzBondState::Active
+        })
+        .collect();
+    let i = if !retargets.is_empty() && !c.unusual(64) {
+        let i = retargets[c.below(retargets.len())];
+        let (bond_i, (from, _)) = (g.mined_staking[i].bond_i, g.mined_staking[i].retarget.expect("a retarget"));
+        let bond = g.bonds[bond_i].clone();
+        if g.tip_known && bond.target != from && !c.unusual(32) {
+            let spends = spends_versions(g).then_some(bond.version);
+            let back = fuzz_retarget(g, &bond.seed, bond.target, from, spends);
+            mine_staking(g, c, bond_i, back, FuzzBondState::Active, from, Some((bond.target, from)));
+        }
+        i
+    } else {
+        recent[c.below(recent.len())]
+    };
+
+    let replay = g.mined_staking[i].clone();
+    let finalized = g.height() + 1 - replay.height > FINALIZED_BETWEEN;
+    let block = g.tip().clone().next_block_with_txs(&g.miner.clone(), &[replay.tx.clone()]);
+    if finalized && !refuses_finalized_repeat(g, &replay.tx) {
+        // The repeat is then as valid as its bond's state lets it be, which the model does not
+        // follow for an old action. Taken, it is a block at the next height that `main` lacks.
+        g.tf.push_instr_load_pow(&block, ANY_OUTCOME);
+        g.tf.push_instr_expect_node_alive(0);
+        g.tip_known = false;
+        g.rival_height = g.rival_height.max(g.height() + 1);
+        g.bonds[replay.bond_i].known = false;
+        return;
+    }
+    refuse(g, c, &block);
+    if !g.tip_known {
+        g.bonds[replay.bond_i].known = false;
+    }
+}
+
+/// Two retargets of one active bond in one block under FeaturenetUpgrade3, which single-action
+/// moves never make: mostly the second spends the first's txid, so the block is valid and leaves
+/// the bond at the second's version; sometimes it spends the version both started from, so the
+/// node must refuse the block.
+fn move_retarget_twice(g: &mut FuzzGen, c: &mut Choices) {
+    refresh_model(g);
+    let active: Vec<usize> =
+        (0..g.bonds.len()).filter(|&i| g.bonds[i].known && g.bonds[i].state == FuzzBondState::Active).collect();
+    if !spends_versions(g) || active.is_empty() || !g.tip_known {
+        return move_staking(g, c);
+    }
+    let bond_i = active[c.below(active.len())];
+    let bond = g.bonds[bond_i].clone();
+    let mid = (bond.target + 1 + c.below(2)) % 3;
+    let to = (mid + 1 + c.below(2)) % 3;
+    let first = fuzz_retarget(g, &bond.seed, bond.target, mid, Some(bond.version));
+    let chained = !c.unusual(8);
+    let second_spends = if chained { first.hash().0 } else { bond.version };
+    let second = fuzz_retarget(g, &bond.seed, mid, to, Some(second_spends));
+
+    if !chained {
+        let block = g.tip().clone().next_block_with_txs(&g.miner.clone(), &[first, second]);
+        refuse(g, c, &block);
+        return;
+    }
+    let h = g.height() + 1;
+    let known = mine(g, c, &[first.clone(), second.clone()]);
+    let at = (h, g.main[h as usize - 1].tip.hash());
+    g.bonds[bond_i] = FuzzBond { target: to, target_at: at, known, version: second.hash().0, ..bond.clone() };
+    g.mined_staking.push(FuzzMinedStaking { tx: first, bond_i, height: h, block: at.1, retarget: Some((bond.target, mid)) });
+    g.mined_staking.push(FuzzMinedStaking { tx: second, bond_i, height: h, block: at.1, retarget: Some((mid, to)) });
+    if known {
+        g.tf.push_instr_expect_bond(bond.key, TF_BOND_ACTIVE, TEST_STAKE_IGNORED, 0);
+    }
 }
 // ---- End of transaction and staking moves ----
 
+// ---- BFT ----
+// A generator of its own: a supplied-BFT chain, SUPPLIED_FINALIZER signing everything as
+// `bonded_start` arranges, over a PoW chain that only grows. Each step may first offer a block wrong
+// in one field `validate` checks against the parent, which must be refused, and then offers a
+// valid one, which must be decided: a proposal one finalizer gets refused, or would have got
+// decided, must never keep a later honest one out.
+
+struct BftFuzz {
+    tf: TF,
+    gen: BlockGen,
+    miner: Address,
+    /// `pow[i]` is the PoW block at height `i + 1 + BONDED_SHIFT`.
+    pow: Vec<Arc<Block>>,
+    /// The decided chain's length, and its tip's certificate, version and first header's index.
+    decided: u32,
+    tip_ptr: FatPointerToBftBlock,
+    tip_version: u32,
+    tip_from: usize,
+}
+
+/// The BFT block at `height` on `parent` carrying `headers`, at `version` and `do_not_include`, with
+/// SUPPLIED_FINALIZER's certificate; the genesis's is empty.
+fn bft_fuzz_block(parent: &FatPointerToBftBlock, height: u32, headers: &[Arc<Block>], version: u32, do_not_include: u64) -> BftBlockAndFatPointerToItWrap {
+    let mut block = create_pos_and_ptr_to_finalize_pow_at_round(height, parent.clone(), headers, 1, &[]).0.block;
+    block.version = version;
+    block.do_not_include_until_bc_height = do_not_include;
+    if height == 0 {
+        return BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt::from_parts(block, 0, 1, &[]));
+    }
+    let seed = synthetic_finalizer_seed(SUPPLIED_FINALIZER);
+    let fat_ptr = signed_fat_pointer(&block, u64::from(height), 1, &[seed.as_bytes()], &[0; 32]);
+    BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr })
+}
+
+fn bft_fuzz_grow_pow(f: &mut BftFuzz, c: &mut Choices) {
+    for _ in 0..1 + c.below(3) {
+        f.pow.push(f.gen.next_block(&f.miner));
+        f.tf.push_instr_load_pow(&f.gen.tip, 0);
+    }
+}
+
+fn bft_fuzz_step(f: &mut BftFuzz, c: &mut Choices) {
+    use zebra_state::new_network::bft::BFT_BLOCK_VERSION_LATEST as LATEST;
+
+    let sigma = HARNESS_PARAMETERS.bc_confirmation_depth_sigma as usize;
+    // Linearity lets the snapshot stay where the parent's is, but not go below it.
+    let (lo, hi) = (if f.decided == 0 { 0 } else { f.tip_from }, f.pow.len() - sigma);
+    let from = lo + c.below(hi - lo + 1);
+    let headers = f.pow[from..from + sigma].to_vec();
+    let lowest_version = f.tip_version.max(1);
+    let version = lowest_version + c.below((LATEST - lowest_version + 1) as usize) as u32;
+
+    if c.unusual(128) {
+        let above_latest = |c: &mut Choices| match c.below(3) {
+            0 => LATEST + 1,
+            1 => u32::MAX,
+            _ => LATEST + 1 + c.below(1000) as u32,
+        };
+        let (parent, h) = (&f.tip_ptr, f.decided);
+        let bad = match c.below(5) {
+            1 if h > 0 => bft_fuzz_block(parent, h, &headers, c.below(f.tip_version as usize) as u32, 0),
+            2 => {
+                let claimed = if h > 0 && c.unusual(128) { h - 1 } else { h + 1 + c.below(3) as u32 };
+                bft_fuzz_block(parent, claimed, &headers, version, 0)
+            }
+            3 if h > 0 && f.tip_from > 0 => {
+                let below = c.below(f.tip_from);
+                bft_fuzz_block(parent, h, &f.pow[below..below + sigma], version, 0)
+            }
+            // No slashfork is scheduled, so the parent's value, 0, is the only one allowed. A v1
+            // block doesn't serialize the field, so only the latest version can carry a raise.
+            4 => {
+                let raised = match c.below(3) {
+                    0 => 1,
+                    1 => u64::MAX,
+                    _ => 1 + c.below(1 << 20) as u64,
+                };
+                bft_fuzz_block(parent, h, &headers, LATEST, raised)
+            }
+            _ => bft_fuzz_block(parent, h, &headers, above_latest(c), 0),
+        };
+        push_decided_pos(&mut f.tf, &bad, SHOULD_FAIL);
+        f.tf.push_instr_expect_node_alive(0);
+        f.tf.push_instr_expect_pos_chain_length(f.decided as usize, 0);
+    }
+
+    let good = bft_fuzz_block(&f.tip_ptr, f.decided, &headers, version, 0);
+    push_decided_pos(&mut f.tf, &good, 0);
+    f.decided += 1;
+    f.tip_ptr = good.0.fat_ptr.clone();
+    f.tip_version = version;
+    f.tip_from = from;
+    f.tf.push_instr_expect_pos_chain_length(f.decided as usize, 0);
+}
+
+fn generate_bft(c: &mut Choices) -> Vec<u8> {
+    let sigma = HARNESS_PARAMETERS.bc_confirmation_depth_sigma as usize;
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let (gen, miner, pow) = bonded_pow_chain_for(&mut tf, sigma + c.below(4));
+    let mut f = BftFuzz { tf, gen, miner, pow, decided: 0, tip_ptr: FatPointerToBftBlock::null(), tip_version: 0, tip_from: 0 };
+    for _ in 0..2 + c.below(14) {
+        if f.tip_from + HARNESS_PARAMETERS.bc_confirmation_depth_sigma as usize == f.pow.len() || c.unusual(96) {
+            bft_fuzz_grow_pow(&mut f, c);
+        }
+        bft_fuzz_step(&mut f, c);
+    }
+    f.tf.push_instr_expect_node_alive(0);
+    f.tf.write_to_bytes()
+}
+// ---- End of BFT ----
+
+// ---- BFT through the engine ----
+// Inputs where the node's own tenderlink engine runs: the bonded four-member roster of the BFT
+// rounds scenes, activated, then PoW growth (direct and over STP, with side branches) between
+// heights the engine decides from the synthetic finalizers' messages, which arrive in any order,
+// with duplicates and wrong-namespace votes among them, and the clock moving between them. Between
+// heights, coinbases are spent through every doorway, some twice, and mined, and bonds are made
+// to the roster's members, so decisions meet a busy mempool and a roster whose stake moves.
+// Finalizers on no roster send mangled tenderlink packets among them.
+//
+// Each round checks who proposes, and each decision that needed the node's stake checks that the
+// node prevoted and precommitted it. PoW blocks cite the decisions, mostly the newest, and each
+// citation that moves `fin` checks it and the finality of blocks on both sides of it, side
+// branches it excludes among them. The staking pools are checked against a replay of the chain.
+//
+// The writer must know every decided block, to propose the next height on it, and every
+// proposer. The proposer is a pure function of the roster, height and round, and the roster for
+// a height is the stake at the snapshot of the block below: active bonds plus reward banks,
+// which every PoW block's issuance grows. The writer replays the chain it generated up to each
+// snapshot, as the node does, and picks the proposer from that. A round the node would propose
+// is failed with nil votes, so the node's own proposals, whose values only it knows, are never
+// decided.
+
+struct EngineFuzz {
+    tf: TF,
+    scene: BftRoundsScene,
+    /// `gens[i]` is the generator after the `i`-th block above the scene's, so a side branch can
+    /// start below the tip.
+    gens: Vec<BlockGen>,
+    /// The engine's height and round, as the writer has driven it.
+    height: u64,
+    round: u32,
+    /// The decided block the next proposal builds on, and the PoW height it finalized.
+    parent: FatPointerToBftBlock,
+    snapshot: u32,
+    next_fresh_peer: u64,
+    sides: u8,
+    /// Ticks of the clock since the engine's current round began, as the writer has moved it.
+    round_ticks: u32,
+    /// The best chain's blocks by height (genesis, which carries no staking state, as `None`).
+    main: Vec<Option<Arc<Block>>>,
+    /// The chain's staking, replayed through `replayed_to`.
+    replay: zebra_state::StakingReplay,
+    replayed_to: u32,
+    /// The key the scene mines to, which owns every coinbase.
+    key: TestKey,
+    /// Transactions the mempool holds that no block of `main` has mined yet.
+    pending: Vec<Arc<Transaction>>,
+    /// Coins spent by `pending`, which the generator's own coin tracking does not see until mined.
+    held: Vec<zebra_chain::transparent::OutPoint>,
+    bonds_made: u32,
+    /// The decision `main`'s tip cites, null until a block cites one, and its snapshot. Once a
+    /// block cites a decision, every block above it cites that one or a later one (the
+    /// Extension rule). `gen_cites[i]` is what `gens[i]`'s tip cites.
+    cite: FatPointerToBftBlock,
+    cite_snapshot: u32,
+    gen_cites: Vec<FatPointerToBftBlock>,
+    /// The newest decision the writer can name, which a block may cite, with its snapshot.
+    citable: Option<(FatPointerToBftBlock, u32)>,
+    /// The height of `fin` the node must hold: the snapshot of the newest decision a best tip
+    /// has cited.
+    fin: Option<u32>,
+    /// Side-branch blocks, with the height of the block each branch forks from.
+    side_blocks: Vec<(u32, zebra_chain::block::Hash)>,
+    /// The next synthetic finalizer index that is on no roster, for packets that may get the
+    /// sender disconnected.
+    next_stranger: u64,
+    /// Whether `parent` is the node's decided tip. Once the node's own proposal is decided it is
+    /// not: that block's certificate holds the precommits the node gathered, which only the node
+    /// knows, so later proposals ask the harness to build on the node's tip (TF_BFT_ON_NODE_TIP)
+    /// and no later decision is cited.
+    parent_known: bool,
+    /// The PoW tip when the engine entered its current round, which is when the node, if it is the
+    /// round's proposer, makes its proposal.
+    round_start_tip: u32,
+    /// Pending spends whose first output, to `key`, no other pending transaction spends yet: what
+    /// a chained spend can spend before it is mined.
+    chainable: Vec<Arc<Transaction>>,
+    /// Transactions the mempool holds that are never mined, until their expiry height has passed
+    /// and they must be gone: each with its expiry height and the coin it holds.
+    expiring: Vec<(Arc<Transaction>, u32, zebra_chain::transparent::OutPoint)>,
+}
+
+/// Synthetic finalizers from here on hold no stake, so the node may disconnect them without the
+/// roster losing a vote.
+const STRANGERS_FROM: u64 = 1000;
+
+/// The next block on `gen`, citing `cite` unless it is null.
+fn cited_block(gen: &mut BlockGen, miner: &Address, txs: &[Arc<Transaction>], cite: &FatPointerToBftBlock) -> Arc<Block> {
+    let block = gen.next_block_with_txs(miner, txs);
+    if *cite == FatPointerToBftBlock::null() {
+        block
+    } else {
+        point_tip_at_bft(gen, cite)
+    }
+}
+
+impl EngineFuzz {
+    /// The stake each finalizer votes with at `snapshot`: its active bonds plus its bank, as the
+    /// node aggregates them.
+    fn stakes_at(&mut self, snapshot: u32) -> Vec<([u8; 32], u64)> {
+        assert!(snapshot >= self.replayed_to, "snapshots only move up");
+        for height in self.replayed_to + 1..=snapshot {
+            let block = self.main[height as usize].clone().expect("only genesis is missing");
+            let main = &self.main;
+            let block_at = |at: zebra_chain::block::Height| main[at.0 as usize].clone().expect("the slash window does not reach genesis");
+            // Every block pays issuance, as on the node (see staking_replay_matches).
+            self.replay
+                .apply_block(&self.scene.gen.network, zebra_chain::block::Height(height), &block, true, block_at)
+                .expect("the generated chain replays");
+        }
+        self.replayed_to = snapshot;
+        let mut stakes: std::collections::HashMap<[u8; 32], u64> = Default::default();
+        for (bond, status) in self.replay.delegation_bonds.values() {
+            if matches!(status, zebra_state::BondStatusInChain::Active) {
+                *stakes.entry(bond.target_finalizer).or_default() += u64::from(bond.amount);
+            }
+        }
+        for (finalizer, bank) in &self.replay.finalizer_rewards {
+            if *bank != 0 {
+                *stakes.entry(*finalizer).or_default() += bank;
+            }
+        }
+        stakes.into_iter().collect()
+    }
+
+    /// Who proposes at the engine's height and round: a synthetic finalizer, or TF_BFT_THE_NODE.
+    fn proposer(&mut self) -> u64 {
+        let members = self.stakes_at(self.snapshot);
+        let proposer = bft_proposer(&members, self.scene.active_roster_max_n, self.height, self.round).expect("the roster has stake");
+        if proposer == self.scene.member_pub_keys[0].0 {
+            return TF_BFT_THE_NODE;
+        }
+        self.scene
+            .finalizers
+            .iter()
+            .map(|&k| u64::from(k))
+            .find(|&k| synthetic_finalizer_pub_key(k) == proposer)
+            .expect("the proposer is on the roster")
+    }
+
+    /// Whether the synthetic finalizers' stake on the roster of the engine's height falls short
+    /// of a quorum under both quorum rules (FeaturenetUpgrade2 picks the strict one), so the
+    /// height is decided only with the node's votes. Bonds and rewards can carry them past it.
+    fn node_needed_for_quorum(&mut self) -> bool {
+        let mut members = self.stakes_at(self.snapshot);
+        members.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        members.truncate(self.scene.active_roster_max_n);
+        let total: u64 = members.iter().map(|&(_, stake)| stake).sum();
+        let node = self.scene.member_pub_keys[0].0;
+        let synthetic: u64 = members.iter().filter(|&&(key, _)| key != node).map(|&(_, stake)| stake).sum();
+        synthetic < decision_threshold(total, false).min(decision_threshold(total, true))
+    }
+
+    /// A synthetic finalizer without which the rest of the roster is still a quorum under both
+    /// quorum rules, so that what it signs cannot decide the height either way; `None` if none is.
+    fn equivocator(&mut self, c: &mut Choices) -> Option<u16> {
+        let members = self.stakes_at(self.snapshot);
+        let total: u64 = members.iter().map(|&(_, stake)| stake).sum();
+        let threshold = decision_threshold(total, false).max(decision_threshold(total, true));
+        let k = self.scene.finalizers[c.below(self.scene.finalizers.len())];
+        let key = synthetic_finalizer_pub_key(k.into());
+        let stake: u64 = members.iter().filter(|&&(member, _)| member == key).map(|&(_, stake)| stake).sum();
+        (total - stake >= threshold).then_some(k)
+    }
+
+    /// A tenderlink packet from a synthetic finalizer on no roster, mostly a real kind of packet
+    /// mangled: a status, a vote or a proposal chunk signed under no namespace, a second
+    /// ID_HELLO, or bytes at random. Whether the node keeps the sender is its call; it must stay
+    /// up and go on deciding, which the next decision checks.
+    fn garbage_packet(&mut self, c: &mut Choices) {
+        let k = self.next_stranger;
+        self.next_stranger += 1;
+        let key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(k).as_bytes()).0;
+        // Payload bytes come from their own stream, so a long packet does not use up `c`.
+        let noise_seed = (c.below(1 << 16) as u64) << 16 | c.below(1 << 16) as u64;
+        let mut noise = Choices::from_seed(noise_seed, 4096);
+        let roster_n = self.scene.member_pub_keys.len();
+        let mut packet = match c.below(5) {
+            0 => status_packet_needing_everything(self.height, self.round, roster_n),
+            1 => {
+                let value_id = if c.below(2) == 0 { ValueId::NIL } else { ValueId(std::array::from_fn(|_| noise.byte())) };
+                vote_packet(&key, c.below(roster_n) as u16, c.below(2) == 0, self.height, self.round, value_id, &[0; 32])
+            }
+            2 => {
+                let value: Vec<u8> = (0..1 + c.below(3000)).map(|_| noise.byte()).collect();
+                let value_id = ValueId(bft_value_id(&value));
+                let mut chunks = proposal_chunk_packets(&key, &value, value_id, self.height, self.round, -1, &[0; 32], roster_n);
+                chunks.swap_remove(c.below(chunks.len()))
+            }
+            3 => id_hello_packet(&key, &[0x5f; 64]),
+            _ => (0..c.below(1500)).map(|_| noise.byte()).collect(),
+        };
+        match c.below(5) {
+            0 => {}
+            1 => packet.truncate(c.below(packet.len().max(1))),
+            2 => {
+                for _ in 0..1 + c.below(4) {
+                    if !packet.is_empty() {
+                        let i = c.below(packet.len());
+                        packet[i] ^= 1 << c.below(8);
+                    }
+                }
+            }
+            3 => {
+                if let Some(tag) = packet.first_mut() {
+                    *tag = c.below(256) as u8;
+                }
+            }
+            _ => packet.extend((0..1 + c.below(64)).map(|_| noise.byte())),
+        }
+        self.tf.push_instr_bft_recv_packet(k, &packet, ANY_OUTCOME);
+        self.tf.push_instr_expect_node_alive(0);
+    }
+
+    /// Every finalizer bank and the staking pool totals at `main`'s tip, as replaying its staking
+    /// from genesis gives them. The node keeps the pools apart from the bonds, so this checks
+    /// that accounting, which EXPECT_STAKING_REPLAY_MATCHES does not.
+    fn expect_staking_totals(&mut self) {
+        let blocks: Vec<Arc<Block>> = self.main[1..].iter().map(|block| block.clone().expect("only genesis is missing")).collect();
+        push_staking_totals(&mut self.tf, &self.scene.gen.network, BFT_ROUNDS_PARAMETERS.staking.slash_analysis_window(), &blocks);
+    }
+
+    fn tip_height(&self) -> u32 {
+        self.scene.gen.tip.coinbase_height().expect("generated blocks have a height").0
+    }
+
+    fn extend(&mut self, c: &mut Choices) {
+        self.extend_with(c, &[]);
+    }
+
+    /// The next block of `main`, which mostly cites the newest decision once there is one, and
+    /// otherwise repeats its parent's citation, as a miner whose template lags would. A tip citing
+    /// a decision moves `fin` to that decision's snapshot, which every decision here buries
+    /// `sigma` deep, so the clamp to `prune_sigma` never binds.
+    fn extend_with(&mut self, c: &mut Choices, txs: &[Arc<Transaction>]) {
+        self.gens.push(self.scene.gen.clone());
+        self.gen_cites.push(self.cite.clone());
+        if let Some((pointer, snapshot)) = self.citable.clone() {
+            if self.cite != pointer && c.below(4) != 0 {
+                self.cite = pointer;
+                self.cite_snapshot = snapshot;
+            }
+        }
+        let block = cited_block(&mut self.scene.gen, &self.scene.miner.clone(), txs, &self.cite);
+        self.main.push(Some(block.clone()));
+        if c.unusual(64) {
+            self.tf.push_instr_recv_pow(&block, self.next_fresh_peer, 0);
+            self.next_fresh_peer += 1;
+        } else {
+            self.tf.push_instr_load_pow(&block, 0);
+        }
+        self.scene.pow.push(block);
+        self.tf.push_instr_expect_pow_tip(&self.scene.gen.tip.hash(), 0);
+        self.expire();
+        if self.cite != FatPointerToBftBlock::null() && self.fin.map_or(true, |fin| fin < self.cite_snapshot) {
+            self.fin = Some(self.cite_snapshot);
+            self.expect_finality(c);
+        }
+    }
+
+    fn main_hash(&self, height: u32) -> zebra_chain::block::Hash {
+        self.main[height as usize].as_ref().expect("only genesis is missing").hash()
+    }
+
+    /// `fin` where the writer put it, and the finality the node reports for a few blocks: on
+    /// `main` at and above `fin`, and on a side branch that forks below it, which `fin` excludes.
+    fn expect_finality(&mut self, c: &mut Choices) {
+        let Some(fin) = self.fin else { return };
+        let fin_hash = self.main_hash(fin);
+        self.tf.push_instr_expect_finalized_tip(Some(&fin_hash), 0);
+        self.tf.push_instr_expect_pow_block_finality(&fin_hash, Some(TFLBlockFinality::Finalized), 0);
+        let below = 1 + c.below(fin as usize) as u32;
+        self.tf.push_instr_expect_pow_block_finality(&self.main_hash(below), Some(TFLBlockFinality::Finalized), 0);
+        let above = fin + 1 + c.below((self.tip_height() - fin) as usize) as u32;
+        self.tf.push_instr_expect_pow_block_finality(&self.main_hash(above), Some(TFLBlockFinality::NotYetFinalized), 0);
+        let excluded: Vec<zebra_chain::block::Hash> =
+            self.side_blocks.iter().filter(|&&(fork, _)| fork < fin).map(|&(_, hash)| hash).collect();
+        if !excluded.is_empty() {
+            let hash = excluded[c.below(excluded.len())];
+            self.tf.push_instr_expect_pow_block_finality(&hash, Some(TFLBlockFinality::CantBeFinalized), 0);
+        }
+    }
+
+    /// A branch from two or more below the tip, shorter than the best chain, so the tip stays.
+    /// Its blocks cite what the block they fork from cites. One forking below `fin` conflicts
+    /// with it: whether the node takes such a block or refuses it, its tip and `fin` stay.
+    fn side_branch(&mut self, c: &mut Choices) {
+        let n = self.gens.len();
+        if n < 3 {
+            return self.extend(c);
+        }
+        // Mostly close below the tip; sometimes from anywhere, so a branch can fork below `fin`.
+        let from = if self.fin.is_some() && c.below(2) == 0 { c.below(n - 2) } else { n - 2 - c.below((n - 2).min(4)) };
+        let mut side = self.gens[from].clone();
+        let side_cite = self.gen_cites[from].clone();
+        let fork = side.tip.coinbase_height().expect("generated blocks have a height").0;
+        let flags = if self.fin.is_some_and(|fin| fork < fin) { ANY_OUTCOME } else { 0 };
+        self.sides = self.sides.wrapping_add(1);
+        let miner = Address::Transparent(zcash_transparent::address::TransparentAddress::PublicKeyHash([self.sides | 0x80; 20]));
+        // Shorter than main: `from + 1` holds main's block at the same height as side's first.
+        for _ in 0..1 + c.below((n - from - 1).min(6)) {
+            let block = cited_block(&mut side, &miner, &[], &side_cite);
+            self.tf.push_instr_load_pow(&block, flags);
+            self.side_blocks.push((fork, block.hash()));
+        }
+        if flags != 0 {
+            self.tf.push_instr_expect_node_alive(0);
+        }
+        self.tf.push_instr_expect_pow_tip(&self.scene.gen.tip.hash(), 0);
+        if flags != 0 {
+            self.expect_finality(c);
+        }
+    }
+
+    /// The oldest mature coinbase no pending transaction spends.
+    fn coin(&self) -> Option<(zebra_chain::transparent::OutPoint, zebra_chain::transparent::Output)> {
+        let gen = &self.scene.gen;
+        let next_height = gen.tip.coinbase_height().expect("generated blocks have a height").0 + 1;
+        let lock_script = self.key.lock_script();
+        gen.utxos
+            .iter()
+            .filter(|(outpoint, utxo)| {
+                utxo.from_coinbase
+                    && utxo.output.lock_script == lock_script
+                    && next_height >= utxo.height.0 + zebra_chain::transparent::MIN_TRANSPARENT_COINBASE_MATURITY
+                    && !self.held.contains(outpoint)
+            })
+            .min_by_key(|(outpoint, utxo)| (utxo.height, outpoint.hash.0, outpoint.index))
+            .map(|(outpoint, utxo)| (*outpoint, utxo.output.clone()))
+    }
+
+    /// `tx` through a doorway chosen by `c`: local, a peer's wire message, or relayed over STP.
+    fn submit(&mut self, c: &mut Choices, tx: &Transaction, flags: u32) {
+        match c.below(3) {
+            0 => self.tf.push_instr_submit_tx(tx, flags),
+            doorway => {
+                let peer = self.next_fresh_peer;
+                self.next_fresh_peer += 1;
+                if doorway == 1 {
+                    self.tf.push_instr_recv_tx_wire(tx, peer, flags);
+                } else {
+                    self.tf.push_instr_recv_tx_stp(tx, peer, flags);
+                }
+            }
+        }
+    }
+
+    /// A coinbase spent, paying the mempool's fee: taken, and resident until mined.
+    fn spend(&mut self, c: &mut Choices) {
+        let Some(coin) = self.coin() else { return self.extend(c) };
+        let tx = transparent_spend(self.scene.gen.next_upgrade(), &self.key, coin.clone());
+        self.submit(c, &tx, 0);
+        self.tf.push_instr_expect_mempool_contains(&tx, 0);
+        self.held.push(coin.0);
+        self.chainable.push(tx.clone());
+        self.pending.push(tx);
+    }
+
+    /// Another spend of a coin a pending transaction spends, paying more: refused, through
+    /// whichever doorway, and the pending one stays.
+    fn double_spend(&mut self, c: &mut Choices) {
+        let Some(first) = self.pending.get(c.below(self.pending.len().max(1))).cloned() else { return self.spend(c) };
+        let Some(input) = first.inputs().first().and_then(|input| input.outpoint()) else { return };
+        let Some(utxo) = self.scene.gen.utxos.get(&input).cloned() else { return };
+        let value = utxo.output.value;
+        let fee = (value - first.outputs()[0].value).expect("the first spend pays a fee");
+        let more = (fee + zebra_chain::amount::Amount::try_from(1_000).expect("a small amount")).expect("fees stay small");
+        let output = zebra_chain::transparent::Output::new((value - more).expect("the coin covers the fee"), self.key.lock_script());
+        let second = signed_tx(self.scene.gen.next_upgrade(), Some(&self.key), &[(input, utxo.output.clone())], vec![output], None, 0);
+        self.submit(c, &second, SHOULD_FAIL);
+        self.tf.push_instr_expect_mempool_contains(&first, 0);
+    }
+
+    /// A block mining every pending transaction: each leaves the mempool.
+    fn mine_pending(&mut self, c: &mut Choices) {
+        if self.pending.is_empty() {
+            return self.extend(c);
+        }
+        let txs = std::mem::take(&mut self.pending);
+        self.held.clear();
+        self.chainable.clear();
+        // Expiring ones stay in the mempool, and their coins stay held.
+        self.held.extend(self.expiring.iter().map(|(_, _, coin)| *coin));
+        self.extend_with(c, &txs);
+        for tx in &txs {
+            self.tf.push_instr_expect_mempool_absent(tx, 0);
+        }
+        if c.below(2) == 0 {
+            self.expect_staking_totals();
+        }
+    }
+
+    /// A bond of 10^8 zats to a member of the roster, so the roster's stake moves and the
+    /// writer's replay of it must follow. Inside the staking window it goes through the mempool
+    /// and is mined later; outside it, a block holding it is refused.
+    fn bond(&mut self, c: &mut Choices) {
+        let Some(coin) = self.coin() else { return self.extend(c) };
+        let staking = BFT_ROUNDS_PARAMETERS.staking;
+        let target_seed = match c.below(1 + self.scene.finalizers.len()) {
+            0 => TEST_NODE_FINALIZER_SEED.to_string(),
+            k => synthetic_finalizer_seed(self.scene.finalizers[k - 1].into()),
+        };
+        let signing_key = zebra_crosslink::rng_private_public_key_from_address(target_seed.as_bytes()).0;
+        let target = zcash_primitives::bft::FinalizerAddress::create(&signing_key);
+        self.bonds_made += 1;
+        let seed = format!("engine-bond-{}", self.bonds_made);
+        let tx = staking_tx_create_bond_funded(self.scene.gen.next_upgrade(), seed.as_bytes(), target, 100_000_000, &self.key, coin.clone());
+        let next_height = self.tip_height() + 1;
+        if next_height % staking.period < staking.day_window {
+            self.submit(c, &tx, 0);
+            self.tf.push_instr_expect_mempool_contains(&tx, 0);
+            self.held.push(coin.0);
+            self.pending.push(tx);
+        } else {
+            let refused = cited_block(&mut self.scene.gen.clone(), &self.scene.miner.clone(), &[tx], &self.cite);
+            self.tf.push_instr_load_pow(&refused, SHOULD_FAIL);
+            self.tf.push_instr_expect_rejection_reason("staking window", 0);
+        }
+    }
+
+    /// A transaction other than a single coin's spend, through any doorway: a chained spend of a
+    /// pending transaction's output, a spend of two coins into three outputs, one expiring a few
+    /// blocks on that is never mined, or one the mempool must refuse (expired, spending an
+    /// immature coinbase, signed by the wrong key, or paying out more than it spends), whose block
+    /// is refused too.
+    fn fancy_tx(&mut self, c: &mut Choices) {
+        use zebra_chain::amount::{Amount, NonNegative};
+        use zebra_chain::transparent::{OutPoint, Output};
+        let upgrade = self.scene.gen.next_upgrade();
+        let next_height = self.tip_height() + 1;
+        let fee_for = |inputs: &[(OutPoint, Output)], outputs: Vec<Output>, key: &TestKey, expiry: u32| {
+            mempool_fee(&signed_tx(upgrade, Some(key), inputs, outputs, None, expiry))
+        };
+        match c.below(4) {
+            0 => {
+                let Some(parent) = (!self.chainable.is_empty()).then(|| self.chainable.remove(c.below(self.chainable.len()))) else {
+                    return self.spend(c);
+                };
+                let input = (OutPoint { hash: parent.hash(), index: 0 }, parent.outputs()[0].clone());
+                let child = transparent_spend(upgrade, &self.key, input);
+                self.submit(c, &child, 0);
+                self.tf.push_instr_expect_mempool_contains(&child, 0);
+                self.chainable.push(child.clone());
+                self.pending.push(child);
+            }
+            1 => {
+                let Some(first) = self.coin() else { return self.extend(c) };
+                self.held.push(first.0);
+                let Some(second) = self.coin() else {
+                    self.held.pop();
+                    return self.extend(c);
+                };
+                self.held.push(second.0);
+                let inputs = [first.clone(), second.clone()];
+                let total = (first.1.value + second.1.value).expect("two coins add up");
+                let split = |fee: Amount<NonNegative>| {
+                    let rest = (total - fee).expect("the coins cover the fee");
+                    let third = Amount::<NonNegative>::try_from(u64::from(rest) / 3).expect("a third is an amount");
+                    let last = ((rest - third).expect("less than the whole") - third).expect("less than the whole");
+                    vec![Output::new(third, self.key.lock_script()), Output::new(third, self.key.lock_script()), Output::new(last, self.key.lock_script())]
+                };
+                let fee = fee_for(&inputs, split(Amount::zero()), &self.key, 0);
+                let tx = signed_tx(upgrade, Some(&self.key), &inputs, split(fee), None, 0);
+                self.submit(c, &tx, 0);
+                self.tf.push_instr_expect_mempool_contains(&tx, 0);
+                self.chainable.push(tx.clone());
+                self.pending.push(tx);
+            }
+            2 => {
+                let Some(coin) = self.coin() else { return self.extend(c) };
+                let expiry = next_height + 1 + c.below(3) as u32;
+                let pay = |fee: Amount<NonNegative>| vec![Output::new((coin.1.value - fee).expect("the coin covers the fee"), self.key.lock_script())];
+                let fee = fee_for(&[coin.clone()], pay(Amount::zero()), &self.key, expiry);
+                let tx = signed_tx(upgrade, Some(&self.key), &[coin.clone()], pay(fee), None, expiry);
+                self.submit(c, &tx, 0);
+                self.tf.push_instr_expect_mempool_contains(&tx, 0);
+                self.held.push(coin.0);
+                self.expiring.push((tx, expiry, coin.0));
+            }
+            _ => {
+                let mature = self.coin();
+                let lock_script = self.key.lock_script();
+                let young = self
+                    .scene
+                    .gen
+                    .utxos
+                    .iter()
+                    .filter(|(_, utxo)| utxo.from_coinbase && utxo.output.lock_script == lock_script)
+                    .max_by_key(|(outpoint, utxo)| (utxo.height, outpoint.hash.0, outpoint.index))
+                    .map(|(outpoint, utxo)| (*outpoint, utxo.output.clone()));
+                let tx = match (c.below(4), mature) {
+                    (0, Some(coin)) => {
+                        let pay = |fee: Amount<NonNegative>| vec![Output::new((coin.1.value - fee).expect("the coin covers the fee"), self.key.lock_script())];
+                        let fee = fee_for(&[coin.clone()], pay(Amount::zero()), &self.key, 0);
+                        // Expired: its expiry height is the tip's, below the next block's.
+                        signed_tx(upgrade, Some(&self.key), &[coin.clone()], pay(fee), None, next_height - 1)
+                    }
+                    (1, Some(coin)) => {
+                        let thief = TestKey::new(b"crosslink fuzz wrong signer");
+                        let pay = |fee: Amount<NonNegative>| vec![Output::new((coin.1.value - fee).expect("the coin covers the fee"), thief.lock_script())];
+                        let fee = fee_for(&[coin.clone()], pay(Amount::zero()), &thief, 0);
+                        signed_tx(upgrade, Some(&thief), &[coin.clone()], pay(fee), None, 0)
+                    }
+                    (2, Some(coin)) => {
+                        let more = (coin.1.value + Amount::<NonNegative>::try_from(1).expect("one zat")).expect("a coin and a zat");
+                        signed_tx(upgrade, Some(&self.key), &[coin], vec![Output::new(more, self.key.lock_script())], None, 0)
+                    }
+                    _ => {
+                        let Some(coin) = young else { return self.extend(c) };
+                        let pay = |fee: Amount<NonNegative>| vec![Output::new((coin.1.value - fee).expect("the coin covers the fee"), self.key.lock_script())];
+                        let fee = fee_for(&[coin.clone()], pay(Amount::zero()), &self.key, 0);
+                        signed_tx(upgrade, Some(&self.key), &[coin.clone()], pay(fee), None, 0)
+                    }
+                };
+                self.submit(c, &tx, SHOULD_FAIL);
+                self.tf.push_instr_expect_mempool_absent(&tx, 0);
+                if c.below(2) == 0 {
+                    let refused = cited_block(&mut self.scene.gen.clone(), &self.scene.miner.clone(), &[tx], &self.cite);
+                    self.tf.push_instr_load_pow(&refused, SHOULD_FAIL);
+                    self.tf.push_instr_expect_pow_tip(&self.scene.gen.tip.hash(), 0);
+                }
+            }
+        }
+    }
+
+    /// Expiring transactions whose expiry height the tip has passed: the mempool must have dropped
+    /// them, and their coins are free again.
+    fn expire(&mut self) {
+        let tip = self.tip_height();
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.expiring).into_iter().partition(|(_, expiry, _)| tip > *expiry);
+        self.expiring = kept;
+        for (tx, _, coin) in gone {
+            self.tf.push_instr_expect_mempool_absent(&tx, 0);
+            self.held.retain(|held| *held != coin);
+        }
+    }
+
+    fn votes(&mut self, bits: u64, id: &[u8; 32]) {
+        for k in self.scene.finalizers {
+            self.tf.push_instr_bft_recv_vote(k, bits, self.height, self.round, id, 0);
+        }
+    }
+
+    fn tick(&mut self) {
+        self.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+        self.round_ticks += 1;
+    }
+
+    /// The most ticks the current round may have seen before its proposal arrives: the propose
+    /// timeout (2 s plus 500 ms a round) less two ticks of margin. A proposal any later finds the
+    /// node already prevoting nil, and the synthetic finalizers are not a quorum without it.
+    fn proposal_window_ticks(&self) -> u32 {
+        ((2000 + 500 * u64::from(self.round)) / BFT_TICK_MILLIS) as u32 - 2
+    }
+
+    /// The snapshot of the proposal the node makes at the start of its round, as `propose` makes
+    /// it: the tip less sigma, at most 40 above the parent's, and none unless it improves on the
+    /// parent's. Only round 0, which the engine enters as the height before is decided: a later
+    /// round is entered on its own messages, or on timeouts the writer does not model, and the
+    /// node's round has no message before its proposal.
+    fn node_proposal_snapshot(&self) -> Option<u32> {
+        if self.round != 0 {
+            return None;
+        }
+        let sigma = BFT_ROUNDS_PARAMETERS.bc_confirmation_depth_sigma as u32;
+        let candidate = self.round_start_tip.checked_sub(sigma)?;
+        (candidate > self.snapshot).then(|| candidate.min(self.snapshot + 40))
+    }
+
+    /// Decides the engine's height on the node's own proposal: it made it when the round began,
+    /// and the synthetic finalizers prevote and precommit it, in any order, by what the node sent
+    /// (TF_BFT_FOR_NODE_PROPOSAL). From then on the writer knows the decided block's snapshot but
+    /// not its certificate.
+    fn decide_node_proposal(&mut self, c: &mut Choices, snapshot: u32) {
+        self.tick();
+        self.tf.push_instr_expect_bft_sent(2, self.height, self.round, None, 0);
+        let finalizers = self.scene.finalizers;
+        let mut cast: Vec<(u16, u64)> = finalizers.iter().flat_map(|&k| [(k, 0), (k, TF_BFT_PRECOMMIT)]).collect();
+        let mut ticks = 0;
+        while !cast.is_empty() {
+            let (k, bits) = cast.remove(c.below(cast.len()));
+            self.tf.push_instr_bft_recv_vote(k, bits | TF_BFT_FOR_NODE_PROPOSAL, self.height, self.round, &[0; 32], 0);
+            if ticks < 4 && c.unusual(48) {
+                ticks += 1;
+                self.tick();
+            }
+        }
+        for _ in 0..4 {
+            self.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+        }
+        self.round_ticks = 4;
+        self.snapshot = snapshot;
+        self.parent_known = false;
+        self.height += 1;
+        self.round = 0;
+        self.round_start_tip = self.tip_height();
+        self.tf.push_instr_expect_bft_step(self.height, 0, None, 0);
+        self.tf.push_instr_expect_pos_chain_length(self.height as usize, 0);
+    }
+
+    /// Gives up the current round: every synthetic finalizer prevotes and precommits nil, and the
+    /// writer moves on to the next round without waiting out the timeouts. How long those take
+    /// depends on whether the node had anything to propose, which the writer does not model; the
+    /// next round's messages, from more than a third of the stake, pull the engine into that
+    /// round at once (tendermint's round catch-up), whatever this one is doing.
+    fn nil_round(&mut self) {
+        self.tick();
+        self.votes(TF_BFT_NIL, &[0; 32]);
+        self.votes(TF_BFT_PRECOMMIT | TF_BFT_NIL, &[0; 32]);
+        self.round += 1;
+        // The next round begins when its messages pull the engine into it.
+        self.round_ticks = 0;
+        self.round_start_tip = self.tip_height();
+    }
+
+    /// Decides the engine's height on a proposal from the round's synthetic proposer. Its
+    /// messages (the proposal, three prevotes, three precommits, some sent twice, some
+    /// prevotes under the wrong namespace too) arrive in a random order with up to five ticks
+    /// between them, none before the proposal once its window is spent: a proposal and a quorum
+    /// of precommits decide whatever the order.
+    fn decide(&mut self, c: &mut Choices) {
+        let sigma = BFT_ROUNDS_PARAMETERS.bc_confirmation_depth_sigma as u32;
+        while self.tip_height() < self.snapshot + 1 + sigma {
+            self.extend(c);
+        }
+        while self.proposer() == TF_BFT_THE_NODE {
+            self.tf.push_instr_expect_bft_proposer(TF_BFT_THE_NODE, self.height, self.round, 0);
+            if let Some(snapshot) = self.node_proposal_snapshot() {
+                if c.below(2) == 0 {
+                    return self.decide_node_proposal(c, snapshot);
+                }
+            }
+            self.nil_round();
+        }
+        let proposer = u16::try_from(self.proposer()).expect("a synthetic finalizer proposes");
+        self.tf.push_instr_expect_bft_proposer(proposer.into(), self.height, self.round, 0);
+        let node_needed = self.node_needed_for_quorum();
+        // Half the time as recent as allowed, so the next roster takes in the latest bonds and
+        // rewards; a snapshot drawn evenly from the whole range mostly falls before any of them.
+        let top = self.tip_height() - sigma;
+        let snapshot = if c.below(2) == 0 { top } else { self.snapshot + 1 + c.below((top - self.snapshot) as usize) as u32 };
+        let block = bft_proposal(&BFT_ROUNDS_PARAMETERS, self.height as u32, self.parent.clone(), 0, &self.scene.tail_above(snapshot));
+        let value = bft_proposal_value(&block);
+        let id = bft_value_id(&value);
+        if self.parent_known && c.below(4) == 0 {
+            return self.lock_then_decide(c, proposer, block, value, id, snapshot, top);
+        }
+
+        enum Message {
+            Proposal,
+            Vote(u16, u64),
+            /// A vote for another value: an equivocation.
+            Other(u16, u64, [u8; 32]),
+        }
+        // On the node's tip the value is known only once the harness has sent it, so the votes
+        // name it by delivery and come after it.
+        let (proposal_flags, vote_bits) = if self.parent_known { (0, 0) } else { (TF_BFT_ON_NODE_TIP, TF_BFT_FOR_DELIVERED_PROPOSAL) };
+        if !self.parent_known {
+            self.tf.push_instr_bft_recv_proposal(proposer, self.height, self.round, -1, 0, &value, proposal_flags);
+        }
+        let mut messages = if self.parent_known { vec![Message::Proposal] } else { Vec::new() };
+        let mut proposed = !self.parent_known;
+        for k in self.scene.finalizers {
+            messages.push(Message::Vote(k, 0));
+            messages.push(Message::Vote(k, TF_BFT_PRECOMMIT));
+            if c.unusual(48) {
+                messages.push(Message::Vote(k, if c.below(2) == 0 { TF_BFT_PRECOMMIT } else { 0 }));
+            }
+            if c.unusual(32) {
+                messages.push(Message::Vote(k, TF_BFT_WRONG_NAMESPACE));
+            }
+        }
+        // A finalizer the quorum does not need also signs a value nobody proposed (its prevote, its
+        // precommit or both), or votes nil instead, splitting the vote. The height is decided as
+        // before.
+        if c.unusual(48) {
+            if let Some(k) = self.equivocator(c) {
+                let mut other = id;
+                other[0] ^= 0xff;
+                match c.below(4) {
+                    0 => messages.push(Message::Other(k, 0, other)),
+                    1 => messages.push(Message::Other(k, TF_BFT_PRECOMMIT, other)),
+                    2 => {
+                        messages.push(Message::Other(k, 0, other));
+                        messages.push(Message::Other(k, TF_BFT_PRECOMMIT, other));
+                    }
+                    _ => {
+                        messages.retain(|m| !matches!(m, Message::Vote(j, _) if *j == k));
+                        messages.push(Message::Vote(k, TF_BFT_NIL));
+                        messages.push(Message::Vote(k, TF_BFT_PRECOMMIT | TF_BFT_NIL));
+                    }
+                }
+            }
+        }
+        let mut ticks = 0;
+        let room = |f: &EngineFuzz, proposed: bool| proposed || f.round_ticks + 1 < f.proposal_window_ticks();
+        if room(self, proposed) {
+            ticks += 1;
+            self.tick();
+        }
+        while !messages.is_empty() {
+            match messages.remove(c.below(messages.len())) {
+                Message::Proposal => {
+                    proposed = true;
+                    self.tf.push_instr_bft_recv_proposal(proposer, self.height, self.round, -1, 0, &value, 0)
+                }
+                Message::Vote(k, bits) => self.tf.push_instr_bft_recv_vote(k, bits | vote_bits, self.height, self.round, &id, 0),
+                Message::Other(k, bits, other) => self.tf.push_instr_bft_recv_vote(k, bits, self.height, self.round, &other, 0),
+            }
+            if ticks < 6 && room(self, proposed) && c.unusual(48) {
+                ticks += 1;
+                self.tick();
+            }
+        }
+        // A decision waits on the node's answer before the engine starts the next height, and
+        // the last message may arrive after the engine's own precommit: four ticks see both out.
+        // They fall in the next height's first round, so they count against its proposal.
+        for _ in 0..4 {
+            self.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+        }
+        self.round_ticks = 4;
+        // Without the node's stake there is no quorum, so the decision shows it prevoted and
+        // precommitted the proposal.
+        if node_needed && self.parent_known {
+            self.tf.push_instr_expect_bft_sent(0, self.height, self.round, Some(&id), 0);
+            self.tf.push_instr_expect_bft_sent(1, self.height, self.round, Some(&id), 0);
+        }
+
+        self.decided(&block, snapshot);
+    }
+
+    /// The engine's height decided `block`, at the current round, finalizing `snapshot`: the
+    /// engine moves to the next height, which the writer follows.
+    fn decided(&mut self, block: &BftBlock, snapshot: u32) {
+        let seeds: Vec<String> = self.scene.finalizers.iter().map(|&k| synthetic_finalizer_seed(k.into())).collect();
+        let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
+        self.parent = signed_fat_pointer(block, self.height, self.round, &seeds, &[0; 32]);
+        self.snapshot = snapshot;
+        // A decision is cited only while the writer can name it.
+        if self.parent_known {
+            self.citable = Some((self.parent.clone(), snapshot));
+        }
+        self.height += 1;
+        self.round = 0;
+        self.round_start_tip = self.tip_height();
+        self.tf.push_instr_expect_bft_step(self.height, 0, None, 0);
+        self.tf.push_instr_expect_pos_chain_length(self.height as usize, 0);
+    }
+
+    /// Three ticks: what the node does with messages it was just sent. The engine applies its
+    /// rules on a tick, and what one rule does there satisfies another only on the next: entering
+    /// a round its messages pulled it into, then prevoting, then precommitting on the prevotes its
+    /// own completed. Three ticks (750 ms) stay inside a later round's prevote timeout, and in round
+    /// 0, whose timeout is two ticks, the precommit comes a tick after the quorum, before it.
+    fn settle_ticks(&mut self) {
+        self.tick();
+        self.tick();
+        self.tick();
+    }
+
+    /// Locks the node on a value and decides it in a later round, through the valid-round rules.
+    /// In the current round the synthetic proposer's value gets a quorum of prevotes, so the node
+    /// locks it and precommits it, but the synthetic finalizers precommit nil. Each later round is
+    /// entered on its own synthetic prevotes. When the node proposes one, it must re-propose the
+    /// locked value. A synthetic proposer sometimes first offers another valid value, which the
+    /// locked node must prevote nil, and then re-proposes the locked one with the round it got its
+    /// prevotes in as its valid round, which the node must prevote. The locked value is decided.
+    fn lock_then_decide(&mut self, c: &mut Choices, proposer: u16, block: BftBlock, value: Vec<u8>, id: [u8; 32], snapshot: u32, top: u32) {
+        let locked_round = self.round;
+        if self.round_ticks + 1 < self.proposal_window_ticks() {
+            self.tick();
+        }
+        self.tf.push_instr_bft_recv_proposal(proposer, self.height, self.round, -1, 0, &value, 0);
+        self.votes(0, &id);
+        self.settle_ticks();
+        self.tf.push_instr_expect_bft_sent(1, self.height, self.round, Some(&id), 0);
+        self.votes(TF_BFT_PRECOMMIT | TF_BFT_NIL, &[0; 32]);
+
+        let mut offered_other = false;
+        loop {
+            self.round += 1;
+            self.round_ticks = 0;
+            let proposer = self.proposer();
+            self.tf.push_instr_expect_bft_proposer(proposer, self.height, self.round, 0);
+            if proposer == TF_BFT_THE_NODE {
+                // Its prevotes pull the engine into the round, where the node proposes its valid
+                // value: the locked one.
+                self.votes(0, &id);
+                self.settle_ticks();
+                self.tf.push_instr_expect_bft_sent(2, self.height, self.round, Some(&id), 0);
+                self.votes(TF_BFT_PRECOMMIT, &id);
+                break;
+            }
+            let proposer = u16::try_from(proposer).expect("a synthetic finalizer proposes");
+            // Another valid value: the same parent, a different snapshot.
+            let other_snapshot = if snapshot < top { snapshot + 1 } else { snapshot.saturating_sub(1).max(self.snapshot + 1) };
+            if !offered_other && other_snapshot != snapshot && c.below(2) == 0 {
+                offered_other = true;
+                let other = bft_proposal(&BFT_ROUNDS_PARAMETERS, self.height as u32, self.parent.clone(), 0, &self.scene.tail_above(other_snapshot));
+                self.tf.push_instr_bft_recv_proposal(proposer, self.height, self.round, -1, 0, &bft_proposal_value(&other), 0);
+                self.votes(TF_BFT_NIL, &[0; 32]);
+                self.settle_ticks();
+                self.tf.push_instr_expect_bft_sent(0, self.height, self.round, None, 0);
+                self.votes(TF_BFT_PRECOMMIT | TF_BFT_NIL, &[0; 32]);
+                continue;
+            }
+            self.tf.push_instr_bft_recv_proposal(proposer, self.height, self.round, i64::from(locked_round), 0, &value, 0);
+            self.votes(0, &id);
+            self.settle_ticks();
+            self.tf.push_instr_expect_bft_sent(0, self.height, self.round, Some(&id), 0);
+            self.votes(TF_BFT_PRECOMMIT, &id);
+            break;
+        }
+        for _ in 0..4 {
+            self.tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+        }
+        self.round_ticks = 4;
+        self.decided(&block, snapshot);
+    }
+}
+
+fn generate_engine(c: &mut Choices) -> Vec<u8> {
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let node_proposes_round_0 = c.below(2) == 0;
+    let scene = bft_rounds_scene(&mut tf, &[node_proposes_round_0]);
+    let zcash_primitives::bft::BftBootstrap::FromChain { roster_height, .. } = BFT_ROUNDS_PARAMETERS.bootstrap else {
+        unreachable!("the BFT rounds scenes bootstrap from the chain")
+    };
+    let parent = FatPointerToBftBlock::from_parts(scene.genesis().blake3_hash(), 0, 0, &[]);
+    // The scene loads only best-chain blocks, so they are the chain from genesis + 1 on.
+    let bytes = tf.write_to_bytes();
+    let mut main: Vec<Option<Arc<Block>>> = vec![None];
+    for instr in &TF::read_from_bytes(&bytes).expect("the scene reads back").instrs {
+        if instr.kind == TFInstr::LOAD_POW {
+            let block = Block::zcash_deserialize(instr.data_slice(&bytes)).expect("the scene's blocks parse");
+            assert_eq!(block.coinbase_height().map(|h| h.0 as usize), Some(main.len()), "the scene loads one chain in order");
+            main.push(Some(Arc::new(block)));
+        }
+    }
+    let replay = zebra_state::StakingReplay::new(&Default::default(), BFT_ROUNDS_PARAMETERS.staking.slash_analysis_window());
+    let mut f = EngineFuzz {
+        tf, scene, gens: Vec::new(), height: 1, round: 0, parent, snapshot: roster_height, next_fresh_peer: FRESH_PEERS_FROM, sides: 0,
+        main, replay, replayed_to: 0, round_ticks: 0, chainable: Vec::new(), expiring: Vec::new(),
+        key: TestKey::new(b"crosslink test miner"), pending: Vec::new(), held: Vec::new(), bonds_made: 0,
+        cite: FatPointerToBftBlock::null(), cite_snapshot: 0, gen_cites: Vec::new(), citable: None, fin: None,
+        side_blocks: Vec::new(), next_stranger: STRANGERS_FROM, parent_known: true, round_start_tip: 0,
+    };
+    f.round_start_tip = f.tip_height();
+    // BFT starts at the activation height the scene loaded up to.
+    f.tick();
+    for _ in 0..2 + c.below(10) {
+        match c.below(14) {
+            0..=2 => {
+                for _ in 0..1 + c.below(3) {
+                    f.extend(c);
+                }
+            }
+            3 => f.side_branch(c),
+            4 => f.spend(c),
+            5 => f.double_spend(c),
+            6 => f.mine_pending(c),
+            7 => f.bond(c),
+            8 => f.garbage_packet(c),
+            9 => f.fancy_tx(c),
+            _ => f.decide(c),
+        }
+    }
+    f.tf.push_instr_expect_node_alive(0);
+    f.tf.push_instr_expect_staking_replay_matches(0);
+    f.expect_staking_totals();
+    f.tf.write_to_bytes()
+}
+
+/// One engine input, drawn from the seed like the directed scenarios: whatever order a round's
+/// messages arrive in, a proposal and a quorum of precommits decide the height.
+#[test]
+fn crosslink_fuzz_directed_the_engine_decides_each_height_whatever_order_its_messages_arrive_in() {
+    set_test_name(function_name!());
+    test_bytes(generate_engine(&mut directed_choices()));
+}
+// ---- End of BFT through the engine ----
+
 type Move = fn(&mut FuzzGen, &mut Choices);
 
+/// The lowest height an input schedules FeaturenetUpgrade2 or FeaturenetUpgrade3 at, and the
+/// span above it it may pick from: a run's staking moves reach a few staking periods.
+const FUZZ_UTXO_UPGRADE_FROM: u32 = 4;
+const FUZZ_UTXO_UPGRADE_SPAN: usize = 60;
+
 /// The moves, most ordinary first: choice 0 picks extend.
-const MOVES: &[Move] = &[move_extend, move_fork, move_invalid_block, move_mangled_block, move_spend, move_mine_pending, move_double_spend, move_staking];
+const MOVES: &[Move] = &[move_extend, move_fork, move_invalid_block, move_mangled_block, move_spend, move_mine_pending, move_double_spend, move_staking, move_replay, move_retarget_twice, move_malicious_peer];
 
 /// The test file for `c`. Each input enables a subset of the moves, so rare combinations are not
-/// drowned out by common ones.
+/// drowned out by common ones. Some inputs are BFT chains instead (`generate_bft`), and some run
+/// the node's BFT engine (`generate_engine`).
 pub(crate) fn generate(c: &mut Choices) -> Vec<u8> {
+    if c.unusual(48) {
+        return generate_bft(c);
+    }
+    if c.unusual(64) {
+        return generate_engine(c);
+    }
     // The short staking calendar, so bonds can unbond and withdraw within one input.
     let params = zcash_primitives::bft::ZcashCrosslinkParameters { staking: short_staking(&HARNESS_PARAMETERS), ..HARNESS_PARAMETERS };
-    let mut g = FuzzGen::new(&params);
+    // A third of the inputs bond under FeaturenetUpgrade3's spent versions and a third refuse
+    // finalized repeats under FeaturenetUpgrade2, from early in the run or after some bonds act
+    // without them.
+    use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
+    let upgrades = c.below(3);
+    let node_config = match upgrades {
+        0 => String::new(),
+        1 => node_config_with_activation_heights(ConfiguredActivationHeights {
+            featurenet_upgrade_3: Some(FUZZ_UTXO_UPGRADE_FROM + c.below(FUZZ_UTXO_UPGRADE_SPAN) as u32),
+            ..Default::default()
+        }),
+        _ => node_config_with_activation_heights(ConfiguredActivationHeights {
+            featurenet_upgrade_2: Some(FUZZ_UTXO_UPGRADE_FROM + c.below(FUZZ_UTXO_UPGRADE_SPAN) as u32),
+            ..Default::default()
+        }),
+    };
+    let mut g = FuzzGen::new_with_node_config(&params, &node_config);
     let enabled: Vec<Move> = MOVES.iter().enumerate().filter(|(i, _)| *i == 0 || !c.unusual(64)).map(|(_, m)| *m).collect();
     let moves_n = 4 + c.below(28);
-    for _ in 0..moves_n {
+    // A quarter of the inputs replay an action after it is finalized.
+    let finalize_at = c.unusual(64).then(|| c.below(moves_n));
+    // Three quarters of those that schedule FeaturenetUpgrade3 cross it early with bonds made
+    // before it, while the activation is still ahead.
+    let cross_at = (upgrades == 1 && c.unusual(192)).then(|| c.below(moves_n.min(4)));
+    for k in 0..moves_n {
+        if cross_at == Some(k) {
+            move_cross_featurenet_upgrade_3(&mut g, c);
+        }
+        if finalize_at == Some(k) {
+            move_finalize(&mut g, c);
+        }
         let m = enabled[c.below(enabled.len())];
         m(&mut g, c);
     }
@@ -688,16 +2249,93 @@ fn fuzz_dir() -> PathBuf {
     dir
 }
 
-/// One input: CROSSLINK_FUZZ_FILE, or the input for CROSSLINK_FUZZ_SEED. Writes the file it ran
-/// to the fuzz directory first, so a crash still leaves it behind.
+// # Coverage
+//
+// Built with SanitizerCoverage's inline 8-bit edge counters (the RUSTFLAGS are in
+// `crosslink_fuzz`'s doc), every instrumented module registers its counters at startup through
+// the hook below, and a child run given CROSSLINK_FUZZ_COVERAGE writes
+// the indices of the edges it hit there when it exits. Without the instrumentation nothing calls
+// the hook and no edges are written.
+
+/// Each instrumented module's counters, in the order the modules registered them, which is fixed
+/// for a binary, so an edge's index means the same in every run of it.
+static COVERAGE_COUNTERS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Called by every SanitizerCoverage-instrumented module before `main`, with its counters. On
+/// macOS each module passes the whole image's counter section, so a range is kept once.
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "C" fn __sanitizer_cov_8bit_counters_init(start: *mut u8, stop: *mut u8) {
+    if let Ok(mut counters) = COVERAGE_COUNTERS.lock() {
+        let range = (start as usize, stop as usize);
+        if !counters.contains(&range) {
+            counters.push(range);
+        }
+    }
+}
+
+/// The indices of every edge hit so far, ascending.
+#[allow(unsafe_code)]
+fn coverage_edges() -> Vec<u32> {
+    let counters = COVERAGE_COUNTERS.lock().unwrap();
+    let mut edges = Vec::new();
+    let mut base = 0u32;
+    for &(start, stop) in counters.iter() {
+        // SAFETY: each range is a module's counter array, live for the whole process, which
+        // other threads only ever increment.
+        let module = unsafe { std::slice::from_raw_parts(start as *const u8, stop - start) };
+        edges.extend(module.iter().enumerate().filter(|(_, &hits)| hits != 0).map(|(i, _)| base + i as u32));
+        base += module.len() as u32;
+    }
+    edges
+}
+
+extern "C" fn write_coverage_at_exit() {
+    if let Ok(path) = std::env::var("CROSSLINK_FUZZ_COVERAGE") {
+        let edges = coverage_edges();
+        let bytes: Vec<u8> = edges.iter().flat_map(|edge| edge.to_le_bytes()).collect();
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+/// The edges a child run wrote to `path`, empty when it wrote none.
+fn read_coverage(path: &std::path::Path) -> Vec<u32> {
+    std::fs::read(path)
+        .map(|bytes| bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        .unwrap_or_default()
+}
+
+/// One input: CROSSLINK_FUZZ_FILE, the input generated from the choice bytes in
+/// CROSSLINK_FUZZ_CHOICES, or the input for CROSSLINK_FUZZ_SEED. Writes the file it ran to the
+/// fuzz directory first, so a crash still leaves it behind. With CROSSLINK_FUZZ_COVERAGE, writes
+/// the edges it hit there at exit (see # Coverage).
 #[test]
 #[ignore]
+#[allow(unsafe_code)]
 fn crosslink_fuzz_one() {
     set_test_name(function_name!());
+    if std::env::var("CROSSLINK_FUZZ_RACE").is_ok_and(|v| v == "1") {
+        zebra_crosslink::TEST_READ_OPTIONS.lock().unwrap().race = true;
+    }
+    if std::env::var("CROSSLINK_FUZZ_COVERAGE").is_ok() {
+        extern "C" {
+            fn atexit(callback: extern "C" fn()) -> i32;
+        }
+        // SAFETY: registers a plain function with no captured state.
+        unsafe { atexit(write_coverage_at_exit) };
+    }
     let bytes = match (std::env::var("CROSSLINK_FUZZ_FILE"), std::env::var("CROSSLINK_FUZZ_SEED")) {
         (Ok(path), _) => std::fs::read(&path).expect("CROSSLINK_FUZZ_FILE reads"),
+        _ if std::env::var("CROSSLINK_FUZZ_CHOICES").is_ok() => {
+            let path = std::env::var("CROSSLINK_FUZZ_CHOICES").expect("checked just above");
+            let choices = std::fs::read(&path).expect("CROSSLINK_FUZZ_CHOICES reads");
+            let bytes = generate(&mut Choices { bytes: choices, o: 0 });
+            std::fs::write(PathBuf::from(&path).with_extension("zeccltf"), &bytes).expect("fuzz input writes");
+            bytes
+        }
         (_, Ok(seed)) => {
             let seed: u64 = seed.parse().expect("CROSSLINK_FUZZ_SEED is a number");
+            eprintln!("fuzz seed {seed}");
             let bytes = generate(&mut Choices::from_seed(seed, 4096));
             std::fs::write(fuzz_dir().join(format!("seed-{seed}.zeccltf")), &bytes).expect("fuzz input writes");
             bytes
@@ -721,12 +2359,12 @@ enum Verdict {
 /// far past its longest normal time is not still working.
 const CHILD_LIMIT_SECS: u64 = 150;
 
-fn run_child(env: (&str, String), log: &std::path::Path) -> Verdict {
+fn run_child(envs: &[(&str, String)], log: &std::path::Path) -> Verdict {
     let exe = std::env::current_exe().expect("the test binary path");
     let log_file = std::fs::File::create(log).expect("child log creates");
     let mut child = std::process::Command::new(exe)
         .args(["fuzz::crosslink_fuzz_one", "--exact", "--ignored", "--nocapture"])
-        .env(env.0, env.1)
+        .envs(envs.iter().map(|(name, value)| (*name, value.as_str())))
         .stdout(log_file.try_clone().expect("log handle clones"))
         .stderr(log_file)
         .spawn()
@@ -807,7 +2445,7 @@ fn minimize(bytes: Vec<u8>, keep: &dyn Fn(&Verdict, &std::path::Path) -> bool, n
             std::fs::write(&path, &candidate).expect("candidate writes");
             tried += 1;
             let log = dir.join(format!("{name}.try.log"));
-            let got = run_child(("CROSSLINK_FUZZ_FILE", path.display().to_string()), &log);
+            let got = run_child(&[("CROSSLINK_FUZZ_FILE", path.display().to_string()), ("CROSSLINK_TEST_TIMINGS", "off".to_string())], &log);
             if keep(&got, &log) {
                 best = candidate;
                 progressed = true;
@@ -825,46 +2463,407 @@ fn minimize(bytes: Vec<u8>, keep: &dyn Fn(&Verdict, &std::path::Path) -> bool, n
     best
 }
 
+// # Doorways
+//
+// A block or transaction must get the same verdict whichever way it reaches the node. After an
+// input passes, a second run sends some of its direct block loads over STP and some of its local
+// transaction submissions over the wire or STP, each made to expect the verdict the first run
+// saw, so a doorway that disagrees fails the second run like any other expectation, and is
+// minimized like one.
+
+/// The most instructions one doorway pass sends another way.
+const DOORWAY_SWAPS_MAX: usize = 8;
+
+/// Peer indices for the doorway pass, above any the generator uses (`FRESH_PEERS_FROM` up).
+const DOORWAY_PEERS_FROM: u64 = 10_000;
+
+/// Mixed into an input's seed for the doorway pass's choices, so the input itself is unchanged.
+const DOORWAY_SEED_SALT: u64 = 0xd008_3a75;
+
+/// What an instruction's check said in a run, by its timing row; `None` for one with no verdict
+/// that the doorways could share (pending, no answer, or no check).
+fn seen_verdicts(timings: &std::path::Path) -> std::collections::HashMap<usize, bool> {
+    let text = std::fs::read_to_string(timings).unwrap_or_default();
+    let mut seen = std::collections::HashMap::new();
+    for row in text.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()) {
+        if row["type"] != "instr" {
+            continue;
+        }
+        let (Some(index), Some(accepted), Some(message)) = (row["index"].as_u64(), row["accepted"].as_bool(), row["message"].as_str()) else {
+            continue;
+        };
+        if accepted {
+            seen.insert(index as usize, true);
+        } else if message.contains("rejected") && !message.contains("pending:") && !message.contains("no verdict") {
+            seen.insert(index as usize, false);
+        }
+    }
+    seen
+}
+
+/// `bytes` with up to `DOORWAY_SWAPS_MAX` of its direct block loads and local transaction
+/// submissions sent another way, each expecting the verdict `seen` gives it, or `None` when none
+/// can be. A held block is left alone (a peer is not asked for a block whose parent is missing),
+/// as is one that does not parse, has no coinbase height, or claims a height that does not follow
+/// its parent's: a peer's STATUS cannot advertise it so that a node would ask for it. A reason
+/// check after a swapped
+/// instruction is dropped: the doorways word their reasons differently, and only the verdict
+/// has to agree.
+fn swap_doorways(bytes: &[u8], seen: &std::collections::HashMap<usize, bool>, c: &mut Choices) -> Option<(Vec<u8>, usize)> {
+    let tf = TF::read_from_bytes(bytes).ok()?;
+    // The heights of the blocks the file holds before each instruction, by hash. A peer's STATUS
+    // places a block by its parent and height, and a node rightly ignores one whose height does
+    // not follow its parent's: a mangled coinbase can claim any height under an unchanged header.
+    let mut heights: std::collections::HashMap<zebra_chain::block::Hash, u32> = Default::default();
+    let mut eligible: Vec<usize> = Vec::new();
+    for (i, instr) in tf.instrs.iter().enumerate() {
+        let block = (instr.kind == TFInstr::LOAD_POW).then(|| Block::zcash_deserialize(instr.data_slice(bytes)).ok()).flatten();
+        let ok = seen.contains_key(&i)
+            && match instr.kind {
+                TFInstr::LOAD_POW => {
+                    instr.val[1] == TF_POW_DIRECT
+                        && instr.flags & SHOULD_DEFER == 0
+                        && block.as_ref().and_then(|block| block.coinbase_height()).is_some_and(|height| {
+                            let parent = block.as_ref().expect("a height comes from a block").header.previous_block_hash;
+                            match heights.get(&parent) {
+                                Some(parent_height) => height.0 == parent_height + 1,
+                                // Only genesis, which no file loads, has no earlier block.
+                                None => height.0 == 1,
+                            }
+                        })
+                }
+                TFInstr::SUBMIT_TX => instr.val[1] == TF_TX_LOCAL,
+                _ => false,
+            };
+        if ok {
+            eligible.push(i);
+        }
+        if let Some(height) = block.as_ref().and_then(|block| block.coinbase_height()) {
+            heights.insert(block.expect("a height comes from a block").hash(), height.0);
+        }
+    }
+    if eligible.is_empty() {
+        return None;
+    }
+    let mut eligible = eligible;
+    let mut picked = Vec::new();
+    for _ in 0..1 + c.below(DOORWAY_SWAPS_MAX.min(eligible.len())) {
+        picked.push(eligible.remove(c.below(eligible.len())));
+    }
+    let mut out = TF { instrs: Vec::new(), data: Vec::new() };
+    let mut peer = DOORWAY_PEERS_FROM;
+    let mut drop_reason_check = false;
+    for (i, instr) in tf.instrs.iter().enumerate() {
+        let data = instr.data_slice(bytes);
+        if std::mem::take(&mut drop_reason_check) && instr.kind == TFInstr::EXPECT_REJECTION_REASON {
+            continue;
+        }
+        if !picked.contains(&i) {
+            out.push_instr_ex(instr.kind, instr.flags, data, instr.val);
+            continue;
+        }
+        let doorway = match instr.kind {
+            TFInstr::LOAD_POW => TF_POW_STP_PEER,
+            _ if c.below(2) == 0 => TF_TX_WIRE,
+            _ => TF_TX_STP_PEER,
+        };
+        let expect = if seen[&i] { 0 } else { SHOULD_FAIL };
+        out.push_instr_ex(instr.kind, (instr.flags & !(SHOULD_FAIL | SHOULD_DEFER | ANY_OUTCOME)) | expect, data, [peer, doorway]);
+        peer += 1;
+        drop_reason_check = true;
+    }
+    Some((out.write_to_bytes(), picked.len()))
+}
+
+/// The choice bytes a guided campaign derives from `parent`: a few stacked mutations (bit flips,
+/// random bytes, an overwritten range, a range spliced from `other`, inserted or deleted bytes),
+/// placed within the first `used` bytes, the ones the generator read, so that each changes a
+/// decision. `c` makes the mutation's own decisions and `noise` supplies the bytes it writes.
+fn mutate_choices(parent: &[u8], used: usize, other: &[u8], c: &mut Choices, noise: &mut Choices) -> Vec<u8> {
+    let len = parent.len();
+    let mut out = parent.to_vec();
+    let used = used.clamp(1, len);
+    for _ in 0..1 + c.below(4) {
+        let i = c.below(used);
+        let k = 1 + c.below(32);
+        match c.below(6) {
+            0 => out[i] ^= 1 << c.below(8),
+            1 => out[i] = noise.byte(),
+            2 => (i..(i + k).min(len)).for_each(|j| out[j] = noise.byte()),
+            3 => {
+                let from = c.below(other.len().max(1));
+                for j in 0..k {
+                    if let (Some(&byte), true) = (other.get(from + j), i + j < len) {
+                        out[i + j] = byte;
+                    }
+                }
+            }
+            4 => {
+                let inserted: Vec<u8> = (0..k).map(|_| noise.byte()).collect();
+                out.splice(i..i, inserted);
+                out.truncate(len);
+            }
+            _ => {
+                out.drain(i..(i + k).min(len));
+                while out.len() < len {
+                    out.push(noise.byte());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Guided campaigns salt the iteration number with this for their own decisions, so they are not
+/// those of the input the same number generates.
+const GUIDED_SEED_SALT: u64 = 0x6775_6964_6564_0000;
+
 /// A campaign: CROSSLINK_FUZZ_SEEDS (`a..b`, default 0..20) within CROSSLINK_FUZZ_SECS (default
-/// 300, inside nextest's per-test bound; run the test binary directly to go longer). Passing
-/// inputs are deleted; a failing one is kept with its log, minimized (CROSSLINK_FUZZ_MINIMIZE
-/// attempts, default 40, 0 for none), and the campaign fails listing what it found.
+/// 300, inside nextest's per-test bound; run the test binary directly to go longer), on
+/// CROSSLINK_FUZZ_JOBS workers (default 1), each running one input's child processes at a time.
+/// Passing inputs are deleted; a failing one is kept with its log, minimized (CROSSLINK_FUZZ_MINIMIZE
+/// attempts, default 40, 0 for none), and the campaign fails listing what it found. Each passing
+/// input also gets a doorway pass (see # Doorways); CROSSLINK_FUZZ_DOORWAYS=0 turns it off. And a race
+/// pass: the input again in race mode (`ReadOptions::race`), whose expectations must hold however
+/// its runs of deliveries interleave; CROSSLINK_FUZZ_RACES=0 turns it off.
+///
+/// With CROSSLINK_FUZZ_GUIDED=1 the campaign is coverage-guided: each number in the range is an
+/// iteration that runs either a fresh input or a mutation (`mutate_choices`) of the choice bytes
+/// of one in the corpus, and an input that hits an edge no run before it hit joins the corpus, kept
+/// in CROSSLINK_FUZZ_CORPUS (default `corpus` in the fuzz directory). A corpus left by an earlier
+/// campaign is run again first. It needs a binary built with SanitizerCoverage's 8-bit counters
+/// (see # Coverage), in its own target directory and for an explicit target, so build scripts
+/// and proc macros stay uninstrumented. The `zebrad` binary the tests depend on has no counter
+/// hook, so the link argument (macOS's) leaves the hook to be found at run time, which only the
+/// test binary does:
+///
+/// ```text
+/// CARGO_TARGET_DIR=target/cov RUSTFLAGS="-Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=3 \
+///   -Cllvm-args=-sanitizer-coverage-inline-8bit-counters -Clink-arg=-Wl,-U,___sanitizer_cov_8bit_counters_init" \
+///   cargo test --release --target aarch64-apple-darwin -p zebrad --test crosslink --no-run
+/// ```
+///
+/// Without the counters every run hits no edges and the corpus never grows.
 #[test]
 #[ignore]
 fn crosslink_fuzz() {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
     let seeds = std::env::var("CROSSLINK_FUZZ_SEEDS").unwrap_or_else(|_| "0..20".to_string());
     let (a, b) = seeds.split_once("..").expect("CROSSLINK_FUZZ_SEEDS is a..b");
     let (a, b): (u64, u64) = (a.parse().expect("seed range start"), b.parse().expect("seed range end"));
     let secs: u64 = std::env::var("CROSSLINK_FUZZ_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
     let attempts: usize = std::env::var("CROSSLINK_FUZZ_MINIMIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+    let doorways = std::env::var("CROSSLINK_FUZZ_DOORWAYS").map_or(true, |v| v != "0");
+    let races = std::env::var("CROSSLINK_FUZZ_RACES").map_or(true, |v| v != "0");
+    let jobs: usize = std::env::var("CROSSLINK_FUZZ_JOBS").ok().and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+    let guided = std::env::var("CROSSLINK_FUZZ_GUIDED").is_ok_and(|v| v == "1");
     let dir = fuzz_dir();
     let start = std::time::Instant::now();
-    let mut findings = Vec::new();
-    let mut ran = 0;
-    for seed in a..b {
-        if start.elapsed().as_secs() >= secs {
-            break;
+    let findings = std::sync::Mutex::new(Vec::new());
+    let next_seed = AtomicU64::new(a);
+    let ran = AtomicUsize::new(0);
+    let swapped_total = AtomicUsize::new(0);
+
+    // One input, `name`, which the child reads from `input_env` and writes to `input`: its run,
+    // then its doorway pass if it passed; a finding is minimized here, on this worker, while the
+    // others go on. Answers whether the first run passed.
+    let run_input = |name: &str, input_env: (&'static str, String), input: PathBuf, salt: u64, extra_env: &[(&'static str, String)]| -> bool {
+        let log = dir.join(format!("{name}.log"));
+        let timings = dir.join(format!("{name}.timings.jsonl"));
+        let _ = std::fs::remove_file(&timings);
+        let mut envs = vec![input_env, ("CROSSLINK_TEST_TIMINGS", timings.display().to_string())];
+        envs.extend(extra_env.iter().cloned());
+        let child_start = std::time::Instant::now();
+        let verdict = run_child(&envs, &log);
+        ran.fetch_add(1, Ordering::Relaxed);
+        eprintln!("fuzz {name}: {verdict:?} in {:.1?}", child_start.elapsed());
+        let mut passed = verdict == Verdict::Pass;
+        let mut raced = None;
+        if passed && races {
+            let race_input = dir.join(format!("{name}.race.zeccltf"));
+            let _ = std::fs::copy(&input, &race_input);
+            let log = dir.join(format!("{name}.race.log"));
+            let child_start = std::time::Instant::now();
+            let verdict = run_child(
+                &[
+                    ("CROSSLINK_FUZZ_FILE", race_input.display().to_string()),
+                    ("CROSSLINK_FUZZ_RACE", "1".to_string()),
+                    ("CROSSLINK_TEST_TIMINGS", "off".to_string()),
+                ],
+                &log,
+            );
+            eprintln!("fuzz {name}: raced: {verdict:?} in {:.1?}", child_start.elapsed());
+            if verdict == Verdict::Pass {
+                let _ = std::fs::remove_file(&race_input);
+                let _ = std::fs::remove_file(&log);
+            } else {
+                raced = Some((format!("{name}.race"), race_input, verdict));
+            }
         }
-        let log = dir.join(format!("seed-{seed}.log"));
-        let verdict = run_child(("CROSSLINK_FUZZ_SEED", seed.to_string()), &log);
-        ran += 1;
-        let input = dir.join(format!("seed-{seed}.zeccltf"));
-        eprintln!("fuzz seed {seed}: {verdict:?}");
-        if verdict == Verdict::Pass {
+        let (finding, input, verdict) = if let Some(raced) = raced {
+            passed = false;
+            raced
+        } else if !passed {
+            (name.to_string(), input, verdict)
+        } else {
+            let swapped = if doorways {
+                let bytes = std::fs::read(&input).expect("the passing input was written");
+                swap_doorways(&bytes, &seen_verdicts(&timings), &mut Choices::from_seed(salt ^ DOORWAY_SEED_SALT, 256))
+            } else {
+                None
+            };
             let _ = std::fs::remove_file(&input);
             let _ = std::fs::remove_file(&log);
-            continue;
-        }
+            let _ = std::fs::remove_file(&timings);
+            let Some((swapped, n)) = swapped else {
+                return true;
+            };
+            swapped_total.fetch_add(n, Ordering::Relaxed);
+            let finding = format!("{name}.doorways");
+            let swapped_input = dir.join(format!("{finding}.zeccltf"));
+            std::fs::write(&swapped_input, &swapped).expect("the doorway input writes");
+            let log = dir.join(format!("{finding}.log"));
+            let child_start = std::time::Instant::now();
+            let verdict = run_child(
+                &[("CROSSLINK_FUZZ_FILE", swapped_input.display().to_string()), ("CROSSLINK_TEST_TIMINGS", "off".to_string())],
+                &log,
+            );
+            eprintln!("fuzz {name}: {n} instruction(s) through other doorways: {verdict:?} in {:.1?}", child_start.elapsed());
+            if verdict == Verdict::Pass {
+                let _ = std::fs::remove_file(&swapped_input);
+                let _ = std::fs::remove_file(&log);
+                return true;
+            }
+            (finding, swapped_input, verdict)
+        };
+        let _ = std::fs::remove_file(&timings);
         let bytes = std::fs::read(&input).expect("the failing input was written");
-        if attempts > 0 {
+        // Minimizing runs settle, which a race finding needs not to.
+        if attempts > 0 && !finding.ends_with(".race") {
             let same = |got: &Verdict, _: &std::path::Path| *got == verdict;
-            let min = minimize(bytes.clone(), &same, &format!("seed-{seed}"), attempts);
-            std::fs::write(dir.join(format!("seed-{seed}.min.zeccltf")), &min).expect("minimized input writes");
-            eprintln!("fuzz seed {seed}: minimized {} -> {} bytes", bytes.len(), min.len());
+            let min = minimize(bytes.clone(), &same, &finding, attempts);
+            std::fs::write(dir.join(format!("{finding}.min.zeccltf")), &min).expect("minimized input writes");
+            eprintln!("fuzz {finding}: minimized {} -> {} bytes", bytes.len(), min.len());
         }
-        findings.push((seed, verdict));
+        findings.lock().unwrap().push((finding, verdict));
+        passed
+    };
+
+    let run_seed = |seed: u64| {
+        let name = format!("seed-{seed}");
+        run_input(&name, ("CROSSLINK_FUZZ_SEED", seed.to_string()), dir.join(format!("{name}.zeccltf")), seed, &[]);
+    };
+
+    // The guided campaign's corpus: choice bytes, with how many of them the generator read, and
+    // every edge any run has hit. `pending` is an earlier campaign's corpus, run again first to
+    // learn its edges on this binary.
+    struct Corpus {
+        entries: Vec<(Vec<u8>, usize)>,
+        edges: std::collections::HashSet<u32>,
+        pending: Vec<Vec<u8>>,
     }
-    eprintln!("fuzz: {ran} inputs, {} findings, in {:?}; files in {}", findings.len(), start.elapsed(), dir.display());
+    let corpus_dir = std::env::var("CROSSLINK_FUZZ_CORPUS").map(PathBuf::from).unwrap_or_else(|_| dir.join("corpus"));
+    let used_of = |choices: &[u8]| {
+        let mut c = Choices { bytes: choices.to_vec(), o: 0 };
+        let _ = generate(&mut c);
+        c.o.min(choices.len())
+    };
+    let corpus = std::sync::Mutex::new(Corpus { entries: Vec::new(), edges: Default::default(), pending: Vec::new() });
+    if guided {
+        let _ = std::fs::create_dir_all(&corpus_dir);
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&corpus_dir)
+            .map(|dir| dir.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "choices")).collect())
+            .unwrap_or_default();
+        files.sort();
+        corpus.lock().unwrap().pending = files.iter().filter_map(|p| std::fs::read(p).ok()).collect();
+        eprintln!("fuzz: guided, {} corpus entries from {} to run first", files.len(), corpus_dir.display());
+    }
+
+    let run_guided = |n: u64| {
+        let mut c = Choices::from_seed(n ^ GUIDED_SEED_SALT, 256);
+        let (choices, known) = {
+            let mut corpus = corpus.lock().unwrap();
+            if let Some(choices) = corpus.pending.pop() {
+                (choices, true)
+            } else if corpus.entries.is_empty() || c.unusual(48) {
+                (Choices::from_seed(n, 4096).bytes, false)
+            } else {
+                let (parent, used) = &corpus.entries[c.below(corpus.entries.len())];
+                let (other, _) = &corpus.entries[c.below(corpus.entries.len())];
+                let mut noise = Choices::from_seed(n ^ GUIDED_SEED_SALT ^ 1, 4096);
+                (mutate_choices(parent, *used, other, &mut c, &mut noise), false)
+            }
+        };
+        let name = format!("guided-{n}");
+        let choices_path = dir.join(format!("{name}.choices"));
+        let coverage_path = dir.join(format!("{name}.cov"));
+        std::fs::write(&choices_path, &choices).expect("the choices write");
+        let _ = std::fs::remove_file(&coverage_path);
+        run_input(
+            &name,
+            ("CROSSLINK_FUZZ_CHOICES", choices_path.display().to_string()),
+            dir.join(format!("{name}.zeccltf")),
+            n,
+            &[("CROSSLINK_FUZZ_COVERAGE", coverage_path.display().to_string())],
+        );
+        let edges = read_coverage(&coverage_path);
+        let _ = std::fs::remove_file(&coverage_path);
+        let _ = std::fs::remove_file(&choices_path);
+        let used = used_of(&choices);
+        let mut corpus = corpus.lock().unwrap();
+        let before = corpus.edges.len();
+        corpus.edges.extend(edges.iter().copied());
+        let new = corpus.edges.len() - before;
+        if new > 0 || known {
+            if !known {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                choices.hash(&mut hasher);
+                let _ = std::fs::write(corpus_dir.join(format!("{:016x}.choices", hasher.finish())), &choices);
+            }
+            corpus.entries.push((choices, used));
+            eprintln!(
+                "fuzz {name}: {} edges, {new} new; corpus {} entries, {} edges",
+                edges.len(),
+                corpus.entries.len(),
+                corpus.edges.len()
+            );
+        }
+    };
+
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| loop {
+                if start.elapsed().as_secs() >= secs {
+                    break;
+                }
+                let seed = next_seed.fetch_add(1, Ordering::Relaxed);
+                if seed >= b {
+                    break;
+                }
+                if guided {
+                    run_guided(seed);
+                } else {
+                    run_seed(seed);
+                }
+            });
+        }
+    });
+
+    let findings = findings.into_inner().unwrap();
+    let corpus = corpus.into_inner().unwrap();
+    eprintln!("fuzz: {} instruction(s) sent through other doorways", swapped_total.into_inner());
+    if guided {
+        eprintln!("fuzz: corpus {} entries, {} edges, in {}", corpus.entries.len(), corpus.edges.len(), corpus_dir.display());
+    }
+    eprintln!(
+        "fuzz: {} inputs on {jobs} worker(s), {} findings, in {:?}; files in {}",
+        ran.into_inner(),
+        findings.len(),
+        start.elapsed(),
+        dir.display()
+    );
     assert!(findings.is_empty(), "fuzz findings: {findings:?}");
 }
 
@@ -895,7 +2894,7 @@ fn crosslink_fuzz_minimize() {
 //
 // Each is a minimized fuzz input under crosslink-test-data/fuzz/. One still open is #[ignore]d
 // with its reason, so the suite stays green until it is fixed; its control shows the input means
-// what the finding says.
+// what the finding says. A fixed one stays as a regression test.
 
 fn finding(name: &str) -> Vec<u8> {
     let path = format!("{}/../crosslink-test-data/fuzz/{name}.zeccltf", env!("CARGO_MANIFEST_DIR"));
@@ -919,11 +2918,9 @@ const POISON_INSTR: usize = 4;
 /// stored under block 4's hash. The real block 4 still commits, since only its parent's hash is
 /// looked up, but block 5's parent is block 4's hash, so block 5 gets the copy's error. A hash
 /// commits only to the header, and the copy failed for its body, so the error says nothing about
-/// block 4's children. Removing the hash from the map when a block with it commits makes this
-/// pass with the suite otherwise unchanged; not storing errors that only show a body does not
-/// match its header would also work.
+/// block 4's children. Fixed by removing the hash from the map when a block with it commits. A
+/// copy that arrives after the real block never reaches the map: ingest answers it as known.
 #[test]
-#[ignore = "open finding: a refused block body poisons the next block's commit; ingest code, needs a human look before a fix"]
 fn crosslink_fuzz_finding_refused_body_poisons_the_next_block() {
     set_test_name(function_name!());
     test_bytes(finding("refused_body_poisons_the_next_block"));
@@ -950,13 +2947,83 @@ fn crosslink_fuzz_finding_refused_body_poisons_the_next_block_control() {
 // merkle root and the auth commitment. A copy of a real block with a different body under the
 // same header has the real block's hash, and is refused for its body. If the node then condemns
 // the hash, anyone who relays such a copy first keeps the real block out (the mutated-block
-// class, CVE-2012-2459 in Bitcoin). Each scenario: three blocks, the copy (refused), the real
-// block (must be taken), and one more on top.
+// class, CVE-2012-2459 in Bitcoin). Each scenario: a few blocks, the copy (refused), the real
+// block (must be taken), and a few more on top.
+
+/// The choices for a directed scenario, from CROSSLINK_FUZZ_SEED or else a fresh random seed, so
+/// each run tries the scenario another way. The seed goes straight to stderr, which the test
+/// harness's capture does not hold back, since a failing scenario ends the process.
+fn directed_choices() -> Choices {
+    use std::hash::{BuildHasher, Hasher};
+    use std::io::Write;
+
+    let seed: u64 = match std::env::var("CROSSLINK_FUZZ_SEED") {
+        Ok(seed) => seed.parse().expect("CROSSLINK_FUZZ_SEED is a number"),
+        Err(_) => std::collections::hash_map::RandomState::new().build_hasher().finish(),
+    };
+    let _ = writeln!(std::io::stderr(), "fuzz seed {seed}: set CROSSLINK_FUZZ_SEED={seed} to run this again");
+    Choices::from_seed(seed, 4096)
+}
+
+/// Three blocks, a peer serving `serve(real block's bytes)` under the real block's claim (refused
+/// for `reason`, since what it serves is not that block), the real block (must be taken), and one
+/// more on top.
+fn claimed_garbage_then_real(serve: fn(Vec<u8>) -> Vec<u8>, reason: &str) -> Vec<u8> {
+    let mut c = directed_choices();
+    let mut g = FuzzGen::new(&HARNESS_PARAMETERS);
+    for _ in 0..1 + c.below(6) {
+        move_extend(&mut g, &mut c);
+    }
+    let mut next = g.tip().clone();
+    let real = next.next_block(&g.miner.clone());
+    let served = serve(real.zcash_serialize_to_vec().expect("a generated block serializes"));
+    g.tf.push_instr_recv_pow_claimed(StpClaim::of(&real).expect("a generated block has a height"), &served, FRESH_PEERS_FROM, SHOULD_FAIL);
+    g.tf.push_instr_expect_rejection_reason(reason, 0);
+    g.tf.push_instr_expect_node_alive(0);
+    g.tf.push_instr_load_pow(&real, 0);
+    g.main.push(next);
+    g.expect_tip();
+    for _ in 0..1 + c.below(3) {
+        move_extend(&mut g, &mut c);
+    }
+    g.tf.write_to_bytes()
+}
+
+#[test]
+fn crosslink_fuzz_directed_truncated_bytes_under_a_claim_do_not_condemn_the_real_block() {
+    set_test_name(function_name!());
+    test_bytes(claimed_garbage_then_real(
+        |mut bytes| {
+            bytes.truncate(bytes.len() / 2);
+            bytes
+        },
+        "Failed to deserialize block",
+    ));
+}
+
+#[test]
+fn crosslink_fuzz_directed_unparseable_bytes_under_a_claim_do_not_condemn_the_real_block() {
+    set_test_name(function_name!());
+    test_bytes(claimed_garbage_then_real(|bytes| vec![0xff; bytes.len()], "Failed to deserialize block"));
+}
+
+#[test]
+fn crosslink_fuzz_directed_another_block_under_a_claim_does_not_condemn_the_real_block() {
+    set_test_name(function_name!());
+    // A valid block's bytes, but not the claimed one's: its header has one bit of its nonce flipped.
+    test_bytes(claimed_garbage_then_real(
+        |mut bytes| {
+            bytes[4 + 32 + 32 + 32 + 4 + 4] ^= 1;
+            bytes
+        },
+        "did not match advertised hash",
+    ));
+}
 
 fn refused_body_then_real(mutate: fn(&mut Block)) -> Vec<u8> {
-    let mut c = Choices::from_seed(0, 0);
+    let mut c = directed_choices();
     let mut g = FuzzGen::new(&HARNESS_PARAMETERS);
-    for _ in 0..3 {
+    for _ in 0..1 + c.below(6) {
         move_extend(&mut g, &mut c);
     }
     let mut next = g.tip().clone();
@@ -969,7 +3036,9 @@ fn refused_body_then_real(mutate: fn(&mut Block)) -> Vec<u8> {
     g.tf.push_instr_load_pow(&real, 0);
     g.main.push(next);
     g.expect_tip();
-    move_extend(&mut g, &mut c);
+    for _ in 0..1 + c.below(3) {
+        move_extend(&mut g, &mut c);
+    }
     g.tf.write_to_bytes()
 }
 
@@ -988,17 +3057,233 @@ fn crosslink_fuzz_directed_repeated_coinbase_does_not_condemn_the_real_block() {
     }));
 }
 
-/// How often the generator emits each kind of instruction, with which outcome flag, over
-/// CROSSLINK_FUZZ_SEEDS (default 0..200), and how often a bond is expected in each status. Runs
-/// no node: it shows whether a move's paths come up at all, and whether its hard expectations are
-/// drowned out by ANY_OUTCOME.
+// # Directed: a mined transaction mined again
+//
+// A transaction with no spends has no nullifier or outpoint to stop it being mined twice. A
+// retarget is one: once its bond is moved back to the finalizer it left, it passes every staking
+// rule again, and only its hash shows it is a replay. Each scenario: a bond to finalizer 0,
+// retargeted to another, `blocks_between` empty blocks and a few more, retargeted back to 0, a
+// few more blocks, and the first retarget mined again.
+
+fn replayed_retarget(
+    featurenet_upgrade_2: Option<u32>,
+    featurenet_upgrade_3: Option<u32>,
+    blocks_between: u32,
+    refused: bool,
+) -> Vec<u8> {
+    use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
+
+    let node_config = if featurenet_upgrade_2.is_some() || featurenet_upgrade_3.is_some() {
+        node_config_with_activation_heights(ConfiguredActivationHeights {
+            featurenet_upgrade_2,
+            featurenet_upgrade_3,
+            ..Default::default()
+        })
+    } else {
+        String::new()
+    };
+    let upgrade_height = featurenet_upgrade_2.max(featurenet_upgrade_3);
+    let params = zcash_primitives::bft::ZcashCrosslinkParameters { staking: short_staking(&HARNESS_PARAMETERS), ..HARNESS_PARAMETERS };
+    let mut c = directed_choices();
+    let mut g = FuzzGen::new_with_node_config(&params, &node_config);
+    let staking = params.staking;
+    while (g.height() + 1) % staking.period >= staking.day_window {
+        mine(&mut g, &mut c, &[]);
+    }
+    let seed = b"crosslink fuzz replayed retarget".to_vec();
+    let create = staking_tx_create_bond(g.tip().next_upgrade(), &seed, fuzz_finalizer(0), 0);
+    let created = create.hash().0;
+    assert!(mine(&mut g, &mut c, &[create]));
+    // The replay must carry the network upgrade of the height it is mined at, or it is refused for that.
+    while g.height() + 1 < upgrade_height.unwrap_or(0) {
+        mine(&mut g, &mut c, &[]);
+    }
+
+    // Under FeaturenetUpgrade3 the first retarget spends the bond's first version, the create's
+    // txid, and the second spends the first's txid.
+    let away_spends = spends_versions(&g).then_some(created);
+    let to = 1 + c.below(2);
+    let away = fuzz_retarget(&mut g, &seed, 0, to, away_spends);
+    assert!(mine(&mut g, &mut c, &[away.clone()]));
+    load_empty_blocks(&mut g, blocks_between + c.below(16) as u32);
+    for _ in 0..c.below(8) {
+        mine(&mut g, &mut c, &[]);
+    }
+    let back_spends = spends_versions(&g).then_some(away.hash().0);
+    let back = fuzz_retarget(&mut g, &seed, to, 0, back_spends);
+    assert!(mine(&mut g, &mut c, &[back]));
+    for _ in 0..c.below(4) {
+        mine(&mut g, &mut c, &[]);
+    }
+
+    if refused {
+        let block = g.tip().clone().next_block_with_txs(&g.miner.clone(), &[away]);
+        refuse(&mut g, &mut c, &block);
+    } else {
+        assert!(mine(&mut g, &mut c, &[away]));
+    }
+    move_extend(&mut g, &mut c);
+    g.tf.push_instr_expect_node_alive(0);
+    g.tf.write_to_bytes()
+}
+
+/// Issue #260: the first copy is in the non-finalized chain. The replay is refused there under
+/// any network upgrade, and the node keeps running.
+#[test]
+fn crosslink_fuzz_directed_replayed_retarget_is_refused() {
+    set_test_name(function_name!());
+    test_bytes(replayed_retarget(None, None, 0, true));
+}
+
+/// Under FeaturenetUpgrade3 the replay spends a bond version the retarget back already spent.
+#[test]
+fn crosslink_fuzz_directed_replayed_retarget_is_refused_under_featurenet_upgrade_3() {
+    set_test_name(function_name!());
+    test_bytes(replayed_retarget(None, Some(REPLAY_UPGRADE), 0, true));
+}
+
+/// Where the replay scenarios schedule FeaturenetUpgrade2 or FeaturenetUpgrade3: below the first
+/// retarget.
+const REPLAY_UPGRADE: u32 = 4;
+
+#[test]
+fn crosslink_fuzz_directed_replayed_finalized_retarget_is_refused_from_featurenet_upgrade_2() {
+    set_test_name(function_name!());
+    test_bytes(replayed_retarget(Some(REPLAY_UPGRADE), None, FINALIZED_BETWEEN, true));
+}
+
+/// Scheduling FeaturenetUpgrade3 alone activates FeaturenetUpgrade2 with it, so its duplicate
+/// check refuses the replay before the spent version it carries is looked at.
+#[test]
+fn crosslink_fuzz_directed_replayed_finalized_retarget_is_refused_from_featurenet_upgrade_3() {
+    set_test_name(function_name!());
+    test_bytes(replayed_retarget(None, Some(REPLAY_UPGRADE), FINALIZED_BETWEEN, true));
+}
+
+/// The control: without FeaturenetUpgrade2 or FeaturenetUpgrade3 a replay of a finalized
+/// transaction is valid, as it is on the deployed chain, so refusing it is those upgrades' rule.
+#[test]
+fn crosslink_fuzz_directed_replayed_finalized_retarget_is_accepted_without_featurenet_upgrade_2() {
+    set_test_name(function_name!());
+    test_bytes(replayed_retarget(None, None, FINALIZED_BETWEEN, false));
+}
+
+// # Directed: a bond's first spend
+//
+// Under FeaturenetUpgrade3 a bond's first version is the txid of the transaction that created it,
+// never its key. The node finds that txid in the non-finalized chain or, once the create is
+// finalized, in the finalized state. Each scenario: a bond made before the upgrade to a random
+// finalizer, a random run of empty blocks that leaves the create in the non-finalized chain or
+// finalizes it, retargets spending the bond's key and sometimes other wrong versions, in random
+// order, each of which must be refused, then one spending the create's txid, which must be taken.
+// A heavier branch from a random height at or below that block then undoes it, so the bond is
+// back at its first version, and the same retarget or another one spending it is taken again.
+
+fn first_bond_spend(finalized: bool) -> Vec<u8> {
+    use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
+
+    let node_config = node_config_with_activation_heights(ConfiguredActivationHeights {
+        featurenet_upgrade_3: Some(REPLAY_UPGRADE),
+        ..Default::default()
+    });
+    let params = zcash_primitives::bft::ZcashCrosslinkParameters { staking: short_staking(&HARNESS_PARAMETERS), ..HARNESS_PARAMETERS };
+    let mut c = directed_choices();
+    let mut g = FuzzGen::new_with_node_config(&params, &node_config);
+    let staking = params.staking;
+    while (g.height() + 1) % staking.period >= staking.day_window {
+        mine(&mut g, &mut c, &[]);
+    }
+    let seed = b"crosslink fuzz first bond spend".to_vec();
+    let from = c.below(3);
+    let create = staking_tx_create_bond(g.tip().next_upgrade(), &seed, fuzz_finalizer(from), 0);
+    let created = create.hash().0;
+    let key = create.staking_action().expect("a staking transaction").bond_key();
+    assert!(mine(&mut g, &mut c, &[create]));
+    let created_at = g.height();
+    while g.height() + 1 < REPLAY_UPGRADE {
+        mine(&mut g, &mut c, &[]);
+    }
+    let blocks_between = if finalized { FINALIZED_BETWEEN + c.below(16) as u32 } else { c.below(REPLAY_DEPTH_MAX as usize) as u32 };
+    load_empty_blocks(&mut g, blocks_between);
+    assert!(spends_versions(&g));
+    g.tf.push_instr_expect_bond(key, TF_BOND_ACTIVE, TEST_STAKE_IGNORED, 0);
+    g.tf.push_instr_expect_staking_replay_matches(0);
+
+    let mut wrongs = vec![Some(key)];
+    if c.unusual(128) {
+        wrongs.push(None);
+    }
+    if c.unusual(128) {
+        wrongs.push(Some([0xee; 32]));
+    }
+    for i in (1..wrongs.len()).rev() {
+        wrongs.swap(i, c.below(i + 1));
+    }
+    let other = |c: &mut Choices| (from + 1 + c.below(2)) % 3;
+    for spends in wrongs {
+        let to = other(&mut c);
+        let wrong = fuzz_retarget(&mut g, &seed, from, to, spends);
+        let block = g.tip().clone().next_block_with_txs(&g.miner.clone(), &[wrong]);
+        refuse(&mut g, &mut c, &block);
+    }
+    let to = other(&mut c);
+    let right = fuzz_retarget(&mut g, &seed, from, to, Some(created));
+    assert!(mine(&mut g, &mut c, &[right.clone()]));
+    let spent_at = g.height();
+    g.tf.push_instr_expect_bond(key, TF_BOND_ACTIVE, TEST_STAKE_IGNORED, 0);
+    g.tf.push_instr_expect_staking_replay_matches(0);
+    for _ in 0..c.below(4) {
+        mine(&mut g, &mut c, &[]);
+    }
+
+    // The branch leaves the create in place: it grows from the spend's parent or a little below.
+    let fork_from = spent_at - 1 - c.below((spent_at - created_at).min(FORK_DEPTH_MAX as u32) as usize) as u32;
+    g.forks_made += 1;
+    let fork_miner = TestKey::new(format!("crosslink fuzz fork {}", g.forks_made).as_bytes()).address();
+    let mut branch: Vec<BlockGen> = g.main[..fork_from as usize].to_vec();
+    let branch_len = g.main.len() + 1 + c.below(2);
+    while branch.len() < branch_len {
+        let mut next = branch.last().expect("the branch starts above genesis").clone();
+        let block = next.next_block(&fork_miner);
+        branch.push(next);
+        g.deliver(&mut c, &block, 0);
+    }
+    g.main = branch;
+    g.expect_tip();
+    g.tf.push_instr_expect_staking_replay_matches(0);
+    let again = if c.below(2) == 0 { right } else { fuzz_retarget(&mut g, &seed, from, other(&mut c), Some(created)) };
+    assert!(mine(&mut g, &mut c, &[again]));
+    g.tf.push_instr_expect_staking_replay_matches(0);
+    for _ in 0..1 + c.below(3) {
+        move_extend(&mut g, &mut c);
+    }
+    g.tf.push_instr_expect_node_alive(0);
+    g.tf.write_to_bytes()
+}
+
+#[test]
+fn crosslink_fuzz_directed_first_bond_spend_names_its_create() {
+    set_test_name(function_name!());
+    test_bytes(first_bond_spend(false));
+}
+
+#[test]
+fn crosslink_fuzz_directed_first_bond_spend_names_its_finalized_create() {
+    set_test_name(function_name!());
+    test_bytes(first_bond_spend(true));
+}
+
+/// How often the generator emits each kind of instruction (LOAD_POW and SUBMIT_TX by doorway), with
+/// which outcome flag, over CROSSLINK_FUZZ_SEEDS (default 0..200), and how often a bond is
+/// expected in each status. Runs no node: it shows whether a move's paths come up at all, and
+/// whether its hard expectations are drowned out by ANY_OUTCOME.
 #[test]
 #[ignore]
 fn crosslink_fuzz_census() {
     let seeds = std::env::var("CROSSLINK_FUZZ_SEEDS").unwrap_or_else(|_| "0..200".to_string());
     let (a, b) = seeds.split_once("..").expect("CROSSLINK_FUZZ_SEEDS is a..b");
     let (a, b): (u64, u64) = (a.parse().expect("seed range start"), b.parse().expect("seed range end"));
-    let mut counts: std::collections::BTreeMap<(u8, &str), usize> = Default::default();
+    let mut counts: std::collections::BTreeMap<(u8, u64, &str), usize> = Default::default();
     let mut bonds: std::collections::BTreeMap<u64, usize> = Default::default();
     let mut instrs_n = 0;
     for seed in a..b {
@@ -1012,15 +3297,220 @@ fn crosslink_fuzz_census() {
             } else {
                 "pass"
             };
-            *counts.entry((instr.kind as u8, outcome)).or_default() += 1;
+            let doorway = if matches!(instr.kind, TFInstr::LOAD_POW | TFInstr::SUBMIT_TX) { instr.val[1] } else { 0 };
+            *counts.entry((instr.kind as u8, doorway, outcome)).or_default() += 1;
             if instr.kind == TFInstr::EXPECT_BOND {
                 *bonds.entry(instr.val[1]).or_default() += 1;
             }
         }
     }
     eprintln!("census over seeds {a}..{b}: {instrs_n} instructions");
-    for ((kind, outcome), n) in &counts {
-        eprintln!("  kind {kind:>3} {outcome:<4} {n}");
+    for ((kind, doorway, outcome), n) in &counts {
+        eprintln!("  {:<32} {outcome:<4} {n}", format!("{} ({kind}.{doorway})", TFInstr::str_from_kind(u32::from(*kind))));
     }
     eprintln!("  EXPECT_BOND by status (0 active, 1 unbonding, 2 withdrawn, 255 absent): {bonds:?}");
+}
+
+// # The generator's own invariants
+//
+// These run no node. They read what `generate` writes over many seeds, so a mistake in the model
+// fails here instead of turning up as a false finding in a campaign.
+
+/// The seeds the generator checks read: CROSSLINK_FUZZ_SEEDS, or 0..200.
+fn generator_seeds() -> std::ops::Range<u64> {
+    let seeds = std::env::var("CROSSLINK_FUZZ_SEEDS").unwrap_or_else(|_| "0..200".to_string());
+    let (a, b) = seeds.split_once("..").expect("CROSSLINK_FUZZ_SEEDS is a..b");
+    a.parse().expect("seed range start")..b.parse().expect("seed range end")
+}
+
+/// The blocks of an input's LOAD_POWs that parse and have a height, with their flags.
+fn generated_blocks(bytes: &[u8]) -> Vec<(u32, u32, Block)> {
+    let tf = TF::read_from_bytes(bytes).expect("a generated file reads");
+    tf.instrs
+        .iter()
+        .filter(|instr| instr.kind == TFInstr::LOAD_POW)
+        .filter_map(|instr| {
+            let block = Block::zcash_deserialize(instr.data_slice(bytes)).ok()?;
+            Some((instr.flags, block.coinbase_height()?.0, block))
+        })
+        .collect()
+}
+
+/// Every block an input expects the node to take holds only transactions made for its height's
+/// network upgrade, which its coinbase carries.
+#[test]
+fn crosslink_fuzz_generator_expects_blocks_under_one_network_upgrade() {
+    let mut bad = Vec::new();
+    for seed in generator_seeds() {
+        let bytes = generate(&mut Choices::from_seed(seed, 4096));
+        for (flags, height, block) in generated_blocks(&bytes) {
+            let upgrade = block.transactions[0].network_upgrade();
+            if flags == 0 && block.transactions.iter().any(|tx| tx.network_upgrade() != upgrade) {
+                bad.push((seed, height));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "blocks expected valid with a transaction from another network upgrade, as (seed, height): {bad:?}");
+}
+
+/// Some inputs mine a transaction again more than FINALIZED_BETWEEN blocks after it was first
+/// mined, in a block the node must refuse.
+#[test]
+fn crosslink_fuzz_generator_replays_finalized_transactions() {
+    let mut inputs = 0;
+    for seed in generator_seeds() {
+        let bytes = generate(&mut Choices::from_seed(seed, 4096));
+        let mut mined: std::collections::HashMap<zebra_chain::transaction::Hash, u32> = Default::default();
+        let mut found = false;
+        for (flags, height, block) in generated_blocks(&bytes) {
+            let txs = &block.transactions[1..];
+            if flags == 0 {
+                for tx in txs {
+                    mined.entry(tx.hash()).or_insert(height);
+                }
+            } else if flags == SHOULD_FAIL {
+                found |= txs.iter().any(|tx| mined.get(&tx.hash()).is_some_and(|&first| height > first + FINALIZED_BETWEEN));
+            }
+        }
+        inputs += usize::from(found);
+    }
+    eprintln!("{inputs} inputs replay a finalized transaction in a block the node must refuse");
+    assert!(inputs >= 5, "only {inputs} inputs replay a finalized transaction in a block the node must refuse");
+}
+
+/// Under FeaturenetUpgrade3 a bond's first spend names the txid of its create. Some inputs mine one
+/// in a block the node must take with the create still in the non-finalized chain, some with the
+/// create finalized, and some then move the tip off the spend's block, so the node undoes it; some
+/// refuse a block whose action spends the bond's key instead.
+#[test]
+fn crosslink_fuzz_generator_spends_bonds_from_their_create() {
+    use std::collections::HashMap;
+
+    const KINDS: [&str; 4] = ["create in the chain", "create finalized", "spend undone by a reorg", "bond key refused"];
+    let mut inputs = [0usize; 4];
+    for seed in generator_seeds() {
+        let bytes = generate(&mut Choices::from_seed(seed, 4096));
+        let tf = TF::read_from_bytes(&bytes).expect("a generated file reads");
+        let mut parents: HashMap<BlockHash, (u32, BlockHash)> = HashMap::new();
+        let mut creates: HashMap<[u8; 32], ([u8; 32], u32)> = HashMap::new();
+        let mut first_spends: Vec<(BlockHash, u32)> = Vec::new();
+        let mut found = [false; 4];
+        for instr in &tf.instrs {
+            if instr.kind == TFInstr::EXPECT_POW_TIP {
+                let Ok(tip) = <[u8; 32]>::try_from(instr.data_slice(&bytes)) else { continue };
+                let holds = |block: BlockHash, height: u32| {
+                    let mut at = BlockHash(tip);
+                    while let Some(&(h, parent)) = parents.get(&at) {
+                        if h <= height {
+                            break;
+                        }
+                        at = parent;
+                    }
+                    at == block
+                };
+                found[2] |= first_spends.iter().any(|&(block, height)| !holds(block, height));
+                continue;
+            }
+            if instr.kind != TFInstr::LOAD_POW {
+                continue;
+            }
+            let Ok(block) = Block::zcash_deserialize(instr.data_slice(&bytes)) else { continue };
+            let Some(height) = block.coinbase_height() else { continue };
+            parents.insert(block.hash(), (height.0, block.header.previous_block_hash));
+            for tx in &block.transactions[1..] {
+                let Some(action) = tx.staking_action() else { continue };
+                let key = action.bond_key();
+                if !action.acts_on_existing_bond() {
+                    if instr.flags == 0 {
+                        creates.entry(key).or_insert((tx.hash().0, height.0));
+                    }
+                    continue;
+                }
+                match (instr.flags, action.spends(), creates.get(&key)) {
+                    (0, Some(spends), Some(&(created, at))) if spends == created => {
+                        found[usize::from(height.0 > at + FINALIZED_BETWEEN)] = true;
+                        first_spends.push((block.hash(), height.0));
+                    }
+                    (SHOULD_FAIL, Some(spends), Some(_)) if spends == key => found[3] = true,
+                    _ => {}
+                }
+            }
+        }
+        for (n, found) in inputs.iter_mut().zip(found) {
+            *n += usize::from(found);
+        }
+    }
+    let counts: Vec<String> = KINDS.iter().zip(inputs).map(|(kind, n)| format!("{kind}: {n}")).collect();
+    eprintln!("inputs with a bond's first spend: {}", counts.join(", "));
+    assert!(inputs.iter().all(|&n| n >= 10), "too few inputs with a bond's first spend: {}", counts.join(", "));
+}
+
+/// The generator builds its coinbases directly (`BlockGen::fast_coinbase`) rather than through
+/// the production builder, which is far slower: the two must be the same bytes, on the networks
+/// the fuzzer and the scenes run, across their upgrades, for the miners they use.
+#[test]
+fn fast_coinbase_is_the_builders() {
+    use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
+    let networks = [
+        test_network(&BFT_ROUNDS_PARAMETERS, ""),
+        regtest_network(&HARNESS_PARAMETERS),
+        test_network(&HARNESS_PARAMETERS, &node_config_with_activation_heights(ConfiguredActivationHeights {
+            featurenet_upgrade_2: Some(5),
+            ..Default::default()
+        })),
+        test_network(&HARNESS_PARAMETERS, &node_config_with_activation_heights(ConfiguredActivationHeights {
+            featurenet_upgrade_3: Some(7),
+            ..Default::default()
+        })),
+    ];
+    let miners = [
+        TestKey::new(b"crosslink test miner").address(),
+        Address::Transparent(zcash_transparent::address::TransparentAddress::PublicKeyHash([0x81; 20])),
+    ];
+    let mut compared = 0;
+    for network in &networks {
+        for height in [1u32, 2, 3, 4, 5, 6, 7, 8, 16, 111, 112, 256, 10_000, 55_295, 55_296, 165_000, 189_000] {
+            for miner in &miners {
+                for fee in [0i64, 12_345] {
+                    let height = BlockHeight(height);
+                    let fee = zebra_chain::amount::Amount::try_from(fee).expect("a small fee");
+                    let Some(fast) = BlockGen::fast_coinbase(network, miner, height, fee) else { continue };
+                    let builder = BlockGen::builder_coinbase(network, miner, height, fee);
+                    assert_eq!(
+                        hex::encode(fast.zcash_serialize_to_vec().expect("serializes")),
+                        hex::encode(builder.zcash_serialize_to_vec().expect("serializes")),
+                        "the coinbase at height {} differs from the builder's on {network:?}",
+                        height.0,
+                    );
+                    compared += 1;
+                }
+            }
+        }
+    }
+    // Every case above is a transparent miner on a network with no funding streams.
+    assert_eq!(compared, networks.len() * 17 * miners.len() * 2, "every case was built directly");
+}
+
+/// A fork's block whose parent has not arrived is held, and committed once the parent comes over
+/// STP: the fork, now longer, becomes the best chain. The parent's verdict comes as it commits,
+/// before the child does in the same pass, so the tip is checked only once the sync loop has
+/// finished that pass (`sync_settle`); fuzz seed 37 in race mode read it in between.
+#[test]
+fn crosslink_fuzz_directed_a_forks_block_waits_for_its_parent_over_stp() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let network = regtest_network(&HARNESS_PARAMETERS);
+    let miner = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen = BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner);
+    tf.push_instr_load_pow(&gen.tip, 0);
+    let mut fork = gen.clone();
+    let main_2 = gen.next_block(&miner);
+    tf.push_instr_load_pow(&main_2, 0);
+    let other = Address::Transparent(zcash_transparent::address::TransparentAddress::PublicKeyHash([0x81; 20]));
+    let fork_2 = fork.next_block(&other);
+    let fork_3 = fork.next_block(&other);
+    tf.push_instr_load_pow(&fork_3, SHOULD_DEFER);
+    tf.push_instr_recv_pow(&fork_2, 2, 0);
+    tf.push_instr_expect_pow_tip(&fork_3.hash(), 0);
+    test_bytes(tf.write_to_bytes());
 }

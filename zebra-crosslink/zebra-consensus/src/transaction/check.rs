@@ -312,6 +312,19 @@ pub fn coinbase_tx_no_prevout_joinsplit_spend(tx: &Transaction) -> Result<(), Tr
     Ok(())
 }
 
+/// A coinbase transaction must not carry a staking action.
+///
+/// Every staking action's value is left out of the coinbase balance: `miner_fees_are_valid` counts
+/// only the subsidy, fees and the transparent and shielded pools. A bond created in a coinbase
+/// would therefore be paid for by nothing, while the chain value pools still credit it. This rule
+/// is what keeps the staking pools backed, so it applies at every height.
+pub fn coinbase_has_no_staking_action(tx: &Transaction) -> Result<(), TransactionError> {
+    if tx.is_coinbase() && tx.staking_action().is_some() {
+        return Err(TransactionError::CoinbaseHasStakingAction);
+    }
+    Ok(())
+}
+
 /// Check if JoinSplits in the transaction have one of its v_{pub} values equal
 /// to zero.
 ///
