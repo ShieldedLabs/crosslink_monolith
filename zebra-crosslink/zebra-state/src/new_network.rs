@@ -2281,8 +2281,16 @@ pub fn sync(
 
     let actual_network_local_port : u16 = {
         if config.network_local_port == 0 {
+            // A random port that a probe could bind: another process, or another node on this
+            // machine, may hold any one of them, and the transport aborts on a port it cannot
+            // bind. The probe and the transport's bind can still race, but rarely.
             use rand::RngCore;
-            rand::thread_rng().next_u32() as u16 % 45869 + 2000
+            let free = |port: u16| {
+                std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, port)).is_ok()
+                    && std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_ok()
+            };
+            let random_port = || rand::thread_rng().next_u32() as u16 % 45869 + 2000;
+            (0..64).map(|_| random_port()).find(|&port| free(port)).unwrap_or_else(random_port)
         } else {
             config.network_local_port
         }

@@ -906,6 +906,11 @@ impl Service<Request> for Mempool {
                 last_seen_tip_hash,
             } => match req {
                 // Queries
+                Request::InFlightTransactionIds => {
+                    let res: HashSet<_> = tx_downloads.transaction_requests().map(|gossip| gossip.id()).collect();
+                    async move { Ok(Response::TransactionIds(res)) }.boxed()
+                }
+
                 Request::TransactionIds => {
                     trace!(?req, "got mempool request");
 
@@ -1118,7 +1123,7 @@ impl Service<Request> for Mempool {
 
                 let resp = match req {
                     // Return empty responses for queries.
-                    Request::TransactionIds => Response::TransactionIds(Default::default()),
+                    Request::TransactionIds | Request::InFlightTransactionIds => Response::TransactionIds(Default::default()),
 
                     Request::TransactionsById(_) => Response::Transactions(Default::default()),
                     Request::TransactionsByMinedId(_) => Response::Transactions(Default::default()),

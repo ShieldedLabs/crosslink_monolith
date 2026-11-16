@@ -2862,6 +2862,8 @@ async fn await_stp_tx_outcome(stp: &mut HarnessStpPeer, transaction: &Transactio
 /// accepted once it is resident or mined, rejected once it is in the rejected set. Peer-sent
 /// transactions are downloaded and verified asynchronously, so the delivery alone says nothing.
 async fn await_tx_verdict(internal_handle: &TFLServiceHandle, transaction: &Transaction, label: &str) -> (bool, String) {
+    use zebra_node_services::mempool::{Request, Response};
+    let id = UnminedTxId::from(transaction);
     let deadline = tokio::time::Instant::now() + NODE_ANSWER_WAIT;
     loop {
         match mempool_tx_state(internal_handle, transaction).await {
@@ -2869,11 +2871,31 @@ async fn await_tx_verdict(internal_handle: &TFLServiceHandle, transaction: &Tran
             Ok((true, _, _)) => return (true, format!("{label}: accepted into the mempool")),
             Ok((_, _, true)) => return (true, format!("{label}: accepted: already mined")),
             Ok((_, true, _)) => return (false, format!("{label}: rejected: in the mempool's rejected set")),
-            Ok(_) if tokio::time::Instant::now() >= deadline => {
-                return (false, format!("{label}: no mempool verdict within {NODE_ANSWER_WAIT:?}"))
+            // The mempool takes a finished transaction out of flight and stores or rejects it in
+            // one step, so one in none of the four states was refused when it was queued.
+            Ok(_) => {
+                let in_flight = tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.mempool)(Request::InFlightTransactionIds)).await;
+                match in_flight {
+                    Ok(Ok(Response::TransactionIds(ids))) if !ids.contains(&id) => {
+                        // The states were read before the in-flight ids, so it may have finished
+                        // in between: read them once more.
+                        match mempool_tx_state(internal_handle, transaction).await {
+                            Ok((true, _, _)) => return (true, format!("{label}: accepted into the mempool")),
+                            Ok((_, _, true)) => return (true, format!("{label}: accepted: already mined")),
+                            Ok((_, true, _)) => return (false, format!("{label}: rejected: in the mempool's rejected set")),
+                            Ok(_) => return (false, format!("{label}: rejected: refused when queued (not in flight, resident, rejected or mined)")),
+                            Err(err) => return (false, format!("{label}: {err}")),
+                        }
+                    }
+                    Ok(Ok(Response::TransactionIds(_))) => {}
+                    other => return (false, format!("{label}: the in-flight ids request answered {other:?}")),
+                }
             }
-            Ok(_) => tokio::time::sleep(Duration::from_millis(1)).await,
         }
+        if tokio::time::Instant::now() >= deadline {
+            return (false, format!("{label}: no mempool verdict within {NODE_ANSWER_WAIT:?}"));
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 

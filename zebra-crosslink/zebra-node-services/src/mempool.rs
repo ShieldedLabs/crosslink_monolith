@@ -270,6 +270,12 @@ pub enum Request {
     /// Request summary statistics from the mempool for `getmempoolinfo`.
     QueueStats,
 
+    /// Get the IDs of the transactions the mempool is downloading or verifying: queued, not yet
+    /// taken in or refused. Answered with [`Response::TransactionIds`]. A transaction that is
+    /// neither in flight, resident, rejected nor mined was refused when it was queued, a refusal
+    /// the mempool keeps no record of.
+    InFlightTransactionIds,
+
     /// Check whether a transparent output is spent in the mempool.
     UnspentOutput(transparent::OutPoint),
 }
