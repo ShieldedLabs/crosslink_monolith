@@ -2296,6 +2296,11 @@ static TEST_STP_PEERS: Mutex<Vec<HarnessStpPeer>> = Mutex::new(Vec::new());
 /// later. Nothing acknowledges a packet, so this is a bound rather than a handshake.
 const STP_PACKET_SETTLE_PASSES: usize = 3;
 
+/// How long, in real time and in sync passes, an STP delivery waits for a request before a block too
+/// deep to be adopted counts as one the node will not fetch (see `serve_block`).
+const NOT_FETCHED_GRACE: Duration = Duration::from_millis(50);
+const NOT_FETCHED_PASSES: u64 = 10;
+
 /// How long to watch a peer advertise a block the node already has. The node never requests it,
 /// so there is no verdict to wait for, only a kill to rule out; a STATUS naming a new tip brings
 /// the download pass forward to within DL_INIT_WOKEN_MIN_MS, so a request would come well within.
@@ -2708,6 +2713,10 @@ async fn serve_block(
 
     let deadline = tokio::time::Instant::now() + if already_known.is_some() { KNOWN_BLOCK_SETTLE } else { NODE_ANSWER_WAIT };
     let (mut requests, mut chunks) = (0usize, 0usize);
+    // Kept across the loop: the node's other packets to this peer would reset a fresh sleep.
+    let mut not_fetched_check = tokio::time::interval(Duration::from_millis(5));
+    let status_sent = std::time::Instant::now();
+    let status_ticks = zebra_state::new_network::SYNC_TICKS_DONE.load(std::sync::atomic::Ordering::Acquire);
     // Every offset the node asked from, so a request the peer cannot answer is still reported.
     let mut offsets: Vec<u32> = Vec::new();
     loop {
@@ -2745,6 +2754,36 @@ async fn serve_block(
                 Some(_) => {}
                 None => return Err("the sync loop is gone".to_string()),
             },
+            // A block at or below the finalized height, or whose parent is below the near-tip
+            // chains a branch must link into (NEAR_TIP_CHAIN_LEN), is a fork's block that can
+            // never be adopted, and the node does not fetch it, unless it is on the decided chain.
+            // A block the node wants it asks for within a pass or two of the STATUS, so one it has
+            // let several passes go by without asking for, and that is that deep, it is not going
+            // to: waiting longer would only run out the bound.
+            _ = not_fetched_check.tick(), if requests == 0
+                && status_sent.elapsed() >= NOT_FETCHED_GRACE
+                && zebra_state::new_network::SYNC_TICKS_DONE.load(std::sync::atomic::Ordering::Acquire) >= status_ticks + NOT_FETCHED_PASSES => {
+                let finalized = (internal_handle.call.read_state)(zebra_state::ReadRequest::FinalizedTip).await;
+                let finalized_height = match finalized {
+                    Ok(zebra_state::ReadResponse::Tip(Some((finalized_height, _)))) => finalized_height.0,
+                    _ => 0,
+                };
+                let tip = (internal_handle.call.state)(StateRequest::Tip).await;
+                let window_start = match tip {
+                    Ok(StateResponse::Tip(Some((tip_height, _)))) => {
+                        tip_height.0.saturating_sub(zebra_state::new_network::NEAR_TIP_CHAIN_LEN - 1)
+                    }
+                    _ => 0,
+                };
+                if finalized_height >= height || height.saturating_sub(1) < window_start {
+                    return Ok(IngestOutcome::Failed {
+                        reason: format!(
+                            "{hash} @ {height} is not fetched: the finalized height is {finalized_height}, and the near-tip chains a branch must link into start at {window_start}"
+                        ),
+                        misbehavior_score: 0,
+                    });
+                }
+            }
             _ = tokio::time::sleep_until(deadline) => {
                 if let (Some(known), 0) = (&already_known, requests) {
                     return Ok(IngestOutcome::Known { location: known.location.clone(), height: known.height });

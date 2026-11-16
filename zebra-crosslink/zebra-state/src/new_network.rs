@@ -304,7 +304,9 @@ pub fn print_shadow_block_intersection(a: &[ShadowBlock], b: &[ShadowBlock], byt
 }
 
 
-const NEAR_TIP_CHAIN_LEN: u32 = 100;
+/// How many heights below its tip the node's near-tip chains reach. A peer's branch is downloaded
+/// only where it links into them, so a block whose parent is below them is never requested.
+pub const NEAR_TIP_CHAIN_LEN: u32 = 100;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NearTipChain {
