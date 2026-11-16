@@ -201,6 +201,23 @@ impl StartCmd {
         }
     }
 
+    /// Returns the ports of lightwallet_server's gRPC server and of its readiness
+    /// endpoint: the P2P listen port + 10001 and + 10000.
+    ///
+    /// Fails for P2P ports from 55535 up, where those don't fit in a port number.
+    fn lightwallet_server_ports(config: &ZebradConfig) -> Result<(u16, u16), String> {
+        let p2p_port = config.network.listen_addr.port();
+        p2p_port
+            .checked_add(10001)
+            .map(|lwd_port| (lwd_port, lwd_port - 1))
+            .ok_or_else(|| {
+                format!(
+                    "network.listen_addr port {p2p_port} is too high: lightwallet_server \
+                     listens on it + 10000 and + 10001, so it must be below 55535"
+                )
+            })
+    }
+
     /// Returns the default inbound peer IPs that always receive block gossip in
     /// zcashd-compat mode.
     fn zcashd_compat_default_block_gossip_peer_ips() -> Vec<IpAddr> {
@@ -992,8 +1009,8 @@ impl StartCmd {
         // service and mempool. This is lightwallet_server; it takes over the
         // legacy port, and the wallet connects to it unchanged.
         let lightwalletd_thread_handle = {
-            let zebra_port_base = config.network.listen_addr.port();
-            let lwd_port = zebra_port_base + 10001;
+            let (lwd_port, lwd_ready_port) =
+                Self::lightwallet_server_ports(&config).map_err(|err| eyre!(err))?;
             let lwd_ctx = crate::lightwalletd::Ctx {
                 rt: tokio::runtime::Handle::current(),
                 read_state: read_only_state_service.clone(),
@@ -1003,7 +1020,7 @@ impl StartCmd {
                 mempool_events: mempool_transaction_subscriber.clone(),
                 network: config.network.network.clone(),
             };
-            let thread = crate::lightwalletd::lightwalletd_spawn(lwd_ctx, lwd_port, zebra_port_base + 10000, config.crosslink.public_lightwallet_server);
+            let thread = crate::lightwalletd::lightwalletd_spawn(lwd_ctx, lwd_port, lwd_ready_port, config.crosslink.public_lightwallet_server);
             *zebra_crosslink::wallet::wallet_main_lightwalletd_port.lock().unwrap() = lwd_port;
             thread
         };
@@ -1263,6 +1280,8 @@ impl config::Override<ZebradConfig> for StartCmd {
             .into());
         }
 
+        Self::lightwallet_server_ports(&config).map_err(std::io::Error::other)?;
+
         if config.zcashd_compat.enabled && config.zcashd_compat.manage_zcashd {
             zcashd_compat::reject_peer_selection_extra_args(
                 &config.zcashd_compat.zcashd_extra_args,
@@ -1490,6 +1509,40 @@ mod tests {
             StartCmd::zcashd_compat_supervisor_shutdown_timeout(&config),
             None
         );
+    }
+
+    #[test]
+    fn lightwallet_server_ports_follow_the_p2p_port() {
+        let mut config = ZebradConfig::default();
+        for p2p_port in [0, 8233, 18233, 55534] {
+            config.network.listen_addr.set_port(p2p_port);
+            assert_eq!(
+                StartCmd::lightwallet_server_ports(&config),
+                Ok((p2p_port + 10001, p2p_port + 10000))
+            );
+        }
+    }
+
+    #[test]
+    fn p2p_ports_from_55535_up_are_refused_before_start() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        for p2p_port in [55535, 60000, u16::MAX] {
+            let mut config = ZebradConfig::default();
+            config.network.listen_addr.set_port(p2p_port);
+
+            assert!(StartCmd::lightwallet_server_ports(&config).is_err());
+            let error = cmd
+                .override_config(config)
+                .expect_err("lightwallet_server's ports must fit in a port number");
+            assert!(
+                error.to_string().contains("below 55535"),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
