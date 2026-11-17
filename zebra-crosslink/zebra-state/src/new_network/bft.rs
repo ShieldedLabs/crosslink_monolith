@@ -1271,6 +1271,19 @@ pub(super) struct BftRunner {
     /// Tenderlink was due to start while catching up. It starts from the stored chain once the
     /// node has caught up.
     spawn_deferred: bool,
+    /// What the deferred start was given. Each height decided while it is held adds its round
+    /// (`finish_decision`), so it is still the whole decided chain when tenderlink starts.
+    held_start: Option<HeldStart>,
+}
+
+/// A tenderlink start that was due while catching up: the arguments of `spawn_tenderlink`.
+struct HeldStart {
+    /// The roster of the height after `ingest`.
+    roster: Vec<SortedRosterMember>,
+    /// One round per decided height.
+    ingest: Vec<RoundData>,
+    vote_namespace: [u8; 32],
+    strict_quorum: bool,
 }
 
 struct ParkedDecision {
@@ -1314,6 +1327,7 @@ impl BftRunner {
             next_diagnostic: std::time::Instant::now(),
             catching_up: false,
             spawn_deferred: false,
+            held_start: None,
         };
         metrics::gauge!("state.crosslink.bft_dropped").set(0.0);
         crate::new_network::fin::load(&block_writer.finalized_state.db);
@@ -1427,7 +1441,16 @@ impl BftRunner {
             && decided_len() > 0
         {
             self.spawn_deferred = false;
-            self.restore(read_state, block_writer);
+            // A start that was held back is made with what it was given, plus the rounds decided
+            // since (`finish_decision`). Replaying the stored chain a second time would keep two
+            // decoded copies of it until the replay ended, and the chain is most of this node's
+            // memory. With nothing held, or a held start that is not level with the chain,
+            // everything stored is replayed.
+            let held = self.held_start.take().filter(|held| held.ingest.len() as u64 == decided_len());
+            match held {
+                Some(held) => self.spawn_tenderlink(held.roster, held.ingest, held.vote_namespace, held.strict_quorum),
+                None => self.restore(read_state, block_writer),
+            }
         }
 
         // Crosslink bootstrap: the first accepted PoW block at the activation height (h2)
@@ -2295,7 +2318,26 @@ impl BftRunner {
         let next_bft_height = chain.blocks.len() as u64;
         let (roster, voting) =
             roster_for_bft_height(&self.network, slashforks, &chain.roster, next_bft_height, Some(new_final_height));
+        // Who voted at the height just decided: `decide` pushed it along with the block.
+        let voted = chain.voting_rosters.last().cloned();
         drop(chain);
+
+        // Tenderlink is held back (`spawn_tenderlink`) and this height was decided meanwhile, fed
+        // from a peer. Its round joins the held start as `restore` would replay it from the
+        // store: voted on by the roster the previous height returned, which is `held.roster`.
+        // The start then covers the whole decided chain without reading it back.
+        let decided_bft_height = u64::from(block.height);
+        if self.held_start.as_ref().is_some_and(|held| held.ingest.len() as u64 != decided_bft_height) {
+            // Not the height the held start ends at, so it is not built on: `tick` replays the
+            // stored chain instead.
+            self.held_start = None;
+        }
+        if let (Some(held), Some(voted)) = (self.held_start.as_mut(), voted) {
+            let voted_roster = std::mem::replace(&mut held.roster, roster.clone());
+            held.ingest.push(decided_round_data(&block, &fat_pointer, voted_roster, &voted, proposal_sigs.clone(), decided_bft_height, self.params.active_roster_max_n));
+            held.vote_namespace = voting.vote_namespace;
+            held.strict_quorum = voting.strict_quorum;
+        }
 
         tracing::info!(
             "Successfully decided BFT block at height {} finalizing {}",
@@ -2344,6 +2386,7 @@ impl BftRunner {
         let slashforks = self.slashforks.clone();
         let slashforks = slashforks.rules();
         let stored = block_writer.finalized_state.db.bft_chain();
+        let stored_len = stored.len() as u64;
 
         // A tip past the activation height does not mean genesis was stored. Genesis is decided
         // at the start of a tick and the same tick's commit loop can carry the tip past
@@ -2490,6 +2533,11 @@ impl BftRunner {
             );
             self.spawn_tenderlink(roster, ingest, startup_voting.vote_namespace, startup_voting.strict_quorum);
         }
+        // Replay stopped below a stored row. A start held back here is not kept: the start `tick`
+        // makes replays the store again, which takes that row in if its snapshot has arrived.
+        if startup_bft_height < stored_len {
+            self.held_start = None;
+        }
     }
 
     /// The deterministic BFT genesis block: the decision that finalizes the bootstrap roster
@@ -2607,6 +2655,9 @@ impl BftRunner {
                 tracing::info!("holding tenderlink back until the decided BFT chain is caught up with peers");
             }
             self.spawn_deferred = true;
+            // Kept for the start `tick` makes once caught up, so that start does not replay the
+            // stored chain a second time.
+            self.held_start = Some(HeldStart { roster, ingest, vote_namespace, strict_quorum });
             return;
         }
         let Some(launch) = self.launch.take() else { return; };
