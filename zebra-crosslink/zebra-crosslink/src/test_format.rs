@@ -1819,8 +1819,8 @@ pub(crate) async fn handle_instr(
             match settled.and_then(|()| bft_engine_view()) {
                 Err(err) => test_check_outcome(false, false, &format!("BFT sent: {err}")),
                 Ok(view) => {
-                    let node_i = node_roster_index(internal_handle, &view);
-                    let proposer = view_proposer(&view, height, round);
+                    let node_i = view_at_height(&view, height).and_then(|at| node_roster_index(internal_handle, &at));
+                    let node_proposes = node_proposes(internal_handle, &view, height, round);
                     let wanted = value_id.map_or(tenderlink::ValueId::NIL, tenderlink::ValueId);
                     let sent = TEST_BFT_SENT.lock().unwrap().iter().any(|sent| match *sent {
                         tenderlink::SentConsensus::Vote { is_precommit, height: h, round: r, value_id, roster_i } => {
@@ -1833,8 +1833,7 @@ pub(crate) async fn handle_instr(
                             kind == 2
                                 && (h, r) == (height, round)
                                 && (value_id.is_none() || proposal_id == wanted)
-                                && node_i.is_some()
-                                && proposer == node_i
+                                && node_proposes
                         }
                     });
                     test_check(flags, sent, &format!(
@@ -2249,22 +2248,42 @@ const NODE_ANSWER_WAIT: Duration = Duration::from_secs(30);
 /// Whether the node still answers: its state service returns the tip within a bound, and
 /// re-submitting the tip block through the ingest path -- the doorway every LOAD_POW uses --
 /// answers `Known`, which only a live sync loop can do.
+///
+/// The tip can move between reading it and reading its block: a block still being adopted, as race
+/// mode leaves them, can reorganize the best chain, the only chain the block read searches. So a
+/// tip whose block is gone is read again, and fails the check only if it has not moved.
 async fn node_alive(internal_handle: &TFLServiceHandle) -> (bool, String) {
-    let tip = tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.state)(StateRequest::Tip)).await;
-    let (height, hash) = match tip {
-        Ok(Ok(StateResponse::Tip(Some(tip)))) => tip,
-        Ok(Ok(other)) => return (false, format!("node alive: the tip request answered {other:?}")),
-        Ok(Err(err)) => return (false, format!("node alive: the tip request failed: {err}")),
-        Err(_) => return (false, format!("node alive: no answer to the tip request within {NODE_ANSWER_WAIT:?}")),
-    };
-    let block = tokio::time::timeout(
-        NODE_ANSWER_WAIT,
-        (internal_handle.call.state)(StateRequest::Block(hash.into())),
-    )
-    .await;
-    let block = match block {
-        Ok(Ok(StateResponse::Block(Some(block)))) => block,
-        other => return (false, format!("node alive: could not read the tip block {hash} at height {}: {other:?}", height.0)),
+    async fn read_tip(internal_handle: &TFLServiceHandle) -> Result<(zebra_chain::block::Height, zebra_chain::block::Hash), String> {
+        let tip = tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.state)(StateRequest::Tip)).await;
+        match tip {
+            Ok(Ok(StateResponse::Tip(Some(tip)))) => Ok(tip),
+            Ok(Ok(other)) => Err(format!("node alive: the tip request answered {other:?}")),
+            Ok(Err(err)) => Err(format!("node alive: the tip request failed: {err}")),
+            Err(_) => Err(format!("node alive: no answer to the tip request within {NODE_ANSWER_WAIT:?}")),
+        }
+    }
+    const TIP_MOVES: usize = 10;
+    let mut moves = 0;
+    let (height, hash, block) = loop {
+        let (height, hash) = match read_tip(internal_handle).await {
+            Ok(tip) => tip,
+            Err(err) => return (false, err),
+        };
+        let block = tokio::time::timeout(
+            NODE_ANSWER_WAIT,
+            (internal_handle.call.state)(StateRequest::Block(hash.into())),
+        )
+        .await;
+        match block {
+            Ok(Ok(StateResponse::Block(Some(block)))) => break (height, hash, block),
+            other => {
+                let moved = read_tip(internal_handle).await.is_ok_and(|tip| tip != (height, hash));
+                if !moved || moves == TIP_MOVES {
+                    return (false, format!("node alive: could not read the tip block {hash} at height {}: {other:?}", height.0));
+                }
+                moves += 1;
+            }
+        }
     };
     match zebra_state::new_network::submit_block_to_new_network(block, NODE_ANSWER_WAIT).await {
         Ok(zebra_state::new_network::IngestOutcome::Known { .. }) => {
@@ -2440,10 +2459,31 @@ fn view_proposer(view: &tenderlink::EngineView, height: u64, round: u32) -> Opti
     tenderlink::proposer_index(&view.hash_keys, &view.roster, view.active_roster_max_n, height, round)
 }
 
+/// The last engine view the harness saw at each height. A round's proposer, and a finalizer's
+/// roster index, are what its height's roster says, and the engine holds only the current height's.
+static TEST_BFT_HEIGHT_VIEWS: Mutex<Vec<tenderlink::EngineView>> = Mutex::new(Vec::new());
+
+/// The engine view for `height`: `view` when it is at that height, otherwise the last one the
+/// harness saw there.
+fn view_at_height(view: &tenderlink::EngineView, height: u64) -> Option<tenderlink::EngineView> {
+    if view.height == height {
+        return Some(view.clone());
+    }
+    TEST_BFT_HEIGHT_VIEWS.lock().unwrap().iter().find(|seen| seen.height == height).cloned()
+}
+
+/// Whether the node was the proposer of `height` and `round`.
+fn node_proposes(internal_handle: &TFLServiceHandle, view: &tenderlink::EngineView, height: u64, round: u32) -> bool {
+    view_at_height(view, height).is_some_and(|at| {
+        node_roster_index(internal_handle, &at).is_some_and(|node_i| view_proposer(&at, height, round) == Some(node_i))
+    })
+}
+
 /// The id of the proposal the node sent at `height` and `round`, when it was that round's proposer.
+/// Only then: the node also relays other proposers' chunks, but no one else can sign a chunk for a
+/// round it proposes.
 fn node_proposal_id(internal_handle: &TFLServiceHandle, view: &tenderlink::EngineView, height: u64, round: u32) -> Option<tenderlink::ValueId> {
-    let node_i = node_roster_index(internal_handle, view)?;
-    if view_proposer(view, height, round) != Some(node_i) {
+    if !node_proposes(internal_handle, view, height, round) {
         return None;
     }
     TEST_BFT_SENT.lock().unwrap().iter().find_map(|sent| match *sent {
@@ -2475,7 +2515,13 @@ fn bft_engine_view() -> Result<tenderlink::EngineView, String> {
     if !bft_engine_running() {
         return Err("BFT is not running (it starts at a FromChain bootstrap's activation height)".to_string());
     }
-    tenderlink::engine_view().ok_or_else(|| "the BFT engine has not ticked yet; ADVANCE_TIME makes it".to_string())
+    let view = tenderlink::engine_view().ok_or_else(|| "the BFT engine has not ticked yet; ADVANCE_TIME makes it".to_string())?;
+    let mut seen = TEST_BFT_HEIGHT_VIEWS.lock().unwrap();
+    match seen.iter_mut().find(|seen| seen.height == view.height) {
+        Some(at) => *at = view.clone(),
+        None => seen.push(view.clone()),
+    }
+    Ok(view)
 }
 
 /// Where synthetic finalizer `k` is in `peers`, connecting it to the engine, with its identity
@@ -2553,6 +2599,7 @@ async fn bft_settle() -> Result<(), String> {
         Ok(settled) => settled,
         Err(_) => Err(format!("the BFT engine ran no loop passes within {NODE_ANSWER_WAIT:?}")),
     };
+    let _ = bft_engine_view();
     record_bft_sent();
     settled
 }
