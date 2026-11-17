@@ -11,7 +11,13 @@ use tracing_futures::Instrument;
 
 use zebra_chain::{parameters::Network::*, serialization::ZcashDeserialize};
 
+use crate::tests::state_with_checkpoint_commits;
+
 use super::*;
+
+// Crosslink's state service refuses `CommitCheckpointVerifiedBlock` (`new_network` commits blocks
+// through the block writer), so the tests that commit blocks use `state_with_checkpoint_commits`,
+// which commits them through the block writer.
 
 /// The timeout we apply to each verify future during testing.
 ///
@@ -43,7 +49,7 @@ async fn single_item_checkpoint_list() -> Result<(), Report> {
             .cloned()
             .collect();
 
-    let state_service = zebra_state::init_test(&Mainnet).await;
+    let state_service = state_with_checkpoint_commits(&Mainnet).await;
     let mut checkpoint_verifier =
         CheckpointVerifier::from_list(genesis_checkpoint_list, &Mainnet, None, state_service)
             .map_err(|e| eyre!(e))?;
@@ -122,7 +128,7 @@ async fn multi_item_checkpoint_list() -> Result<(), Report> {
         .map(|(_block, height, hash)| (*height, *hash))
         .collect();
 
-    let state_service = zebra_state::init_test(&Mainnet).await;
+    let state_service = state_with_checkpoint_commits(&Mainnet).await;
     let mut checkpoint_verifier =
         CheckpointVerifier::from_list(checkpoint_list, &Mainnet, None, state_service)
             .map_err(|e| eyre!(e))?;
@@ -271,7 +277,7 @@ async fn continuous_blockchain(
         let initial_tip = restart_height.map(|block::Height(height)| {
             (blockchain[height as usize].1, blockchain[height as usize].2)
         });
-        let state_service = zebra_state::init_test(&Mainnet).await;
+        let state_service = state_with_checkpoint_commits(&Mainnet).await;
         let mut checkpoint_verifier = CheckpointVerifier::from_list(
             checkpoint_list,
             &network,
@@ -514,7 +520,7 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
             .cloned()
             .collect();
 
-    let state_service = zebra_state::init_test(&Mainnet).await;
+    let state_service = state_with_checkpoint_commits(&Mainnet).await;
     let mut checkpoint_verifier =
         CheckpointVerifier::from_list(genesis_checkpoint_list, &Mainnet, None, state_service)
             .map_err(|e| eyre!(e))?;
@@ -687,7 +693,7 @@ async fn checkpoint_drop_cancel() -> Result<(), Report> {
         .map(|(_block, height, hash)| (*height, *hash))
         .collect();
 
-    let state_service = zebra_state::init_test(&Mainnet).await;
+    let state_service = state_with_checkpoint_commits(&Mainnet).await;
     let mut checkpoint_verifier =
         CheckpointVerifier::from_list(checkpoint_list, &Mainnet, None, state_service)
             .map_err(|e| eyre!(e))?;
@@ -770,7 +776,7 @@ async fn hard_coded_mainnet() -> Result<(), Report> {
         Arc::<Block>::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?;
     let hash0 = block0.hash();
 
-    let state_service = zebra_state::init_test(&Mainnet).await;
+    let state_service = state_with_checkpoint_commits(&Mainnet).await;
     // Use the hard-coded checkpoint list
     let mut checkpoint_verifier = CheckpointVerifier::new(&Network::Mainnet, None, state_service);
 

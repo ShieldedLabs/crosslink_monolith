@@ -450,13 +450,30 @@ mod tests {
     /// This is the faithfulness test for the phase-2 hoist: these blocks are all real and all
     /// valid, so any rejection here means a check was reordered, dropped, or given the wrong
     /// inputs relative to `SemanticBlockVerifier`.
+    ///
+    /// One exception: the Crosslink testnet funds a single address that never rotates, so while
+    /// `is_crosslink_testnet` is set, `funding_stream_address_index` expects the first address
+    /// on every network. Real Mainnet blocks after the first address period pay a later
+    /// address, so the subsidy check refuses them with `FundingStreamNotFound`. Those blocks
+    /// must fail with exactly that error; every other check before it still has to pass.
     #[test]
     fn cheap_checks_accept_all_mainnet_vectors() {
+        use zebra_chain::parameters::{
+            is_crosslink_testnet,
+            subsidy::{funding_stream_address_period, SubsidyError},
+        };
+
         let network = Network::Mainnet;
         let canopy_height = NetworkUpgrade::Canopy
             .activation_height(&network)
             .expect("Canopy activation height is known on mainnet");
         let mut checked = 0;
+        let mut accepted = 0;
+
+        let funding_stream_not_found =
+            BlockVerifyError::from(VerifyBlockError::from(BlockError::Transaction(
+                TransactionError::Subsidy(SubsidyError::FundingStreamNotFound),
+            )));
 
         for (height, bytes) in zebra_test::vectors::MAINNET_BLOCKS.iter() {
             if Height(*height) < canopy_height {
@@ -469,6 +486,28 @@ mod tests {
             // are historical, so anchor `now` to each block's own header time.
             let now = block.header.time;
 
+            let funding_streams = network
+                .funding_streams(Height(*height))
+                .expect("every post-Canopy mainnet vector is in a funding stream period");
+            let pays_a_later_address = funding_stream_address_period(Height(*height), &network)
+                > funding_stream_address_period(funding_streams.height_range().start, &network);
+
+            if is_crosslink_testnet && pays_a_later_address {
+                let err = block_check_cheap(&block, &network, now, true).err().unwrap_or_else(|| {
+                    panic!("mainnet block {height} pays a later funding stream address, so it must be refused")
+                });
+                assert_eq!(
+                    (err.msg, err.misbehavior_score),
+                    (
+                        funding_stream_not_found.msg.clone(),
+                        funding_stream_not_found.misbehavior_score
+                    ),
+                    "mainnet block {height} must be refused only for its funding stream address"
+                );
+                checked += 1;
+                continue;
+            }
+
             let cheap = block_check_cheap(&block, &network, now, true)
                 .unwrap_or_else(|e| panic!("mainnet block {height} was rejected: {}", e.msg));
 
@@ -480,11 +519,17 @@ mod tests {
                 "transaction hash count mismatch for block {height}"
             );
             checked += 1;
+            accepted += 1;
         }
 
         // 9 post-Canopy vectors exist today; the floor guards against a filter change
         // silently emptying the loop, not against the vector set shrinking.
         assert!(checked >= 5, "expected several post-Canopy vectors, got {checked}");
+        // 1,046,400 and 1,046,401 are in the first address period, so they pass every check.
+        assert!(
+            accepted >= 2,
+            "expected the first-period vectors to be accepted, got {accepted}"
+        );
     }
 
     /// A block whose PoW does not meet the difficulty threshold must be rejected, and the
