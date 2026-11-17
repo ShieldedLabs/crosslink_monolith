@@ -309,6 +309,16 @@ strip = "none"
 #     - see https://doc.rust-lang.org/rustc/linker-plugin-lto.html#cc-code-as-a-dependency-in-rust
 lto = "thin"
 
+# The CI fuzz campaign (.github/workflows/crosslink-fuzz.yml): optimized like release, but with only
+# the line tables backtraces need, no LTO and incremental builds, so the build directory the runner
+# keeps between runs stays small and a change rebuilds quickly. Fuzz inputs mostly wait on the
+# node rather than compute, so LTO buys them little.
+[profile.ci-fuzz]
+inherits = "release"
+debug = "line-tables-only"
+lto = false
+incremental = true
+
 # [profile.release-debug]
 # inherits = "release"
 

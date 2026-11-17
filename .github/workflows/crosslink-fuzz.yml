@@ -1,0 +1,113 @@
+name: Crosslink fuzz
+
+# Runs the Crosslink scenario fuzzer (zebrad/tests/crosslink/fuzz.rs) on each push to dev: the
+# crosslink test suite first, as a gate, then a time-boxed campaign on every core of a Blacksmith
+# runner, with seeds that move on each run. A finding fails the job and its inputs and logs are
+# uploaded. Findings are not minimized here: three of them doubled the first campaign's 20 minutes.
+# Minimize a downloaded one with crosslink_fuzz_minimize or a local CROSSLINK_FUZZ_MINIMIZE campaign.
+
+on:
+  push:
+    branches:
+      - dev
+
+permissions:
+  contents: read
+
+# Pushes to dev come often: a newer push cancels the campaign still running for an older one.
+concurrency:
+  group: crosslink-fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fuzz children and the suite log a lot; color codes only get in the way of reading them.
+  NO_COLOR: "1"
+  # How long the campaign runs, and how many seeds a run owns (it stops at whichever comes first).
+  FUZZ_SECS: "1200"
+  FUZZ_SEEDS_PER_RUN: "1000000"
+
+jobs:
+  fuzz:
+    name: Suite and campaign
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: zebra-crosslink
+    steps:
+      - uses: actions/checkout@v4
+
+      # The build directory and Cargo's downloads persist between runs, so a push rebuilds only what
+      # it changed.
+      - uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ github.repository }}-crosslink-fuzz-target
+          path: zebra-crosslink/target
+      - uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ github.repository }}-crosslink-fuzz-cargo-registry
+          path: ~/.cargo/registry
+      - uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ github.repository }}-crosslink-fuzz-cargo-git
+          path: ~/.cargo/git
+
+      - name: Install system packages
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y --no-install-recommends libclang-dev protobuf-compiler
+
+      - name: Install the pinned toolchain
+        # rust-toolchain.toml pins the version; asking for it installs it.
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Build the crosslink tests
+        run: cargo nextest run --cargo-profile ci-fuzz -p zebrad --test crosslink --no-run
+
+      - name: Crosslink suite
+        run: cargo nextest run --cargo-profile ci-fuzz -p zebrad --test crosslink --no-fail-fast
+
+      - name: Fuzz campaign
+        run: |
+          # The test binary's path changes when the build does, so ask nextest for it every time.
+          BIN=$(cargo nextest list --cargo-profile ci-fuzz -p zebrad --test crosslink --message-format json \
+            | python3 -c "import sys, json; d = json.load(sys.stdin); print([v['binary-path'] for v in d['rust-suites'].values()][0])")
+          # Each run fuzzes its own seeds, so successive runs cover new inputs.
+          START=$(( GITHUB_RUN_NUMBER * FUZZ_SEEDS_PER_RUN ))
+          END=$(( START + FUZZ_SEEDS_PER_RUN ))
+          echo "seeds $START..$END for ${FUZZ_SECS}s on $(nproc) workers" | tee -a "$GITHUB_STEP_SUMMARY"
+          # Findings from an earlier run on this build directory would be uploaded again.
+          rm -rf target/tmp/crosslink-fuzz
+          # The step shell stops at the first failing command, so the campaign's status is caught
+          # rather than left to stop it before the summary.
+          set -o pipefail
+          status=0
+          CROSSLINK_FUZZ_SEEDS="$START..$END" CROSSLINK_FUZZ_SECS="$FUZZ_SECS" CROSSLINK_FUZZ_JOBS="$(nproc)" \
+            CROSSLINK_FUZZ_MINIMIZE=0 \
+            "$BIN" fuzz::crosslink_fuzz --exact --ignored --nocapture 2>&1 | tee fuzz.log || status=$?
+          grep -aE '^fuzz: ' fuzz.log | tee -a "$GITHUB_STEP_SUMMARY"
+          exit $status
+
+      - name: Summarize findings
+        if: failure()
+        run: |
+          {
+            echo '### Findings'
+            grep -aE '^fuzz seed-[^ ]+: .*(Fail|Hang)\(' fuzz.log || echo 'none in the campaign log (the suite or the build failed)'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload findings
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crosslink-fuzz-findings-${{ github.run_number }}
+          path: |
+            zebra-crosslink/target/tmp/crosslink-fuzz
+            zebra-crosslink/fuzz.log
+          if-no-files-found: ignore
+          retention-days: 30
