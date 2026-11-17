@@ -606,9 +606,9 @@ pub async fn service_viz_requests(
                     let internal = zebra_state::new_network::bft::bft_chain().read().unwrap();
                     // bounded per cycle so a bulk load (PoS store replay) doesn't hash the
                     // whole chain under one lock hold
-                    let scan_end = (bft_checked_n + 4096).min(internal.blocks.len());
-                    while bft_checked_n < scan_end {
-                        let b = &internal.blocks[bft_checked_n];
+                    // (blocks older than the ones held in memory are read from the database)
+                    let scan_end = (bft_checked_n + 512).min(internal.blocks.len());
+                    for b in zebra_state::new_network::bft::decided_blocks(&internal, bft_checked_n, scan_end - bft_checked_n) {
                         if b.headers.is_empty() { break; } // placeholder: recheck once filled
                         let hash = Hash32::from_bytes(b.snapshot_block_hash().0);
                         bft_candidate_hashes.push(hash);
@@ -944,7 +944,9 @@ pub async fn service_viz_requests(
                     }
 
                     for i in bft_indices {
-                        let b = &internal.blocks[i];
+                        // a block older than the ones held in memory is read from the database
+                        let Some(b) = zebra_state::new_network::bft::decided_block(&internal, i) else { continue; };
+                        let b = &*b;
                         // Out-of-order BFT ingest pads the chain with empty-headers placeholder
                         // blocks; nothing to show until the real block arrives.
                         if b.headers.is_empty() { continue; }
@@ -1001,13 +1003,9 @@ pub async fn service_viz_requests(
                             response.block_inspection = pow_inspection(bc.as_ref());
                         } else {
                             let internal = zebra_state::new_network::bft::bft_chain().read().unwrap();
-                            for b in internal.blocks.iter() {
-                                let this_hash = Hash32::from_bytes(b.blake3_hash().0);
-                                if want == this_hash {
-                                    response.what_block_it_is = want;
-                                    response.block_inspection = bft_inspection(b);
-                                    break;
-                                }
+                            if let Some(b) = zebra_state::new_network::bft::decided_block_by_hash(&internal, want.as_bytes()) {
+                                response.what_block_it_is = want;
+                                response.block_inspection = bft_inspection(&b);
                             }
                         }
                     }

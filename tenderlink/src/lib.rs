@@ -204,6 +204,15 @@ impl std::fmt::Debug for ClosureToAccessBft {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToAccessBft(..)") }
 }
 
+/// Given a decided BFT height the engine no longer holds, synchronously return the round that
+/// decided it, built from the host database exactly as the rounds ingested at startup are built,
+/// or `None` if it cannot be read. The host should perform only a short database read.
+#[derive(Clone)]
+pub struct ClosureToFetchDecidedRound(pub Arc<dyn Fn(u64) -> Option<RoundData> + Send + Sync + 'static>);
+impl std::fmt::Debug for ClosureToFetchDecidedRound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToFetchDecidedRound(..)") }
+}
+
 fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMember]) -> FatPointerToBftBlock {
     let vote_for_block_without_finalizer_public_key: [u8; 76 - 32];
     {
@@ -714,6 +723,10 @@ pub fn decision_threshold(total_stake: u64, strict_quorum: bool) -> u64 {
 
 
 
+pub const RECENT_COMMIT_ROUND_CACHE_LIMIT: usize = 1024;
+const FETCHED_DECIDED_ROUND_MEMO_LIMIT: usize = 16;
+const DECIDED_ROUND_FETCH_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug)]
 pub struct TMState {
     pub hash_keys: HashKeys,
@@ -743,7 +756,11 @@ pub struct TMState {
 
     pub rounds_data: Vec<RoundData>,
 
-    pub recent_commit_round_cache: Vec<RoundData>, // for now will hold all completed heights
+    /// A contiguous window of decided heights, beginning at the first entry's height.
+    pub recent_commit_round_cache: Vec<RoundData>,
+    pub recent_commit_round_cache_limit: usize,
+    // FIFO of old host reads, including misses until their retry deadline. Both are bounded.
+    fetched_decided_rounds: Vec<(u64, Option<RoundData>, std::time::Instant)>,
 
     /// Dedup for the always-on sig-fault print: one line per distinct
     /// (height, round, claimed roster_i, packet_type). Re-delivered dead votes
@@ -757,6 +774,7 @@ pub struct TMState {
 
     update_peers_cmd_closure: ClosureToUpdatePeers,
     bft_access_closure: ClosureToAccessBft,
+    fetch_decided_round_closure: ClosureToFetchDecidedRound,
 }
 
 impl TMState {
@@ -767,6 +785,7 @@ impl TMState {
         push_block_closure: ClosureToPushDecidedBlock,
         update_peers_cmd_closure: ClosureToUpdatePeers,
         bft_access_closure: ClosureToAccessBft,
+        fetch_decided_round_closure: ClosureToFetchDecidedRound,
     ) -> Self {
         Self {
             hash_keys: HashKeys::default(),
@@ -784,6 +803,8 @@ impl TMState {
 
             rounds_data: Vec::new(),
             recent_commit_round_cache: Vec::new(),
+            recent_commit_round_cache_limit: RECENT_COMMIT_ROUND_CACHE_LIMIT,
+            fetched_decided_rounds: Vec::new(),
             sig_fault_printed: std::collections::HashSet::new(),
 
             propose_closure,
@@ -791,6 +812,7 @@ impl TMState {
             push_block_closure,
             update_peers_cmd_closure,
             bft_access_closure,
+            fetch_decided_round_closure,
         }
     }
 
@@ -903,11 +925,38 @@ impl TMState {
         insert_i
     }
 
+    fn trim_recent_commit_round_cache(&mut self) {
+        let excess = self.recent_commit_round_cache.len().saturating_sub(self.recent_commit_round_cache_limit);
+        self.recent_commit_round_cache.drain(..excess);
+    }
+
     fn ingest_decided_rounds(&mut self, mut decided_rounds: Vec<RoundData>) {
+        decided_rounds.drain(..decided_rounds.len().saturating_sub(self.recent_commit_round_cache_limit));
         for round_data in &mut decided_rounds {
             round_data.recover_proposal_valid_round(&self.hash_keys, self.active_roster_max_n);
         }
+        decided_rounds.shrink_to_fit();
         self.recent_commit_round_cache = decided_rounds;
+    }
+
+    // Prepare the old round before the read-only gossip paths borrow the state. A miss is
+    // remembered too, so an unavailable database height is not read again on every tick.
+    fn fetch_decided_round(&mut self, height: u64) {
+        if height >= self.height || cached_round(self, height).is_some() { return; }
+        if self.recent_commit_round_cache.first().is_some_and(|rd| height >= rd.height) { return; }
+        if let Some(i) = self.fetched_decided_rounds.iter().position(|entry| entry.0 == height) {
+            let (_, round, fetched_at) = &self.fetched_decided_rounds[i];
+            if round.is_some() || fetched_at.elapsed() < DECIDED_ROUND_FETCH_RETRY { return; }
+            self.fetched_decided_rounds.remove(i);
+        }
+        let round = (self.fetch_decided_round_closure.0)(height).filter(|rd| rd.height == height).map(|mut rd| {
+            rd.recover_proposal_valid_round(&self.hash_keys, self.active_roster_max_n);
+            rd
+        });
+        if self.fetched_decided_rounds.len() == FETCHED_DECIDED_ROUND_MEMO_LIMIT {
+            self.fetched_decided_rounds.remove(0);
+        }
+        self.fetched_decided_rounds.push((height, round, std::time::Instant::now()));
     }
 
     async fn start_round(&mut self, roster: &[SortedRosterMember], now: Instant, round: u32) {
@@ -1502,6 +1551,7 @@ impl TMState {
                 self.vote_namespace = new_vote_namespace;
                 self.strict_quorum = new_strict_quorum;
                 self.recent_commit_round_cache.push(self.rounds_data[i].clone());
+                self.trim_recent_commit_round_cache();
                 self.rounds_data.retain(|r| r.height >= self.height);
                 self.locked_value_round = (None, -1);
                 self.valid_value_round = (None, -1);
@@ -1831,6 +1881,7 @@ async fn instance(
         ClosureToAccessBft(Arc::new(move |_bft_state, _key_addr_map| { Box::pin(async move {
         })})),
 
+        ClosureToFetchDecidedRound(Arc::new(|_| None)),
         Vec::new(),
         [0u8; 32], // initial_vote_namespace: no slashforks in the sim
         false,     // initial_strict_quorum
@@ -2549,7 +2600,19 @@ fn set_peer_view_height(peer: &mut Peer, height: u64) {
 }
 
 fn cached_round(bft_state: &TMState, height: u64) -> Option<&RoundData> {
-    usize::try_from(height).ok().and_then(|h| bft_state.recent_commit_round_cache.get(h)).filter(|rd| rd.height == height)
+    let base = bft_state.recent_commit_round_cache.first()?.height;
+    let offset = usize::try_from(height.checked_sub(base)?).ok()?;
+    bft_state.recent_commit_round_cache.get(offset).filter(|rd| rd.height == height)
+}
+
+fn decided_round(bft_state: &TMState, height: u64) -> Option<&RoundData> {
+    cached_round(bft_state, height).or_else(|| {
+        bft_state.fetched_decided_rounds.iter().find(|entry| entry.0 == height).and_then(|entry| entry.1.as_ref())
+    })
+}
+
+fn startup_height(decided_rounds: &[RoundData]) -> u64 {
+    decided_rounds.last().map_or(0, |rd| rd.height.checked_add(1).expect("decided BFT height overflow"))
 }
 
 /// Whether this node holds anything a peer at `height` could be sent for `round`: a round of its
@@ -2558,7 +2621,7 @@ fn holds_round(bft_state: &TMState, height: u64, round: u32) -> bool {
     if height == bft_state.height {
         bft_state.rounds_data.binary_search_by_key(&(height, round), |rd| (rd.height, rd.round)).is_ok()
     } else {
-        height < bft_state.height && cached_round(bft_state, height).is_some_and(|rd| rd.round == round)
+        height < bft_state.height && decided_round(bft_state, height).is_some_and(|rd| rd.round == round)
     }
 }
 
@@ -2671,8 +2734,9 @@ fn write_have_for_peer(bft_state: &TMState, rounds: &GossipRounds, peer: &mut Pe
     Some(o)
 }
 
-fn take_have(bft_state: &TMState, peer: &mut Peer, have: PacketHave) {
+fn take_have(bft_state: &mut TMState, peer: &mut Peer, have: PacketHave) {
     if have.seq <= peer.have_seq { return; }
+    bft_state.fetch_decided_round(have.height);
     peer.have_seq = have.seq;
     peer.have_height_round = Some((have.height, have.round));
     peer.latest_status_request_height = Some(have.height);
@@ -2817,8 +2881,11 @@ fn gossip_round(w: &mut GossipWriter, rd: &RoundData, peer: &mut Peer, kind: Gos
 /// budget less `backlog`, the bytes already queued to it. A peer behind gets the proposal and
 /// precommits that decided its height, which are all it needs from that height; a peer ahead
 /// gets only HAVEs, from which it catches this node up.
-fn gossip_to_peer(bft_state: &TMState, roster: &[SortedRosterMember], rounds: &GossipRounds, peer: &mut Peer, peer_bft_key: PubKeyID,
+fn gossip_to_peer(bft_state: &mut TMState, roster: &[SortedRosterMember], rounds: &GossipRounds, peer: &mut Peer, peer_bft_key: PubKeyID,
                   ctx_str: &str, tick: u64, backlog: u64, out: &mut Vec<Vec<u8>>) -> GossipSent {
+    if let Some(height) = peer.have_height_round.map(|hr| hr.0).or_else(|| peer.latest_status.map(|status| status.height)) {
+        bft_state.fetch_decided_round(height);
+    }
     let mut buf = [0u8; PROPOSAL_PACKET_SIZE];
     let have_bytes = write_have_for_peer(bft_state, rounds, peer, tick, &mut buf).unwrap_or(0);
     if have_bytes > 0 { out.push(buf[..have_bytes].to_vec()); }
@@ -2836,7 +2903,7 @@ fn gossip_to_peer(bft_state: &TMState, roster: &[SortedRosterMember], rounds: &G
     for view in &mut peer.view { view.expire(tick); }
 
     if peer_height < bft_state.height {
-        let Some(rd) = cached_round(bft_state, peer_height) else { return w.sent; };
+        let Some(rd) = decided_round(bft_state, peer_height) else { return w.sent; };
         w.budget = allowance;
         let view = peer_round_view(&mut peer.view, rd.round);
         let _ = gossip_votes(&mut w, rd, view, 1) && gossip_chunks(&mut w, rd, view);
@@ -2977,9 +3044,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          push_block_closure: ClosureToPushDecidedBlock,
                          peer_cmd_closure: ClosureToUpdatePeers,
                          bft_access_closure: ClosureToAccessBft,
+                         fetch_decided_round_closure: ClosureToFetchDecidedRound,
                          ingest_startup_data: Vec<RoundData>,
                          // Vote-namespacing domain separator for the startup height
-                         // (`ingest_startup_data.len()`); `[0; 32]` when no slashforks are in effect.
+                         // (one after the last ingested round, or 0 when none); `[0; 32]` when no slashforks are in effect.
                          initial_vote_namespace: [u8; 32],
                          // Whether the startup height decides by the strict quorum.
                          initial_strict_quorum: bool,
@@ -3055,9 +3123,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         push_block_closure,
         peer_cmd_closure,
         bft_access_closure,
+        fetch_decided_round_closure,
     ); // TODO: double-check this is the right key
 
-    bft_state.height = ingest_startup_data.len() as u64;
+    bft_state.height = startup_height(&ingest_startup_data);
     bft_state.vote_namespace = initial_vote_namespace;
     bft_state.strict_quorum = initial_strict_quorum;
     bft_state.ingest_decided_rounds(ingest_startup_data);
@@ -3252,7 +3321,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         }
                     }
                     let backlog = network_thread_handle.send_backlog_bytes(*connection_key, transport::Channel::BftLive).unwrap_or(0);
-                    let sent = gossip_to_peer(&bft_state, &roster, &gossip_rounds, peer, peer_bft_key, &ctx_str, gossip_tick, backlog, &mut gossip_out);
+                    let sent = gossip_to_peer(&mut bft_state, &roster, &gossip_rounds, peer, peer_bft_key, &ctx_str, gossip_tick, backlog, &mut gossip_out);
                     if PRINT_SEND_CS && sent.data_bytes > 0 {
                         eprintln!("{ctx_str} {ANSI_GRY}SEND_CS{ANSI_RST}: to {:?}: {} proposal chunks, {} prevotes, {} precommits; {} bytes, {} of them HAVE, {} queued before",
                             peer_bft_key, sent.chunks, sent.votes[0], sent.votes[1], sent.have_bytes + sent.data_bytes, sent.have_bytes, backlog);
@@ -4581,6 +4650,7 @@ mod tests {
             ClosureToPushDecidedBlock(Arc::new(|_, _, _| Box::pin(async { (Vec::new(), [0; 32], false) }))),
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
+            ClosureToFetchDecidedRound(Arc::new(|_| None)),
         );
         state.insert_round(0, 0, &roster);
         (state, roster)
@@ -4763,6 +4833,7 @@ mod tests {
             ClosureToPushDecidedBlock(Arc::new(|_, _, _| Box::pin(async { (Vec::new(), [0; 32], false) }))),
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
+            ClosureToFetchDecidedRound(Arc::new(|_| None)),
         );
         state.vote_namespace = namespace;
         for r in 0..ROUNDS_N { state.insert_round(r as usize, r, &roster); }
@@ -4985,6 +5056,7 @@ mod tests {
             ClosureToPushDecidedBlock(Arc::new(|_, _, _| Box::pin(async { (Vec::new(), [0; 32], false) }))),
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
+            ClosureToFetchDecidedRound(Arc::new(|_| None)),
         );
         state.round = 2;
 
@@ -5037,6 +5109,7 @@ mod tests {
             ClosureToPushDecidedBlock(Arc::new(move |_, _, _| { let roster = decided_roster.clone(); Box::pin(async move { (roster, [0; 32], false) }) })),
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
+            ClosureToFetchDecidedRound(Arc::new(|_| None)),
         )
     }
 
@@ -5742,6 +5815,7 @@ mod tests {
             ClosureToPushDecidedBlock(Arc::new(move |_, _, _| { let roster = decided_roster.clone(); Box::pin(async move { (roster, [0; 32], false) }) })),
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
+            ClosureToFetchDecidedRound(Arc::new(|_| None)),
         );
         node.height = height;
         node.vote_namespace = namespace;
@@ -5759,6 +5833,146 @@ mod tests {
         data.extend_from_slice(&proposal.0[chunk_o..chunk_o + chunk_size]);
         let sig = TMSig(sign_with_namespace(key, &data, namespace));
         (data, sig)
+    }
+
+    // Decide a run on one real engine and keep the host's reconstruction of every decision.
+    // Late-round re-proposals exercise recovery of the signed valid round on a database read.
+    fn recent_decisions(keys: &[SigningKey], roster: &[SortedRosterMember], limit: usize, count: u64) -> (TMState, Vec<RoundData>) {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut node = engine_with_key(&keys[0], roster, 0, [0; 32], false);
+        node.recent_commit_round_cache_limit = limit;
+        let mut stored = Vec::new();
+        for height in 0..count {
+            let round = 1 + (height % 3) as u32;
+            let valid_round = round as i64 - 1;
+            let proposer = TMState::proposer_from_height_round(&node.hash_keys, roster, ROSTER_MAX_N, height, round).0.unwrap();
+            let value = BlockValue(vec![height as u8; PROPOSAL_CHUNK_DATA_SIZE + 1]);
+            let id = value.id_from_value(&node.hash_keys);
+            for chunk_i in 0..value.chunks_n() {
+                let (data, sig) = signed_chunk(&keys[proposer], &[0; 32], &value, id, height, round, valid_round, chunk_i);
+                assert_eq!(node.check_and_incorporate_msg(height, round, chunk_i, id, valid_round, roster, proposer,
+                    PACKET_TYPE_PROPOSAL_CHUNK, &data, sig), TMStatus::Pass);
+            }
+            for voter in 0..roster.len() {
+                let data = make_vote_sign_datas(roster[voter].pub_key, true, height, round, id)[1];
+                let sig = TMSig(sign_with_namespace(&keys[voter], &data, &[0; 32]));
+                node.check_and_incorporate_msg(height, round, 0, id, -2, roster, voter, PACKET_TYPE_PRECOMMIT_SIGNATURES, &data, sig);
+            }
+            rt.block_on(node.bft_update(&mut roster.to_vec()));
+            assert_eq!(node.height, height + 1);
+            let mut rd = decided_round_as_stored(node.recent_commit_round_cache.last().unwrap());
+            rd.active_roster_max_n = node.active_roster_max_n;
+            stored.push(rd);
+        }
+        (node, stored)
+    }
+
+    #[test]
+    fn recent_decided_round_cache_keeps_only_the_window_by_absolute_height() {
+        let (keys, roster) = sim_finalizers(4);
+        let (node, _) = recent_decisions(&keys, &roster, 3, 7);
+        assert_eq!(node.recent_commit_round_cache.len(), 3);
+        for height in 0..7 {
+            assert_eq!(cached_round(&node, height).map(|rd| rd.height), (height >= 4).then_some(height));
+        }
+        assert!(cached_round(&node, 7).is_none());
+        assert!(cached_round(&node, u64::MAX).is_none());
+    }
+
+    #[test]
+    fn recent_decided_round_startup_uses_the_last_height_of_a_nonzero_run() {
+        let (keys, roster) = sim_finalizers(4);
+        let (_, stored) = recent_decisions(&keys, &roster, 3, 7);
+        let mut node = engine_with_key(&keys[0], &roster, 0, [0; 32], false);
+        node.recent_commit_round_cache_limit = 2;
+        let startup = stored[2..].to_vec();
+        node.height = startup_height(&startup);
+        node.ingest_decided_rounds(startup);
+        assert_eq!(node.height, 7);
+        assert_eq!(node.recent_commit_round_cache.len(), 2);
+        assert_eq!(node.recent_commit_round_cache[0].height, 5);
+        assert_eq!(cached_round(&node, 6).unwrap().proposal_valid_round, 0);
+        assert!(cached_round(&node, 4).is_none());
+        assert_eq!(startup_height(&[]), 0);
+        node.recent_commit_round_cache_limit = 0;
+        node.ingest_decided_rounds(stored);
+        assert!(node.recent_commit_round_cache.is_empty());
+    }
+
+    #[test]
+    fn recent_decided_round_fetch_memo_bounds_reads_and_retries_misses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (keys, roster) = sim_finalizers(4);
+        let mut node = engine_with_key(&keys[0], &roster, 100, [0; 32], false);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let calls = reads.clone();
+        node.fetch_decided_round_closure = ClosureToFetchDecidedRound(Arc::new(move |height| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            if height == 1 { return None; }
+            Some(RoundData { height: if height == 0 { 99 } else { height }, ..RoundData::EMPTY })
+        }));
+        for height in [0, 0, 1, 1] { node.fetch_decided_round(height); }
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+        assert!(decided_round(&node, 0).is_none(), "a wrong-height host result must be rejected");
+        assert!(decided_round(&node, 1).is_none());
+        for entry in &mut node.fetched_decided_rounds { entry.2 -= DECIDED_ROUND_FETCH_RETRY; }
+        for height in [0, 1] { node.fetch_decided_round(height); }
+        assert_eq!(reads.load(Ordering::Relaxed), 4);
+        for height in [2, 2, 100, 101] { node.fetch_decided_round(height); }
+        assert_eq!(reads.load(Ordering::Relaxed), 5);
+        assert!(holds_round(&node, 2, 0));
+        for height in 3..20 { node.fetch_decided_round(height); }
+        assert_eq!(node.fetched_decided_rounds.len(), FETCHED_DECIDED_ROUND_MEMO_LIMIT);
+        assert_eq!(node.fetched_decided_rounds[0].0, 4);
+        assert!(decided_round(&node, 2).is_none());
+    }
+
+    // A peer farther behind than the window needs each old decision to re-decide its height.
+    // Without the host callback it cannot get past even the first evicted height.
+    #[test]
+    fn recent_decided_round_fetch_brings_a_peer_all_the_way_from_zero() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (keys, roster) = sim_finalizers(4);
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        for available in [true, false] {
+            let (mut ahead, stored) = recent_decisions(&keys, &roster, 2, 7);
+            let reads = Arc::new(AtomicUsize::new(0));
+            let calls = reads.clone();
+            ahead.fetch_decided_round_closure = ClosureToFetchDecidedRound(Arc::new(move |height| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                if available { stored.get(height as usize).cloned() } else { None }
+            }));
+            let mut behind = engine_with_key(&keys[1], &roster, 0, [0; 32], false);
+            rt.block_on(behind.start_round(&roster, zebra_debug_time::instant_now(), 0));
+            let (mut ahead_peer, mut behind_peer) = (Peer::default(), Peer::default());
+            for tick in 0..100 {
+                let mut out = Vec::new();
+                let rounds = gossip_rounds_of(&behind);
+                gossip_to_peer(&mut behind, &roster, &rounds, &mut behind_peer, roster[0].pub_key, "", tick, 0, &mut out);
+                for packet in out.drain(..) { sim_deliver(&mut ahead, &roster, &mut ahead_peer, tick, &packet); }
+                let rounds = gossip_rounds_of(&ahead);
+                gossip_to_peer(&mut ahead, &roster, &rounds, &mut ahead_peer, roster[1].pub_key, "", tick, 0, &mut out);
+                for packet in out.drain(..) { sim_deliver(&mut behind, &roster, &mut behind_peer, tick, &packet); }
+                rt.block_on(behind.bft_update(&mut roster.clone()));
+                if available && behind.height == ahead.height { break; }
+            }
+            assert_eq!(behind.height, if available { ahead.height } else { 0 }, "host available: {available}");
+            assert_eq!(ahead.recent_commit_round_cache.len(), 2);
+            if available {
+                assert_eq!(reads.load(Ordering::Relaxed), 5, "one database read per evicted height");
+                let restored = decided_round(&ahead, 0).unwrap();
+                assert_eq!(restored.proposal_valid_round, 0, "host reads recover the signed valid round");
+                // A HAVE for an evicted round uses the same memo and records the peer's holdings.
+                let have = HaveRound::of(restored);
+                take_have(&mut ahead, &mut ahead_peer, PacketHave {
+                    seq: u64::MAX, height: 0, round: have.round, vote_bits_n: roster.len(), rounds: vec![have.clone()],
+                });
+                assert_eq!(ahead_peer.view[0].have, have);
+                assert_eq!(reads.load(Ordering::Relaxed), 5);
+            } else {
+                assert_eq!(reads.load(Ordering::Relaxed), 1, "a miss must not be retried every tick");
+            }
+        }
     }
 
     // A height can be decided in a round whose proposer re-proposed the value it last saw 2f+1 prevotes
@@ -6188,7 +6402,7 @@ mod tests {
                 let Some(link) = sim.links[i][j].as_mut() else { continue; };
                 let backlog = link.outbox_bytes;
                 if backlog >= PROPOSAL_PACKET_SIZE { sim.cov.gated += 1; }
-                let sent = gossip_to_peer(&sim.nodes[i], &sim.roster, &rounds, &mut sim.peers[i][j], sim.roster[j].pub_key, &ctx_str, sim.tick, backlog as u64, &mut out);
+                let sent = gossip_to_peer(&mut sim.nodes[i], &sim.roster, &rounds, &mut sim.peers[i][j], sim.roster[j].pub_key, &ctx_str, sim.tick, backlog as u64, &mut out);
                 assert!(sent.have_bytes <= PROPOSAL_PACKET_SIZE);
                 assert!(sent.data_bytes <= GOSSIP_BYTES_PER_PEER_TICK.saturating_sub(backlog + sent.have_bytes),
                     "tick {}: {i} sent {j} {} bytes with {backlog} queued and a {}-byte HAVE", sim.tick, sent.data_bytes, sent.have_bytes);
@@ -6453,6 +6667,7 @@ mod tests {
             ClosureToPushDecidedBlock(Arc::new(move |_, _, _| { let roster = decided_roster.clone(); Box::pin(async move { (roster, [0; 32], strict_quorum) }) })),
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
+            ClosureToFetchDecidedRound(Arc::new(|_| None)),
         );
         node.strict_quorum = strict_quorum;
         node

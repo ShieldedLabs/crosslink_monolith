@@ -8,6 +8,7 @@
 //! read lock on [`bft_chain`].
 #![allow(missing_docs)]
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasherDefault;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
@@ -69,10 +70,11 @@ impl std::hash::Hasher for Blake3HashFold {
 /// The decided bft-chain, plus the finality facts derived from it.
 #[derive(Debug)]
 pub struct BftChain {
-    /// Decided blocks by BFT height. A block with no headers is a placeholder left by
-    /// out-of-order ingest and is never a valid pointer target.
-    pub blocks: Vec<BftBlock>,
-    /// Block hash -> 0-based height (index into `blocks`). Real blocks only; append-only, so
+    /// Decided blocks by BFT height, of which only the newest are in memory: `decided_block`
+    /// reads an older one. A block with no headers is a placeholder left by out-of-order ingest
+    /// and is never a valid pointer target.
+    pub blocks: HeldBlocks,
+    /// Block hash -> 0-based height, for every decided height. Real blocks only; append-only, so
     /// entries are never invalidated. `blake3_hash()` re-serializes the whole block, so
     /// resolving a pointer by scanning costs ~150 MB of hashing at 9.5k blocks.
     pub hash_to_height: HashMap<Blake3Hash, u64, BuildHasherDefault<Blake3HashFold>>,
@@ -123,9 +125,117 @@ fn push_voting_roster(voting_rosters: &mut Vec<Arc<VotingRoster>>, voting: Votin
     voting_rosters.push(shared);
 }
 
+/// How many of the newest decided BFT blocks stay in memory. A block weighs about 15 KB, and
+/// rules about the tip read only the last few; what reads further back (a PoW block that cites
+/// an old BFT block during catch-up, the visualizer's history) reads the database.
+pub const BFT_BLOCKS_HELD: usize = 1024;
+
+/// The decided BFT blocks, holding the newest `BFT_BLOCKS_HELD` of them. Lengths and heights
+/// are those of the whole decided chain, so a height below `base` is decided but not held.
+#[derive(Debug)]
+pub struct HeldBlocks {
+    /// The height of the oldest held block: how many blocks are in the database only.
+    base: usize,
+    held: VecDeque<BftBlock>,
+}
+
+impl HeldBlocks {
+    pub const fn new() -> Self {
+        Self { base: 0, held: VecDeque::new() }
+    }
+
+    /// How many heights are decided, held or not: the next height to decide.
+    pub fn len(&self) -> usize {
+        self.base + self.held.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The lowest height held in memory.
+    pub fn base(&self) -> usize {
+        self.base
+    }
+
+    /// The newest decided block.
+    pub fn last(&self) -> Option<&BftBlock> {
+        self.held.back()
+    }
+
+    /// The block at `height` if it is held: `None` below `base` as well as past the tip.
+    /// `decided_block` also reads the ones below.
+    pub fn get(&self, height: usize) -> Option<&BftBlock> {
+        self.held.get(height.checked_sub(self.base)?)
+    }
+
+    /// The held blocks with their heights, oldest first.
+    pub fn held(&self) -> impl DoubleEndedIterator<Item = (usize, &BftBlock)> {
+        self.held.iter().enumerate().map(|(i, block)| (self.base + i, block))
+    }
+
+    /// Appends the block of the next height, letting go of the oldest held one past the limit.
+    pub fn push(&mut self, block: BftBlock) {
+        self.held.push_back(block);
+        if self.held.len() > BFT_BLOCKS_HELD {
+            self.held.pop_front();
+            self.base += 1;
+        }
+    }
+}
+
+impl Default for HeldBlocks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The database the decided chain is stored in, for reading back what memory no longer holds.
+/// Set when the runner is made.
+static BFT_DB: RwLock<Option<ZebraDb>> = RwLock::new(None);
+
+/// The decision stored for `height`, read from the database.
+fn stored_decision(height: usize) -> Option<StoredDecision> {
+    let db = BFT_DB.read().unwrap();
+    db.as_ref()?.bft_decisions(u32::try_from(height).ok()?, 1, usize::MAX).into_iter().next()
+}
+
+/// The decided block at `height`: the one held in memory, or the stored one below those.
+pub fn decided_block(chain: &BftChain, height: usize) -> Option<Cow<'_, BftBlock>> {
+    match chain.blocks.get(height) {
+        Some(block) => Some(Cow::Borrowed(block)),
+        None if height < chain.blocks.base() => stored_decision(height).map(|decision| Cow::Owned(decision.block)),
+        None => None,
+    }
+}
+
+/// The decided block with this hash, held or stored.
+pub fn decided_block_by_hash(chain: &BftChain, hash: [u8; 32]) -> Option<Cow<'_, BftBlock>> {
+    decided_block(chain, *chain.hash_to_height.get(&Blake3Hash(hash))? as usize)
+}
+
+/// The decided blocks of `count` heights from `from` on, held or stored: for a reader that walks
+/// the history (the visualizer). Shorter than `count` where the chain or the database ends.
+pub fn decided_blocks(chain: &BftChain, from: usize, count: usize) -> Vec<BftBlock> {
+    let mut blocks = Vec::new();
+    let stored_n = chain.blocks.base().saturating_sub(from).min(count);
+    if stored_n > 0 {
+        let db = BFT_DB.read().unwrap();
+        let (Some(db), Ok(from), Ok(stored_n)) = (db.as_ref(), u32::try_from(from), u32::try_from(stored_n)) else {
+            return blocks;
+        };
+        blocks.extend(db.bft_decisions(from, stored_n, usize::MAX).into_iter().map(|decision| decision.block));
+        if blocks.len() < stored_n as usize {
+            return blocks;
+        }
+    }
+    blocks.extend((from + blocks.len()..from + count).map_while(|height| chain.blocks.get(height).cloned()));
+    blocks
+}
+
 static BFT_CHAIN: LazyLock<RwLock<BftChain>> = LazyLock::new(|| {
     RwLock::new(BftChain {
-        blocks: Vec::new(),
+        blocks: HeldBlocks::new(),
         hash_to_height: HashMap::default(),
         fat_pointer_to_tip: FatPointerToBftBlock::null(),
         roster: Vec::new(),
@@ -777,18 +887,15 @@ pub fn tenderlink_roster_from_internal(
 /// The fat pointer to the block at 1-based `at_height`, or `None` when the chain has no such
 /// block. The tip's pointer is the stored one; any other is the next block's previous-block
 /// pointer.
-pub fn fat_pointer_to_block_at_height(
-    bft_blocks: &[BftBlock],
-    fat_pointer_to_tip: &FatPointerToBftBlock,
-    at_height: u64,
-) -> Option<FatPointerToBftBlock> {
-    if at_height == 0 || at_height as usize - 1 >= bft_blocks.len() {
+pub fn fat_pointer_to_block_at_height(chain: &BftChain, at_height: u64) -> Option<FatPointerToBftBlock> {
+    let decided_n = chain.blocks.len();
+    if at_height == 0 || at_height as usize - 1 >= decided_n {
         return None;
     }
-    if at_height as usize == bft_blocks.len() {
-        Some(fat_pointer_to_tip.clone())
+    if at_height as usize == decided_n {
+        Some(chain.fat_pointer_to_tip.clone())
     } else {
-        Some(bft_blocks[at_height as usize].previous_block_fat_ptr.clone())
+        decided_block(chain, at_height as usize).map(|next| next.previous_block_fat_ptr.clone())
     }
 }
 
@@ -960,8 +1067,17 @@ pub fn admit_fat_pointer(
     // `do_not_include_until_bc_height`, and the PoW block carries its own height. Both are
     // fixed, so a PoW block referencing a BFT block before that BFT block is allowed to be
     // included can never become valid later.
-    if let Some(h) = child_index {
-        let do_not_include = chain.blocks[h].do_not_include_until_bc_height;
+    // The block is read back when it is older than the ones held, as for a PoW block far below
+    // the BFT tip. One that resolved and cannot be read defers, like one not here yet.
+    let child_block = match child_index {
+        Some(h) => match decided_block(chain, h) {
+            Some(block) => Some(block),
+            None => return None,
+        },
+        None => None,
+    };
+    if let Some(child_block) = &child_block {
+        let do_not_include = child_block.do_not_include_until_bc_height;
         if (pow_block_height.0 as u64) < do_not_include {
             return Some(CrosslinkVerdict::Reject);
         }
@@ -970,13 +1086,14 @@ pub fn admit_fat_pointer(
     // The PoW block this block's certificate finalizes -- the snapshot, i.e. the parent of the
     // BFT block's deepest carried header. Placeholder entries from out-of-order BFT ingest carry
     // no headers and are never valid pointer targets, but guard rather than panic.
-    let snapshot_hash = match child_index {
-        Some(h) if !chain.blocks[h].headers.is_empty() => {
-            Some(Hash(chain.blocks[h].snapshot_block_hash().0))
+    let snapshot_hash = match &child_block {
+        Some(child_block) if !child_block.headers.is_empty() => {
+            Some(Hash(child_block.snapshot_block_hash().0))
         }
         Some(_) => return None,
         None => None,
     };
+    drop(child_block);
 
     let parent_index = if parent_is_null {
         None
@@ -1123,7 +1240,9 @@ pub fn fat_pointer_for_template(
     let certificates_checked = u32::try_from(proposed_pow_height)
         .is_ok_and(|height| read_state.network().is_nu_active(NetworkUpgrade::FeaturenetUpgrade2, height.into()));
     let mut suitable_height = None;
-    for (i, b) in chain.blocks.iter().enumerate().rev() {
+    // Only the held blocks are tried. When none of them suits, the template is for a chain far
+    // from the BFT tip, and it keeps its parent's pointer, as below.
+    for (i, b) in chain.blocks.held().rev() {
         if b.headers.is_empty() || b.do_not_include_until_bc_height > proposed_pow_height {
             continue;
         }
@@ -1140,7 +1259,7 @@ pub fn fat_pointer_for_template(
         };
         if on_the_template_chain {
             if certificates_checked {
-                let pointer = fat_pointer_to_block_at_height(&chain.blocks, &chain.fat_pointer_to_tip, i as u64 + 1);
+                let pointer = fat_pointer_to_block_at_height(chain, i as u64 + 1);
                 let voting = chain.voting_rosters.get(i).expect("voting_rosters is indexed like blocks");
                 // usize to u64 is lossless on every supported target.
                 if !pointer.is_some_and(|pointer| certificate_is_valid(&pointer, i as u64, voting)) {
@@ -1152,8 +1271,7 @@ pub fn fat_pointer_for_template(
         }
     }
     if let Some(h) = suitable_height {
-        return fat_pointer_to_block_at_height(&chain.blocks, &chain.fat_pointer_to_tip, h)
-            .unwrap_or_else(FatPointerToBftBlock::null);
+        return fat_pointer_to_block_at_height(chain, h).unwrap_or_else(FatPointerToBftBlock::null);
     }
     parent_hash
         .and_then(|parent_hash| read_state.any_chain_block_header(parent_hash.into()))
@@ -1272,7 +1390,7 @@ pub(super) struct BftRunner {
     /// node has caught up.
     spawn_deferred: bool,
     /// What the deferred start was given. Each height decided while it is held adds its round
-    /// (`finish_decision`), so it is still the whole decided chain when tenderlink starts.
+    /// (`finish_decision`), so it still ends at the decided tip when tenderlink starts.
     held_start: Option<HeldStart>,
 }
 
@@ -1280,10 +1398,32 @@ pub(super) struct BftRunner {
 struct HeldStart {
     /// The roster of the height after `ingest`.
     roster: Vec<SortedRosterMember>,
-    /// One round per decided height.
+    /// The rounds of the newest decided heights, one each, as `restore` builds them.
     ingest: Vec<RoundData>,
     vote_namespace: [u8; 32],
     strict_quorum: bool,
+}
+
+/// The BFT height after the last of `rounds`: where tenderlink starts when it is given them.
+fn height_after(rounds: &[RoundData]) -> u64 {
+    rounds.last().map_or(0, |round| round.height + 1)
+}
+
+/// The round that decided `height`, as tenderlink holds it: the stored decision, voted on by
+/// `voting`. Its roster is the active one, which is all of a roster tenderlink reads. `None` when
+/// the height is not stored.
+fn stored_round(db: &ZebraDb, voting: &VotingRoster, height: u64, active_roster_max_n: usize) -> Option<RoundData> {
+    let StoredDecision { block, fat_pointer, proposal_sigs } =
+        db.bft_decisions(u32::try_from(height).ok()?, 1, usize::MAX).into_iter().next()?;
+    Some(decided_round_data(&block, &fat_pointer, voting.roster.clone(), voting, proposal_sigs, height, active_roster_max_n))
+}
+
+/// The round that decided `height`, read back for tenderlink when it no longer holds it: a peer
+/// that far behind is still sent the rounds it lacks.
+fn fetch_decided_round(height: u64, active_roster_max_n: usize) -> Option<RoundData> {
+    let voting = Arc::clone(BFT_CHAIN.read().unwrap().voting_rosters.get(usize::try_from(height).ok()?)?);
+    let db = BFT_DB.read().unwrap();
+    stored_round(db.as_ref()?, &voting, height, active_roster_max_n)
 }
 
 struct ParkedDecision {
@@ -1330,6 +1470,7 @@ impl BftRunner {
             held_start: None,
         };
         metrics::gauge!("state.crosslink.bft_dropped").set(0.0);
+        *BFT_DB.write().unwrap() = Some(block_writer.finalized_state.db.clone());
         crate::new_network::fin::load(&block_writer.finalized_state.db);
         if runner.launch.is_some() {
             // A chain-bootstrapped node restarting with a stored chain holds tenderlink back until
@@ -1442,11 +1583,10 @@ impl BftRunner {
         {
             self.spawn_deferred = false;
             // A start that was held back is made with what it was given, plus the rounds decided
-            // since (`finish_decision`). Replaying the stored chain a second time would keep two
-            // decoded copies of it until the replay ended, and the chain is most of this node's
-            // memory. With nothing held, or a held start that is not level with the chain,
-            // everything stored is replayed.
-            let held = self.held_start.take().filter(|held| held.ingest.len() as u64 == decided_len());
+            // since (`finish_decision`), and not by replaying the stored chain a second time, which
+            // reads every decided height. With nothing held, or a held start that is not level
+            // with the chain, everything stored is replayed.
+            let held = self.held_start.take().filter(|held| height_after(&held.ingest) == decided_len());
             match held {
                 Some(held) => self.spawn_tenderlink(held.roster, held.ingest, held.vote_namespace, held.strict_quorum),
                 None => self.restore(read_state, block_writer),
@@ -2144,10 +2284,13 @@ impl BftRunner {
         {
             let chain = BFT_CHAIN.read().unwrap();
             let height = new_block.height as usize;
-            if chain.blocks.get(height).is_some_and(|stored| !stored.headers.is_empty()) {
+            // Tenderlink decides one height at a time, so it can be at a height this node no
+            // longer holds in memory.
+            if let Some(stored) = decided_block(&chain, height).filter(|stored| !stored.headers.is_empty()) {
                 let same = chain.hash_to_height.get(&new_block_hash) == Some(&(height as u64));
                 // Only the conflict, which ends BFT, needs the stored block's hash.
-                let chain_block_hash = (!same).then(|| chain.blocks[height].blake3_hash());
+                let chain_block_hash = (!same).then(|| stored.blake3_hash());
+                drop(stored);
                 let next = match chain.voting_rosters.get(height + 1) {
                     Some(voting) => (voting.roster.clone(), voting.vote_namespace, voting.strict_quorum),
                     None => {
@@ -2242,7 +2385,7 @@ impl BftRunner {
         assert_eq!(insert_i, chain.blocks.len(), "validate passed, so the block extends the tip");
         if insert_i > 0 {
             assert_eq!(
-                chain.blocks[insert_i - 1].blake3_hash(),
+                chain.blocks.last().expect("the tip is held, and the chain is not empty").blake3_hash(),
                 new_block.previous_block_fat_ptr.points_at_block_hash()
             );
         }
@@ -2325,9 +2468,9 @@ impl BftRunner {
         // Tenderlink is held back (`spawn_tenderlink`) and this height was decided meanwhile, fed
         // from a peer. Its round joins the held start as `restore` would replay it from the
         // store: voted on by the roster the previous height returned, which is `held.roster`.
-        // The start then covers the whole decided chain without reading it back.
+        // The start then ends at the decided tip without reading the chain back.
         let decided_bft_height = u64::from(block.height);
-        if self.held_start.as_ref().is_some_and(|held| held.ingest.len() as u64 != decided_bft_height) {
+        if self.held_start.as_ref().is_some_and(|held| height_after(&held.ingest) != decided_bft_height) {
             // Not the height the held start ends at, so it is not built on: `tick` replays the
             // stored chain instead.
             self.held_start = None;
@@ -2335,6 +2478,9 @@ impl BftRunner {
         if let (Some(held), Some(voted)) = (self.held_start.as_mut(), voted) {
             let voted_roster = std::mem::replace(&mut held.roster, roster.clone());
             held.ingest.push(decided_round_data(&block, &fat_pointer, voted_roster, &voted, proposal_sigs.clone(), decided_bft_height, self.params.active_roster_max_n));
+            // Tenderlink keeps this many rounds and reads an older one back when it needs it.
+            let excess_n = held.ingest.len().saturating_sub(tenderlink::RECENT_COMMIT_ROUND_CACHE_LIMIT);
+            held.ingest.drain(..excess_n);
             held.vote_namespace = voting.vote_namespace;
             held.strict_quorum = voting.strict_quorum;
         }
@@ -2385,8 +2531,10 @@ impl BftRunner {
     fn restore(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
         let slashforks = self.slashforks.clone();
         let slashforks = slashforks.rules();
-        let stored = block_writer.finalized_state.db.bft_chain();
-        let stored_len = stored.len() as u64;
+        let db = &block_writer.finalized_state.db;
+        // The stored chain is replayed one decision at a time, and only its newest blocks are kept
+        // (`HeldBlocks`), so it is never all in memory.
+        let stored = |height: usize| db.bft_decisions(u32::try_from(height).ok()?, 1, usize::MAX).into_iter().next();
 
         // A tip past the activation height does not mean genesis was stored. Genesis is decided
         // at the start of a tick and the same tick's commit loop can carry the tip past
@@ -2395,7 +2543,7 @@ impl BftRunner {
         // pure function of the headers above h1 (`build_bootstrap_genesis`), so the first tick's
         // `bootstrap` derives the same block this node would have stored, and rows above it are
         // rewritten as catch-up decides them again.
-        if stored.is_empty() {
+        if stored(0).is_none() {
             if let (Some(activation_height), Some((tip, _))) =
                 (self.params.bootstrap.activation_height(), read_state.best_tip())
             {
@@ -2409,8 +2557,10 @@ impl BftRunner {
             }
         }
 
-        let mut ingest: Vec<RoundData> = Vec::new();
-        let mut blocks: Vec<BftBlock> = Vec::new();
+        let mut blocks = HeldBlocks::new();
+        let mut hash_to_height = HashMap::default();
+        // Replay stopped at a stored decision it could not take, with more stored above it.
+        let mut stopped_short = false;
         let mut fat_pointer_to_tip = FatPointerToBftBlock::null();
         // The roster that voted on the block about to be replayed. BFT genesis is decided by
         // the nil validator set (see `build_bootstrap_genesis`), so replay starts empty; each
@@ -2427,16 +2577,17 @@ impl BftRunner {
         // Dropping BFT is permanent for a database (FINALITY.md §4.3).
         let recorded_drop = block_writer.finalized_state.db.crosslink_bft_dropped();
 
-        for decision in stored {
-            let StoredDecision { block, fat_pointer, proposal_sigs } = decision;
+        while let Some(decision) = stored(blocks.len()) {
+            let StoredDecision { block, fat_pointer, .. } = decision;
             if block.previous_block_fat_ptr.points_at_block_hash() != fat_pointer_to_tip.points_at_block_hash() {
+                stopped_short = true;
                 break;
             }
 
             // Historical round replay: filter the roster exactly as the live path did at this
             // height, so it matches the roster that actually voted on this decided block.
-            let this_bft_height = ingest.len() as u64;
-            let (roster, voting) =
+            let this_bft_height = blocks.len() as u64;
+            let (_, voting) =
                 roster_for_bft_height(&self.network, slashforks, &unsorted_roster, this_bft_height, prev_finalized_bc_height);
 
             // The roster the next height votes with, and the watermark that filters it, both
@@ -2464,6 +2615,7 @@ impl BftRunner {
                         // This node stored the decision, so the snapshot is on the decided chain:
                         // fetched whatever height a peer alleges, and never expired.
                         DECIDED_MISSING_POW_BLOCKS.lock().unwrap().insert(snapshot);
+                        stopped_short = true;
                         break;
                     }
                     // BFT was dropped here, so nothing is decided from this replay; the stored
@@ -2487,8 +2639,8 @@ impl BftRunner {
                 }
             }
 
-            ingest.push(decided_round_data(&block, &fat_pointer, roster, &voting, proposal_sigs, this_bft_height, self.params.active_roster_max_n));
             push_voting_roster(&mut voting_rosters, voting);
+            hash_to_height.insert(block.blake3_hash(), this_bft_height);
             blocks.push(block);
             fat_pointer_to_tip = fat_pointer;
         }
@@ -2513,11 +2665,21 @@ impl BftRunner {
             &self.network, slashforks, &unsorted_roster, startup_bft_height, last_final.map(|(height, _)| height),
         );
 
+        // Tenderlink starts with the rounds of the newest heights, built as it is given an older
+        // one when a peer needs it (`fetch_decided_round`).
+        let ingest_from = startup_bft_height.saturating_sub(tenderlink::RECENT_COMMIT_ROUND_CACHE_LIMIT as u64);
+        let ingest: Vec<RoundData> = (ingest_from..startup_bft_height)
+            .map(|height| {
+                stored_round(db, &voting_rosters[height as usize], height, self.params.active_roster_max_n)
+                    .expect("a decision replayed above is stored")
+            })
+            .collect();
+
         let loaded_any = !blocks.is_empty();
         {
             let mut chain = BFT_CHAIN.write().unwrap();
             chain.roster = unsorted_roster;
-            chain.hash_to_height = blocks.iter().enumerate().map(|(i, b)| (b.blake3_hash(), i as u64)).collect();
+            chain.hash_to_height = hash_to_height;
             chain.blocks = blocks;
             chain.voting_rosters = voting_rosters;
             chain.fat_pointer_to_tip = fat_pointer_to_tip;
@@ -2535,7 +2697,7 @@ impl BftRunner {
         }
         // Replay stopped below a stored row. A start held back here is not kept: the start `tick`
         // makes replays the store again, which takes that row in if its snapshot has arrived.
-        if startup_bft_height < stored_len {
+        if stopped_short {
             self.held_start = None;
         }
     }
@@ -2593,7 +2755,12 @@ impl BftRunner {
         // Genesis is decided exactly once. `decide` asserts the block it is given validates
         // against the chain, and a genesis already at index 0 fails that assert -- which under
         // `panic = abort` takes the node down.
-        if BFT_CHAIN.read().unwrap().blocks.first().is_some_and(|b| !b.headers.is_empty()) {
+        // A genesis below the held blocks was decided and stored, so it is a real block.
+        let genesis_decided = {
+            let chain = BFT_CHAIN.read().unwrap();
+            chain.blocks.base() > 0 || chain.blocks.get(0).is_some_and(|b| !b.headers.is_empty())
+        };
+        if genesis_decided {
             return;
         }
         // A parked genesis is decided already and waits only for its snapshot.
@@ -2641,7 +2808,7 @@ impl BftRunner {
         if roster.is_empty() {
             tracing::error!(
                 "BFT height {} has an empty roster: no stake was bonded by the bootstrap roster height ({:?}). BFT will not run on this chain.",
-                ingest.len(), self.params.bootstrap,
+                height_after(&ingest), self.params.bootstrap,
             );
             self.launch = None;
             return;
@@ -2661,7 +2828,7 @@ impl BftRunner {
             return;
         }
         let Some(launch) = self.launch.take() else { return; };
-        tracing::info!("starting tenderlink at BFT height {} with {} finalizer(s)", ingest.len(), roster.len());
+        tracing::info!("starting tenderlink at BFT height {} with {} finalizer(s)", height_after(&ingest), roster.len());
         BFT_CHAIN.write().unwrap().is_activated = true;
 
         // The seeds are only addresses to start connections from. A finalizer's BFT key is
@@ -2752,6 +2919,10 @@ impl BftRunner {
                 note_decided_missing_pow_blocks(bft_state);
                 Box::pin(async {})
             })),
+            tenderlink::ClosureToFetchDecidedRound(Arc::new({
+                let active_roster_max_n = self.params.active_roster_max_n;
+                move |height| fetch_decided_round(height, active_roster_max_n)
+            })),
             ingest,
             vote_namespace,
             strict_quorum,
@@ -2839,6 +3010,28 @@ mod tests {
             slashforks: Vec::new(),
             do_not_include_until_bc_height: if version >= 2 { 11 } else { 0 },
         }
+    }
+
+    #[test]
+    fn held_blocks_keep_the_newest_and_the_heights_of_the_whole_chain() {
+        let mut blocks = HeldBlocks::new();
+        assert!(blocks.is_empty() && blocks.last().is_none() && blocks.get(0).is_none());
+        let decided_n = BFT_BLOCKS_HELD + 3;
+        for height in 0..decided_n {
+            // The version stands in for the height, to tell the blocks apart.
+            blocks.push(test_block(height as u32));
+            assert_eq!(blocks.len(), height + 1);
+            assert_eq!(blocks.last().map(|block| block.version), Some(height as u32));
+        }
+        assert_eq!(blocks.base(), 3);
+        assert_eq!(blocks.held().count(), BFT_BLOCKS_HELD);
+        assert!(blocks.get(0).is_none() && blocks.get(2).is_none(), "below the held blocks");
+        assert!(blocks.get(decided_n).is_none(), "past the tip");
+        for height in [3, 4, decided_n - 1] {
+            assert_eq!(blocks.get(height).map(|block| block.version), Some(height as u32));
+        }
+        assert!(blocks.held().map(|(height, block)| (height as u32, block.version)).all(|(height, version)| height == version));
+        assert_eq!(blocks.held().next_back().map(|(height, _)| height), Some(decided_n - 1));
     }
 
     #[test]

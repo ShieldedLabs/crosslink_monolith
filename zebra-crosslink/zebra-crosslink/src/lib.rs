@@ -271,10 +271,12 @@ async fn block_pays_pos_issuance(
 
     let snapshot_hash = {
         let chain = zebra_state::new_network::bft::bft_chain().read().unwrap();
-        match chain.hash_to_height.get(&fat_pointer.points_at_block_hash()) {
-            Some(&h) if !chain.blocks[h as usize].headers.is_empty() => {
-                ZebBlockHash(chain.blocks[h as usize].snapshot_block_hash().0)
-            }
+        let cited = chain
+            .hash_to_height
+            .get(&fat_pointer.points_at_block_hash())
+            .and_then(|&h| zebra_state::new_network::bft::decided_block(&chain, h as usize));
+        match cited {
+            Some(cited) if !cited.headers.is_empty() => ZebBlockHash(cited.snapshot_block_hash().0),
             _ => {
                 return Err(format!(
                     "block at height {} carries a certificate this node cannot resolve ({:?});                      its issuance cannot be replayed",
