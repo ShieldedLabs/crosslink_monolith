@@ -2343,31 +2343,18 @@ impl BftRunner {
     fn restore(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
         let slashforks = self.slashforks.clone();
         let slashforks = slashforks.rules();
-        let stored = block_writer.finalized_state.db.bft_chain();
 
-        // A tip past the activation height does not mean genesis was stored. Genesis is decided
-        // at the start of a tick and the same tick's commit loop can carry the tip past
-        // activation, so a node stopped before the next tick has neither; so does one whose
-        // genesis row failed to write, or lacks row 0, which hides every later row. Genesis is a
-        // pure function of the headers above h1 (`build_bootstrap_genesis`), so the first tick's
-        // `bootstrap` derives the same block this node would have stored, and rows above it are
-        // rewritten as catch-up decides them again.
-        if stored.is_empty() {
-            if let (Some(activation_height), Some((tip, _))) =
-                (self.params.bootstrap.activation_height(), read_state.best_tip())
-            {
-                if tip.0 >= activation_height {
-                    tracing::info!(
-                        "crosslink restore: tip {} is at or above the BFT activation height {} and no \
-                         BFT chain is stored; BFT genesis will be derived from the chain on the first tick",
-                        tip.0, activation_height,
-                    );
-                }
-            }
-        }
-
+        // One copy of the chain at a time. The stored chain is walked one decision at a time,
+        // a block already in memory at its height (loaded by a held start-up, or fetched and
+        // decided since) is kept rather than loaded again, and tenderlink's rounds are built only
+        // when it starts now. Loading the chain again beside the copy in memory, and building
+        // rounds a held start-up then dropped, ran restarted nodes out of memory.
+        let spawning = self.launch.is_some() && !self.catching_up;
         let mut ingest: Vec<RoundData> = Vec::new();
+        // Blocks from the first height whose block is not the one in memory; below it, memory's.
         let mut blocks: Vec<BftBlock> = Vec::new();
+        let mut kept_from: Option<u64> = None;
+        let mut replayed: u64 = 0;
         let mut fat_pointer_to_tip = FatPointerToBftBlock::null();
         // The roster that voted on the block about to be replayed. BFT genesis is decided by
         // the nil validator set (see `build_bootstrap_genesis`), so replay starts empty; each
@@ -2384,7 +2371,8 @@ impl BftRunner {
         // Dropping BFT is permanent for a database (FINALITY.md §4.3).
         let recorded_drop = block_writer.finalized_state.db.crosslink_bft_dropped();
 
-        for decision in stored {
+        // Stops at the first gap, as `ZebraDb::bft_chain` does. Heights fit u32: they are stored so.
+        while let Some(decision) = u32::try_from(replayed).ok().and_then(|height| block_writer.finalized_state.db.bft_decision(height)) {
             let StoredDecision { block, fat_pointer, proposal_sigs } = decision;
             if block.previous_block_fat_ptr.points_at_block_hash() != fat_pointer_to_tip.points_at_block_hash() {
                 break;
@@ -2392,7 +2380,7 @@ impl BftRunner {
 
             // Historical round replay: filter the roster exactly as the live path did at this
             // height, so it matches the roster that actually voted on this decided block.
-            let this_bft_height = ingest.len() as u64;
+            let this_bft_height = replayed;
             let (roster, voting) =
                 roster_for_bft_height(&self.network, slashforks, &unsorted_roster, this_bft_height, prev_finalized_bc_height);
 
@@ -2444,10 +2432,41 @@ impl BftRunner {
                 }
             }
 
-            ingest.push(decided_round_data(&block, &fat_pointer, roster, &voting, proposal_sigs, this_bft_height, self.params.active_roster_max_n));
+            if spawning {
+                ingest.push(decided_round_data(&block, &fat_pointer, roster, &voting, proposal_sigs, this_bft_height, self.params.active_roster_max_n));
+            }
             push_voting_roster(&mut voting_rosters, voting);
-            blocks.push(block);
+            // A decision's fat pointer names its block, so whether memory holds the same block at
+            // this height is one lookup, without hashing the block.
+            let in_memory = kept_from.is_none()
+                && BFT_CHAIN.read().unwrap().hash_to_height.get(&fat_pointer.points_at_block_hash()) == Some(&this_bft_height);
+            if !in_memory {
+                kept_from.get_or_insert(this_bft_height);
+                blocks.push(block);
+            }
             fat_pointer_to_tip = fat_pointer;
+            replayed += 1;
+        }
+
+        // A tip past the activation height does not mean genesis was stored. Genesis is decided
+        // at the start of a tick and the same tick's commit loop can carry the tip past
+        // activation, so a node stopped before the next tick has neither; so does one whose
+        // genesis row failed to write, or lacks row 0, which hides every later row. Genesis is a
+        // pure function of the headers above h1 (`build_bootstrap_genesis`), so the first tick's
+        // `bootstrap` derives the same block this node would have stored, and rows above it are
+        // rewritten as catch-up decides them again.
+        if replayed == 0 {
+            if let (Some(activation_height), Some((tip, _))) =
+                (self.params.bootstrap.activation_height(), read_state.best_tip())
+            {
+                if tip.0 >= activation_height {
+                    tracing::info!(
+                        "crosslink restore: tip {} is at or above the BFT activation height {} and no \
+                         BFT chain is stored; BFT genesis will be derived from the chain on the first tick",
+                        tip.0, activation_height,
+                    );
+                }
+            }
         }
 
         if let Some((dropped_height, dropped_hash)) = recorded_drop {
@@ -2464,18 +2483,26 @@ impl BftRunner {
         // Startup roster is for the next height to decide (the loaded chain length), with the
         // terminated finalizers excluded inclusively at that height. A watermark of 0 means
         // nothing is finalized yet, the value replay starts from.
-        let startup_bft_height = blocks.len() as u64;
+        let startup_bft_height = replayed;
         let finalized_watermark = last_final.map_or(0, |(height, _)| u64::from(height.0));
         let (roster, startup_voting) = roster_for_bft_height(
             &self.network, slashforks, &unsorted_roster, startup_bft_height, last_final.map(|(height, _)| height),
         );
 
-        let loaded_any = !blocks.is_empty();
+        let loaded_any = replayed > 0;
+        let reused = kept_from.unwrap_or(replayed);
         {
             let mut chain = BFT_CHAIN.write().unwrap();
             chain.roster = unsorted_roster;
-            chain.hash_to_height = blocks.iter().enumerate().map(|(i, b)| (b.blake3_hash(), i as u64)).collect();
-            chain.blocks = blocks;
+            // Memory's blocks below `reused` are the stored ones; the stored chain replaces the
+            // rest, including any memory held past what was replayed.
+            let keep = reused as usize;
+            chain.blocks.truncate(keep);
+            chain.hash_to_height.retain(|_, height| *height < reused);
+            for (i, block) in blocks.into_iter().enumerate() {
+                chain.hash_to_height.insert(block.blake3_hash(), (keep + i) as u64);
+                chain.blocks.push(block);
+            }
             chain.voting_rosters = voting_rosters;
             chain.fat_pointer_to_tip = fat_pointer_to_tip;
             if last_final.is_some() {
@@ -2485,8 +2512,8 @@ impl BftRunner {
 
         if loaded_any {
             tracing::info!(
-                "crosslink restore: resuming BFT at height {}, finalizing bc height {}",
-                startup_bft_height, finalized_watermark,
+                "crosslink restore: resuming BFT at height {}, finalizing bc height {} ({} of them already in memory)",
+                startup_bft_height, finalized_watermark, reused,
             );
             self.spawn_tenderlink(roster, ingest, startup_voting.vote_namespace, startup_voting.strict_quorum);
         }

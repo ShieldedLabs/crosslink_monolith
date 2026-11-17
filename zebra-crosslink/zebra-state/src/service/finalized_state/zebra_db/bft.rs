@@ -90,6 +90,17 @@ impl ZebraDb {
         chain
     }
 
+    /// The decided height `height`, or `None` if its block or fat pointer is missing. Read alone,
+    /// so a caller walking the chain holds one decision at a time rather than all of them (see
+    /// [`Self::bft_chain`], which reads every row at once).
+    pub fn bft_decision(&self, height: u32) -> Option<StoredDecision> {
+        let height = BftHeight(height);
+        let block = self.bft_block_by_height_cf().zs_get(&height)?;
+        let fat_pointer = self.bft_fat_pointer_by_height_cf().zs_get(&height)?;
+        let proposal_sigs = self.bft_proposal_sigs_by_height_cf().zs_get(&height).map(|s| s.0).unwrap_or_default();
+        Some(StoredDecision { block: block.0, fat_pointer: fat_pointer.0, proposal_sigs })
+    }
+
     /// Up to `count` decided heights from `from` on, ascending, stopping at the first gap like
     /// [`Self::bft_chain`]: what a peer catching up asks for. Read one height at a time, and no
     /// further once the decisions read reach `byte_budget` (the last one may cross it), so a
