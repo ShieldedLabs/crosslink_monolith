@@ -41,7 +41,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tonic::IntoRequest;
 use zcash_client_backend::data_api::chain::{BlockCache, CommitmentTreeRoot};
 use zcash_client_backend::data_api::wallet::{ConfirmationsPolicy, TargetHeight, create_proposed_transactions, propose_shielding, shield_transparent_funds};
-use zcash_client_backend::proto::service::{GetSubtreeRootsArg, RawTransaction, FaucetRequest, TreeState, TxFilter};
+use zcash_client_backend::proto::service::{GetSubtreeRootsArg, RawTransaction, FaucetRequest, SendResponse, TreeState, TxFilter};
 use zcash_client_backend::wallet::WalletTransparentOutput;
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::util::SystemClock;
@@ -1524,6 +1524,33 @@ fn to_zats_or_dump_err(src: &str, z: u64) -> Option<Zatoshis> {
             None
         }
     }
+}
+
+/// How long the sync loop waits for the node's answer to one resent transaction (see RESEND
+/// REORGED-OUT TXS). The node answers after verifying it, which for a valid tx takes well under a
+/// second; a tx whose inputs no longer exist is held for the mempool's 17 s verify timeout.
+const RESEND_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Sends every `(wallet name, txid, tx bytes)` in `resends` through `send`, all at once and in
+/// the order given, and waits at most `wait` for each answer. Answers come back in the order they
+/// arrive; None for a send still unanswered after `wait` (dropping it doesn't stop the node from
+/// verifying the tx).
+async fn resend_txs<F, Fut>(resends: Vec<(&'static str, TxId, Vec<u8>)>, wait: Duration, send: F)
+    -> Vec<(&'static str, TxId, Option<Result<SendResponse, tonic::Status>>)>
+where
+    F: Fn(Vec<u8>) -> Fut,
+    Fut: Future<Output = Result<SendResponse, tonic::Status>> + Send + 'static,
+{
+    let mut sends = tokio::task::JoinSet::new();
+    for (name, txid, data) in resends {
+        let send = send(data);
+        sends.spawn(async move { (name, txid, tokio::time::timeout(wait, send).await.ok()) });
+    }
+    let mut answers = Vec::new();
+    while let Some(joined) = sends.join_next().await {
+        if let Ok(answer) = joined { answers.push(answer); }
+    }
+    answers
 }
 
 const EMPTY_MEMO_BYTES: [u8; 512] = {
@@ -4853,8 +4880,16 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // so a tx of ours mined only there would never be mined again. Send every tx the reorg
         // pass soft-failed, from a block or the mempool, again once per scanned block until it
         // is back on the best chain or expires. A tx the node still holds is merely refused.
+        //
+        // The sends run concurrently and none is waited on for longer than RESEND_WAIT: the
+        // node answers only once it has verified the tx, and a miner shielding tx whose coinbase
+        // input was orphaned waits out the mempool's 17 s verify timeout. Awaited one by one,
+        // a handful of those stalled this loop (block scan and the user's own resends) for a
+        // minute per scanned block. A tx still being verified when the wait ends is not lost:
+        // the node keeps it, and the next scanned block resends it if it is still off chain.
+        // The user wallet's txs go first.
         let mut resends = Vec::new();
-        for wallet in [&mut miner_wallet, &mut user_wallet] {
+        for wallet in [&mut user_wallet, &mut miner_wallet] {
             wallet.sent_txs.retain(|_, sent| sent.expiry_h.map_or(true, |expiry_h| expiry_h >= wallets_sync_h));
             for tx in &wallet.txs {
                 let TxStatus::SoftFail(stage) = tx.status else { continue; };
@@ -4865,11 +4900,16 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 resends.push((wallet.name, tx.txid, sent.data.clone()));
             }
         }
-        for (name, txid, data) in resends {
-            match client.send_transaction(RawTransaction { data, height: 0 }).await {
-                Ok(resp) if resp.get_ref().error_code == 0 => println!("{name} wallet: resent tx {txid}, which a reorg dropped"),
-                Ok(resp) => println!("{name} wallet: the node refused tx {txid}, which a reorg dropped: {}", resp.get_ref().error_message),
-                Err(status) => println!("{name} wallet: failed to resend tx {txid}, which a reorg dropped: {status}"),
+        let answers = resend_txs(resends, RESEND_WAIT, |data| {
+            let mut client = client.clone();
+            async move { client.send_transaction(RawTransaction { data, height: 0 }).await.map(tonic::Response::into_inner) }
+        }).await;
+        for (name, txid, answer) in answers {
+            match answer {
+                Some(Ok(resp)) if resp.error_code == 0 => println!("{name} wallet: resent tx {txid}, which a reorg dropped"),
+                Some(Ok(resp)) => println!("{name} wallet: the node refused tx {txid}, which a reorg dropped: {}", resp.error_message),
+                Some(Err(status)) => println!("{name} wallet: failed to resend tx {txid}, which a reorg dropped: {status}"),
+                None => println!("{name} wallet: resent tx {txid}, which a reorg dropped; the node is still verifying it"),
             }
         }
 
@@ -5998,5 +6038,33 @@ mod tests {
             }
         }
         assert!(paid > 1_000 && hit_cap > 1_000, "paid {paid}, hit the cap {hit_cap}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resends_go_out_at_once_and_none_holds_the_loop_past_the_wait() {
+        let txid = |b: u8| TxId::from_bytes([b; 32]);
+        // The user's tx is valid and answered at once. The miner's two spend coinbase outputs of
+        // an orphaned block, so the node holds each for its mempool's 17 s verify bound.
+        let resends = vec![("user", txid(1), vec![1]), ("miner", txid(2), vec![2]), ("miner", txid(3), vec![3])];
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let start = tokio::time::Instant::now();
+        let answers = resend_txs(resends, Duration::from_secs(2), |data| {
+            let sent = sent.clone();
+            async move {
+                sent.lock().unwrap().push((data[0], start.elapsed()));
+                if data[0] != 1 {
+                    tokio::time::sleep(Duration::from_secs(17)).await;
+                }
+                Ok(SendResponse { error_code: 0, error_message: String::new() })
+            }
+        }).await;
+
+        assert!(start.elapsed() <= Duration::from_secs(2), "the sync loop waited {:?}, longer than the wait", start.elapsed());
+        assert_eq!(*sent.lock().unwrap(), vec![(1, Duration::ZERO), (2, Duration::ZERO), (3, Duration::ZERO)],
+                   "every resend goes out at once, the user's first");
+        assert_eq!(answers.len(), 3);
+        assert!(matches!(&answers[0], ("user", t, Some(Ok(resp))) if *t == txid(1) && resp.error_code == 0));
+        assert!(answers[1..].iter().all(|(name, _, answer)| *name == "miner" && answer.is_none()),
+                "the miner's txs are still being verified");
     }
 }
