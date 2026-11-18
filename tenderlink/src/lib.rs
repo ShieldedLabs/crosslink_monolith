@@ -121,6 +121,9 @@ use zcash_primitives::bft::{ HashKey, HashKeys, FatPointerToBftBlock, TMSig, Pub
 const TICK_DURATION:         std::time::Duration = std::time::Duration::from_millis(250);
 const PEER_GOSSIP_DURATION:  std::time::Duration = std::time::Duration::from_millis(1500);
 const PEER_CONNECT_DURATION: std::time::Duration = std::time::Duration::from_millis(5000);
+/// ID_HELLO is re-sent on a live session one to two of these after the last, renewing the
+/// attestations long before their 24 h expiry.
+const ID_HELLO_REFRESH_SECS: u64 = 3 * 60 * 60;
 
 // NOTE: Sam and Phillip discussed forward jumps; Noise trial decryption already protects connectsions against replay attacks.
 const NONCE_FORWARD_JUMP_TOLERANCE: u64 = 512;
@@ -1571,6 +1574,7 @@ pub struct Peer {
     pub bft_pk: PubKeyID,             // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
     pub stp_address: STPAddress,      // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
     pub stp_handshake_hash: [u8; 64], // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
+    pub next_id_hello: Option<std::time::Instant>, // when to re-send ID_HELLO on this session
 
     // Gossip state; see `gossip_to_peer`.
     have_seq: u64,
@@ -1614,6 +1618,7 @@ impl Default for Peer {
         bft_pk:                       Default::default(),
         stp_address:                  Default::default(),
         stp_handshake_hash:           [0u8; 64],
+        next_id_hello:                None,
         have_seq:                     0,
         have_height_round:            None,
         view_height:                  0,
@@ -1890,9 +1895,23 @@ impl BftAddressMap {
         self.by_key.entry(*key).or_default().insert(addr.clone(), attestation);
         self.by_addr.insert(addr.clone(), *key);
     }
+    /// Reads `by_addr`. Note that there is a risk that the `addr` entry to will not exist
+    /// if it has been pruned. For a connected peer, use `key_of` instead.
     pub fn get_key(&self, addr: &STPAddress) -> Option<&PubKeyID> { self.by_addr.get(addr) }
+
+    /// The key `peer` proved in ID_HELLO. Until it has, the key mapped to `addr`, or NIL.
+    pub fn key_of(&self, peer: &Peer, addr: &STPAddress) -> PubKeyID {
+        if peer.bft_pk != PubKeyID::NIL {
+            peer.bft_pk
+        } else {
+            self.get_key(addr).copied().unwrap_or(PubKeyID::NIL)
+        }
+    }
+
     pub fn get_addrs(&self, key: &PubKeyID) -> impl Iterator<Item = (&STPAddress, &Option<PeerAttestation>)> { self.by_key.get(key).map(|v| v.iter()).unwrap_or_default() }
+
     pub fn contains_key(&self, key: &PubKeyID) -> bool { self.by_key.contains_key(key) }
+
     pub fn all_addrs(&self) -> impl Iterator<Item = (&STPAddress, &PubKeyID)> { self.by_addr.iter() }
 }
 
@@ -3026,8 +3045,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let mut synthetic_bft_peers: Vec<SyntheticBftPeerLink> = Vec::new();
     let mut bft_address_map = BftAddressMap::new();
 
-    let mut my_address_attestations = Vec::new();
-
     for FinalizerPeerAddress { bft_pk, address } in &finalizer_peer_addresses {
         bft_address_map.insert(bft_pk, address, None);
 
@@ -3087,9 +3104,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 let mut bft_key = PubKeyID::NIL;
                 for (c, _) in &current_connections {
                     if c.connection_key() == *ck {
-                        if let Some(k) = bft_address_map.get_key(c) {
-                            bft_key = *k;
-                        }
+                        bft_key = bft_address_map.key_of(p, c);
                         break;
                     }
                 }
@@ -3230,9 +3245,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     let mut bft_key = PubKeyID::NIL;
                     for (c, _) in &current_connections {
                         if c.connection_key() == *ck {
-                            if let Some(k) = bft_address_map.get_key(&c) {
-                                bft_key = *k;
-                            }
+                            bft_key = bft_address_map.key_of(p, c);
                             break;
                         }
                     }
@@ -3245,9 +3258,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     let mut peer_bft_key = PubKeyID::NIL;
                     for (c, _) in &current_connections {
                         if c.connection_key() == *connection_key {
-                            if let Some(k) = bft_address_map.get_key(&c) {
-                                peer_bft_key = *k;
-                            }
+                            peer_bft_key = bft_address_map.key_of(peer, c);
                             break;
                         }
                     }
@@ -3467,12 +3478,16 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         // Ensure a Peer entry exists for every active connection's session
         for &(ref stp_address, handshake_hash) in &current_connections {
             let key = stp_address.connection_key();
-            let Some((peer, replaced)) = peer_for_new_session(&mut peers, stp_address, handshake_hash) else {
-                continue;
-            };
-            if replaced {
-                println!("{:05}: Peer {:?} has a new STP session; verifying it again.", my_port, key);
+            let new_session = peer_for_new_session(&mut peers, stp_address, handshake_hash).map(|(_, replaced)| replaced);
+            let peer = peers.get_mut(&key).expect("peer_for_new_session leaves a Peer for the session");
+            let now = std::time::Instant::now();
+            match new_session {
+                Some(true)  => println!("{:05}: Peer {:?} has a new STP session; verifying it again.", my_port, key),
+                Some(false) => {}
+                // A live session: its attestations are only renewed by another ID_HELLO.
+                None => if !peer.next_id_hello.is_some_and(|due| now >= due) { continue; },
             }
+            peer.next_id_hello = Some(now + std::time::Duration::from_secs(ID_HELLO_REFRESH_SECS + rand::rng().next_u64() % ID_HELLO_REFRESH_SECS));
 
             let verification = { // almost @Duplicate
                 let pk_bytes = my_root_public_bft_key.as_ref();
@@ -3626,7 +3641,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     } };
                 }
 
-                bft_address_map.insert(&their_verification.pk, &peer.stp_address, None);
+                // Not on a refresh: `None` never expires.
+                if peer.bft_pk != their_verification.pk {
+                    bft_address_map.insert(&their_verification.pk, &peer.stp_address, None);
+                }
                 peer.bft_pk = their_verification.pk;
 
                 let my_verification = { // almost @Duplicate
@@ -3709,7 +3727,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     } };
                 }
 
-                bft_address_map.insert(&their_verification.pk, &peer.stp_address, None);
+                // Not on a refresh: `None` never expires.
+                if peer.bft_pk != their_verification.pk {
+                    bft_address_map.insert(&their_verification.pk, &peer.stp_address, None);
+                }
                 peer.bft_pk = their_verification.pk;
 
                 let Some(attestation) = PacketIdAttestation::read_from(msg) else {
@@ -3798,7 +3819,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     attester_sig:       attestation.sig,
                     attestee_sig:       sig,
                 };
-                my_address_attestations.push(peer_attestation.clone());
                 bft_address_map.insert(&peer_attestation.attestee_bft_pk, &peer_attestation.stp_address, Some(peer_attestation.clone()));
 
                 // @Todo: Decide if @Temporary?
@@ -3857,8 +3877,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             else {
             }
 
-            if let Some(pk) = bft_address_map.get_key(&peer.stp_address) {
-                bft_address_map.last_packet_utcs.insert(*pk, chrono::Utc::now().timestamp());
+            let pk = bft_address_map.key_of(peer, &peer.stp_address);
+            if pk != PubKeyID::NIL {
+                bft_address_map.last_packet_utcs.insert(pk, chrono::Utc::now().timestamp());
             }
         }
 
