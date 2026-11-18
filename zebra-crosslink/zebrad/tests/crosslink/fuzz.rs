@@ -2686,6 +2686,7 @@ fn crosslink_fuzz() {
     // One input, `name`, which the child reads from `input_env` and writes to `input`: its run,
     // then its doorway pass if it passed; a finding is minimized here, on this worker, while the
     // others go on. Answers whether the first run passed.
+    // Whether the input passed every pass: as written, race and doorways.
     let run_input = |name: &str, input_env: (&'static str, String), input: PathBuf, salt: u64, extra_env: &[(&'static str, String)]| -> bool {
         let log = dir.join(format!("{name}.log"));
         let timings = dir.join(format!("{name}.timings.jsonl"));
@@ -2765,7 +2766,7 @@ fn crosslink_fuzz() {
             eprintln!("fuzz {finding}: minimized {} -> {} bytes", bytes.len(), min.len());
         }
         findings.lock().unwrap().push((finding, verdict));
-        passed
+        false
     };
 
     let run_seed = |seed: u64| {
@@ -2778,16 +2779,28 @@ fn crosslink_fuzz() {
     // learn its edges on this binary.
     struct Corpus {
         entries: Vec<(Vec<u8>, usize)>,
+        // The edges each entry hit in this campaign, by the entries' order.
+        entry_edges: Vec<Vec<u32>>,
         edges: std::collections::HashSet<u32>,
         pending: Vec<Vec<u8>>,
+        // Inputs with a finding, kept until they pass: a failing run aborts before it writes its
+        // edges, so its coverage cannot keep it.
+        failing: Vec<Vec<u8>>,
     }
+    // A corpus file is named for its contents, so the same choices are kept once.
+    let corpus_file = |choices: &[u8]| {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        choices.hash(&mut hasher);
+        format!("{:016x}.choices", hasher.finish())
+    };
     let corpus_dir = std::env::var("CROSSLINK_FUZZ_CORPUS").map(PathBuf::from).unwrap_or_else(|_| dir.join("corpus"));
     let used_of = |choices: &[u8]| {
         let mut c = Choices { bytes: choices.to_vec(), o: 0 };
         let _ = generate(&mut c);
         c.o.min(choices.len())
     };
-    let corpus = std::sync::Mutex::new(Corpus { entries: Vec::new(), edges: Default::default(), pending: Vec::new() });
+    let corpus = std::sync::Mutex::new(Corpus { entries: Vec::new(), entry_edges: Vec::new(), edges: Default::default(), pending: Vec::new(), failing: Vec::new() });
     if guided {
         let _ = std::fs::create_dir_all(&corpus_dir);
         let mut files: Vec<PathBuf> = std::fs::read_dir(&corpus_dir)
@@ -2818,7 +2831,7 @@ fn crosslink_fuzz() {
         let coverage_path = dir.join(format!("{name}.cov"));
         std::fs::write(&choices_path, &choices).expect("the choices write");
         let _ = std::fs::remove_file(&coverage_path);
-        run_input(
+        let clean = run_input(
             &name,
             ("CROSSLINK_FUZZ_CHOICES", choices_path.display().to_string()),
             dir.join(format!("{name}.zeccltf")),
@@ -2830,20 +2843,24 @@ fn crosslink_fuzz() {
         let _ = std::fs::remove_file(&choices_path);
         let used = used_of(&choices);
         let mut corpus = corpus.lock().unwrap();
+        if !clean {
+            let _ = std::fs::write(corpus_dir.join(corpus_file(&choices)), &choices);
+            corpus.failing.push(choices);
+            return;
+        }
         let before = corpus.edges.len();
         corpus.edges.extend(edges.iter().copied());
         let new = corpus.edges.len() - before;
         if new > 0 || known {
             if !known {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                choices.hash(&mut hasher);
-                let _ = std::fs::write(corpus_dir.join(format!("{:016x}.choices", hasher.finish())), &choices);
+                let _ = std::fs::write(corpus_dir.join(corpus_file(&choices)), &choices);
             }
             corpus.entries.push((choices, used));
+            let hit = edges.len();
+            corpus.entry_edges.push(edges);
             eprintln!(
                 "fuzz {name}: {} edges, {new} new; corpus {} entries, {} edges",
-                edges.len(),
+                hit,
                 corpus.entries.len(),
                 corpus.edges.len()
             );
@@ -2874,6 +2891,9 @@ fn crosslink_fuzz() {
     eprintln!("fuzz: {} instruction(s) sent through other doorways", swapped_total.into_inner());
     if guided {
         eprintln!("fuzz: corpus {} entries, {} edges, in {}", corpus.entries.len(), corpus.edges.len(), corpus_dir.display());
+        if std::env::var("CROSSLINK_FUZZ_DISTILL").map_or(true, |v| v != "0") {
+            distill_corpus(&corpus_dir, &corpus.entries, &corpus.entry_edges, &corpus.pending, &corpus.failing, corpus_file);
+        }
     }
     eprintln!(
         "fuzz: {} inputs on {jobs} worker(s), {} findings, in {:?}; files in {}",
@@ -2883,6 +2903,54 @@ fn crosslink_fuzz() {
         dir.display()
     );
     assert!(findings.is_empty(), "fuzz findings: {findings:?}");
+}
+
+/// Rewrites the corpus directory to the entries a guided campaign needs: the fewest of this
+/// campaign's entries that together hit every edge any of them hit, picked greedily from the one
+/// that hit most, plus every input with a finding and every entry the campaign ran out of time
+/// before reaching. The rest are deleted. Without it a campaign that runs its corpus first would
+/// spend more of its time on that each run, and edges that vary between runs of one input would
+/// keep adding entries.
+fn distill_corpus(
+    corpus_dir: &std::path::Path,
+    entries: &[(Vec<u8>, usize)],
+    entry_edges: &[Vec<u32>],
+    pending: &[Vec<u8>],
+    failing: &[Vec<u8>],
+    corpus_file: impl Fn(&[u8]) -> String,
+) {
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(entry_edges[i].len()));
+    let mut covered = std::collections::HashSet::new();
+    let mut keep: Vec<&[u8]> = Vec::new();
+    for i in order {
+        if entry_edges[i].iter().any(|edge| !covered.contains(edge)) {
+            covered.extend(entry_edges[i].iter().copied());
+            keep.push(&entries[i].0);
+        }
+    }
+    let covering = keep.len();
+    keep.extend(pending.iter().map(Vec::as_slice));
+    keep.extend(failing.iter().map(Vec::as_slice));
+    // Written again under the current name, so a renaming (a different hasher) loses nothing.
+    let names: std::collections::HashSet<String> = keep.iter().map(|choices| corpus_file(choices)).collect();
+    for choices in &keep {
+        let _ = std::fs::write(corpus_dir.join(corpus_file(choices)), choices);
+    }
+    let mut removed = 0;
+    for path in std::fs::read_dir(corpus_dir).into_iter().flatten().filter_map(|e| e.ok()).map(|e| e.path()) {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        if name.ends_with(".choices") && !names.contains(&name) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    eprintln!(
+        "fuzz: corpus distilled to {} entries ({covering} covering {} edges, {} not reached, {} with findings); {removed} removed",
+        names.len(),
+        covered.len(),
+        pending.len(),
+        failing.len()
+    );
 }
 
 /// Minimizes the file CROSSLINK_FUZZ_FILE, keeping every deletion after which the run still fails
