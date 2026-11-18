@@ -812,12 +812,18 @@ impl Storage {
             }
             RejectionError::SameEffectsChain(e) => {
                 let eviction_memory_time = self.eviction_memory_time;
-                self.chain_rejected_same_effects
+                let rejected = self
+                    .chain_rejected_same_effects
                     .entry(e)
                     .or_insert_with(|| {
                         EvictionList::new(MAX_EVICTION_MEMORY_ENTRIES, eviction_memory_time)
-                    })
-                    .insert(tx_id.mined_id());
+                    });
+                // Crosslink can mine one transaction id twice: before FeaturenetUpgrade2 a
+                // replayed staking transaction is valid in a later block. Its rejection is already
+                // remembered, and the list refuses a second entry for an id.
+                if !rejected.contains_key(&tx_id.mined_id()) {
+                    rejected.insert(tx_id.mined_id());
+                }
             }
             RejectionError::NonStandardTransaction(e) => {
                 // Non-standard transactions are rejected based on their exact
