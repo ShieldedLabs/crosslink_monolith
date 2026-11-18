@@ -188,14 +188,16 @@ impl CopyStateCmd {
             .map(|max_source_height| min(source_tip_height, max_source_height))
             .unwrap_or(source_tip_height);
 
-        if min_target_height >= max_copy_height {
+        // `min_target_height` is the next height the target needs, and the copy below includes
+        // `max_copy_height`, so equal heights still leave one block to copy.
+        if min_target_height > max_copy_height {
             info!(
                 ?min_target_height,
                 ?max_copy_height,
                 max_source_height = ?self.max_source_height,
                 ?source_tip,
                 ?initial_target_tip,
-                "target is already at or after max copy height"
+                "target already has every block up to max copy height"
             );
 
             return Ok(());
