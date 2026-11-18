@@ -2629,6 +2629,29 @@ async fn drive_clock() {
     }
 }
 
+/// Lets the mempool see the chain each instruction leaves, at the same point every run. The mempool
+/// reads the tip only when it is called, and a tip more than one block on from the last it read is a
+/// reset (`ChainTipChange::last_tip_change`): it clears its rejections and verifies all it holds
+/// again, where one block at a time expires and mines transactions. Left to its own callers, which
+/// run on timers, how many blocks it sees at once, and so which path it takes, depends on timing.
+/// So a tip the instruction moved is shown to it as the instruction ends. This does not settle the
+/// sync loop first: a commit that trails the instruction's verdict is shown with the next one, and
+/// settling here cost two-thirds more time per input with no difference measured.
+async fn mempool_follow_tip(internal_handle: &TFLServiceHandle, last: &mut Option<zebra_chain::block::Hash>) {
+    let tip = match tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.state)(StateRequest::Tip)).await {
+        Ok(Ok(StateResponse::Tip(Some((_, hash))))) => hash,
+        _ => return,
+    };
+    if *last != Some(tip) {
+        *last = Some(tip);
+        let _ = tokio::time::timeout(
+            NODE_ANSWER_WAIT,
+            (internal_handle.call.mempool)(zebra_node_services::mempool::Request::TransactionIds),
+        )
+        .await;
+    }
+}
+
 /// Returns once a sync loop tick that began after the call has finished, waking the loop so it does
 /// not wait out its idle time. Bounded for a loop that has stopped, which the check after reports.
 async fn sync_settle() {
@@ -3091,6 +3114,7 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
     // delivery at a time, so one asked for again ends the run first.
     let mut racing: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>> = Vec::new();
     let mut racing_peers: Vec<u64> = Vec::new();
+    let mut mempool_tip = None;
     let handle = &internal_handle;
     for instr_i in 0..instrs.len() {
         // info!(
@@ -3126,6 +3150,7 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
                     futures::future::join_all(racing.drain(..)).await;
                     *TEST_INSTR_RUNNING_SINCE.lock().unwrap() = None;
                     racing_peers.clear();
+                    mempool_follow_tip(handle, &mut mempool_tip).await;
                 }
                 if is_delivery {
                     racing_peers.extend(peer);
@@ -3150,6 +3175,20 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
                     .map(|height| height.0),
                 _ => None,
             };
+            let moves_tip = matches!(
+                instr,
+                TestInstr::LoadPoW(_)
+                    | TestInstr::LoadPoS { .. }
+                    | TestInstr::RecvPoW { .. }
+                    | TestInstr::RecvStpPacket { .. }
+                    | TestInstr::MineFromTemplate { .. }
+                    | TestInstr::SetTime(_)
+                    | TestInstr::CallRpc { .. }
+                    | TestInstr::BftRecvPacket { .. }
+                    | TestInstr::BftRecvVote { .. }
+                    | TestInstr::BftRecvProposal { .. }
+                    | TestInstr::AdvanceTime { .. }
+            );
             let failed_before = TEST_FAILED_INSTR_IDXS.lock().unwrap().len();
             *TEST_LAST_CHECK.lock().unwrap() = None;
             let start = std::time::Instant::now();
@@ -3166,6 +3205,9 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
             .await;
 
             *TEST_INSTR_RUNNING_SINCE.lock().unwrap() = None;
+            if moves_tip {
+                mempool_follow_tip(&internal_handle, &mut mempool_tip).await;
+            }
             let outcome = TEST_LAST_CHECK.lock().unwrap().take();
             *TEST_PREV_OUTCOME.lock().unwrap() = outcome.clone();
             let failed = TEST_FAILED_INSTR_IDXS.lock().unwrap().len() > failed_before;
