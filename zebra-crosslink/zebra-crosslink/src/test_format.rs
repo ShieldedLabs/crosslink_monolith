@@ -2045,7 +2045,7 @@ pub(crate) async fn handle_instr(
             Ok(mut stp) => {
                 let label = format!("SUBMIT_TX {} via STP peer {peer}", tx.hash());
                 let wire_tx = tx.zcash_serialize_to_vec().expect("a parsed transaction serializes");
-                let (served, message) = serve_tx(&mut stp, &wire_tx).await;
+                let (served, message) = serve_tx(internal_handle, &mut stp, &wire_tx).await;
                 let (accepted, message) = if served {
                     await_stp_tx_outcome(&mut stp, &tx, &label).await
                 } else {
@@ -2829,10 +2829,15 @@ async fn serve_block(
             // never be adopted, and the node does not fetch it, unless it is on the decided chain.
             // A block the node wants it asks for within a pass or two of the STATUS, so one it has
             // let several passes go by without asking for, and that is that deep, it is not going
-            // to: waiting longer would only run out the bound.
-            _ = not_fetched_check.tick(), if requests == 0
-                && status_sent.elapsed() >= NOT_FETCHED_GRACE
-                && zebra_state::new_network::SYNC_TICKS_DONE.load(std::sync::atomic::Ordering::Acquire) >= status_ticks + NOT_FETCHED_PASSES => {
+            // to: waiting longer would only run out the bound. The grace and the passes are checked
+            // in the branch, on each tick: a select! guard is read once, when the select! starts, so
+            // one false then would keep the branch off until some other packet came.
+            _ = not_fetched_check.tick(), if requests == 0 => {
+                if status_sent.elapsed() < NOT_FETCHED_GRACE
+                    || zebra_state::new_network::SYNC_TICKS_DONE.load(std::sync::atomic::Ordering::Acquire) < status_ticks + NOT_FETCHED_PASSES
+                {
+                    continue;
+                }
                 let finalized = (internal_handle.call.read_state)(zebra_state::ReadRequest::FinalizedTip).await;
                 let finalized_height = match finalized {
                     Ok(zebra_state::ReadResponse::Tip(Some((finalized_height, _)))) => finalized_height.0,
@@ -2867,12 +2872,22 @@ async fn serve_block(
     }
 }
 
+/// How often the peer `serve_tx` plays lists its transaction again, on the node's clock: as a real
+/// peer's status heartbeat does (`tx_relay_state::STATUS_HEARTBEAT`).
+const TX_RELIST_EVERY: Duration = Duration::from_secs(30);
+
 /// Plays a peer that has `wire_tx` in its mempool: lists it, then answers the node's TX_REQ for
 /// it with a TX. `true` once it was asked for and sent; a kill or no ask is `false`.
-async fn serve_tx(stp: &mut HarnessStpPeer, wire_tx: &[u8]) -> (bool, String) {
+///
+/// Like a real peer, it first tells the node its tip, which is the node's own, and lists the
+/// transaction again each heartbeat. The node hears listings only while it relays, which it does
+/// not while the peers that told it their tips put it more than a few blocks behind; so a peer that
+/// said nothing of its tip left the node behind whenever another peer claimed a higher one. The
+/// node judges relay once a tick, so the listing goes once the tick after the STATUS is done.
+async fn serve_tx(internal_handle: &TFLServiceHandle, stp: &mut HarnessStpPeer, wire_tx: &[u8]) -> (bool, String) {
     use zebra_chain::transaction::UnminedTxId;
     use zebra_state::new_network::tx_relay::{parse_tx_req, tx_packets, tx_status_packet};
-    use zebra_state::new_network::SyntheticPeerEvent;
+    use zebra_state::new_network::{status_packet, NearTipChains, ShadowBlock, SyntheticPeerEvent};
     let index = stp.index;
     let Ok(tx) = Transaction::zcash_deserialize(wire_tx) else {
         return (false, "the transaction does not parse; send its packets with RECV_STP_PACKET".to_string());
@@ -2882,12 +2897,35 @@ async fn serve_tx(stp: &mut HarnessStpPeer, wire_tx: &[u8]) -> (bool, String) {
     if let Some(reason) = &stp.killed {
         return (false, format!("peer {index} was already killed: {reason}"));
     }
+    if let Ok(Ok(StateResponse::Tip(Some((height, hash))))) =
+        tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.state)(StateRequest::Tip)).await
+    {
+        if let Ok(Ok(StateResponse::Block(Some(block)))) =
+            tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.state)(StateRequest::Block(hash.into()))).await
+        {
+            let mut chains = NearTipChains::default();
+            chains.push_chain_unchecked(vec![ShadowBlock { this_hash: hash, parent_hash: block.header.previous_block_hash, this_height: height.0 }]);
+            stp.link.send(status_packet(&[], &chains, None));
+            sync_settle().await;
+        }
+    }
     // Wire sizes fit u32: a transaction is at most MAX_BLOCK_BYTES.
-    stp.link.send(tx_status_packet(1, [(&id, wire_tx.len() as u32)]));
+    let listing = tx_status_packet(1, [(&id, wire_tx.len() as u32)]);
+    stp.link.send(listing.clone());
+    let mut listed_at = zebra_debug_time::instant_now();
 
     let deadline = tokio::time::Instant::now() + NODE_ANSWER_WAIT;
+    // Polls the node's clock for the heartbeat; kept across the loop, as a fresh sleep would be
+    // reset by the node's other packets.
+    let mut heartbeat = tokio::time::interval(Duration::from_millis(5));
     loop {
         tokio::select! {
+            _ = heartbeat.tick() => {
+                if zebra_debug_time::instant_now().saturating_duration_since(listed_at) >= TX_RELIST_EVERY {
+                    stp.link.send(listing.clone());
+                    listed_at = zebra_debug_time::instant_now();
+                }
+            }
             packet = stp.link.outbound.recv() => {
                 let Some(packet) = packet else {
                     return (false, "the sync loop is gone".to_string());
