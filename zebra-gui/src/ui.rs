@@ -2115,6 +2115,46 @@ pub fn ui_left_pane(ui: &mut Context,
                             let colour = (0xff, 0xaf, 0x0e, 0xff);
                             ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
                         }
+                        // Explicit merge (#300): the funding planner says whether the wallet can pay amount + fee from
+                        // one spendable set of notes; merging is only ever done when the user presses the button.
+                        {
+                            let (quote, waiting_for_merge, merge_status, merge_error, op_error) = {
+                                let ws = wallet_state.lock().unwrap();
+                                ({
+            // Any fixed amount the total balance covers but the planner cannot fund from one
+            // spendable set of notes makes merging relevant; the largest such amount's reason is shown.
+            let mut found = None;
+            for amt in [ONE_cTAZ / 100, ONE_cTAZ / 10, ONE_cTAZ, 5 * ONE_cTAZ, 10 * ONE_cTAZ, 31 * ONE_cTAZ, 100 * ONE_cTAZ, 141 * ONE_cTAZ, 1000 * ONE_cTAZ, 10000 * ONE_cTAZ] {
+                if (balance as u64) < amt { break; }
+                let quote = ws.send_funding(amt);
+                // Prefer a merge-fixable shortfall; otherwise keep the first unfundable one (pending funds etc).
+                if quote.needs_merge || (found.is_none() && !quote.can_fund) { found = Some(quote); }
+            }
+            found.unwrap_or_else(|| ws.send_funding(ONE_cTAZ / 100))
+        }, ws.waiting_for_merge, ws.merge_status.clone(), ws.merge_error.clone(), ws.send_error.clone())
+                            };
+                            let warn = (0xff, 0xaf, 0x0e, 0xff);
+                            if !op_error.is_empty() {
+                                ui.text(frame_strf!(data, "{}", op_error), TextDecl { h: ui.scale(16.0), colour: warn, align: AlignX::Center, ..TextDecl });
+                            }
+                            if !quote.can_fund {
+                                if let Some(reason) = &quote.reason {
+                                    ui.text(frame_strf!(data, "{}", reason), TextDecl { h: ui.scale(16.0), colour: warn, align: AlignX::Center, ..TextDecl });
+                                }
+                            }
+                            if quote.needs_merge || waiting_for_merge {
+                                ui.text("Your funds are spread over too many notes for one transaction. Merging notes pays a network fee (your balance drops only by that fee) and then waits for 3 confirmations before the combined note can be spent. Larger amounts may be disabled until then.", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                                if button(ui, "Merge notes", quote.needs_merge && !waiting_for_merge) {
+                                    wallet_state.lock().unwrap().merge_notes();
+                                }
+                            }
+                            if !merge_status.is_empty() {
+                                ui.text(frame_strf!(data, "Merge: {}", merge_status), TextDecl { h: ui.scale(16.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                            }
+                            if !merge_error.is_empty() {
+                                ui.text(frame_strf!(data, "Merge failed: {}", merge_error), TextDecl { h: ui.scale(16.0), colour: warn, align: AlignX::Center, ..TextDecl });
+                            }
+                        }
 
                         if let _ = elem().decl(Decl {
                             child_gap, radius,
@@ -2154,7 +2194,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
                             if true {
                                 for send in sends {
-                                    if button(ui, send.0, can && (balance as u64) >= send.1) {
+                                    if button(ui, send.0, can && wallet_state.lock().unwrap().send_funding(send.1).can_fund) {
                                         let ua = data.send_address_ua.clone().expect("the button is disabled until the address decodes");
                                         wallet_state.lock().unwrap().send_to_address(ua, send.1);
                                         // The pending row in the history confirms it; a build failure shows on the wallet tab.
@@ -2197,7 +2237,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 if button(
                                     ui,
                                     frame_strf!(data, "Send {}", selected.0),
-                                    can && (balance as u64) >= selected.1,
+                                    can && wallet_state.lock().unwrap().send_funding(selected.1).can_fund,
                                 ) {
                                     let ua = data.send_address_ua.clone().expect("the button is disabled until the address decodes");
                                     wallet_state.lock().unwrap().send_to_address(ua, selected.1);
@@ -2388,6 +2428,46 @@ pub fn ui_left_pane(ui: &mut Context,
                         let colour = (0xff, 0xaf, 0x0e, 0xff);
                         ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
                     }
+                    // Explicit merge (#300): the funding planner says whether the wallet can pay amount + fee from
+                    // one spendable set of notes; merging is only ever done when the user presses the button.
+                    {
+                        let (quote, waiting_for_merge, merge_status, merge_error, op_error) = {
+                            let ws = wallet_state.lock().unwrap();
+                            ({
+            // Any fixed amount the total balance covers but the planner cannot fund from one
+            // spendable set of notes makes merging relevant; the largest such amount's reason is shown.
+            let mut found = None;
+            for amt in [ONE_cTAZ / 100, ONE_cTAZ / 10, ONE_cTAZ, 5 * ONE_cTAZ, 10 * ONE_cTAZ, 31 * ONE_cTAZ, 100 * ONE_cTAZ, 141 * ONE_cTAZ, 1000 * ONE_cTAZ, 10000 * ONE_cTAZ] {
+                if (balance as u64) < amt { break; }
+                let quote = ws.stake_funding(amt);
+                // Prefer a merge-fixable shortfall; otherwise keep the first unfundable one (pending funds etc).
+                if quote.needs_merge || (found.is_none() && !quote.can_fund) { found = Some(quote); }
+            }
+            found.unwrap_or_else(|| ws.stake_funding(ONE_cTAZ / 100))
+        }, ws.waiting_for_merge, ws.merge_status.clone(), ws.merge_error.clone(), ws.stake_error.clone())
+                        };
+                        let warn = (0xff, 0xaf, 0x0e, 0xff);
+                        if !op_error.is_empty() {
+                            ui.text(frame_strf!(data, "{}", op_error), TextDecl { h: ui.scale(16.0), colour: warn, align: AlignX::Center, ..TextDecl });
+                        }
+                        if !quote.can_fund {
+                            if let Some(reason) = &quote.reason {
+                                ui.text(frame_strf!(data, "{}", reason), TextDecl { h: ui.scale(16.0), colour: warn, align: AlignX::Center, ..TextDecl });
+                            }
+                        }
+                        if quote.needs_merge || waiting_for_merge {
+                            ui.text("Your funds are spread over too many notes for one transaction. Merging notes pays a network fee (your balance drops only by that fee) and then waits for 3 confirmations before the combined note can be spent. Larger amounts may be disabled until then.", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                            if button(ui, "Merge notes", quote.needs_merge && !waiting_for_merge) {
+                                wallet_state.lock().unwrap().merge_notes();
+                            }
+                        }
+                        if !merge_status.is_empty() {
+                            ui.text(frame_strf!(data, "Merge: {}", merge_status), TextDecl { h: ui.scale(16.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                        }
+                        if !merge_error.is_empty() {
+                            ui.text(frame_strf!(data, "Merge failed: {}", merge_error), TextDecl { h: ui.scale(16.0), colour: warn, align: AlignX::Center, ..TextDecl });
+                        }
+                    }
 
                     let waiting_for_stake_to_finalizer = wallet_state.lock().unwrap().waiting_for_stake_to_finalizer;
 
@@ -2408,13 +2488,13 @@ pub fn ui_left_pane(ui: &mut Context,
                         let mut hover = false;
 
                         if true {
-                            { let label =  "+0.01 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ / 100)   { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ /   100, hex_dest.unwrap()); } hover |= ui.hovered(id); }
-                            { let label =   "+0.1 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ / 10)    { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ /    10, hex_dest.unwrap()); } hover |= ui.hovered(id); }
-                            { let label =     "+1 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ)         { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ,         hex_dest.unwrap()); } hover |= ui.hovered(id); }
-                            { let label =    "+10 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ * 10)    { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ *    10, hex_dest.unwrap()); } hover |= ui.hovered(id); }
-                            { let label =   "+100 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ * 100)   { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ *   100, hex_dest.unwrap()); } hover |= ui.hovered(id); }
-                            { let label =  "+1000 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ * 1000)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ *  1000, hex_dest.unwrap()); } hover |= ui.hovered(id); }
-                            { let label = "+10000 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ * 10000) { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 10000, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                            { let label =  "+0.01 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && wallet_state.lock().unwrap().stake_funding(ONE_cTAZ / 100).can_fund)   { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ /   100, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                            { let label =   "+0.1 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && wallet_state.lock().unwrap().stake_funding(ONE_cTAZ / 10).can_fund)    { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ /    10, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                            { let label =     "+1 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && wallet_state.lock().unwrap().stake_funding(ONE_cTAZ).can_fund)         { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ,         hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                            { let label =    "+10 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && wallet_state.lock().unwrap().stake_funding(ONE_cTAZ * 10).can_fund)    { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ *    10, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                            { let label =   "+100 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && wallet_state.lock().unwrap().stake_funding(ONE_cTAZ * 100).can_fund)   { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ *   100, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                            { let label =  "+1000 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && wallet_state.lock().unwrap().stake_funding(ONE_cTAZ * 1000).can_fund)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ *  1000, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                            { let label = "+10000 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && wallet_state.lock().unwrap().stake_funding(ONE_cTAZ * 10000).can_fund) { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 10000, hex_dest.unwrap()); } hover |= ui.hovered(id); }
 
                         } else {
                             // TODO: finish new version
@@ -2471,7 +2551,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ui,
                                 stake_id,
                                 frame_strf!(data, "+{} cTAZ", selected.0),
-                                can && (balance as u64) >= selected.1,
+                                can && wallet_state.lock().unwrap().stake_funding(selected.1).can_fund,
                             ) {
                                 wallet_state.lock().unwrap().stake_to_finalizer(selected.1, hex_dest.unwrap());
                             }
