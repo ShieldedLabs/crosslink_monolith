@@ -240,6 +240,13 @@ pub struct FundingQuote {
     pub eligible_notes: usize,
 }
 
+// Status text is word-wrapped in the GUI. A full, unbroken txid would widen the
+// modal past the wallet panel and put its close button outside the visible area.
+fn merge_tx_label(id: TxId) -> String {
+    let full = id.to_string();
+    format!("{}..{}", &full[..8], &full[full.len() - 8..])
+}
+
 /// Uses the actual Ironwood builder's flags, padding and fee rule (including staking).
 fn ironwood_fee(spends: usize, outputs: usize, staking: bool) -> u64 {
     let actions = orchard::builder::BundleType::DEFAULT.num_actions(
@@ -5037,11 +5044,12 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let eligible_balance: u64 = spend_order(&funding_values).iter().map(|&i| funding_values[i]).sum();
         let mut merge_update = None;
         if let Some(id) = merge_txid {
+            let label = merge_tx_label(id);
             let merge = user_wallet.txs.iter().find(|tx| tx.txid == id);
             if let Some(tx) = merge {
                 if let TxStatus::HardFail(_, error) = tx.status {
                     let mut state = wallet_state.lock().unwrap();
-                    state.merge_error = format!("Merge {id} failed: {}", error.to_string().trim_end_matches('\0'));
+                    state.merge_error = format!("Merge {label} failed: {}", error.to_string().trim_end_matches('\0'));
                     state.merge_status.clear();
                     state.waiting_for_merge = false;
                     merge_txid = None;
@@ -5054,7 +5062,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 merge_update = Some((false, format!("Merge confirmed ({SPENDABLE_CONFIRMATIONS} confirmations). You can now retry the payment.")));
                 merge_txid = None;
             } else {
-                merge_update = Some((true, format!("Merge {id}: waiting for confirmations ({confirmations}/{SPENDABLE_CONFIRMATIONS}).")));
+                merge_update = Some((true, format!("Merge {label}: waiting for confirmations ({confirmations}/{SPENDABLE_CONFIRMATIONS}).")));
             }
         }
 
@@ -6451,6 +6459,18 @@ mod tests {
             assert!(take_ready_staged_merge_notes(false, false, false).is_none());
         }
         drop(first);
+    }
+
+    #[test]
+    fn merge_tx_label_fits_word_wrapped_wallet_dialogs() {
+        let id = TxId::from_bytes(std::array::from_fn(|i| i as u8));
+        let full = id.to_string();
+        let label = merge_tx_label(id);
+        assert_eq!(label, format!("{}..{}", &full[..8], &full[56..]));
+        assert_eq!(label.len(), 18);
+        let status = format!("Merge {label}: waiting for confirmations (1/{SPENDABLE_CONFIRMATIONS}).");
+        assert!(status.split_whitespace().all(|word| word.len() <= 20));
+        assert!(!status.contains(&full));
     }
 
     #[test]
