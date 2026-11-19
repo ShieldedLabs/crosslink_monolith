@@ -576,14 +576,24 @@ fn offer_tx(g: &mut FuzzGen, c: &mut Choices, tx: &Arc<Transaction>, flags: u32)
 }
 
 /// Whether a transaction built for `main`'s next block is built for the node's next block too. The
-/// node may hold a tip `main` does not (the tip unknown), up to the highest rival's, and the
-/// mempool checks a transaction against the network upgrade of the block after the node's tip:
-/// with an activation that close, that is another upgrade's.
+/// mempool checks a transaction against the network upgrade of the block after the node's tip, and
+/// with an activation that close, the node's tip may be one under another upgrade's: a rival's
+/// higher one `main` does not have (the tip unknown), or, in race mode, a lower one, where the
+/// blocks delivered since the last other instruction race this one and may not be taken yet.
 fn next_upgrade_known(g: &FuzzGen) -> bool {
     let upgrade = g.tip().next_upgrade();
-    g.tip_known
-        || (g.height()..=g.rival_height.max(g.height()))
-            .all(|height| NetworkUpgrade::current(&g.network, BlockHeight(height + 1)) == upgrade)
+    let racing_blocks = g
+        .tf
+        .instrs
+        .iter()
+        .rev()
+        .take_while(|instr| matches!(instr.kind, TFInstr::LOAD_POW | TFInstr::SUBMIT_TX))
+        .filter(|instr| instr.kind == TFInstr::LOAD_POW)
+        .count();
+    // usize to u32: an input holds far fewer instructions than u32::MAX.
+    let lowest = g.height().saturating_sub(racing_blocks as u32);
+    let highest = if g.tip_known { g.height() } else { g.rival_height.max(g.height()) };
+    (lowest..=highest).all(|height| NetworkUpgrade::current(&g.network, BlockHeight(height + 1)) == upgrade)
 }
 
 /// A spend of `coin` paying another key, so it conflicts with `transparent_spend` of the same
