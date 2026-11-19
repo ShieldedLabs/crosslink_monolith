@@ -240,10 +240,10 @@ pub struct FundingQuote {
     pub eligible_notes: usize,
 }
 
-/// Uses the same bundle padding and fee rule as BuildPrep (including the staking action).
+/// Uses the actual Ironwood builder's flags, padding and fee rule (including staking).
 fn ironwood_fee(spends: usize, outputs: usize, staking: bool) -> u64 {
     let actions = orchard::builder::BundleType::DEFAULT.num_actions(
-        orchard::bundle::BundleVersion::orchard_v3().default_flags(), spends, outputs,
+        orchard::bundle::BundleVersion::ironwood_v3().default_flags(), spends, outputs,
     ).expect("valid default bundle");
     zip317::FeeRule::standard().fee_required(
         &TEST_NETWORK, LRZBlockHeight::from_u32(1),
@@ -527,8 +527,8 @@ impl BuildPrep {
         // NOTE: we can impl these ourselves
         use zcash_primitives::transaction::fees::transparent::{InputView, OutputView, InputSize};
         let orchard_actions = orchard::builder::BundleType::DEFAULT.num_actions(
-            // Crosslink spends from the Orchard pool; NU6.3 onward fixes its bundle version.
-            orchard::bundle::BundleVersion::orchard_v3().default_flags(),
+            // Match TxBuilder::add_ironwood_*: Ironwood pairs spends and outputs.
+            orchard::bundle::BundleVersion::ironwood_v3().default_flags(),
             self.o_inputs.len(),
             self.o_outputs.len(),
         ).map_err(|e| builder::FeeError::Bundle(e))?;
@@ -5941,7 +5941,7 @@ mod tests {
         use rand_chacha::ChaCha20Rng;
         use zcash_primitives::transaction::fees::transparent::InputSize;
         let fee_unit = zip317::MARGINAL_FEE.into_u64();
-        let flags = orchard::bundle::BundleVersion::orchard_v3().default_flags();
+        let flags = orchard::bundle::BundleVersion::ironwood_v3().default_flags();
         let fee = |inputs: usize, ironwood_outputs: usize| {
             let actions = orchard::builder::BundleType::DEFAULT.num_actions(flags, 0, ironwood_outputs).unwrap();
             zip317::FeeRule::standard().fee_required(
@@ -6269,6 +6269,76 @@ mod tests {
         (wallet, usk, tree, addr)
     }
 
+    /// Replays preparation into the real transaction builder, without proving or networking.
+    fn prepared_ironwood_builder_fee(prep: &BuildPrep) -> u64 {
+        assert!(prep.t_inputs.is_empty() && prep.t_outputs.is_empty());
+        let mut txb = TxBuilder::new(TEST_NETWORK, LRZBlockHeight::from_u32(prep.block_h), prep.build_config.clone());
+        for spend in &prep.o_inputs {
+            txb.add_ironwood_spend::<zip317::FeeError>(spend.fvk.clone(), spend.note.note, spend.witness_merkle_path.clone()).unwrap();
+        }
+        for output in &prep.o_outputs {
+            txb.add_ironwood_output::<zip317::FeeError>(output.ovk.clone(), output.dst, output.zats, output.memo.clone()).unwrap();
+        }
+        if let Some(action) = prep.staking_action {
+            txb.put_staking_action(action).unwrap();
+        }
+        txb.get_fee(&zip317::FeeRule::standard()).unwrap().into_u64()
+    }
+
+    #[tokio::test]
+    async fn funding_real_builder_prices_send_and_stake_at_exact_boundary_and_cap() {
+        let (key, _) = bft::finalizer_key_from_seed(b"funding-fee-boundary");
+        let target = bft::FinalizerAddress::create(&key);
+        for staking in [false, true] {
+            for count in [1, 3, MAX_IRONWOOD_SPENDS] {
+                // Keep the bond amount a valid power of ten; vary the input balance instead.
+                let amount = 1_000_000_000;
+                // Ironwood pairs spends/outputs; staking adds one ZIP-317 action.
+                let expected_fee = zip317::MARGINAL_FEE.into_u64() * (count.max(2) + usize::from(staking)) as u64;
+                for surplus in [-1i64, 0, 12_345] {
+                    let total = (amount + expected_fee) as i64 + surplus;
+                    let total = total as u64;
+                    let mut values = vec![total / count as u64; count];
+                    values[0] += total % count as u64;
+                    let (mut wallet, usk, tree, addr) = funding_fixture(&values);
+                    let mut client = CompactTxStreamerClient::new(Endpoint::from_static("http://127.0.0.1:1").connect_lazy());
+                    let quote = wallet.funding(amount, staking);
+                    assert_eq!(quote.can_fund, surplus >= 0, "{count} notes, staking={staking}: {quote:?}");
+                    assert_eq!(quote.max_amount, total - expected_fee);
+                    assert_eq!(quote.fee_zats, expected_fee);
+                    if surplus < 0 {
+                        // A valid amount one zat short of amount + actual fee must not reserve notes.
+                        let mut rejected = ProposedTx::EMPTY;
+                        let result = if staking {
+                            wallet.stake_ironwood_to_finalizer(TEST_NETWORK, &mut rejected, &mut client, &usk, amount, &tree, target)
+                        } else {
+                            wallet.send_ironwood_to_ironwood_zats(TEST_NETWORK, &mut rejected, &mut client, &usk, amount, &tree, addr, MemoBytes::empty())
+                        };
+                        assert!(result.unwrap_err().contains("Insufficient eligible funds"));
+                        assert!(wallet.reserved_orchard_nfs.is_empty());
+                        continue;
+                    }
+                    let change = surplus as u64;
+                    let mut tx = ProposedTx::EMPTY;
+                    if staking {
+                        wallet.stake_ironwood_to_finalizer(TEST_NETWORK, &mut tx, &mut client, &usk, amount, &tree, target).unwrap();
+                    } else {
+                        wallet.send_ironwood_to_ironwood_zats(TEST_NETWORK, &mut tx, &mut client, &usk, amount, &tree, addr, MemoBytes::empty()).unwrap();
+                    }
+                    let prep = tx.prep.as_ref().unwrap();
+                    assert_eq!(prep.o_inputs.len(), count);
+                    assert_eq!(prep.o_outputs.len(), usize::from(!staking) + usize::from(change > 0));
+                    let actual_fee = prepared_ironwood_builder_fee(prep);
+                    assert_eq!(actual_fee, expected_fee);
+                    assert_eq!(prep.fee_required().unwrap().into_u64(), actual_fee);
+                    assert_eq!(wallet.reserved_orchard_nfs.len(), count);
+                    let output_total: u64 = prep.o_outputs.iter().map(|output| output.zats.into_u64()).sum();
+                    assert_eq!(total - output_total - if staking { amount } else { 0 }, actual_fee);
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn funding_builder_matches_quote_and_reserves_prepared_notes() {
         let (mut wallet, usk, tree, addr) = funding_fixture(&[50_000_000; 21]);
@@ -6286,6 +6356,7 @@ mod tests {
         let prep = send.prep.as_ref().unwrap();
         assert_eq!(prep.o_inputs.len(), 3);
         assert_eq!(prep.fee_required().unwrap().into_u64(), quote.fee_zats);
+        assert_eq!(prepared_ironwood_builder_fee(prep), quote.fee_zats);
         assert_eq!(wallet.funding(1, false).eligible_notes, 18);
         for spend in &prep.o_inputs { assert!(wallet.reserved_orchard_nfs.contains(&spend.note.nf)); }
         let mut send2 = ProposedTx::EMPTY;
@@ -6303,7 +6374,10 @@ mod tests {
         assert_eq!(prep.o_inputs.len(), 20);
         assert_eq!(prep.o_outputs.len(), 1);
         assert_eq!(prep.o_outputs[0].dst, addr);
-        assert_eq!(prep.o_outputs[0].zats.into_u64(), 1_000_000_000 - prep.fee_required().unwrap().into_u64());
+        let actual_fee = prepared_ironwood_builder_fee(prep);
+        assert_eq!(actual_fee, 100_000);
+        assert_eq!(prep.fee_required().unwrap().into_u64(), actual_fee);
+        assert_eq!(prep.o_outputs[0].zats.into_u64(), 1_000_000_000 - actual_fee);
         assert!(prep.t_inputs.is_empty() && prep.t_outputs.is_empty() && prep.staking_action.is_none());
         assert_eq!(wallet.funding(1, false).eligible_notes, 1);
         // A second explicit merge cannot consume notes reserved by the first preparation.
