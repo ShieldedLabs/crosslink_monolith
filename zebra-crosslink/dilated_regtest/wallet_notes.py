@@ -155,6 +155,9 @@ def render_config(ports, start):
     sub(r'^listen_addr = "127\.0\.0\.1:8232"$', f'listen_addr = "127.0.0.1:{ports["rpc"]}"')
     sub(r'^network_local_port = .*$', f'network_local_port = {ports["local"]}')
     sub(r'^network_initial_peers = .*$', 'network_initial_peers = []')
+    # Exact confirmation counts matter here, so only `generate` mines (node1's setting in the
+    # two-node run); at 90x dilation the internal miner would run past the staking window.
+    sub(r'^internal_miner = true$', 'internal_miner = false')
     sub(r'^cache_dir = true$', 'cache_dir = false')  # no peer cache in the user's home
     return t
 
@@ -317,7 +320,10 @@ def run(zebrad):
             check(res.get("amount") == FAUCET_ZATS,
                   f"the faucet pays the normal {FAUCET_ZATS} zats (0.5 cTAZ), got {res}")
         wait_for(f"faucet tx {i} in the mempool", lambda: len(mempool()) > 0, step=1, limit=150)
-        generate(1)
+        # Mined, plus two blocks so the miner's change (3 confirmations, the tip counting as 1)
+        # can fund the next faucet payment, and the wallet has seen all of it.
+        generate(3)
+        wait_for("the wallet to reach the tip", lambda: funds()["tip_height"] >= tip(), step=1, limit=90)
 
     def settle_notes(n):
         """Mine until the wallet has n mature faucet notes and nothing in flight."""
