@@ -43,6 +43,8 @@ pub enum TFLServiceRequest {
     WalletSpendableFunds,
     /// Send a basic shielded value transfer from the wallet: (value in zatoshis, unified address)
     WalletBasicSend(u64, String),
+    /// Explicitly consolidate eligible shielded notes into one self-owned note, paying a fee.
+    WalletMergeNotes,
     /// Write the best chain from genesis to a height (the best tip if `None`) to a chain prefix
     /// file in this node's export directory, with the BFT blocks `bft` selects.
     ExportChainPrefix {
@@ -72,6 +74,8 @@ pub enum TFLServiceResponse {
     WalletSpendableFunds(Option<WalletSpendableFunds>),
     /// Send a basic shielded value transfer from the wallet
     WalletBasicSend(Result<String, String>),
+    /// Transaction id of a submitted consolidation, or why it could not be built/submitted.
+    WalletMergeNotes(Result<String, String>),
     /// What was written for [`TFLServiceRequest::ExportChainPrefix`], or why nothing was
     ExportChainPrefix(Result<ChainPrefixExport, String>),
 }

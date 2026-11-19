@@ -628,10 +628,10 @@ pub trait Rpc {
 
     /// What the wallet can spend now, what is still maturing, and its own address.
     ///
-    /// The companion query to `wallet_basic_send`. `spendable_zats` is exactly what a send can
-    /// draw on: notes with 3 confirmations, counting the tip block as 1. Newer notes are in
-    /// `pending_zats`, and notes already consumed by a send not yet seen in a block are held in
-    /// `committed_zats`.
+    /// `spendable_zats` totals eligible shielded notes with 3 confirmations, excluding dust,
+    /// unknown tree positions and notes reserved by our transactions. `max_send_zats` and
+    /// `max_stake_zats` also apply the input cap and fee. Newer notes are in `pending_zats`,
+    /// and notes reserved by our transactions are in `committed_zats`.
     ///
     /// ## Example Usage
     /// ```shell
@@ -655,6 +655,12 @@ pub trait Rpc {
     /// ```
     #[method(name = "wallet_basic_send")]
     async fn wallet_basic_send(&self, value_zats: u64, dst_address: String) -> Result<String>;
+
+    /// Explicitly merge up to 20 eligible shielded notes into one note owned by this wallet.
+    /// Pays a network fee and returns the submitted transaction id. The merged note needs
+    /// 3 confirmations before it can fund a send or bond; neither is retried automatically.
+    #[method(name = "wallet_merge_notes")]
+    async fn wallet_merge_notes(&self) -> Result<String>;
 
     /// Returns the requested block header by hash or height, as a [`GetBlockHeader`] JSON string.
     /// If the block is not in Zebra's state,
@@ -2576,6 +2582,23 @@ where
                     format!("Send of {value_zats} zats to \"{dst_address}\" failed: {err}"),
                     None::<()>,
             )),
+        }
+    }
+
+    async fn wallet_merge_notes(&self) -> Result<String> {
+        let res = self.tfl_service.clone().ready().await.unwrap()
+            .call(TFLServiceRequest::WalletMergeNotes).await;
+        match res {
+            Ok(TFLServiceResponse::WalletMergeNotes(Ok(txid))) => Ok(txid),
+            Ok(TFLServiceResponse::WalletMergeNotes(Err(err))) => Err(ErrorObject::owned(
+                server::error::LegacyCode::Verify.into(),
+                format!("Merge notes failed: {err}"), None::<()>,
+            )),
+            Err(err) => Err(ErrorObject::owned(
+                server::error::LegacyCode::Verify.into(),
+                format!("Merge notes failed: {err}"), None::<()>,
+            )),
+            Ok(_) => unreachable!("unmatched response to a WalletMergeNotes request"),
         }
     }
 

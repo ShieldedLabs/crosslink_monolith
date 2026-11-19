@@ -780,6 +780,29 @@ async fn tfl_service_incoming_request(
 
         TFLServiceRequest::WalletSpendableFunds => Ok(TFLServiceResponse::WalletSpendableFunds(wallet::SPENDABLE_FUNDS.lock().unwrap().clone())),
 
+        TFLServiceRequest::WalletMergeNotes if !runs_a_wallet_loop(&internal_handle.config) => {
+            Ok(TFLServiceResponse::WalletMergeNotes(Err(NO_WALLET_LOOP.to_string())))
+        }
+        TFLServiceRequest::WalletMergeNotes => Ok(TFLServiceResponse::WalletMergeNotes({
+            let rx = {
+                let mut lock = wallet::MERGE_NOTES_STAGE.lock().unwrap();
+                match &*lock {
+                    Some(tx) if !tx.is_closed() => {
+                        return Err(TFLServiceError::Misc("Another merge in progress, please try again soon".to_string()))
+                    }
+                    _ => {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        *lock = Some(tx);
+                        rx
+                    }
+                }
+            };
+            match rx.await {
+                Ok(result) => result,
+                Err(err) => return Err(TFLServiceError::Misc(format!("{err}"))),
+            }
+        })),
+
         // workshop - mining & staking via PoW
         TFLServiceRequest::TotalIssuanceFromKey(ufvk_str, first_height, last_height) => {
             Ok(TFLServiceResponse::TotalIssuanceFromKey({
@@ -1055,6 +1078,30 @@ mod wallet_rpc_tests {
     // Every run draws a fresh seed (set CROSSLINK_FUZZ_SEED to replay one).
     #[tokio::test]
     async fn wallet_rpcs_stage_one_live_request_per_kind_and_drop_the_ones_whose_caller_gave_up() {
+        // Consolidation uses the same one-live-caller rule as send and stake. Test the real
+        // handler without a wallet, with a competing caller, and after a caller disconnects.
+        wallet::MERGE_NOTES_STAGE.lock().unwrap().take();
+        let disabled = tfl_service_incoming_request(handle(true), TFLServiceRequest::WalletMergeNotes).await;
+        match disabled {
+            Ok(TFLServiceResponse::WalletMergeNotes(Err(reason))) => assert!(reason.contains("disable_the_headless_wallet")),
+            other => panic!("merge without a wallet: {other:?}"),
+        }
+        let h = handle(false);
+        let first = tokio::spawn(tfl_service_incoming_request(h.clone(), TFLServiceRequest::WalletMergeNotes));
+        settle().await;
+        assert!(matches!(tfl_service_incoming_request(h.clone(), TFLServiceRequest::WalletMergeNotes).await,
+            Err(TFLServiceError::Misc(reason)) if reason.contains("in progress")));
+        first.abort();
+        let _ = first.await;
+        assert!(wallet::take_staged_merge_notes().is_none());
+        let live = tokio::spawn(tfl_service_incoming_request(h, TFLServiceRequest::WalletMergeNotes));
+        settle().await;
+        wallet::take_staged_merge_notes().unwrap().send(Ok("merge txid".to_string())).unwrap();
+        match live.await.unwrap() {
+            Ok(TFLServiceResponse::WalletMergeNotes(Ok(txid))) => assert_eq!(txid, "merge txid"),
+            other => panic!("merge response: {other:?}"),
+        }
+
         let seed: u64 = std::env::var("CROSSLINK_FUZZ_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| rand::thread_rng().next_u64());
         eprintln!("CROSSLINK_FUZZ_SEED={seed}");
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
