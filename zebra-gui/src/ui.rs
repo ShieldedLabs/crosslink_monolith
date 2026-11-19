@@ -2120,7 +2120,17 @@ pub fn ui_left_pane(ui: &mut Context,
                         {
                             let (quote, waiting_for_merge, merge_status, merge_error, op_error) = {
                                 let ws = wallet_state.lock().unwrap();
-                                (ws.send_funding(ONE_cTAZ / 100), ws.waiting_for_merge, ws.merge_status.clone(), ws.merge_error.clone(), ws.send_error.clone())
+                                ({
+            // Any fixed amount the total balance covers but the planner cannot fund from one
+            // spendable set of notes makes merging relevant; the largest such amount's reason is shown.
+            let mut found = None;
+            for amt in [ONE_cTAZ / 100, ONE_cTAZ / 10, ONE_cTAZ, 5 * ONE_cTAZ, 10 * ONE_cTAZ, 31 * ONE_cTAZ, 100 * ONE_cTAZ, 141 * ONE_cTAZ, 1000 * ONE_cTAZ, 10000 * ONE_cTAZ] {
+                if (balance as u64) < amt { break; }
+                let quote = ws.send_funding(amt);
+                if quote.needs_merge { found = Some(quote); }
+            }
+            found.unwrap_or_else(|| ws.send_funding(ONE_cTAZ / 100))
+        }, ws.waiting_for_merge, ws.merge_status.clone(), ws.merge_error.clone(), ws.send_error.clone())
                             };
                             let warn = (0xff, 0xaf, 0x0e, 0xff);
                             if !op_error.is_empty() {
@@ -2130,7 +2140,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 if let Some(reason) = &quote.reason {
                                     ui.text(frame_strf!(data, "{}", reason), TextDecl { h: ui.scale(16.0), colour: warn, align: AlignX::Center, ..TextDecl });
                                 }
-                                ui.text("Your funds are spread over too many notes for one transaction. Merging notes pays a network fee and then waits for 3 confirmations before the combined note can be spent. Your total balance does not change.", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                                ui.text("Your funds are spread over too many notes for one transaction. Merging notes pays a network fee (your balance drops only by that fee) and then waits for 3 confirmations before the combined note can be spent. Larger amounts may be disabled until then.", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                                 if button(ui, "Merge notes", quote.needs_merge && !waiting_for_merge) {
                                     wallet_state.lock().unwrap().merge_notes();
                                 }
@@ -2420,7 +2430,17 @@ pub fn ui_left_pane(ui: &mut Context,
                     {
                         let (quote, waiting_for_merge, merge_status, merge_error, op_error) = {
                             let ws = wallet_state.lock().unwrap();
-                            (ws.stake_funding(ONE_cTAZ / 100), ws.waiting_for_merge, ws.merge_status.clone(), ws.merge_error.clone(), ws.stake_error.clone())
+                            ({
+            // Any fixed amount the total balance covers but the planner cannot fund from one
+            // spendable set of notes makes merging relevant; the largest such amount's reason is shown.
+            let mut found = None;
+            for amt in [ONE_cTAZ / 100, ONE_cTAZ / 10, ONE_cTAZ, 5 * ONE_cTAZ, 10 * ONE_cTAZ, 31 * ONE_cTAZ, 100 * ONE_cTAZ, 141 * ONE_cTAZ, 1000 * ONE_cTAZ, 10000 * ONE_cTAZ] {
+                if (balance as u64) < amt { break; }
+                let quote = ws.stake_funding(amt);
+                if quote.needs_merge { found = Some(quote); }
+            }
+            found.unwrap_or_else(|| ws.stake_funding(ONE_cTAZ / 100))
+        }, ws.waiting_for_merge, ws.merge_status.clone(), ws.merge_error.clone(), ws.stake_error.clone())
                         };
                         let warn = (0xff, 0xaf, 0x0e, 0xff);
                         if !op_error.is_empty() {
@@ -2430,7 +2450,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             if let Some(reason) = &quote.reason {
                                 ui.text(frame_strf!(data, "{}", reason), TextDecl { h: ui.scale(16.0), colour: warn, align: AlignX::Center, ..TextDecl });
                             }
-                            ui.text("Your funds are spread over too many notes for one transaction. Merging notes pays a network fee and then waits for 3 confirmations before the combined note can be spent. Your total balance does not change.", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                            ui.text("Your funds are spread over too many notes for one transaction. Merging notes pays a network fee (your balance drops only by that fee) and then waits for 3 confirmations before the combined note can be spent. Larger amounts may be disabled until then.", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                             if button(ui, "Merge notes", quote.needs_merge && !waiting_for_merge) {
                                 wallet_state.lock().unwrap().merge_notes();
                             }
