@@ -2142,9 +2142,9 @@ pub fn ui_left_pane(ui: &mut Context,
                                     ui.text(frame_strf!(data, "{}", reason), TextDecl { h: ui.scale(16.0), colour: warn, align: AlignX::Center, ..TextDecl });
                                 }
                             }
-                            if quote.needs_merge || waiting_for_merge {
-                                ui.text("Your funds are spread over too many notes for one transaction. Merging notes pays a network fee (your balance drops only by that fee) and then waits for 3 confirmations before the combined note can be spent. Larger amounts may be disabled until then.", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-                                if button(ui, "Merge notes", quote.needs_merge && !waiting_for_merge) {
+                            if quote.needs_merge || quote.eligible_notes > 1 || waiting_for_merge {
+                                ui.text("Your funds are spread over several notes. Merging notes pays a network fee (your balance drops only by that fee) and then waits for 3 confirmations before the combined note can be spent. Larger amounts may be disabled until then.", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                                if button(ui, "Merge notes", (quote.needs_merge || quote.eligible_notes > 1) && !waiting_for_merge) {
                                     wallet_state.lock().unwrap().merge_notes();
                                 }
                             }
@@ -2455,9 +2455,9 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ui.text(frame_strf!(data, "{}", reason), TextDecl { h: ui.scale(16.0), colour: warn, align: AlignX::Center, ..TextDecl });
                             }
                         }
-                        if quote.needs_merge || waiting_for_merge {
-                            ui.text("Your funds are spread over too many notes for one transaction. Merging notes pays a network fee (your balance drops only by that fee) and then waits for 3 confirmations before the combined note can be spent. Larger amounts may be disabled until then.", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-                            if button(ui, "Merge notes", quote.needs_merge && !waiting_for_merge) {
+                        if quote.needs_merge || quote.eligible_notes > 1 || waiting_for_merge {
+                            ui.text("Your funds are spread over several notes. Merging notes pays a network fee (your balance drops only by that fee) and then waits for 3 confirmations before the combined note can be spent. Larger amounts may be disabled until then.", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                            if button(ui, "Merge notes", (quote.needs_merge || quote.eligible_notes > 1) && !waiting_for_merge) {
                                 wallet_state.lock().unwrap().merge_notes();
                             }
                         }
