@@ -565,13 +565,25 @@ fn refuse(g: &mut FuzzGen, c: &mut Choices, block: &Block) {
     g.expect_tip();
 }
 
-/// Hands the node a transaction it must take, through SUBMIT_TX or a peer's relay.
-fn offer_tx(g: &mut FuzzGen, c: &mut Choices, tx: &Arc<Transaction>) {
+/// Hands the node a transaction, through SUBMIT_TX or a peer's relay, with the outcome `flags`
+/// expects.
+fn offer_tx(g: &mut FuzzGen, c: &mut Choices, tx: &Arc<Transaction>, flags: u32) {
     if c.unusual(96) {
-        g.tf.push_instr_recv_tx_wire(tx, 0, 0);
+        g.tf.push_instr_recv_tx_wire(tx, 0, flags);
     } else {
-        g.tf.push_instr_submit_tx(tx, 0);
+        g.tf.push_instr_submit_tx(tx, flags);
     }
+}
+
+/// Whether a transaction built for `main`'s next block is built for the node's next block too. The
+/// node may hold a tip `main` does not (the tip unknown), up to the highest rival's, and the
+/// mempool checks a transaction against the network upgrade of the block after the node's tip:
+/// with an activation that close, that is another upgrade's.
+fn next_upgrade_known(g: &FuzzGen) -> bool {
+    let upgrade = g.tip().next_upgrade();
+    g.tip_known
+        || (g.height()..=g.rival_height.max(g.height()))
+            .all(|height| NetworkUpgrade::current(&g.network, BlockHeight(height + 1)) == upgrade)
 }
 
 /// A spend of `coin` paying another key, so it conflicts with `transparent_spend` of the same
@@ -602,9 +614,15 @@ fn move_spend(g: &mut FuzzGen, c: &mut Choices) {
     }
     let coin = coins[c.below(coins.len())].clone();
     let tx = transparent_spend(g.tip().next_upgrade(), &g.key, (coin.0, coin.1.output.clone()));
-    offer_tx(g, c, &tx);
-    g.tf.push_instr_expect_mempool_contains(&tx, 0);
-    g.pending.push(FuzzPending { tx, coin, known: true });
+    if next_upgrade_known(g) {
+        offer_tx(g, c, &tx, 0);
+        g.tf.push_instr_expect_mempool_contains(&tx, 0);
+        g.pending.push(FuzzPending { tx, coin, known: true });
+    } else {
+        // Built for an upgrade the node's next block may not be under, so the mempool may refuse it.
+        offer_tx(g, c, &tx, ANY_OUTCOME);
+        g.pending.push(FuzzPending { tx, coin, known: false });
+    }
 }
 
 /// Mines every pending spend, and sometimes a spend straight into the block too. A mined spend
