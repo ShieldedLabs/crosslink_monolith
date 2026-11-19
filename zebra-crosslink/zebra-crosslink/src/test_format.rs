@@ -169,6 +169,8 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::EXPECT_BFT_SENT as usize] = "EXPECT_BFT_SENT";
     strs[TFInstr::EXPECT_BFT_PROPOSER as usize] = "EXPECT_BFT_PROPOSER";
     strs[TFInstr::EXPECT_BFT_DROPPED as usize] = "EXPECT_BFT_DROPPED";
+    strs[TFInstr::CLOCK_STEP_DURING as usize] = "CLOCK_STEP_DURING";
+    strs[TFInstr::MEMPOOL_LAG as usize] = "MEMPOOL_LAG";
 
     let mut retired_i = 0;
     while retired_i < TFInstr::RETIRED.len() {
@@ -176,7 +178,7 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
         retired_i += 1;
     }
 
-    const_assert!(TFInstr::COUNT == 37);
+    const_assert!(TFInstr::COUNT == 39);
     strs
 };
 
@@ -330,7 +332,17 @@ impl TFInstr {
     /// MINE_FROM_TEMPLATE (20), CHECK_POW (23) and RECV_TX_STP (36). Never reused, so an old file
     /// holding one fails to parse rather than meaning something else.
     pub const RETIRED: [TFInstrKind; 5] = [10, 18, 20, 23, 36];
-    pub const COUNT: TFInstrKind = 37;
+    /// During the next instruction, once the sync loop has finished `val[1]` ticks since it began,
+    /// moves the node's clock forward `val[0]` milliseconds, while that instruction is still at
+    /// work: a timer can run out in the middle of a delivery, as real time lets it, at a point the
+    /// file picks rather than the machine. Nothing while the BFT engine runs, whose rounds run on
+    /// that clock and which only ADVANCE_TIME moves.
+    pub const CLOCK_STEP_DURING: TFInstrKind = 37;
+    /// The mempool is not shown the tips the next `val[0]` instructions that can move the tip leave
+    /// (see `mempool_follow_tip`), so it reads them only when its own callers call it, and may see
+    /// several blocks at once and reset, as a node's mempool does.
+    pub const MEMPOOL_LAG: TFInstrKind = 38;
+    pub const COUNT: TFInstrKind = 39;
 
     pub fn str_from_kind(kind: TFInstrKind) -> &'static str {
         let kind = kind as usize;
@@ -464,6 +476,8 @@ impl TFInstr {
                 str += &format!("type {:?}, {} bytes from peer {peer}", packet.first(), packet.len())
             }
             Some(TestInstr::RecvTxStp { tx, peer }) => str += &format!("{} via STP peer {peer}", tx.hash()),
+            Some(TestInstr::ClockStepDuring { millis, ticks }) => str += &format!("{millis} ms after {ticks} tick(s)"),
+            Some(TestInstr::MempoolLag { tips }) => str += &format!("{tips} tip(s)"),
             Some(TestInstr::ExpectBftDropped { dropped, hash }) => {
                 str += &format!("{dropped}");
                 if let Some(hash) = hash {
@@ -949,6 +963,14 @@ impl TF {
         self.push_instr_ex(TFInstr::EXPECT_BFT_PROPOSER, flags, &[0; 0], [finalizer, bft_height_round(height, round)])
     }
 
+    pub fn push_instr_clock_step_during(&mut self, millis: u64, ticks: u64) {
+        self.push_instr_ex(TFInstr::CLOCK_STEP_DURING, 0, &[0; 0], [millis, ticks])
+    }
+
+    pub fn push_instr_mempool_lag(&mut self, tips: u64) {
+        self.push_instr_ex(TFInstr::MEMPOOL_LAG, 0, &[0; 0], [tips, 0])
+    }
+
     /// `hash`, when given, is the block the dropped-BFT record must name.
     pub fn push_instr_expect_bft_dropped(&mut self, dropped: bool, hash: Option<&ZebBlockHash>, flags: u32) {
         let data = hash.map_or(&[][..], |hash| &hash.0[..]);
@@ -1306,7 +1328,7 @@ pub fn read_load_pos(bytes: &[u8], instr: &TFInstr) -> Option<(BftBlock, FatPoin
 }
 
 pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> {
-    const_assert!(TFInstr::COUNT == 37);
+    const_assert!(TFInstr::COUNT == 39);
     match instr.kind {
         TFInstr::LOAD_POW => {
             let data = instr.data_slice(bytes);
@@ -1485,6 +1507,8 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
             let hash = if data.is_empty() { None } else { Some(ZebBlockHash(data.try_into().ok()?)) };
             Some(TestInstr::ExpectBftDropped { dropped: instr.val[0] != 0, hash })
         }
+        TFInstr::CLOCK_STEP_DURING => Some(TestInstr::ClockStepDuring { millis: instr.val[0], ticks: instr.val[1] }),
+        TFInstr::MEMPOOL_LAG => Some(TestInstr::MempoolLag { tips: instr.val[0] }),
 
         // An instruction this build doesn't know. The caller decides whether that is fatal
         // (a test) or skippable (the fuzzer, the GUI viewer).
@@ -1539,6 +1563,8 @@ pub(crate) enum TestInstr {
     ExpectBftSent { kind: u64, height: u64, round: u32, value_id: Option<[u8; 32]> },
     ExpectBftProposer { finalizer: u64, height: u64, round: u32 },
     ExpectBftDropped { dropped: bool, hash: Option<ZebBlockHash> },
+    ClockStepDuring { millis: u64, ticks: u64 },
+    MempoolLag { tips: u64 },
     RosterForceInclude([u8; 32], u64),   // public address
     ExpectRosterIncludes([u8; 32], u64), // public address
 }
@@ -2233,6 +2259,16 @@ pub(crate) async fn handle_instr(
             }
         }
 
+        TestInstr::ClockStepDuring { millis, ticks } => {
+            *TEST_CLOCK_STEP_DURING_NEXT.lock().unwrap() = Some((millis, ticks));
+            test_check(flags, true, &format!("CLOCK_STEP_DURING: the next instruction sees the clock move {millis} ms after {ticks} sync tick(s)"));
+        }
+
+        TestInstr::MempoolLag { tips } => {
+            TEST_MEMPOOL_LAG.store(tips, std::sync::atomic::Ordering::Release);
+            test_check(flags, true, &format!("MEMPOOL_LAG: the mempool is not shown the next {tips} tip(s)"));
+        }
+
         TestInstr::RosterForceInclude(pub_key, stake) => {
             zebra_state::new_network::bft::bft_chain()
                 .write()
@@ -2614,6 +2650,34 @@ async fn bft_settle() -> Result<(), String> {
     settled
 }
 
+/// A CLOCK_STEP_DURING's step, for the next instruction: milliseconds, and the sync loop ticks into
+/// that instruction it comes after.
+static TEST_CLOCK_STEP_DURING_NEXT: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+/// How many more tips a MEMPOOL_LAG keeps from the mempool.
+static TEST_MEMPOOL_LAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Moves the clock `millis` once the sync loop has finished `ticks` ticks after `ticks_at_start`:
+/// a CLOCK_STEP_DURING, run beside the instruction it applies to. While that instruction is at
+/// work its ticks are not woken, like the clock driver's; once it is `done`, nothing waits on
+/// where they fall, so they are. Bounded for a loop that has stopped.
+async fn clock_step_during(millis: u64, ticks: u64, ticks_at_start: u64, done: &std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::Ordering;
+    let _ = tokio::time::timeout(NODE_ANSWER_WAIT, async {
+        while zebra_state::new_network::SYNC_TICKS_DONE.load(Ordering::Acquire) < ticks_at_start + ticks {
+            if done.load(Ordering::Acquire) {
+                zebra_state::new_network::wake_sync_loop_now();
+            }
+            tokio::time::sleep(Duration::from_micros(200)).await;
+        }
+    })
+    .await;
+    if !bft_engine_running() && zebra_debug_time::instant_is_supplied() {
+        zebra_debug_time::advance_instant(Duration::from_millis(millis));
+        zebra_state::new_network::wake_sync_loop_now();
+    }
+}
+
 /// When the instruction in hand began, while one runs: the clock driver's cue.
 static TEST_INSTR_RUNNING_SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
@@ -2682,6 +2746,11 @@ async fn drive_clock() {
 /// sync loop first: a commit that trails the instruction's verdict is shown with the next one, and
 /// settling here cost two-thirds more time per input with no difference measured.
 async fn mempool_follow_tip(internal_handle: &TFLServiceHandle, last: &mut Option<zebra_chain::block::Hash>) {
+    use std::sync::atomic::Ordering;
+    if TEST_MEMPOOL_LAG.load(Ordering::Acquire) > 0 {
+        TEST_MEMPOOL_LAG.fetch_sub(1, Ordering::AcqRel);
+        return;
+    }
     let tip = match tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.state)(StateRequest::Tip)).await {
         Ok(Ok(StateResponse::Tip(Some((_, hash))))) => hash,
         _ => return,
@@ -3280,15 +3349,27 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
             let start = std::time::Instant::now();
             *TEST_INSTR_RUNNING_SINCE.lock().unwrap() = Some(start);
 
-            handle_instr(
+            let handled = handle_instr(
                 &internal_handle,
                 bytes,
                 instr,
                 instrs[instr_i].flags,
                 instr_i,
                 instr_i < options.trusted_before,
-            )
-            .await;
+            );
+            let step = TEST_CLOCK_STEP_DURING_NEXT.lock().unwrap().take();
+            match step {
+                Some((millis, ticks)) => {
+                    let ticks_at_start = zebra_state::new_network::SYNC_TICKS_DONE.load(std::sync::atomic::Ordering::Acquire);
+                    let done = std::sync::atomic::AtomicBool::new(false);
+                    let handled = async {
+                        handled.await;
+                        done.store(true, std::sync::atomic::Ordering::Release);
+                    };
+                    futures::join!(handled, clock_step_during(millis, ticks, ticks_at_start, &done));
+                }
+                None => handled.await,
+            }
 
             *TEST_INSTR_RUNNING_SINCE.lock().unwrap() = None;
             if moves_tip {

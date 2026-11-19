@@ -2276,7 +2276,26 @@ pub(crate) fn generate(c: &mut Choices) -> Vec<u8> {
     }
     g.tf.push_instr_expect_node_alive(0);
     g.tf.push_instr_expect_staking_replay_matches(0);
+    add_timing(&mut g.tf, c);
     g.tf.write_to_bytes()
+}
+
+/// Timing the input picks, where the harness otherwise holds the node's clock and the mempool's
+/// view to the node's progress: before some deliveries a CLOCK_STEP_DURING, so a timer of the
+/// node's runs out while the delivery is at work, and before some block loads a MEMPOOL_LAG, so
+/// the mempool sees several blocks at once and resets. The steps stay well below the mempool's
+/// verification timeout (17 s), so the outcomes the moves expect hold however a step falls.
+fn add_timing(tf: &mut TF, c: &mut Choices) {
+    for instr in std::mem::take(&mut tf.instrs) {
+        if matches!(instr.kind, TFInstr::LOAD_POW | TFInstr::SUBMIT_TX | TFInstr::RECV_STP_PACKET) && c.unusual(16) {
+            let millis = [250, 1000, 3000][c.below(3)];
+            tf.push_instr_clock_step_during(millis, c.below(4) as u64);
+        }
+        if instr.kind == TFInstr::LOAD_POW && c.unusual(12) {
+            tf.push_instr_mempool_lag(1 + c.below(3) as u64);
+        }
+        tf.instrs.push(instr);
+    }
 }
 
 fn fuzz_dir() -> PathBuf {
