@@ -131,6 +131,20 @@ pub fn take_staged_merge_notes() -> Option<tokio::sync::oneshot::Sender<Result<S
     MERGE_NOTES_STAGE.lock().unwrap().take().filter(|sender| !sender.is_closed())
 }
 
+fn take_ready_staged_merge_notes(merge_in_progress: bool, awaiting_confirmations: bool, shield_in_progress: bool) -> Option<tokio::sync::oneshot::Sender<Result<String, String>>> {
+    let sender = take_staged_merge_notes()?;
+    // Consume busy requests now, never leave an explicit action queued for a later round.
+    let reason = if merge_in_progress || awaiting_confirmations {
+        "A merge is already in progress; wait for three confirmations."
+    } else if shield_in_progress {
+        "Wallet shielding is in progress; retry the merge explicitly when it finishes."
+    } else {
+        return Some(sender);
+    };
+    let _ = sender.send(Err(reason.to_string()));
+    None
+}
+
 /// Takes the staged RPC staking request for the wallet to build, unless its caller has gone (an RPC
 /// client that timed out): nobody would be told about it, and the caller may well have sent it again.
 pub fn take_staged_staking_action() -> Option<(StakingActionRequest, tokio::sync::oneshot::Sender<Result<String, String>>)> {
@@ -1234,6 +1248,17 @@ impl WalletState {
         }
     }
 
+    fn record_proposal_progress(&mut self, was_in_progress: bool, is_stake: bool, progress: WalletTx) {
+        // An idle slot returns WalletTx::EMPTY, whose status is not a transaction failure.
+        if !was_in_progress || progress.status == TxStatus::OnBc { return; }
+        let reason = match progress.status {
+            TxStatus::HardFail(_, error) => error.to_string().trim_end_matches('\0').to_string(),
+            _ => "The node could not accept the transaction. Check connectivity and retry explicitly.".to_string(),
+        };
+        if is_stake { self.stake_error = reason; self.waiting_for_stake_to_finalizer = false; }
+        else { self.send_error = reason; self.waiting_for_send = false; }
+    }
+
     pub fn user_balance(&self)          -> u64 { self.user_unshielded_funds + self.user_shielded_spendable_funds + self.user_shielded_pending_funds }
     pub fn user_pending_balance(&self)  -> u64 { self.user_shielded_pending_funds }
     pub fn miner_balance(&self)         -> u64 { self.miner_unshielded_funds + self.miner_shielded_spendable_funds + self.miner_shielded_pending_funds }
@@ -2085,7 +2110,7 @@ impl ManualWallet {
                 // TODO: check it hasn't already been unbonded
                 let Some(bond_tx) = self.txs.iter().find(|t| t.staking_action.filter(|s| s.kind() == StakingActionKind::BeginDelegationUnbonding).map(|s| s.bond_key()).unwrap_or_default() == *bond_key) else {
                     println!("Could not find bond {:?} that was ready to claim.", bond_key);
-                    return Err("Repeated source pool in transaction options.".to_string());
+                    return Err("Could not find the unbonding action for this bond; it is not ready to claim.".to_string());
                 };
 
                 // fee comes from bond itself
@@ -5330,19 +5355,17 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
-        if !proposed_merge.is_in_progress() && merge_txid.is_none() && !proposed_user_shield.is_in_progress() {
-            if let Some(sender) = take_staged_merge_notes() {
-                match user_wallet.merge_ironwood_notes(network, &mut proposed_merge, &mut client, &user_usk, &orchard_tree) {
-                    Ok(()) => {
-                        just_init_new_tx = true;
-                        merge_sender = Some(sender);
-                        let mut state = wallet_state.lock().unwrap();
-                        state.waiting_for_merge = true;
-                        state.merge_error.clear();
-                        state.merge_status = "Preparing explicitly requested merge.".to_string();
-                    }
-                    Err(reason) => { let _ = sender.send(Err(reason)); }
+        if let Some(sender) = take_ready_staged_merge_notes(proposed_merge.is_in_progress(), merge_txid.is_some(), proposed_user_shield.is_in_progress()) {
+            match user_wallet.merge_ironwood_notes(network, &mut proposed_merge, &mut client, &user_usk, &orchard_tree) {
+                Ok(()) => {
+                    just_init_new_tx = true;
+                    merge_sender = Some(sender);
+                    let mut state = wallet_state.lock().unwrap();
+                    state.waiting_for_merge = true;
+                    state.merge_error.clear();
+                    state.merge_status = "Preparing explicitly requested merge.".to_string();
                 }
+                Err(reason) => { let _ = sender.send(Err(reason)); }
             }
         }
 
@@ -5649,18 +5672,14 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             continue_proposed_tx(&mut miner_wallet, network, &mut proposed_miner_shield, &mut client, "miner shield", DUMP_TX_SEND && false).await;
             continue_proposed_tx(&mut user_wallet,  network, &mut proposed_user_shield, &mut client, "user shield",  DUMP_TX_SEND && false).await;
+            let stake_was_in_progress = proposed_stake.is_in_progress();
+            let send_was_in_progress = proposed_send.is_in_progress();
             let stake_progress = continue_proposed_tx(&mut user_wallet, network, &mut proposed_stake, &mut client, "stake", DUMP_TX_SEND).await;
             let send_progress = continue_proposed_tx(&mut user_wallet, network, &mut proposed_send, &mut client, "send", DUMP_TX_SEND).await;
-            for (is_stake, progress) in [(true, stake_progress), (false, send_progress)] {
-                if progress.status != TxStatus::OnBc {
-                    let reason = match progress.status {
-                        TxStatus::HardFail(_, error) => error.to_string().trim_end_matches('\0').to_string(),
-                        _ => "The node could not accept the transaction. Check connectivity and retry explicitly.".to_string(),
-                    };
-                    let mut state = wallet_state.lock().unwrap();
-                    if is_stake { state.stake_error = reason; state.waiting_for_stake_to_finalizer = false; }
-                    else { state.send_error = reason; state.waiting_for_send = false; }
-                }
+            {
+                let mut state = wallet_state.lock().unwrap();
+                state.record_proposal_progress(stake_was_in_progress, true, stake_progress);
+                state.record_proposal_progress(send_was_in_progress, false, send_progress);
             }
 
             if proposed_merge.is_in_progress() {
@@ -6312,6 +6331,55 @@ mod tests {
     }
 
     #[test]
+    fn idle_proposals_preserve_useful_send_and_stake_errors() {
+        let mut state = WalletState::new();
+        let idle = ProposedTx::EMPTY;
+        assert!(!idle.is_in_progress());
+        state.send_error = "Not enough confirmed notes to cover the payment and fee.".to_string();
+        state.stake_error = "Merge notes explicitly before staking.".to_string();
+        state.waiting_for_send = true;
+        state.waiting_for_stake_to_finalizer = true;
+        for _ in 0..3 {
+            state.record_proposal_progress(idle.is_in_progress(), false, WalletTx::EMPTY);
+            state.record_proposal_progress(idle.is_in_progress(), true, WalletTx::EMPTY);
+        }
+        assert_eq!(state.send_error, "Not enough confirmed notes to cover the payment and fee.");
+        assert_eq!(state.stake_error, "Merge notes explicitly before staking.");
+        assert!(state.waiting_for_send && state.waiting_for_stake_to_finalizer);
+
+        // A real proposal's failure is still reported after its slot has been reset.
+        let failed = WalletTx { status: TxStatus::HardFail(BlockHeight::PROPOSED, ErrBuf::from_str("Proof failed.")), ..WalletTx::EMPTY };
+        state.record_proposal_progress(true, false, failed);
+        state.record_proposal_progress(true, true, failed);
+        assert_eq!(state.send_error, "Proof failed.");
+        assert_eq!(state.stake_error, "Proof failed.");
+        assert!(!state.waiting_for_send && !state.waiting_for_stake_to_finalizer);
+    }
+
+    #[test]
+    fn busy_staged_merge_is_rejected_without_a_deferred_action() {
+        // Accept the first request, as the wallet does before preparing its merge.
+        let (first_sender, _first_receiver) = tokio::sync::oneshot::channel();
+        *MERGE_NOTES_STAGE.lock().unwrap() = Some(first_sender);
+        let first = take_ready_staged_merge_notes(false, false, false).unwrap();
+        for (merging, confirming, shielding, expected_reason) in [
+            (true, false, false, "A merge is already in progress"),
+            (false, true, false, "A merge is already in progress"),
+            (false, false, true, "Wallet shielding is in progress"),
+        ] {
+            let (sender, mut receiver) = tokio::sync::oneshot::channel();
+            *MERGE_NOTES_STAGE.lock().unwrap() = Some(sender);
+            assert!(take_ready_staged_merge_notes(merging, confirming, shielding).is_none());
+            let reason = receiver.try_recv().unwrap().unwrap_err();
+            assert!(reason.starts_with(expected_reason), "{reason}");
+            assert!(MERGE_NOTES_STAGE.lock().unwrap().is_none());
+            // Finishing the first operation must not start the rejected second request.
+            assert!(take_ready_staged_merge_notes(false, false, false).is_none());
+        }
+        drop(first);
+    }
+
+    #[test]
     fn funding_merge_is_explicit_and_never_queues_or_retries_a_stake() {
         let mut state = WalletState::new();
         state.funding_values = vec![50_000_000; 21];
@@ -6336,6 +6404,14 @@ mod tests {
         assert!(wallet.begin_unbonding_using_ironwood(TEST_NETWORK, &mut tx, &mut client, &usk, &tree, key).unwrap_err().contains("create action for bond"));
         assert!(wallet.retarget_bond_using_ironwood(TEST_NETWORK, &mut tx, &mut client, &usk, &tree, key, target).unwrap_err().contains("create action for bond"));
         assert!(wallet.claim_bond_using_ironwood(TEST_NETWORK, &mut tx, &mut client, &usk, &tree, key).await.unwrap_err().contains("create action for bond"));
+        let withdrawal = TxOptions {
+            staking_action: Some(StakingAction::WithdrawDelegationBond {
+                amount_zats: 50_000_000, unique_pubkey: key, signature: [0; 64], spends: None,
+            }),
+            ..TxOptions::default()
+        };
+        assert_eq!(wallet.send_zats_no_insert(TEST_NETWORK, &mut tx, &mut client, &[], &usk, &withdrawal).unwrap_err(),
+            "Could not find the unbonding action for this bond; it is not ready to claim.");
         wallet.branch_mismatch = Some((1, 2));
         assert!(wallet.send_ironwood_to_ironwood_zats(TEST_NETWORK, &mut tx, &mut client, &usk, 100_000, &tree, addr, MemoBytes::empty()).unwrap_err().contains("consensus branch"));
         assert!(wallet.reserved_orchard_nfs.is_empty());
