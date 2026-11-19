@@ -2127,7 +2127,8 @@ pub fn ui_left_pane(ui: &mut Context,
             for amt in [ONE_cTAZ / 100, ONE_cTAZ / 10, ONE_cTAZ, 5 * ONE_cTAZ, 10 * ONE_cTAZ, 31 * ONE_cTAZ, 100 * ONE_cTAZ, 141 * ONE_cTAZ, 1000 * ONE_cTAZ, 10000 * ONE_cTAZ] {
                 if (balance as u64) < amt { break; }
                 let quote = ws.send_funding(amt);
-                if quote.needs_merge { found = Some(quote); }
+                // Prefer a merge-fixable shortfall; otherwise keep the first unfundable one (pending funds etc).
+                if quote.needs_merge || (found.is_none() && !quote.can_fund) { found = Some(quote); }
             }
             found.unwrap_or_else(|| ws.send_funding(ONE_cTAZ / 100))
         }, ws.waiting_for_merge, ws.merge_status.clone(), ws.merge_error.clone(), ws.send_error.clone())
@@ -2136,10 +2137,12 @@ pub fn ui_left_pane(ui: &mut Context,
                             if !op_error.is_empty() {
                                 ui.text(frame_strf!(data, "{}", op_error), TextDecl { h: ui.scale(16.0), colour: warn, align: AlignX::Center, ..TextDecl });
                             }
-                            if quote.needs_merge || waiting_for_merge {
+                            if !quote.can_fund {
                                 if let Some(reason) = &quote.reason {
                                     ui.text(frame_strf!(data, "{}", reason), TextDecl { h: ui.scale(16.0), colour: warn, align: AlignX::Center, ..TextDecl });
                                 }
+                            }
+                            if quote.needs_merge || waiting_for_merge {
                                 ui.text("Your funds are spread over too many notes for one transaction. Merging notes pays a network fee (your balance drops only by that fee) and then waits for 3 confirmations before the combined note can be spent. Larger amounts may be disabled until then.", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                                 if button(ui, "Merge notes", quote.needs_merge && !waiting_for_merge) {
                                     wallet_state.lock().unwrap().merge_notes();
@@ -2437,7 +2440,8 @@ pub fn ui_left_pane(ui: &mut Context,
             for amt in [ONE_cTAZ / 100, ONE_cTAZ / 10, ONE_cTAZ, 5 * ONE_cTAZ, 10 * ONE_cTAZ, 31 * ONE_cTAZ, 100 * ONE_cTAZ, 141 * ONE_cTAZ, 1000 * ONE_cTAZ, 10000 * ONE_cTAZ] {
                 if (balance as u64) < amt { break; }
                 let quote = ws.stake_funding(amt);
-                if quote.needs_merge { found = Some(quote); }
+                // Prefer a merge-fixable shortfall; otherwise keep the first unfundable one (pending funds etc).
+                if quote.needs_merge || (found.is_none() && !quote.can_fund) { found = Some(quote); }
             }
             found.unwrap_or_else(|| ws.stake_funding(ONE_cTAZ / 100))
         }, ws.waiting_for_merge, ws.merge_status.clone(), ws.merge_error.clone(), ws.stake_error.clone())
@@ -2446,10 +2450,12 @@ pub fn ui_left_pane(ui: &mut Context,
                         if !op_error.is_empty() {
                             ui.text(frame_strf!(data, "{}", op_error), TextDecl { h: ui.scale(16.0), colour: warn, align: AlignX::Center, ..TextDecl });
                         }
-                        if quote.needs_merge || waiting_for_merge {
+                        if !quote.can_fund {
                             if let Some(reason) = &quote.reason {
                                 ui.text(frame_strf!(data, "{}", reason), TextDecl { h: ui.scale(16.0), colour: warn, align: AlignX::Center, ..TextDecl });
                             }
+                        }
+                        if quote.needs_merge || waiting_for_merge {
                             ui.text("Your funds are spread over too many notes for one transaction. Merging notes pays a network fee (your balance drops only by that fee) and then waits for 3 confirmations before the combined note can be spent. Larger amounts may be disabled until then.", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                             if button(ui, "Merge notes", quote.needs_merge && !waiting_for_merge) {
                                 wallet_state.lock().unwrap().merge_notes();
