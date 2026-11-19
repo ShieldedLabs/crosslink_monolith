@@ -125,6 +125,12 @@ pub static STAKING_STAGE: Mutex<Option<(StakingActionRequest, tokio::sync::onesh
 /// Staged basic send requested over RPC: (value in zatoshis, unified address string, result channel).
 pub static BASIC_SEND_STAGE: Mutex<Option<(u64, String, tokio::sync::oneshot::Sender<Result<String, String>>)>> = Mutex::new(None);
 
+/// Explicit, user-approved RPC consolidation. Returns the submitted transaction id.
+pub static MERGE_NOTES_STAGE: Mutex<Option<tokio::sync::oneshot::Sender<Result<String, String>>>> = Mutex::new(None);
+pub fn take_staged_merge_notes() -> Option<tokio::sync::oneshot::Sender<Result<String, String>>> {
+    MERGE_NOTES_STAGE.lock().unwrap().take().filter(|sender| !sender.is_closed())
+}
+
 /// Takes the staged RPC staking request for the wallet to build, unless its caller has gone (an RPC
 /// client that timed out): nobody would be told about it, and the caller may well have sent it again.
 pub fn take_staged_staking_action() -> Option<(StakingActionRequest, tokio::sync::oneshot::Sender<Result<String, String>>)> {
@@ -208,6 +214,64 @@ pub fn spend_order(values: &[u64]) -> Vec<usize> {
     order
 }
 
+/// A quote for confirmed, witnessable, unreserved Ironwood notes, not the total balance.
+#[derive(Clone, Debug, Default)]
+pub struct FundingQuote {
+    pub can_fund: bool,
+    pub needs_merge: bool,
+    pub reason: Option<String>,
+    pub max_amount: u64,
+    pub fee_zats: u64,
+    pub eligible_balance: u64,
+    pub eligible_notes: usize,
+}
+
+/// Uses the same bundle padding and fee rule as BuildPrep (including the staking action).
+fn ironwood_fee(spends: usize, outputs: usize, staking: bool) -> u64 {
+    let actions = orchard::builder::BundleType::DEFAULT.num_actions(
+        orchard::bundle::BundleVersion::orchard_v3().default_flags(), spends, outputs,
+    ).expect("valid default bundle");
+    zip317::FeeRule::standard().fee_required(
+        &TEST_NETWORK, LRZBlockHeight::from_u32(1),
+        std::iter::empty(), std::iter::empty(), 0, 0, 0, actions, usize::from(staking),
+    ).expect("bounded Ironwood fee").into_u64()
+}
+
+/// Values are zero for notes which cannot be used. Both the builder and quotes use this order.
+fn funding_quote(values: &[u64], amount: u64, staking: bool) -> FundingQuote {
+    let order = spend_order(values);
+    let cap = order.len().min(MAX_IRONWOOD_SPENDS);
+    let eligible_balance = order.iter().map(|&i| values[i]).sum::<u64>();
+    let capacity = order[..cap].iter().map(|&i| values[i]).sum::<u64>();
+    let outputs = if staking { 1 } else { 2 }; // reserve room for change
+    let max_amount = capacity.saturating_sub(ironwood_fee(cap, outputs, staking));
+    let mut total = 0u64;
+    let mut fee = ironwood_fee(0, outputs, staking);
+    let mut can_fund = false;
+    for (n, &i) in order[..cap].iter().enumerate() {
+        total += values[i];
+        fee = ironwood_fee(n + 1, outputs, staking);
+        if amount.checked_add(fee).is_some_and(|needed| total >= needed) {
+            can_fund = amount > 0;
+            break;
+        }
+    }
+    // A merge burns its own fee; do not suggest it when it cannot make this payment possible.
+    let merge_fee = ironwood_fee(cap, 1, false);
+    let after_merge_notes = order.len().saturating_sub(cap) + usize::from(cap > 0);
+    let after_merge_total = capacity.saturating_sub(merge_fee) + (eligible_balance - capacity);
+    let needs_merge = !can_fund && order.len() > cap &&
+        after_merge_total >= amount.saturating_add(ironwood_fee(after_merge_notes.min(MAX_IRONWOOD_SPENDS), outputs, staking));
+    let reason = if can_fund { None } else if amount == 0 {
+        Some("Amount must be greater than zero.".to_string())
+    } else if needs_merge {
+        Some(format!("This transaction can use at most {MAX_IRONWOOD_SPENDS} notes (capacity {max_amount} zats after fees). Merge notes explicitly, then wait {SPENDABLE_CONFIRMATIONS} confirmations before trying again."))
+    } else {
+        Some(format!("Insufficient eligible funds: {eligible_balance} zats in {} confirmed, positioned, unreserved non-dust notes; at most {max_amount} zats can be sent in one transaction after fees. Pending and unshielded funds cannot be used yet.", order.len()))
+    };
+    FundingQuote { can_fund, needs_merge, reason, max_amount, fee_zats: fee, eligible_balance, eligible_notes: order.len() }
+}
+
 /// Each coin's value if a new transaction may spend it, else 0, which `spend_order` passes over.
 /// A coin stays in `utxos` until the wallet scans the block that spends it, so a coin that a sent
 /// transaction spends still looks unspent; a second spend of it is refused as a double spend.
@@ -239,6 +303,26 @@ impl ManualWallet {
     /// it has scanned, so this trails the network tip while it catches up.
     pub fn confirmations_tip(&self) -> BlockHeight {
         self.chain_tip_h.min(self.sync_h)
+    }
+
+    fn ironwood_values(&self) -> Vec<u64> {
+        let sent_nfs: Vec<_> = self.sent_txs.values().flat_map(|sent| sent.o_spends.iter()).collect();
+        self.accounts[0].unspent_orchard_notes.iter().map(|note| {
+            if note.recv_h.confirmations(self.confirmations_tip()) >= SPENDABLE_CONFIRMATIONS &&
+                note.position != unknown_tree_position() &&
+                !self.reserved_orchard_nfs.contains(&note.nf) && !sent_nfs.contains(&&note.nf) {
+                note.note.value().inner()
+            } else { 0 }
+        }).collect()
+    }
+
+    pub fn funding(&self, amount: u64, staking: bool) -> FundingQuote {
+        funding_quote(&self.ironwood_values(), amount, staking)
+    }
+
+    fn build_error(&self) -> String {
+        if self.last_build_error.is_empty() { "Could not prepare transaction: required keys or bond data are unavailable.".to_string() }
+        else { self.last_build_error.clone() }
     }
 
     /// The transparent coins spent by transactions this wallet has sent and not yet seen expire.
@@ -592,6 +676,7 @@ impl Drop for Timer<'_> {
 enum WalletAction {
     RequestFromFaucet,
     TestStakeAction,
+    MergeNotes,
     StakeToFinalizer(Zatoshis, bft::FinalizerAddress),
     UnstakeFromFinalizer(TxId),
     RetargetBond(TxId, bft::FinalizerAddress),
@@ -1123,6 +1208,11 @@ pub struct WalletState {
     pub waiting_for_send: bool,
     /// Why the last GUI send could not be built; cleared by the next send.
     pub send_error: String,
+    pub stake_error: String,
+    pub waiting_for_merge: bool,
+    pub merge_status: String,
+    pub merge_error: String,
+    funding_values: Vec<u64>,
 
     pub wallets_sync_h: u64,
     pub wallets_tip_h: u64,
@@ -1151,6 +1241,18 @@ impl WalletState {
     pub fn miner_balance(&self)         -> u64 { self.miner_unshielded_funds + self.miner_shielded_spendable_funds + self.miner_shielded_pending_funds }
     pub fn miner_pending_balance(&self) -> u64 { self.miner_shielded_pending_funds }
 
+    pub fn stake_funding(&self, amount: u64) -> FundingQuote { funding_quote(&self.funding_values, amount, true) }
+    pub fn send_funding(&self, amount: u64) -> FundingQuote { funding_quote(&self.funding_values, amount, false) }
+
+    /// User-approved consolidation only. Never queues a stake or retries a failed payment.
+    pub fn merge_notes(&mut self) {
+        if self.waiting_for_merge { return; }
+        self.merge_error.clear();
+        self.merge_status = "Preparing merge (one self note, minus the transaction fee).".to_string();
+        self.waiting_for_merge = true;
+        self.actions_in_flight.push_back(WalletAction::MergeNotes);
+    }
+
     pub fn request_from_faucet(&mut self) {
         self.waiting_for_faucet = true;
 
@@ -1162,12 +1264,17 @@ impl WalletState {
     }
 
     pub fn stake_to_finalizer(&mut self, amount: u64, target_finalizer: bft::FinalizerAddress) {
+        self.stake_error.clear();
+        let Ok(amount) = Zatoshis::from_u64(amount) else {
+            self.stake_error = "Stake amount exceeds the monetary range.".to_string();
+            return;
+        };
         if self.actions_in_flight.iter().filter(|a| match a { WalletAction::StakeToFinalizer(_,_) => true, _ => false }).count() != 0 {
             return;
         }
 
         self.waiting_for_stake_to_finalizer = true;
-        self.actions_in_flight.push_back(WalletAction::StakeToFinalizer(Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_finalizer"), target_finalizer));
+        self.actions_in_flight.push_back(WalletAction::StakeToFinalizer(amount, target_finalizer));
     }
 
     pub fn unstake_from_finalizer(&mut self, txid: [u8; 32]) {
@@ -1640,6 +1747,9 @@ pub struct ManualWallet {
     pub seen_bond_versions: HashMap<[u8; 32], [u8; 32]>,
     pub care_about_bonds: Vec<[u8; 32]>,
     pub sent_txs: HashMap<TxId, SentTx>,
+    /// Includes preparations not yet proved; refreshed from live proposals every wallet round.
+    pub reserved_orchard_nfs: Vec<orchard::note::Nullifier>,
+    pub last_build_error: String,
 }
 
 /// A transaction this wallet sent, kept until it expires so it can be sent again if a reorg
@@ -1650,6 +1760,7 @@ pub struct SentTx {
     pub expiry_h: Option<BlockHeight>,
     pub resent_h: BlockHeight,
     pub t_spends: Vec<OutPoint>,
+    pub o_spends: Vec<orchard::note::Nullifier>,
 }
 // N.B. using some of the same API as WalletDb to allow smooth transition/comparison
 impl ManualWallet {
@@ -1728,6 +1839,8 @@ impl ManualWallet {
                             expiry_h: if expiry_h.0 == 0 { None } else { Some(expiry_h) },
                             resent_h: BlockHeight::INVALID,
                             t_spends,
+                            o_spends: [tx.orchard_bundle(), tx.ironwood_bundle()].into_iter().flatten()
+                                .flat_map(|bundle| bundle.actions().iter().map(|action| *action.nullifier())).collect(),
                         });
                     } else {
                         println!("node rejected transaction {:?} ({}): {}", tx.txid(), resp.error_code, resp.error_message);
@@ -1845,11 +1958,10 @@ impl ManualWallet {
     pub fn send_zats_no_insert<P: Parameters>(
         &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>, outputs: &[TxOutput],
         src_usk: &UnifiedSpendingKey, opts: &TxOptions<'_>
-    ) -> Option<()>
+    ) -> Result<(), String>
     {
         if let Some((node_branch, wallet_branch)) = self.branch_mismatch {
-            println!("tx build refused: the node is on consensus branch {node_branch:08x}, but the wallet's network parameters give {wallet_branch:08x}");
-            return None;
+            return Err(format!("tx build refused: the node is on consensus branch {node_branch:08x}, but the wallet's network parameters give {wallet_branch:08x}"));
         }
 
         let block_h = self.chain_tip_h.0 + 1;
@@ -1873,7 +1985,7 @@ impl ManualWallet {
                     if has_transparent_src {
                         println!("build error: repeated transparent source pool (can only have 1)");
                         // ALT: ignore the latter ones?
-                        return None;
+                        return Err("Repeated source pool in transaction options.".to_string());
                     }
                     has_transparent_src = true;
                 }
@@ -1882,7 +1994,7 @@ impl ManualWallet {
                     if has_orchard_src {
                         println!("build error: repeated orchard source pool (can only have 1)");
                         // ALT: ignore the latter ones (maybe iff they have the same anchor)?
-                        return None;
+                        return Err("Repeated source pool in transaction options.".to_string());
                     }
                     has_orchard_src = true;
                     // TODO: balance:
@@ -1897,8 +2009,7 @@ impl ManualWallet {
                     orchard_anchor = match shardtree.root_at_checkpoint_id(&orchard_anchor_h).expect("Infallible MemoryShardStore") {
                         Some(root) => orchard::Anchor::from(root),
                         None => {
-                            println!("tx build: couldn't get anchor at {orchard_anchor_h:?}");
-                            return None;
+                            return Err(format!("tx build: couldn't get anchor at {orchard_anchor_h:?}"));
                         }
                     }
                 }
@@ -1910,8 +2021,7 @@ impl ManualWallet {
         let mut t_pubkey = None;
         if has_transparent_src {
             let Some((pubkey, privkey)) = transparent_keys_from_usk(&src_usk, 0) else {
-                println!("tried to send from transparent source without available transparent keys");
-                return None;
+                return Err(format!("tried to send from transparent source without available transparent keys"));
             };
             signing_set.add_key(privkey);
             t_pubkey = Some(pubkey);
@@ -1959,8 +2069,8 @@ impl ManualWallet {
             None => (),
 
             Some(StakingAction::CreateNewDelegationBond { amount_zats, .. }) => {
-                b.sent(to_zats_or_dump_err("tx build: new bond", amount_zats)?, true)?;
-                b.recv(to_zats_or_dump_err("tx build: new bond", amount_zats)?, true)?;
+                b.sent(to_zats_or_dump_err("tx build: new bond", amount_zats).ok_or_else(|| "Amount is outside the monetary range.".to_string())?, true).ok_or_else(|| "Transaction value exceeds the monetary range.".to_string())?;
+                b.recv(to_zats_or_dump_err("tx build: new bond", amount_zats).ok_or_else(|| "Amount is outside the monetary range.".to_string())?, true).ok_or_else(|| "Transaction value exceeds the monetary range.".to_string())?;
                 if DUMP_TX_BUILD { println!("  added new staking position: {}", amount_zats); }
             },
 
@@ -1983,25 +2093,24 @@ impl ManualWallet {
                 // TODO: check it hasn't already been unbonded
                 let Some(bond_tx) = self.txs.iter().find(|t| t.staking_action.filter(|s| s.kind() == StakingActionKind::BeginDelegationUnbonding).map(|s| s.bond_key()).unwrap_or_default() == *bond_key) else {
                     println!("Could not find bond {:?} that was ready to claim.", bond_key);
-                    return None;
+                    return Err("Repeated source pool in transaction options.".to_string());
                 };
 
                 // fee comes from bond itself
                 // TODO: does this now have the correct amount?
-                b.spent(to_zats_or_dump_err("tx build: new bond", amount_zats)?, true)?;
+                b.spent(to_zats_or_dump_err("tx build: new bond", amount_zats).ok_or_else(|| "Amount is outside the monetary range.".to_string())?, true).ok_or_else(|| "Transaction value exceeds the monetary range.".to_string())?;
                 if DUMP_TX_BUILD { println!("  withdrawing bond: {}", amount_zats); }
             },
 
             Some(StakingAction::ConvertFinalizerRewardToDelegationBond { amount_zats, .. }) => {
-                b.recv(to_zats_or_dump_err("tx build: convert finalizer reward", amount_zats)?, true)?;
+                b.recv(to_zats_or_dump_err("tx build: convert finalizer reward", amount_zats).ok_or_else(|| "Amount is outside the monetary range.".to_string())?, true).ok_or_else(|| "Transaction value exceeds the monetary range.".to_string())?;
                 if DUMP_TX_BUILD { println!("  converting finalizer reward into a bond: {}", amount_zats); }
             },
         }
 
         let staking_action = if let Some(staking_action) = opts.staking_action {
             if let Err(err) = txb.put_staking_action(staking_action) {
-                println!("tx build staking action error: {err:?}");
-                return None;
+                return Err(format!("tx build staking action error: {err:?}"));
             }
             prep.staking_action = Some(staking_action);
             prep.staking_signing_key = opts.staking_signing_key;
@@ -2014,28 +2123,26 @@ impl ManualWallet {
         for output in outputs {
             match output {
                 &TxOutput::Transparent{ dst, zats } => {
-                    t.sent(zats, true)?;
+                    t.sent(zats, true).ok_or_else(|| "Transaction value exceeds the monetary range.".to_string())?;
                     let is_to_me = t_addr_belongs_to_account(account, dst);
-                    t.maybe_recv(is_to_me, zats, true)?;
+                    t.maybe_recv(is_to_me, zats, true).ok_or_else(|| "Transaction value exceeds the monetary range.".to_string())?;
 
                     if let Err(err) = txb.add_transparent_output(&dst, zats) {
-                        println!("tx build error: {err:?}");
-                        return None;
+                        return Err(format!("tx build error: {err:?}"));
                     }
                     prep.t_outputs.push(ProposedTransparentOutput{ dst, zats });
                     if DUMP_TX_BUILD { println!("  added transparent output: {}", zats.into_u64()); }
                 }
                 &TxOutput::Ironwood{ ref ovk, dst, zats, memo: ref note_memo } => {
-                    s.sent(zats, true)?;
+                    s.sent(zats, true).ok_or_else(|| "Transaction value exceeds the monetary range.".to_string())?;
                     let is_to_me = (dst == *orchard_addr); // TODO: more comprehensive address matching
-                    s.maybe_recv(is_to_me, zats, true)?;
+                    s.maybe_recv(is_to_me, zats, true).ok_or_else(|| "Transaction value exceeds the monetary range.".to_string())?;
 
                     tx.tx.memo_count += !memo_is_empty(note_memo.as_array()) as usize;
                     tx.tx.memo = *note_memo.as_array(); // TODO: handle multiple memos
 
                     if let Err(err) = txb.add_ironwood_output::<zip317::FeeError>(ovk.clone(), dst.clone(), zats, note_memo.clone()) {
-                        println!("tx build error: {err:?}");
-                        return None;
+                        return Err(format!("tx build error: {err:?}"));
                     }
                     prep.o_outputs.push(ProposedOrchardOutput{ ovk: ovk.clone(), dst: dst.clone(), zats, memo: note_memo.clone() });
                     if DUMP_TX_BUILD { println!("  added orchard output: {}", zats.into_u64()); }
@@ -2112,13 +2219,13 @@ impl ManualWallet {
                             println!("tx build: transparent/UTXO spend failed: {err:?}, {:?}", utxo.t_addr);
                             continue;
                         }
-                        t.spent(utxo.value, true)?;
+                        t.spent(utxo.value, true).ok_or_else(|| "Transaction value exceeds the monetary range.".to_string())?;
                         if DUMP_TX_BUILD { println!("  added transparent spend: {}", utxo.value.into_u64()); }
 
                         prep.t_inputs = txb.transparent_inputs().to_vec(); // ALT: do something *not* bad
 
                         total_spend += utxo.value.into_u64();
-                        if (total_spend >= target_send + calc_fee::<P>(&txb, &prep)?) {
+                        if (total_spend >= target_send + calc_fee::<P>(&txb, &prep).ok_or_else(|| "Could not calculate transaction fee.".to_string())?) {
                             break 'src_pool;
                         }
                     }
@@ -2138,7 +2245,7 @@ impl ManualWallet {
                         //     }
                         // }
 
-                        let values: Vec<u64> = account.unspent_orchard_notes.iter().map(|note| note.note.value().inner()).collect();
+                        let values = self.ironwood_values();
                         for i in spend_order(&values) {
                             if prep.o_inputs.len() >= MAX_IRONWOOD_SPENDS { break; }
                             let note = account.unspent_orchard_notes[i];
@@ -2153,12 +2260,10 @@ impl ManualWallet {
                                 // NOTE: presumably can fail from too-recent note
                                 Ok(Some(witness)) => witness,
                                 Ok(None) => {
-                                    println!("tx build: no orchard checkpoint exists at {orchard_anchor_h:?}");
-                                    return None;
+                                    return Err(format!("tx build: no orchard checkpoint exists at {orchard_anchor_h:?}"));
                                 }
                                 Err(err) => {
-                                    println!("tx build: orchard witness error: {err:?}");
-                                    return None;
+                                    return Err(format!("tx build: orchard witness error: {err:?}"));
                                 }
                             };
                             let merkle_path = orchard::tree::MerklePath::from(witness);
@@ -2168,14 +2273,14 @@ impl ManualWallet {
                             }
                             let note_val = note.note.value().inner();
 
-                            s.spent(to_zats_or_dump_err("tx build orchard note", note_val)?, true)?;
+                            s.spent(to_zats_or_dump_err("tx build orchard note", note_val).ok_or_else(|| "Amount is outside the monetary range.".to_string())?, true).ok_or_else(|| "Transaction value exceeds the monetary range.".to_string())?;
                             if DUMP_TX_BUILD { println!("  added orchard spend: {}", note_val); }
 
                             prep.o_inputs.push(ProposedOrchardSpend{ fvk: fvk.clone(), note, witness_merkle_path: merkle_path });
 
 
                             total_spend   += note_val;
-                            if (total_spend >= target_send + calc_fee::<P>(&txb, &prep)?) {
+                            if (total_spend >= target_send + calc_fee::<P>(&txb, &prep).ok_or_else(|| "Could not calculate transaction fee.".to_string())?) {
                                 break 'src_pool;
                             }
                         }
@@ -2184,7 +2289,7 @@ impl ManualWallet {
             }
         }
 
-        let min_spend = target_send + calc_fee::<P>(&txb, &prep)?;
+        let min_spend = target_send + calc_fee::<P>(&txb, &prep).ok_or_else(|| "Could not calculate transaction fee.".to_string())?;
         let change = match total_spend.cmp(&min_spend) {
             std::cmp::Ordering::Less => {
                 if prep.o_inputs.len() >= MAX_IRONWOOD_SPENDS || txb.transparent_inputs().len() >= MAX_TRANSPARENT_SPENDS {
@@ -2192,27 +2297,25 @@ impl ManualWallet {
                 } else {
                     println!("tx build error: can't afford {min_spend}; only {total_spend} available from given sources");
                 }
-                return None
+                return Err(self.funding(target_send, opts.staking_action.is_some()).reason.unwrap_or_else(|| format!("Insufficient funds: need {min_spend} zats including fee; only {total_spend} available.")))
             }, // can't afford
             std::cmp::Ordering::Equal => Zatoshis::const_from_u64(0),
             std::cmp::Ordering::Greater => {
                 // TODO: prefer shielded output
-                let change = to_zats_or_dump_err("tx build change", total_spend - min_spend)?;
+                let change = to_zats_or_dump_err("tx build change", total_spend - min_spend).ok_or_else(|| "Amount is outside the monetary range.".to_string())?;
                 if let Some(ovk) = keys.orchard_ovk {
-                    s.sent(change, true)?;
-                    s.recv(change, true)?;
+                    s.sent(change, true).ok_or_else(|| "Transaction value exceeds the monetary range.".to_string())?;
+                    s.recv(change, true).ok_or_else(|| "Transaction value exceeds the monetary range.".to_string())?;
                     if let Err(err) = txb.add_ironwood_output::<zip317::FeeError>(Some(ovk.clone()), orchard_addr.clone(), change, MemoBytes::empty()) {
-                        println!("tx build: failed to add change: {err:?}");
-                        return None;
+                        return Err(format!("tx build: failed to add change: {err:?}"));
                     };
                     prep.o_outputs.push(ProposedOrchardOutput{ ovk: Some(ovk), dst: orchard_addr.clone(), zats: change, memo: MemoBytes::empty() });
                     if DUMP_TX_BUILD { println!("  added orchard change: {}", change.into_u64()); }
                 } else {
-                    t.sent(change, true)?;
-                    t.recv(change, true)?;
+                    t.sent(change, true).ok_or_else(|| "Transaction value exceeds the monetary range.".to_string())?;
+                    t.recv(change, true).ok_or_else(|| "Transaction value exceeds the monetary range.".to_string())?;
                     if let Err(err) = txb.add_transparent_output(&t_addr, change) {
-                        println!("tx build: failed to add change: {err:?}");
-                        return None;
+                        return Err(format!("tx build: failed to add change: {err:?}"));
                     };
                     prep.t_outputs.push(ProposedTransparentOutput{ dst: t_addr, zats: change });
                     if DUMP_TX_BUILD { println!("  added transparent change: {}", change.into_u64()); }
@@ -2229,7 +2332,8 @@ impl ManualWallet {
             ..tx.tx
         };
         tx.prep = Some(prep);
-        Some(())
+        self.reserved_orchard_nfs.extend(tx.prep.as_ref().unwrap().o_inputs.iter().map(|spend| spend.note.nf));
+        Ok(())
     }
 
     pub fn send_zats<P: Parameters>(
@@ -2237,11 +2341,13 @@ impl ManualWallet {
         src_usk: &UnifiedSpendingKey, opts: &TxOptions<'_>
     ) -> Option<()>
     {
+        self.last_build_error.clear();
         let res = self.send_zats_no_insert(network, tx, client, outputs, src_usk, opts);
+        if let Err(ref reason) = res { self.last_build_error = reason.clone(); }
         // let mut insert_i = 0;
         // update_insert_i(&self.txs, &mut insert_i, tx.tx.h);
         // update_with_tx(self, tx.tx, &mut insert_i);
-        res
+        res.ok()
     }
 
     // NOTE: because we get 2 grace actions, we don't need to try and special-case getting all
@@ -2278,13 +2384,38 @@ impl ManualWallet {
         if let Some(ovk) = keys.orchard_ovk {
             let zats = to_zats_or_dump_err("shielding zats", exact_amount_to_send)?;
             let out = &[TxOutput::Ironwood{ ovk: Some(ovk), dst, zats, memo }];
-            let opts = &TxOptions{ src_pools: &[TxPool::Ironwood(orchard_tree), TxPool::Transparent], ..TxOptions::default() };
+            let opts = &TxOptions{ src_pools: &[TxPool::Ironwood(orchard_tree)], ..TxOptions::default() };
             self.send_zats(network, tx, client, out, src_usk, opts)
         } else {
             None
         }
     }
 
+
+    pub fn merge_ironwood_notes<P: Parameters>(
+        &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
+        src_usk: &UnifiedSpendingKey, tree: &OrchardShardTree,
+    ) -> Result<(), String> {
+        let values = self.ironwood_values();
+        let order = spend_order(&values);
+        let count = order.len().min(MAX_IRONWOOD_SPENDS);
+        if count < 2 { return Err("Merge requires at least two eligible confirmed notes.".to_string()); }
+        let total: u64 = order[..count].iter().map(|&i| values[i]).sum();
+        let fee = ironwood_fee(count, 1, false);
+        let amount = total.checked_sub(fee).filter(|&amount| amount > zip317::MARGINAL_FEE.into_u64())
+            .ok_or_else(|| "Merge output would be dust after paying the fee.".to_string())?;
+        let account = &self.accounts[0];
+        let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
+        let (_, _, ua) = addrs_from_account(account, 0).ok_or_else(|| "Self address is unavailable.".to_string())?;
+        let dst = *ua.orchard().ok_or_else(|| "Ironwood self address is unavailable.".to_string())?;
+        let output = TxOutput::Ironwood { ovk: keys.orchard_ovk, dst,
+            zats: Zatoshis::from_u64(amount).map_err(|_| "Merge amount exceeds monetary range.".to_string())?, memo: MemoBytes::empty() };
+        self.send_zats_no_insert(network, tx, client, &[output], src_usk,
+            &TxOptions { src_pools: &[TxPool::Ironwood(tree)], ..TxOptions::default() })?;
+        debug_assert_eq!(tx.prep.as_ref().unwrap().o_inputs.len(), count);
+        debug_assert_eq!(tx.prep.as_ref().unwrap().o_outputs.len(), 1);
+        Ok(())
+    }
 
     /// The signing key for one of our bonds, recovered from the action that created it
     /// (Create or Convert) in our history.
@@ -2342,22 +2473,23 @@ impl ManualWallet {
         src_usk: &UnifiedSpendingKey, exact_amount_to_send: u64, orchard_tree: &OrchardShardTree, target_finalizer: bft::FinalizerAddress,
     ) -> Option<()>
     {
+        self.last_build_error.clear();
         let tz = Timer::scope("stake_ironwood_to_finalizer");
         // The target capability must verify or consensus will reject the whole tx;
         // refuse to build rather than burn a fee on a doomed action.
         if !target_finalizer.verify() {
-            println!("stake_ironwood_to_finalizer: invalid finalizer address capability");
+            self.last_build_error = "Invalid finalizer address capability.".to_string();
             return None;
         }
         // Consensus takes a small-order key until FeaturenetUpgrade3, but anyone can sign for
         // it: vote with the stake and convert its commission.
         if target_finalizer.pub_key.is_small_order() {
-            println!("stake_ironwood_to_finalizer: the finalizer address has a key anyone can sign for");
+            self.last_build_error = "The finalizer address uses an unsafe small-order key.".to_string();
             return None;
         }
         // From FeaturenetUpgrade1 consensus only accepts new bonds of a power of 10 zats.
         if !zcash_primitives::transaction::is_power_of_10(exact_amount_to_send) {
-            println!("stake_ironwood_to_finalizer: bond amount {exact_amount_to_send} zats is not a power of 10");
+            self.last_build_error = format!("Bond amount {exact_amount_to_send} zats must be a power of ten.");
             return None;
         }
         let account = &self.accounts[0];
@@ -2373,7 +2505,7 @@ impl ManualWallet {
                 zcash_primitives::ed25519_zebra::VerificationKeyBytes::from(&signing_key));
 
             let opts = &TxOptions{
-                src_pools: &[TxPool::Ironwood(orchard_tree), TxPool::Transparent],
+                src_pools: &[TxPool::Ironwood(orchard_tree)],
                 staking_action: Some(StakingAction::CreateNewDelegationBond {
                     amount_zats: exact_amount_to_send,
                     unique_pubkey,
@@ -3469,7 +3601,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             seen_bond_values: HashMap::new(),
             seen_bond_versions: HashMap::new(),
             care_about_bonds: Vec::new(),
-            sent_txs: HashMap::new(),
+            sent_txs: HashMap::new(), reserved_orchard_nfs: Vec::new(), last_build_error: String::new(),
         };
 
         (wallet, account)
@@ -4005,6 +4137,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let mut proposed_user_shield = ProposedTx::EMPTY;
     let mut proposed_stake = ProposedTx::EMPTY;
     let mut proposed_send = ProposedTx::EMPTY;
+    let mut proposed_merge = ProposedTx::EMPTY;
+    let mut merge_sender: Option<tokio::sync::oneshot::Sender<Result<String, String>>> = None;
+    let mut merge_txid: Option<TxId> = None;
 
     let mut rpc_stake: Option<(ProposedTx, tokio::sync::oneshot::Sender<Result<String, String>>)> = None;
     let mut rpc_send:  Option<(ProposedTx, tokio::sync::oneshot::Sender<Result<String, String>>)> = None;
@@ -4873,6 +5008,43 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
+        // Refresh reservations from both preparations and completed proofs, not just broadcasts.
+        // Successful preparations add reservations immediately, so later actions in this round
+        // cannot select the same note. Failed/cleared proposals release them next round.
+        fn proposal_nullifiers(proposals: &[&ProposedTx]) -> Vec<orchard::note::Nullifier> {
+            let mut nfs = Vec::new();
+            for proposed in proposals {
+                if !proposed.is_in_progress() { continue; }
+                if let Some(prep) = proposed.prep.as_ref() {
+                    nfs.extend(prep.o_inputs.iter().map(|spend| spend.note.nf));
+                }
+                if let Some(result) = proposed.tx_res.as_ref() {
+                    for bundle in [result.transaction().orchard_bundle(), result.transaction().ironwood_bundle()].into_iter().flatten() {
+                        nfs.extend(bundle.actions().iter().map(|action| *action.nullifier()));
+                    }
+                }
+            }
+            nfs
+        }
+        let mut user_proposals = vec![&proposed_send, &proposed_stake, &proposed_merge, &proposed_user_shield];
+        if let Some((tx, _)) = rpc_send.as_ref() { user_proposals.push(tx); }
+        if let Some((tx, _)) = rpc_stake.as_ref() { user_proposals.push(tx); }
+        user_wallet.reserved_orchard_nfs = proposal_nullifiers(&user_proposals);
+        miner_wallet.reserved_orchard_nfs = proposal_nullifiers(&[&proposed_faucet, &proposed_miner_shield]);
+        let funding_values = user_wallet.ironwood_values();
+        let eligible_balance: u64 = spend_order(&funding_values).iter().map(|&i| funding_values[i]).sum();
+        let mut merge_update = None;
+        if let Some(id) = merge_txid {
+            let mined = user_wallet.txs.iter().find(|tx| tx.txid == id && tx.is_on_bc() && tx.h.is_in_block());
+            let confirmations = mined.map_or(0, |tx| tx.h.confirmations(user_wallet.confirmations_tip()));
+            if confirmations >= SPENDABLE_CONFIRMATIONS {
+                merge_update = Some((false, format!("Merge confirmed ({SPENDABLE_CONFIRMATIONS} confirmations). You can now retry the payment.")));
+                merge_txid = None;
+            } else {
+                merge_update = Some((true, format!("Merge {id}: waiting for confirmations ({confirmations}/{SPENDABLE_CONFIRMATIONS}).")));
+            }
+        }
+
         //-- SEND DATA TO UI
         {
             if DUMP_NOTES {
@@ -4907,31 +5079,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 user_unshielded_funds += txo.value.into_u64();
             }
 
-            // A note stays in `unspent_orchard_notes` until the wallet scans the block that
-            // spends it, so a send we have already built or broadcast still looks available.
-            // Counting those notes as spendable tells a caller it can spend the same note
-            // twice; the mempool then rejects the second transaction as a double spend.
-            // A user-wallet spend can be in flight in four places: the two proposals the GUI
-            // drives, and the two the RPCs drive.
-            let mut in_flight: [Option<&ProposedTx>; 4] = [Some(&proposed_send), Some(&proposed_stake), None, None];
-            if let Some((tx, _sender)) = rpc_send.as_ref()  { in_flight[2] = Some(tx); }
-            if let Some((tx, _sender)) = rpc_stake.as_ref() { in_flight[3] = Some(tx); }
-
-            let mut committed_nfs: Vec<orchard::note::Nullifier> = Vec::new();
-            for proposed in in_flight {
-                let Some(proposed) = proposed else { continue; };
-                if !proposed.is_in_progress() { continue; }
-                let Some(tx_res) = proposed.tx_res.as_ref() else { continue; };
-                let tx = tx_res.transaction();
-                // Ironwood notes are carried in their own bundle, so an Ironwood send has no
-                // orchard bundle at all; scan both so either pool's inputs are accounted for.
-                for bundle in [tx.orchard_bundle(), tx.ironwood_bundle()] {
-                    let Some(bundle) = bundle else { continue; };
-                    for action in bundle.actions() {
-                        committed_nfs.push(*action.nullifier());
-                    }
-                }
-            }
+            let committed_nfs: Vec<_> = user_wallet.reserved_orchard_nfs.iter().copied()
+                .chain(user_wallet.sent_txs.values().flat_map(|sent| sent.o_spends.iter().copied())).collect();
 
             for note in &user_wallet.accounts[0].unspent_orchard_notes {
                 let val = note.note.value().inner();
@@ -5070,7 +5219,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             wallet_state_push_time = new_wallet_state_push_time;
             *SPENDABLE_FUNDS.lock().unwrap() = Some(zcash_primitives::bft::WalletSpendableFunds {
                 address: user_ua.encode(network),
-                spendable_zats: user_shielded_spendable_funds,
+                spendable_zats: eligible_balance,
                 pending_zats: user_shielded_pending_funds,
                 committed_zats: user_shielded_committed_funds,
                 unshielded_zats: user_unshielded_funds,
@@ -5079,6 +5228,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             // DO NOT DO ANY WORK AFTER THIS LOCK IS TAKEN
             let mut lock = wallet_state.lock().unwrap();
+            lock.funding_values = funding_values;
+            if let Some((waiting, status)) = merge_update {
+                lock.waiting_for_merge = waiting;
+                lock.merge_status = status;
+            }
             lock.waiting_for_send = waiting_for_send;
             lock.waiting_for_faucet = waiting_for_faucet;
             lock.waiting_for_stake_to_finalizer = waiting_for_stake_to_finalizer;
@@ -5139,7 +5293,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // Sent transactions' coins are skipped when building, but one still being built or proven
             // isn't sent yet, so wait for those; the user's stakes and sends wait for this one likewise.
             let user_spend_in_progress = proposed_stake.is_in_progress() || proposed_send.is_in_progress()
-                || rpc_stake.is_some() || rpc_send.is_some();
+                || rpc_stake.is_some() || rpc_send.is_some() || proposed_merge.is_in_progress();
             if !proposed_user_shield.is_in_progress() && !user_spend_in_progress {
                 let values = spendable_utxo_values(&user_wallet.accounts[0].utxos, &user_wallet.t_spends_in_flight());
                 // The spendable coins, not all of them, so a coin freed by an expired send is retried.
@@ -5184,6 +5338,22 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
+        if !proposed_merge.is_in_progress() && merge_txid.is_none() && !proposed_user_shield.is_in_progress() {
+            if let Some(sender) = take_staged_merge_notes() {
+                match user_wallet.merge_ironwood_notes(network, &mut proposed_merge, &mut client, &user_usk, &orchard_tree) {
+                    Ok(()) => {
+                        just_init_new_tx = true;
+                        merge_sender = Some(sender);
+                        let mut state = wallet_state.lock().unwrap();
+                        state.waiting_for_merge = true;
+                        state.merge_error.clear();
+                        state.merge_status = "Preparing explicitly requested merge.".to_string();
+                    }
+                    Err(reason) => { let _ = sender.send(Err(reason)); }
+                }
+            }
+        }
+
         if rpc_stake.is_none() && !proposed_user_shield.is_in_progress() {
             let staged_action = take_staged_staking_action();
             if let Some((request, sender)) = staged_action {
@@ -5205,7 +5375,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                 match res {
                     None => {
-                        sender.send(Err("failed to create staking transaction from notes".to_string()));
+                        sender.send(Err(user_wallet.build_error()));
                     }
                     Some(()) => {
                         println!("prepared notes for RPC-requested staking action");
@@ -5234,7 +5404,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             just_init_new_tx = true;
                             rpc_send = Some((tx, sender));
                         } else {
-                            let _ = sender.send(Err("failed to create send transaction from notes".to_string()));
+                            let _ = sender.send(Err(user_wallet.build_error()));
                         }
                     }
                 }
@@ -5303,6 +5473,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                 &WalletAction::StakeToFinalizer(amount, target_finalizer) => {
                     let ok = user_wallet.stake_ironwood_to_finalizer(network, &mut proposed_stake, &mut client, &user_usk, amount.into_u64(), &orchard_tree, target_finalizer).is_some();
+                    if !ok {
+                        let mut state = wallet_state.lock().unwrap();
+                        state.stake_error = user_wallet.build_error();
+                        state.waiting_for_stake_to_finalizer = false;
+                    }
                     println!("Try stake: {ok:?}");
                     just_init_new_tx |= ok;
                     ok
@@ -5316,7 +5491,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         if DUMP_ACTIONS { println!("Try user send: {ok:?}"); }
                         if !ok {
                             // The modal closed on the click, so the wallet tab is the only place left to say so.
-                            wallet_state.lock().unwrap().send_error = "Could not build the send. Check that funds are confirmed and cover the fee.".to_string();
+                            let mut state = wallet_state.lock().unwrap();
+                            state.send_error = user_wallet.build_error();
+                            state.waiting_for_send = false;
                         }
                         true // ALT ok
                     } else {
@@ -5356,6 +5533,19 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     ok
                 }
 
+                &WalletAction::MergeNotes => {
+                    let result = if proposed_merge.is_in_progress() || merge_txid.is_some() {
+                        Err("A merge is already in progress; wait for three confirmations.".to_string())
+                    } else {
+                        user_wallet.merge_ironwood_notes(network, &mut proposed_merge, &mut client, &user_usk, &orchard_tree)
+                    };
+                    let mut state = wallet_state.lock().unwrap();
+                    match result {
+                        Ok(()) => { just_init_new_tx = true; state.waiting_for_merge = true; }
+                        Err(reason) => { state.merge_error = reason; state.waiting_for_merge = false; state.merge_status.clear(); }
+                    }
+                    true // explicit action is consumed even on failure: no automatic retry
+                }
                 &WalletAction::TestStakeAction => true,
             };
 
@@ -5466,11 +5656,26 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             continue_proposed_tx(&mut user_wallet,  network, &mut proposed_stake,        &mut client, "stake",        DUMP_TX_SEND).await;
             continue_proposed_tx(&mut user_wallet,  network, &mut proposed_send,         &mut client, "send",         DUMP_TX_SEND).await;
 
+            if proposed_merge.is_in_progress() {
+                let progress = continue_proposed_tx(&mut user_wallet, network, &mut proposed_merge, &mut client, "merge notes", DUMP_TX_SEND).await;
+                if progress.h == BlockHeight::SENT && progress.status == TxStatus::OnBc {
+                    merge_txid = Some(progress.txid);
+                    if let Some(sender) = merge_sender.take() { let _ = sender.send(Ok(progress.txid.to_string())); }
+                } else if !proposed_merge.is_in_progress() {
+                    let reason = format!("Merge transaction failed: {:?}. No payment was retried.", progress.status);
+                    let mut state = wallet_state.lock().unwrap();
+                    state.merge_error = reason.clone();
+                    state.merge_status.clear();
+                    state.waiting_for_merge = false;
+                    if let Some(sender) = merge_sender.take() { let _ = sender.send(Err(reason)); }
+                }
+            }
+
             if let Some((mut tx, sender)) = rpc_stake.take() {
                 let tx_progress = continue_proposed_tx(&mut user_wallet, network, &mut tx, &mut client, "rpc stake", DUMP_TX_SEND || true).await;
                 match tx_progress.h {
-                    BlockHeight::INVALID => {
-                        sender.send(Err(format!("failed to build staking action")));
+                    _ if !tx.is_in_progress() && tx_progress.h != BlockHeight::SENT => {
+                        sender.send(Err(format!("Staking transaction failed: {:?}", tx_progress.status)));
                         rpc_stake = None;
                     }
                     BlockHeight::SENT => {
@@ -5493,8 +5698,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             if let Some((mut tx, sender)) = rpc_send.take() {
                 let tx_progress = continue_proposed_tx(&mut user_wallet, network, &mut tx, &mut client, "rpc send", DUMP_TX_SEND).await;
                 match tx_progress.h {
-                    BlockHeight::INVALID => {
-                        let _ = sender.send(Err("failed to build send transaction".to_string()));
+                    _ if !tx.is_in_progress() && tx_progress.h != BlockHeight::SENT => {
+                        let _ = sender.send(Err(format!("Send transaction failed: {:?}", tx_progress.status)));
                     }
                     BlockHeight::SENT => {
                         let _ = sender.send(Ok(format!("{{ \"txid\": {} }}", tx_progress.txid)));
@@ -5798,7 +6003,7 @@ mod tests {
             name: "note-position-test", accounts: vec![account], strms: vec![],
             chain_tip_h: BlockHeight(100), sync_h: BlockHeight(100), branch_mismatch: None,
             txs: vec![], tx_h_map: HashMap::new(), seen_bond_values: HashMap::new(), seen_bond_versions: HashMap::new(), care_about_bonds: vec![],
-            sent_txs: HashMap::new(),
+            sent_txs: HashMap::new(), reserved_orchard_nfs: Vec::new(), last_build_error: String::new(),
         };
         (wallet, keys, note, recipient)
     }
