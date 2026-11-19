@@ -2612,19 +2612,53 @@ const AUTO_ADVANCE_GRACE: Duration = Duration::from_millis(50);
 /// How far the clock driver moves the supplied clock each time, and how often.
 const AUTO_ADVANCE_STEP: Duration = Duration::from_millis(250);
 const AUTO_ADVANCE_EVERY: Duration = Duration::from_millis(2);
+/// The sync loop ticks an instruction must also have outlasted before the clock moves. A tick that
+/// verifies and commits a block runs as long as that takes, so an instruction slowed by a loaded
+/// machine is not taken for one waiting on a timer, as the real-time grace alone took it.
+const AUTO_ADVANCE_IDLE_TICKS: u64 = 3;
+
+/// Set while the instruction in hand is one the clock must not move during: one that waits on the
+/// harness's own work, not the node's timers, however long that takes.
+static TEST_INSTR_KEEPS_CLOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Moves the test's supplied clock (`zebra_debug_time::advance_instant`) while an instruction is
 /// stuck, as tokio's paused clock auto-advances: the node's timers (a retry backoff, the mempool's
 /// verification timeout) run out in milliseconds rather than seconds, and only when nothing else is
 /// left to happen. Never while the BFT engine runs: its rounds run on the same clock, which there
 /// only ADVANCE_TIME moves, so they stay where the file put them.
+///
+/// So that the same input moves the clock the same number of times in every run: an instruction is
+/// stuck once it has outlasted both a real-time grace and a few sync loop ticks (one slowed by a
+/// loaded machine is not), and each step waits for a tick that saw the one before, so the node
+/// takes each step in, rather than however many the machine's speed let by.
 async fn drive_clock() {
+    use std::sync::atomic::Ordering;
+    // The instruction in hand, and how many sync loop ticks were done when this first saw it.
+    let mut seen: Option<(std::time::Instant, u64)> = None;
     loop {
         tokio::time::sleep(AUTO_ADVANCE_EVERY).await;
-        let stuck = TEST_INSTR_RUNNING_SINCE.lock().unwrap().is_some_and(|since| since.elapsed() >= AUTO_ADVANCE_GRACE);
+        let since = *TEST_INSTR_RUNNING_SINCE.lock().unwrap();
+        let ticks = zebra_state::new_network::SYNC_TICKS_DONE.load(Ordering::Acquire);
+        let Some(since) = since else {
+            seen = None;
+            continue;
+        };
+        let ticks_at_start = match seen {
+            Some((seen_since, at_start)) if seen_since == since => at_start,
+            _ => {
+                seen = Some((since, ticks));
+                ticks
+            }
+        };
+        // The ticks are not woken: woken ticks come so fast that a few go by before a block's
+        // commit begins, and an instruction waiting on that commit was taken for a stuck one.
+        let stuck = since.elapsed() >= AUTO_ADVANCE_GRACE
+            && ticks >= ticks_at_start + AUTO_ADVANCE_IDLE_TICKS
+            && !TEST_INSTR_KEEPS_CLOCK.load(Ordering::Acquire);
         if stuck && !bft_engine_running() && zebra_debug_time::instant_is_supplied() {
             zebra_debug_time::advance_instant(AUTO_ADVANCE_STEP);
-            zebra_state::new_network::wake_sync_loop_now();
+            // In step with the node: the next step waits for a sync loop tick that saw this one.
+            sync_settle().await;
         }
     }
 }
@@ -3184,6 +3218,7 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
                     _ => None,
                 };
                 if !is_delivery || peer.is_some_and(|peer| racing_peers.contains(&peer)) {
+                    TEST_INSTR_KEEPS_CLOCK.store(false, std::sync::atomic::Ordering::Release);
                     *TEST_INSTR_RUNNING_SINCE.lock().unwrap() = Some(std::time::Instant::now());
                     futures::future::join_all(racing.drain(..)).await;
                     *TEST_INSTR_RUNNING_SINCE.lock().unwrap() = None;
@@ -3227,6 +3262,9 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
                     | TestInstr::BftRecvProposal { .. }
                     | TestInstr::AdvanceTime { .. }
             );
+            // The staking replay is the harness's computation, which a loaded machine slows past the
+            // clock driver's grace.
+            TEST_INSTR_KEEPS_CLOCK.store(matches!(instr, TestInstr::ExpectStakingReplayMatches), std::sync::atomic::Ordering::Release);
             let failed_before = TEST_FAILED_INSTR_IDXS.lock().unwrap().len();
             *TEST_LAST_CHECK.lock().unwrap() = None;
             let start = std::time::Instant::now();
