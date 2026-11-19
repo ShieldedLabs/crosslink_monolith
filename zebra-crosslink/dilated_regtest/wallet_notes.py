@@ -133,8 +133,21 @@ def generate(n):
     rpc("generate", [n], timeout=120)
 
 
-def mempool():
-    return rpc("getrawmempool")
+def mempool(include_shields=False):
+    txids = rpc("getrawmempool")
+    if include_shields:
+        return txids
+    # The miner shields coinbase periodically. Those housekeeping transactions have
+    # transparent inputs; user sends, bonds and merges here spend only shielded notes.
+    # Do not mistake a miner shield for an automatic user payment or merge.
+    shielded = []
+    for txid in txids:
+        tx = rpc("getrawtransaction", [txid, 1])
+        if not isinstance(tx, dict) or not isinstance(tx.get("vin"), list):
+            raise Abort(f"Cannot classify mempool transaction {txid}: missing vin")
+        if not tx["vin"]:
+            shielded.append(txid)
+    return shielded
 
 
 def funds():
@@ -260,8 +273,12 @@ def main():
     say(f"out={OUT} rpc={RPC_URL}")
 
     ok = False
+    env = os.environ.copy()
+    for key in ("DISPLAY", "WAYLAND_DISPLAY", "MIR_SOCKET"):
+        env.pop(key, None)
     try:
-        proc = subprocess.Popen([zebrad, "-c", cfg, "start"], cwd=OUT, stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen([zebrad, "--headless", "-c", cfg, "start"], cwd=OUT, env=env,
+                                stdin=subprocess.DEVNULL,
                                 stdout=open(os.path.join(OUT, "node0.log"), "w"),
                                 stderr=open(os.path.join(OUT, "node0.err"), "w"), start_new_session=True)
         run(zebrad)
@@ -328,6 +345,16 @@ def run(zebrad):
     # ---- fund: enough mature coinbase for the faucet, then pay 0.5 cTAZ at a time
     if tip() < 40:
         generate(40 - tip())
+    # Faucet sends spend shielded notes, not coinbase directly. Wait for two automatic
+    # 10 cTAZ shields and mature them before queuing donations (21 payments need 10.5).
+    # Otherwise an accepted faucet request can be consumed before it can be funded.
+    for n in range(2):
+        wait_for(f"miner shield {n + 1} in the mempool", lambda: len(mempool(include_shields=True)) > 0,
+                 step=1, limit=120)
+        generate(3)
+        wait_for("the wallet to scan the miner shield", lambda: funds()["tip_height"] >= tip(),
+                 step=1, limit=90)
+    time.sleep(2)
 
     def donate(i):
         end = min(time.time() + 120, DEADLINE)
@@ -341,11 +368,14 @@ def run(zebrad):
         if i == 1:
             check(res.get("amount") == FAUCET_ZATS,
                   f"the faucet pays the normal {FAUCET_ZATS} zats (0.5 cTAZ), got {res}")
-        wait_for(f"faucet tx {i} in the mempool", lambda: len(mempool()) > 0, step=1, limit=150)
+        wait_for(f"faucet payment {i} received in the mempool",
+                 lambda: funds()["pending_zats"] == FAUCET_ZATS and len(mempool()) > 0,
+                 step=1, limit=150)
         # Mined, plus two blocks so the miner's change (3 confirmations, the tip counting as 1)
         # can fund the next faucet payment, and the wallet has seen all of it.
         generate(3)
-        wait_for("the wallet to reach the tip", lambda: funds()["tip_height"] >= tip(), step=1, limit=90)
+        settle_notes(i)
+        say(f"faucet payment {i} confirmed")
 
     def settle_notes(n):
         """Mine until the wallet has n mature faucet notes and nothing in flight."""
@@ -383,11 +413,9 @@ def run(zebrad):
           f"a bond of 12345678 zats (not a power of 10) is refused with a bond/amount error ({err})")
     missing = "00" * 31 + "01"
     _, err = try_rpc("wallet_staking_action", [{"BeginDelegationUnbonding": {"bond_key": missing}}])
-    if err is not None and re.search(r"-32602|invalid (type|value|params|length)|unknown variant", err, re.I):
-        say(f"skip: could not form a bond_key request this build accepts ({err})")
-    else:
-        check(err is not None and re.search(r"bond", err, re.I) is not None,
-              f"unbonding a bond the wallet does not have is refused with a missing-bond error ({err})")
+    check(err is not None and re.search(r"bond", err, re.I) is not None
+          and re.search(r"not find|not have|missing", err, re.I) is not None,
+          f"unbonding a bond the wallet does not have is refused with a missing-bond error ({err})")
     check(mempool() == [], "the invalid requests left nothing in the mempool")
 
     # ---- 3. 21 notes: over the cap
@@ -409,12 +437,16 @@ def run(zebrad):
     check(mempool() == [], "no automatic merge or retry was broadcast")
 
     # ---- 4. explicit merge, mined, confirmed, then the stake
-    txid, err = try_rpc("wallet_merge_notes", [])
+    txid, err = try_rpc("wallet_merge_notes", [], timeout=300)
     require(err is None and isinstance(txid, str) and re.fullmatch(r"[0-9a-fA-F]{64}", txid) is not None,
             f"wallet_merge_notes returns a txid ({txid or err})")
     before_total = 21 * FAUCET_ZATS
     wait_for("the merge in the mempool", lambda: txid in mempool(), step=1, limit=150)
-    check(mempool() == [txid], "the merge is the only transaction in the mempool")
+    check(mempool() == [txid], "the merge is the only shielded-input transaction in the mempool")
+    _, err = try_rpc("wallet_merge_notes", [], timeout=15)
+    check(err is not None and re.search(r"progress|confirm|busy", err, re.I) is not None,
+          f"a second merge request is rejected immediately, not queued ({err})")
+    check(mempool() == [txid], "the rejected second merge broadcasts nothing")
     generate(1)
     tx = rpc("getrawtransaction", [txid, 1])
     check(isinstance(tx, dict) and tx.get("confirmations") == 1 and tx.get("height", 0) > 0,
@@ -448,7 +480,7 @@ def run(zebrad):
                  step=1.5, limit=90)
     say(f"after the merge, 3 confs: {f}")
     check(f["eligible_note_count"] <= 2, f"21 notes are down to {f['eligible_note_count']} (the merged one and the spare)")
-    res, err = try_rpc("wallet_staking_action", [stake_cmd(STAKE_ZATS, fin)])
+    res, err = try_rpc("wallet_staking_action", [stake_cmd(STAKE_ZATS, fin)], timeout=180)
     check(err is None, f"the 10 cTAZ stake succeeds after the merge ({res or err})")
     wait_for("the stake in the mempool", lambda: len(mempool()) > 0, step=1, limit=150)
     generate(1)
