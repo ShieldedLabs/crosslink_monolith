@@ -247,18 +247,41 @@ def main():
     except RpcError as e:
         say(f"FAIL: unexpected RPC error: {e}")
         failures.append(f"unexpected RPC error: {e}")
+    except Exception as e:  # a bug in the test or an odd reply: fail, and keep the logs
+        say(f"FAIL: unexpected {type(e).__name__}: {e}")
+        failures.append(f"unexpected {type(e).__name__}: {e}")
     finally:
         if proc is not None and proc.poll() is not None:
             say(f"note: zebrad exited early with status {proc.returncode}")
         errs = [l for l in node_log().splitlines() if " ERROR " in l or "panicked" in l]
         if errs:
             say(f"node logged {len(errs)} ERROR/panic line(s); first: {errs[0][:200]}")
-        cleanup(success=not failures, keep=a.keep)
+        cleanup(success=ok, keep=a.keep)
     if failures:
         say(f"FAILED ({len(failures)}): " + "; ".join(failures) + f"; logs in {OUT}")
         return 1
     say("PASS")
     return 0
+
+
+def require(cond, msg):
+    """A check later steps depend on: stop at once instead of waiting through them."""
+    if not check(cond, msg):
+        raise Abort(f"cannot continue: {msg}")
+
+
+def find_keys(obj, needle):
+    """Every (key, value) in a decoded JSON tree whose key contains needle, case-insensitively."""
+    out = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if needle in k.lower():
+                out.append((k, v))
+            out += find_keys(v, needle)
+    elif isinstance(obj, list):
+        for v in obj:
+            out += find_keys(v, needle)
+    return out
 
 
 def run(zebrad):
@@ -349,7 +372,7 @@ def run(zebrad):
           f"({f['max_stake_zats']}) stays below 10 cTAZ although 10.5 cTAZ is spendable")
     check(f["max_send_zats"] < f["spendable_zats"], "max_send_zats is below spendable_zats (input cap)")
     _, err = try_rpc("wallet_staking_action", [stake_cmd(STAKE_ZATS, fin)])
-    check(err is not None, "the 10 cTAZ stake from 21 notes fails before any merge")
+    require(err is not None, "the 10 cTAZ stake from 21 notes fails before any merge")
     say(f"      error was: {err}")
     check(err is not None and re.search(r"\b20\b", err) and re.search(r"note|input", err, re.I)
           and re.search(r"merge|consolidat|combine", err, re.I),
@@ -359,9 +382,9 @@ def run(zebrad):
 
     # ---- 4. explicit merge, mined, confirmed, then the stake
     txid, err = try_rpc("wallet_merge_notes", [])
-    if not check(err is None and isinstance(txid, str) and re.fullmatch(r"[0-9a-fA-F]{64}", txid),
-                 f"wallet_merge_notes returns a txid ({txid or err})"):
-        raise Abort("merge did not start")
+    require(err is None and isinstance(txid, str) and re.fullmatch(r"[0-9a-fA-F]{64}", txid) is not None,
+            f"wallet_merge_notes returns a txid ({txid or err})")
+    before_total = 21 * FAUCET_ZATS
     wait_for("the merge in the mempool", lambda: txid in mempool(), step=1, limit=150)
     check(mempool() == [txid], "the merge is the only transaction in the mempool")
     generate(1)
@@ -372,9 +395,19 @@ def run(zebrad):
              lambda: funds()["pending_zats"] > 0 and funds()["committed_zats"] == 0, step=1, limit=60)
     f = funds()
     say(f"after the merge, 1 conf: {f}")
+    # Fee conservation: the merge moves value into one self note and burns only the fee.
+    total = f["spendable_zats"] + f["pending_zats"] + f["committed_zats"]
+    fee = before_total - total
+    check(f["committed_zats"] == 0 and 0 < fee <= ZAT // 100,
+          f"the merge conserved value up to a fee: wallet total {total} of {before_total}, fee {fee} zats")
+    bal = [v for k, v in find_keys(tx, "valuebalance") if isinstance(v, int) and v != 0]
+    if bal:
+        check(all(abs(v) == fee for v in bal), f"the merge transaction's shielded value balance {bal} equals the wallet's fee {fee}")
+    else:
+        say("note: getrawtransaction shows no shielded value balance field; the fee was checked from wallet totals only")
     check(f["max_stake_zats"] < STAKE_ZATS, "the merged note is immature, so 10 cTAZ is not stakeable yet")
     _, err = try_rpc("wallet_staking_action", [stake_cmd(STAKE_ZATS, fin)])
-    check(err is not None, "a stake while the merge output has 1 confirmation is refused")
+    require(err is not None, "a stake while the merge output has 1 confirmation is refused")
     say(f"      error was: {err}")
     check(err is not None and re.search(r"confirm|wait|pending|mature|immature", err, re.I) is not None,
           "the refusal gives a wait reason (confirmations / pending change)")
