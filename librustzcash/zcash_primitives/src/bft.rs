@@ -1402,14 +1402,23 @@ pub struct ScanBond {
 ///
 /// A note is spendable once it has `SPENDABLE_CONFIRMATIONS` (3) confirmations, counted inclusively
 /// (a note in the tip block has 1) against the lower of the chain tip and the wallet's scanned
-/// height. The transaction builder uses the same rule, so a send of `spendable_zats` (less the fee)
-/// has the funds it needs and a larger one does not.
+/// height. Eligible notes also need a known tree position, must be worth more than their marginal
+/// fee, and must not be reserved by an in-flight transaction. `spendable_zats` is their total;
+/// `max_send_zats` and `max_stake_zats` additionally account for the per-transaction input cap and fee.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WalletSpendableFunds {
     /// The wallet's own unified address, the destination other wallets pay to.
     pub address: std::string::String,
-    /// Shielded value that can be spent now.
+    /// Total eligible shielded value, before per-transaction fees and input limits.
     pub spendable_zats: u64,
+    /// Largest shielded send fundable in one transaction, after its fee.
+    pub max_send_zats: u64,
+    /// Largest bond fundable in one transaction, after its fee (not quantized to bond sizes).
+    pub max_stake_zats: u64,
+    /// Number of eligible notes, before applying the per-transaction limit.
+    pub eligible_note_count: usize,
+    /// Maximum shielded notes consumed by one transaction.
+    pub max_notes_per_tx: usize,
     /// Shielded value with too few confirmations to spend yet.
     pub pending_zats: u64,
     /// Shielded value whose notes are already consumed by a send of ours that has been built
