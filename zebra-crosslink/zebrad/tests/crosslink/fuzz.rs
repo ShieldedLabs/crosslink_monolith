@@ -576,14 +576,24 @@ fn offer_tx(g: &mut FuzzGen, c: &mut Choices, tx: &Arc<Transaction>, flags: u32)
 }
 
 /// Whether a transaction built for `main`'s next block is built for the node's next block too. The
-/// node may hold a tip `main` does not (the tip unknown), up to the highest rival's, and the
-/// mempool checks a transaction against the network upgrade of the block after the node's tip:
-/// with an activation that close, that is another upgrade's.
+/// mempool checks a transaction against the network upgrade of the block after the node's tip, and
+/// with an activation that close, the node's tip may be one under another upgrade's: a rival's
+/// higher one `main` does not have (the tip unknown), or, in race mode, a lower one, where the
+/// blocks delivered since the last other instruction race this one and may not be taken yet.
 fn next_upgrade_known(g: &FuzzGen) -> bool {
     let upgrade = g.tip().next_upgrade();
-    g.tip_known
-        || (g.height()..=g.rival_height.max(g.height()))
-            .all(|height| NetworkUpgrade::current(&g.network, BlockHeight(height + 1)) == upgrade)
+    let racing_blocks = g
+        .tf
+        .instrs
+        .iter()
+        .rev()
+        .take_while(|instr| matches!(instr.kind, TFInstr::LOAD_POW | TFInstr::SUBMIT_TX))
+        .filter(|instr| instr.kind == TFInstr::LOAD_POW)
+        .count();
+    // usize to u32: an input holds far fewer instructions than u32::MAX.
+    let lowest = g.height().saturating_sub(racing_blocks as u32);
+    let highest = if g.tip_known { g.height() } else { g.rival_height.max(g.height()) };
+    (lowest..=highest).all(|height| NetworkUpgrade::current(&g.network, BlockHeight(height + 1)) == upgrade)
 }
 
 /// A spend of `coin` paying another key, so it conflicts with `transparent_spend` of the same
@@ -2276,7 +2286,26 @@ pub(crate) fn generate(c: &mut Choices) -> Vec<u8> {
     }
     g.tf.push_instr_expect_node_alive(0);
     g.tf.push_instr_expect_staking_replay_matches(0);
+    add_timing(&mut g.tf, c);
     g.tf.write_to_bytes()
+}
+
+/// Timing the input picks, where the harness otherwise holds the node's clock and the mempool's
+/// view to the node's progress: before some deliveries a CLOCK_STEP_DURING, so a timer of the
+/// node's runs out while the delivery is at work, and before some block loads a MEMPOOL_LAG, so
+/// the mempool sees several blocks at once and resets. The steps stay well below the mempool's
+/// verification timeout (17 s), so the outcomes the moves expect hold however a step falls.
+fn add_timing(tf: &mut TF, c: &mut Choices) {
+    for instr in std::mem::take(&mut tf.instrs) {
+        if matches!(instr.kind, TFInstr::LOAD_POW | TFInstr::SUBMIT_TX | TFInstr::RECV_STP_PACKET) && c.unusual(16) {
+            let millis = [250, 1000, 3000][c.below(3)];
+            tf.push_instr_clock_step_during(millis, c.below(4) as u64);
+        }
+        if instr.kind == TFInstr::LOAD_POW && c.unusual(12) {
+            tf.push_instr_mempool_lag(1 + c.below(3) as u64);
+        }
+        tf.instrs.push(instr);
+    }
 }
 
 fn fuzz_dir() -> PathBuf {
