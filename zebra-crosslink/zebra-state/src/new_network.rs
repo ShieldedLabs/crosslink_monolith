@@ -4355,15 +4355,26 @@ pub fn sync(
                 let check_pow = !network.disable_pow();
 
                 // The agreed order: header (PoW gate) -> body (merkle binds the height) ->
-                // crosslink gate -> expensive. The crosslink gate MUST come after the body:
-                // it makes permanent, height-keyed decisions, and until the merkle root is
-                // checked the height is not bound to the PoW'd header.
+                // commitment (binds the fat pointer to the PoW) -> crosslink gate -> expensive.
+                // The crosslink gate MUST come after the body: it makes permanent, height-keyed
+                // decisions, and until the merkle root is checked the height is not bound to the
+                // PoW'd header.
                 let cheap_result = if let Some(cheap) = &fate.cheap_checks {
                     Ok(cheap.clone())
                 } else {
                     let res = (verify_fns.check_header)(&block_arc.header, &network, block::Height(height), zebra_debug_time::now(), check_pow)
                         .map_err(|err| ("header", err))
-                        .and_then(|()| (verify_fns.check_body)(&block_arc, &network, block::Height(height)).map_err(|err| ("body", err)));
+                        .and_then(|()| (verify_fns.check_body)(&block_arc, &network, block::Height(height)).map_err(|err| ("body", err)))
+                        // Only the commitment binds the fat pointer to the proof of work, so
+                        // check it before the gate and transaction verification (#303). Without
+                        // this, a valid block with a swapped pointer costs a full verification.
+                        .and_then(|cheap| {
+                            read_state
+                                .block_commitment_is_valid_for_parent(&block_arc)
+                                .map(|()| cheap)
+                                // Debug, to match the text a commit failure reports.
+                                .map_err(|err| ("commitment", BlockVerifyError { msg: format!("{err:?}"), misbehavior_score: 0 }))
+                        });
                     if let Ok(cheap) = &res {
                         fate.cheap_checks = Some(cheap.clone());
                     }

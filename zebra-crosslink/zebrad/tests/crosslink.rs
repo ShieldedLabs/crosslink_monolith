@@ -493,7 +493,7 @@ const FAT_POINTER_BINDING_UPGRADE: u32 = 4 + BONDED_SHIFT as u32;
 /// certificate SUPPLIED_FINALIZER signs. Both are certificates the node admits, so the copy
 /// passes the certificate check and fails only the commitment. A pointer with a changed height
 /// byte or signature list is not a variant this scene offers: the certificate check would refuse
-/// it before the commitment check ran, proving nothing about the binding. Changed signature lists
+/// it as well, so its refusal would prove nothing about the binding. Changed signature lists
 /// are covered by `fat_pointer_binding_on_a_roster_across_featurenet_upgrade_2`.
 fn fat_pointer_binding_scene(tf: &mut TF, network: Network) -> (Arc<Block>, Vec<Arc<Block>>) {
     let miner = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
@@ -543,6 +543,43 @@ fn crosslink_fat_pointer_changed_after_the_commitment_is_refused_from_featurenet
         tf.push_instr_load_pow(block, SHOULD_FAIL);
         tf.push_instr_expect_rejection_reason("InvalidChainHistoryBlockTxAuthCommitment", 0);
         tf.push_instr_expect_pow_chain_length(8 + BONDED_SHIFT, 0);
+        tf.push_instr_expect_pow_tip(&honest.hash(), 0);
+    }
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// A copy of a valid block with a swapped pointer is refused before its transactions are
+/// verified (#303): the reason names the sync loop's `commitment` phase, which a commit failure
+/// does not. The copies arrive first, one citing a BFT block the node does not know, and the
+/// honest block still commits.
+#[test]
+fn crosslink_fat_pointer_changed_after_the_commitment_is_refused_before_transaction_verification() {
+    // The sync loop's "commitment" phase, then the error the commit step would also give.
+    const EARLY_COMMITMENT_REFUSAL: &str = "commitment: InvalidBlockCommitment(InvalidChainHistoryBlockTxAuthCommitment";
+    set_test_name(function_name!());
+    let (mut tf, network) = fat_pointer_binding_node(Some(FAT_POINTER_BINDING_UPGRADE));
+    let (honest, mut copies) = fat_pointer_binding_scene(&mut tf, network);
+
+    let mut unknown = copies[0].header.fat_pointer_to_bft_block.clone();
+    unknown.vote_for_block_without_finalizer_public_key[0] ^= 1;
+    copies.push(Arc::new(Block {
+        header: Arc::new(BlockHeader { fat_pointer_to_bft_block: unknown, ..*honest.header }),
+        ..honest.as_ref().clone()
+    }));
+
+    for block in &copies {
+        tf.push_instr_load_pow(block, SHOULD_FAIL);
+        tf.push_instr_expect_rejection_reason(EARLY_COMMITMENT_REFUSAL, 0);
+        tf.push_instr_expect_pow_chain_length(7 + BONDED_SHIFT, 0);
+    }
+    tf.push_instr_load_pow(&honest, 0);
+    tf.push_instr_expect_pow_chain_length(8 + BONDED_SHIFT, 0);
+    tf.push_instr_expect_pow_tip(&honest.hash(), 0);
+    for block in &copies {
+        tf.push_instr_load_pow(block, SHOULD_FAIL);
+        tf.push_instr_expect_rejection_reason(EARLY_COMMITMENT_REFUSAL, 0);
         tf.push_instr_expect_pow_tip(&honest.hash(), 0);
     }
     tf.push_instr_expect_node_alive(0);
@@ -2271,7 +2308,7 @@ fn test_format_survives_malformed_files_and_odd_blocks() {
 
 /// `block` with one byte of its first spend's unlock script flipped. Transaction ids leave out
 /// unlock scripts (ZIP-244), so the merkle root and the block hash stay the honest block's;
-/// only the auth data commitment, checked at commit, catches it.
+/// only the auth data commitment catches it.
 fn with_forged_signature(block: &Block) -> Block {
     let mut forged = block.clone();
     let spend_i = forged
@@ -2657,9 +2694,10 @@ fn crosslink_honest_block_accepted_after_forged_body_with_its_hash() {
     chain_length += 1;
     tf.push_instr_expect_pow_chain_length(chain_length, 0);
 
-    // a forged signature: it passes every check keyed by the hash and fails only late. The second
-    // time, the same forger forges another block: it is asked for that one, a hash it has not
-    // served bad bytes under, and the honest block again comes from another peer.
+    // a forged signature: it passes every check keyed by the hash and fails only the block
+    // commitment. The second time, the same forger forges another block: it is asked for that
+    // one, a hash it has not served bad bytes under, and the honest block again comes from
+    // another peer.
     for (forged_peer, honest_peer) in [(2, 3), (2, 5)] {
         while gen.mature_coinbase_for(&key).is_none() {
             tf.push_instr_load_pow(&gen.next_block(&miner), 0);
@@ -5214,9 +5252,9 @@ fn crosslink_fat_pointer_certificates_are_hash_only_below_featurenet_upgrade_2()
 /// carry a certificate over the same vote from another valid signer set: the nine after the first
 /// signer, and all ten. Each copy is a strict quorum in roster order under the right namespace, so
 /// it passes the certificate check (`admit_fat_pointer`) and every other rule, and only the
-/// commitment check, which runs after it, can refuse it: that is what makes these copies isolate
-/// the binding. With the upgrade below the scenario the honest block is accepted and each copy
-/// refused with the commitment error; with it above, all three are accepted as siblings.
+/// commitment check can refuse it: that is what makes these copies isolate the binding. With the
+/// upgrade below the scenario the honest block is accepted and each copy refused with the
+/// commitment error; with it above, all three are accepted as siblings.
 fn fat_pointer_binding_on_a_roster_across_featurenet_upgrade_2(upgrade: Option<u32>) {
     let (network, node_config) = network_with_featurenet_upgrade_2_at(&TWELVE_SEATS_PARAMETERS, upgrade);
     let mut tf = TF::new_with_node_config(&TWELVE_SEATS_PARAMETERS, &node_config);

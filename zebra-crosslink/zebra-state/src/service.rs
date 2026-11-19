@@ -634,6 +634,27 @@ impl ReadStateService {
         })
     }
 
+    /// Run the commit step's block commitment check early, on the history tree as of `block`'s
+    /// parent (#303).
+    ///
+    /// Returns `Ok` without checking when the parent has no tree here: a fork below the
+    /// finalized tip, which the commit step refuses.
+    pub(crate) fn block_commitment_is_valid_for_parent(
+        &self,
+        block: &Arc<block::Block>,
+    ) -> Result<(), ValidateContextError> {
+        let parent_hash = block.header.previous_block_hash;
+        // A chain keeps the tree as of each of its blocks.
+        let history_tree = self.non_finalized_state_receiver.with_watch_data(|non_finalized_state| {
+            non_finalized_state
+                .chain_iter()
+                .find_map(|chain| chain.history_tree(parent_hash.into()))
+                .or_else(|| (self.db.finalized_tip_hash() == parent_hash).then(|| self.db.history_tree()))
+        });
+        let Some(history_tree) = history_tree else { return Ok(()) };
+        check::block_commitment_is_valid_for_chain_history(block.clone(), &self.network, &history_tree)
+    }
+
     /// The network this state is for.
     pub fn network(&self) -> &Network {
         &self.network
