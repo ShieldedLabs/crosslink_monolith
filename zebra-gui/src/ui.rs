@@ -2437,7 +2437,7 @@ pub fn ui_left_pane(ui: &mut Context,
             // Any fixed amount the total balance covers but the planner cannot fund from one
             // spendable set of notes makes merging relevant; the largest such amount's reason is shown.
             let mut found = None;
-            for amt in [ONE_cTAZ / 100, ONE_cTAZ / 10, ONE_cTAZ, 5 * ONE_cTAZ, 10 * ONE_cTAZ, 31 * ONE_cTAZ, 100 * ONE_cTAZ, 141 * ONE_cTAZ, 1000 * ONE_cTAZ, 10000 * ONE_cTAZ] {
+            for amt in [ONE_cTAZ / 100, ONE_cTAZ / 10, ONE_cTAZ, 10 * ONE_cTAZ, 100 * ONE_cTAZ, 1000 * ONE_cTAZ, 10000 * ONE_cTAZ] {
                 if (balance as u64) < amt { break; }
                 let quote = ws.stake_funding(amt);
                 // Prefer a merge-fixable shortfall; otherwise keep the first unfundable one (pending funds etc).

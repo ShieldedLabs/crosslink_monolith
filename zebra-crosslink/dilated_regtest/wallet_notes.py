@@ -66,12 +66,33 @@ def remaining():
     return left
 
 
-def free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
+USED_PORTS = set()
+
+
+def free_port(offsets=(0,)):
+    # The node derives its lightwallet ports as p2p+10000 and p2p+10001.
+    # Check those too, and avoid a high ephemeral port overflowing the node's u16 addition.
+    for _ in range(100):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            p = s.getsockname()[1]
+        ports = [p + offset for offset in offsets]
+        if max(ports) > 65535 or USED_PORTS.intersection(ports):
+            continue
+        sockets = []
+        try:
+            for port in ports:
+                s = socket.socket()
+                sockets.append(s)
+                s.bind(("127.0.0.1", port))
+        except OSError:
+            continue
+        finally:
+            for s in sockets:
+                s.close()
+        USED_PORTS.update(ports)
+        return p
+    raise Abort("Could not allocate isolated node ports")
 
 
 class RpcError(Exception):
@@ -231,7 +252,8 @@ def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: sys.exit(2))
 
-    ports = {k: free_port() for k in ("rpc", "p2p", "public", "local")}
+    ports = {k: free_port((0, 10000, 10001) if k == "p2p" else (0,))
+             for k in ("rpc", "p2p", "public", "local")}
     RPC_URL = f"http://127.0.0.1:{ports['rpc']}"
     cfg = os.path.join(OUT, "node0.toml")
     open(cfg, "w").write(render_config(ports, int(time.time())))
