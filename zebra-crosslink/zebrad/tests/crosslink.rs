@@ -4540,6 +4540,12 @@ const BFT_TICK_MILLIS: u64 = 251;
 /// picked so that the node proposes round r of height 1 exactly when `node_proposes[r]`. Which
 /// member proposes follows from the stakes and keys alone, so it is known before the node runs.
 fn bft_rounds_scene(tf: &mut TF, node_proposes: &[bool]) -> BftRoundsScene {
+    bft_rounds_scene_loading_to(tf, node_proposes, 111)
+}
+
+/// As `bft_rounds_scene`, generating the same blocks up to BFT activation but loading those
+/// above the bonds only up to `last_loaded`. The rest are in `pow` for the scenario to load.
+fn bft_rounds_scene_loading_to(tf: &mut TF, node_proposes: &[bool], last_loaded: u32) -> BftRoundsScene {
     const STAKE: u64 = 100_000_000;
     let network = regtest_network(&BFT_ROUNDS_PARAMETERS);
     let key = TestKey::new(b"crosslink test miner");
@@ -4583,7 +4589,9 @@ fn bft_rounds_scene(tf: &mut TF, node_proposes: &[bool]) -> BftRoundsScene {
     let mut pow = Vec::new();
     while height(&gen) < 111 {
         let block = gen.next_block(&miner);
-        tf.push_instr_load_pow(&block, 0);
+        if height(&gen) <= last_loaded {
+            tf.push_instr_load_pow(&block, 0);
+        }
         pow.push(block);
     }
     let member_pub_keys: Vec<([u8; 32], u64)> = std::iter::once((node.1 .0, node_stake))
@@ -4675,6 +4683,98 @@ fn crosslink_bft_round_decides_the_nodes_proposal() {
     tf.push_instr_expect_bft_step(2, 0, None, 0);
 
     test_bytes(tf.write_to_bytes());
+}
+
+/// #422: a node syncing from empty, behind a peer that holds decided BFT heights, runs
+/// tenderlink from the head of what it fetched, not from height 1.
+///
+/// The peer answers the node's first BFT_REQ while PoW is still below the activation height. Those
+/// decisions wait for the BFT genesis, which the node derives only at activation, and the peer has
+/// nothing more to send, so no BFT answer arrives for longer than the catch-up evidence lasts
+/// (`BFT_EVIDENCE_WINDOW`). Then PoW reaches activation, the node decides the genesis, and the
+/// fetched decisions are stored. A live tenderlink would otherwise re-decide every stored height
+/// from its peers' rounds, which on the featurenet took hours.
+///
+/// Ignored until #422 is fixed: the node starts tenderlink at height 1 when PoW reaches activation,
+/// since the peer's answer no longer counts as evidence, and the stored decisions never move it.
+#[test]
+#[ignore]
+fn crosslink_bft_fresh_node_behind_its_peers_runs_tenderlink_from_the_fetched_head() {
+    set_test_name(function_name!());
+    test_bytes(fresh_node_behind_its_peers_scene(30_000));
+}
+
+/// As crosslink_bft_fresh_node_behind_its_peers_runs_tenderlink_from_the_fetched_head, but PoW
+/// reaches activation while the peer's answer is still recent catch-up evidence, as it did on
+/// loopback in 37910f1f's live run. Shows the scene's checks can pass, so the test above fails
+/// only for the evidence running out.
+#[test]
+fn crosslink_bft_fresh_node_behind_its_peers_runs_tenderlink_from_the_fetched_head_control() {
+    set_test_name(function_name!());
+    test_bytes(fresh_node_behind_its_peers_scene(1_000));
+}
+
+/// The scene for crosslink_bft_fresh_node_behind_its_peers_runs_tenderlink_from_the_fetched_head,
+/// with PoW reaching activation `lapse_millis` after the peer's answer.
+fn fresh_node_behind_its_peers_scene(lapse_millis: u64) -> Vec<u8> {
+    /// Decided heights the peer holds above the genesis.
+    const DECIDED: u64 = 20;
+    /// The last PoW height loaded before the fetch: below activation, above every snapshot's tail.
+    const BEFORE_ACTIVATION: u32 = 100;
+    const PEER: u64 = 7;
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene_loading_to(&mut tf, &[false], BEFORE_ACTIVATION);
+    assert!(
+        3 * (scene.total_stake - scene.node_stake) >= 2 * scene.total_stake,
+        "the synthetic finalizers decide without the node",
+    );
+
+    // A certificate lists its signers in roster order, by stake and then key, both descending; the
+    // three synthetic finalizers have the same stake.
+    let mut signers: Vec<u64> = scene.finalizers.iter().map(|&k| u64::from(k)).collect();
+    signers.sort_by_key(|&k| std::cmp::Reverse(synthetic_finalizer_pub_key(k)));
+    let seeds: Vec<String> = signers.iter().map(|&k| synthetic_finalizer_seed(k)).collect();
+    let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
+    let mut parent = FatPointerToBftBlock::from_parts(scene.genesis().blake3_hash(), 0, 0, &[]);
+    let mut decided = Vec::new();
+    for height in 1..=DECIDED {
+        // Each finalizes the block after its parent's snapshot, starting above the genesis's.
+        let snapshot = 20 + u32::try_from(height).expect("a small height");
+        assert!(snapshot + BFT_ROUNDS_PARAMETERS.bc_confirmation_depth_sigma as u32 <= BEFORE_ACTIVATION);
+        let block = bft_proposal(&BFT_ROUNDS_PARAMETERS, height as u32, parent.clone(), 0, &scene.tail_above(snapshot));
+        let fat_ptr = signed_fat_pointer(&block, height, 0, &seeds, &[0; 32]);
+        let proposer_seed = match scene.proposer(height, 0) {
+            TF_BFT_THE_NODE => TEST_NODE_FINALIZER_SEED.to_string(),
+            k => synthetic_finalizer_seed(k),
+        };
+        let proposer_key = zebra_crosslink::rng_private_public_key_from_address(proposer_seed.as_bytes()).0;
+        let sigs = bft_proposal_sigs(&proposer_key, &block, 0, -1, &[0; 32]);
+        parent = fat_ptr.clone();
+        decided.push((height, block, fat_ptr, sigs));
+    }
+
+    // The peer says it holds the genesis and DECIDED heights above it, then answers the BFT_REQ
+    // that makes the node send.
+    use zebra_state::new_network::bft_sync;
+    // The node's clock follows real time until a test first moves it. Taking it over here means
+    // the answer ages by `lapse_millis` alone, however long the harness takes.
+    tf.push_instr_advance_time(1, 0);
+    tf.push_instr_recv_stp_packet(&bft_sync::bft_status_packet(DECIDED + 1), PEER, 0);
+    let answer = bft_sync::bft_decisions_packet(decided.iter().map(|(height, block, fat_ptr, sigs)| (*height, block, fat_ptr, sigs.as_slice())));
+    tf.push_instr_recv_stp_packet(&answer, PEER, 0);
+    tf.push_instr_expect_pos_chain_length(0, 0);
+    tf.push_instr_advance_time(lapse_millis, 0);
+    for block in scene.pow.iter().filter(|block| block.coinbase_height().is_some_and(|h| h.0 > BEFORE_ACTIVATION)) {
+        tf.push_instr_load_pow(block, 0);
+    }
+
+    // The decisions are stored on the sync loop's passes after the genesis: a tick, settled.
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_pos_chain_length(DECIDED as usize + 1, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_step(DECIDED + 1, 0, None, 0);
+
+    tf.write_to_bytes()
 }
 
 /// As crosslink_bft_round_decides_the_nodes_proposal, but the synthetic finalizers sign their

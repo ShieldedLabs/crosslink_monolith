@@ -24,7 +24,7 @@ use tenderlink::{dbg_panic, dbg_verify};
 
 mod checkpoint;
 pub mod bft;
-mod bft_sync;
+pub mod bft_sync;
 pub mod tx_relay;
 mod tx_relay_bridge;
 mod tx_relay_state;

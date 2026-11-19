@@ -1571,6 +1571,7 @@ pub(crate) async fn handle_instr(
         instr,
         TestInstr::ExpectPoWTip { .. }
             | TestInstr::ExpectPoWChainLength(_)
+            | TestInstr::ExpectPoSChainLength(_)
             | TestInstr::ExpectFinalizedTip { .. }
             | TestInstr::ExpectPoWBlockFinality(..)
             | TestInstr::ExpectBond(..)
@@ -2497,10 +2498,19 @@ fn bft_engine_running() -> bool {
 }
 
 /// BFT starts on the sync loop's tick after the activation block commits, so it can trail the
-/// instruction that loaded that block. With a bootstrap configured, waits for it to start; the
-/// bound is for a node that never starts it, which the instruction then reports.
+/// instruction that loaded that block. With a bootstrap configured and PoW at its activation
+/// height, waits for it to start; the bound is for a node that never starts it, which the
+/// instruction then reports. Below the activation height BFT is not due, so nothing waits: a wait
+/// there would only let the clock driver move the clock for the instruction.
 async fn bft_await_start(internal_handle: &TFLServiceHandle) {
-    if bft_engine_running() || internal_handle.params.bootstrap.activation_height().is_none() {
+    let Some(activation_height) = internal_handle.params.bootstrap.activation_height() else {
+        return;
+    };
+    if bft_engine_running() {
+        return;
+    }
+    let tip = tokio::time::timeout(NODE_ANSWER_WAIT, (internal_handle.call.state)(StateRequest::Tip)).await;
+    if !matches!(tip, Ok(Ok(StateResponse::Tip(Some((height, _))))) if height.0 >= activation_height) {
         return;
     }
     let _ = tokio::time::timeout(NODE_ANSWER_WAIT, async {
