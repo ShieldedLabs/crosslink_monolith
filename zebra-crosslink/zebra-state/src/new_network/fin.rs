@@ -133,7 +133,7 @@ pub fn candidate(
         return None;
     }
     let bft_height = *chain.hash_to_height.get(&fat_pointer.points_at_block_hash())?;
-    let bft_block = chain.blocks.get(bft_height as usize)?;
+    let bft_block = crate::new_network::bft::decided_block(chain, bft_height as usize)?;
     if bft_block.headers.is_empty() {
         return None;
     }
