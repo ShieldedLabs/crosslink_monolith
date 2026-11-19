@@ -197,7 +197,7 @@ static BFT_DB: RwLock<Option<ZebraDb>> = RwLock::new(None);
 /// The decision stored for `height`, read from the database.
 fn stored_decision(height: usize) -> Option<StoredDecision> {
     let db = BFT_DB.read().unwrap();
-    db.as_ref()?.bft_decisions(u32::try_from(height).ok()?, 1, usize::MAX).into_iter().next()
+    db.as_ref()?.bft_decision(u32::try_from(height).ok()?)
 }
 
 /// The decided block at `height`: the one held in memory, or the stored one below those.
@@ -1414,7 +1414,7 @@ fn height_after(rounds: &[RoundData]) -> u64 {
 /// the height is not stored.
 fn stored_round(db: &ZebraDb, voting: &VotingRoster, height: u64, active_roster_max_n: usize) -> Option<RoundData> {
     let StoredDecision { block, fat_pointer, proposal_sigs } =
-        db.bft_decisions(u32::try_from(height).ok()?, 1, usize::MAX).into_iter().next()?;
+        db.bft_decision(u32::try_from(height).ok()?)?;
     Some(decided_round_data(&block, &fat_pointer, voting.roster.clone(), voting, proposal_sigs, height, active_roster_max_n))
 }
 
@@ -2534,7 +2534,7 @@ impl BftRunner {
         let db = &block_writer.finalized_state.db;
         // The stored chain is replayed one decision at a time, and only its newest blocks are kept
         // (`HeldBlocks`), so it is never all in memory.
-        let stored = |height: usize| db.bft_decisions(u32::try_from(height).ok()?, 1, usize::MAX).into_iter().next();
+        let stored = |height: usize| db.bft_decision(u32::try_from(height).ok()?);
 
         // A tip past the activation height does not mean genesis was stored. Genesis is decided
         // at the start of a tick and the same tick's commit loop can carry the tip past
