@@ -119,7 +119,8 @@ fn quorum_size(n: usize) -> usize {
 fn fixture(kind: Kind, n: usize) -> Fixture {
     assert!(n >= 4);
     let c = config(n);
-    let (mut votes, mut pre, mut group) = (vec![], vec![], CertKind::Jump { round: 1 });
+    let votes: Vec<Vote>;
+    let (mut pre, mut group) = (vec![], CertKind::Jump { round: 1 });
     let (mut jump_round, mut jump_count) = (0, 0);
     match kind {
         Kind::Quorum | Kind::Conflict => {
@@ -271,11 +272,11 @@ fn run(kind: Kind, n: usize, repeats: usize, samples: usize, emit: bool) -> Repo
             f.receive(black_box(e));
         }
         let dt = t.elapsed().as_nanos();
-        let mut total = 0u64;
+        let mut total = 0xcbf29ce484222325u64;
         for e in &engines {
-            total ^= f.check(black_box(e));
+            total = total.rotate_left(7).wrapping_add(f.check(black_box(e)));
         }
-        // Same checksum in every sample (XOR of identical per-engine values).
+        // Ordered accumulation does not cancel identical even-count engines.
         let expect = *sum.get_or_insert(total);
         assert_eq!(total, expect, "non-deterministic result");
         times.push(dt);
