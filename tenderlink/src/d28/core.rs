@@ -152,6 +152,11 @@ impl<S: Storage> Engine<S> {
         if self.d().step == Step::Decided {
             return Ok(());
         }
+        // A verified fresh copy can resolve retained evidence even when its
+        // round/header is not eligible to replace the current proposal slot.
+        if let Some(p) = f.proposal {
+            self.resolve_id(p.header.content.id, status)?;
+        }
         if self.d().step != Step::PreRound {
             self.jump(f, sink)?;
         }
@@ -259,7 +264,7 @@ impl<S: Storage> Engine<S> {
                 sink,
             )?;
         }
-        if self.d().step != Step::PreRound {
+        if !matches!(self.d().step, Step::PreRound | Step::Decided) {
             if let Some(v) = f.outer {
                 if v.content.kind == VoteKind::Enter
                     && self.current(v)

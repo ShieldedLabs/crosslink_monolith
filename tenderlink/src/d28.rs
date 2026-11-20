@@ -838,10 +838,12 @@ impl<S: Storage> Engine<S> {
             return Ok(false);
         }
         self.store.seal_config(config)?;
+        // Preserve the existing grid without postponing service past the new
+        // height's period when trusted INIT changes retransmission parameters.
         let grid = self
             .store
             .descriptor()
-            .map_or(config.rho, |d| d.grid_remaining);
+            .map_or(config.rho, |d| d.grid_remaining.min(config.rho));
         let d = Descriptor {
             height,
             config: config.hash,
