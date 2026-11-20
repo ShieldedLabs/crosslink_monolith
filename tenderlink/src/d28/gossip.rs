@@ -138,6 +138,12 @@ impl<S: Storage> Engine<S> {
                 return Plan::Precommit;
             }
         }
+        // Recovery may have cleared the volatile row after a late polka
+        // advanced VC without changing an already-issued nil precommit.
+        // The retained certificate is still a complete current-round bridge.
+        if d.valid_round == Some(d.round) && d.vc.is_some() {
+            return Plan::Polka;
+        }
         if pv_quorum && self.own_current(VoteKind::Prevote).is_some() {
             return Plan::Prevote;
         }
