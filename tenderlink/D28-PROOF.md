@@ -132,7 +132,9 @@ with Byzantine weight strictly below one third, unforgeable signatures and
 correct non-equivocating signing/recovery. Keep the source's validity premises:
 trimodal validity and determinate latches, the strong M9c bound d for a received
 copy of a body already T at a correct holder, and M9d for a correct fresh
-candidate. Keep weight-blind proposer rotation, so each member is proposer once
+candidate. Specifically, after acquisition at t, a held copy is determinate by
+max(t,s)+d, where s replaces the source's stabilization time T*; soundness
+makes that result T when a correct holder already has T. Keep weight-blind proposer rotation, so each member is proposer once
 in each N-round cycle. Timers do not depend on validity completion.
 
 The following theorem retains source NB/Z/ZG: ready local guards are executed
@@ -181,8 +183,10 @@ to the protocol, such that for each distinct correct ordered pair (p,q), each
 of the four lanes, and each interval [u,u+H] wholly inside the service interval:
 if that lane is available throughout, its periodic offers yield at least one
 frame OFFERED after the start boundary u and processed by q no later than u+H.
-An offer at the same logical timestamp counts only if it follows that boundary
-in execution order; an earlier same-time queued copy does not count. For the
+Use one global total order of events extending each process's local order to
+resolve equal logical timestamps. An offer at the same logical timestamp counts
+only if it follows that boundary in this order; an earlier same-time queued
+copy does not count. For the
 three round-relative lanes the interval must lie wholly within that availability
 context r. For Progress the frame version and sender round may change during
 the interval. Endpoint transitions may be assigned to either adjacent version;
@@ -520,9 +524,10 @@ such a generic service window is sufficient, not claimed necessary or minimal.
 Let C_fast be one FIXED set of actually correct roster members with
 w(C_fast)>2TW/3. It must remain the same set throughout the service window.
 Require the preceding online, height/configuration, NB/Z/ZG, clock, proposal
-and validity premises only for members of C_fast, and BPS only for ordered
-pairs within C_fast. Members outside C_fast need not be online or timely and
-may keep arbitrary stale locks. Retain the full roster's N, weights,
+and bounded-validity (M9c/M9d) premises only for members of C_fast, and BPS only
+for ordered pairs within C_fast. M9a soundness remains a global safety premise
+for every actually correct participant, including slow outsiders. Members
+outside C_fast need not be online or timely and may keep arbitrary stale locks. Retain the full roster's N, weights,
 configuration and proposer rotation; do not renormalize to the fast members.
 Compute m as the maximum round within C_fast and use the same R, W', B', L.
 
