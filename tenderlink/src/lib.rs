@@ -216,27 +216,24 @@ impl std::fmt::Debug for ClosureToFetchDecidedRound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToFetchDecidedRound(..)") }
 }
 
-/// A height the host holds decided, for an engine behind it to take as decided instead of
-/// deciding it again: the round that decided it, built as `ClosureToFetchDecidedRound` builds one,
-/// and the roster, vote namespace and quorum rule of the height after it, as
-/// `ClosureToPushDecidedBlock` answers them.
+/// The host's newest decided height, and the roster, vote namespace and quorum rule of the height
+/// after it, as `ClosureToPushDecidedBlock` answers them. The host publishes it only once that
+/// height's decision is stored, so it can read the round back (`ClosureToFetchDecidedRound`).
 #[derive(Clone, Debug)]
-pub struct DecidedHeight {
-    pub round: RoundData,
+pub struct HostTip {
+    pub height: u64,
     pub next_roster: Vec<SortedRosterMember>,
     pub next_vote_namespace: [u8; 32],
     pub next_strict_quorum: bool,
 }
 
-/// Given the engine's height, synchronously return the heights the host holds decided from it up:
-/// in order, without gaps, starting at that height, and at most a bounded batch per call. Empty
-/// when the engine is not behind. The host checked each decision before storing it, so the engine
-/// takes them as decided. Called once per tick, before consensus runs, so the host should perform
-/// only short reads.
+/// Given the engine's height, synchronously return the host's decided tip if it has reached that
+/// height, else `None`. Called once per tick, before consensus runs: an engine the tip has reached
+/// takes it as decided and moves to the height after it. The host should perform only a cheap read.
 #[derive(Clone)]
-pub struct ClosureToPullDecided(pub Arc<dyn Fn(u64) -> Vec<DecidedHeight> + Send + Sync + 'static>);
-impl std::fmt::Debug for ClosureToPullDecided {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToPullDecided(..)") }
+pub struct ClosureToReadDecidedTip(pub Arc<dyn Fn(u64) -> Option<HostTip> + Send + Sync + 'static>);
+impl std::fmt::Debug for ClosureToReadDecidedTip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToReadDecidedTip(..)") }
 }
 
 /// Store this node's WAL record for a BFT height (`Wal::encode`), replacing the one stored for
@@ -953,7 +950,7 @@ pub struct TMState {
     fetch_decided_round_closure: ClosureToFetchDecidedRound,
     write_wal_closure: ClosureToWriteWal,
     /// Set by `entry_point`; `init` leaves one that gives nothing, for engines with no host chain.
-    pull_decided_closure: ClosureToPullDecided,
+    read_tip_closure: ClosureToReadDecidedTip,
 }
 
 impl TMState {
@@ -996,7 +993,7 @@ impl TMState {
             bft_access_closure,
             fetch_decided_round_closure,
             write_wal_closure,
-            pull_decided_closure: ClosureToPullDecided(Arc::new(|_| Vec::new())),
+            read_tip_closure: ClosureToReadDecidedTip(Arc::new(|_| None)),
         }
     }
 
@@ -1278,17 +1275,31 @@ impl TMState {
         self.fetched_decided_rounds.push((height, round, std::time::Instant::now()));
     }
 
-    /// Records `decided` as the round that decided this height and moves to the next, with the
-    /// roster, vote namespace and quorum rule the host gave for it. The caller then takes the next
-    /// height's WAL record and starts its round.
-    fn enter_next_height(&mut self, roster: &mut Vec<SortedRosterMember>, decided: RoundData, next_roster: Vec<SortedRosterMember>, next_vote_namespace: [u8; 32], next_strict_quorum: bool) {
-        *roster = next_roster;
-        self.height += 1;
+    /// Moves to the height after `tip`, the host's newest decided height, with the roster, vote
+    /// namespace and quorum rule the host gave for it. `own_round` is the round that decided
+    /// `tip.height` here, when this engine decided it. Otherwise the engine was behind and jumps:
+    /// it keeps no round of a height it passed, and reads the tip's round back from the host, so a
+    /// peer one height behind is still served from memory; older ones are read when a peer needs
+    /// them (`fetch_decided_round`). The caller then takes the next height's WAL record and starts
+    /// its round.
+    fn enter_height_after(&mut self, roster: &mut Vec<SortedRosterMember>, tip: &HostTip, own_round: Option<RoundData>) {
+        *roster = tip.next_roster.clone();
+        self.height = tip.height + 1;
         // Vote namespacing: adopt the namespace for the new height (supplied alongside the new
         // roster by the host).
-        self.vote_namespace = next_vote_namespace;
-        self.strict_quorum = next_strict_quorum;
-        self.recent_commit_round_cache.push(decided);
+        self.vote_namespace = tip.next_vote_namespace;
+        self.strict_quorum = tip.next_strict_quorum;
+        match own_round.filter(|round| round.height == tip.height) {
+            Some(round) => self.recent_commit_round_cache.push(round),
+            None => {
+                self.recent_commit_round_cache.clear();
+                let stored = (self.fetch_decided_round_closure.0)(tip.height).filter(|round| round.height == tip.height);
+                if let Some(mut round) = stored {
+                    round.recover_proposal_valid_round(&self.hash_keys, self.active_roster_max_n);
+                    self.recent_commit_round_cache.push(round);
+                }
+            }
+        }
         self.trim_recent_commit_round_cache();
         self.rounds_data.retain(|r| r.height >= self.height);
         self.locked_value_round = (None, -1);
@@ -1296,24 +1307,15 @@ impl TMState {
         self.own_msgs.clear();
     }
 
-    /// Takes the heights the host already holds decided, from this one up, as decided here: the
-    /// host stored them from peers or an import while this engine was behind, and deciding them
-    /// again would take a round of consensus each (#422). Only the height after the last one taken
-    /// starts a round, so nothing is proposed or voted for a height about to be passed.
-    async fn take_decided_heights(&mut self, roster: &mut Vec<SortedRosterMember>) {
-        let decided = (self.pull_decided_closure.0)(self.height);
-        if decided.is_empty() { return; }
+    /// Takes the host's decided tip as decided here once it has reached this engine's height: the
+    /// host stored those heights from peers or an import while this engine was behind, and
+    /// deciding them again would take a round of consensus each (#422). The engine goes straight
+    /// to the height after the tip and starts a round only there, so it proposes and votes for
+    /// nothing it passes.
+    async fn take_decided_tip(&mut self, roster: &mut Vec<SortedRosterMember>) {
+        let Some(tip) = (self.read_tip_closure.0)(self.height).filter(|tip| tip.height >= self.height) else { return };
         let from = self.height;
-        for DecidedHeight { mut round, next_roster, next_vote_namespace, next_strict_quorum } in decided {
-            if round.height != self.height {
-                eprintln!("{} {ANSI_RED}BFT ERROR{ANSI_RST}: the host gave decided height {} when the engine is at {}; taking no more until the next pull",
-                    self.ctx_str(roster), round.height, self.height);
-                break;
-            }
-            round.recover_proposal_valid_round(&self.hash_keys, self.active_roster_max_n);
-            self.enter_next_height(roster, round, next_roster, next_vote_namespace, next_strict_quorum);
-        }
-        if self.height == from { return; }
+        self.enter_height_after(roster, &tip, None);
         if PRINT_ROSTER { println!("{} {ANSI_GRY}ROSTER{ANSI_RST}: took decided heights {}..{}; new roster: {:?}", self.ctx_str(roster), from, self.height, roster); }
         let round = self.take_wal_for_height(roster);
         self.start_round(roster, zebra_debug_time::instant_now(), round).await;
@@ -1924,7 +1926,8 @@ impl TMState {
                 let (new_roster, new_vote_namespace, new_strict_quorum) = self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster), self.rounds_data[i].proposal_sigs.clone()).await;
                 if PRINT_ROSTER { println!("{ctx_str} {ANSI_GRY}ROSTER{ANSI_RST}: new roster: {:?}", new_roster); }
                 let decided = self.rounds_data[i].clone();
-                self.enter_next_height(roster, decided, new_roster, new_vote_namespace, new_strict_quorum);
+                let tip = HostTip { height: self.height, next_roster: new_roster, next_vote_namespace: new_vote_namespace, next_strict_quorum: new_strict_quorum };
+                self.enter_height_after(roster, &tip, Some(decided));
                 let round = self.take_wal_for_height(roster);
                 self.start_round(roster, now, round).await;
                 break;
@@ -2257,7 +2260,7 @@ async fn instance(
         ClosureToFetchDecidedRound(Arc::new(|_| None)),
         // This runner keeps nothing across a restart.
         ClosureToWriteWal(Arc::new(|_, _| Box::pin(async { true }))),
-        ClosureToPullDecided(Arc::new(|_| Vec::new())),
+        ClosureToReadDecidedTip(Arc::new(|_| None)),
         Vec::new(),
         Vec::new(),
         [0u8; 32], // initial_vote_namespace: no slashforks in the sim
@@ -3437,7 +3440,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          bft_access_closure: ClosureToAccessBft,
                          fetch_decided_round_closure: ClosureToFetchDecidedRound,
                          write_wal_closure: ClosureToWriteWal,
-                         pull_decided_closure: ClosureToPullDecided,
+                         read_tip_closure: ClosureToReadDecidedTip,
                          ingest_startup_data: Vec<RoundData>,
                          // The WAL records `write_wal_closure` stored, of the startup height and
                          // any above it; older ones are ignored.
@@ -3530,7 +3533,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         fetch_decided_round_closure,
         write_wal_closure,
     ); // TODO: double-check this is the right key
-    bft_state.pull_decided_closure = pull_decided_closure;
+    bft_state.read_tip_closure = read_tip_closure;
 
     bft_state.vote_namespace = initial_vote_namespace;
     bft_state.strict_quorum = initial_strict_quorum;
@@ -3691,7 +3694,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 }
 
                 bft_state.bft_access_closure.0(&bft_state, &bft_address_map).await;
-                bft_state.take_decided_heights(&mut roster).await;
+                bft_state.take_decided_tip(&mut roster).await;
 
                 // BFT CONSENSUS
                 // account for the state updates we've accumulated
@@ -6290,6 +6293,44 @@ mod tests {
         }
         assert!(cached_round(&node, 7).is_none());
         assert!(cached_round(&node, u64::MAX).is_none());
+    }
+
+    /// A jump to the host's tip keeps no round of the heights passed: the cache holds only the
+    /// tip's round, read back from the host, and an older height is read from the host when asked.
+    /// A tip below the engine's height moves nothing.
+    #[test]
+    fn a_jump_to_the_host_tip_keeps_only_the_tips_round() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (keys, roster) = sim_finalizers(4);
+        let (mut node, stored) = recent_decisions(&keys, &roster, 8, 7);
+        assert_eq!((node.height, node.recent_commit_round_cache.len()), (7, 7));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (calls, host) = (reads.clone(), stored.clone());
+        node.fetch_decided_round_closure = ClosureToFetchDecidedRound(Arc::new(move |height| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            host.iter().find(|rd| rd.height == height).cloned()
+        }));
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut engine_roster = roster.to_vec();
+
+        let behind = HostTip { height: 3, next_roster: roster.to_vec(), next_vote_namespace: [0; 32], next_strict_quorum: false };
+        node.read_tip_closure = ClosureToReadDecidedTip(Arc::new(move |_| Some(behind.clone())));
+        rt.block_on(node.take_decided_tip(&mut engine_roster));
+        assert_eq!((node.height, node.recent_commit_round_cache.len()), (7, 7), "a tip below the engine moves nothing");
+
+        // The host decided up to 6 the same way; its tip is 6, so the engine at 7 is level and
+        // jumps to 7 again, keeping only 6's round.
+        let tip = HostTip { height: 6, next_roster: roster.to_vec(), next_vote_namespace: [0; 32], next_strict_quorum: false };
+        node.height = 6;
+        node.read_tip_closure = ClosureToReadDecidedTip(Arc::new(move |_| Some(tip.clone())));
+        rt.block_on(node.take_decided_tip(&mut engine_roster));
+        assert_eq!(node.height, 7);
+        assert_eq!(node.recent_commit_round_cache.iter().map(|rd| rd.height).collect::<Vec<_>>(), vec![6]);
+        assert_eq!(reads.load(Ordering::Relaxed), 1, "the tip's round is read back once");
+        assert!(node.rounds_data.iter().all(|rd| rd.height == 7));
+        assert_eq!(node.locked_value_round.1, -1);
+        node.fetch_decided_round(2);
+        assert_eq!(reads.load(Ordering::Relaxed), 2, "an older height is read from the host");
     }
 
     #[test]
