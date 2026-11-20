@@ -1246,3 +1246,54 @@ fn timeout_index_keeps_first_matching_vote_and_rx_scratch_is_not_evidence() {
     assert!(recovered.rx_weights.is_empty());
     assert!(recovered.selected.iter().all(Option::is_none));
 }
+
+#[test]
+fn verified_outer_reuse_requires_exact_bytes_and_all_group_guards() {
+    let c = config([1; 4]);
+    let (mut e, _) = engine(&c, 0, 4, 100);
+    let valid = vote(&c, 1, 0, VoteKind::Prevote, Some([1; 32]));
+    let other = vote(&c, 2, 0, VoteKind::Prevote, Some([1; 32]));
+    let mut bad_signature = valid;
+    bad_signature.signature[0] ^= 1;
+    let mut bad_content = valid;
+    bad_content.content.id = Some([2; 32]);
+    let mut wrong_height = valid;
+    wrong_height.content.height += 1;
+    let variants = [valid, bad_signature, bad_content, wrong_height];
+    for outer in &variants {
+        for inner in &variants {
+            let votes = [*inner, other];
+            let duplicate = [*inner, *inner];
+            for kind in [
+                CertKind::Row {
+                    round: 0,
+                    kind: VoteKind::Prevote,
+                },
+                CertKind::Row {
+                    round: 1,
+                    kind: VoteKind::Prevote,
+                },
+                CertKind::Polka {
+                    round: 0,
+                    id: [1; 32],
+                },
+            ] {
+                for rows in [&votes[..], &duplicate[..]] {
+                    let groups = [Group {
+                        kind,
+                        votes: Votes::Dense(rows),
+                    }];
+                    let frame = ordinary(Some(outer), None, &groups);
+                    let expected = (0..3)
+                        .map(|i| slow_accepted(&e, frame, i).copied())
+                        .collect::<Vec<_>>();
+                    e.index_frame(frame);
+                    assert_eq!(e.group_ok[0], slow_group_valid(&e, groups[0]));
+                    for (position, expected) in expected.iter().enumerate() {
+                        assert_eq!(e.accepted_vote(frame, position).copied(), *expected);
+                    }
+                }
+            }
+        }
+    }
+}
