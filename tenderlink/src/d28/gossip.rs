@@ -9,7 +9,8 @@
 //! a peer is only served when its status shows a concrete gap the local node can
 //! fill from retained state.
 //!
-//! Scope. This does not replace the periodic rho replay or `CompactLive`
+//! Scope. Under `Emission::Guided` this is the only source of complete frames;
+//! otherwise it does not replace the periodic rho replay or `CompactLive`
 //! fallback and nothing here claims liveness for guided-only gossip. Receivers
 //! still validate every frame as a whole through `Engine::receive`; the helper
 //! never fabricates a threshold, copies source votes, or declares an external
@@ -39,8 +40,8 @@ impl Gap {
         match self {
             Gap::Decision => 5,
             Gap::Round => 4,
-            Gap::Proposal => 3,
-            Gap::Polka => 2,
+            Gap::Polka => 3,
+            Gap::Proposal => 2,
             Gap::Votes => 1,
         }
     }
@@ -78,6 +79,10 @@ pub struct StatusSnapshot {
     /// A quorum of current-round prevotes (any ids) is held, i.e. the prevote
     /// row is complete enough to arm the prevote timeout. Constant size.
     pub prevote_quorum: bool,
+    /// The held current proposal (`proposal`) is justified: its valid-round
+    /// polka was seen (or it needs none). Bound to that proposal; false when
+    /// no proposal is held.
+    pub justified: bool,
 }
 fn step_rank(s: Step) -> u8 {
     match s {
@@ -93,6 +98,7 @@ enum Plan {
     Dec,
     Enter,
     Proposal,
+    Polka,
     Precommit,
     Prevote,
 }
@@ -112,7 +118,37 @@ impl<S: Storage> Engine<S> {
             proposal: d.slot.map(|s| self.proposal(s).header.content.id),
             polka,
             prevote_quorum: self.c().quorum(self.row_weight(VoteKind::Prevote, None)),
+            justified: d.slot.is_some() && d.justified,
         })
+    }
+    /// For a lower-round peer: current self-carrying evidence jumps it straight
+    /// into our round (no predecessor-round TPC delay); else ENTER + entry
+    /// certificate. Guards check the actual retained quorum (recovery rebuilds
+    /// only own rows), so a frame is never chosen on a bare vote's say-so.
+    fn round_plan(&self) -> Plan {
+        let d = self.d();
+        let pv_quorum = self.c().quorum(self.row_weight(VoteKind::Prevote, None));
+        if let (Some(v), Some(s), Some(vc)) = (self.own_current(VoteKind::Precommit), d.slot, d.vc)
+        {
+            let id = self.proposal(s).header.content.id;
+            if v.content.id == Some(id)
+                && d.valid_round == Some(d.round)
+                && self.proposal(vc.proposal).header.content.id == id
+            {
+                return Plan::Precommit;
+            }
+        }
+        if pv_quorum && self.own_current(VoteKind::Prevote).is_some() {
+            return Plan::Prevote;
+        }
+        if pv_quorum
+            && self
+                .own_current(VoteKind::Precommit)
+                .is_some_and(|v| v.content.id.is_none())
+        {
+            return Plan::Precommit;
+        }
+        Plan::Enter
     }
     fn plan(&self, st: &StatusSnapshot) -> std::result::Result<(Gap, Plan), Skip> {
         let d = self.d();
@@ -139,34 +175,50 @@ impl<S: Storage> Engine<S> {
             && self.own_current(VoteKind::Enter).is_some()
             && (st.step == Step::PreRound || st.round < d.round)
         {
-            return Ok((Gap::Round, Plan::Enter));
+            return Ok((Gap::Round, self.round_plan()));
         }
         if st.round != d.round || st.step == Step::PreRound {
             return Err(Skip::NoGap);
         }
         let slot = d.slot.map(|s| self.proposal(s));
-        let vc_matches = |p: &Proposal<'_>| {
-            d.vc.filter(|vc| self.proposal(vc.proposal).header.content.id == p.header.content.id)
-        };
+        // 1. Current-round polka package (body + VC) when the peer does not
+        // hold the matching polka, even if it also lacks the body. State
+        // changing, so it precedes proposal-only service.
+        if let (Some(vr), Some(vc)) = (d.valid_round, d.vc) {
+            let id = self.proposal(vc.proposal).header.content.id;
+            if vr == d.round && st.polka != Some((vr, id)) {
+                let pc = self.own_current(VoteKind::Precommit);
+                let slot_id = slot.as_ref().map(|p| p.header.content.id);
+                let plan = if pc.is_some_and(|v| v.content.id == Some(id)) && slot_id == Some(id) {
+                    Plan::Precommit
+                } else {
+                    Plan::Polka
+                };
+                return Ok((Gap::Polka, plan));
+            }
+        }
+        // 2. Our full PV row when the peer lacks a prevote quorum (any step).
+        if !st.prevote_quorum
+            && self.c().quorum(self.row_weight(VoteKind::Prevote, None))
+            && self.own_current(VoteKind::Prevote).is_some()
+        {
+            return Ok((Gap::Votes, Plan::Prevote));
+        }
+        // 3. Proposal body, or the exact valid-round certificate of a held but
+        // unjustified proposal.
         if let Some(p) = slot {
-            // The body is a complete valid frame on its own; the certificate is
-            // attached only when useful (see `proposal_group`), so a form-B
-            // body is still served after the polka moved on.
             let servable = p.header.content.round == d.round;
             if st.proposal.is_none() && servable {
                 return Ok((Gap::Proposal, Plan::Proposal));
             }
-            if let (Some(vr), Some(vc)) = (d.valid_round, vc_matches(&p)) {
-                let id = p.header.content.id;
-                let _ = vc;
-                if vr == d.round && st.polka != Some((vr, id)) {
-                    let pc = self.own_current(VoteKind::Precommit);
-                    let plan = if pc.is_some_and(|v| v.content.id == Some(id)) {
-                        Plan::Precommit
-                    } else {
-                        Plan::Proposal
-                    };
-                    return Ok((Gap::Polka, plan));
+            if let (Some(vr), Some(vc)) = (p.header.content.valid_round, d.vc) {
+                if d.valid_round == Some(vr)
+                    && vr < d.round
+                    && self.proposal(vc.proposal).header.content.id == p.header.content.id
+                    && st.proposal == Some(p.header.content.id)
+                    && !st.justified
+                {
+                    return Ok((Gap::Proposal, Plan::Proposal));
                 }
             }
         }
@@ -247,6 +299,25 @@ impl<S: Storage> Engine<S> {
             Plan::Enter => self.emit_vote_complete(VoteKind::Enter, t, sink),
             Plan::Precommit => self.emit_vote_complete(VoteKind::Precommit, t, sink),
             Plan::Prevote => self.emit_vote_complete(VoteKind::Prevote, t, sink),
+            Plan::Polka => {
+                let vc = self.d().vc.ok_or(Error::Corrupt)?;
+                let mut p = self.proposal(vc.proposal);
+                if let Some(sl) = self.d().slot {
+                    if self.proposal(sl).header.content.id == p.header.content.id {
+                        p = self.proposal(sl);
+                    }
+                }
+                let groups = [self.group(vc.certificate)];
+                sink.send(
+                    t,
+                    Frame {
+                        message: Message::Ordinary,
+                        outer: None,
+                        proposal: Some(p),
+                        groups: &groups,
+                    },
+                );
+            }
             Plan::Proposal => {
                 let s = self.d().slot.ok_or(Error::Corrupt)?;
                 let p = self.proposal(s);
@@ -303,6 +374,7 @@ struct PeerState {
     status: StatusSnapshot,
     received: u64,
     retry_at: u64,
+    /// Service ordinal (not a clock) of the last send; None = never served.
     last_served: Option<u64>,
     failures: u32,
     granted: bool,
@@ -325,6 +397,9 @@ pub struct Director {
     /// Alternates priority-first and oldest-unserved-first selection; kept
     /// across polls and status updates so churn cannot reset it.
     fair_next: bool,
+    /// Monotone count of sends; orders "oldest served" even when many polls
+    /// share one host-clock value. Overflow fails closed before sending.
+    serial: u64,
 }
 impl Director {
     pub fn new(cfg: DirectorConfig) -> Self {
@@ -335,7 +410,15 @@ impl Director {
             grants: Vec::with_capacity(cfg.max_grants),
             clock: 0,
             fair_next: false,
+            serial: 0,
         }
+    }
+    /// Checked constructor: `max_grants`, `grant_timeout` and `status_ttl`
+    /// must be positive and `max_peers` nonzero. `new` keeps accepting any
+    /// config; liveness claims exclude degenerate ones.
+    pub fn try_new(cfg: DirectorConfig) -> Option<Self> {
+        (cfg.max_peers > 0 && cfg.max_grants > 0 && cfg.grant_timeout > 0 && cfg.status_ttl > 0)
+            .then(|| Self::new(cfg))
     }
     pub fn peers(&self) -> usize {
         self.peers.len()
@@ -387,6 +470,8 @@ impl Director {
             self.index.insert(moved.id, i);
         }
     }
+    /// `now` must be a host clock that never decreases (it is clamped, never
+    /// trusted backwards); fairness uses a send ordinal, not `now`.
     /// Release finished or timed-out grants, then serve up to the free grant
     /// slots, best gap first. Returns the interactions started this call
     /// (at most K).
@@ -447,7 +532,7 @@ impl Director {
                             (
                                 std::cmp::Reverse(if fair { 0 } else { g.rank() }),
                                 if fair { 0 } else { p.failures },
-                                p.last_served.map_or(0, |t| t.saturating_add(1)),
+                                p.last_served.unwrap_or(0),
                                 p.failures,
                                 p.id,
                             )
@@ -460,11 +545,13 @@ impl Director {
                 }
             }
             let Some((i, gap)) = best else { break };
+            let next = self.serial.checked_add(1).ok_or(Error::Exhausted)?;
             let p = &mut self.peers[i];
             match engine.serve(p.id, &p.status, sink)? {
                 Served::Sent(g) => {
+                    self.serial = next;
                     p.granted = true;
-                    p.last_served = Some(now);
+                    p.last_served = Some(next);
                     self.fair_next = !self.fair_next;
                     self.grants.push(Grant {
                         peer: p.id,

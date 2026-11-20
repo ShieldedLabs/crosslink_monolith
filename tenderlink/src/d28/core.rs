@@ -689,6 +689,9 @@ impl<S: Storage> Engine<S> {
     }
     fn periodic(&self, sink: &mut impl Sink) {
         if self.d().step == Step::Decided {
+            if self.emission == Emission::Guided {
+                return;
+            }
             let p = self.d().pending.unwrap();
             let groups = [self.group(p.certificate)];
             sink.send(
@@ -703,10 +706,10 @@ impl<S: Storage> Engine<S> {
             return;
         }
         if self.d().step != Step::PreRound {
-            self.emit_vote_complete(VoteKind::Enter, Target::All, sink);
+            self.emit_replay(VoteKind::Enter, sink);
             self.emit_proposal(Target::All, sink);
-            self.emit_vote_complete(VoteKind::Prevote, Target::All, sink);
-            self.emit_vote_complete(VoteKind::Precommit, Target::All, sink);
+            self.emit_replay(VoteKind::Prevote, sink);
+            self.emit_replay(VoteKind::Precommit, sink);
         }
         for (i, s) in [self.d().slot, self.d().pending.map(|p| p.proposal)]
             .into_iter()
@@ -766,7 +769,18 @@ impl<S: Storage> Engine<S> {
         Ok(())
     }
     pub fn recover(store: S, key: SigningKey, sink: &mut impl Sink) -> Result<Self> {
+        Self::recover_with_emission(store, key, Emission::Reference, sink)
+    }
+    /// Recover with the emission policy selected BEFORE any recovery output,
+    /// so a guided node never leaks a complete frame while restarting.
+    pub fn recover_with_emission(
+        store: S,
+        key: SigningKey,
+        emission: Emission,
+        sink: &mut impl Sink,
+    ) -> Result<Self> {
         let mut e = Self::attach(store, key)?;
+        e.emission = emission;
         let r = e.recover_inner(sink);
         e.finish(r)?;
         Ok(e)
@@ -902,7 +916,7 @@ impl<S: Storage> Engine<S> {
             self.commit(d)?;
             self.request_proposal(sink);
             for k in [VoteKind::Enter, VoteKind::Prevote, VoteKind::Precommit] {
-                self.emit_vote_complete(k, Target::All, sink);
+                self.emit_replay(k, sink);
             }
             self.emit_proposal(Target::All, sink);
         }

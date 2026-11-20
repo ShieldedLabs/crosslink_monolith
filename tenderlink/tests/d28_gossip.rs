@@ -90,6 +90,7 @@ impl Packet {
 struct Recorder {
     packets: Vec<Packet>,
     decisions: Vec<(u64, Id)>,
+    acquired: Vec<ProposalTag>,
 }
 impl Sink for Recorder {
     fn send(&mut self, target: Target, f: Frame<'_>) {
@@ -104,6 +105,9 @@ impl Sink for Recorder {
                 .map(|g| (g.kind, g.votes.iter().copied().collect()))
                 .collect(),
         });
+    }
+    fn acquire(&mut self, tag: ProposalTag) {
+        self.acquired.push(tag);
     }
     fn decided(&mut self, h: u64, p: Proposal<'_>, g: Group<'_>) {
         assert_eq!(
@@ -594,7 +598,7 @@ fn form_b_proposal_is_served_with_its_justifying_polka_and_after_vc_advanced() {
     assert_eq!(st(&b).proposal, None);
     assert_eq!(
         e.serve(5, &st(&b), &mut s).unwrap(),
-        Served::Sent(Gap::Proposal)
+        Served::Sent(Gap::Polka)
     );
     assert_eq!(s.packets.len(), 1);
     assert_eq!(s.packets[0].groups[0].0, CertKind::Polka { round: 1, id });
@@ -657,6 +661,7 @@ fn certified_conflict_is_repaired_not_nogap() {
         proposal: Some([9; 32]),
         polka: None,
         prevote_quorum: false,
+        justified: false,
         ..st(&e)
     };
     assert!(matches!(
@@ -664,12 +669,10 @@ fn certified_conflict_is_repaired_not_nogap() {
         Served::Sent(Gap::Polka)
     ));
     assert!(s.packets[0].proposal.is_some());
-    assert!(
-        s.packets[0]
-            .groups
-            .iter()
-            .any(|g| g.0 == CertKind::Polka { round: 0, id })
-    );
+    assert!(s.packets[0]
+        .groups
+        .iter()
+        .any(|g| g.0 == CertKind::Polka { round: 0, id }));
 }
 
 #[test]
@@ -691,6 +694,7 @@ fn same_step_peer_lacking_prevote_quorum_gets_full_row_and_arms_timer() {
     // A single missing vote alone never triggers a package.
     let near = StatusSnapshot {
         prevote_quorum: true,
+        justified: false,
         ..st(&r)
     };
     assert_eq!(
@@ -760,4 +764,185 @@ fn poll_on_healthy_engine_with_no_peers_is_empty() {
     let (e, mut s, _) = with_proposal(&c, 3, b"x");
     let mut d = Director::new(dcfg(2, 1));
     assert!(d.poll(&e, 0, &mut s).unwrap().is_empty());
+}
+
+fn assert_bare(packets: &[Packet]) {
+    for p in packets {
+        assert_eq!(p.target, Target::All, "no targeted blind reply");
+        assert_eq!(p.message, Message::Ordinary, "no DEC");
+        assert!(p.outer.is_some(), "bare signed vote");
+        assert!(p.proposal.is_none(), "no proposal/body");
+        assert!(p.groups.is_empty(), "no groups");
+    }
+}
+
+#[test]
+fn guided_automatic_emissions_are_only_bare_votes_and_serve_is_explicit() {
+    let c = config(&[0, 1, 2, 3], &[1; 4]);
+    let p = c.proposer(0, 0);
+    let mut e = Engine::boot(MemoryStore::default(), key(p as u8), c.clone()).unwrap();
+    e.set_emission(Emission::Guided);
+    let mut s = Recorder::default();
+    assert!(e.init(&c, 0, 0, &mut s).unwrap());
+    assert_eq!(s.acquired.len(), 1);
+    let tag = s.acquired[0];
+    e.supply_proposal(tag, b"guided", Status::Valid, &mut s)
+        .unwrap();
+    let id = body_id(b"guided");
+    assert_eq!(st(&e).proposal, Some(id), "proposal retained");
+    assert!(!s.packets.is_empty());
+    // Reactive reply to another member's ENTER stays silent.
+    let others: Vec<usize> = (0..4).filter(|i| *i != p).collect();
+    let enter = vote(&c, others[0], others[0] as u8, 0, 0, VoteKind::Enter, None);
+    e.receive(ordinary(Some(&enter), None, &[]), Status::Valid, &mut s)
+        .unwrap();
+    // Two more prevotes: polka, own precommit.
+    for &i in &others[..2] {
+        let v = vote(&c, i, i as u8, 0, 0, VoteKind::Prevote, Some(id));
+        e.receive(ordinary(Some(&v), None, &[]), Status::Valid, &mut s)
+            .unwrap();
+    }
+    assert_eq!(st(&e).step, Step::Precommit);
+    // Several periodic rho replays, independent of the current step.
+    e.elapse(3 * 4, &mut s).unwrap();
+    assert!(s.packets.len() >= 6);
+    assert_bare(&s.packets);
+    // Recovery selects Guided before any output.
+    let mut rs = Recorder::default();
+    let store = e.into_storage();
+    let mut e =
+        Engine::recover_with_emission(store, key(p as u8), Emission::Guided, &mut rs).unwrap();
+    assert!(!rs.packets.is_empty());
+    assert_bare(&rs.packets);
+    // Decide, then no DEC replay.
+    for &i in &others[..2] {
+        let v = vote(&c, i, i as u8, 0, 0, VoteKind::Precommit, Some(id));
+        e.receive(ordinary(Some(&v), None, &[]), Status::Valid, &mut rs)
+            .unwrap();
+    }
+    assert_eq!(rs.decisions, [(0, id)]);
+    rs.packets.clear();
+    e.elapse(9, &mut rs).unwrap();
+    assert!(rs.packets.is_empty(), "no DEC in guided");
+    // Explicit serve is the only source of the full package.
+    let mut sv = Recorder::default();
+    let (fresh, _) = engine(&c, others[0] as u8, 0);
+    let lag = StatusSnapshot {
+        proposal: None,
+        ..st(&fresh)
+    };
+    assert_eq!(
+        e.serve(4, &lag, &mut sv).unwrap(),
+        Served::Sent(Gap::Decision)
+    );
+    assert_eq!(sv.packets[0].target, Target::Peer(4));
+    assert_eq!(sv.packets[0].message, Message::Dec);
+    assert!(sv.packets[0].proposal.is_some());
+}
+
+#[test]
+fn reference_recovery_still_replays_full_frames() {
+    let c = config(&[0, 1, 2, 3], &[1; 4]);
+    let p = c.proposer(0, 0);
+    let (mut e, mut s) = engine(&c, p as u8, 0);
+    e.supply_proposal(s.acquired[0], b"ref", Status::Valid, &mut s)
+        .unwrap();
+    let mut rs = Recorder::default();
+    let _e = Engine::recover(e.into_storage(), key(p as u8), &mut rs).unwrap();
+    assert!(rs.packets.iter().any(|p| p.proposal.is_some()));
+}
+
+#[test]
+fn held_unjustified_form_b_body_gets_exact_vr_witness_and_progresses() {
+    let (c, mut e, mut s, id) = round1_with_polka();
+    let body = b"x";
+    let h = header(&c, c.proposer(0, 1) as u8, 0, 1, Some(0), body);
+    let (mut r, mut rs) = engine(&c, 2, 0);
+    let rj = [
+        vote(&c, 0, 0, 0, 1, VoteKind::Prevote, None),
+        vote(&c, 1, 1, 0, 1, VoteKind::Prevote, None),
+    ];
+    let rg = [Group {
+        kind: CertKind::Row {
+            round: 1,
+            kind: VoteKind::Prevote,
+        },
+        votes: Votes::Dense(&rj),
+    }];
+    r.receive(
+        ordinary(Some(&rj[0]), None, &rg),
+        Status::Indeterminate,
+        &mut rs,
+    )
+    .unwrap();
+    // Held body, no justification.
+    r.receive(
+        ordinary(None, Some(Proposal { header: &h, body }), &[]),
+        Status::Valid,
+        &mut rs,
+    )
+    .unwrap();
+    assert_eq!(st(&r).proposal, Some(id));
+    assert!(!st(&r).justified);
+    assert_eq!(st(&r).step, Step::Propose);
+    // Sender holds the proposal and the exact vr=0 polka.
+    let g0v = polka_votes(&c, id);
+    let g0 = [Group {
+        kind: CertKind::Polka { round: 0, id },
+        votes: Votes::Dense(&g0v),
+    }];
+    e.receive(
+        ordinary(None, Some(Proposal { header: &h, body }), &g0),
+        Status::Valid,
+        &mut s,
+    )
+    .unwrap();
+    s.packets.clear();
+    // State-changing quorum row first (peer lacks a prevote quorum)...
+    assert_eq!(
+        e.serve(5, &st(&r), &mut s).unwrap(),
+        Served::Sent(Gap::Votes)
+    );
+    s.packets[0].deliver(&mut r, &mut rs).unwrap();
+    assert!(st(&r).prevote_quorum && !st(&r).justified);
+    s.packets.clear();
+    // ...then the exact valid-round certificate for the held body.
+    assert_eq!(
+        e.serve(5, &st(&r), &mut s).unwrap(),
+        Served::Sent(Gap::Proposal)
+    );
+    assert_eq!(s.packets[0].groups[0].0, CertKind::Polka { round: 0, id });
+    s.packets[0].deliver(&mut r, &mut rs).unwrap();
+    assert!(st(&r).justified);
+    assert_eq!(st(&r).step, Step::Prevote);
+    // A justified peer is no longer served.
+    assert_eq!(
+        e.serve(5, &st(&r), &mut s).unwrap(),
+        Served::Skipped(Skip::NoGap)
+    );
+}
+
+#[test]
+fn lagging_round_receiver_jumps_directly_on_self_carrying_prevote_row() {
+    let (c, mut e, mut s, _) = round1_with_polka();
+    e.elapse(35, &mut s).unwrap();
+    assert!(st(&e).prevote_quorum);
+    assert_eq!(e.prevotes()[3].unwrap().content.round, 1);
+    s.packets.clear();
+    let (mut r, mut rs) = engine(&c, 2, 0);
+    assert_eq!(st(&r).round, 0);
+    assert_eq!(
+        e.serve(1, &st(&r), &mut s).unwrap(),
+        Served::Sent(Gap::Round)
+    );
+    assert_eq!(s.packets[0].outer.unwrap().content.kind, VoteKind::Prevote);
+    s.packets[0].deliver(&mut r, &mut rs).unwrap();
+    assert_eq!(st(&r).round, 1, "no predecessor-round TPC wait");
+    assert!(st(&r).prevote_quorum, "quorum row merged");
+}
+
+#[test]
+fn director_checked_constructor_rejects_degenerate_config() {
+    assert!(Director::try_new(dcfg(2, 0)).is_none());
+    assert!(Director::try_new(dcfg(2, 1)).is_some());
 }

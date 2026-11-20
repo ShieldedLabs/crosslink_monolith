@@ -742,6 +742,11 @@ pub enum Emission {
     #[default]
     Reference,
     CompactLive,
+    /// Guided-only: every automatic (unsolicited) network emission is a bare
+    /// signed ENTER/PREVOTE/PRECOMMIT to everyone (live, periodic rho replay
+    /// and recovery replay). Proposals, groups and DEC are never sent
+    /// automatically; complete frames leave only through `Engine::serve`.
+    Guided,
 }
 pub struct Engine<S: Storage> {
     emission: Emission,
@@ -1074,7 +1079,7 @@ impl<S: Storage> Engine<S> {
     }
     /// Live state-transition emission, subject to the volatile policy.
     fn emit_vote(&self, k: VoteKind, target: Target, sink: &mut impl Sink) {
-        if self.emission == Emission::CompactLive {
+        if self.emission != Emission::Reference {
             let Some(v) = self.own_current(k) else { return };
             sink.send(
                 target,
@@ -1089,8 +1094,17 @@ impl<S: Storage> Engine<S> {
         }
         self.emit_vote_complete(k, target, sink);
     }
-    /// Complete evidence replay (periodic rho service and recovery); never
-    /// affected by the emission policy.
+    /// Periodic rho and recovery replay: the complete reference frame, except
+    /// that Guided replays the bare current own vote.
+    fn emit_replay(&self, k: VoteKind, sink: &mut impl Sink) {
+        if self.emission == Emission::Guided {
+            self.emit_vote(k, Target::All, sink);
+        } else {
+            self.emit_vote_complete(k, Target::All, sink);
+        }
+    }
+    /// Complete evidence frame (reference replay and targeted service); not
+    /// affected by the CompactLive policy.
     fn emit_vote_complete(&self, k: VoteKind, target: Target, sink: &mut impl Sink) {
         let Some(v) = self.own_current(k) else { return };
         let mut proposal = None;
@@ -1147,6 +1161,9 @@ impl<S: Storage> Engine<S> {
         );
     }
     fn emit_proposal(&self, target: Target, sink: &mut impl Sink) {
+        if self.emission == Emission::Guided {
+            return;
+        }
         if self.c().proposer(self.d().height, self.d().round) != self.me {
             return;
         }
