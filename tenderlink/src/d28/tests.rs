@@ -765,3 +765,484 @@ fn round_time_arithmetic_exhaustion_fails_closed() {
     );
     assert!(!e.is_active());
 }
+
+// Original receive scans retained as a deliberately slow, independent oracle.
+// In particular, a whole malformed group vanishes, while duplicate signers in
+// DIFFERENT valid groups are legal and count once for each matching tuple.
+fn slow_group_valid(e: &Engine<MemoryStore>, g: Group<'_>) -> bool {
+    if g.votes.is_empty() || g.votes.len() > e.c().members.len() {
+        return false;
+    }
+    let mut weight = 0;
+    for (i, v) in g.votes.iter().enumerate() {
+        let c = v.content;
+        if c.height != e.d().height
+            || !v.verify(e.c())
+            || g.votes.iter().take(i).any(|v| v.content.signer == c.signer)
+        {
+            return false;
+        }
+        if !match g.kind {
+            CertKind::Polka { round, id } => {
+                c.kind == VoteKind::Prevote && c.round == round && c.id == Some(id)
+            }
+            CertKind::Decision { round, id } => {
+                c.kind == VoteKind::Precommit && c.round == round && c.id == Some(id)
+            }
+            CertKind::Timeout { round } => c.kind == VoteKind::Precommit && c.round == round,
+            CertKind::Jump { round } => c.round >= round,
+            CertKind::Row { round, kind } => {
+                kind != VoteKind::Enter && c.kind == kind && c.round == round
+            }
+        } {
+            return false;
+        }
+        weight += e.c().members[c.signer as usize].weight;
+    }
+    match g.kind {
+        CertKind::Polka { .. } | CertKind::Decision { .. } | CertKind::Timeout { .. } => {
+            e.c().quorum(weight)
+        }
+        CertKind::Jump { .. } => e.c().witness(weight),
+        CertKind::Row { .. } => true,
+    }
+}
+fn slow_accepted<'a>(e: &Engine<MemoryStore>, f: Frame<'a>, position: usize) -> Option<&'a Vote> {
+    if let Some(v) = f.outer {
+        if position == 0 {
+            return (v.content.height == e.d().height && v.verify(e.c())).then_some(v);
+        }
+    }
+    let mut i = usize::from(f.outer.is_some());
+    for g in f.groups {
+        let valid = slow_group_valid(e, *g);
+        for v in g.votes.iter() {
+            if position == i {
+                return valid.then_some(v);
+            }
+            i += 1;
+        }
+    }
+    None
+}
+fn slow_weight(e: &Engine<MemoryStore>, accepted: &[Option<Vote>], c: VoteContent) -> u64 {
+    (0..e.c().members.len())
+        .filter(|s| {
+            accepted.iter().flatten().any(|v| {
+                let x = v.content;
+                x.signer as usize == *s && (x.round, x.kind, x.id) == (c.round, c.kind, c.id)
+            })
+        })
+        .map(|s| e.c().members[s].weight)
+        .sum()
+}
+#[test]
+fn indexed_receive_matches_slow_scans_and_row_order() {
+    let c = config([4, 2, 1, 3]);
+    let mut seed = 0x28_u64;
+    for case in 0..128 {
+        let (mut e, mut out) = engine(&c, 3, 4, 100);
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            seed >> 32
+        };
+        // Every frame is admitted: <=5 occupied positions and <=4 physical
+        // rows per group. Physical row order intentionally differs from signer.
+        let mut votes = (0..5)
+            .map(|_| {
+                let signer = next() as usize % 4;
+                let round = next() % 3;
+                let kind =
+                    [VoteKind::Enter, VoteKind::Prevote, VoteKind::Precommit][next() as usize % 3];
+                let id = if kind == VoteKind::Enter || next() % 2 == 0 {
+                    None
+                } else {
+                    Some([next() as u8 % 3; 32])
+                };
+                vote(&c, signer, round, kind, id)
+            })
+            .collect::<Vec<_>>();
+        // Deliberate legal across-group duplicates, illegal within-group
+        // duplicates, malformed signatures/heights, and valid matching rows.
+        if case % 3 == 0 {
+            votes[1] = votes[0];
+        }
+        if case % 4 == 0 {
+            votes[2] = votes[1];
+        }
+        if case % 7 == 0 {
+            votes[3].signature[0] ^= 1;
+        }
+        if case % 11 == 0 {
+            votes[4].content.height += 1;
+        }
+        let sparse = [Some(votes[3]), None, None, Some(votes[4])];
+        let row_kind = |v: Vote| CertKind::Row {
+            round: v.content.round,
+            kind: v.content.kind,
+        };
+        let groups = [
+            Group {
+                kind: row_kind(votes[1]),
+                votes: Votes::Dense(&votes[1..3]),
+            },
+            Group {
+                kind: if case % 2 == 0 {
+                    CertKind::Jump { round: 0 }
+                } else {
+                    row_kind(votes[3])
+                },
+                votes: Votes::Rows(&sparse),
+            },
+        ];
+        let f = ordinary(Some(&votes[0]), None, &groups);
+        let accepted = (0..5)
+            .map(|i| slow_accepted(&e, f, i).copied())
+            .collect::<Vec<_>>();
+        e.index_frame(f);
+        assert_eq!(e.rx_positions.len(), 5);
+        for (position, expected) in accepted.iter().enumerate() {
+            assert_eq!(
+                e.accepted_vote(f, position).copied(),
+                *expected,
+                "case={case} pos={position}"
+            );
+            if let Some(v) = expected {
+                assert_eq!(
+                    e.rx_weight(f, position),
+                    slow_weight(&e, &accepted, v.content),
+                    "case={case} pos={position}"
+                );
+            }
+        }
+        assert!(e.accepted_vote(f, 5).is_none());
+        // Retained rows take precedence over the FIRST matching RX PC, even
+        // when different valid groups contain conflicting ids for one signer.
+        e.pc[0] = Some(vote(&c, 0, 0, VoteKind::Precommit, Some([8; 32])));
+        e.index_timeout(f);
+        for signer in 0..4 {
+            let expected = e.pc[signer].or_else(|| {
+                accepted
+                    .iter()
+                    .flatten()
+                    .find(|v| {
+                        v.content.signer as usize == signer
+                            && v.content.round == 0
+                            && v.content.kind == VoteKind::Precommit
+                    })
+                    .copied()
+            });
+            assert_eq!(
+                e.timeout_vote(f, signer),
+                expected,
+                "case={case} signer={signer}"
+            );
+        }
+        // Compare the entire repair pass, including its sequential overwrites,
+        // against the old algorithm; pre-round prevents subsequent signing.
+        for signer in 0..4 {
+            e.pv[signer] = Some(vote(&c, signer, 0, VoteKind::Prevote, Some([9; 32])));
+            e.pc[signer] = Some(vote(&c, signer, 0, VoteKind::Precommit, Some([9; 32])));
+        }
+        let mut pv = e.pv.clone();
+        let mut pc = e.pc.clone();
+        for v in accepted
+            .iter()
+            .flatten()
+            .filter(|v| v.content.round == 0 && v.content.kind != VoteKind::Enter)
+        {
+            let row = if v.content.kind == VoteKind::Prevote {
+                &mut pv
+            } else {
+                &mut pc
+            };
+            let signer = v.content.signer as usize;
+            if row[signer].is_none_or(|old| old.content == v.content)
+                || c.quorum(slow_weight(&e, &accepted, v.content))
+            {
+                row[signer] = Some(*v);
+            }
+        }
+        e.receive(f, Status::Indeterminate, &mut out).unwrap();
+        assert_eq!(e.pv, pv, "case={case}");
+        assert_eq!(e.pc, pc, "case={case}");
+        assert!(e.rx_positions.is_empty());
+        assert!(e.rx_weights.is_empty());
+        assert!(e.selected.iter().all(Option::is_none));
+    }
+}
+#[test]
+fn rx_quorum_deduplicates_across_groups_and_excludes_whole_malformed_group() {
+    let c = config([4, 2, 1, 3]);
+    let (mut e, mut out) = engine(&c, 3, 4, 100);
+    let id = Some([7; 32]);
+    let old = vote(&c, 1, 0, VoteKind::Prevote, None);
+    e.pv[1] = Some(old);
+    let outer = vote(&c, 0, 0, VoteKind::Prevote, id);
+    let repeated = [outer, vote(&c, 1, 0, VoteKind::Prevote, id)];
+    let malformed = [
+        vote(&c, 2, 0, VoteKind::Prevote, id),
+        vote(&c, 3, 1, VoteKind::Prevote, id),
+    ];
+    let groups = [
+        Group {
+            kind: CertKind::Row {
+                round: 0,
+                kind: VoteKind::Prevote,
+            },
+            votes: Votes::Dense(&repeated),
+        },
+        Group {
+            kind: CertKind::Row {
+                round: 0,
+                kind: VoteKind::Prevote,
+            },
+            votes: Votes::Dense(&malformed),
+        },
+    ];
+    e.receive(
+        ordinary(Some(&outer), None, &groups),
+        Status::Indeterminate,
+        &mut out,
+    )
+    .unwrap();
+    // Only weights 4+2 count, not repeated 4 and not the otherwise-valid vote
+    // of signer 2 in the malformed group: six is not a quorum of ten.
+    assert_eq!(e.pv[1], Some(old));
+    assert!(e.pv[2].is_none());
+    let extra = [None, None, Some(malformed[0]), None];
+    let groups = [
+        groups[0],
+        Group {
+            kind: groups[1].kind,
+            votes: Votes::Rows(&extra),
+        },
+    ];
+    e.receive(
+        ordinary(Some(&outer), None, &groups),
+        Status::Indeterminate,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(e.pv[1], Some(repeated[1])); // 4+2+1 is a strict quorum.
+    // A later frame must not inherit that cached seven-weight tuple.
+    e.pv[1] = Some(old);
+    e.receive(
+        ordinary(Some(&repeated[1]), None, &[]),
+        Status::Indeterminate,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(e.pv[1], Some(old));
+}
+#[test]
+fn same_frame_jump_preserves_sparse_positions_and_sequential_conflict_choices() {
+    let c = config([1, 1, 1, 7]);
+    let (mut e, mut out) = engine(&c, 0, 4, 0);
+    let first = vote(&c, 3, 5, VoteKind::Prevote, Some([8; 32]));
+    let second = vote(&c, 3, 5, VoteKind::Prevote, Some([9; 32]));
+    let last = vote(&c, 3, 5, VoteKind::Prevote, None);
+    let pc = vote(&c, 3, 5, VoteKind::Precommit, Some([6; 32]));
+    let sparse = [None, None, Some(second), None];
+    let groups = [
+        Group {
+            kind: CertKind::Row {
+                round: 5,
+                kind: VoteKind::Prevote,
+            },
+            votes: Votes::Rows(&sparse),
+        },
+        Group {
+            kind: CertKind::Row {
+                round: 5,
+                kind: VoteKind::Precommit,
+            },
+            votes: Votes::Dense(std::slice::from_ref(&pc)),
+        },
+        Group {
+            kind: CertKind::Row {
+                round: 5,
+                kind: VoteKind::Prevote,
+            },
+            votes: Votes::Dense(std::slice::from_ref(&last)),
+        },
+    ];
+    e.receive(
+        ordinary(Some(&first), None, &groups),
+        Status::Indeterminate,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(e.d().round, 5);
+    // Jump picks greatest kind, independent of row repair's later frame order.
+    assert_eq!(
+        e.group(e.d().entry.unwrap())
+            .votes
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![pc]
+    );
+    assert_eq!(e.pv[3], Some(last));
+    assert_eq!(e.pc[3], Some(pc));
+    assert!(e.rx_positions.is_empty());
+    assert!(e.rx_weights.is_empty());
+}
+#[test]
+fn indexed_jump_matches_original_max_cut_and_ties() {
+    let c = config([2, 3, 1, 4]);
+    let mut seed = 0x412_u64;
+    for case in 0..64 {
+        let (mut e, mut out) = engine(&c, 0, 4, 0);
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            seed >> 32
+        };
+        let mut votes = (0..5)
+            .map(|_| {
+                let signer = next() as usize % 4;
+                let round = 1 + next() % 8;
+                let kind =
+                    [VoteKind::Enter, VoteKind::Prevote, VoteKind::Precommit][next() as usize % 3];
+                let id = if kind == VoteKind::Enter || next() % 2 == 0 {
+                    None
+                } else {
+                    Some([next() as u8 % 3; 32])
+                };
+                vote(&c, signer, round, kind, id)
+            })
+            .collect::<Vec<_>>();
+        if case % 3 == 0 {
+            votes[2] = votes[0];
+        }
+        if case % 7 == 0 {
+            votes[3].signature[0] ^= 1;
+        }
+        let sparse = [None, Some(votes[1]), None, None];
+        let groups = (1..5)
+            .map(|i| Group {
+                kind: if votes[i].content.kind == VoteKind::Enter {
+                    CertKind::Jump { round: 0 }
+                } else {
+                    CertKind::Row {
+                        round: votes[i].content.round,
+                        kind: votes[i].content.kind,
+                    }
+                },
+                votes: if i == 1 {
+                    Votes::Rows(&sparse)
+                } else {
+                    Votes::Dense(&votes[i..i + 1])
+                },
+            })
+            .collect::<Vec<_>>();
+        let f = ordinary(Some(&votes[0]), None, &groups);
+        let accepted = (0..5)
+            .filter_map(|i| slow_accepted(&e, f, i).copied())
+            .collect::<Vec<_>>();
+        let mut selected: [Option<Vote>; 4] = [None; 4];
+        for v in accepted {
+            let x = v.content;
+            let signer = x.signer as usize;
+            if signer == e.me || x.round <= e.d().round {
+                continue;
+            }
+            if selected[signer].is_none_or(|v| {
+                let old = v.content;
+                (x.round, x.kind) > (old.round, old.kind)
+                    || ((x.round, x.kind) == (old.round, old.kind) && x.id < old.id)
+            }) {
+                selected[signer] = Some(v);
+            }
+        }
+        let target = selected
+            .iter()
+            .flatten()
+            .map(|v| v.content.round)
+            .filter(|round| {
+                let weight = selected
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| v.is_some_and(|v| v.content.round >= *round))
+                    .map(|(s, _)| c.members[s].weight)
+                    .sum();
+                c.witness(weight)
+            })
+            .max();
+        e.receive(f, Status::Indeterminate, &mut out).unwrap();
+        assert_eq!(e.d().round, target.unwrap_or(0), "case={case}");
+        if let Some(round) = target {
+            let expected = selected
+                .into_iter()
+                .flatten()
+                .filter(|v| v.content.round >= round)
+                .collect::<Vec<_>>();
+            let entry = e.group(e.d().entry.unwrap());
+            assert_eq!(entry.kind, CertKind::Jump { round });
+            assert_eq!(
+                entry.votes.iter().copied().collect::<Vec<_>>(),
+                expected,
+                "case={case}"
+            );
+        } else {
+            assert!(e.d().entry.is_none());
+        }
+    }
+}
+#[test]
+fn timeout_index_keeps_first_matching_vote_and_rx_scratch_is_not_evidence() {
+    let c = config([1; 4]);
+    let (mut e, mut out) = engine(&c, 0, 4, 100);
+    let first = vote(&c, 1, 0, VoteKind::Precommit, Some([1; 32]));
+    let second = vote(&c, 1, 0, VoteKind::Precommit, None);
+    let future = vote(&c, 2, 1, VoteKind::Precommit, None);
+    let sparse = [None, None, Some(second), None];
+    let groups = [
+        Group {
+            kind: CertKind::Row {
+                round: 0,
+                kind: VoteKind::Precommit,
+            },
+            votes: Votes::Rows(&sparse),
+        },
+        Group {
+            kind: CertKind::Row {
+                round: 1,
+                kind: VoteKind::Precommit,
+            },
+            votes: Votes::Dense(std::slice::from_ref(&future)),
+        },
+    ];
+    let f = ordinary(Some(&first), None, &groups);
+    e.index_frame(f);
+    e.index_timeout(f);
+    assert_eq!(e.timeout_vote(f, 1), Some(first));
+    assert_eq!(e.timeout_vote(f, 2), None);
+    e.pc[1] = Some(second);
+    assert_eq!(e.timeout_vote(f, 1), Some(second));
+    let oversized = [None; 5];
+    let bad = [Group {
+        kind: groups[0].kind,
+        votes: Votes::Rows(&oversized),
+    }];
+    assert_eq!(
+        e.receive(ordinary(None, None, &bad), Status::Indeterminate, &mut out),
+        Err(Error::Invalid)
+    );
+    assert!(e.rx_positions.is_empty());
+    assert!(e.rx_weights.is_empty());
+    assert!(!e.outer_ok);
+    assert!(!e.group_ok.iter().any(|x| *x));
+    e.index_frame(f);
+    e.rx_weight(f, 0);
+    let next = Config::new([99; 32], c.members()[..3].to_vec(), 512, 10, c.timeouts()).unwrap();
+    e.init(&next, 5, 100, &mut out).unwrap();
+    assert!(e.rx_positions.is_empty());
+    assert!(e.rx_weights.is_empty());
+    assert_eq!(e.group_ok.len(), 4);
+    assert_eq!(e.selected.len(), 3);
+    let recovered = Engine::recover(e.into_storage(), keys()[0].clone(), &mut out).unwrap();
+    assert!(recovered.rx_positions.is_empty());
+    assert!(recovered.rx_weights.is_empty());
+    assert!(recovered.selected.iter().all(Option::is_none));
+}
