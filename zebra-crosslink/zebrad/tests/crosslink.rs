@@ -1606,6 +1606,80 @@ fn crosslink_reject_pos_block_that_raises_do_not_include_without_a_slashfork() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// A slashfork in the node's config reaches BFT, not only the state service. At its certificate
+/// height a BFT block must carry it, set `do_not_include_until_bc_height` to its activation and be
+/// signed under the namespace that folds it in, and the block the node would take with no slashfork
+/// is refused. `_control` is the same scene with no slashfork configured: it takes that block and
+/// refuses the one carrying the rule.
+#[test]
+fn crosslink_configured_slashfork_reaches_bft() {
+    set_test_name(function_name!());
+    configured_slashfork_scene(true);
+}
+
+#[test]
+fn crosslink_configured_slashfork_reaches_bft_control() {
+    set_test_name(function_name!());
+    configured_slashfork_scene(false);
+}
+
+fn configured_slashfork_scene(configured: bool) {
+    use zebra_chain::parameters::SlashForkConfig;
+    use zebra_state::new_network::bft::{namespace_for_bft_height, BFT_BLOCK_VERSION_LATEST as LATEST};
+
+    // A finalizer no scene bonds, so the rule changes no roster, in bytes that read the same in
+    // either key order.
+    let terminated = PubKeyID([0x5a; 32]);
+    let rule = SlashForkConfig {
+        // Config parsing wants the activation to start a staking day.
+        pow_activation_height: 2 * u64::from(zcash_primitives::transaction::STAKING_PERIOD),
+        bft_certificate_height: 1,
+        terminated_finalizers: vec![terminated],
+    };
+    let mut tf = if configured {
+        // Regtest with no parameters of its own is the harness's network, as `TF::new` builds it.
+        let node_config = format!(
+            "[network]\nnetwork = \"Regtest\"\n\n[[crosslink.slashforks]]\npow_activation_height = {}\nbft_certificate_height = {}\nterminated_finalizers = [\"{}\"]\n",
+            rule.pow_activation_height,
+            rule.bft_certificate_height,
+            "5a".repeat(32),
+        );
+        TF::new_with_node_config(&HARNESS_PARAMETERS, &node_config)
+    } else {
+        TF::new(&HARNESS_PARAMETERS)
+    };
+    let (_gen, _miner_addr, pow) = bonded_pow_chain_for(&mut tf, 8);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+    let bft0 = next_signed_pos(pos_h, fat_ptr, &pow[4..7]);
+    push_decided_pos(&mut tf, &bft0, 0);
+
+    // Height 1, carrying these slashforks, decided and proposed by SUPPLIED_FINALIZER in round 1
+    // under the namespace they give the height.
+    let at_height_1 = |slashforks: Vec<SlashForkConfig>| {
+        let height = u64::from(*pos_h);
+        let mut block = create_pos_and_ptr_to_finalize_pow_at_round(*pos_h, fat_ptr.clone(), &pow[5..8], 1, &[]).0.block;
+        block.version = LATEST;
+        block.do_not_include_until_bc_height = slashforks.last().map_or(0, |rule| rule.pow_activation_height);
+        let namespace = namespace_for_bft_height(&slashforks, height, false);
+        block.slashforks = slashforks;
+        let seed = synthetic_finalizer_seed(SUPPLIED_FINALIZER);
+        let fat_ptr = signed_fat_pointer(&block, height, 1, &[seed.as_bytes()], &namespace);
+        let signing_key = zebra_crosslink::rng_private_public_key_from_address(seed.as_bytes()).0;
+        let sigs = bft_proposal_sigs(&signing_key, &block, 1, -1, &namespace);
+        (BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr }), sigs)
+    };
+    let plain = at_height_1(Vec::new());
+    let carrying = at_height_1(vec![rule]);
+    let (refused, accepted) = if configured { (plain, carrying) } else { (carrying, plain) };
+    tf.push_instr_load_pos_signed(&refused.0, &refused.1, -1, SHOULD_FAIL);
+    tf.push_instr_expect_pos_chain_length(1, 0);
+    tf.push_instr_load_pos_signed(&accepted.0, &accepted.1, -1, 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 /// With BFT bootstrapped from the chain, a PoW block at or below the activation height may not point
 /// at a BFT block. Every other scenario supplies BFT directly (`HARNESS_PARAMETERS`) and so never
 /// meets this rule; this one runs the prototype's bootstrap so the rule itself stays tested.

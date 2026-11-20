@@ -487,6 +487,9 @@ impl StartCmd {
         let mut state_config = config.state.clone();
         // config.crosslink.slashforks is already canonical and merged (see ZebradConfig::load)
         state_config.slashfork_schedule = Arc::new(SlashForkSchedule::from_canonical(config.crosslink.slashforks.clone()));
+        // new_network::sync runs BFT, which must apply the same slashforks as the state service:
+        // `config.state` leaves the schedule empty, since it is not read from the config file.
+        let sync_state_config = state_config.clone();
 
         let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change, block_writer) =
             zebra_state::spawn_init(
@@ -719,7 +722,7 @@ impl StartCmd {
                     check_cheap: zebra_consensus::sync_verify::block_check_cheap,
                     verify_expensive: zebra_consensus::sync_verify::block_verify_expensive,
                 };
-                zebra_state::new_network::sync(&config.state, sync_read_state, tokio::runtime::Handle::current(), verify_fns, Some(bft_launch), block_writer, genesis_block_for_new_network, Some(tx_relay_launch))
+                zebra_state::new_network::sync(&sync_state_config, sync_read_state, tokio::runtime::Handle::current(), verify_fns, Some(bft_launch), block_writer, genesis_block_for_new_network, Some(tx_relay_launch))
             })
         };
 
