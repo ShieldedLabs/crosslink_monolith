@@ -302,6 +302,18 @@ pub enum TransactionError {
         required_delay: u32,
     },
 
+    #[error(
+        "withdrawal waits for finality: bond {bond_key:?} unbonded at height {unbonded_at}, the \
+         chain has finalized {finalized_height:?}, which must pass {required_height}"
+    )]
+    #[non_exhaustive]
+    StakingWithdrawalNotFinalized {
+        bond_key: [u8; 32],
+        unbonded_at: u32,
+        finalized_height: Option<u32>,
+        required_height: u32,
+    },
+
     #[error("staking action on non-existent bond: {bond_key:?}")]
     StakingActionBondNotFound { bond_key: [u8; 32] },
 
@@ -537,6 +549,7 @@ impl TransactionError {
             | DisabledAddToSproutPool
             | NegativeOrchardValueBalance
             | StakingActionDelayNotMet { .. }
+            | StakingWithdrawalNotFinalized { .. }
             | StakingActionBondNotFound { .. }
             | StakingActionBondStateInvalid { .. }
             | StakingActionOutsideWindow { .. }

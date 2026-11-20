@@ -4960,16 +4960,17 @@ mod staking_signature {
                 last_action_height: LAST_ACTION,
                 target_finalizer: TARGET,
                 version: KEY,
+                chain_finalized_height: None,
             })
         };
         let ready = Height(LAST_ACTION + STAKING.action_delay);
         let early = Height(LAST_ACTION + STAKING.action_delay - 1);
-        let check = |kind, amount, bond_info, height| check_staking_action_bond_state(kind, KEY, amount, None, 0, bond_info, height, STAKING);
+        let check = |kind, amount, bond_info, height| check_staking_action_bond_state(kind, KEY, amount, None, 0, bond_info, height, STAKING, false);
         let retarget = |from, bond_info, height| {
-            check_staking_action_bond_state(RetargetDelegationBond, KEY, 0, from, 0, bond_info, height, STAKING)
+            check_staking_action_bond_state(RetargetDelegationBond, KEY, 0, from, 0, bond_info, height, STAKING, false)
         };
         let convert = |amount, bank, bond_info| {
-            check_staking_action_bond_state(ConvertFinalizerRewardToDelegationBond, KEY, amount, None, bank, bond_info, ready, STAKING)
+            check_staking_action_bond_state(ConvertFinalizerRewardToDelegationBond, KEY, amount, None, bank, bond_info, ready, STAKING, false)
         };
 
         assert!(check(CreateNewDelegationBond, 500, None, ready).is_ok());
@@ -4985,6 +4986,17 @@ mod staking_signature {
         assert!(check(WithdrawDelegationBond, 499, bond(1), ready).is_err());
         assert!(check(WithdrawDelegationBond, 500, bond(0), ready).is_err());
         assert!(check(WithdrawDelegationBond, 500, bond(2), ready).is_err());
+
+        // From FeaturenetUpgrade3 a withdrawal also needs the chain to have finalized more than
+        // the withdrawal finality delay past the unbonding, and is held while it finalizes nothing.
+        let finalized = |finalized_height| {
+            let info = bond(1).map(|info| BondInfoResponse { chain_finalized_height: finalized_height, ..info });
+            check_staking_action_bond_state(WithdrawDelegationBond, KEY, 500, None, 0, info, ready, STAKING, true)
+        };
+        let required = LAST_ACTION + STAKING.withdrawal_finality_delay();
+        assert!(finalized(Some(required + 1)).is_ok());
+        assert!(finalized(Some(required)).is_err());
+        assert!(finalized(None).is_err());
 
         // A retarget must name the bond's current target, as block validation requires.
         assert!(retarget(Some(TARGET), bond(0), early).is_ok());
@@ -5019,6 +5031,7 @@ mod staking_signature {
                 last_action_height: 0,
                 target_finalizer: [7; 32],
                 version,
+                chain_finalized_height: None,
             };
             for bond_info in [None, Some(&info)] {
                 for spends in std::iter::once(None).chain(versions.map(Some)) {

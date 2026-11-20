@@ -18,7 +18,8 @@ use crate::{
 /// - Validates that BeginDelegationUnbonding references existing active bonds created at least
 ///   the network's staking action delay earlier
 /// - Validates that WithdrawDelegationBond references existing unbonding bonds unbonded at least
-///   the network's staking action delay earlier
+///   the network's staking action delay earlier, and from FeaturenetUpgrade3 unbonded more than
+///   the withdrawal finality delay below the chain's finalized height
 /// - Validates that RetargetDelegationBond references existing active bonds
 pub fn validate_delegation_bonds(
     semantically_verified: &SemanticallyVerifiedBlock,
@@ -74,6 +75,17 @@ struct InBlockBonds {
     // bond_key -> version after in-block creates and spends, so an action on a
     // bond created or spent earlier in the block must name that transaction
     versions: HashMap<[u8; 32], [u8; 32]>,
+    // the extended chain's finalized height, read at the block's first withdrawal
+    chain_finalized_height: std::cell::OnceCell<Option<zebra_chain::block::Height>>,
+}
+
+/// The finalized height of the chain `chain` ends, or of the finalized state when `chain` is
+/// `None` or empty: `candidate` of its tip (FINALITY.md §3.1), which the tip's own bft pointer
+/// determines, and not this node's `fin`. `None` while that pointer finalizes nothing.
+pub(crate) fn chain_finalized_height(chain: Option<&Chain>, finalized_state: &ZebraDb) -> Option<zebra_chain::block::Height> {
+    let sigma = finalized_state.network().crosslink_parameters().bc_confirmation_depth_sigma;
+    let bft = crate::new_network::bft::bft_chain().read().unwrap();
+    crate::new_network::fin::chain_candidate(&bft, chain, finalized_state, sigma).map(|(height, _)| height)
 }
 
 /// The current version of `bond`, which `chain` holds if it is given and the finalized state
@@ -242,11 +254,22 @@ impl InBlockBonds {
                 self.unbonded_or_withdrawn.insert(bond_key);
             }
             StakingActionKind::WithdrawDelegationBond => {
+                // From FeaturenetUpgrade3 a withdrawal also waits for the chain the block extends
+                // to finalize past its unbonding, so it cannot happen while finality is stalled.
+                // The extended chain, not the block, so the mempool's check at the tip is exactly
+                // the next block's.
+                let finalized_height = spends_versions.then(|| {
+                    *self
+                        .chain_finalized_height
+                        .get_or_init(|| chain_finalized_height(Some(non_finalized_chain), finalized_state))
+                });
+
                 // Check that bond exists, is unbonding, and withdrawal amount matches bond amount
                 validate_bond_for_withdrawal(
                     bond_key,
                     height,
                     staking_action.amount_zats(),
+                    finalized_height,
                     non_finalized_chain,
                 )?;
 
@@ -467,12 +490,37 @@ fn validate_bond_for_unbonding(
     )))
 }
 
+/// Rejects a withdrawal of a bond unbonded at `unbonded_at` unless `finalized_height`, the
+/// finalized height of the chain it extends, is more than the network's withdrawal finality delay
+/// above it: the book's provisional rule C. A chain that finalizes nothing, because BFT has not
+/// started or its pointer names no snapshot, holds every withdrawal.
+fn validate_withdrawal_finality(
+    bond_key: [u8; 32],
+    unbonded_at: zebra_chain::block::Height,
+    finalized_height: Option<zebra_chain::block::Height>,
+    non_finalized_chain: &Chain,
+) -> Result<(), ValidateContextError> {
+    let delay = non_finalized_chain.network().crosslink_parameters().staking.withdrawal_finality_delay();
+    let required = unbonded_at.0.saturating_add(delay);
+
+    match finalized_height {
+        Some(finalized_height) if finalized_height.0 > required => Ok(()),
+        _ => Err(ValidateContextError::InvalidDelegationBond(format!(
+            "withdrawal waits for finality: unbonded at height {}, the chain has finalized {:?}, which must pass {}: {:?}",
+            unbonded_at.0, finalized_height.map(|height| height.0), required, bond_key
+        ))),
+    }
+}
+
 /// Validates WithdrawDelegationBond: ensures the bond exists, is unbonding, was unbonded at least
-/// the network's staking action delay before `height`, and the amount matches.
+/// the network's staking action delay before `height`, and the amount matches. With
+/// `finalized_height` given (from FeaturenetUpgrade3), the unbonding must also be far enough
+/// below it; see [`validate_withdrawal_finality`].
 fn validate_bond_for_withdrawal(
     bond_key: [u8; 32],
     height: zebra_chain::block::Height,
     withdrawal_amount: u64,
+    finalized_height: Option<Option<zebra_chain::block::Height>>,
     non_finalized_chain: &Chain,
 ) -> Result<(), ValidateContextError> {
     // Check if bond exists in non-finalized state
@@ -489,7 +537,11 @@ fn validate_bond_for_withdrawal(
                         withdrawal_amount, bond_amount, bond_key
                     )));
                 }
-                return validate_staking_action_delay(bond_key, height, unbonded_at.height, non_finalized_chain);
+                validate_staking_action_delay(bond_key, height, unbonded_at.height, non_finalized_chain)?;
+                if let Some(finalized_height) = finalized_height {
+                    validate_withdrawal_finality(bond_key, unbonded_at.height, finalized_height, non_finalized_chain)?;
+                }
+                return Ok(());
             }
             BondStatusInChain::Active => {
                 return Err(ValidateContextError::InvalidDelegationBond(format!(
@@ -774,7 +826,7 @@ mod tests {
     fn withdrawal_waits_for_the_delay_after_unbonding() {
         let unbonded = CREATED + 400;
         let chain = chain_with(BondStatus::Unbonding { unbonded_at: loc(unbonded) });
-        let withdraw_at = |height| validate_bond_for_withdrawal(KEY, Height(height), 1000, &chain);
+        let withdraw_at = |height| validate_bond_for_withdrawal(KEY, Height(height), 1000, None, &chain);
 
         assert!(withdraw_at(unbonded + STAKING_ACTION_DELAY - 1).is_err());
         assert!(withdraw_at(unbonded + STAKING_ACTION_DELAY).is_ok());

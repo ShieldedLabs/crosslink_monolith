@@ -686,6 +686,10 @@ pub struct BondInfoResponse {
     /// The version an action on this bond must spend from FeaturenetUpgrade3: the txid of the
     /// last action that spent the bond, or of the transaction that created it if none has.
     pub version: [u8; 32],
+    /// For an unbonding bond, the finalized height of the chain the answer was read from, which
+    /// a withdrawal must be far enough below from FeaturenetUpgrade3. `None` while that chain
+    /// finalizes nothing, and for a bond in any other status.
+    pub chain_finalized_height: Option<u32>,
 }
 
 /// A structure with the information needed from the state to build a `getblocktemplate` RPC response.

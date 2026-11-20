@@ -523,6 +523,7 @@ where
 
             tracing::trace!(?tx_id, "passed quick checks");
 
+            // FeaturenetUpgrade3 brings both bond versions and the withdrawal finality rule.
             let spends_versions = NetworkUpgrade::FeaturenetUpgrade3
                 .activation_height(&network)
                 .is_some_and(|activation_height| height >= activation_height);
@@ -697,6 +698,7 @@ where
             bond_info,
             height,
             staking,
+            spends_versions,
         )
     }
 
@@ -857,6 +859,8 @@ where
 /// mempool admits an action that spoils every block template carrying it: the mined block is
 /// rejected, and the action stays pending, so the next template carries it again.
 /// `finalizer_bank` is the target finalizer's reward bank at the tip, read only for a conversion.
+/// `withdrawal_needs_finality` (from FeaturenetUpgrade3) also holds a withdrawal until the chain
+/// `bond_info` was read from has finalized far enough past its unbonding.
 fn check_staking_action_bond_state(
     kind: zcash_primitives::transaction::StakingActionKind,
     bond_key: [u8; 32],
@@ -866,6 +870,7 @@ fn check_staking_action_bond_state(
     bond_info: Option<zs::BondInfoResponse>,
     height: block::Height,
     staking: StakingParameters,
+    withdrawal_needs_finality: bool,
 ) -> Result<(), TransactionError> {
     use zcash_primitives::transaction::StakingActionKind;
 
@@ -903,7 +908,11 @@ fn check_staking_action_bond_state(
             if u64::from(info.amount) != amount_zats {
                 return invalid("the withdrawal amount does not match the bond");
             }
-            check_staking_action_delay(bond_key, height, info.last_action_height, staking.action_delay)
+            check_staking_action_delay(bond_key, height, info.last_action_height, staking.action_delay)?;
+            if withdrawal_needs_finality {
+                check_staking_withdrawal_finality(bond_key, info.last_action_height, info.chain_finalized_height, staking)?;
+            }
+            Ok(())
         }
         (StakingActionKind::RetargetDelegationBond, Some(info)) => {
             if info.status != ACTIVE {
@@ -954,6 +963,27 @@ fn check_staking_action_delay(
         });
     }
     Ok(())
+}
+
+/// Rejects a withdrawal of a bond unbonded at `unbonded_at` unless `finalized_height`, the
+/// finalized height of the chain the next block extends, is more than the withdrawal finality
+/// delay above it: the book's provisional rule C, as `validate_delegation_bonds` applies it.
+fn check_staking_withdrawal_finality(
+    bond_key: [u8; 32],
+    unbonded_at: u32,
+    finalized_height: Option<u32>,
+    staking: StakingParameters,
+) -> Result<(), TransactionError> {
+    let required_height = unbonded_at.saturating_add(staking.withdrawal_finality_delay());
+    match finalized_height {
+        Some(finalized_height) if finalized_height > required_height => Ok(()),
+        _ => Err(TransactionError::StakingWithdrawalNotFinalized {
+            bond_key,
+            unbonded_at,
+            finalized_height,
+            required_height,
+        }),
+    }
 }
 
 /// Checks that a staking action's target finalizer address, when it carries one,

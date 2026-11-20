@@ -2080,6 +2080,10 @@ fn bond_info_response(
             BondStatus::Withdrawn { withdrawn_at } => withdrawn_at.height.0,
         },
         target_finalizer: bond.target_finalizer,
+        chain_finalized_height: match status {
+            BondStatus::Unbonding { .. } => check::delegation::chain_finalized_height(chain, finalized_state).map(|height| height.0),
+            BondStatus::Active | BondStatus::Withdrawn { .. } | BondStatus::Burned => None,
+        },
     }
 }
 
