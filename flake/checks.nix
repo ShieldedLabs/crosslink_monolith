@@ -28,7 +28,7 @@
         # `zebra-chain` test vectors fail to deserialize, so they would keep
         # `nix flake check` permanently red.
 
-        # Our own nix files only: the subtrees (`crosslink_book`, `zips`, ...)
+        # Our own nix files only: the subtrees (`crosslink_book`, ...)
         # carry their own flakes and formatting conventions.
         nixfmt = pkgs.runCommand "crosslink-monolith-nixfmt" { nativeBuildInputs = [ pkgs.nixfmt ]; } ''
           nixfmt --check --strict ${../flake.nix} ${./.}/*.nix
