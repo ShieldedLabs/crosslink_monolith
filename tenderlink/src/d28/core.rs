@@ -40,55 +40,114 @@ impl<S: Storage> Engine<S> {
             CertKind::Row { .. } => true,
         }
     }
-    fn accepted_vote<'a>(&self, f: Frame<'a>, position: usize) -> Option<&'a Vote> {
-        if let Some(v) = f.outer {
-            if position == 0 {
-                return self.outer_ok.then_some(v);
-            }
+    pub(super) fn accepted_vote<'a>(&self, f: Frame<'a>, position: usize) -> Option<&'a Vote> {
+        let &(group, row) = self.rx_positions.get(position)?;
+        if position == 0 && f.outer.is_some() {
+            return f.outer.filter(|_| self.outer_ok);
         }
-        let mut i = usize::from(f.outer.is_some());
-        for (group_index, g) in f.groups.iter().enumerate() {
-            let valid = self.group_ok[group_index];
-            for v in g.votes.iter() {
-                if position == i {
-                    return valid.then_some(v);
-                }
-                i += 1;
-            }
+        if !self.group_ok[group] {
+            return None;
         }
-        None
+        match f.groups[group].votes {
+            Votes::Dense(votes) => votes.get(row),
+            Votes::Rows(votes) => votes.get(row).and_then(Option::as_ref),
+        }
     }
     fn positions(f: Frame<'_>) -> usize {
         usize::from(f.outer.is_some()) + f.groups.iter().map(|g| g.votes.len()).sum::<usize>()
     }
-    fn rx_weight(&self, f: Frame<'_>, kind: VoteKind, id: Option<Id>) -> u64 {
+    pub(super) fn clear_rx(&mut self) {
+        self.rx_positions.clear();
+        self.rx_weights.clear();
+        self.outer_ok = false;
+        self.group_ok.fill(false);
+        self.selected.fill(None);
+    }
+    // Called only after admission. Each signature is checked at most once;
+    // physical coordinates make later accepted-vote reads O(1), even for Rows.
+    pub(super) fn index_frame(&mut self, f: Frame<'_>) {
+        self.clear_rx();
+        self.outer_ok = f
+            .outer
+            .is_some_and(|v| v.content.height == self.d().height && v.verify(self.c()));
+        if f.outer.is_some() {
+            self.rx_positions.push((0, 0));
+        }
+        for (group, g) in f.groups.iter().enumerate() {
+            self.group_ok[group] = self.group_valid(*g);
+            match g.votes {
+                Votes::Dense(votes) => {
+                    self.rx_positions
+                        .extend((0..votes.len()).map(|row| (group, row)));
+                }
+                Votes::Rows(votes) => {
+                    self.rx_positions.extend(
+                        votes
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(row, v)| v.is_some().then_some((group, row))),
+                    );
+                }
+            }
+        }
+        self.rx_weights.resize(self.rx_positions.len(), 0);
+    }
+    // P <= N+1 admitted positions. Lazily cache a conflicting vote's tuple
+    // weight in O(N+P) work; all repairs together take O(P*(N+P)) worst case.
+    // Common nonconflicting frames need no weight scan. Distinctness is per
+    // (round, kind, id), NOT per frame: equivocations may contribute a signer
+    // to several different tuple weights. Zero means uncached (weights >= 1).
+    pub(super) fn rx_weight(&mut self, f: Frame<'_>, position: usize) -> u64 {
+        if self.rx_weights[position] != 0 {
+            return self.rx_weights[position];
+        }
+        let c = self
+            .accepted_vote(f, position)
+            .expect("accepted RX vote")
+            .content;
         let mut weight = 0;
-        for signer in 0..self.c().members.len() {
-            if (0..Self::positions(f))
-                .filter_map(|i| self.accepted_vote(f, i))
-                .any(|v| {
-                    v.content.signer as usize == signer
-                        && v.content.round == self.d().round
-                        && v.content.kind == kind
-                        && v.content.id == id
-                })
-            {
-                weight += self.c().members[signer].weight;
+        self.selected.fill(None);
+        for i in 0..self.rx_positions.len() {
+            if let Some(v) = self.accepted_vote(f, i) {
+                let x = v.content;
+                if (x.round, x.kind, x.id) == (c.round, c.kind, c.id) {
+                    let signer = x.signer as usize;
+                    if self.selected[signer].is_none() {
+                        self.selected[signer] = Some(i);
+                        weight += self.c().members[signer].weight;
+                    }
+                }
+            }
+        }
+        for i in 0..self.rx_positions.len() {
+            if self.accepted_vote(f, i).is_some_and(|v| {
+                let x = v.content;
+                (x.round, x.kind, x.id) == (c.round, c.kind, c.id)
+            }) {
+                self.rx_weights[i] = weight;
             }
         }
         weight
     }
+    // Reuse the jump/weight scratch only after jump staging has finished. Keep
+    // the FIRST matching RX precommit, and always prefer the retained PC row.
+    pub(super) fn index_timeout(&mut self, f: Frame<'_>) {
+        self.selected.fill(None);
+        for position in 0..self.rx_positions.len() {
+            if let Some(v) = self.accepted_vote(f, position) {
+                let c = v.content;
+                if c.round == self.d().round && c.kind == VoteKind::Precommit {
+                    let selected = &mut self.selected[c.signer as usize];
+                    if selected.is_none() {
+                        *selected = Some(position);
+                    }
+                }
+            }
+        }
+    }
     pub(super) fn timeout_vote(&self, f: Frame<'_>, signer: usize) -> Option<Vote> {
-        self.pc[signer].or_else(|| {
-            (0..Self::positions(f))
-                .filter_map(|i| self.accepted_vote(f, i))
-                .find(|v| {
-                    v.content.signer as usize == signer
-                        && v.content.kind == VoteKind::Precommit
-                        && v.content.round == self.d().round
-                })
-                .copied()
-        })
+        self.pc[signer]
+            .or_else(|| self.selected[signer].and_then(|i| self.accepted_vote(f, i).copied()))
     }
     fn timeout_weight(&self, f: Frame<'_>) -> u64 {
         (0..self.c().members.len())
@@ -103,6 +162,7 @@ impl<S: Storage> Engine<S> {
         sink: &mut impl Sink,
     ) -> Result<()> {
         let r = self.receive_inner(frame, status, sink);
+        self.clear_rx();
         self.finish(r)
     }
     fn receive_inner(&mut self, f: Frame<'_>, status: Status, sink: &mut impl Sink) -> Result<()> {
@@ -123,12 +183,7 @@ impl<S: Storage> Engine<S> {
                 return Err(Error::Invalid);
             }
         }
-        self.outer_ok = f
-            .outer
-            .is_some_and(|v| v.content.height == self.d().height && v.verify(self.c()));
-        for (index, g) in f.groups.iter().enumerate() {
-            self.group_ok[index] = self.group_valid(*g);
-        }
+        self.index_frame(f);
         if f.message == Message::Dec {
             if let Some(p) = f.proposal {
                 for (index, g) in f.groups.iter().enumerate() {
@@ -161,7 +216,7 @@ impl<S: Storage> Engine<S> {
             self.jump(f, sink)?;
         }
         // Independent complete groups repair rows, but never own signing bytes.
-        for position in 0..Self::positions(f) {
+        for position in 0..self.rx_positions.len() {
             let Some(v) = self.accepted_vote(f, position).copied() else {
                 continue;
             };
@@ -177,11 +232,10 @@ impl<S: Storage> Engine<S> {
             } else {
                 self.pc[signer]
             };
-            if old.is_none_or(|old| old.content == v.content)
-                || self
-                    .c()
-                    .quorum(self.rx_weight(f, v.content.kind, v.content.id))
-            {
+            if old.is_none_or(|old| old.content == v.content) || {
+                let weight = self.rx_weight(f, position);
+                self.c().quorum(weight)
+            } {
                 if v.content.kind == VoteKind::Prevote {
                     self.pv[signer] = Some(v);
                 } else {
@@ -252,17 +306,21 @@ impl<S: Storage> Engine<S> {
             && self.d().step != Step::Decided
             && self.d().timers[3].active
             && self.d().timers[3].remaining == 0
-            && self.c().quorum(self.timeout_weight(f))
         {
-            let r = self.d().round;
-            let entry =
-                self.stage_selected(CertKind::Timeout { round: r }, Selection::Timeout(f))?;
-            self.start(
-                r.checked_add(1).ok_or(Error::Exhausted)?,
-                Some(entry),
-                false,
-                sink,
-            )?;
+            // drive may have entered a new round; select timeout evidence for
+            // the round as it stands now, only when its timer needs evidence.
+            self.index_timeout(f);
+            if self.c().quorum(self.timeout_weight(f)) {
+                let r = self.d().round;
+                let entry =
+                    self.stage_selected(CertKind::Timeout { round: r }, Selection::Timeout(f))?;
+                self.start(
+                    r.checked_add(1).ok_or(Error::Exhausted)?,
+                    Some(entry),
+                    false,
+                    sink,
+                )?;
+            }
         }
         if !matches!(self.d().step, Step::PreRound | Step::Decided) {
             if let Some(v) = f.outer {
@@ -284,7 +342,7 @@ impl<S: Storage> Engine<S> {
     fn jump(&mut self, f: Frame<'_>, sink: &mut impl Sink) -> Result<()> {
         self.selected.fill(None);
         let current = self.d().round;
-        for position in 0..Self::positions(f) {
+        for position in 0..self.rx_positions.len() {
             let Some(v) = self.accepted_vote(f, position) else {
                 continue;
             };
@@ -792,6 +850,7 @@ impl<S: Storage> Engine<S> {
             }
         }
         self.clear_volatile();
+        self.clear_rx();
         if self.d().step == Step::Decided {
             if self.d().pending.is_none() {
                 return Err(Error::Corrupt);
