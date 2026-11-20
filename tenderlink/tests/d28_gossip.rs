@@ -669,10 +669,12 @@ fn certified_conflict_is_repaired_not_nogap() {
         Served::Sent(Gap::Polka)
     ));
     assert!(s.packets[0].proposal.is_some());
-    assert!(s.packets[0]
-        .groups
-        .iter()
-        .any(|g| g.0 == CertKind::Polka { round: 0, id }));
+    assert!(
+        s.packets[0]
+            .groups
+            .iter()
+            .any(|g| g.0 == CertKind::Polka { round: 0, id })
+    );
 }
 
 #[test]
@@ -945,4 +947,75 @@ fn lagging_round_receiver_jumps_directly_on_self_carrying_prevote_row() {
 fn director_checked_constructor_rejects_degenerate_config() {
     assert!(Director::try_new(dcfg(2, 0)).is_none());
     assert!(Director::try_new(dcfg(2, 1)).is_some());
+}
+
+#[test]
+fn recovered_late_polka_bridges_lower_round_despite_nil_own_precommit() {
+    let c = config(&[0, 1, 2, 3], &[1; 4]);
+    let (mut e, mut s) = engine(&c, 3, 0);
+    e.set_emission(Emission::Guided);
+    let entrants = [
+        vote(&c, 0, 0, 0, 1, VoteKind::Enter, None),
+        vote(&c, 1, 1, 0, 1, VoteKind::Enter, None),
+    ];
+    let entry = [Group {
+        kind: CertKind::Jump { round: 1 },
+        votes: Votes::Dense(&entrants),
+    }];
+    e.receive(
+        ordinary(Some(&entrants[0]), None, &entry),
+        Status::Valid,
+        &mut s,
+    )
+    .unwrap();
+    assert_eq!(st(&e).round, 1);
+    let body = b"late certificate";
+    let h = header(&c, c.proposer(0, 1) as u8, 0, 1, None, body);
+    let id = h.content.id;
+    e.receive(
+        ordinary(None, Some(Proposal { header: &h, body }), &[]),
+        Status::Valid,
+        &mut s,
+    )
+    .unwrap();
+    // One Byzantine signer first supplies nil, then equivocates to the value.
+    // The correct sender's own prevote stays for the value throughout.
+    let nil = vote(&c, 0, 0, 0, 1, VoteKind::Prevote, None);
+    let yes = vote(&c, 1, 1, 0, 1, VoteKind::Prevote, Some(id));
+    for v in [&nil, &yes] {
+        e.receive(ordinary(Some(v), None, &[]), Status::Valid, &mut s)
+            .unwrap();
+    }
+    assert!(e.view().unwrap().timers[2].active);
+    e.elapse(e.view().unwrap().timers[2].remaining, &mut s)
+        .unwrap();
+    assert_eq!(e.precommits()[3].unwrap().content.id, None);
+    let votes: Vec<_> = [0usize, 1, 3]
+        .into_iter()
+        .map(|i| vote(&c, i, i as u8, 0, 1, VoteKind::Prevote, Some(id)))
+        .collect();
+    let polka = [Group {
+        kind: CertKind::Polka { round: 1, id },
+        votes: Votes::Dense(&votes),
+    }];
+    e.receive(ordinary(None, None, &polka), Status::Valid, &mut s)
+        .unwrap();
+    assert_eq!(st(&e).polka, Some((1, id)));
+    let e =
+        Engine::recover_with_emission(e.into_storage(), key(3), Emission::Guided, &mut s).unwrap();
+    assert!(!st(&e).prevote_quorum, "volatile quorum row was cleared");
+    assert_eq!(e.precommits()[3].unwrap().content.id, None);
+    s.packets.clear();
+    let (mut r, mut rs) = engine(&c, 2, 0);
+    assert_eq!(
+        e.serve(2, &st(&r), &mut s).unwrap(),
+        Served::Sent(Gap::Round)
+    );
+    assert_eq!(s.packets.len(), 1);
+    assert_eq!(s.packets[0].outer, None);
+    assert_eq!(s.packets[0].groups[0].0, CertKind::Polka { round: 1, id });
+    s.packets[0].deliver(&mut r, &mut rs).unwrap();
+    assert_eq!(st(&r).round, 1);
+    assert_eq!(r.view().unwrap().locked_round, Some(1));
+    assert_eq!(st(&r).step, Step::Precommit);
 }
