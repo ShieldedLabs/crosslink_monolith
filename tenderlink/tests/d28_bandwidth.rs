@@ -278,7 +278,14 @@ impl Net {
                 continue;
             }
             for _ in 0..d {
-                let fires = self.nodes[i].as_ref().unwrap().0.view().unwrap().grid_remaining == 1;
+                let fires = self.nodes[i]
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .view()
+                    .unwrap()
+                    .grid_remaining
+                    == 1;
                 if fires && self.loss == Loss::AllLive {
                     let before = normalized(&self.nodes[i].as_ref().unwrap().0);
                     let (e, r) = self.nodes[i].as_mut().unwrap();
@@ -322,8 +329,14 @@ impl Net {
                 continue;
             }
             let (e, r) = self.nodes[to].as_mut().unwrap();
-            if p.deliver(e, r).is_err() {
+            if let Err(error) = p.deliver(e, r) {
                 self.stats.errors += 1;
+                panic!(
+                    "correct frame rejected: {}->{to}, message={:?}, outer={:?}: {error:?}",
+                    p.from,
+                    p.message,
+                    p.outer.map(|v| v.content),
+                );
             }
             self.flush(to);
             self.supply(to);
@@ -364,7 +377,10 @@ impl Net {
         // First tick of RHO-1 ends the first period (grid started at RHO, 1 used).
         let mut step = RHO - 1;
         while self.all_decided(h).is_none() {
-            assert!(periods < max_periods, "no decision in {max_periods} periods");
+            assert!(
+                periods < max_periods,
+                "no decision in {max_periods} periods"
+            );
             self.tick_all(step);
             step = RHO;
             periods += 1;
@@ -424,7 +440,10 @@ fn run_healthy(n: usize, em: Emission, body_len: usize) -> (Stats, u64) {
 fn default_emission_is_reference_and_recover_restores_it() {
     let (c, ids) = uniform(4);
     let mut net = Net::new(&c, &ids, Emission::CompactLive, 64);
-    assert_eq!(net.nodes[1].as_ref().unwrap().0.emission(), Emission::CompactLive);
+    assert_eq!(
+        net.nodes[1].as_ref().unwrap().0.emission(),
+        Emission::CompactLive
+    );
     let e = Engine::boot(MemoryStore::default(), key(0), c.clone()).unwrap();
     assert_eq!(e.emission(), Emission::Reference);
     net.healthy();
@@ -471,12 +490,21 @@ fn compact_live_initial_votes_are_bare_and_replay_is_complete() {
         .find(|p| p.from == proposer && kind(p) == Some(VoteKind::Prevote))
         .expect("own prevote replayed");
     assert!(pv.proposal.is_some(), "prevote replay carries the body");
-    assert!(!pv.groups.is_empty(), "prevote replay carries the current row");
+    assert!(
+        !pv.groups.is_empty(),
+        "prevote replay carries the current row"
+    );
 }
 
 #[test]
 fn healthy_round0_reduction_is_exact_and_needs_no_timer_wait() {
-    for (n, body_len) in [(4usize, 4096usize), (8, 4096), (16, 4096), (4, 65536), (16, 65536)] {
+    for (n, body_len) in [
+        (4usize, 4096usize),
+        (8, 4096),
+        (16, 4096),
+        (4, 65536),
+        (16, 65536),
+    ] {
         let (r, _) = run_healthy(n, Emission::Reference, body_len);
         let (k, _) = run_healthy(n, Emission::CompactLive, body_len);
         println!(
@@ -491,7 +519,10 @@ fn healthy_round0_reduction_is_exact_and_needs_no_timer_wait() {
         assert!(k.body_bytes < r.body_bytes, "n={n}");
         // Body: proposer's one broadcast (N-1) plus at most one reactive reply
         // per peer; Reference additionally re-sends it inside prevotes.
-        assert!(k.body_bytes <= 2 * (n as u64 - 1) * body_len as u64, "n={n}");
+        assert!(
+            k.body_bytes <= 2 * (n as u64 - 1) * body_len as u64,
+            "n={n}"
+        );
         assert!(k.tx <= r.tx);
     }
 }
@@ -516,7 +547,10 @@ fn compact_healthy_reduction_with_reordering_and_weights() {
 fn all_live_effects_dropped_still_decides_through_periodic_replay() {
     for n in [4usize, 7] {
         let mut periods = [0u64; 2];
-        for (k, em) in [Emission::Reference, Emission::CompactLive].into_iter().enumerate() {
+        for (k, em) in [Emission::Reference, Emission::CompactLive]
+            .into_iter()
+            .enumerate()
+        {
             let (c, ids) = uniform(n);
             let mut net = Net::new(&c, &ids, em, 4096);
             net.loss = Loss::AllLive;
@@ -530,25 +564,40 @@ fn all_live_effects_dropped_still_decides_through_periodic_replay() {
             let has = |f: &dyn Fn(&Packet) -> bool| net.plog.iter().any(|p| f(p));
             let kind = |p: &Packet| p.outer.as_ref().map(|v| v.content.kind);
             assert!(has(&|p| kind(p) == Some(VoteKind::Enter)));
-            assert!(has(&|p| p.outer.is_none() && p.proposal.is_some()
+            assert!(has(&|p| p.outer.is_none()
+                && p.proposal.is_some()
                 && p.message == Message::Ordinary));
             assert!(has(&|p| kind(p) == Some(VoteKind::Prevote)
                 && p.proposal.is_some()
-                && p.groups.iter().any(|g| matches!(g.0, CertKind::Row { .. }) && !g.1.is_empty())));
+                && p.groups.iter().any(
+                    |g| matches!(g.0, CertKind::Row { .. }) && !g.1.is_empty()
+                )));
             assert!(has(&|p| kind(p) == Some(VoteKind::Precommit)
                 && p.proposal.is_some()
-                && p.groups.iter().any(|g| matches!(g.0, CertKind::Polka { .. }) && !g.1.is_empty())));
+                && p.groups
+                    .iter()
+                    .any(
+                        |g| matches!(g.0, CertKind::Polka { .. }) && !g.1.is_empty()
+                    )));
             assert!(has(&|p| p.message == Message::Dec
                 && p.proposal.is_some()
-                && p.groups.iter().any(|g| matches!(g.0, CertKind::Decision { .. }))));
+                && p.groups
+                    .iter()
+                    .any(|g| matches!(g.0, CertKind::Decision { .. }))));
             // No timer fired: total elapsed stays below the propose timeout.
             assert!(net.elapsed < 30, "{em:?} elapsed={}", net.elapsed);
             for (e, _) in net.nodes.iter().flatten() {
                 assert_eq!(e.view().unwrap().round, 0);
             }
         }
-        println!("D28_BW loss n={n} ref_periods={} compact_periods={}", periods[0], periods[1]);
-        assert_eq!(periods[0], periods[1], "periodic replay is policy independent");
+        println!(
+            "D28_BW loss n={n} ref_periods={} compact_periods={}",
+            periods[0], periods[1]
+        );
+        assert_eq!(
+            periods[0], periods[1],
+            "periodic replay is policy independent"
+        );
     }
 }
 
@@ -601,7 +650,13 @@ fn roster_rotation_recovers_under_compact_live_and_total_live_loss() {
     net.offline.resize(top, false);
     let mut e = Engine::boot(MemoryStore::default(), key(4), b.clone()).unwrap();
     e.set_emission(Emission::CompactLive);
-    net.nodes[4] = Some((e, Rec { from: 4, ..Rec::default() }));
+    net.nodes[4] = Some((
+        e,
+        Rec {
+            from: 4,
+            ..Rec::default()
+        },
+    ));
     net.ids = ids_b.to_vec();
     net.body = body(4096, 9);
     net.loss = Loss::AllLive;
@@ -644,6 +699,12 @@ fn weighted_offline_proposer_node0_silent_until_tick_120() {
         assert!(net.nodes[0].as_ref().unwrap().1.decisions.is_empty());
         assert!(net.nodes[0].as_ref().unwrap().1.packets.is_empty());
         let decided = net.decided(0)[1].unwrap();
+        while net.elapsed < 120 {
+            net.tick_all(1);
+            net.settle();
+            assert!(net.nodes[0].as_ref().unwrap().1.decisions.is_empty());
+        }
+        assert_eq!(net.elapsed, 120);
         net.offline[0] = false;
         let mut periods = 0;
         while net.nodes[0].as_ref().unwrap().1.decisions.is_empty() {
