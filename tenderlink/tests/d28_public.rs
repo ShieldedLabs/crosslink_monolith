@@ -805,3 +805,78 @@ fn deterministic_mixed_evidence_trace() {
         "bcd574186d9d0438b36872e4d3d351c16c0a65f53032804a0bce4480a2e6a506"
     );
 }
+
+/// Finite executable prefix of the loss counterexample in D28-PROOF.md.
+/// Every link repeatedly delivers genuine control traffic, but selectively
+/// dropping bodies prevents decisions. This is not an infinite-run proof.
+#[test]
+fn continuing_control_delivery_does_not_replace_proposal_service() {
+    let c = Config::new(
+        [42; 32],
+        (0..4)
+            .map(|i| Member {
+                public_key: VerificationKeyBytes::from(&key(i)).into(),
+                weight: 1,
+            })
+            .collect(),
+        1024,
+        3,
+        Timeouts {
+            propose: 4,
+            prevote: 2,
+            precommit: 4,
+            inc_propose: 5,
+            inc_prevote: 1,
+            inc_precommit: 3,
+        },
+    )
+    .unwrap();
+    let mut nodes: Vec<_> = (0..4).map(|i| engine(&c, i, 0)).collect();
+    let mut delivered = [[0usize; 4]; 4];
+    let mut discarded_bodies = 0;
+    for _ in 0..80 {
+        for (e, s) in &mut nodes {
+            if let Some(tag) = e.proposal_tag() {
+                e.supply_proposal(tag, b"selectively withheld body", Status::Valid, s)
+                    .unwrap();
+            }
+            e.elapse(1, s).unwrap();
+        }
+        let mut deliveries = Vec::new();
+        for (from, (_, sink)) in nodes.iter_mut().enumerate() {
+            for packet in std::mem::take(&mut sink.packets) {
+                for (to, count) in delivered[from].iter_mut().enumerate() {
+                    if from == to
+                        || packet.target != Target::All && packet.target != Target::Peer(to as u32)
+                    {
+                        continue;
+                    }
+                    if packet.proposal.is_some() {
+                        discarded_bodies += 1;
+                        continue;
+                    }
+                    *count += 1;
+                    deliveries.push((to, packet.clone()));
+                }
+            }
+        }
+        deliveries.reverse();
+        for (to, packet) in deliveries {
+            let (e, s) = &mut nodes[to];
+            packet.deliver(e, s).unwrap();
+        }
+    }
+    assert!(discarded_bodies > 100);
+    for (from, row) in delivered.iter().enumerate() {
+        for (to, count) in row.iter().enumerate() {
+            if from != to {
+                assert!(*count > 20, "link {from}->{to} stopped delivering");
+            }
+        }
+    }
+    for (e, s) in &nodes {
+        assert!(e.is_active());
+        assert!(e.view().unwrap().round >= 3);
+        assert!(s.decisions.is_empty());
+    }
+}
