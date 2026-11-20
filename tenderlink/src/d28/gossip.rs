@@ -75,6 +75,9 @@ pub struct StatusSnapshot {
     pub proposal: Option<Id>,
     /// Round and body id of the held valid-round polka, if any.
     pub polka: Option<(Round, Id)>,
+    /// A quorum of current-round prevotes (any ids) is held, i.e. the prevote
+    /// row is complete enough to arm the prevote timeout. Constant size.
+    pub prevote_quorum: bool,
 }
 fn step_rank(s: Step) -> u8 {
     match s {
@@ -108,6 +111,7 @@ impl<S: Storage> Engine<S> {
             step: d.step,
             proposal: d.slot.map(|s| self.proposal(s).header.content.id),
             polka,
+            prevote_quorum: self.c().quorum(self.row_weight(VoteKind::Prevote, None)),
         })
     }
     fn plan(&self, st: &StatusSnapshot) -> std::result::Result<(Gap, Plan), Skip> {
@@ -145,11 +149,10 @@ impl<S: Storage> Engine<S> {
             d.vc.filter(|vc| self.proposal(vc.proposal).header.content.id == p.header.content.id)
         };
         if let Some(p) = slot {
-            let servable = p.header.content.round == d.round
-                && match p.header.content.valid_round {
-                    Some(_) => vc_matches(&p).is_some(),
-                    None => true,
-                };
+            // The body is a complete valid frame on its own; the certificate is
+            // attached only when useful (see `proposal_group`), so a form-B
+            // body is still served after the polka moved on.
+            let servable = p.header.content.round == d.round;
             if st.proposal.is_none() && servable {
                 return Ok((Gap::Proposal, Plan::Proposal));
             }
@@ -175,7 +178,35 @@ impl<S: Storage> Engine<S> {
         if mine >= 2 && theirs < 2 && self.own_current(VoteKind::Prevote).is_some() {
             return Ok((Gap::Votes, Plan::Prevote));
         }
+        // Same-step missing row: not every individual missing vote, only when
+        // we hold a prevote quorum row and the peer (already prevoting) lacks one.
+        if mine >= 2
+            && theirs >= 2
+            && !st.prevote_quorum
+            && self.c().quorum(self.row_weight(VoteKind::Prevote, None))
+            && self.own_current(VoteKind::Prevote).is_some()
+        {
+            return Ok((Gap::Votes, Plan::Prevote));
+        }
         Err(Skip::NoGap)
+    }
+    /// The certificate worth attaching to the current proposal: the retained
+    /// polka for the SAME body, and only when its round either justifies the
+    /// proposal (its valid round) or is the current round (repairs rows and
+    /// conflicting cached bodies). A polka of another round would be a valid
+    /// but useless group on a form-B proposal.
+    fn proposal_group(&self, p: &Proposal<'_>) -> Option<Group<'_>> {
+        let d = self.d();
+        let vc = d.vc?;
+        if self.proposal(vc.proposal).header.content.id != p.header.content.id {
+            return None;
+        }
+        let r = d.valid_round?;
+        if r == d.round || p.header.content.valid_round == Some(r) {
+            Some(self.group(vc.certificate))
+        } else {
+            None
+        }
     }
     /// Side-effect-free: the gap `serve` would attempt for this status.
     pub fn gap_for(&self, status: &StatusSnapshot) -> Option<Gap> {
@@ -219,13 +250,7 @@ impl<S: Storage> Engine<S> {
             Plan::Proposal => {
                 let s = self.d().slot.ok_or(Error::Corrupt)?;
                 let p = self.proposal(s);
-                let group = self
-                    .d()
-                    .vc
-                    .filter(|vc| {
-                        self.proposal(vc.proposal).header.content.id == p.header.content.id
-                    })
-                    .map(|vc| self.group(vc.certificate));
+                let group = self.proposal_group(&p);
                 sink.send(
                     t,
                     Frame {
@@ -254,7 +279,9 @@ pub struct DirectorConfig {
 }
 /// Host-assigned update. `generation` identifies the transport session
 /// (fresh and larger on reconnect, assigned by the host, never peer-claimed);
-/// `sequence` increases per received status within a session. Latest wins.
+/// `sequence` is the SENDER's per-session status sequence carried on the wire,
+/// not a receiver arrival counter, so reordered or replayed statuses are stale.
+/// Latest wins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatusUpdate {
     pub peer: u32,
@@ -295,6 +322,9 @@ pub struct Director {
     index: HashMap<u32, usize>,
     grants: Vec<Grant>,
     clock: u64,
+    /// Alternates priority-first and oldest-unserved-first selection; kept
+    /// across polls and status updates so churn cannot reset it.
+    fair_next: bool,
 }
 impl Director {
     pub fn new(cfg: DirectorConfig) -> Self {
@@ -304,6 +334,7 @@ impl Director {
             index: HashMap::with_capacity(cfg.max_peers),
             grants: Vec::with_capacity(cfg.max_grants),
             clock: 0,
+            fair_next: false,
         }
     }
     pub fn peers(&self) -> usize {
@@ -365,6 +396,7 @@ impl Director {
         now: u64,
         sink: &mut impl Sink,
     ) -> Result<Vec<(u32, Gap)>> {
+        engine.check()?;
         let now = self.tick(now);
         let mut kept = Vec::with_capacity(self.cfg.max_grants);
         for g in std::mem::take(&mut self.grants) {
@@ -410,11 +442,13 @@ impl Director {
                     Some((b, bg)) => {
                         let q = &self.peers[b];
                         // fair tie: fewer failures, then longest unserved, then id
+                        let fair = self.fair_next;
                         let key = |p: &PeerState, g: Gap| {
                             (
-                                std::cmp::Reverse(g.rank()),
-                                p.failures,
+                                std::cmp::Reverse(if fair { 0 } else { g.rank() }),
+                                if fair { 0 } else { p.failures },
                                 p.last_served.map_or(0, |t| t.saturating_add(1)),
+                                p.failures,
                                 p.id,
                             )
                         };
@@ -431,6 +465,7 @@ impl Director {
                 Served::Sent(g) => {
                     p.granted = true;
                     p.last_served = Some(now);
+                    self.fair_next = !self.fair_next;
                     self.grants.push(Grant {
                         peer: p.id,
                         gap: g,

@@ -479,3 +479,237 @@ fn state_changing_gap_has_priority_and_progress_releases_grant() {
     let got = d.poll(&e, 2, &mut s).unwrap();
     assert!(got.iter().all(|(p, _)| *p != 2));
 }
+
+/// Local node: polka for X at round 0 retained, then moved to round 1.
+fn round1_with_polka() -> (Config, Engine<MemoryStore>, Recorder, Id) {
+    let c = config(&[0, 1, 2, 3], &[1; 4]);
+    let (mut e, mut s, h) = with_proposal(&c, 3, b"x");
+    let id = h.content.id;
+    let votes = polka_votes(&c, id);
+    let g = [Group {
+        kind: CertKind::Polka { round: 0, id },
+        votes: Votes::Dense(&votes),
+    }];
+    e.receive(ordinary(Some(&votes[0]), None, &g), Status::Valid, &mut s)
+        .unwrap();
+    let future = [
+        vote(&c, 0, 0, 0, 1, VoteKind::Prevote, None),
+        vote(&c, 1, 1, 0, 1, VoteKind::Prevote, None),
+    ];
+    let jump = [Group {
+        kind: CertKind::Row {
+            round: 1,
+            kind: VoteKind::Prevote,
+        },
+        votes: Votes::Dense(&future),
+    }];
+    e.receive(
+        ordinary(Some(&future[0]), None, &jump),
+        Status::Indeterminate,
+        &mut s,
+    )
+    .unwrap();
+    assert_eq!(st(&e).round, 1);
+    s.packets.clear();
+    (c, e, s, id)
+}
+
+#[test]
+fn form_b_proposal_is_served_with_its_justifying_polka_and_after_vc_advanced() {
+    let (c, mut e, mut s, id) = round1_with_polka();
+    let body = b"x";
+    let h = header(&c, c.proposer(0, 1) as u8, 0, 1, Some(0), body);
+    assert_eq!(h.content.id, id);
+    let g0v = polka_votes(&c, id);
+    let g0 = [Group {
+        kind: CertKind::Polka { round: 0, id },
+        votes: Votes::Dense(&g0v),
+    }];
+    e.receive(
+        ordinary(None, Some(Proposal { header: &h, body }), &g0),
+        Status::Valid,
+        &mut s,
+    )
+    .unwrap();
+    s.packets.clear();
+    let lag = StatusSnapshot {
+        proposal: None,
+        polka: None,
+        ..st(&e)
+    };
+    assert_eq!(
+        e.serve(5, &lag, &mut s).unwrap(),
+        Served::Sent(Gap::Proposal)
+    );
+    let kinds: Vec<_> = s.packets[0].groups.iter().map(|g| g.0).collect();
+    assert_eq!(kinds, [CertKind::Polka { round: 0, id }]);
+    assert_eq!(s.packets[0].proposal.as_ref().unwrap().0, h);
+    // The receiver validates the whole frame and is justified.
+    let (mut r, mut rs) = engine(&c, 2, 0);
+    let rj = [
+        vote(&c, 0, 0, 0, 1, VoteKind::Prevote, None),
+        vote(&c, 1, 1, 0, 1, VoteKind::Prevote, None),
+    ];
+    let rg = [Group {
+        kind: CertKind::Row {
+            round: 1,
+            kind: VoteKind::Prevote,
+        },
+        votes: Votes::Dense(&rj),
+    }];
+    r.receive(
+        ordinary(Some(&rj[0]), None, &rg),
+        Status::Indeterminate,
+        &mut rs,
+    )
+    .unwrap();
+    s.packets[0].deliver(&mut r, &mut rs).unwrap();
+    assert_eq!(st(&r).proposal, Some(id));
+}
+
+#[test]
+fn form_b_body_with_unrelated_vc_is_still_served_alone() {
+    let (c, mut e, mut s, _) = round1_with_polka();
+    let body = b"y";
+    let h = header(&c, c.proposer(0, 1) as u8, 0, 1, Some(0), body);
+    e.receive(
+        ordinary(None, Some(Proposal { header: &h, body }), &[]),
+        Status::Valid,
+        &mut s,
+    )
+    .unwrap();
+    s.packets.clear();
+    let status = st(&e);
+    assert_eq!(status.proposal, Some(h.content.id));
+    let lag = StatusSnapshot {
+        proposal: None,
+        ..status
+    };
+    assert_eq!(
+        e.serve(5, &lag, &mut s).unwrap(),
+        Served::Sent(Gap::Proposal)
+    );
+    assert!(s.packets[0].groups.is_empty());
+    assert_eq!(s.packets[0].proposal.as_ref().unwrap().0, h);
+}
+
+#[test]
+fn certified_conflict_is_repaired_not_nogap() {
+    // Peer caches a conflicting proposal; we hold the current-round polka.
+    let c = config(&[0, 1, 2, 3], &[1; 4]);
+    let (mut e, mut s, h) = with_proposal(&c, 3, b"x");
+    let id = h.content.id;
+    let votes = polka_votes(&c, id);
+    let g = [Group {
+        kind: CertKind::Polka { round: 0, id },
+        votes: Votes::Dense(&votes),
+    }];
+    e.receive(ordinary(Some(&votes[0]), None, &g), Status::Valid, &mut s)
+        .unwrap();
+    let lag = StatusSnapshot {
+        proposal: Some([9; 32]),
+        polka: None,
+        prevote_quorum: false,
+        ..st(&e)
+    };
+    assert!(matches!(
+        e.serve(5, &lag, &mut s).unwrap(),
+        Served::Sent(Gap::Polka)
+    ));
+    assert!(s.packets[0].proposal.is_some());
+    assert!(s.packets[0]
+        .groups
+        .iter()
+        .any(|g| g.0 == CertKind::Polka { round: 0, id }));
+}
+
+#[test]
+fn same_step_peer_lacking_prevote_quorum_gets_full_row_and_arms_timer() {
+    let c = config(&[0, 1, 2, 3], &[1; 4]);
+    let (mut e, mut s, h) = with_proposal(&c, 3, b"x");
+    let id = h.content.id;
+    let (mut r, mut rs, _) = with_proposal(&c, 2, b"x");
+    let a = vote(&c, 0, 0, 0, 0, VoteKind::Prevote, None);
+    let b = vote(&c, 1, 1, 0, 0, VoteKind::Prevote, None);
+    e.receive(ordinary(Some(&a), None, &[]), Status::Valid, &mut s)
+        .unwrap();
+    e.receive(ordinary(Some(&b), None, &[]), Status::Valid, &mut s)
+        .unwrap();
+    s.packets.clear();
+    assert!(st(&e).prevote_quorum);
+    assert!(!st(&r).prevote_quorum);
+    assert_eq!(st(&e).step, st(&r).step);
+    assert!(!r.view().unwrap().timers[2].active);
+    // A single missing vote alone never triggers a package.
+    let near = StatusSnapshot {
+        prevote_quorum: true,
+        ..st(&r)
+    };
+    assert_eq!(
+        e.serve(6, &near, &mut s).unwrap(),
+        Served::Skipped(Skip::NoGap)
+    );
+    assert_eq!(
+        e.serve(6, &st(&r), &mut s).unwrap(),
+        Served::Sent(Gap::Votes)
+    );
+    s.packets[0].deliver(&mut r, &mut rs).unwrap();
+    assert!(st(&r).prevote_quorum);
+    assert!(r.view().unwrap().timers[2].active);
+}
+
+#[test]
+fn high_priority_churn_cannot_starve_lower_gap() {
+    let (c, mut e, mut s, id) = round1_with_polka();
+    let _ = id;
+    let body = b"z";
+    let h = header(&c, c.proposer(0, 1) as u8, 0, 1, None, body);
+    e.receive(
+        ordinary(None, Some(Proposal { header: &h, body }), &[]),
+        Status::Valid,
+        &mut s,
+    )
+    .unwrap();
+    s.packets.clear();
+    let mine = st(&e);
+    let low = StatusSnapshot {
+        step: Step::Propose,
+        ..mine
+    };
+    let hi_round = StatusSnapshot { round: 0, ..mine };
+    let hi_prop = StatusSnapshot {
+        proposal: None,
+        ..mine
+    };
+    assert_eq!(e.gap_for(&low), Some(Gap::Votes));
+    assert_eq!(e.gap_for(&hi_round), Some(Gap::Round));
+    assert_eq!(e.gap_for(&hi_prop), Some(Gap::Proposal));
+    let mut d = Director::new(dcfg(4, 1));
+    d.update(upd(1, 1, 1, low), 0).unwrap();
+    d.update(upd(2, 1, 1, hi_round), 0).unwrap();
+    let mut seq = 1;
+    let mut served_low = false;
+    for now in 0..12u64 {
+        // The high peer's status flips every tick, releasing its grant.
+        seq += 1;
+        let flip = if seq % 2 == 0 { hi_prop } else { hi_round };
+        d.update(upd(2, 1, seq, flip), now).unwrap();
+        for (p, _) in d.poll(&e, now, &mut s).unwrap() {
+            if p == 1 {
+                served_low = true;
+            }
+        }
+        if served_low {
+            break;
+        }
+    }
+    assert!(served_low, "low-priority eligible peer starved");
+}
+
+#[test]
+fn poll_on_healthy_engine_with_no_peers_is_empty() {
+    let c = config(&[0, 1, 2, 3], &[1; 4]);
+    let (e, mut s, _) = with_proposal(&c, 3, b"x");
+    let mut d = Director::new(dcfg(2, 1));
+    assert!(d.poll(&e, 0, &mut s).unwrap().is_empty());
+}
