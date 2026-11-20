@@ -4957,6 +4957,8 @@ pub fn run_instances(i: usize) {
 
 pub use shielded_transport_pigeon::{stp, native_sockets};
 pub mod transport;
+/// Deterministic bounded-memory weighted consensus reference core.
+pub mod d28;
 pub mod helpers;
 
 use helpers::*;
