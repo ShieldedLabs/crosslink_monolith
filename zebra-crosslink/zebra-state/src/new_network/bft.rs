@@ -508,11 +508,12 @@ pub enum BftRequest {
         block: BftBlock,
         reply: tokio::sync::oneshot::Sender<(TMStatus, TMStatusReason)>,
     },
+    /// A decision tenderlink reached, to store. Nothing answers it: tenderlink waits for the
+    /// published decided tip to pass its height (`DECIDED_TIP`).
     Decided {
         block: BftBlock,
         fat_pointer: FatPointerToBftBlock,
         proposal_sigs: Vec<TMSig>,
-        reply: tokio::sync::oneshot::Sender<(Vec<SortedRosterMember>, [u8; 32], bool)>,
     },
     /// A decided block supplied from outside (the test format's `LoadPoS`): validated and stored
     /// exactly as a tenderlink decision, with the proposer's chunk signatures, or none for a round
@@ -1328,13 +1329,12 @@ struct DecidedBlock {
     block: BftBlock,
     fat_pointer: FatPointerToBftBlock,
     proposal_sigs: Vec<TMSig>,
-    reply: Option<DecisionReply>,
+    reply: Option<ImportReply>,
 }
 
-enum DecisionReply {
-    Tenderlink(tokio::sync::oneshot::Sender<(Vec<SortedRosterMember>, [u8; 32], bool)>),
-    ForceFeed(tokio::sync::oneshot::Sender<Result<(), String>>),
-}
+/// How an imported decision is answered: `Ok` once stored, or why it was not. Tenderlink's own
+/// decisions are not answered; it follows the published decided tip.
+type ImportReply = tokio::sync::oneshot::Sender<Result<(), String>>;
 
 /// The BFT side of the sync thread: answers tenderlink's requests against the writer's chains,
 /// bootstraps BFT from the bc-chain, and persists decisions.
@@ -1370,8 +1370,8 @@ enum Source {
 enum Admitted {
     /// Store it, voted on by `voting`, keeping `proposal_sigs`.
     New { block_hash: Blake3Hash, voting: Arc<VotingRoster>, proposal_sigs: Vec<TMSig> },
-    /// Stored already with this block; `next` is the height after it, for tenderlink.
-    AlreadyDecided { next: (Vec<SortedRosterMember>, [u8; 32], bool) },
+    /// Stored already: this block, or for tenderlink's own decision possibly another (reported).
+    AlreadyDecided,
     /// Validation cannot settle it until a missing block is back.
     Park { reason: TMStatusReason },
 }
@@ -1440,10 +1440,6 @@ pub(super) struct BftRunner {
     /// tenderlink cannot be started from it. Waiting on the reply here would freeze the sync
     /// thread, which is the only thread that can retry the commit.
     pending_bootstrap: Option<PendingBootstrap>,
-    /// Decisions that arrived after BFT was dropped. Tenderlink waits on each reply before it
-    /// moves to the next height, and treats a closed channel as fatal, so they are kept open and
-    /// never answered.
-    unanswered_decisions: Vec<tokio::sync::oneshot::Sender<(Vec<SortedRosterMember>, [u8; 32], bool)>>,
     /// A decision whose re-validation came back indeterminate: its snapshot was here when
     /// tenderlink validated the proposal and has been dropped from the non-finalized state since.
     /// The decision is final either way, so it is retried at the start of every tick until the
@@ -1508,16 +1504,26 @@ fn publish_tip(tip: &Arc<DecidedTip>) {
     });
 }
 
-/// The decided tip as tenderlink takes it, if it has reached `engine_height`.
-fn host_tip(engine_height: u64) -> Option<tenderlink::HostTip> {
-    let published = DECIDED_TIP.borrow();
-    let tip = published.as_ref().filter(|tip| tip.height >= engine_height)?;
-    Some(tenderlink::HostTip {
+/// `tip` as tenderlink takes it.
+fn host_tip_of(tip: &DecidedTip) -> tenderlink::HostTip {
+    tenderlink::HostTip {
         height: tip.height,
         next_roster: tip.next_roster.clone(),
         next_vote_namespace: tip.next_voting.vote_namespace,
         next_strict_quorum: tip.next_voting.strict_quorum,
-    })
+    }
+}
+
+/// The published decided tip as tenderlink takes it, if it has reached `engine_height`.
+fn host_tip(engine_height: u64) -> Option<tenderlink::HostTip> {
+    DECIDED_TIP.borrow().as_deref().filter(|tip| tip.height >= engine_height).map(host_tip_of)
+}
+
+/// Hands the sync thread a decision as this node's tenderlink hands over one it reached (the test
+/// format's `BFT_PUSH_CANDIDATE`). Nothing answers it; what became of it shows in the decided chain
+/// and the published tip. False when there is no sync thread to take it.
+pub fn push_candidate(block: BftBlock, fat_pointer: FatPointerToBftBlock, proposal_sigs: Vec<TMSig>) -> bool {
+    send_request(BftRequest::Decided { block, fat_pointer, proposal_sigs })
 }
 
 /// Assumption, kept by `finish_decision` and `restore`: a published tip's decision is stored, so
@@ -1688,8 +1694,27 @@ const ASSUME_REPLAY_ROWS_ARE_THIS_NODES: () = ();
 /// rule itself.
 const ASSUME_ADMITTED_BEFORE_APPLY: () = ();
 
-/// The height and value of the last conflicting quorum reported, so each is reported once.
-static CONFLICTING_QUORUM_REPORTED: Mutex<Option<(u64, ValueId)>> = Mutex::new(None);
+/// The height and block of the last conflicting quorum reported, so each is reported once.
+static CONFLICTING_QUORUM_REPORTED: Mutex<Option<(u64, Blake3Hash)>> = Mutex::new(None);
+
+/// Reports, loudly and once per height and block, a quorum for block `other` at a height where
+/// this node stored `stored`: finalizers precommitted both. The stored decision stands and BFT
+/// keeps running: stopping it would let anyone holding finalizer keys from the past, which cost
+/// nothing once unbonded, stop BFT on every node that sees such a quorum. `how` says where the
+/// other quorum was seen.
+fn report_conflicting_quorum(height: u64, stored: Blake3Hash, other: Blake3Hash, how: &str) {
+    let mut reported = CONFLICTING_QUORUM_REPORTED.lock().unwrap();
+    if *reported == Some((height, other)) {
+        return;
+    }
+    *reported = Some((height, other));
+    metrics::counter!("state.crosslink.bft_conflicting_quorums").increment(1);
+    tracing::error!(
+        "crosslink: CONFLICTING BFT QUORUM at height {height}. This node stored block {stored} as decided \
+         there, and {how} block {other}: at least a third of that height's stake signed both. This node \
+         keeps the stored decision and BFT keeps running. Report this with both block hashes.",
+    );
+}
 
 /// Reports, loudly, a quorum of precommits tenderlink holds at its height for a value other than
 /// the decision this node already stored there: finalizers precommitted both. Tenderlink takes
@@ -1712,19 +1737,8 @@ fn note_conflicting_quorum(bft_state: &TMState) {
         if round.proposal_id.0 == stored.0 {
             continue;
         }
-        let mut reported = CONFLICTING_QUORUM_REPORTED.lock().unwrap();
-        if *reported == Some((height, round.proposal_id)) {
-            continue;
-        }
-        *reported = Some((height, round.proposal_id));
-        metrics::counter!("state.crosslink.bft_conflicting_quorums").increment(1);
-        tracing::error!(
-            "crosslink: CONFLICTING BFT QUORUM at height {height}. This node stored block {stored} as decided \
-             there, and tenderlink holds a quorum of precommits for block {} in round {}: at least a third of \
-             that height's stake signed both. This node keeps the stored decision and BFT keeps running. \
-             Report this with both block hashes.",
-            Blake3Hash(round.proposal_id.0), round.round,
-        );
+        let how = format!("tenderlink holds a quorum of precommits in round {} for", round.round);
+        report_conflicting_quorum(height, stored, Blake3Hash(round.proposal_id.0), &how);
     }
 }
 
@@ -1757,13 +1771,14 @@ struct ParkedDecision {
     block: BftBlock,
     fat_pointer: FatPointerToBftBlock,
     proposal_sigs: Vec<TMSig>,
-    reply: Option<DecisionReply>,
+    reply: Option<ImportReply>,
 }
 
+/// The genesis bootstrap decided, waiting to be stored (it may park on its snapshot) before
+/// tenderlink starts on it.
 struct PendingBootstrap {
     genesis: BftBlock,
     fat_pointer: FatPointerToBftBlock,
-    roster_rx: tokio::sync::oneshot::Receiver<(Vec<SortedRosterMember>, [u8; 32], bool)>,
 }
 
 impl BftRunner {
@@ -1788,7 +1803,6 @@ impl BftRunner {
             slashforks: config.slashfork_schedule.clone(),
             launch,
             pending_bootstrap: None,
-            unanswered_decisions: Vec::new(),
             parked_decision: None,
             retrying_parked_decision: false,
             next_diagnostic: std::time::Instant::now(),
@@ -1878,7 +1892,7 @@ impl BftRunner {
         // finalizes h1 through a deterministic genesis decision, and BFT starts at height 1 with
         // h1's roster. A network whose BFT is supplied has no activation height and never
         // bootstraps.
-        self.finish_bootstrap();
+        self.finish_bootstrap(read_state, block_writer);
         if let (Some(_), Some(activation_height)) = (self.launch.as_ref(), self.params.bootstrap.activation_height()) {
             if read_state.best_tip().is_some_and(|(tip, _)| tip.0 >= activation_height) {
                 self.bootstrap(read_state, block_writer);
@@ -1967,14 +1981,12 @@ impl BftRunner {
                 let chain = BFT_CHAIN.read().unwrap();
                 let _ = reply.send(self.validate(&chain, read_state, &block));
             }
-            BftRequest::Decided { block, fat_pointer, proposal_sigs, reply } => {
-                let reply = Some(DecisionReply::Tenderlink(reply));
-                let _ = self.store_decision(Source::Tenderlink, &block, &fat_pointer, &proposal_sigs, reply, read_state, block_writer);
+            BftRequest::Decided { block, fat_pointer, proposal_sigs } => {
+                let _ = self.store_decision(Source::Tenderlink, &block, &fat_pointer, &proposal_sigs, None, read_state, block_writer);
             }
             BftRequest::ForceFeed { block, fat_pointer, proposal_sigs, valid_round, require_certificate, reply } => {
                 let source = Source::Imported { valid_round, require_certificate };
-                let reply = Some(DecisionReply::ForceFeed(reply));
-                let _ = self.store_decision(source, &block, &fat_pointer, &proposal_sigs, reply, read_state, block_writer);
+                let _ = self.store_decision(source, &block, &fat_pointer, &proposal_sigs, Some(reply), read_state, block_writer);
             }
         }
     }
@@ -2039,42 +2051,30 @@ impl BftRunner {
                     );
                 }
                 // A height decided already: the sync loop fed it from peers while tenderlink lagged.
-                // Answer as that decision did, so tenderlink moves on. Another block at a decided
-                // height needs a conflicting quorum: finalizers equivocated, and BFT stops.
+                // The tip has passed it, so tenderlink moves on. Another block at a decided height
+                // needs a conflicting quorum: finalizers equivocated. The stored decision stands.
                 let chain = BFT_CHAIN.read().unwrap();
                 // Tenderlink decides one height at a time, so it can be at a height this node no
                 // longer holds in memory.
                 if let Some(stored) = decided_block(&chain, block.height as usize).filter(|stored| !stored.headers.is_empty()) {
                     let same = chain.hash_to_height.get(&block_hash) == Some(&height);
-                    // Only the conflict, which ends BFT, needs the stored block's hash.
+                    // Only the conflict needs the stored block's hash.
                     let chain_block_hash = (!same).then(|| stored.blake3_hash());
                     drop(stored);
-                    if !same {
-                        drop(chain);
-                        // Two blocks at one height, each with a quorum certificate this node
-                        // verified: finalizers equivocated. Stop BFT, as for any decision this
-                        // node cannot follow.
-                        halt_bft(format!(
-                            "crosslink: BFT is stopped on this node. BFT height {height} is decided with block {}, and a \
-                             quorum certificate also names block {}: finalizers voted for both. The node keeps running \
-                             as proof of work, without finality.",
-                            chain_block_hash.expect("computed when the blocks differ"), block_hash,
-                        ));
-                        return Err(Refusal::refused(format!("BFT height {height} is decided already with another block")));
+                    drop(chain);
+                    if let Some(stored_hash) = chain_block_hash {
+                        // Two blocks at one height, each with a quorum certificate: finalizers
+                        // equivocated. Warned, never a halt (decisions table, 2026-11-19/20).
+                        report_conflicting_quorum(height, stored_hash, block_hash, "this node's tenderlink decided");
                     }
-                    let next = match (chain.voting_rosters.get(block.height as usize + 1), &chain.tip) {
-                        (Some(voting), _) => (voting.roster.clone(), voting.vote_namespace, voting.strict_quorum),
-                        (None, Some(tip)) => (tip.next_roster.clone(), tip.next_voting.vote_namespace, tip.next_voting.strict_quorum),
-                        (None, None) => unreachable!("a decided height means a tip"),
-                    };
-                    return Ok(Admitted::AlreadyDecided { next });
+                    return Ok(Admitted::AlreadyDecided);
                 }
             }
         }
 
         if source != Source::Tenderlink {
             if BFT_CHAIN.read().unwrap().hash_to_height.get(&block_hash) == Some(&height) {
-                return Ok(Admitted::AlreadyDecided { next: (Vec::new(), [0; 32], false) });
+                return Ok(Admitted::AlreadyDecided);
             }
             // A decision at this height is already final and waits only for its snapshot;
             // storing another one here would fork the chain under it. (A fetched decision was
@@ -2119,11 +2119,19 @@ impl BftRunner {
             // now with the last roster would guess the next height's validator set, which is the
             // stake at a snapshot this node does not hold.
             (TMStatus::Indeterminate, _) => return Ok(Admitted::Park { reason }),
-            (TMStatus::Fail, Source::Tenderlink) => panic!(
-                "decided BFT block {} at height {} failed re-validation after this node validated it: \
-                 an immutable fact changed ({reason:?})",
-                block_hash, block.height,
-            ),
+            // Tenderlink validated the proposal against this node's chain when it arrived, so a
+            // rule that refuses it now means that chain moved under it. Not stored and not a crash:
+            // tenderlink waits at this height until the tip passes it, decided from peers.
+            (TMStatus::Fail, Source::Tenderlink) => {
+                metrics::counter!("state.crosslink.bft_own_decisions_refused").increment(1);
+                tracing::error!(
+                    "crosslink: this node's tenderlink decided BFT block {} at height {}, which now fails this \
+                     node's block rules ({reason:?}). It is not stored; tenderlink waits until that height is \
+                     decided from peers.",
+                    block_hash, block.height,
+                );
+                return Err(Refusal::refused(format!("PoS validation = {status:?}: {reason:?}")));
+            }
             (TMStatus::Fail, _) => return Err(Refusal::refused(format!("PoS validation = {status:?}: {reason:?}"))),
         }
         if source == Source::Tenderlink {
@@ -2629,38 +2637,26 @@ impl BftRunner {
         block: &BftBlock,
         fat_pointer: &FatPointerToBftBlock,
         proposal_sigs: &[TMSig],
-        reply: Option<DecisionReply>,
+        reply: Option<ImportReply>,
         read_state: &ReadState,
         block_writer: &mut WriteBlockWorkerTask,
     ) -> Result<Stored, Refusal> {
         let admitted = match self.admit_decision(source, block, fat_pointer, proposal_sigs, read_state, block_writer) {
             Ok(admitted) => admitted,
             Err(refusal) => {
-                match reply {
-                    // Refused only with BFT dropped or stopped, so tenderlink is being aborted:
-                    // it treats a closed reply as fatal, so the reply is kept open.
-                    Some(DecisionReply::Tenderlink(reply)) => self.unanswered_decisions.push(reply),
-                    Some(DecisionReply::ForceFeed(reply)) => {
-                        let _ = reply.send(Err(refusal.why.clone()));
-                    }
-                    None => {}
+                if let Some(reply) = reply {
+                    let _ = reply.send(Err(refusal.why.clone()));
                 }
                 return Err(refusal);
             }
         };
         let (block_hash, voted, proposal_sigs) = match admitted {
             Admitted::New { block_hash, voting, proposal_sigs } => (block_hash, voting, proposal_sigs),
-            Admitted::AlreadyDecided { next } => {
-                match reply {
-                    Some(DecisionReply::Tenderlink(reply)) => {
-                        let _ = reply.send(next);
-                    }
-                    // An import is accepted once; saying so beats a roster check of the wrong
-                    // height that would refuse it for a reason that is not true.
-                    Some(DecisionReply::ForceFeed(reply)) => {
-                        let _ = reply.send(Err(format!("BFT height {} is decided already with this block", block.height)));
-                    }
-                    None => {}
+            Admitted::AlreadyDecided => {
+                // An import is accepted once; saying so beats a roster check of the wrong height
+                // that would refuse it for a reason that is not true.
+                if let Some(reply) = reply {
+                    let _ = reply.send(Err(format!("BFT height {} is decided already with this block", block.height)));
                 }
                 return Ok(Stored::AlreadyDecided);
             }
@@ -2740,16 +2736,8 @@ impl BftRunner {
             ),
         }
 
-        match reply {
-            Some(DecisionReply::Tenderlink(reply)) => {
-                // Vote namespacing: the next height's namespace is the cumulative slashfork hash
-                // inclusive of any slashfork scheduled at that next height.
-                let _ = reply.send((tip.next_roster.clone(), tip.next_voting.vote_namespace, tip.next_voting.strict_quorum));
-            }
-            Some(DecisionReply::ForceFeed(reply)) => {
-                let _ = reply.send(Ok(()));
-            }
-            None => {}
+        if let Some(reply) = reply {
+            let _ = reply.send(Ok(()));
         }
     }
 
@@ -2986,33 +2974,40 @@ impl BftRunner {
             "crosslink bootstrap: PoW reached height {}; deciding BFT genesis {} which finalizes height {}",
             activation_height, genesis.blake3_hash(), roster_height,
         );
-        let (reply, roster_rx) = tokio::sync::oneshot::channel();
-        let reply = Some(DecisionReply::Tenderlink(reply));
-        let _ = self.store_decision(Source::Tenderlink, &genesis, &fat_pointer, &[], reply, read_state, block_writer);
-        self.pending_bootstrap = Some(PendingBootstrap { genesis, fat_pointer, roster_rx });
-        self.finish_bootstrap();
+        match self.store_decision(Source::Tenderlink, &genesis, &fat_pointer, &[], None, read_state, block_writer) {
+            Ok(_) => {
+                self.pending_bootstrap = Some(PendingBootstrap { genesis, fat_pointer });
+                self.finish_bootstrap(read_state, block_writer);
+            }
+            Err(refusal) => tracing::error!("crosslink bootstrap: genesis could not be finalized: {}", refusal.why),
+        }
     }
 
     /// Start tenderlink once the bootstrap genesis decision has committed. Genesis finalizes a
     /// block every chain at the activation height holds, so this normally succeeds on the tick
     /// that decided it.
-    fn finish_bootstrap(&mut self) {
-        let Some(pending) = self.pending_bootstrap.as_mut() else { return; };
-        let (roster, vote_namespace, strict_quorum) = match pending.roster_rx.try_recv() {
-            Ok(next) => next,
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                tracing::error!("crosslink bootstrap: genesis could not be finalized");
-                self.pending_bootstrap = None;
-                return;
-            }
+    fn finish_bootstrap(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
+        if self.pending_bootstrap.is_none() {
+            return;
+        }
+        // Stored once the chain has a tip; a parked genesis waits for its snapshot.
+        let (tip, genesis_voting) = {
+            let chain = BFT_CHAIN.read().unwrap();
+            let Some(tip) = chain.tip.clone() else { return };
+            // Who decided genesis, as stored with it: the roster `next_voting` gives before
+            // genesis, computed there only.
+            (tip, Arc::clone(chain.voting_rosters.first().expect("a decided tip means genesis is stored")))
         };
-        let PendingBootstrap { genesis, fat_pointer, .. } = self.pending_bootstrap.take().unwrap();
-        // Who decided genesis, as stored with it: the roster `next_voting_roster` gives before
-        // genesis, computed there only.
-        let genesis_voting = Arc::clone(BFT_CHAIN.read().unwrap().voting_rosters.first().expect("genesis is stored before its reply is sent"));
+        let PendingBootstrap { genesis, fat_pointer } = self.pending_bootstrap.take().unwrap();
+        if tip.height > 0 {
+            // More than genesis was decided while it waited: start from the tip as any start does.
+            if !self.start_from_tip(block_writer) {
+                self.restore(read_state, block_writer);
+            }
+            return;
+        }
         let genesis_round = decided_round_data(&genesis, &fat_pointer, genesis_voting.roster.clone(), &genesis_voting, Vec::new(), 0, self.params.active_roster_max_n);
-        self.spawn_tenderlink(roster, vec![genesis_round], vote_namespace, strict_quorum);
+        self.spawn_tenderlink(tip.next_roster.clone(), vec![genesis_round], tip.next_voting.vote_namespace, tip.next_voting.strict_quorum);
     }
 
     /// Start tenderlink at the height after `ingest` with `roster`, and mark BFT active. Refuses
@@ -3101,18 +3096,27 @@ impl BftRunner {
             tenderlink::ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer, proposal_sigs| {
                 Box::pin(async move {
                     let block = BftBlock::zcash_deserialize(&block.0[..]).unwrap();
-                    let (reply, rx) = tokio::sync::oneshot::channel();
-                    // Both failures mean the sync thread will never answer: it has shut down, or
-                    // this node dropped BFT and is aborting this task. Either way this height
-                    // never completes here, and waiting forever lets the abort or the runtime's
-                    // shutdown end the task instead of the process.
-                    if !send_request(BftRequest::Decided { block, fat_pointer, proposal_sigs, reply }) {
+                    let height = u64::from(block.height);
+                    // Subscribed before the hand-off, so the tip it leads to is not missed.
+                    let mut tips = DECIDED_TIP.subscribe();
+                    // Failing to send means the sync thread is gone, so no tip will pass this
+                    // height; waiting forever lets the runtime's shutdown end the task instead of
+                    // the process. A refused or parked decision likewise waits, for the height to
+                    // be decided from peers or the snapshot to return.
+                    if !send_request(BftRequest::Decided { block, fat_pointer, proposal_sigs }) {
                         return std::future::pending().await;
                     }
-                    let Ok(answer) = rx.await else {
-                        return std::future::pending().await;
-                    };
-                    answer
+                    // The decision's own height when it was stored, or a later tip when the node
+                    // had decided past it: either way the published tip passing it is the answer.
+                    loop {
+                        let reached = tips.borrow_and_update().as_deref().filter(|tip| tip.height >= height).map(host_tip_of);
+                        if let Some(tip) = reached {
+                            return tip;
+                        }
+                        if tips.changed().await.is_err() {
+                            return std::future::pending().await;
+                        }
+                    }
                 })
             })),
             tenderlink::ClosureToUpdatePeers(Arc::new(move |all_peers| {

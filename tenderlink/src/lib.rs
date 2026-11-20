@@ -189,10 +189,22 @@ impl std::fmt::Debug for ClosureToValidateProposedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToValidateProposedBlock(..)") }
 }
 #[derive(Clone)]
-// Returns the roster for the next height together with that height's 32-byte vote-namespacing
-// domain separator (the cumulative hash of slashforks in effect; `[0; 32]` when there are none)
-// and whether it decides by the strict quorum (see `decision_threshold`).
-pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock, Vec<TMSig>)-> core::pin::Pin<Box<dyn Future<Output = (Vec<SortedRosterMember>, [u8; 32], bool)> + Send>> + Send + Sync + 'static>);
+// Hands the host a decision this engine reached. The future resolves with the host's decided tip
+// once it has reached the decision's height: that height when the host stored the decision, or a
+// later one when the host had decided past it. The engine then moves to the height after the tip,
+// with the roster, 32-byte vote-namespacing domain separator (the cumulative hash of slashforks in
+// effect; `[0; 32]` when there are none) and quorum rule (see `decision_threshold`) it carries.
+pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock, Vec<TMSig>)-> core::pin::Pin<Box<dyn Future<Output = HostTip> + Send>> + Send + Sync + 'static>);
+impl ClosureToPushDecidedBlock {
+    /// A host that stores every decision it is handed and answers with its height as the tip,
+    /// the next height voting with `next_roster`: for engines run without a node.
+    pub fn echo(next_roster: Vec<SortedRosterMember>, next_vote_namespace: [u8; 32], next_strict_quorum: bool) -> Self {
+        Self(Arc::new(move |_, fat_pointer, _| {
+            let tip = HostTip { height: fat_pointer.get_vote_template().height, next_roster: next_roster.clone(), next_vote_namespace, next_strict_quorum };
+            Box::pin(async move { tip })
+        }))
+    }
+}
 impl std::fmt::Debug for ClosureToPushDecidedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToPushDecidedBlock(..)") }
 }
@@ -1923,10 +1935,9 @@ impl TMState {
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass)
             {
                 if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 49: value decided"); }
-                let (new_roster, new_vote_namespace, new_strict_quorum) = self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster), self.rounds_data[i].proposal_sigs.clone()).await;
-                if PRINT_ROSTER { println!("{ctx_str} {ANSI_GRY}ROSTER{ANSI_RST}: new roster: {:?}", new_roster); }
+                let tip = self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster), self.rounds_data[i].proposal_sigs.clone()).await;
+                if PRINT_ROSTER { println!("{ctx_str} {ANSI_GRY}ROSTER{ANSI_RST}: decided tip {}; new roster: {:?}", tip.height, tip.next_roster); }
                 let decided = self.rounds_data[i].clone();
-                let tip = HostTip { height: self.height, next_roster: new_roster, next_vote_namespace: new_vote_namespace, next_strict_quorum: new_strict_quorum };
                 self.enter_height_after(roster, &tip, Some(decided));
                 let round = self.take_wal_for_height(roster);
                 self.start_round(roster, now, round).await;
@@ -2244,11 +2255,12 @@ async fn instance(
             let decisions = Arc::clone(&decisions);
             let roster2 = roster2.clone();
             Box::pin(async move {
+                let height = fat_pointer.get_vote_template().height;
                 decisions.lock().unwrap().push((block, fat_pointer));
                 let mut ret = roster2.clone();
                 ret.truncate(3 + decisions.lock().unwrap().len() % 2);
                 // Sim/test has no slashforks → nil namespace (backwards-compatible no-op).
-                (ret, [0u8; 32], false)
+                HostTip { height, next_roster: ret, next_vote_namespace: [0u8; 32], next_strict_quorum: false }
             })
         })),
         ClosureToUpdatePeers(Arc::new(move |_all_peers| { Box::pin(async move {
@@ -5058,7 +5070,7 @@ mod tests {
             key, pub_key, 0, ROSTER_MAX_N,
             ClosureToProposeNewBlock(Arc::new(|| Box::pin(async { None }))),
             ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
-            ClosureToPushDecidedBlock(Arc::new(|_, _, _| Box::pin(async { (Vec::new(), [0; 32], false) }))),
+            ClosureToPushDecidedBlock::echo(Vec::new(), [0; 32], false),
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
             ClosureToFetchDecidedRound(Arc::new(|_| None)),
@@ -5242,7 +5254,7 @@ mod tests {
             keys[me].clone(), roster[me].pub_key, 0, ROSTER_MAX_N,
             ClosureToProposeNewBlock(Arc::new(|| Box::pin(async { None }))),
             ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
-            ClosureToPushDecidedBlock(Arc::new(|_, _, _| Box::pin(async { (Vec::new(), [0; 32], false) }))),
+            ClosureToPushDecidedBlock::echo(Vec::new(), [0; 32], false),
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
             ClosureToFetchDecidedRound(Arc::new(|_| None)),
@@ -5466,7 +5478,7 @@ mod tests {
             keys[0].clone(), roster[0].pub_key, 0, ROSTER_MAX_N,
             ClosureToProposeNewBlock(Arc::new(|| Box::pin(async { None }))),
             ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
-            ClosureToPushDecidedBlock(Arc::new(|_, _, _| Box::pin(async { (Vec::new(), [0; 32], false) }))),
+            ClosureToPushDecidedBlock::echo(Vec::new(), [0; 32], false),
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
             ClosureToFetchDecidedRound(Arc::new(|_| None)),
@@ -5520,7 +5532,7 @@ mod tests {
             keys[i].clone(), roster[i].pub_key, 0, ROSTER_MAX_N,
             ClosureToProposeNewBlock(Arc::new(move || { let value = proposes.clone(); Box::pin(async move { value }) })),
             ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
-            ClosureToPushDecidedBlock(Arc::new(move |_, _, _| { let roster = decided_roster.clone(); Box::pin(async move { (roster, [0; 32], false) }) })),
+            ClosureToPushDecidedBlock::echo(decided_roster.clone(), [0; 32], false),
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
             ClosureToFetchDecidedRound(Arc::new(|_| None)),
@@ -6227,7 +6239,7 @@ mod tests {
             key.clone(), PubKeyID(VerificationKeyBytes::from(key).into()), 0, ROSTER_MAX_N,
             ClosureToProposeNewBlock(Arc::new(move || { let value = proposes.clone(); Box::pin(async move { value }) })),
             ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
-            ClosureToPushDecidedBlock(Arc::new(move |_, _, _| { let roster = decided_roster.clone(); Box::pin(async move { (roster, [0; 32], false) }) })),
+            ClosureToPushDecidedBlock::echo(decided_roster.clone(), [0; 32], false),
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
             ClosureToFetchDecidedRound(Arc::new(|_| None)),
@@ -7122,7 +7134,7 @@ mod tests {
                 Box::pin(async move { Some(value) })
             })),
             ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(async { (TMStatus::Pass, TMStatusReason::None) }))),
-            ClosureToPushDecidedBlock(Arc::new(move |_, _, _| { let roster = decided_roster.clone(); Box::pin(async move { (roster, [0; 32], strict_quorum) }) })),
+            ClosureToPushDecidedBlock::echo(decided_roster.clone(), [0; 32], strict_quorum),
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
             ClosureToFetchDecidedRound(Arc::new(|_| None)),
@@ -7276,7 +7288,7 @@ mod tests {
             let height = u64::from_le_bytes(fat_pointer.vote_for_block_without_finalizer_public_key[32..40].try_into().unwrap());
             decisions.lock().unwrap().decided.push((height, block.id_from_value(&HashKeys::default())));
             let roster = decided_roster.clone();
-            Box::pin(async move { (roster, [0; 32], strict_quorum) })
+            Box::pin(async move { HostTip { height, next_roster: roster, next_vote_namespace: [0; 32], next_strict_quorum: strict_quorum } })
         }));
         let records = Arc::clone(store);
         node.write_wal_closure = ClosureToWriteWal(Arc::new(move |height, record| {

@@ -4863,6 +4863,61 @@ fn crosslink_bft_engine_jumps_to_the_decided_tip_in_one_tick() {
     test_bytes(tf.write_to_bytes());
 }
 
+/// A decision this node's tenderlink reaches for another block at a height the node already
+/// stored is a conflicting quorum: finalizers precommitted both. The node reports it loudly and
+/// keeps the stored decision, and BFT keeps running. Halting would let anyone holding finalizer
+/// keys from the past stop BFT for free. (Before step 3 of the decided-tip plan the node stopped
+/// BFT here.) The candidate is handed over directly: the race that makes tenderlink reach one in a
+/// live run cannot be scheduled.
+#[test]
+fn crosslink_bft_own_candidate_conflicting_with_a_stored_decision_warns_and_keeps_bft_running() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene(&mut tf, &[false]);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    let stored = bft_rounds_decisions(&scene, 20, 1);
+    let other = bft_rounds_decisions(&scene, 30, 1);
+    assert_ne!(stored[0].1.blake3_hash(), other[0].1.blake3_hash());
+    push_scene_decision(&mut tf, &stored[0], 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+
+    let (_, block, fat_ptr, sigs) = &other[0];
+    let candidate = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block: block.clone(), fat_ptr: fat_ptr.clone() });
+    tf.push_instr_bft_push_candidate(&candidate, sigs, 0);
+    tf.push_instr_expect_bft_dropped(false, None, 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// A decision this node's tenderlink hands over that this node's block rules refuse is not stored,
+/// and the node keeps running: tenderlink waits at that height until it is decided from peers.
+/// (Before step 3 of the decided-tip plan the node panicked here.) The candidate's previous-block
+/// pointer does not name the decided tip, a rule tenderlink's own validation would have caught, so
+/// it is handed over directly.
+#[test]
+fn crosslink_bft_own_candidate_failing_the_block_rules_is_refused_without_a_crash() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene(&mut tf, &[false]);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+
+    let mut signers: Vec<u64> = scene.finalizers.iter().map(|&k| u64::from(k)).collect();
+    signers.sort_by_key(|&k| std::cmp::Reverse(synthetic_finalizer_pub_key(k)));
+    let seeds: Vec<String> = signers.iter().map(|&k| synthetic_finalizer_seed(k)).collect();
+    let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
+    let block = bft_proposal(&BFT_ROUNDS_PARAMETERS, 1, FatPointerToBftBlock::null(), 0, &scene.tail_above(20));
+    let fat_ptr = signed_fat_pointer(&block, 1, 0, &seeds, &[0; 32]);
+    let candidate = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr });
+    tf.push_instr_bft_push_candidate(&candidate, &[], 0);
+    tf.push_instr_expect_pos_chain_length(1, 0);
+    tf.push_instr_expect_bft_dropped(false, None, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 /// A tenderlink that holds a quorum of precommits for one value at its height, when the node stores
 /// another as decided there, takes the stored one and moves on: finalizers precommitted both, which
 /// the node reports loudly, but stopping BFT for it would let anyone holding finalizer keys from

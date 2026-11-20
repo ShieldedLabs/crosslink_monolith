@@ -171,6 +171,7 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::EXPECT_BFT_DROPPED as usize] = "EXPECT_BFT_DROPPED";
     strs[TFInstr::CLOCK_STEP_DURING as usize] = "CLOCK_STEP_DURING";
     strs[TFInstr::MEMPOOL_LAG as usize] = "MEMPOOL_LAG";
+    strs[TFInstr::BFT_PUSH_CANDIDATE as usize] = "BFT_PUSH_CANDIDATE";
 
     let mut retired_i = 0;
     while retired_i < TFInstr::RETIRED.len() {
@@ -178,7 +179,7 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
         retired_i += 1;
     }
 
-    const_assert!(TFInstr::COUNT == 39);
+    const_assert!(TFInstr::COUNT == 40);
     strs
 };
 
@@ -342,7 +343,13 @@ impl TFInstr {
     /// (see `mempool_follow_tip`), so it reads them only when its own callers call it, and may see
     /// several blocks at once and reset, as a node's mempool does.
     pub const MEMPOOL_LAG: TFInstrKind = 38;
-    pub const COUNT: TFInstrKind = 39;
+    /// A decided block and its certificate, with any proposal signatures (a `LOAD_POS` payload;
+    /// `val` unused), handed to the node as its own tenderlink hands over a decision it reached:
+    /// checked and stored as tenderlink's own. Nothing answers it, so it passes once the sync
+    /// thread has taken it; what became of it is for the instructions after it to check. Fails
+    /// when there is no sync thread to take it.
+    pub const BFT_PUSH_CANDIDATE: TFInstrKind = 39;
+    pub const COUNT: TFInstrKind = 40;
 
     pub fn str_from_kind(kind: TFInstrKind) -> &'static str {
         let kind = kind as usize;
@@ -367,6 +374,7 @@ impl TFInstr {
                 };
                 str += &format!("{} - {}, parent: {}", height, block.hash(), block.header.previous_block_hash)
             }
+            Some(TestInstr::BftPushCandidate { block, .. }) => str += &format!("{} at BFT height {}", block.blake3_hash(), block.height),
             Some(TestInstr::LoadPoS { block, proposal_sigs, valid_round, .. }) => {
                 match (block.headers.first(), block.headers.last()) {
                     (Some(first), Some(last)) => {
@@ -745,12 +753,13 @@ impl TF {
 
     /// `proposal_sigs` one per chunk (see [`bft_proposal_sigs`]), `valid_round` -1 for none.
     pub fn push_instr_load_pos_signed(&mut self, data: &BftBlockAndFatPointerToItWrap, proposal_sigs: &[TMSig], valid_round: i64, flags: u32) {
-        let mut bytes = data.zcash_serialize_to_vec().expect("a BFT block and fat pointer serialize");
-        for sig in proposal_sigs {
-            bytes.extend_from_slice(&sig.0);
-        }
         let valid_round = u64::try_from(valid_round + 1).expect("a valid round of -1 or more");
-        self.push_instr_ex(TFInstr::LOAD_POS, flags, &bytes, [valid_round, 0])
+        self.push_instr_ex(TFInstr::LOAD_POS, flags, &decision_payload(data, proposal_sigs), [valid_round, 0])
+    }
+
+    /// `BFT_PUSH_CANDIDATE`: `data` handed over as the node's own tenderlink hands a decision.
+    pub fn push_instr_bft_push_candidate(&mut self, data: &BftBlockAndFatPointerToItWrap, proposal_sigs: &[TMSig], flags: u32) {
+        self.push_instr_ex(TFInstr::BFT_PUSH_CANDIDATE, flags, &decision_payload(data, proposal_sigs), [0, 0])
     }
 
     pub fn push_instr_expect_pow_chain_length(&mut self, length: usize, flags: u32) {
@@ -1318,6 +1327,30 @@ pub fn crosslink_parameters_for_test(bytes: &[u8]) -> ZcashCrosslinkParameters {
     }
 }
 
+/// The payload `LOAD_POS` and `BFT_PUSH_CANDIDATE` carry: a decided block and its fat pointer,
+/// then its proposal signatures, one per chunk or none.
+fn decision_payload(data: &BftBlockAndFatPointerToItWrap, proposal_sigs: &[TMSig]) -> Vec<u8> {
+    let mut bytes = data.zcash_serialize_to_vec().expect("a BFT block and fat pointer serialize");
+    for sig in proposal_sigs {
+        bytes.extend_from_slice(&sig.0);
+    }
+    bytes
+}
+
+/// Reads `decision_payload`'s bytes back.
+fn read_decision_payload(data: &[u8]) -> Option<(BftBlock, FatPointerToBftBlock, Vec<TMSig>)> {
+    let mut rest = data;
+    let block_and_fat_ptr = BftBlockAndFatPointerToItWrap::zcash_deserialize(&mut rest).ok()?;
+    // The count comes from the block, never from the file: the chunk count, or none. Whether
+    // none is allowed at this height is the node's call.
+    let chunks_n = tenderlink::proposal_chunks_n(block_and_fat_ptr.0.block.zcash_serialize_to_vec().ok()?.len());
+    if !rest.is_empty() && rest.len() != 64 * chunks_n {
+        return None;
+    }
+    let proposal_sigs = rest.chunks_exact(64).map(|sig| TMSig(sig.try_into().expect("64 bytes"))).collect();
+    Some((block_and_fat_ptr.0.block, block_and_fat_ptr.0.fat_ptr, proposal_sigs))
+}
+
 /// A `LOAD_POS` instruction's decided block, fat pointer, proposal signatures and valid round, or
 /// `None` for any other instruction or one that does not parse.
 pub fn read_load_pos(bytes: &[u8], instr: &TFInstr) -> Option<(BftBlock, FatPointerToBftBlock, Vec<TMSig>, i64)> {
@@ -1328,7 +1361,7 @@ pub fn read_load_pos(bytes: &[u8], instr: &TFInstr) -> Option<(BftBlock, FatPoin
 }
 
 pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> {
-    const_assert!(TFInstr::COUNT == 39);
+    const_assert!(TFInstr::COUNT == 40);
     match instr.kind {
         TFInstr::LOAD_POW => {
             let data = instr.data_slice(bytes);
@@ -1346,21 +1379,13 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
         }
 
         TFInstr::LOAD_POS => {
-            let mut rest = instr.data_slice(bytes);
-            let block_and_fat_ptr = BftBlockAndFatPointerToItWrap::zcash_deserialize(&mut rest).ok()?;
-            // The count comes from the block, never from the file: the chunk count, or none.
-            // Whether none is allowed at this height is the node's call.
-            let chunks_n = tenderlink::proposal_chunks_n(block_and_fat_ptr.0.block.zcash_serialize_to_vec().ok()?.len());
-            if !rest.is_empty() && rest.len() != 64 * chunks_n {
-                return None;
-            }
-            let proposal_sigs = rest.chunks_exact(64).map(|sig| TMSig(sig.try_into().expect("64 bytes"))).collect();
-            Some(TestInstr::LoadPoS {
-                block: block_and_fat_ptr.0.block,
-                fat_ptr: block_and_fat_ptr.0.fat_ptr,
-                proposal_sigs,
-                valid_round: i64::try_from(instr.val[0]).ok()? - 1,
-            })
+            let (block, fat_ptr, proposal_sigs) = read_decision_payload(instr.data_slice(bytes))?;
+            Some(TestInstr::LoadPoS { block, fat_ptr, proposal_sigs, valid_round: i64::try_from(instr.val[0]).ok()? - 1 })
+        }
+
+        TFInstr::BFT_PUSH_CANDIDATE => {
+            let (block, fat_ptr, proposal_sigs) = read_decision_payload(instr.data_slice(bytes))?;
+            Some(TestInstr::BftPushCandidate { block, fat_ptr, proposal_sigs })
         }
 
         TFInstr::SET_PARAMS => {
@@ -1521,6 +1546,7 @@ pub(crate) enum TestInstr {
     LoadPoW(Block),
     /// A decided BFT height, with the proposer's chunk signatures and the valid round they cover.
     LoadPoS { block: BftBlock, fat_ptr: FatPointerToBftBlock, proposal_sigs: Vec<TMSig>, valid_round: i64 },
+    BftPushCandidate { block: BftBlock, fat_ptr: FatPointerToBftBlock, proposal_sigs: Vec<TMSig> },
     SetParams(ZcashCrosslinkParameters),
     ExpectPoWChainLength(u32),
     ExpectPoSChainLength(u64),
@@ -1918,6 +1944,15 @@ pub(crate) async fn handle_instr(
                 );
             }
         },
+
+        TestInstr::BftPushCandidate { block, fat_ptr, proposal_sigs } => {
+            let height = block.height;
+            let sent = zebra_state::new_network::bft::push_candidate(block, fat_ptr, proposal_sigs);
+            // Taken on the sync thread's next request pass; a settled tick has served it.
+            sync_settle().await;
+            sync_settle().await;
+            test_check(flags, sent, &format!("BFT_PUSH_CANDIDATE: a decision at BFT height {height} handed to the sync thread"));
+        }
 
         TestInstr::LoadPoS { block, fat_ptr, proposal_sigs, valid_round } => {
             // let path = format!("../crosslink-test-data/test_pos_block_{}.bin", instr_i);
@@ -3331,6 +3366,7 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
                 instr,
                 TestInstr::LoadPoW(_)
                     | TestInstr::LoadPoS { .. }
+                    | TestInstr::BftPushCandidate { .. }
                     | TestInstr::RecvPoW { .. }
                     | TestInstr::RecvStpPacket { .. }
                     | TestInstr::MineFromTemplate { .. }
