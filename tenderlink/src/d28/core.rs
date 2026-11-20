@@ -1,6 +1,12 @@
 use super::*;
 impl<S: Storage> Engine<S> {
     fn group_valid(&self, g: Group<'_>) -> bool {
+        self.group_valid_with_outer(g, None)
+    }
+    // Only a fully verified, current-frame outer vote may supply this shortcut.
+    // Equality includes the signature bytes; group kind, distinctness and weight
+    // are still checked independently. Recovery has no verified outer to reuse.
+    fn group_valid_with_outer(&self, g: Group<'_>, verified_outer: Option<&Vote>) -> bool {
         let n = self.c().members.len();
         if g.votes.is_empty() || g.votes.len() > n {
             return false;
@@ -9,7 +15,7 @@ impl<S: Storage> Engine<S> {
         for (i, v) in g.votes.iter().enumerate() {
             let c = v.content;
             if c.height != self.d().height
-                || !v.verify(self.c())
+                || !(verified_outer == Some(v) || v.verify(self.c()))
                 || g.votes.iter().take(i).any(|x| x.content.signer == c.signer)
             {
                 return false;
@@ -74,7 +80,8 @@ impl<S: Storage> Engine<S> {
             self.rx_positions.push((0, 0));
         }
         for (group, g) in f.groups.iter().enumerate() {
-            self.group_ok[group] = self.group_valid(*g);
+            self.group_ok[group] =
+                self.group_valid_with_outer(*g, f.outer.filter(|_| self.outer_ok));
             match g.votes {
                 Votes::Dense(votes) => {
                     self.rx_positions
