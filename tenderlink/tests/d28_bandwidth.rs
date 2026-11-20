@@ -719,6 +719,80 @@ fn weighted_offline_proposer_node0_silent_until_tick_120() {
 }
 
 #[test]
+fn directed_late_catchup_sends_one_decision_only_to_the_information_gap() {
+    use tenderlink::d28::gossip::*;
+
+    for n in [4usize, 8, 16] {
+        let (c, ids) = uniform(n);
+        let mut net = Net::new(&c, &ids, Emission::CompactLive, 4096);
+        let late = n - 1;
+        net.offline[late] = true;
+        net.healthy();
+        assert!(net.decided(0)[..late].iter().all(Option::is_some));
+        assert!(net.decided(0)[late].is_none());
+        net.offline[late] = false;
+
+        let statuses: Vec<_> = net
+            .nodes
+            .iter()
+            .map(|node| node.as_ref().unwrap().0.status().unwrap())
+            .collect();
+        let mut director = Director::new(DirectorConfig {
+            max_peers: n - 1,
+            max_grants: 1,
+            grant_timeout: 10,
+            status_ttl: 100,
+        });
+        for (peer, &status) in statuses.iter().enumerate().skip(1) {
+            director
+                .update(
+                    StatusUpdate {
+                        peer: peer as u32,
+                        generation: 1,
+                        sequence: 1,
+                        status,
+                    },
+                    1,
+                )
+                .unwrap();
+        }
+        let before = net.stats;
+        let (e, r) = net.nodes[0].as_mut().unwrap();
+        assert_eq!(
+            director.poll(e, 1, r).unwrap(),
+            [(late as u32, Gap::Decision)]
+        );
+        assert_eq!(r.packets.len(), 1);
+        assert_eq!(r.packets[0].target, Target::Peer(late as u32));
+        assert_eq!(r.packets[0].message, Message::Dec);
+        net.flush(0);
+        // Unlike one all-peer DEC replay (N-1 bodies), this beam carries one
+        // complete body and certificate, with no extra output to current peers.
+        assert_eq!(net.stats.tx - before.tx, 1);
+        assert_eq!(net.stats.body_bytes - before.body_bytes, 4096);
+        net.pump();
+        assert_eq!(net.all_decided(0), Some(body_id(&net.body)));
+        assert_eq!(net.elapsed, 1, "catch-up did not wait for a replay timer");
+        let status = net.nodes[late].as_ref().unwrap().0.status().unwrap();
+        director
+            .update(
+                StatusUpdate {
+                    peer: late as u32,
+                    generation: 1,
+                    sequence: 2,
+                    status,
+                },
+                2,
+            )
+            .unwrap();
+        let (e, r) = net.nodes[0].as_mut().unwrap();
+        assert!(director.poll(e, 2, r).unwrap().is_empty());
+        assert_eq!(director.active_grants(), 0);
+        assert!(r.packets.is_empty());
+    }
+}
+
+#[test]
 #[ignore]
 fn bandwidth_benchmark() {
     let ns: Vec<usize> = std::env::var("D28_BW_N")
