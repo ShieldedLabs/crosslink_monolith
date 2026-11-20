@@ -254,22 +254,29 @@ impl InBlockBonds {
                 self.unbonded_or_withdrawn.insert(bond_key);
             }
             StakingActionKind::WithdrawDelegationBond => {
-                // From FeaturenetUpgrade3 a withdrawal also waits for the chain the block extends
-                // to finalize past its unbonding, so it cannot happen while finality is stalled.
-                // The extended chain, not the block, so the mempool's check at the tip is exactly
-                // the next block's.
-                let finalized_height = spends_versions.then(|| {
-                    *self
-                        .chain_finalized_height
-                        .get_or_init(|| chain_finalized_height(Some(non_finalized_chain), finalized_state))
-                });
+                // From FeaturenetUpgrade3, once its delay is chosen, a withdrawal also waits for
+                // the chain the block extends to finalize past its unbonding, so it cannot happen
+                // while finality is stalled. The extended chain, not the block, so the mempool's
+                // check at the tip is exactly the next block's.
+                let finality = non_finalized_chain
+                    .network()
+                    .crosslink_parameters()
+                    .staking
+                    .withdrawal_finality_delay()
+                    .filter(|_| spends_versions)
+                    .map(|delay| WithdrawalFinality {
+                        delay,
+                        finalized_height: *self
+                            .chain_finalized_height
+                            .get_or_init(|| chain_finalized_height(Some(non_finalized_chain), finalized_state)),
+                    });
 
                 // Check that bond exists, is unbonding, and withdrawal amount matches bond amount
                 validate_bond_for_withdrawal(
                     bond_key,
                     height,
                     staking_action.amount_zats(),
-                    finalized_height,
+                    finality,
                     non_finalized_chain,
                 )?;
 
@@ -490,17 +497,24 @@ fn validate_bond_for_unbonding(
     )))
 }
 
-/// Rejects a withdrawal of a bond unbonded at `unbonded_at` unless `finalized_height`, the
-/// finalized height of the chain it extends, is more than the network's withdrawal finality delay
-/// above it: the book's provisional rule C. A chain that finalizes nothing, because BFT has not
-/// started or its pointer names no snapshot, holds every withdrawal.
+/// What the book's provisional rule C checks a withdrawal against, where it applies.
+#[derive(Clone, Copy, Debug)]
+struct WithdrawalFinality {
+    /// Blocks past the unbonding that the chain must have finalized beyond.
+    delay: u32,
+    /// The finalized height of the chain the block extends, `None` while it finalizes nothing.
+    finalized_height: Option<zebra_chain::block::Height>,
+}
+
+/// Rejects a withdrawal of a bond unbonded at `unbonded_at` unless the finalized height of the
+/// chain it extends is more than `delay` above it: the book's provisional rule C. A chain that
+/// finalizes nothing, because BFT has not started or its pointer names no snapshot, holds every
+/// withdrawal.
 fn validate_withdrawal_finality(
     bond_key: [u8; 32],
     unbonded_at: zebra_chain::block::Height,
-    finalized_height: Option<zebra_chain::block::Height>,
-    non_finalized_chain: &Chain,
+    WithdrawalFinality { delay, finalized_height }: WithdrawalFinality,
 ) -> Result<(), ValidateContextError> {
-    let delay = non_finalized_chain.network().crosslink_parameters().staking.withdrawal_finality_delay();
     let required = zebra_chain::block::Height(unbonded_at.0.saturating_add(delay));
 
     match finalized_height {
@@ -513,14 +527,14 @@ fn validate_withdrawal_finality(
 }
 
 /// Validates WithdrawDelegationBond: ensures the bond exists, is unbonding, was unbonded at least
-/// the network's staking action delay before `height`, and the amount matches. With
-/// `finalized_height` given (from FeaturenetUpgrade3), the unbonding must also be far enough
-/// below it; see [`validate_withdrawal_finality`].
+/// the network's staking action delay before `height`, and the amount matches. With `finality`
+/// given (from FeaturenetUpgrade3, once its delay is chosen), the unbonding must also be far
+/// enough below the chain's finalized height; see [`validate_withdrawal_finality`].
 fn validate_bond_for_withdrawal(
     bond_key: [u8; 32],
     height: zebra_chain::block::Height,
     withdrawal_amount: u64,
-    finalized_height: Option<Option<zebra_chain::block::Height>>,
+    finality: Option<WithdrawalFinality>,
     non_finalized_chain: &Chain,
 ) -> Result<(), ValidateContextError> {
     // Check if bond exists in non-finalized state
@@ -538,8 +552,8 @@ fn validate_bond_for_withdrawal(
                     )));
                 }
                 validate_staking_action_delay(bond_key, height, unbonded_at.height, non_finalized_chain)?;
-                if let Some(finalized_height) = finalized_height {
-                    validate_withdrawal_finality(bond_key, unbonded_at.height, finalized_height, non_finalized_chain)?;
+                if let Some(finality) = finality {
+                    validate_withdrawal_finality(bond_key, unbonded_at.height, finality)?;
                 }
                 return Ok(());
             }

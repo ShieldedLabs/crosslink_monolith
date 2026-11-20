@@ -4205,7 +4205,11 @@ fn crosslink_reject_action_on_a_bond_after_it_unbonds_or_withdraws_in_the_block(
 /// delay. No block cites a BFT block, so finality is stalled and the withdrawal is refused. Then
 /// the tip cites a BFT block finalizing exactly the unbonding plus the delay, which is still
 /// refused, and then one finalizing the block after, which lets it through.
+///
+/// Ignored while the rule is off: `StakingParameters::withdrawal_finality_delay` is `None` until
+/// its value is chosen (#287), so both refusals are accepted. Remove the `ignore` when it is set.
 #[test]
+#[ignore = "provisional rule C is off until its withdrawal finality delay is chosen (#287)"]
 fn crosslink_withdrawal_waits_for_finality_from_featurenet_upgrade_3() {
     set_test_name(function_name!());
     test_bytes(withdrawal_finality_scene(false));
@@ -4255,7 +4259,8 @@ fn withdrawal_finality_scene(finalized_before_withdrawal: bool) -> Vec<u8> {
     // where the action delay has passed. A withdrawal needs the chain to have finalized past
     // `required`.
     let (created_at, unbonded_at, withdraw_from) = (staking.period, 2 * staking.period, 3 * staking.period);
-    let required = unbonded_at + staking.withdrawal_finality_delay();
+    // Until the delay is chosen the scene is built for one the length of the action delay.
+    let required = unbonded_at + staking.withdrawal_finality_delay().unwrap_or(staking.action_delay);
     assert!(withdraw_from >= unbonded_at + staking.action_delay);
     assert!(staking.day_window >= 3, "three withdrawal attempts fit in one staking day");
     // A BFT block finalizing `required + 1` carries the sigma blocks above it, and a block may

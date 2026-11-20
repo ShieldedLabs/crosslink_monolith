@@ -500,13 +500,14 @@ impl StakingParameters {
 
     /// Blocks past a bond's unbonding that the chain's finalized height must be beyond before the
     /// bond can be withdrawn, from FeaturenetUpgrade3: the book's provisional rule C. A withdrawal
-    /// therefore waits while finality is stalled, which keeps the stake slashable.
+    /// therefore waits while finality is stalled, which keeps the stake slashable. `None` turns
+    /// the rule off, even once FeaturenetUpgrade3 is active.
     ///
-    /// @Todo: the book calls this "N staking cycles" without fixing N; #287 defers the value, and
-    /// this stands in until it is chosen. It is derived rather than set so the test format, which
-    /// carries the calendar, does not change before then.
-    pub const fn withdrawal_finality_delay(&self) -> u32 {
-        self.action_delay
+    /// @Todo: the book calls this "N staking cycles" without fixing N, and the rule stays off
+    /// until N is chosen (#287). Derived from the calendar rather than set, so the test format,
+    /// which carries the calendar, does not change.
+    pub const fn withdrawal_finality_delay(&self) -> Option<u32> {
+        None
     }
 
     /// Whether consensus can run on this calendar: a non-empty day window no longer than the
