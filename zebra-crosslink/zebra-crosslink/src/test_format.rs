@@ -2353,7 +2353,8 @@ static TEST_STP_PEERS: Mutex<Vec<HarnessStpPeer>> = Mutex::new(Vec::new());
 const STP_PACKET_SETTLE_PASSES: usize = 3;
 
 /// How long, in real time and in sync passes, an STP delivery waits for a request before a block too
-/// deep to be adopted counts as one the node will not fetch (see `serve_block`).
+/// deep to be adopted counts as one the node will not fetch (see `serve_block`), or a transaction as
+/// one it will not ask for (`serve_tx`).
 const NOT_FETCHED_GRACE: Duration = Duration::from_millis(50);
 const NOT_FETCHED_PASSES: u64 = 10;
 
@@ -3026,6 +3027,7 @@ async fn serve_tx(internal_handle: &TFLServiceHandle, stp: &mut HarnessStpPeer, 
     let listing = tx_status_packet(1, [(&id, wire_tx.len() as u32)]);
     stp.link.send(listing.clone());
     let mut listed_at = zebra_debug_time::instant_now();
+    let (listed_real, listed_ticks) = (std::time::Instant::now(), zebra_state::new_network::SYNC_TICKS_DONE.load(std::sync::atomic::Ordering::Acquire));
 
     let deadline = tokio::time::Instant::now() + NODE_ANSWER_WAIT;
     // Polls the node's clock for the heartbeat; kept across the loop, as a fresh sleep would be
@@ -3034,6 +3036,16 @@ async fn serve_tx(internal_handle: &TFLServiceHandle, stp: &mut HarnessStpPeer, 
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
+                // The node asks for a transaction it wants within a pass or two of the listing (one
+                // to read it, one to take the mempool's filter), so one it has let several passes go
+                // by without asking for it is not going to ask for: one it holds, has refused or is
+                // verifying. Waiting out the bound took 30 s of every such delivery, and as the
+                // guided corpus kept inputs that reach that path, of most of a CI campaign.
+                if listed_real.elapsed() >= NOT_FETCHED_GRACE
+                    && zebra_state::new_network::SYNC_TICKS_DONE.load(std::sync::atomic::Ordering::Acquire) >= listed_ticks + NOT_FETCHED_PASSES
+                {
+                    return (false, format!("the node did not ask peer {index} for {id} within {NOT_FETCHED_PASSES} sync passes"));
+                }
                 if zebra_debug_time::instant_now().saturating_duration_since(listed_at) >= TX_RELIST_EVERY {
                     stp.link.send(listing.clone());
                     listed_at = zebra_debug_time::instant_now();
