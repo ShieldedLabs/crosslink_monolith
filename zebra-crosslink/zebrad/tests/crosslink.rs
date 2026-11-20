@@ -4198,18 +4198,16 @@ fn crosslink_reject_action_on_a_bond_after_it_unbonds_or_withdraws_in_the_block(
 }
 
 /// From FeaturenetUpgrade3 a bond withdraws only once the chain the block extends has finalized
-/// more than the withdrawal finality delay past its unbonding: the book's provisional rule C
-/// (#287). A withdrawal waits while finality is stalled, so the stake stays slashable.
+/// the height the selected withdrawal finality rule requires (#287). A withdrawal waits while
+/// finality is stalled, so the stake stays slashable.
 ///
-/// The bond unbonds on one staking day and is withdrawn on the next, late enough for the action
-/// delay. No block cites a BFT block, so finality is stalled and the withdrawal is refused. Then
-/// the tip cites a BFT block finalizing exactly the unbonding plus the delay, which is still
-/// refused, and then one finalizing the block after, which lets it through.
-///
-/// Ignored while the rule is off: `StakingParameters::withdrawal_finality_delay` is `None` until
-/// its value is chosen (#287), so both refusals are accepted. Remove the `ignore` when it is set.
+/// The bond unbonds on one staking day and is withdrawn on the next. No block cites a BFT block,
+/// so finality is stalled and the withdrawal is refused. Then the tip cites a BFT block finalizing
+/// the block just below the required height, which is still refused, and then one finalizing the
+/// required height itself, which lets it through. The heights follow the selected rule, so the
+/// scene holds for each of `zcash_primitives::bft::WithdrawalFinality`'s rules. With the rule off
+/// (`WITHDRAWAL_FINALITY` is `None`) both refusals are accepted and this fails.
 #[test]
-#[ignore = "provisional rule C is off until its withdrawal finality delay is chosen (#287)"]
 fn crosslink_withdrawal_waits_for_finality_from_featurenet_upgrade_3() {
     set_test_name(function_name!());
     test_bytes(withdrawal_finality_scene(false));
@@ -4233,14 +4231,19 @@ fn withdrawal_finality_scene(finalized_before_withdrawal: bool) -> Vec<u8> {
     const REFUSAL: &str = "withdrawal waits for finality";
 
     // `bonded_start` bonds the supplied finalizer at height BONDED_SHIFT, which the day window
-    // must reach; the short calendar's ends just below it.
+    // must reach, and three withdrawals must fit in a staking day after finality reaches the
+    // start of it (rule D, or C with one period), which takes sigma + 1 blocks and one more for
+    // the BFT block that says so. The short calendar's window is shorter than either.
     let params = HARNESS_PARAMETERS;
+    let sigma = params.bc_confirmation_depth_sigma as u32;
     let short = short_staking(&params);
-    let day_window = short.day_window.max(BONDED_SHIFT as u32 + 1);
-    let staking = zcash_primitives::bft::StakingParameters { day_window, action_delay: short.action_delay.max(day_window + 1), ..short };
+    let day_window = short.day_window.max(BONDED_SHIFT as u32 + 1).max(2 * sigma + 4);
+    let action_delay = short.action_delay.max(day_window + 1);
+    let staking = zcash_primitives::bft::StakingParameters { day_window, action_delay, period: short.period.max(day_window + action_delay) };
     assert!(staking.is_valid());
     let params = zcash_primitives::bft::ZcashCrosslinkParameters { staking, ..params };
-    let sigma = params.bc_confirmation_depth_sigma as u32;
+    // While no rule is selected the scene is built for D, so the control still runs.
+    let rule = zcash_primitives::bft::WITHDRAWAL_FINALITY.unwrap_or(zcash_primitives::bft::WithdrawalFinality::NextStakingPeriod);
     let upgrade_3 = 1 + BONDED_SHIFT as u32 + 1;
     let node_config = node_config_with_activation_heights(ConfiguredActivationHeights {
         featurenet_upgrade_3: Some(upgrade_3),
@@ -4256,16 +4259,15 @@ fn withdrawal_finality_scene(finalized_before_withdrawal: bool) -> Vec<u8> {
     assert!(height(&gen) < upgrade_3);
 
     // The bond is created on one staking day, unbonds on the next and withdraws on the one after,
-    // where the action delay has passed. A withdrawal needs the chain to have finalized past
-    // `required`.
-    let (created_at, unbonded_at, withdraw_from) = (staking.period, 2 * staking.period, 3 * staking.period);
-    // Until the delay is chosen the scene is built for one the length of the action delay.
-    let required = unbonded_at + staking.withdrawal_finality_delay().unwrap_or(staking.action_delay);
-    assert!(withdraw_from >= unbonded_at + staking.action_delay);
-    assert!(staking.day_window >= 3, "three withdrawal attempts fit in one staking day");
-    // A BFT block finalizing `required + 1` carries the sigma blocks above it, and a block may
-    // cite it from sigma + 1 above that: the control cites it from `withdraw_from - 1`.
-    assert!(withdraw_from - 1 >= required + 1 + sigma + 1);
+    // where the action delay has passed. A withdrawal needs the chain to have finalized
+    // `required`. A BFT block finalizing it carries the sigma blocks above it, and a block may cite
+    // it from sigma + 1 above that, so the first attempt, at `first_try`, is late enough for the
+    // control to cite it the block before.
+    let (created_at, unbonded_at) = (staking.period, 2 * staking.period);
+    let required = staking.withdrawal_required_finalized(rule, unbonded_at);
+    let first_try = (3 * staking.period).max(required + sigma + 2);
+    assert!(first_try >= unbonded_at + staking.action_delay);
+    assert!(first_try + 2 < 3 * staking.period + staking.day_window, "three withdrawal attempts fit in one staking day under {rule:?}");
 
     // Every block loaded from here on, by height, for the BFT blocks to carry.
     let mut blocks: BTreeMap<u32, Arc<Block>> = BTreeMap::new();
@@ -4360,43 +4362,43 @@ fn withdrawal_finality_scene(finalized_before_withdrawal: bool) -> Vec<u8> {
         spends: Some(unbond.hash().0),
     });
 
-    mine_until(&mut gen, &mut tf, &mut blocks, withdraw_from - 1);
+    mine_until(&mut gen, &mut tf, &mut blocks, first_try - 1);
     let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
 
     if finalized_before_withdrawal {
-        let enough = finalizing(&mut tf, &blocks, pos_h, fat_ptr, None, required + 1);
+        let enough = finalizing(&mut tf, &blocks, pos_h, fat_ptr, None, required);
         let block = next_citing(&mut gen, &[], &enough.0.fat_ptr);
         load(&mut tf, &mut blocks, block);
-        assert_eq!(height(&gen), withdraw_from - 1);
+        assert_eq!(height(&gen), first_try - 1);
 
         let block = next_citing(&mut gen, &[withdraw.clone()], &enough.0.fat_ptr);
         load(&mut tf, &mut blocks, block);
-        tf.push_instr_expect_pow_chain_length(withdraw_from as usize + 1, 0);
+        tf.push_instr_expect_pow_chain_length(first_try as usize + 1, 0);
         return tf.write_to_bytes();
     }
 
     let block = gen.next_block(&miner);
     load(&mut tf, &mut blocks, block);
-    assert_eq!(height(&gen), withdraw_from - 1);
+    assert_eq!(height(&gen), first_try - 1);
 
     // Stalled: no block on the chain has cited a BFT block.
     tf.push_instr_load_pow(&gen.clone().next_block_with_txs(&miner, &[withdraw.clone()]), SHOULD_FAIL);
     tf.push_instr_expect_rejection_reason(REFUSAL, 0);
 
-    // The tip cites a BFT block finalizing `required` itself, which is not past it.
-    let just_short = finalizing(&mut tf, &blocks, pos_h, fat_ptr, None, required);
+    // The tip cites a BFT block finalizing the block just below `required`.
+    let just_short = finalizing(&mut tf, &blocks, pos_h, fat_ptr, None, required - 1);
     let block = next_citing(&mut gen, &[], &just_short.0.fat_ptr);
     load(&mut tf, &mut blocks, block);
     tf.push_instr_load_pow(&next_citing(&mut gen.clone(), &[withdraw.clone()], &just_short.0.fat_ptr), SHOULD_FAIL);
     tf.push_instr_expect_rejection_reason(REFUSAL, 0);
 
-    let enough = finalizing(&mut tf, &blocks, pos_h, fat_ptr, Some(required), required + 1);
+    let enough = finalizing(&mut tf, &blocks, pos_h, fat_ptr, Some(required - 1), required);
     let block = next_citing(&mut gen, &[], &enough.0.fat_ptr);
     load(&mut tf, &mut blocks, block);
     let block = next_citing(&mut gen, &[withdraw.clone()], &enough.0.fat_ptr);
     load(&mut tf, &mut blocks, block);
-    assert_eq!(height(&gen), withdraw_from + 2);
-    tf.push_instr_expect_pow_chain_length(withdraw_from as usize + 3, 0);
+    assert_eq!(height(&gen), first_try + 2);
+    tf.push_instr_expect_pow_chain_length(first_try as usize + 3, 0);
 
     tf.write_to_bytes()
 }

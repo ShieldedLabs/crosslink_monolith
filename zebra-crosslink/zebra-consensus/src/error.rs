@@ -305,7 +305,7 @@ pub enum TransactionError {
 
     #[error(
         "withdrawal waits for finality: bond {bond_key:?} unbonded at height {}, the chain has \
-         finalized {:?}, which must pass {}",
+         finalized {:?}, and must finalize {}",
         .unbonded_at.0, .finalized_height.map(|height| height.0), .required_height.0
     )]
     #[non_exhaustive]

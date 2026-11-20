@@ -4987,18 +4987,20 @@ mod staking_signature {
         assert!(check(WithdrawDelegationBond, 500, bond(0), ready).is_err());
         assert!(check(WithdrawDelegationBond, 500, bond(2), ready).is_err());
 
-        // Given a withdrawal finality delay (from FeaturenetUpgrade3, once one is chosen), a
-        // withdrawal also needs the chain to have finalized more than that past the unbonding, and
-        // is held while it finalizes nothing. Any delay will do here, as none is chosen yet.
-        const FINALITY_DELAY: u32 = STAKING.action_delay;
-        let finalized = |finalized_height| {
-            let info = bond(1).map(|info| BondInfoResponse { chain_finalized_height: finalized_height, ..info });
-            check_staking_action_bond_state(WithdrawDelegationBond, KEY, 500, None, 0, info, ready, STAKING, Some(FINALITY_DELAY))
-        };
-        let required = LAST_ACTION + FINALITY_DELAY;
-        assert!(finalized(Some(Height(required + 1))).is_ok());
-        assert!(finalized(Some(Height(required))).is_err());
-        assert!(finalized(None).is_err());
+        // Under a withdrawal finality rule (from FeaturenetUpgrade3, once one is selected), a
+        // withdrawal also needs the chain to have finalized the height the rule requires, and is
+        // held while it finalizes nothing. Each rule is checked, as none is selected yet.
+        use zcash_primitives::bft::WithdrawalFinality::*;
+        for rule in [PastUnbonding, PeriodsPastUnbonding(1), NextStakingPeriod] {
+            let finalized = |finalized_height| {
+                let info = bond(1).map(|info| BondInfoResponse { chain_finalized_height: finalized_height, ..info });
+                check_staking_action_bond_state(WithdrawDelegationBond, KEY, 500, None, 0, info, ready, STAKING, Some(rule))
+            };
+            let required = STAKING.withdrawal_required_finalized(rule, LAST_ACTION);
+            assert!(finalized(Some(Height(required))).is_ok(), "{rule:?}");
+            assert!(finalized(Some(Height(required - 1))).is_err(), "{rule:?}");
+            assert!(finalized(None).is_err(), "{rule:?}");
+        }
 
         // A retarget must name the bond's current target, as block validation requires.
         assert!(retarget(Some(TARGET), bond(0), early).is_ok());
