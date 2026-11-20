@@ -191,8 +191,20 @@ pub mod config {
         /// Disable the headless wallet.
         pub disable_the_headless_wallet: bool,
         /// Serve lightwallet_server's gRPC port on every interface instead of loopback only.
-        /// It has no authentication or limits, so only enable this behind a firewall or proxy.
+        /// The same as setting `lightwallet_server_listen_addr` to `[::]` on the default port.
         pub public_lightwallet_server: bool,
+        /// The address and port lightwallet_server's gRPC server listens on. Loopback on the
+        /// same port is always served too, for the node's own wallet. Unset: loopback only (or
+        /// every interface with `public_lightwallet_server`), on the P2P port + 10001.
+        pub lightwallet_server_listen_addr: Option<std::net::SocketAddr>,
+        /// The loopback port of lightwallet_server's readiness endpoint. Unset: the P2P port +
+        /// 10000.
+        pub lightwallet_server_ready_port: Option<u16>,
+        /// A token callers from other hosts must send as `authorization: Bearer <token>` on
+        /// every lightwallet_server call. Unset: they may call every method but
+        /// `RequestFaucetDonation`, which only loopback callers may use. Loopback callers never
+        /// need it. Hidden from logs, and not settable from the environment.
+        pub lightwallet_server_token: Option<zebra_state::RedactedString>,
         /// User-led slashfork rules, as supplied in the config file. These are
         /// merged with [`shipped_slashforks`] and validated by building a
         /// [`SlashForkSchedule`]; after loading, this holds the canonical, merged
@@ -214,6 +226,9 @@ pub mod config {
                 explicit_bft_key_seed: None,
                 disable_the_headless_wallet: false,
                 public_lightwallet_server: false,
+                lightwallet_server_listen_addr: None,
+                lightwallet_server_ready_port: None,
+                lightwallet_server_token: None,
                 slashforks: Vec::new(),
                 disable_shipped_slashforks: false,
             }

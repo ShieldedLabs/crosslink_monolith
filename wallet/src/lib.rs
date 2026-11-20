@@ -640,6 +640,11 @@ async fn next_stream_message<T>(stream: &mut tonic::Streaming<T>) -> Result<Opti
 async fn wait_for_lightwalletd() {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
     for _ in 0..10 {
+        let ready_port = *wallet_main_lightwalletd_ready_port.lock().unwrap();
+        if ready_port == 0 {
+            interval.tick().await;
+            continue;
+        }
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(2))
             .timeout(std::time::Duration::from_secs(5))
@@ -649,7 +654,7 @@ async fn wait_for_lightwalletd() {
 
         let request_body = r#"{"jsonrpc":"2.0","method":"getinfo","params":[],"id":1}"#;
         let request_builder = client
-            .post("http://localhost:18232")
+            .post(format!("http://localhost:{ready_port}"))
             .header("Content-Type", "application/json")
             .body(request_body);
 
@@ -1454,6 +1459,8 @@ impl<'a> Default for TxOptions<'a> {
 }
 
 pub static wallet_main_lightwalletd_port : Mutex<u16> = Mutex::new(0);
+/// The port of lightwallet_server's readiness endpoint on loopback, 0 until the server starts.
+pub static wallet_main_lightwalletd_ready_port : Mutex<u16> = Mutex::new(0);
 
 pub enum TxPool<'a> {
     Transparent,
