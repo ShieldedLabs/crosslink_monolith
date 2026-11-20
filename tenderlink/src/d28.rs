@@ -19,6 +19,14 @@
 //! capacities/allocator overhead mean these are logical role bounds, **not** an
 //! exact byte/RSS bound or a fixed-size codec. Reject untrusted wire lengths
 //! before allocating a `Frame`; this API only admits borrowed typed frames.
+//! Receive indexing adds at most N+1 pairs of usize physical coordinates and
+//! N+1 u64 cached weights (24*(N+1) payload bytes on 64-bit targets, plus two
+//! Vec headers/capacity/allocator overhead). They contain no votes or bodies,
+//! are reused across frames, and are cleared at RX release, INIT and recovery.
+//! Accepted position access is O(1); conflicting-row weight preparation and
+//! max-cut jump selection are O(N^2) worst case, not a claim of linear whole
+//! receive work. Group duplicate checking and sparse-row traversal also remain
+//! quadratic in the worst case. Signature verification stays <=N+2 per frame.
 //!
 //! Validity and acquisition are trusted host events tagged to retained copies
 //! and current proposal opportunities. A retained determinate validity latch
@@ -734,6 +742,10 @@ pub struct Engine<S: Storage> {
     selected: Vec<Option<usize>>,
     group_ok: Vec<bool>,
     outer_ok: bool,
+    // Physical (group, row) coordinates, not vote copies. Sparse Rows keep
+    // their physical row index; outer position zero uses a dummy coordinate.
+    rx_positions: Vec<(usize, usize)>,
+    rx_weights: Vec<u64>,
     acquiring: bool,
 }
 impl<S: Storage> Engine<S> {
@@ -766,6 +778,8 @@ impl<S: Storage> Engine<S> {
             selected: vec![None; n],
             group_ok: vec![false; n + 1],
             outer_ok: false,
+            rx_positions: Vec::with_capacity(n + 1),
+            rx_weights: Vec::with_capacity(n + 1),
             acquiring: false,
         })
     }
@@ -887,6 +901,12 @@ impl<S: Storage> Engine<S> {
         self.selected.shrink_to_fit();
         self.group_ok.shrink_to_fit();
         self.clear_volatile();
+        self.clear_rx();
+        // Keep scalar scratch bounded by the new roster, including on shrink.
+        self.rx_positions.shrink_to(n + 1);
+        self.rx_weights.shrink_to(n + 1);
+        self.rx_positions.reserve(n + 1);
+        self.rx_weights.reserve(n + 1);
         if tau == 0 {
             self.start(0, None, true, sink)?;
         }
@@ -1124,7 +1144,7 @@ impl<S: Storage> Engine<S> {
                     self.pc[signer].filter(|v| id.is_none_or(|id| v.content.id == id))
                 }
                 Selection::Frame(frame) => {
-                    self.selected[signer].and_then(|i| frame_vote(frame, i).copied())
+                    self.selected[signer].and_then(|i| self.accepted_vote(frame, i).copied())
                 }
                 Selection::Group(g) => g
                     .votes
@@ -1346,12 +1366,6 @@ enum Selection<'a> {
     Frame(Frame<'a>),
     Group(Group<'a>),
     Timeout(Frame<'a>),
-}
-fn frame_vote<'a>(f: Frame<'a>, i: usize) -> Option<&'a Vote> {
-    f.outer
-        .into_iter()
-        .chain(f.groups.iter().flat_map(|g| g.votes.iter()))
-        .nth(i)
 }
 fn region_hasher(kind: CertKind) -> blake3::Hasher {
     let mut h = blake3::Hasher::new();
