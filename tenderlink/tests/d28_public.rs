@@ -665,3 +665,143 @@ fn review_regression_no_proposal_reply_after_decision() {
         "ordinary proposal reply escaped after DECIDED"
     );
 }
+
+/// A compatibility trace, not a Byzantine-fault model: signing fixtures may
+/// equivocate arbitrarily. Its digest records baseline state AND effects across
+/// dense/sparse frames, malformed groups, round changes, recovery and roster resize.
+#[test]
+fn deterministic_mixed_evidence_trace() {
+    fn next(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+    let mut c = config(&[0, 1, 2, 3], &[4, 3, 2, 1]);
+    let (mut e, mut s) = engine(&c, 3, 0);
+    let mut seed = 0xd28_412_2026_u64;
+    let mut digest = blake3::Hasher::new();
+    let body = b"trace-value";
+    for step in 0..128 {
+        if step > 0 && step % 32 == 0 {
+            c = match step {
+                32 => config(&[0, 1, 2], &[4, 3, 2]),
+                64 => config(&[0, 1, 2, 3, 4], &[4, 3, 2, 1, 1]),
+                _ => config(&[0, 1, 2, 3], &[4, 3, 2, 1]),
+            };
+            e.init(&c, (step / 32) as u64, 0, &mut s).unwrap();
+        }
+        if step % 17 == 0 {
+            e = Engine::recover(e.into_storage(), key(3), &mut s).unwrap();
+        }
+        if let Some(tag) = e.proposal_tag() {
+            e.supply_proposal(tag, body, Status::Valid, &mut s).unwrap();
+        }
+        let n = c.members().len();
+        let height = e.view().unwrap().height;
+        let current = e.view().unwrap().round;
+        let r = current + next(&mut seed) % 4;
+        let kind = if next(&mut seed) & 1 == 0 {
+            VoteKind::Prevote
+        } else {
+            VoteKind::Precommit
+        };
+        let mut signers = [0usize; 3];
+        for signer in &mut signers {
+            *signer = (next(&mut seed) as usize) % n;
+            if *signer == 3 {
+                *signer = 0;
+            }
+        }
+        if step % 7 == 0 {
+            signers[1] = signers[0];
+        }
+        let mut votes: Vec<_> = signers
+            .iter()
+            .enumerate()
+            .map(|(i, &signer)| {
+                let id = (next(&mut seed) % 3 != 0).then_some(body_id(body));
+                vote(
+                    &c,
+                    signer,
+                    signer as u8,
+                    height,
+                    if i == 2 { current } else { r },
+                    kind,
+                    id,
+                )
+            })
+            .collect();
+        if step % 5 == 0 {
+            votes[1].content.id = Some([9; 32]);
+        }
+        let mut sparse = vec![None; n];
+        sparse[n - 1] = Some(votes[2]);
+        let groups = [
+            Group {
+                kind: CertKind::Row { round: r, kind },
+                votes: Votes::Dense(&votes[..2]),
+            },
+            Group {
+                kind: CertKind::Row {
+                    round: current,
+                    kind,
+                },
+                votes: Votes::Rows(&sparse),
+            },
+        ];
+        let enter = vote(
+            &c,
+            signers[2],
+            signers[2] as u8,
+            height,
+            r,
+            VoteKind::Enter,
+            None,
+        );
+        let proposer = c.proposer(height, current);
+        let h = header(&c, proposer as u8, height, current, None, body);
+        let status = if step % 3 == 0 {
+            Status::Indeterminate
+        } else {
+            Status::Valid
+        };
+        let result = e.receive(
+            ordinary(
+                Some(&enter),
+                (step % 4 == 0).then_some(Proposal { header: &h, body }),
+                &groups,
+            ),
+            status,
+            &mut s,
+        );
+        digest.update(format!("{result:?}").as_bytes());
+        e.elapse(next(&mut seed) % 7, &mut s).unwrap();
+        digest.update(
+            format!(
+                "{:?}{:?}{:?}{:?}",
+                e.view(),
+                e.prevotes(),
+                e.precommits(),
+                s.decisions
+            )
+            .as_bytes(),
+        );
+        for packet in std::mem::take(&mut s.packets) {
+            digest.update(
+                format!(
+                    "{:?}{:?}{:?}{:?}{:?}",
+                    packet.target, packet.message, packet.outer, packet.proposal, packet.groups
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    assert!(e.is_active());
+    // Captured from the unoptimised e36a3ac70 core; includes every state/effect
+    // snapshot, not just the final decision or current vote rows.
+    assert_eq!(
+        digest.finalize().to_hex().as_str(),
+        "bcd574186d9d0438b36872e4d3d351c16c0a65f53032804a0bce4480a2e6a506"
+    );
+}
