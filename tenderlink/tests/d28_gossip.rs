@@ -1048,3 +1048,25 @@ fn guided_suppression_does_not_consume_a_later_reference_reply() {
     assert_eq!(s.packets[0].target, Target::Peer(1));
     assert!(s.packets[0].proposal.is_some());
 }
+
+#[test]
+fn equal_information_gaps_do_not_make_every_holder_aim_at_one_peer() {
+    let c = config(&[0, 1, 2, 3], &[1; 4]);
+    let mut targets = std::collections::HashSet::new();
+    for source in 0..4 {
+        let (e, mut s, _) = with_proposal(&c, source, b"shared proposal");
+        let lag = StatusSnapshot {
+            proposal: None,
+            ..st(&e)
+        };
+        let mut d = Director::new(dcfg(64, 1));
+        for peer in 1000..1064 {
+            d.update(upd(peer, 1, 1, lag), 0).unwrap();
+        }
+        let sent = d.poll(&e, 0, &mut s).unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, Gap::Proposal);
+        targets.insert(sent[0].0);
+    }
+    assert!(targets.len() >= 3, "holders herded onto {targets:?}");
+}
