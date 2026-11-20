@@ -94,6 +94,19 @@ pub struct BftChain {
 }
 
 impl BftChain {
+    /// A chain with nothing decided.
+    pub fn new() -> Self {
+        Self {
+            blocks: HeldBlocks::new(),
+            hash_to_height: HashMap::default(),
+            tip: None,
+            roster: Vec::new(),
+            voting_rosters: Vec::new(),
+            is_activated: false,
+            peer_strings: Vec::new(),
+        }
+    }
+
     /// The certificate of the newest decided block, or the null pointer before genesis.
     pub fn fat_pointer_to_tip(&self) -> FatPointerToBftBlock {
         self.tip.as_ref().map_or_else(FatPointerToBftBlock::null, |tip| tip.certificate.clone())
@@ -115,7 +128,7 @@ impl BftChain {
 /// The newest decided BFT height and everything that follows from it. A decision builds one and
 /// swaps it in under the same lock that adds the block, so the next height's roster can never be
 /// read from a chain that has the block but not yet the stakes at its snapshot.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DecidedTip {
     pub height: u64,
     pub block_hash: Blake3Hash,
@@ -272,15 +285,7 @@ pub fn decided_blocks(chain: &BftChain, from: usize, count: usize) -> Vec<BftBlo
 }
 
 static BFT_CHAIN: LazyLock<RwLock<BftChain>> = LazyLock::new(|| {
-    RwLock::new(BftChain {
-        blocks: HeldBlocks::new(),
-        hash_to_height: HashMap::default(),
-        tip: None,
-        roster: Vec::new(),
-        voting_rosters: Vec::new(),
-        is_activated: false,
-        peer_strings: Vec::new(),
-    })
+    RwLock::new(BftChain::new())
 });
 
 /// The decided bft-chain. Written only by the sync thread; never hold the guard across an await.
@@ -1320,8 +1325,6 @@ pub fn fat_pointer_for_template(
 struct DecidedBlock {
     /// The tip the decision made, already in `BFT_CHAIN`.
     tip: Arc<DecidedTip>,
-    /// Who voted on the decided height.
-    voted: Arc<VotingRoster>,
     block: BftBlock,
     fat_pointer: FatPointerToBftBlock,
     proposal_sigs: Vec<TMSig>,
@@ -1455,19 +1458,9 @@ pub(super) struct BftRunner {
     /// Tenderlink was due to start while catching up. It starts from the stored chain once the
     /// node has caught up.
     spawn_deferred: bool,
-    /// What the deferred start was given. Each height decided while it is held adds its round
-    /// (`finish_decision`), so it still ends at the decided tip when tenderlink starts.
-    held_start: Option<HeldStart>,
-}
-
-/// A tenderlink start that was due while catching up: the arguments of `spawn_tenderlink`.
-struct HeldStart {
-    /// The roster of the height after `ingest`.
-    roster: Vec<SortedRosterMember>,
-    /// The rounds of the newest decided heights, one each, as `restore` builds them.
-    ingest: Vec<RoundData>,
-    vote_namespace: [u8; 32],
-    strict_quorum: bool,
+    /// `restore` stopped below a stored row whose snapshot this state lacked. The start `tick`
+    /// makes then replays the store again, which takes that row in if its snapshot has arrived.
+    replay_on_start: bool,
 }
 
 /// The BFT height after the last of `rounds`: where tenderlink starts when it is given them.
@@ -1571,10 +1564,12 @@ fn apply_decision(
     fat_pointer: FatPointerToBftBlock,
     voted: Arc<VotingRoster>,
     stakes: Vec<RosterMember>,
-    final_snapshot: (Height, Hash),
+    final_snapshot: Option<(Height, Hash)>,
 ) -> Arc<DecidedTip> {
     let () = ASSUME_ADMITTED_BEFORE_APPLY;
-    let (new_final_height, new_final_hash) = final_snapshot;
+    // Unknown only where `restore` replays a chain whose snapshot this state no longer holds (BFT
+    // dropped): the last one known stands, for the tip and for the next roster's watermark.
+    let final_snapshot = final_snapshot.or_else(|| chain.bft_final_snapshot());
     // `height` is the 0-based canonical height, i.e. the chain index directly.
     let insert_i = block.height as usize;
     assert_eq!(insert_i, chain.blocks.len(), "validate passed, so the block extends the tip");
@@ -1610,12 +1605,12 @@ fn apply_decision(
         // `zebrad --fixup-db-stake` remains the repair path.
         if chain.roster.iter().any(|val| val.voting_power > 1) {
             tracing::warn!(
-                "No aggregated stakes for block {} at height {:?}; carrying the previous \
+                "No aggregated stakes for BFT height {} (snapshot {:?}); carrying the previous \
                  roster forward as a ghost roster ({} finalizers) until a new bond \
                  establishes a consistent stake set. Expected when every bond has been \
                  unbonded. If it persists once new bonds exist the stake cache may be torn \
                  -- stop the node and run `zebrad --fixup-db-stake` to repair it.",
-                new_final_hash, new_final_height, chain.roster.len(),
+                insert_i, final_snapshot, chain.roster.len(),
             );
         }
     }
@@ -1625,7 +1620,8 @@ fn apply_decision(
     // already out of the roster that will vote on a slashfork block scheduled there.
     // usize to u64 is lossless on every supported target.
     let next_bft_height = chain.blocks.len() as u64;
-    let (next_roster, next_voting) = roster_for_bft_height(network, slashforks, &chain.roster, next_bft_height, Some(new_final_height));
+    let (next_roster, next_voting) =
+        roster_for_bft_height(network, slashforks, &chain.roster, next_bft_height, final_snapshot.map(|(height, _)| height));
     // A decision no longer commits. It advances the final snapshot, which may name a block on a
     // chain that is not `bc_best`; `fin` moves only where the best chain changes, and only by the
     // §3.2 rule (FINALITY.md §4.3).
@@ -1633,13 +1629,77 @@ fn apply_decision(
         height: insert_i as u64,
         block_hash,
         certificate: fat_pointer,
-        final_snapshot: Some(final_snapshot),
+        final_snapshot,
         next_roster,
         next_voting: Arc::new(next_voting),
     });
     chain.tip = Some(Arc::clone(&tip));
     tip
 }
+
+/// The roster that votes on the next height to decide, `chain.blocks.len()`: the one the last
+/// decision (or `restore`) stored in the tip. Before genesis, the roster genesis is decided by,
+/// built from `chain.roster` as it stands; that is the only place it is built.
+fn next_voting(chain: &BftChain, network: &Network, slashforks: &[SlashForkConfig]) -> Arc<VotingRoster> {
+    let () = ASSUME_NEXT_ROSTER_IS_THE_TIPS;
+    match &chain.tip {
+        Some(tip) => Arc::clone(&tip.next_voting),
+        None => Arc::new(roster_for_bft_height(network, slashforks, &chain.roster, 0, None).1),
+    }
+}
+
+/// Whether `block`'s previous-block pointer names `chain`'s decided tip (the null pointer before
+/// genesis): what validation requires of every new decision, and replay of every stored one.
+fn links_to_tip(chain: &BftChain, block: &BftBlock) -> bool {
+    block.previous_block_fat_ptr.points_at_block_hash() == chain.tip_block_hash()
+}
+
+/// The stakes at `snapshot`, as the roster of the height after a decision that finalizes it is
+/// built from (FINALITY.md §7): from the non-finalized state that holds them, or from the
+/// finalized database once `fin` or the depth commit has moved them there. Empty when neither
+/// has them.
+fn stakes_at(block_writer: &WriteBlockWorkerTask, snapshot: Hash) -> Vec<RosterMember> {
+    block_writer
+        .non_finalized_state
+        .aggregated_stakes_at(snapshot)
+        .or_else(|| block_writer.finalized_state.db.aggregated_stakes(&snapshot))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| RosterMember { pub_key: s.0, voting_power: s.1, txids: Vec::new(), finalizer_address: None })
+        .collect()
+}
+
+/// Adds a stored decision to `chain` as `restore` replays it: voted on by the roster the chain
+/// holds for its height, as when it was decided, and applied by `apply_decision`, as when it was
+/// decided. `final_snapshot` is `None` only where BFT was dropped and this state no longer holds
+/// the snapshot.
+fn replay_decision(
+    chain: &mut BftChain,
+    network: &Network,
+    slashforks: &[SlashForkConfig],
+    block: BftBlock,
+    fat_pointer: FatPointerToBftBlock,
+    final_snapshot: Option<(Height, Hash)>,
+    stakes: Vec<RosterMember>,
+) -> Arc<DecidedTip> {
+    let voted = next_voting(chain, network, slashforks);
+    let block_hash = block.blake3_hash();
+    apply_decision(chain, network, slashforks, block, block_hash, fat_pointer, voted, stakes, final_snapshot)
+}
+
+/// The rounds tenderlink starts with: those that decided the newest
+/// `RECENT_COMMIT_ROUND_CACHE_LIMIT` heights below `decided_n`, read back from the store as an
+/// older one is read when a peer needs it (`fetch_decided_round`). `None` when one is not stored.
+fn startup_rounds(db: &ZebraDb, voting_rosters: &[Arc<VotingRoster>], decided_n: u64, active_roster_max_n: usize) -> Option<Vec<RoundData>> {
+    let from = decided_n.saturating_sub(tenderlink::RECENT_COMMIT_ROUND_CACHE_LIMIT as u64);
+    (from..decided_n)
+        .map(|height| stored_round(db, voting_rosters.get(usize::try_from(height).ok()?)?, height, active_roster_max_n))
+        .collect()
+}
+
+/// Assumption: `restore` replays only rows this node's own `store_decision` wrote, so it checks
+/// their linkage and nothing else (no signature, certificate or block rule).
+const ASSUME_REPLAY_ROWS_ARE_THIS_NODES: () = ();
 
 /// Assumption, kept by `store_decision`: `apply_decision` is given only decisions
 /// `admit_decision` admitted in the same call, so it checks no signature, certificate or block
@@ -1752,7 +1812,7 @@ impl BftRunner {
             next_diagnostic: std::time::Instant::now(),
             catching_up: false,
             spawn_deferred: false,
-            held_start: None,
+            replay_on_start: false,
         };
         metrics::gauge!("state.crosslink.bft_dropped").set(0.0);
         *BFT_DB.write().unwrap() = Some(block_writer.finalized_state.db.clone());
@@ -1824,14 +1884,11 @@ impl BftRunner {
             && decided_len() > 0
         {
             self.spawn_deferred = false;
-            // A start that was held back is made with what it was given, plus the rounds decided
-            // since (`finish_decision`), and not by replaying the stored chain a second time, which
-            // reads every decided height. With nothing held, or a held start that is not level
-            // with the chain, everything stored is replayed.
-            let held = self.held_start.take().filter(|held| height_after(&held.ingest) == decided_len());
-            match held {
-                Some(held) => self.spawn_tenderlink(held.roster, held.ingest, held.vote_namespace, held.strict_quorum),
-                None => self.restore(read_state, block_writer),
+            // The chain is in memory, so tenderlink starts from its tip without replaying the store,
+            // which reads every decided height. A replay that stopped short of a stored row replays
+            // again instead, as does a start whose newest rounds cannot all be read back.
+            if std::mem::take(&mut self.replay_on_start) || !self.start_from_tip(block_writer) {
+                self.restore(read_state, block_writer);
             }
         }
 
@@ -2132,12 +2189,7 @@ impl BftRunner {
                 return Err(format!("{} proposal signatures on the genesis decision, which is not proposed", sigs.len()));
             }
             let snapshot = Hash(block.snapshot_block_hash().0);
-            let stakes = block_writer
-                .non_finalized_state
-                .aggregated_stakes_at(snapshot)
-                .or_else(|| block_writer.finalized_state.db.aggregated_stakes(&snapshot))
-                .unwrap_or_default();
-            if stakes.is_empty() {
+            if stakes_at(block_writer, snapshot).is_empty() {
                 return Err(format!("the BFT genesis finalizes {snapshot}, where nothing is bonded, so BFT would have no roster"));
             }
             return Ok(());
@@ -2169,11 +2221,7 @@ impl BftRunner {
     /// decision (or `restore`) stored in the tip and handed tenderlink. Before genesis, the roster
     /// genesis is decided by, built from `chain.roster` as it stands.
     fn next_voting_roster(&self, chain: &BftChain) -> Arc<VotingRoster> {
-        let () = ASSUME_NEXT_ROSTER_IS_THE_TIPS;
-        match &chain.tip {
-            Some(tip) => Arc::clone(&tip.next_voting),
-            None => Arc::new(roster_for_bft_height(&self.network, self.slashforks.rules(), &chain.roster, 0, None).1),
-        }
+        next_voting(chain, &self.network, self.slashforks.rules())
     }
 
     fn propose(&self, read_state: &ReadState) -> Option<BftBlock> {
@@ -2363,7 +2411,7 @@ impl BftRunner {
             return fail;
         }
 
-        if new_block.previous_block_fat_ptr.points_at_block_hash() != chain.tip_block_hash() {
+        if !links_to_tip(chain, new_block) {
             tracing::warn!(
                 "Block has invalid previous block fat pointer hash: was {} but should be {}",
                 new_block.previous_block_fat_ptr.points_at_block_hash(),
@@ -2669,14 +2717,7 @@ impl BftRunner {
             .known_block(new_final_hash)
             .expect("admit_decision validated it, and validation requires the snapshot to be known")
             .height;
-        let stakes: Vec<RosterMember> = block_writer
-            .non_finalized_state
-            .aggregated_stakes_at(new_final_hash)
-            .or_else(|| block_writer.finalized_state.db.aggregated_stakes(&new_final_hash))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| RosterMember { pub_key: s.0, voting_power: s.1, txids: Vec::new(), finalizer_address: None })
-            .collect();
+        let stakes = stakes_at(block_writer, new_final_hash);
         // Read before the lock, still true under it; so is what `admit_decision` checked.
         let () = ASSUME_SYNC_THREAD_SOLE_WRITER;
 
@@ -2684,38 +2725,18 @@ impl BftRunner {
             let mut chain = BFT_CHAIN.write().unwrap();
             apply_decision(
                 &mut chain, &self.network, self.slashforks.rules(), block.clone(), block_hash, fat_pointer.clone(),
-                Arc::clone(&voted), stakes, (new_final_height, new_final_hash),
+                voted, stakes, Some((new_final_height, new_final_hash)),
             )
         };
         self.finish_decision(
-            DecidedBlock { tip, voted, block: block.clone(), fat_pointer: fat_pointer.clone(), proposal_sigs, reply },
+            DecidedBlock { tip, block: block.clone(), fat_pointer: fat_pointer.clone(), proposal_sigs, reply },
             block_writer,
         );
         Ok(Stored::Decided)
     }
 
     fn finish_decision(&mut self, decision: DecidedBlock, block_writer: &mut WriteBlockWorkerTask) {
-        let DecidedBlock { tip, voted, block, fat_pointer, proposal_sigs, reply } = decision;
-
-        // Tenderlink is held back (`spawn_tenderlink`) and this height was decided meanwhile, fed
-        // from a peer. Its round joins the held start as `restore` would replay it from the
-        // store: voted on by the roster the previous height returned, which is `held.roster`.
-        // The start then ends at the decided tip without reading the chain back.
-        let decided_bft_height = u64::from(block.height);
-        if self.held_start.as_ref().is_some_and(|held| height_after(&held.ingest) != decided_bft_height) {
-            // Not the height the held start ends at, so it is not built on: `tick` replays the
-            // stored chain instead.
-            self.held_start = None;
-        }
-        if let Some(held) = self.held_start.as_mut() {
-            let voted_roster = std::mem::replace(&mut held.roster, tip.next_roster.clone());
-            held.ingest.push(decided_round_data(&block, &fat_pointer, voted_roster, &voted, proposal_sigs.clone(), decided_bft_height, self.params.active_roster_max_n));
-            // Tenderlink keeps this many rounds and reads an older one back when it needs it.
-            let excess_n = held.ingest.len().saturating_sub(tenderlink::RECENT_COMMIT_ROUND_CACHE_LIMIT);
-            held.ingest.drain(..excess_n);
-            held.vote_namespace = tip.next_voting.vote_namespace;
-            held.strict_quorum = tip.next_voting.strict_quorum;
-        }
+        let DecidedBlock { tip, block, fat_pointer, proposal_sigs, reply } = decision;
 
         tracing::info!(
             "Successfully decided BFT block at height {} finalizing {}",
@@ -2763,7 +2784,7 @@ impl BftRunner {
     /// stored bytes: a roster that disagreed with the stored votes would re-index every one of
     /// them through seats that never voted (FINALITY.md §8.1).
     fn restore(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
-        let slashforks = self.slashforks.clone();
+        let slashforks = Arc::clone(&self.slashforks);
         let slashforks = slashforks.rules();
         let db = &block_writer.finalized_state.db;
         // The stored chain is replayed one decision at a time, and only its newest blocks are kept
@@ -2791,92 +2812,59 @@ impl BftRunner {
             }
         }
 
-        let mut blocks = HeldBlocks::new();
-        let mut hash_to_height = HashMap::default();
+        // Replayed into a chain of its own and swapped in whole: `restore` also runs while other
+        // threads read `BFT_CHAIN`, which must never show a chain half replayed.
+        let mut scratch = BftChain::new();
         // Replay stopped at a stored decision it could not take, with more stored above it.
         let mut stopped_short = false;
-        let mut fat_pointer_to_tip = FatPointerToBftBlock::null();
-        // The roster that voted on the block about to be replayed. BFT genesis is decided by
-        // the nil validator set (see `build_bootstrap_genesis`), so replay starts empty; each
-        // later height votes with the stakes at the previous height's snapshot.
-        let mut unsorted_roster: Vec<RosterMember> = Vec::new();
-        let mut voting_rosters: Vec<Arc<VotingRoster>> = Vec::new();
-        // BC height finalized by the previous replayed block's cert; the roster voting on block
-        // N was formed at N-1's decision, so N's replayed roster must use this. Using this
-        // block's own height jailed and unjailed finalizers one cert early at a slashfork
-        // activation boundary. It also picks N's quorum rule and namespace.
-        let mut prev_finalized_bc_height: Option<Height> = None;
-        // The snapshot of the last replayed block, when this state holds it.
-        let mut last_final: Option<(Height, Hash)> = None;
         // Dropping BFT is permanent for a database (FINALITY.md §4.3).
-        let recorded_drop = block_writer.finalized_state.db.crosslink_bft_dropped();
+        let recorded_drop = db.crosslink_bft_dropped();
 
-        while let Some(decision) = stored(blocks.len()) {
+        while let Some(decision) = stored(scratch.blocks.len()) {
             let StoredDecision { block, fat_pointer, .. } = decision;
-            if block.previous_block_fat_ptr.points_at_block_hash() != fat_pointer_to_tip.points_at_block_hash() {
+            let () = ASSUME_REPLAY_ROWS_ARE_THIS_NODES;
+            if !links_to_tip(&scratch, &block) {
                 stopped_short = true;
                 break;
             }
-
-            // Historical round replay: filter the roster exactly as the live path did at this
-            // height, so it matches the roster that actually voted on this decided block.
-            let this_bft_height = blocks.len() as u64;
-            let (_, voting) =
-                roster_for_bft_height(&self.network, slashforks, &unsorted_roster, this_bft_height, prev_finalized_bc_height);
-
-            // The roster the next height votes with, and the watermark that filters it, both
-            // come from this block's snapshot -- the same two reads `store_decision` makes
-            // live.
-            if !block.headers.is_empty() {
-                let snapshot = Hash(block.snapshot_block_hash().0);
-                let known = read_state.known_block(snapshot);
-                match (&known, recorded_drop) {
-                    (Some(known), _) => {
-                        prev_finalized_bc_height = Some(known.height);
-                    }
-                    (None, None) => {
-                        // A decision's row is written before its snapshot is durable: the
-                        // snapshot can still be only in the non-finalized state, which a crash,
-                        // a lost backup or a disabled one does not bring back. The decision is
-                        // still final, so BFT resumes at this height and catch-up decides it
-                        // again once PoW sync has the snapshot. Replay cannot go past it, because
-                        // the next height's roster is the stake at this snapshot.
-                        tracing::warn!(
-                            "crosslink restore: BFT height {} finalizes {}, which this state does not hold; \
-                             resuming BFT at that height",
-                            this_bft_height, snapshot,
-                        );
-                        // This node stored the decision, so the snapshot is on the decided chain:
-                        // fetched whatever height a peer alleges, and never expired.
-                        DECIDED_MISSING_POW_BLOCKS.lock().unwrap().insert(snapshot);
-                        stopped_short = true;
-                        break;
-                    }
-                    // BFT was dropped here, so nothing is decided from this replay; the stored
-                    // chain is loaded whole because bc-blocks cite it, and an unresolvable
-                    // snapshot keeps the last known values.
-                    (None, Some(_)) => {}
-                }
-                last_final = known.map(|known| (known.height, snapshot));
-                let stakes = block_writer
-                    .non_finalized_state
-                    .aggregated_stakes_at(snapshot)
-                    .or_else(|| block_writer.finalized_state.db.aggregated_stakes(&snapshot))
-                    .unwrap_or_default();
-                // Empty stakes are the ghost roster of `apply_decision`: the previous roster is
-                // carried forward rather than replaced, so replay reproduces what voted.
-                if !stakes.is_empty() {
-                    unsorted_roster = stakes
-                        .into_iter()
-                        .map(|s| RosterMember { pub_key: s.0, voting_power: s.1, txids: Vec::new(), finalizer_address: None })
-                        .collect();
-                }
+            // usize to u64 is lossless on every supported target.
+            let this_bft_height = scratch.blocks.len() as u64;
+            // `store_decision` stores no block without headers, so such a row cannot be replayed.
+            if block.headers.is_empty() {
+                tracing::error!("crosslink restore: BFT height {this_bft_height} is stored without headers; resuming BFT at that height");
+                stopped_short = true;
+                break;
             }
-
-            push_voting_roster(&mut voting_rosters, Arc::new(voting));
-            hash_to_height.insert(block.blake3_hash(), this_bft_height);
-            blocks.push(block);
-            fat_pointer_to_tip = fat_pointer;
+            // The roster the next height votes with, and the watermark that filters it, both come
+            // from this block's snapshot, as when it was decided.
+            let snapshot = Hash(block.snapshot_block_hash().0);
+            let final_snapshot = match (read_state.known_block(snapshot), recorded_drop) {
+                (Some(known), _) => Some((known.height, snapshot)),
+                (None, None) => {
+                    // A decision's row is written before its snapshot is durable: the snapshot can
+                    // still be only in the non-finalized state, which a crash, a lost backup or a
+                    // disabled one does not bring back. The decision is still final, so BFT resumes
+                    // at this height and catch-up decides it again once PoW sync has the snapshot.
+                    // Replay cannot go past it, because the next height's roster is the stake at
+                    // this snapshot.
+                    tracing::warn!(
+                        "crosslink restore: BFT height {} finalizes {}, which this state does not hold; \
+                         resuming BFT at that height",
+                        this_bft_height, snapshot,
+                    );
+                    // This node stored the decision, so the snapshot is on the decided chain:
+                    // fetched whatever height a peer alleges, and never expired.
+                    DECIDED_MISSING_POW_BLOCKS.lock().unwrap().insert(snapshot);
+                    stopped_short = true;
+                    break;
+                }
+                // BFT was dropped here, so nothing is decided from this replay; the stored chain
+                // is loaded whole because bc-blocks cite it, and an unresolvable snapshot keeps the
+                // last known values.
+                (None, Some(_)) => None,
+            };
+            let stakes = stakes_at(block_writer, snapshot);
+            replay_decision(&mut scratch, &self.network, slashforks, block, fat_pointer, final_snapshot, stakes);
         }
 
         if let Some((dropped_height, dropped_hash)) = recorded_drop {
@@ -2890,60 +2878,56 @@ impl BftRunner {
             );
         }
 
-        // Startup roster is for the next height to decide (the loaded chain length), with the
-        // terminated finalizers excluded inclusively at that height. A watermark of 0 means
-        // nothing is finalized yet, the value replay starts from.
-        let startup_bft_height = blocks.len() as u64;
-        let finalized_watermark = last_final.map_or(0, |(height, _)| u64::from(height.0));
-        let (roster, startup_voting) = roster_for_bft_height(
-            &self.network, slashforks, &unsorted_roster, startup_bft_height, last_final.map(|(height, _)| height),
-        );
-
-        // Tenderlink starts with the rounds of the newest heights, built as it is given an older
-        // one when a peer needs it (`fetch_decided_round`).
-        let ingest_from = startup_bft_height.saturating_sub(tenderlink::RECENT_COMMIT_ROUND_CACHE_LIMIT as u64);
-        let ingest: Vec<RoundData> = (ingest_from..startup_bft_height)
-            .map(|height| {
-                stored_round(db, &voting_rosters[height as usize], height, self.params.active_roster_max_n)
-                    .expect("a decision replayed above is stored")
-            })
-            .collect();
-
-        let loaded_any = !blocks.is_empty();
-        let startup_voting = Arc::new(startup_voting);
-        let tip_hash = blocks.last().map(|block| block.blake3_hash());
-        {
+        // usize to u64 is lossless on every supported target.
+        let decided_n = scratch.blocks.len() as u64;
+        let ingest = startup_rounds(db, &scratch.voting_rosters, decided_n, self.params.active_roster_max_n)
+            .expect("every decision replayed above is stored");
+        let tip = {
             let mut chain = BFT_CHAIN.write().unwrap();
             // A replay that reached no snapshot this state holds keeps the one already known.
-            let final_snapshot = last_final.or_else(|| chain.bft_final_snapshot());
-            chain.tip = tip_hash.map(|block_hash| {
-                Arc::new(DecidedTip {
-                    height: startup_bft_height - 1,
-                    block_hash,
-                    certificate: fat_pointer_to_tip,
-                    final_snapshot,
-                    next_roster: roster.clone(),
-                    next_voting: Arc::clone(&startup_voting),
-                })
-            });
-            chain.roster = unsorted_roster;
-            chain.hash_to_height = hash_to_height;
+            if let (Some(tip), Some(known)) = (scratch.tip.as_mut(), chain.bft_final_snapshot()) {
+                if tip.final_snapshot.is_none() {
+                    *tip = Arc::new(DecidedTip { final_snapshot: Some(known), ..(**tip).clone() });
+                }
+            }
+            let tip = scratch.tip.clone();
+            let BftChain { blocks, hash_to_height, tip: scratch_tip, roster, voting_rosters, .. } = scratch;
             chain.blocks = blocks;
+            chain.hash_to_height = hash_to_height;
+            chain.tip = scratch_tip;
+            chain.roster = roster;
             chain.voting_rosters = voting_rosters;
-        }
+            tip
+        };
 
-        if loaded_any {
+        if let Some(tip) = tip {
             tracing::info!(
                 "crosslink restore: resuming BFT at height {}, finalizing bc height {}",
-                startup_bft_height, finalized_watermark,
+                decided_n, tip.final_snapshot.map_or(0, |(height, _)| height.0),
             );
-            self.spawn_tenderlink(roster, ingest, startup_voting.vote_namespace, startup_voting.strict_quorum);
+            self.spawn_tenderlink(tip.next_roster.clone(), ingest, tip.next_voting.vote_namespace, tip.next_voting.strict_quorum);
         }
-        // Replay stopped below a stored row. A start held back here is not kept: the start `tick`
-        // makes replays the store again, which takes that row in if its snapshot has arrived.
-        if stopped_short {
-            self.held_start = None;
-        }
+        // Replay stopped below a stored row: the start `tick` makes replays the store again, which
+        // takes that row in if its snapshot has arrived.
+        self.replay_on_start = stopped_short;
+    }
+
+    /// Starts tenderlink at the height after the decided tip held in memory, with the newest
+    /// decided rounds read back from the store. False, starting nothing, when there is no tip or a
+    /// round cannot be read back (its row failed to write), so the caller replays the store.
+    fn start_from_tip(&mut self, block_writer: &WriteBlockWorkerTask) -> bool {
+        let started = {
+            let chain = BFT_CHAIN.read().unwrap();
+            let Some(tip) = chain.tip.clone() else { return false };
+            let db = &block_writer.finalized_state.db;
+            startup_rounds(db, &chain.voting_rosters, tip.height + 1, self.params.active_roster_max_n).map(|ingest| (tip, ingest))
+        };
+        let Some((tip, ingest)) = started else {
+            tracing::warn!("crosslink: a decided BFT round cannot be read back from the store; replaying the stored chain to start tenderlink");
+            return false;
+        };
+        self.spawn_tenderlink(tip.next_roster.clone(), ingest, tip.next_voting.vote_namespace, tip.next_voting.strict_quorum);
+        true
     }
 
     /// The deterministic BFT genesis block: the decision that finalizes the bootstrap roster
@@ -3068,10 +3052,8 @@ impl BftRunner {
             if !self.spawn_deferred {
                 tracing::info!("holding tenderlink back until the decided BFT chain is caught up with peers");
             }
+            // `tick` starts it from the decided tip once caught up.
             self.spawn_deferred = true;
-            // Kept for the start `tick` makes once caught up, so that start does not replay the
-            // stored chain a second time.
-            self.held_start = Some(HeldStart { roster, ingest, vote_namespace, strict_quorum });
             return;
         }
         let Some(launch) = self.launch.take() else { return; };
@@ -3268,6 +3250,72 @@ mod tests {
             slashforks: Vec::new(),
             do_not_include_until_bc_height: if version >= 2 { 11 } else { 0 },
         }
+    }
+
+    /// `restore` replays the stored chain through `replay_decision`; a live decision goes through
+    /// `apply_decision` voted on by the roster `next_voting` gives. Both must build the same
+    /// chain: the same voting roster at every height, the same stakes and the same tip, with the
+    /// same roster for the next height. Restore's own derivation once drifted from the live one
+    /// (a finalizer jailed a certificate early at a slashfork boundary); this pins them together.
+    /// The steps cover changed stakes, empty stakes (the ghost roster carries the last forward),
+    /// a watermark crossing FeaturenetUpgrade2 (the strict quorum starts), and an unknown snapshot
+    /// with BFT dropped (the last final snapshot stands).
+    #[test]
+    fn replaying_stored_decisions_builds_the_chain_deciding_them_built() {
+        let network = Network::new_regtest(zebra_chain::parameters::testnet::RegtestParameters::from(
+            zebra_chain::parameters::testnet::ConfiguredActivationHeights { featurenet_upgrade_2: Some(50), ..Default::default() },
+        ));
+        let slashforks: &[SlashForkConfig] = &[];
+        let member = |k: u8, stake: u64| RosterMember { pub_key: [k; 32], voting_power: stake, txids: Vec::new(), finalizer_address: None };
+        let final_at = |height: u32| Some((Height(height), Hash([height as u8; 32])));
+        let steps = vec![
+            (vec![member(1, 10), member(2, 20)], final_at(40)),
+            (Vec::new(), final_at(45)),
+            (vec![member(2, 20), member(3, 30), member(4, 5)], final_at(50)),
+            (vec![member(3, 30)], None),
+            (vec![member(3, 30), member(5, 50)], final_at(55)),
+        ];
+        let mut live = BftChain::new();
+        let mut replayed = BftChain::new();
+        let mut previous = FatPointerToBftBlock::null();
+        for (height, (stakes, final_snapshot)) in steps.into_iter().enumerate() {
+            let mut block = test_block(2);
+            block.height = height as u32;
+            block.previous_block_fat_ptr = previous;
+            let block_hash = block.blake3_hash();
+            let fat_pointer = FatPointerToBftBlock::from_parts(block_hash, height as u64, 0, &[]);
+            previous = fat_pointer.clone();
+            let voted = next_voting(&live, &network, slashforks);
+            apply_decision(&mut live, &network, slashforks, block.clone(), block_hash, fat_pointer.clone(), voted, stakes.clone(), final_snapshot);
+            replay_decision(&mut replayed, &network, slashforks, block, fat_pointer, final_snapshot, stakes);
+        }
+
+        let members = |roster: &[SortedRosterMember]| roster.iter().map(|m| (m.pub_key, m.stake)).collect::<Vec<_>>();
+        assert_eq!(live.voting_rosters.len(), 5);
+        assert_eq!(replayed.voting_rosters.len(), 5);
+        for (height, (a, b)) in live.voting_rosters.iter().zip(&replayed.voting_rosters).enumerate() {
+            assert!(**a == **b, "the roster that voted at height {height} differs");
+        }
+        let stakes = |roster: &[RosterMember]| roster.iter().map(|m| (m.pub_key, m.voting_power)).collect::<Vec<_>>();
+        assert_eq!(stakes(&live.roster), stakes(&replayed.roster));
+        let (live_tip, replayed_tip) = (live.tip.expect("five decisions"), replayed.tip.expect("five decisions"));
+        assert_eq!(
+            (live_tip.height, live_tip.block_hash, live_tip.final_snapshot),
+            (replayed_tip.height, replayed_tip.block_hash, replayed_tip.final_snapshot),
+        );
+        assert!(*live_tip.next_voting == *replayed_tip.next_voting);
+        assert_eq!(members(&live_tip.next_roster), members(&replayed_tip.next_roster));
+
+        // And what both built is what the rules say.
+        let keys = |voting: &VotingRoster| voting.roster.iter().map(|m| m.pub_key.0[0]).collect::<Vec<_>>();
+        assert!(keys(&live.voting_rosters[0]).is_empty(), "genesis is decided by the nil roster");
+        let mut ghost = keys(&live.voting_rosters[2]);
+        ghost.sort();
+        assert_eq!(ghost, vec![1, 2], "empty stakes at height 1's snapshot carry height 0's forward");
+        assert!(!live.voting_rosters[2].strict_quorum, "watermark 45: before FeaturenetUpgrade2");
+        assert!(live.voting_rosters[3].strict_quorum, "watermark 50: FeaturenetUpgrade2");
+        assert!(live.voting_rosters[4].strict_quorum, "an unknown snapshot keeps watermark 50");
+        assert_eq!(live_tip.final_snapshot, final_at(55));
     }
 
     #[test]
