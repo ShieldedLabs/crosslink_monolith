@@ -731,7 +731,20 @@ impl Storage for MemoryStore {
     }
 }
 
+/// Volatile public emission policy (not persisted, not consensus). `Reference`
+/// is the default and the policy after `recover`: every vote carries its
+/// evidence. `CompactLive` makes only live state-transition votes (initial and
+/// transition ENTER/PREVOTE/PRECOMMIT) bare signed votes; proposer proposals,
+/// reactive replies and every periodic rho replay (and recovery replay) remain
+/// the complete reference frames, so loss is repaired by the existing grid.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Emission {
+    #[default]
+    Reference,
+    CompactLive,
+}
 pub struct Engine<S: Storage> {
+    emission: Emission,
     store: S,
     key: SigningKey,
     me: usize,
@@ -768,6 +781,7 @@ impl<S: Storage> Engine<S> {
             .unwrap_or(usize::MAX);
         let n = c.members.len();
         Ok(Self {
+            emission: Emission::Reference,
             store,
             key,
             me,
@@ -782,6 +796,12 @@ impl<S: Storage> Engine<S> {
             rx_weights: Vec::with_capacity(n + 1),
             acquiring: false,
         })
+    }
+    pub fn emission(&self) -> Emission {
+        self.emission
+    }
+    pub fn set_emission(&mut self, emission: Emission) {
+        self.emission = emission;
     }
     pub fn storage(&self) -> &S {
         &self.store
@@ -1052,7 +1072,26 @@ impl<S: Storage> Engine<S> {
         self.emit_vote(k, Target::All, sink);
         Ok(())
     }
+    /// Live state-transition emission, subject to the volatile policy.
     fn emit_vote(&self, k: VoteKind, target: Target, sink: &mut impl Sink) {
+        if self.emission == Emission::CompactLive {
+            let Some(v) = self.own_current(k) else { return };
+            sink.send(
+                target,
+                Frame {
+                    message: Message::Ordinary,
+                    outer: Some(v),
+                    proposal: None,
+                    groups: &[],
+                },
+            );
+            return;
+        }
+        self.emit_vote_complete(k, target, sink);
+    }
+    /// Complete evidence replay (periodic rho service and recovery); never
+    /// affected by the emission policy.
+    fn emit_vote_complete(&self, k: VoteKind, target: Target, sink: &mut impl Sink) {
         let Some(v) = self.own_current(k) else { return };
         let mut proposal = None;
         let group = match k {
