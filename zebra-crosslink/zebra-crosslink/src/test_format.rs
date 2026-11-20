@@ -2115,7 +2115,7 @@ pub(crate) async fn handle_instr(
                             "status {} amount {} (last action at {}, target {})",
                             info.status,
                             u64::from(info.amount),
-                            info.last_action_height,
+                            info.last_action_height.0,
                             PubKeyID(info.target_finalizer),
                         ),
                         None => "no such bond".to_string(),

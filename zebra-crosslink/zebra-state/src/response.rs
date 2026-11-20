@@ -680,7 +680,7 @@ pub struct BondInfoResponse {
     /// The bond status: 0 = Active, 1 = Unbonding, 2 = Withdrawn.
     pub status: u8,
     /// The block height of the last staking action on this bond.
-    pub last_action_height: u32,
+    pub last_action_height: block::Height,
     /// The finalizer the bond's stake currently points at.
     pub target_finalizer: [u8; 32],
     /// The version an action on this bond must spend from FeaturenetUpgrade3: the txid of the
@@ -689,7 +689,7 @@ pub struct BondInfoResponse {
     /// For an unbonding bond, the finalized height of the chain the answer was read from, which
     /// a withdrawal must be far enough below from FeaturenetUpgrade3. `None` while that chain
     /// finalizes nothing, and for a bond in any other status.
-    pub chain_finalized_height: Option<u32>,
+    pub chain_finalized_height: Option<block::Height>,
 }
 
 /// A structure with the information needed from the state to build a `getblocktemplate` RPC response.

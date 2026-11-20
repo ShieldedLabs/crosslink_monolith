@@ -4957,7 +4957,7 @@ mod staking_signature {
             Some(BondInfoResponse {
                 amount: Amount::try_from(500u64).unwrap(),
                 status,
-                last_action_height: LAST_ACTION,
+                last_action_height: Height(LAST_ACTION),
                 target_finalizer: TARGET,
                 version: KEY,
                 chain_finalized_height: None,
@@ -4994,8 +4994,8 @@ mod staking_signature {
             check_staking_action_bond_state(WithdrawDelegationBond, KEY, 500, None, 0, info, ready, STAKING, true)
         };
         let required = LAST_ACTION + STAKING.withdrawal_finality_delay();
-        assert!(finalized(Some(required + 1)).is_ok());
-        assert!(finalized(Some(required)).is_err());
+        assert!(finalized(Some(Height(required + 1))).is_ok());
+        assert!(finalized(Some(Height(required))).is_err());
         assert!(finalized(None).is_err());
 
         // A retarget must name the bond's current target, as block validation requires.
@@ -5028,7 +5028,7 @@ mod staking_signature {
             let info = BondInfoResponse {
                 amount: Amount::try_from(500u64).unwrap(),
                 status: 0,
-                last_action_height: 0,
+                last_action_height: zebra_chain::block::Height(0),
                 target_finalizer: [7; 32],
                 version,
                 chain_finalized_height: None,

@@ -951,14 +951,14 @@ fn check_staking_action_spends(
 fn check_staking_action_delay(
     bond_key: [u8; 32],
     height: block::Height,
-    last_action_height: u32,
+    last_action_height: block::Height,
     action_delay: u32,
 ) -> Result<(), TransactionError> {
-    if height.0 < last_action_height.saturating_add(action_delay) {
+    if height.0 < last_action_height.0.saturating_add(action_delay) {
         return Err(TransactionError::StakingActionDelayNotMet {
             bond_key,
             last_action_height,
-            current_height: height.0,
+            current_height: height,
             required_delay: action_delay,
         });
     }
@@ -970,11 +970,11 @@ fn check_staking_action_delay(
 /// delay above it: the book's provisional rule C, as `validate_delegation_bonds` applies it.
 fn check_staking_withdrawal_finality(
     bond_key: [u8; 32],
-    unbonded_at: u32,
-    finalized_height: Option<u32>,
+    unbonded_at: block::Height,
+    finalized_height: Option<block::Height>,
     staking: StakingParameters,
 ) -> Result<(), TransactionError> {
-    let required_height = unbonded_at.saturating_add(staking.withdrawal_finality_delay());
+    let required_height = block::Height(unbonded_at.0.saturating_add(staking.withdrawal_finality_delay()));
     match finalized_height {
         Some(finalized_height) if finalized_height > required_height => Ok(()),
         _ => Err(TransactionError::StakingWithdrawalNotFinalized {

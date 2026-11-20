@@ -291,27 +291,29 @@ pub enum TransactionError {
     #[error("unexpected error")]
     Other(String),
     #[error(
-        "staking action delay not met: bond {bond_key:?} last action at height {last_action_height}, \
-         current height {current_height}, required delay is {required_delay} blocks"
+        "staking action delay not met: bond {bond_key:?} last action at height {}, \
+         current height {}, required delay is {required_delay} blocks",
+        .last_action_height.0, .current_height.0
     )]
     #[non_exhaustive]
     StakingActionDelayNotMet {
         bond_key: [u8; 32],
-        last_action_height: u32,
-        current_height: u32,
+        last_action_height: block::Height,
+        current_height: block::Height,
         required_delay: u32,
     },
 
     #[error(
-        "withdrawal waits for finality: bond {bond_key:?} unbonded at height {unbonded_at}, the \
-         chain has finalized {finalized_height:?}, which must pass {required_height}"
+        "withdrawal waits for finality: bond {bond_key:?} unbonded at height {}, the chain has \
+         finalized {:?}, which must pass {}",
+        .unbonded_at.0, .finalized_height.map(|height| height.0), .required_height.0
     )]
     #[non_exhaustive]
     StakingWithdrawalNotFinalized {
         bond_key: [u8; 32],
-        unbonded_at: u32,
-        finalized_height: Option<u32>,
-        required_height: u32,
+        unbonded_at: block::Height,
+        finalized_height: Option<block::Height>,
+        required_height: block::Height,
     },
 
     #[error("staking action on non-existent bond: {bond_key:?}")]

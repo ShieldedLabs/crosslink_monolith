@@ -1777,7 +1777,7 @@ where
                 Ok(Some(GetBondInfoResponse {
                     amount: u64::from(info.amount),
                     status: info.status,
-                    last_action_height: info.last_action_height,
+                    last_action_height: info.last_action_height.0,
                 }))
             }
             zebra_state::ReadResponse::BondInfo(None) => Ok(None),

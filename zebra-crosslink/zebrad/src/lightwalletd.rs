@@ -1017,7 +1017,7 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                                                             [enc(&BondInfoResponse {
                                                                 amount: u64::from(info.amount),
                                                                 status: info.status as u32,
-                                                                last_action_height: info.last_action_height,
+                                                                last_action_height: info.last_action_height.0,
                                                                 version: info.version.to_vec(),
                                                             })]
                                                             .into(),

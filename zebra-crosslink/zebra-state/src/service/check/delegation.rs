@@ -501,13 +501,13 @@ fn validate_withdrawal_finality(
     non_finalized_chain: &Chain,
 ) -> Result<(), ValidateContextError> {
     let delay = non_finalized_chain.network().crosslink_parameters().staking.withdrawal_finality_delay();
-    let required = unbonded_at.0.saturating_add(delay);
+    let required = zebra_chain::block::Height(unbonded_at.0.saturating_add(delay));
 
     match finalized_height {
-        Some(finalized_height) if finalized_height.0 > required => Ok(()),
+        Some(finalized_height) if finalized_height > required => Ok(()),
         _ => Err(ValidateContextError::InvalidDelegationBond(format!(
             "withdrawal waits for finality: unbonded at height {}, the chain has finalized {:?}, which must pass {}: {:?}",
-            unbonded_at.0, finalized_height.map(|height| height.0), required, bond_key
+            unbonded_at.0, finalized_height.map(|height| height.0), required.0, bond_key
         ))),
     }
 }
