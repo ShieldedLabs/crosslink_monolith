@@ -331,7 +331,8 @@ impl<S: Storage> Engine<S> {
         }
         if !matches!(self.d().step, Step::PreRound | Step::Decided) {
             if let Some(v) = f.outer {
-                if v.content.kind == VoteKind::Enter
+                if self.emission != Emission::Guided
+                    && v.content.kind == VoteKind::Enter
                     && self.current(v)
                     && self.outer_ok
                     && v.content.signer as usize != self.me

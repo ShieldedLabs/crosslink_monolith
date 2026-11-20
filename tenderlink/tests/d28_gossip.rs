@@ -1019,3 +1019,32 @@ fn recovered_late_polka_bridges_lower_round_despite_nil_own_precommit() {
     assert_eq!(r.view().unwrap().locked_round, Some(1));
     assert_eq!(st(&r).step, Step::Precommit);
 }
+
+#[test]
+fn status_justification_reports_when_no_round_witness_is_required() {
+    let c = config(&[0, 1, 2, 3], &[1; 4]);
+    let (empty, _) = engine(&c, 2, 0);
+    assert!(!st(&empty).justified);
+    let (e, _, _) = with_proposal(&c, 2, b"no valid-round witness needed");
+    assert!(st(&e).justified);
+    assert!(st(&e).proposal.is_some());
+}
+
+#[test]
+fn guided_suppression_does_not_consume_a_later_reference_reply() {
+    let c = config(&[0, 1, 2, 3], &[1; 4]);
+    let (mut e, mut s, _) = with_proposal(&c, 0, b"proposal");
+    assert_eq!(c.proposer(0, 0), 0);
+    e.set_emission(Emission::Guided);
+    s.packets.clear();
+    let enter = vote(&c, 1, 1, 0, 0, VoteKind::Enter, None);
+    e.receive(ordinary(Some(&enter), None, &[]), Status::Valid, &mut s)
+        .unwrap();
+    assert!(s.packets.is_empty());
+    e.set_emission(Emission::CompactLive);
+    e.receive(ordinary(Some(&enter), None, &[]), Status::Valid, &mut s)
+        .unwrap();
+    assert_eq!(s.packets.len(), 1);
+    assert_eq!(s.packets[0].target, Target::Peer(1));
+    assert!(s.packets[0].proposal.is_some());
+}

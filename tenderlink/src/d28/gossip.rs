@@ -118,7 +118,9 @@ impl<S: Storage> Engine<S> {
             proposal: d.slot.map(|s| self.proposal(s).header.content.id),
             polka,
             prevote_quorum: self.c().quorum(self.row_weight(VoteKind::Prevote, None)),
-            justified: d.slot.is_some() && d.justified,
+            justified: d.slot.is_some_and(|s| {
+                self.proposal(s).header.content.valid_round.is_none() || d.justified
+            }),
         })
     }
     /// For a lower-round peer: current self-carrying evidence jumps it straight
