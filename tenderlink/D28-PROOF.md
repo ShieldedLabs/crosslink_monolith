@@ -792,15 +792,24 @@ by the following evidence-or-absorption bound:
     b_c <= max(e_c,e_q) + 2E + d
         <= max(e_c,e_q) + H_g + d.
 
-Form A already held from a relay is sufficient authorization. Form B, whether
-newly served or already held, provides a verified value polka at a correct
-holder, NOT necessarily a lock at the relay or at q. From ANY such correct
-holder the retained current polka/body reaches every still-deficient peer in
-one further wave, with T at most d later. This replaces R4's reliance on q's
-nonnil-PC lane in its any-form-B case; it does not infer a lock from a relay's
-form B. A nil prevoter is outside the polka's correct signer set regardless
-of the relay's lock. Exact-vr-to-current-polka supersession and phase changes
-therefore preserve the obligation and cannot reset a deadline.
+Form A already held from a relay is sufficient authorization. A received form B
+alone is NOT a servable retained VC: a receiver still in Propose may hold its
+verified PV row and even a T body without installing VC or signing a PV until
+34'. In particular, such a receiver is not an additional one-wave polka source.
+Use the CORRECT PROPOSER q's following dichotomy instead. While q retains the
+exact-vr VC, a peer lacking authorization keeps q's form-A obligation open,
+even if that peer already received a form B from someone else. After at most
+the quorum-row wave and the authorization wave, q supplies form A. If q
+supersedes that exact-vr VC, its replacement in this fixed-round prefix is the
+matching CURRENT-round VC; q already has the T body and can itself serve form B.
+The current-polka priority then repairs every still-deficient peer in one wave,
+with T at most d later. A status reporting the matching current polka denotes
+an already installed VC, not merely a received row; this closes the obligation
+only when there is a genuine retained-VC holder. This replaces R4's reliance
+on q's nonnil-PC lane without inferring a lock or immediate relay ability from
+a received form B. A nil prevoter is outside the polka's correct signer set
+regardless of the relay's lock. Exact-vr-to-current-polka supersession and phase
+changes therefore preserve the obligation and cannot reset a deadline.
 
 **G4 (first stopping events and frontier).** Apply G1-G3 only to prefixes
 ending at the first correct nil PC, first exit, or earlier decision. Use
@@ -810,12 +819,16 @@ ending at the first correct nil PC, first exit, or earlier decision. Use
     TPC(r) > TPV(r) + 2H_g + d.
 
 The earliest-prevote and form-A lock-domination arguments of R4 are unchanged.
-At a purported first rule-63 nil PC n, G2 aligns everyone by s1+H_g; G3 gives
-body/authorization by s1+3H_g+d. If a form-B alternative occurred, its correct
-polka holder repairs everyone by s1+3H_g+d. Otherwise all correct value PVs
-are received by s1+4H_g+d using BARE after entry. Both precede n, so 36
-preempts 63. A nil quorum cannot intersect a value polka in a correct signer,
-excluding 44. At a purported first exit L with first PC-timer arming t2, the
+At a purported first rule-63 nil PC n, G2 aligns everyone by s1+E. Put
+tau=s1+3E. By G3 either q has installed its matching current VC by tau, or
+every correct receiver has received form-A authorization and body by tau.
+In the first case q already has T and a servable VC; current-polka repair
+gives everyone body/polka by s1+4E, with T by s1+4E+d. Otherwise all correct
+processes have value-prevoted by s1+3E+d, and BARE supplies those votes
+everywhere by s1+3E+d+V. Both bounds are at most s1+4H_g+d, strictly before n,
+so 36 preempts 63. Supersession AFTER tau cannot invalidate the second branch:
+its required value prevotes have already been enabled by the delivered form A.
+A nil quorum cannot intersect a value polka in a correct signer, excluding 44. At a purported first exit L with first PC-timer arming t2, the
 PC quorum has a correct nonnil member; its guided body/polka aligns everyone
 by t2+H_g, and bare PCs complete decision by
 
@@ -823,8 +836,10 @@ by t2+H_g, and bare PCs complete decision by
 
 Thus the deciding-round contradiction survives without q-origin full
 broadcasts or any delivered E reply. R5's L11 propagation uses G2 for the
-first quorum and G3's ANY-correct-holder polka repair after a lock; its same
-bounds s1+H_g+2TPV(r) and s1+2H_g+2TPV(r)+d still precede the first exit.
+first quorum and complete current-polka repair from a correct LOCKED holder.
+Such a holder has a T body and installed current VC already, so its service
+needs no Propose-step bootstrap or extra validity delay at the source. The
+same bounds s1+H_g+2TPV(r) and s1+2H_g+2TPV(r)+d precede the first exit.
 For A5.0, a correct member of the first PC quorum has either a nonnil PC with
 polka or a nil PC with retained quorum PV row. Its CURRENT self-carrier reaches
 old-round laggards by t2+H_g, before that round's first exit. This is why merely
