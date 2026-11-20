@@ -1746,11 +1746,16 @@ fn note_conflicting_quorum(bft_state: &TMState) {
     }
 }
 
-/// This node's tenderlink WAL records from BFT height `from` up, as tenderlink stored them.
-fn stored_tenderlink_wal(from: u64) -> Vec<Vec<u8>> {
+/// This node's tenderlink WAL records from BFT height `from` up, each with its height, as
+/// tenderlink stored them.
+fn stored_tenderlink_wal(from: u64) -> Vec<(u64, Vec<u8>)> {
     let db = BFT_DB.read().unwrap();
-    let (Some(db), Ok(from)) = (db.as_ref(), u32::try_from(from)) else { return Vec::new() };
-    db.tenderlink_wal(from).into_iter().map(|(_, record)| record).collect()
+    let Some(db) = db.as_ref() else {
+        tracing::error!("there is no database to read tenderlink's WAL records from");
+        return Vec::new();
+    };
+    let Ok(from) = u32::try_from(from) else { return Vec::new() };
+    db.tenderlink_wal(from).into_iter().map(|(height, record)| (u64::from(height), record)).collect()
 }
 
 /// Stores tenderlink's WAL record for `height`, synced to disk. `false` when it is not stored,
