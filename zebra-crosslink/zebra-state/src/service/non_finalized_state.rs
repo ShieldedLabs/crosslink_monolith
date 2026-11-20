@@ -301,7 +301,7 @@ impl NonFinalizedState {
         let decided = crate::new_network::bft::bft_chain()
             .read()
             .unwrap()
-            .bft_final_snapshot
+            .bft_final_snapshot()
             .map(|(_, hash)| hash);
 
         while self.chain_set.len() > MAX_NON_FINALIZED_CHAIN_FORKS {

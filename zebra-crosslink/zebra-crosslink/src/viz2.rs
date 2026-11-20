@@ -794,7 +794,7 @@ pub async fn service_viz_requests(
                         // next block to decide) and the current finalized BC height. Identical source
                         // means the viz display and the actual consensus roster always agree.
                         let working_bft_height = internal.blocks.len() as u64;
-                        let finalized_bc_height = internal.bft_final_snapshot.map(|(h, _)| h.0 as u64).unwrap_or(0);
+                        let finalized_bc_height = internal.bft_final_snapshot().map(|(h, _)| h.0 as u64).unwrap_or(0);
                         response.blacklisted_finalizers = zebra_state::new_network::bft::terminated_finalizers_at(
                             &tfl_handle.config.slashforks, working_bft_height, finalized_bc_height,
                         )
@@ -813,7 +813,7 @@ pub async fn service_viz_requests(
                     response.pow_peer_count = zebra_state::new_network::POW_PEER_COUNT
                         .load(std::sync::atomic::Ordering::Relaxed);
                     response.mempool_tx_strings = mempool_tx_strings.clone();
-                    response.pos_tip_signers = internal.fat_pointer_to_tip.signatures.iter()
+                    response.pos_tip_signers = internal.fat_pointer_to_tip().signatures.iter()
                         .map(|sig| Hash32::from_bytes(sig.pub_key.0))
                         .collect();
                     response.bc_tip_roster = bc_tip_roster.clone();

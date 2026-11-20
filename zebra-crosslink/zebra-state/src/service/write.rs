@@ -225,7 +225,7 @@ impl WriteBlockWorkerTask {
         let Some((decided_height, decided_hash)) = crate::new_network::bft::bft_chain()
             .read()
             .unwrap()
-            .bft_final_snapshot
+            .bft_final_snapshot()
         else {
             return;
         };

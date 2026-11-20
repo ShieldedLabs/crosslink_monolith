@@ -1767,7 +1767,7 @@ pub(crate) async fn handle_instr(
                     let value = if flags & TF_BFT_ON_NODE_TIP != 0 {
                         match BftBlock::zcash_deserialize(&value[..]) {
                             Ok(mut block) => {
-                                block.previous_block_fat_ptr = zebra_state::new_network::bft::bft_chain().read().unwrap().fat_pointer_to_tip.clone();
+                                block.previous_block_fat_ptr = zebra_state::new_network::bft::bft_chain().read().unwrap().fat_pointer_to_tip();
                                 block.zcash_serialize_to_vec().expect("a BFT block serializes")
                             }
                             Err(_) => value,
