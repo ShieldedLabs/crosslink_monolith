@@ -177,9 +177,9 @@ across round changes and the active-to-decided transition. Pre-round ENTER is
 not an available Progress offer for this theorem.
 
 **BPS(H), bounded periodic-lane service.** There is some finite H>=rho, unknown
-to the protocol, such that for each correct ordered pair (p,q), each of the four
-lanes, and each interval [u,u+H] wholly inside the service interval: if that lane
-is available throughout the interval, its periodic offers yield at least one
+to the protocol, such that for each distinct correct ordered pair (p,q), each
+of the four lanes, and each interval [u,u+H] wholly inside the service interval:
+if that lane is available throughout, its periodic offers yield at least one
 frame OFFERED after the start boundary u and processed by q no later than u+H.
 An offer at the same logical timestamp counts only if it follows that boundary
 in execution order; an earlier same-time queued copy does not count. For the
@@ -190,7 +190,11 @@ all comparisons protecting round-local evidence below are strict.
 
 The arbitration key is (authenticated sender, destination, lane), NOT a round,
 ENTRY region, certificate digest, proposal-authorization form or frame hash.
-Each broadcast has this contract separately for each correct destination.
+Each broadcast has this contract separately for each other correct destination.
+Self-insertion and local publication need no network self-delivery. If the
+designated correct set consists of a single member, necessarily of quorum
+weight, its pairwise service requirements are vacuous; the own-vote and
+local-proposal cases below still apply.
 An old queued frame offered before u, arbitrary replay traffic, or success on
 another lane does not fulfill it. A frame offered inside the interval may be
 superseded before its processing, but the receiver must still process that
