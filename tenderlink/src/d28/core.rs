@@ -703,10 +703,10 @@ impl<S: Storage> Engine<S> {
             return;
         }
         if self.d().step != Step::PreRound {
-            self.emit_vote(VoteKind::Enter, Target::All, sink);
+            self.emit_vote_complete(VoteKind::Enter, Target::All, sink);
             self.emit_proposal(Target::All, sink);
-            self.emit_vote(VoteKind::Prevote, Target::All, sink);
-            self.emit_vote(VoteKind::Precommit, Target::All, sink);
+            self.emit_vote_complete(VoteKind::Prevote, Target::All, sink);
+            self.emit_vote_complete(VoteKind::Precommit, Target::All, sink);
         }
         for (i, s) in [self.d().slot, self.d().pending.map(|p| p.proposal)]
             .into_iter()
@@ -902,7 +902,7 @@ impl<S: Storage> Engine<S> {
             self.commit(d)?;
             self.request_proposal(sink);
             for k in [VoteKind::Enter, VoteKind::Prevote, VoteKind::Precommit] {
-                self.emit_vote(k, Target::All, sink);
+                self.emit_vote_complete(k, Target::All, sink);
             }
             self.emit_proposal(Target::All, sink);
         }
