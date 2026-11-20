@@ -1435,37 +1435,42 @@ const DECIDED_PULL_MAX: u64 = 256;
 /// roster of the height after it. Stops at the first decision it cannot read back, which the next
 /// pull retries. Only `decide` stores decisions, after the checks of the path each came in by, so
 /// these are taken as tenderlink would take its own.
+///
+/// Runs on tenderlink's task, beside the sync thread that stores decisions, so it reads in the
+/// order the store writes: the rows first, then the rosters after them.
 fn pull_decided(height: u64, network: &Network, slashforks: &zebra_chain::parameters::SlashForkSchedule, active_roster_max_n: usize) -> Vec<tenderlink::DecidedHeight> {
+    // The rosters that voted on the heights to pull, each stored with its block.
     let votings: Vec<Arc<VotingRoster>> = {
         let chain = BFT_CHAIN.read().unwrap();
         // usize to u64 is lossless on every supported target.
-        let decided_n = chain.blocks.len() as u64;
-        if height >= decided_n {
-            return Vec::new();
-        }
-        let end = decided_n.min(height.saturating_add(DECIDED_PULL_MAX));
-        // The rosters that voted on `height..end`, then the one the height after those votes with:
-        // stored for a decided height, and built for the next one as `next_voting_roster` builds it.
-        let mut votings = Vec::new();
-        for h in height..=end {
-            match usize::try_from(h).ok().and_then(|h| chain.voting_rosters.get(h)) {
-                Some(voting) => votings.push(Arc::clone(voting)),
-                None if h == decided_n => {
-                    let roster_snapshot_height = chain.bft_final_snapshot.map(|(height, _)| height);
-                    let next = roster_for_bft_height(network, slashforks.rules(), &chain.roster, decided_n, roster_snapshot_height).1;
-                    votings.push(Arc::new(next));
-                }
-                None => break,
-            }
-        }
-        votings
+        let end = (chain.blocks.len() as u64).min(height.saturating_add(DECIDED_PULL_MAX));
+        (height..end).map_while(|h| usize::try_from(h).ok().and_then(|h| chain.voting_rosters.get(h)).map(Arc::clone)).collect()
     };
-    let db = BFT_DB.read().unwrap();
-    let Some(db) = db.as_ref() else { return Vec::new() };
-    let mut decided = Vec::new();
-    for (h, voting) in (height..).zip(votings.windows(2)) {
-        let Some(round) = stored_round(db, &voting[0], h, active_roster_max_n) else { break };
-        let next = &voting[1];
+    if votings.is_empty() {
+        return Vec::new();
+    }
+    let rounds: Vec<RoundData> = {
+        let db = BFT_DB.read().unwrap();
+        let Some(db) = db.as_ref() else { return Vec::new() };
+        (height..).zip(&votings).map_while(|(h, voting)| stored_round(db, voting, h, active_roster_max_n)).collect()
+    };
+    // The roster after each height read back, read only now: a height's row is written after the
+    // stakes its successor's roster comes from, so a row read above means those stakes are in place.
+    let () = ASSUME_STAKES_IN_PLACE_BEFORE_DECISION_ROW;
+    let chain = BFT_CHAIN.read().unwrap();
+    // usize to u64 is lossless on every supported target.
+    let decided_n = chain.blocks.len() as u64;
+    let mut decided = Vec::with_capacity(rounds.len());
+    for (h, round) in (height..).zip(rounds) {
+        let next = match usize::try_from(h + 1).ok().and_then(|n| chain.voting_rosters.get(n)) {
+            Some(voting) => Arc::clone(voting),
+            // The height after the newest decision, built as `finish_decision` builds it.
+            None if h + 1 == decided_n => {
+                let roster_snapshot_height = chain.bft_final_snapshot.map(|(height, _)| height);
+                Arc::new(roster_for_bft_height(network, slashforks.rules(), &chain.roster, decided_n, roster_snapshot_height).1)
+            }
+            None => break,
+        };
         decided.push(tenderlink::DecidedHeight {
             round,
             next_roster: next.roster.clone(),
@@ -1475,6 +1480,13 @@ fn pull_decided(height: u64, network: &Network, slashforks: &zebra_chain::parame
     }
     decided
 }
+
+/// Assumption, kept by `finish_decision`: when a decision's row can be read from the database,
+/// `BFT_CHAIN` already holds the stakes at its snapshot, which the next height's roster comes from.
+/// `decide` makes the height visible first, then `finish_decision` updates the stakes, then writes
+/// the row. `pull_decided`, on another thread, relies on it: reordering those writes means
+/// revisiting it.
+const ASSUME_STAKES_IN_PLACE_BEFORE_DECISION_ROW: () = ();
 
 /// The height and value of the last conflicting quorum reported, so each is reported once.
 static CONFLICTING_QUORUM_REPORTED: Mutex<Option<(u64, ValueId)>> = Mutex::new(None);
@@ -2609,6 +2621,7 @@ impl BftRunner {
         // that height is decided again on the next run. A crash after it, while the snapshot is
         // still only in the non-finalized state, leaves a row whose snapshot the next run may
         // not hold; `restore` resumes BFT below that row and decides it again.
+        let () = ASSUME_STAKES_IN_PLACE_BEFORE_DECISION_ROW;
         if let Err(err) = block_writer.finalized_state.db.write_bft_decision(
             block.height,
             &block,
