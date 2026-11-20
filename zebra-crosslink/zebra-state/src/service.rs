@@ -2075,11 +2075,15 @@ fn bond_info_response(
             BondStatus::Burned => 3,
         },
         last_action_height: match status {
-            BondStatus::Active | BondStatus::Burned => bond.created_at.height.0,
-            BondStatus::Unbonding { unbonded_at } => unbonded_at.height.0,
-            BondStatus::Withdrawn { withdrawn_at } => withdrawn_at.height.0,
+            BondStatus::Active | BondStatus::Burned => bond.created_at.height,
+            BondStatus::Unbonding { unbonded_at } => unbonded_at.height,
+            BondStatus::Withdrawn { withdrawn_at } => withdrawn_at.height,
         },
         target_finalizer: bond.target_finalizer,
+        chain_finalized_height: match status {
+            BondStatus::Unbonding { .. } => check::delegation::chain_finalized_height(chain, finalized_state),
+            BondStatus::Active | BondStatus::Withdrawn { .. } | BondStatus::Burned => None,
+        },
     }
 }
 

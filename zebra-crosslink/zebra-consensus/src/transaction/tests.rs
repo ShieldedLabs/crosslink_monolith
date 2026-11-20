@@ -4957,19 +4957,20 @@ mod staking_signature {
             Some(BondInfoResponse {
                 amount: Amount::try_from(500u64).unwrap(),
                 status,
-                last_action_height: LAST_ACTION,
+                last_action_height: Height(LAST_ACTION),
                 target_finalizer: TARGET,
                 version: KEY,
+                chain_finalized_height: None,
             })
         };
         let ready = Height(LAST_ACTION + STAKING.action_delay);
         let early = Height(LAST_ACTION + STAKING.action_delay - 1);
-        let check = |kind, amount, bond_info, height| check_staking_action_bond_state(kind, KEY, amount, None, 0, bond_info, height, STAKING);
+        let check = |kind, amount, bond_info, height| check_staking_action_bond_state(kind, KEY, amount, None, 0, bond_info, height, STAKING, None);
         let retarget = |from, bond_info, height| {
-            check_staking_action_bond_state(RetargetDelegationBond, KEY, 0, from, 0, bond_info, height, STAKING)
+            check_staking_action_bond_state(RetargetDelegationBond, KEY, 0, from, 0, bond_info, height, STAKING, None)
         };
         let convert = |amount, bank, bond_info| {
-            check_staking_action_bond_state(ConvertFinalizerRewardToDelegationBond, KEY, amount, None, bank, bond_info, ready, STAKING)
+            check_staking_action_bond_state(ConvertFinalizerRewardToDelegationBond, KEY, amount, None, bank, bond_info, ready, STAKING, None)
         };
 
         assert!(check(CreateNewDelegationBond, 500, None, ready).is_ok());
@@ -4985,6 +4986,21 @@ mod staking_signature {
         assert!(check(WithdrawDelegationBond, 499, bond(1), ready).is_err());
         assert!(check(WithdrawDelegationBond, 500, bond(0), ready).is_err());
         assert!(check(WithdrawDelegationBond, 500, bond(2), ready).is_err());
+
+        // Under a withdrawal finality rule (from FeaturenetUpgrade3, once one is selected), a
+        // withdrawal also needs the chain to have finalized the height the rule requires, and is
+        // held while it finalizes nothing. Each rule is checked, as none is selected yet.
+        use zcash_primitives::bft::WithdrawalFinality::*;
+        for rule in [PastUnbonding, PeriodsPastUnbonding(1), NextStakingPeriod] {
+            let finalized = |finalized_height| {
+                let info = bond(1).map(|info| BondInfoResponse { chain_finalized_height: finalized_height, ..info });
+                check_staking_action_bond_state(WithdrawDelegationBond, KEY, 500, None, 0, info, ready, STAKING, Some(rule))
+            };
+            let required = STAKING.withdrawal_required_finalized(rule, LAST_ACTION);
+            assert!(finalized(Some(Height(required))).is_ok(), "{rule:?}");
+            assert!(finalized(Some(Height(required - 1))).is_err(), "{rule:?}");
+            assert!(finalized(None).is_err(), "{rule:?}");
+        }
 
         // A retarget must name the bond's current target, as block validation requires.
         assert!(retarget(Some(TARGET), bond(0), early).is_ok());
@@ -5016,9 +5032,10 @@ mod staking_signature {
             let info = BondInfoResponse {
                 amount: Amount::try_from(500u64).unwrap(),
                 status: 0,
-                last_action_height: 0,
+                last_action_height: zebra_chain::block::Height(0),
                 target_finalizer: [7; 32],
                 version,
+                chain_finalized_height: None,
             };
             for bond_info in [None, Some(&info)] {
                 for spends in std::iter::once(None).chain(versions.map(Some)) {
