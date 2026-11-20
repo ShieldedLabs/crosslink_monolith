@@ -534,14 +534,23 @@ impl Director {
                     None => true,
                     Some((b, bg)) => {
                         let q = &self.peers[b];
-                        // fair tie: fewer failures, then longest unserved, then id
+                        // Preserve strict service age, but diversify equal-age
+                        // targets across senders instead of making every holder
+                        // aim at the same lowest peer id. This is a tie-break,
+                        // not random probing or a trust/ownership assignment.
                         let fair = self.fair_next;
                         let key = |p: &PeerState, g: Gap| {
+                            let mut rank =
+                                (p.id as u64) ^ (engine.me as u64).wrapping_mul(0x9e3779b97f4a7c15);
+                            rank = (rank ^ (rank >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                            rank = (rank ^ (rank >> 27)).wrapping_mul(0x94d049bb133111eb);
+                            rank ^= rank >> 31;
                             (
                                 std::cmp::Reverse(if fair { 0 } else { g.rank() }),
                                 if fair { 0 } else { p.failures },
                                 p.last_served.unwrap_or(0),
                                 p.failures,
+                                rank,
                                 p.id,
                             )
                         };
