@@ -565,6 +565,53 @@ fn form_b_proposal_is_served_with_its_justifying_polka_and_after_vc_advanced() {
     .unwrap();
     s.packets[0].deliver(&mut r, &mut rs).unwrap();
     assert_eq!(st(&r).proposal, Some(id));
+    assert!(r.view().unwrap().justified);
+    assert_eq!(st(&r).step, Step::Prevote);
+
+    // Advance the sender's VC to this same body's CURRENT round. The old
+    // proposal header still names valid_round=0; its current-round polka is
+    // nevertheless useful form-B evidence, not a malformed justification.
+    let current_votes: Vec<_> = (0..3)
+        .map(|i| vote(&c, i, i as u8, 0, 1, VoteKind::Prevote, Some(id)))
+        .collect();
+    let current = [Group {
+        kind: CertKind::Polka { round: 1, id },
+        votes: Votes::Dense(&current_votes),
+    }];
+    e.receive(ordinary(None, None, &current), Status::Valid, &mut s)
+        .unwrap();
+    assert_eq!(e.view().unwrap().valid_round, Some(1));
+    s.packets.clear();
+
+    let (mut b, mut bs) = engine(&c, 2, 0);
+    b.receive(
+        ordinary(Some(&rj[0]), None, &rg),
+        Status::Indeterminate,
+        &mut bs,
+    )
+    .unwrap();
+    assert_eq!(st(&b).round, 1);
+    assert_eq!(st(&b).proposal, None);
+    assert_eq!(
+        e.serve(5, &st(&b), &mut s).unwrap(),
+        Served::Sent(Gap::Proposal)
+    );
+    assert_eq!(s.packets.len(), 1);
+    assert_eq!(s.packets[0].groups[0].0, CertKind::Polka { round: 1, id });
+    s.packets[0].deliver(&mut b, &mut bs).unwrap();
+    assert_eq!(st(&b).proposal, Some(id));
+    assert!(
+        !b.view().unwrap().justified,
+        "form B does not fabricate an old-vr justification"
+    );
+    assert!(st(&b).prevote_quorum);
+    assert!(b.view().unwrap().timers[1].active);
+    let remaining = b.view().unwrap().timers[1].remaining;
+    assert!(remaining > 0);
+    b.elapse(remaining, &mut bs).unwrap();
+    assert_eq!(b.view().unwrap().locked_round, Some(1));
+    assert_eq!(st(&b).step, Step::Precommit);
+    assert_eq!(b.precommits()[2].unwrap().content.id, Some(id));
 }
 
 #[test]
@@ -617,17 +664,18 @@ fn certified_conflict_is_repaired_not_nogap() {
         Served::Sent(Gap::Polka)
     ));
     assert!(s.packets[0].proposal.is_some());
-    assert!(s.packets[0]
-        .groups
-        .iter()
-        .any(|g| g.0 == CertKind::Polka { round: 0, id }));
+    assert!(
+        s.packets[0]
+            .groups
+            .iter()
+            .any(|g| g.0 == CertKind::Polka { round: 0, id })
+    );
 }
 
 #[test]
 fn same_step_peer_lacking_prevote_quorum_gets_full_row_and_arms_timer() {
     let c = config(&[0, 1, 2, 3], &[1; 4]);
-    let (mut e, mut s, h) = with_proposal(&c, 3, b"x");
-    let id = h.content.id;
+    let (mut e, mut s, _) = with_proposal(&c, 3, b"x");
     let (mut r, mut rs, _) = with_proposal(&c, 2, b"x");
     let a = vote(&c, 0, 0, 0, 0, VoteKind::Prevote, None);
     let b = vote(&c, 1, 1, 0, 0, VoteKind::Prevote, None);
