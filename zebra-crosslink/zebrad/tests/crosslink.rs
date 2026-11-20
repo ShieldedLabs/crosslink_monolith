@@ -4763,19 +4763,24 @@ type SceneDecision = (u64, BftBlock, FatPointerToBftBlock, Vec<zcash_primitives:
 /// `n` heights from 1 decided on the scene's chain by its three synthetic finalizers: height `h`
 /// finalizes block `first_snapshot + h - 1`, proposed in round 0 by that round's proposer and
 /// certified by the three. The node votes in none of them.
-fn bft_rounds_decisions(scene: &BftRoundsScene, first_snapshot: u32, n: u64) -> Vec<SceneDecision> {
-    // A certificate lists its signers in roster order, by stake and then key, both descending; the
-    // three synthetic finalizers have the same stake.
+/// The certificate the scene's three synthetic finalizers make for `block` at `height`, round 0:
+/// their precommits, listed in roster order (by stake and then key, both descending; the three
+/// have the same stake).
+fn scene_certificate(scene: &BftRoundsScene, block: &BftBlock, height: u64) -> FatPointerToBftBlock {
     let mut signers: Vec<u64> = scene.finalizers.iter().map(|&k| u64::from(k)).collect();
     signers.sort_by_key(|&k| std::cmp::Reverse(synthetic_finalizer_pub_key(k)));
     let seeds: Vec<String> = signers.iter().map(|&k| synthetic_finalizer_seed(k)).collect();
     let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
+    signed_fat_pointer(block, height, 0, &seeds, &[0; 32])
+}
+
+fn bft_rounds_decisions(scene: &BftRoundsScene, first_snapshot: u32, n: u64) -> Vec<SceneDecision> {
     let mut parent = FatPointerToBftBlock::from_parts(scene.genesis().blake3_hash(), 0, 0, &[]);
     let mut decided = Vec::new();
     for height in 1..=n {
         let snapshot = first_snapshot + u32::try_from(height - 1).expect("a small height");
         let block = bft_proposal(&BFT_ROUNDS_PARAMETERS, height as u32, parent.clone(), 0, &scene.tail_above(snapshot));
-        let fat_ptr = signed_fat_pointer(&block, height, 0, &seeds, &[0; 32]);
+        let fat_ptr = scene_certificate(scene, &block, height);
         let proposer_seed = match scene.proposer(height, 0) {
             TF_BFT_THE_NODE => TEST_NODE_FINALIZER_SEED.to_string(),
             k => synthetic_finalizer_seed(k),
@@ -4903,17 +4908,38 @@ fn crosslink_bft_own_candidate_failing_the_block_rules_is_refused_without_a_cras
     let scene = bft_rounds_scene(&mut tf, &[false]);
     tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
 
-    let mut signers: Vec<u64> = scene.finalizers.iter().map(|&k| u64::from(k)).collect();
-    signers.sort_by_key(|&k| std::cmp::Reverse(synthetic_finalizer_pub_key(k)));
-    let seeds: Vec<String> = signers.iter().map(|&k| synthetic_finalizer_seed(k)).collect();
-    let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
     let block = bft_proposal(&BFT_ROUNDS_PARAMETERS, 1, FatPointerToBftBlock::null(), 0, &scene.tail_above(20));
-    let fat_ptr = signed_fat_pointer(&block, 1, 0, &seeds, &[0; 32]);
+    let fat_ptr = scene_certificate(&scene, &block, 1);
     let candidate = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr });
     tf.push_instr_bft_push_candidate(&candidate, &[], 0);
     tf.push_instr_expect_pos_chain_length(1, 0);
     tf.push_instr_expect_bft_dropped(false, None, 0);
     tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// An imported decision whose snapshot this node does not hold is refused at once, as it always
+/// was, not parked: a parked import would hold the node's BFT intake until its snapshot showed up,
+/// before its signatures were even checked. A valid import of the same height right after it is
+/// taken.
+#[test]
+fn crosslink_load_pos_with_an_unknown_snapshot_is_refused_not_parked() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let mut scene = bft_rounds_scene(&mut tf, &[false]);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    // A snapshot and its sigma headers above the node's tip, never loaded.
+    let (miner, gen) = (scene.miner.clone(), &mut scene.gen);
+    let unheld: Vec<Arc<Block>> = (0..1 + BFT_ROUNDS_PARAMETERS.bc_confirmation_depth_sigma).map(|_| gen.next_block(&miner)).collect();
+    let genesis = FatPointerToBftBlock::from_parts(scene.genesis().blake3_hash(), 0, 0, &[]);
+    let block = bft_proposal(&BFT_ROUNDS_PARAMETERS, 1, genesis, 0, &unheld[1..]);
+    let fat_ptr = scene_certificate(&scene, &block, 1);
+    push_scene_decision(&mut tf, &(1, block, fat_ptr, Vec::new()), SHOULD_FAIL);
+
+    let decided = bft_rounds_decisions(&scene, 20, 1);
+    push_scene_decision(&mut tf, &decided[0], 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
 
     test_bytes(tf.write_to_bytes());
 }
