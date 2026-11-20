@@ -597,7 +597,306 @@ regenerate current frames, not retain borrowed `Sink::send` data. A transport
 queue retaining owned frames instead needs its own byte/work accounting.
 Application-processing acknowledgement, not an STP ACK alone, is needed before
 an optimization may suppress periodic repair to a particular receiver. The
-current proof does not certify such an optimization or its memory bound.
+periodic-lane theorem does not certify such an optimization or its memory
+bound. The separate guided-only theorem below has different service premises.
+
+## Guided-only evidence: a separate conditional theorem
+
+This section does NOT infer guided-only termination from the preceding BPS
+premise. BPS services full broadcast lanes; the protocol here has NO broadcast
+body/certificate fallback. It supplies replacement lemmas, using actual latest
+peer status and bare own-vote service. The bound is conservative and is not a
+claim about an STP implementation or a Rust wall-clock refinement.
+
+### Emission/API and information contract
+
+`Emission::Guided` has the following boundary. Automatic transition, proposer,
+reactive-E, periodic and recovery output never sends a proposal body or group,
+whether its target would have been `All` or `Peer`. Automatic vote output is
+only the node's own signed ENTER/PREVOTE/PRECOMMIT without attachments. The rho
+grid continues to offer its current own PREVOTE after precommit, and its current
+own PRECOMMIT after signing it, until departure. It does not stop the PV stream
+at a phase change. A decided node advertises status but broadcasts no DEC.
+Explicit `serve(peer, latest_status, sink)` is the ONLY evidence emission path;
+it emits at most one complete, already-retained frame, to that peer only.
+`recover_with_emission` must select Guided BEFORE recovery can emit anything;
+selecting a volatile policy after a reference-mode recovery is too late.
+Reference and CompactLive retain their separate earlier contracts.
+
+The host advertises `Engine::status()` periodically, also after useful state
+changes, including throughout round changes and after decision. A snapshot
+contains configuration, height, round, step, current proposal id, its
+`justified` bit, retained polka `(round,id)`, and `prevote_quorum`. The last bit
+means quorum signer WEIGHT in the current PV row, not a matching-value quorum.
+These are constant-size hints, never votes or proofs. Bind a snapshot to its
+authenticated source and a fresh transport generation plus sender sequence;
+reject older sequence/generation pairs. The host must admit and retain the
+correct roster peers' records; merely allocating N table slots does not ensure
+that Byzantine identities cannot exclude a correct peer. No per-peer signer
+inventory is required. No status may fabricate weight, external T validity,
+proposal authorization, a lock, or a decision.
+
+The directed planner must have these dominance properties, including when the
+recipient reports `Step::Propose`:
+
+1. An undecided peer is offered retained complete DEC once the sender decides.
+2. For a peer in a lower round, prefer a retained CURRENT self-carrying package
+   when available: matching body/current polka (with own nonnil PC if held), or
+   own PV plus a quorum-weight current PV row, even a mixed/nil row. Otherwise
+   use full ENTER+ENTRY. A TIMEOUT(r-1) ENTRY alone may take another TPC(r-1)
+   to enter r; it is NOT a substitute for the current self-carrier in this rule.
+3. For a peer in the same round, a missing matching current polka/body is
+   repaired by its complete package. If the local PV row has quorum weight and
+   the peer lacks a PV quorum, repair that quorum BEFORE a proposal-only gap.
+   Such a row frame may carry the prescribed best-effort proposal, but need not
+   carry one when the sender prevoted nil.
+4. Remaining proposal gaps include a missing body AND a held old-vr proposal
+   whose exact-vr authorization is missing. Serve the same current header/body
+   with its retained exact-vr polka (form A), or its matching CURRENT-round
+   polka (form B) when the old authorization was superseded. A bare repeated
+   header does not close an authorization gap. Form B does not set `justified`;
+   it repairs the current PV row and uses the existing 34'/36 guards.
+
+A form-A-to-form-B change cannot reset service. Current polka repair must be
+possible from retained VC even if there is no matching own nonnil PC, since a
+late VC update after a nil PC need not create a new lock. Proposal-only repair
+must not repeatedly outrank a quorum repair against a polluted cached body.
+Step-difference repair without a quorum may remain a best-effort extra, but is
+not used in the proof. Individual missing PV/PC votes are supplied by their
+signers' bare streams, NOT inferred from step or `prevote_quorum`. A PC-quorum
+bit, pending-DEC bit or timer flags can reduce redundant traffic, but are not
+needed for this theorem. An indeterminate retained body relies on the validity
+service below, not on status being treated as T.
+
+### Non-oracular service premises
+
+Use all the preceding one-height local-execution, signature, validity,
+NB/Z/ZG, clock, no-crash and no-higher-INIT restrictions for the designated
+correct set. In particular retain STRONG M9c: once a correct holder has T at x,
+every correct copy still held or newly acquired is determinate by the
+applicable max(x,s)+d boundary (a later acquisition adds at most d); soundness
+makes it T. A previously held copy need not be fetched again merely to gain
+this bound. Correct fresh acquisition is still the source's zero-time locally-T
+operation. Timers do not await validity.
+
+There are finite unknown S,A,V>0, including rho-grid waits where applicable,
+with the following contracts for every distinct ordered pair (p,q) of designated
+correct members. Intervals are wholly inside the useful service window. Use
+the earlier global event order for equal timestamps; "after u" excludes an
+old queued copy, even at the same logical timestamp.
+
+* **STATUS(S).** For every boundary u, by u+S, p has accepted a status actually
+  generated by q AFTER u. Status continues across rounds, phase changes and
+  decision. Sender sequences prevent a later receipt from rolling the table
+  back. Thus an old snapshot cannot indefinitely hide a newly created gap.
+* **REQUEST(A).** If the SEMANTIC response obligation
+  `gap_for(latest_admissible_status).is_some()` persists throughout [u,u+A],
+  p's explicit guided response stream to q yields at least one actual complete
+  frame OFFERED after u and admitted, verified and processed by q by u+A.
+  Eligibility here ignores outstanding grants, retry backoff and temporarily
+  occupied K slots: these may delay service WITHIN A, not make the antecedent
+  vacuous. The key is authenticated `(p,q,guided)`, not the gap enum, round,
+  status sequence, certificate hash, evidence version or proposal form.
+* **BARE(V).** In any V-long interval during which p's own PV (respectively PC)
+  remains current in one fixed round, its periodic bare stream has a vote
+  offered after the start and admitted, verified and processed by q by the end.
+  PV and PC have distinct keys, independent of their ids and p's current step.
+  Processing a vote while q is below its round may discard it; this premise
+  does NOT promise retention or combining of future bare votes. Self-insertion
+  needs no network self-delivery. Bare ENTER service is optional for the proof.
+
+All three are observable class/transport contracts: they refer to generated
+statuses, the local public planner result, actual offers and actual receive
+processing. None selects a message by a future decision, global lock knowledge,
+or whether it will ultimately be useful. REQUEST concerns ANY outstanding
+local response stream, not a globally chosen "needed certificate". It remains
+one stream across ENTER supersession and active-to-DEC. Individual status,
+vote, initial send, directed attempt and entire frames may be lost. The
+contracts do not require all live SENDs to succeed. Availability gaps caused
+by genuine completion need no service; the lemmas below prove when that
+completion already supplies the relevant local fact.
+
+The director/host must offer continuations often enough to realize REQUEST:
+K>=1 is fixed independently of N, grant timeout is positive and bounded, capped
+backoff is bounded, host polling is bounded, and status TTL must not expire a
+correct peer between STATUS updates. Latest statuses must not cancel/restart a
+still-open semantic obligation's deadline. Fair service must cover every
+registered correct peer despite Byzantine requests. The guided director uses
+strict monotone service ordinals (checked for exhaustion BEFORE sending) for
+oldest-unserved arbitration, alternating those opportunities with gap priority.
+This preserves ordering even when multiple polls share a host timestamp, with
+O(1) words per peer. Gap priority alone would be insufficient. With capped backoff, finite N, bounded grants/polling
+and strict oldest-ticket opportunities, request OFFER opportunities have a
+finite bound that may grow with N/K. Successful whole-frame admission and CPU
+processing still need their own bounded loss/service premise to obtain A.
+Neither finite K, a fair selection order, an STP ACK, nor existing tests proves
+REQUEST. No lane-level inventory/scheduler is needed for this proof once the
+planner dominance rules above hold; without them ANY-gap service is not enough.
+
+### Derived repair lemmas and timing
+
+Put E=S+A and choose one deliberately loose constant
+
+    H_g = 4(S + A + V).
+
+A repair wave takes at most E: wait for a post-boundary truthful status, then
+apply REQUEST to the still-open local obligation. If that obligation ceases
+before its service deadline, a NEWER truthful status or monotone sender
+advancement must already imply the target fact (or an earlier decision/exit).
+If it does not cease, the actually selected complete frame has the following
+properties by the planner rules. This is a derived alternative, not an extra
+service axiom. In a fixed-round no-exit prefix, row occupancy, correct vote
+columns, matching correct-proposer body/justification and held current polkas
+are persistent. Byzantine row-column replacements do not decrease signer
+occupancy. For Progress the sender's round is monotone and its DEC is terminal.
+
+**G1 (successor bridge).** A correct p at M followed by later versions of its
+Progress response puts any q initially below M into >=M within
+E+TPC(M-1), or supplies complete DEC. If q's latest status already reports
+>=M, the target is already reached. Otherwise its lower-round obligation stays
+open; the actual response is a current self-carrier, or ENTER+ENTRY at L>=M.
+The TIMEOUT/JUMP cases are exactly R2, including L>M and heavy signers. Thus R2
+holds with H_g in place of H, including a transient first entrant whose ENTRY
+is superseded before service. No particular first ENTER must be delivered.
+
+**G2 (quorum handover).** At the first correct quorum-in-prevote instant s1 in
+a fresh r, its holder can serve a current self-carrier. In the no-exit prefix,
+within E every correct q is in r and holds PV quorum signer weight, or already
+has that fact: lower-round responses prefer the self-carrier, same-round
+missing-quorum responses carry the row or a stronger current polka. A package
+jumps BEFORE merging its own current-round evidence. An already complete peer
+needs no duplicate row. Start bare c-to-q PV service AFTER q's entry, not at
+c's earlier signing time a_c. Everyone gets each correct c's vote by
+
+    max(a_c, s1 + E) + V <= max(a_c, s1 + H_g) + H_g.
+
+This proves the R3 handover bound without transmitting every c's quorum row
+and without retaining any below-witness future fragment. Phase changes do not
+remove the bare PV lane. A first departure truncates this prefix; no claim
+uses service after a discarded round.
+
+**G3 (proposal and polka).** Once c and correct proposer q have entered r,
+q's response to missing proposal/authorization supplies its unique header/body
+and either exact-vr authorization or matching current polka within at most
+TWO repair waves. The first wave may instead supply a quorum PV row without
+the body when q's own PV is nil, or WITH the body but WITHOUT its old-vr
+certificate. After a fresh status reports that quorum, the next wave cannot
+be starved by that same row gap: its missing body or held-but-unjustified
+proposal requests the exact-vr package. This is why 2(S+A), rather than one
+wave, is budgeted. A received current-polka package already supplies both. If status already reports body plus justification (or current polka),
+the relevant evidence is already held; strong M9c supplies T within d once q's
+locally-T publication exists. For a correct proposer no conflicting signed
+current header exists. Consequently the R4 designated-copy bound is replaced
+by the following evidence-or-absorption bound:
+
+    b_c <= max(e_c,e_q) + 2E + d
+        <= max(e_c,e_q) + H_g + d.
+
+Form A already held from a relay is sufficient authorization. Form B, whether
+newly served or already held, provides a verified value polka at a correct
+holder, NOT necessarily a lock at the relay or at q. From ANY such correct
+holder the retained current polka/body reaches every still-deficient peer in
+one further wave, with T at most d later. This replaces R4's reliance on q's
+nonnil-PC lane in its any-form-B case; it does not infer a lock from a relay's
+form B. A nil prevoter is outside the polka's correct signer set regardless
+of the relay's lock. Exact-vr-to-current-polka supersession and phase changes
+therefore preserve the obligation and cannot reset a deadline.
+
+**G4 (first stopping events and frontier).** Apply G1-G3 only to prefixes
+ending at the first correct nil PC, first exit, or earlier decision. Use
+
+    TP(r)  > 2H_g + d + TPC(r-1)
+    TPV(r) > 4H_g + d
+    TPC(r) > TPV(r) + 2H_g + d.
+
+The earliest-prevote and form-A lock-domination arguments of R4 are unchanged.
+At a purported first rule-63 nil PC n, G2 aligns everyone by s1+H_g; G3 gives
+body/authorization by s1+3H_g+d. If a form-B alternative occurred, its correct
+polka holder repairs everyone by s1+3H_g+d. Otherwise all correct value PVs
+are received by s1+4H_g+d using BARE after entry. Both precede n, so 36
+preempts 63. A nil quorum cannot intersect a value polka in a correct signer,
+excluding 44. At a purported first exit L with first PC-timer arming t2, the
+PC quorum has a correct nonnil member; its guided body/polka aligns everyone
+by t2+H_g, and bare PCs complete decision by
+
+    t2 + 2H_g + d + TPV(r) < t2 + TPC(r) <= L.
+
+Thus the deciding-round contradiction survives without q-origin full
+broadcasts or any delivered E reply. R5's L11 propagation uses G2 for the
+first quorum and G3's ANY-correct-holder polka repair after a lock; its same
+bounds s1+H_g+2TPV(r) and s1+2H_g+2TPV(r)+d still precede the first exit.
+For A5.0, a correct member of the first PC quorum has either a nonnil PC with
+polka or a nil PC with retained quorum PV row. Its CURRENT self-carrier reaches
+old-round laggards by t2+H_g, before that round's first exit. This is why merely
+serving ENTER+TIMEOUT(r-1) is insufficient here: its extra predecessor timeout
+would invalidate the stated eventual affine inequalities.
+
+**G5 (terminal repair and value-oblivious progress).** A decided correct
+holder serves complete DEC against every truthful not-decided status, regardless
+of the receiver's round. One wave plus validity yields decision by x+H_g+d
+from a first decision x (or s+H_g+d if already decided at s). A status reporting
+decision is already the terminal fact. For the no-exit rendezvous case all
+correct nodes already in r sign PV by A_r+TP(r), bare service yields a quorum
+by another V, and after TPV(r) bare PCs yield a quorum by one further V.
+Hence R7's value-oblivious induction uses the same conservative
+
+    W_g(r) = TP(r) + TPV(r) + TPC(r) + 3H_g.
+
+Its early-exit case instead uses G1. This does not assume a successful
+proposal, T validity or an indefinitely resident sender to establish progress.
+
+### Guided-only conditional termination theorem
+
+Let m be the greatest designated-correct round at s. Assume a finite K_round
+such that all three G4 inequalities hold for every r>=K_round; this is a timeout
+threshold, NOT the director's interaction cap K. The source affine growth
+incPropose>incPrecommit>incPrevote>0 supplies it for finite unknown H_g,d in
+unbounded arithmetic. Retain all finite Rust integer/exhaustion constraints.
+Define
+
+    R_g = max(m, K_round-1) + 2N
+    B_g = H_g + TPC(m-1) + sum[r=m..R_g] W_g(r),  TPC(-1)=0
+    L_g = B_g + H_g + d.
+
+Under the model, API/planner and STATUS/REQUEST/BARE premises above, a first
+correct decision occurs by s+B_g and every designated-correct participant
+decides by s+L_g. Proof: G1 supplies A2/A3, G4 supplies L10/L11 and A5.0,
+while A1's signature/weight frontier provenance and A4's last-departure hidden-
+lock sampling are unchanged. The R7/A5 two-proposer-cycle argument therefore
+applies with H_g; G5 supplies terminal repair and closes the no-stopping-event
+case without circularity. It suffices that these premises hold only through
+[s,s+L_g], with each service premise applied only to its full subintervals
+inside the window. All transmissions outside that window may be lost forever;
+individual transmissions inside it may also be lost. No full evidence is
+broadcast in this argument.
+
+The SAME fixed actually-correct >2/3-weight cohort corollary applies by the
+earlier complement reclassification, with S,A,V/local timeliness required only
+within that fixed cohort. Keep the original roster, weights and N; do not
+renormalize. Soundness, non-equivocation and agreement remain global safety
+requirements for all actually correct members. Only the fixed timely cohort's
+decision latency is bounded. A slow outsider needs a later status/directed DEC
+service interval and its own bounded validity, or an authenticated archive if
+higher INIT has retired PEND. A rotating timely quorum or a cohort containing
+Byzantine members is not covered.
+
+### Scope and missing implementation evidence
+
+This theorem adds no durable region, future-vote bank or per-peer vote
+inventory. The core remains O(N+B), and director metadata is O(N) total/O(1)
+per peer with at most fixed K granted interactions. Complete-frame ownership,
+serialization/reassembly, admission queues and CPU work are separate transport
+budgets; counting K grants does not bound arbitrary transport-held copies.
+STATUS authentication/admission, continuous periodic status, fair host polling,
+bounded grant lifetime/backoff, non-vacuous semantic request continuation,
+whole-frame loss/admission service and validity completion are still explicit
+host/transport obligations. Simulations can verify emission exclusion, planner
+choices, bounded metadata and executions of a chosen service schedule; they do
+not establish these generic premises for STP. Ordinary fair loss, infinitely
+many successful small votes, or finite memory alone still permits every
+finite-lived proposal response to be lost. No physical WAL/backend, deployment
+memory bound, end-to-end Byzantine-flood scheduler proof, or stronger wall-clock
+termination claim is supplied by this section.
 
 ## Persistence and memory are separate contracts
 
