@@ -1155,6 +1155,14 @@ impl DiskDb {
         self.db.write(batch.batch)
     }
 
+    /// Writes `batch` to the database and syncs it to disk before returning, so it survives a
+    /// crash of the machine as well as of the process.
+    pub(crate) fn write_synced(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
+        let mut options = rocksdb::WriteOptions::default();
+        options.set_sync(true);
+        self.db.write_opt(batch.batch, &options)
+    }
+
     // Private methods
 
     /// Tries to reuse an existing db after a major upgrade.

@@ -103,3 +103,22 @@ impl FromDisk for ProposalSignatures {
         ProposalSignatures(sigs)
     }
 }
+
+/// This node's tenderlink WAL record for one BFT height, in tenderlink's own encoding, which only
+/// tenderlink reads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenderlinkWalRecord(pub Vec<u8>);
+
+impl IntoDisk for TenderlinkWalRecord {
+    type Bytes = Vec<u8>;
+
+    fn as_bytes(&self) -> Self::Bytes {
+        self.0.clone()
+    }
+}
+
+impl FromDisk for TenderlinkWalRecord {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        TenderlinkWalRecord(bytes.as_ref().to_vec())
+    }
+}

@@ -124,6 +124,8 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "crosslink_fin",
     // The decided-chain block this node could not follow when it dropped BFT.
     "crosslink_bft_dropped",
+    // This node's tenderlink WAL, by BFT height.
+    "tenderlink_wal_by_height",
     // Legacy slash-index column families, empty and unused since Retarget actions
     // began carrying their `from` finalizer (burn sets are computed lazily at
     // activation now); still registered so existing databases open.

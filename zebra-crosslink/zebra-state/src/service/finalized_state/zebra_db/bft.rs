@@ -6,7 +6,7 @@ use zebra_chain::block::{self, Height};
 
 use crate::service::finalized_state::{
     disk_db::DiskWriteBatch,
-    disk_format::bft::{BftHeight, ProposalSignatures, StoredBftBlock, StoredFatPointer},
+    disk_format::bft::{BftHeight, ProposalSignatures, StoredBftBlock, StoredFatPointer, TenderlinkWalRecord},
     disk_format::fin::{FinKey, FinMarker},
     zebra_db::ZebraDb,
     TypedColumnFamily,
@@ -23,6 +23,17 @@ pub const BFT_PROPOSAL_SIGS_BY_HEIGHT: &str = "bft_proposal_sigs_by_height";
 
 /// The name of the column family recording that this database dropped BFT.
 pub const CROSSLINK_BFT_DROPPED: &str = "crosslink_bft_dropped";
+
+/// The name of this node's tenderlink WAL column family, by BFT height.
+pub const TENDERLINK_WAL_BY_HEIGHT: &str = "tenderlink_wal_by_height";
+
+/// How many BFT heights below the newest WAL record keep theirs. Not only the height being
+/// decided needs its record: `restore` resumes BFT below a stored decision whose snapshot this
+/// state lost, and there the record is what keeps this node to the lock it held.
+pub const TENDERLINK_WAL_HEIGHTS_KEPT: u32 = 64;
+
+/// The type for reading this node's tenderlink WAL records.
+pub type TenderlinkWalByHeightCf<'cf> = TypedColumnFamily<'cf, BftHeight, TenderlinkWalRecord>;
 
 /// The type for reading decided BFT blocks from the database.
 pub type BftBlockByHeightCf<'cf> = TypedColumnFamily<'cf, BftHeight, StoredBftBlock>;
@@ -63,6 +74,38 @@ impl ZebraDb {
     fn crosslink_bft_dropped_cf(&self) -> CrosslinkBftDroppedCf<'_> {
         CrosslinkBftDroppedCf::new(&self.db, CROSSLINK_BFT_DROPPED)
             .expect("column family was created when database was created")
+    }
+
+    fn tenderlink_wal_by_height_cf(&self) -> TenderlinkWalByHeightCf<'_> {
+        TenderlinkWalByHeightCf::new(&self.db, TENDERLINK_WAL_BY_HEIGHT)
+            .expect("column family was created when database was created")
+    }
+
+    /// This node's tenderlink WAL records from BFT height `from` up, ascending.
+    pub fn tenderlink_wal(&self, from: u32) -> Vec<(u32, Vec<u8>)> {
+        self.tenderlink_wal_by_height_cf()
+            .zs_items_in_range_ordered(BftHeight(from)..)
+            .into_iter()
+            .map(|(height, record)| (height.0, record.0))
+            .collect()
+    }
+
+    /// Store this node's tenderlink WAL record for `height`, replacing the one stored before, and
+    /// drop the records more than [`TENDERLINK_WAL_HEIGHTS_KEPT`] heights below it. Synced to
+    /// disk before it returns: tenderlink sends what it signed only once it holds this.
+    pub fn write_tenderlink_wal(&self, height: u32, record: Vec<u8>) -> Result<(), rocksdb::Error> {
+        let keep_from = BftHeight(height.saturating_sub(TENDERLINK_WAL_HEIGHTS_KEPT));
+        let cf = self.tenderlink_wal_by_height_cf();
+        // Only when there is a row to drop: a range delete leaves a tombstone, and one per vote
+        // would pile up faster than compaction clears them.
+        let has_old_rows = cf.zs_first_key_value().is_some_and(|(first, _)| first < keep_from);
+        let mut batch = DiskWriteBatch::new();
+        // zs_insert and zs_delete_range write into the batch and return it; it is committed below.
+        let writer = cf.with_batch_for_writing(&mut batch).zs_insert(&BftHeight(height), &TenderlinkWalRecord(record));
+        if has_old_rows {
+            let _ = writer.zs_delete_range(&BftHeight(0), &keep_from);
+        }
+        self.db.write_synced(batch)
     }
 
     /// The decided BFT chain, ascending from height 0. Stops at the first gap: a crash before
@@ -181,5 +224,85 @@ impl ZebraDb {
             .with_batch_for_writing(&mut batch)
             .zs_insert(&FinKey, &FinMarker { height, hash });
         self.db.write(batch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use rand::{Rng, RngCore, SeedableRng};
+    use rand_chacha::ChaCha20Rng;
+    use zebra_chain::parameters::Network;
+
+    use super::TENDERLINK_WAL_HEIGHTS_KEPT;
+    use crate::{service::finalized_state::FinalizedState, Config};
+
+    /// Tenderlink's WAL records read back as last written, from any height up, and a record is
+    /// dropped only once one is written more than `TENDERLINK_WAL_HEIGHTS_KEPT` heights above it.
+    /// Heights mostly climb, by one or by a jump as after catching up; some are written again,
+    /// some lower, as after a restart that resumes below a stored decision, and some lie at the
+    /// ends of the range.
+    #[test]
+    fn tenderlink_wal_rows_read_back_and_drop_only_far_below_the_newest() {
+        let _init_guard = zebra_test::init();
+        let seed: u64 = std::env::var("CROSSLINK_FUZZ_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| rand::thread_rng().next_u64());
+        eprintln!("CROSSLINK_FUZZ_SEED={seed}");
+        let cases: u64 = std::env::var("CROSSLINK_FUZZ_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+
+        let (mut total_dropped, mut total_lowered) = (0, 0);
+        for case in 0..cases {
+            let mut rng = ChaCha20Rng::seed_from_u64(seed ^ case.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let state = FinalizedState::new(
+                &Config::ephemeral(),
+                &Network::Mainnet,
+                #[cfg(feature = "elasticsearch")]
+                false,
+            )
+            .expect("an ephemeral database opens");
+            let db = &state.db;
+
+            let mut model: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+            let mut height: u32 = match rng.gen_range(0..3) {
+                0 => rng.gen_range(0..TENDERLINK_WAL_HEIGHTS_KEPT * 2),
+                1 => u32::MAX - rng.gen_range(0..TENDERLINK_WAL_HEIGHTS_KEPT * 4),
+                _ => rng.gen(),
+            };
+            let (mut dropped, mut lowered) = (0, 0);
+            for step in 0..rng.gen_range(50..400) {
+                height = match rng.gen_range(0..10) {
+                    0..=4 => height.saturating_add(1),
+                    5 => height,
+                    6 | 7 => height.saturating_add(rng.gen_range(2..3 * TENDERLINK_WAL_HEIGHTS_KEPT)),
+                    _ => { lowered += 1; height.saturating_sub(rng.gen_range(1..TENDERLINK_WAL_HEIGHTS_KEPT)) }
+                };
+                let mut record = vec![0u8; rng.gen_range(0..2048)];
+                rng.fill_bytes(&mut record);
+                db.write_tenderlink_wal(height, record.clone()).expect("the write succeeds");
+
+                let keep_from = height.saturating_sub(TENDERLINK_WAL_HEIGHTS_KEPT);
+                let before = model.len();
+                model.retain(|&h, _| h >= keep_from);
+                dropped += before - model.len();
+                model.insert(height, record);
+
+                let from = match rng.gen_range(0..3) {
+                    0 => 0,
+                    1 => *model.keys().next().unwrap(),
+                    _ => rng.gen_range(keep_from..=height),
+                };
+                let expected: Vec<(u32, Vec<u8>)> = model.range(from..).map(|(&h, r)| (h, r.clone())).collect();
+                assert_eq!(db.tenderlink_wal(from), expected, "seed {seed} case {case} step {step}: height {height}, from {from}");
+            }
+            eprintln!("case {case}: {} rows kept, {dropped} dropped, {lowered} writes lower than the last", model.len());
+            total_dropped += dropped;
+            total_lowered += lowered;
+        }
+        if cases >= 4 {
+            assert!(total_dropped > 0 && total_lowered > 0, "seed {seed}: {total_dropped} rows dropped, {total_lowered} writes lower than the last");
+        }
     }
 }

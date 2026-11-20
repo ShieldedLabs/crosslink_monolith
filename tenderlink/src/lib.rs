@@ -216,6 +216,150 @@ impl std::fmt::Debug for ClosureToFetchDecidedRound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToFetchDecidedRound(..)") }
 }
 
+/// Store this node's WAL record for a BFT height (`Wal::encode`), replacing the one stored for
+/// that height before, and answer `true` once it would survive a crash. The engine sends nothing
+/// it signed until the record holding it is stored, and signs nothing more while this answers
+/// `false`. The host gives the records back to `entry_point` on the next start.
+#[derive(Clone)]
+pub struct ClosureToWriteWal(pub Arc<dyn Fn(u64, Vec<u8>) -> core::pin::Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>);
+impl std::fmt::Debug for ClosureToWriteWal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToWriteWal(..)") }
+}
+
+/// A message this node signed at a height.
+#[derive(Clone, PartialEq, Debug)]
+pub enum WalMsg {
+    Vote { round: u32, is_precommit: bool, value_id: ValueId },
+    Proposal { round: u32, valid_round: i64, value: BlockValue },
+}
+
+impl WalMsg {
+    fn round(&self) -> u32 {
+        match self { WalMsg::Vote { round, .. } | WalMsg::Proposal { round, .. } => *round }
+    }
+}
+
+/// What a finalizer must still know about a height after a crash: every message it signed there,
+/// the value it is locked on, and its valid value together with the prevotes that made it valid.
+///
+/// Tendermint is safe only if no correct node signs two votes in one step or prevotes against its
+/// lock. A finalizer that forgot both could, after a crash, prevote another value in a round where
+/// a quorum had already locked one, and crashes alone could then decide two values at one height.
+/// The prevotes travel with the valid value because a re-proposal of it is accepted only by nodes
+/// that hold them, and after a crash of the whole network no node does unless it stored them.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Wal {
+    pub height: u64,
+    pub msgs: Vec<WalMsg>,
+    pub locked: (Option<BlockValue>, i64),
+    pub valid: (Option<BlockValue>, i64),
+    pub valid_prevotes: Vec<(u16, TMSig)>,
+}
+
+const WAL_VERSION: u8 = 1;
+const WAL_MSG_PREVOTE:   u8 = 0;
+const WAL_MSG_PRECOMMIT: u8 = 1;
+const WAL_MSG_PROPOSAL:  u8 = 2;
+
+impl Wal {
+    pub fn new(height: u64) -> Wal {
+        Wal { height, msgs: Vec::new(), locked: (None, -1), valid: (None, -1), valid_prevotes: Vec::new() }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        fn put_value(out: &mut Vec<u8>, value: &(Option<BlockValue>, i64)) {
+            match value {
+                (Some(value), round) if *round >= 0 => {
+                    out.extend_from_slice(&round.to_le_bytes());
+                    out.extend_from_slice(&(value.0.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&value.0);
+                }
+                _ => out.extend_from_slice(&(-1i64).to_le_bytes()),
+            }
+        }
+        let mut out = Vec::new();
+        out.push(WAL_VERSION);
+        out.extend_from_slice(&self.height.to_le_bytes());
+        out.extend_from_slice(&(self.msgs.len() as u32).to_le_bytes());
+        for msg in &self.msgs {
+            match msg {
+                WalMsg::Vote { round, is_precommit, value_id } => {
+                    out.push(if *is_precommit { WAL_MSG_PRECOMMIT } else { WAL_MSG_PREVOTE });
+                    out.extend_from_slice(&round.to_le_bytes());
+                    out.extend_from_slice(&value_id.0);
+                }
+                WalMsg::Proposal { round, valid_round, value } => {
+                    out.push(WAL_MSG_PROPOSAL);
+                    out.extend_from_slice(&round.to_le_bytes());
+                    out.extend_from_slice(&valid_round.to_le_bytes());
+                    out.extend_from_slice(&(value.0.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&value.0);
+                }
+            }
+        }
+        put_value(&mut out, &self.locked);
+        put_value(&mut out, &self.valid);
+        out.extend_from_slice(&(self.valid_prevotes.len() as u16).to_le_bytes());
+        for (roster_i, sig) in &self.valid_prevotes {
+            out.extend_from_slice(&roster_i.to_le_bytes());
+            out.extend_from_slice(&sig.0);
+        }
+        out
+    }
+
+    /// `None` for anything `encode` cannot have written.
+    pub fn decode(bytes: &[u8]) -> Option<Wal> {
+        fn take<'a>(buf: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+            if buf.len() < n { return None; }
+            let (head, rest) = buf.split_at(n);
+            *buf = rest;
+            Some(head)
+        }
+        fn take_n<const N: usize>(buf: &mut &[u8]) -> Option<[u8; N]> { take(buf, N)?.try_into().ok() }
+        fn take_bytes(buf: &mut &[u8]) -> Option<BlockValue> {
+            let len = u32::from_le_bytes(take_n(buf)?) as usize;
+            if len > PROPOSAL_MAX_SIZE { return None; }
+            Some(BlockValue(take(buf, len)?.to_vec()))
+        }
+        fn take_value(buf: &mut &[u8]) -> Option<(Option<BlockValue>, i64)> {
+            let round = i64::from_le_bytes(take_n(buf)?);
+            match round {
+                -1 => Some((None, -1)),
+                0..=0xFFFF_FFFF => Some((Some(take_bytes(buf)?), round)),
+                _ => None,
+            }
+        }
+
+        let buf = &mut &bytes[..];
+        if take_n::<1>(buf)?[0] != WAL_VERSION { return None; }
+        let height = u64::from_le_bytes(take_n(buf)?);
+        let msgs_n = u32::from_le_bytes(take_n(buf)?) as usize;
+        let mut msgs = Vec::with_capacity(msgs_n.min(buf.len()));
+        for _ in 0..msgs_n {
+            let kind = take_n::<1>(buf)?[0];
+            let round = u32::from_le_bytes(take_n(buf)?);
+            msgs.push(match kind {
+                WAL_MSG_PREVOTE | WAL_MSG_PRECOMMIT => WalMsg::Vote { round, is_precommit: kind == WAL_MSG_PRECOMMIT, value_id: ValueId(take_n(buf)?) },
+                WAL_MSG_PROPOSAL => {
+                    let valid_round = i64::from_le_bytes(take_n(buf)?);
+                    if valid_round < -1 || valid_round >= round as i64 { return None; }
+                    WalMsg::Proposal { round, valid_round, value: take_bytes(buf)? }
+                }
+                _ => return None,
+            });
+        }
+        let locked = take_value(buf)?;
+        let valid = take_value(buf)?;
+        let prevotes_n = u16::from_le_bytes(take_n(buf)?) as usize;
+        let mut valid_prevotes = Vec::with_capacity(prevotes_n.min(buf.len()));
+        for _ in 0..prevotes_n {
+            valid_prevotes.push((u16::from_le_bytes(take_n(buf)?), TMSig(take_n(buf)?)));
+        }
+        if !buf.is_empty() { return None; }
+        Some(Wal { height, msgs, locked, valid, valid_prevotes })
+    }
+}
+
 fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMember]) -> FatPointerToBftBlock {
     let vote_for_block_without_finalizer_public_key: [u8; 76 - 32];
     {
@@ -757,6 +901,12 @@ pub struct TMState {
     /// last round on which a *non-nil* value was sent
     pub locked_value_round: (Option<BlockValue>, i64), // TODO
 
+    /// Everything this node has signed at the current height, as the WAL holds it.
+    pub own_msgs: Vec<WalMsg>,
+    /// The stored records of heights above the current one, taken in as the node reaches them.
+    /// Only a start whose decided chain ended below heights it had voted at has any.
+    wal_ahead: Vec<Wal>,
+
     pub rounds_data: Vec<RoundData>,
 
     /// A contiguous window of decided heights, beginning at the first entry's height.
@@ -778,6 +928,7 @@ pub struct TMState {
     update_peers_cmd_closure: ClosureToUpdatePeers,
     bft_access_closure: ClosureToAccessBft,
     fetch_decided_round_closure: ClosureToFetchDecidedRound,
+    write_wal_closure: ClosureToWriteWal,
 }
 
 impl TMState {
@@ -789,6 +940,7 @@ impl TMState {
         update_peers_cmd_closure: ClosureToUpdatePeers,
         bft_access_closure: ClosureToAccessBft,
         fetch_decided_round_closure: ClosureToFetchDecidedRound,
+        write_wal_closure: ClosureToWriteWal,
     ) -> Self {
         Self {
             hash_keys: HashKeys::default(),
@@ -803,6 +955,8 @@ impl TMState {
             strict_quorum: false,
             valid_value_round: (None, -1), // TODO: is this actually protocol-relevant or just a cache?
             locked_value_round: (None, -1),
+            own_msgs: Vec::new(),
+            wal_ahead: Vec::new(),
 
             rounds_data: Vec::new(),
             recent_commit_round_cache: Vec::new(),
@@ -816,7 +970,143 @@ impl TMState {
             update_peers_cmd_closure,
             bft_access_closure,
             fetch_decided_round_closure,
+            write_wal_closure,
         }
+    }
+
+    fn own_vote(&self, round: u32, is_precommit: bool) -> Option<ValueId> {
+        self.own_msgs.iter().find_map(|msg| match msg {
+            WalMsg::Vote { round: r, is_precommit: p, value_id } if (*r, *p) == (round, is_precommit) => Some(*value_id),
+            _ => None,
+        })
+    }
+
+    fn own_proposal(&self, round: u32) -> Option<(BlockValue, i64)> {
+        self.own_msgs.iter().find_map(|msg| match msg {
+            WalMsg::Proposal { round: r, valid_round, value } if *r == round => Some((value.clone(), *valid_round)),
+            _ => None,
+        })
+    }
+
+    /// The record of the current height that `write_wal` stores.
+    pub fn wal_record(&self) -> Wal {
+        let mut valid_prevotes = Vec::new();
+        if let (Some(valid), valid_round) = &self.valid_value_round &&
+           let Ok(valid_round) = u32::try_from(*valid_round) &&
+           let Ok(round_i) = self.rounds_data.binary_search_by_key(&(self.height, valid_round), |rd| (rd.height, rd.round))
+        {
+            let rd = &self.rounds_data[round_i];
+            let valid_id = valid.id_from_value(&self.hash_keys);
+            for roster_i in 0..rd.msg_val_sigs.len() {
+                for (value_id, sig) in [rd.msg_val_sigs[roster_i][0], rd.other_vote(roster_i, 0)] {
+                    if value_id == valid_id && sig != TMSig::NIL {
+                        valid_prevotes.push((roster_i as u16, sig));
+                        break;
+                    }
+                }
+            }
+        }
+        Wal {
+            height: self.height,
+            msgs: self.own_msgs.clone(),
+            locked: self.locked_value_round.clone(),
+            valid: self.valid_value_round.clone(),
+            valid_prevotes,
+        }
+    }
+
+    async fn write_wal(&mut self, roster: &[SortedRosterMember]) -> bool {
+        let stored = (self.write_wal_closure.0)(self.height, self.wal_record().encode()).await;
+        if !stored {
+            eprintln!("{} {ANSI_RED}BFT ERROR{ANSI_RST}: could not store this node's WAL record; signing nothing until it can", self.ctx_str(roster));
+        }
+        stored
+    }
+
+    /// Signs this node's vote for `value_id` in step `is_precommit` of round `round_i` and sends
+    /// it, once the WAL holds it. If the node already voted in that step, which after a restart
+    /// it may not know until now, it sends that vote again instead: another would be equivocating.
+    /// `lock` is the value a precommit locks on, stored in the same record as the precommit.
+    async fn vote(&mut self, roster: &[SortedRosterMember], round_i: usize, is_precommit: bool, value_id: ValueId, lock: Option<BlockValue>) -> TMStep {
+        let round = self.rounds_data[round_i].round;
+        let msg = |value_id| if is_precommit { TMMsgData::Precommit(value_id) } else { TMMsgData::Prevote(value_id) };
+        if let Some(signed) = self.own_vote(round, is_precommit) {
+            if signed != value_id && PRINT_BFT_VOTE {
+                println!("{} {ANSI_GRY}BFT_VOTE{ANSI_RST}: already signed {} in this step; sending it again instead of {}", self.ctx_str(roster), signed, value_id);
+            }
+            return self.broadcast(roster, round_i, msg(signed));
+        }
+        let locked = self.locked_value_round.clone();
+        if let Some(value) = lock {
+            self.locked_value_round = (Some(value), round as i64);
+        }
+        self.own_msgs.push(WalMsg::Vote { round, is_precommit, value_id });
+        if !self.write_wal(roster).await {
+            self.own_msgs.pop();
+            self.locked_value_round = locked;
+            return self.step;
+        }
+        self.broadcast(roster, round_i, msg(value_id))
+    }
+
+    /// Takes in a stored record of the current height: the lock and valid value as they were, the
+    /// valid value's prevotes, and every message the node signed, which go out again. Returns the
+    /// latest round the record names, which is where the node carries on.
+    fn apply_wal(&mut self, roster: &[SortedRosterMember], wal: Wal) -> u32 {
+        debug_assert_eq!(wal.height, self.height);
+        let roster_n = active_roster_len(roster, self.active_roster_max_n);
+        self.locked_value_round = wal.locked;
+        self.valid_value_round = wal.valid;
+        let mut resume_round = 0;
+        for round in [self.locked_value_round.1, self.valid_value_round.1] {
+            if let Ok(round) = u32::try_from(round) { resume_round = resume_round.max(round); }
+        }
+        if let (Some(valid), valid_round) = &self.valid_value_round && let Ok(valid_round) = u32::try_from(*valid_round) {
+            let valid_id = valid.id_from_value(&self.hash_keys);
+            for &(roster_i, sig) in &wal.valid_prevotes {
+                let roster_i = roster_i as usize;
+                if roster_i >= roster_n { continue; }
+                let signed_data = make_vote_sign_datas(roster[roster_i].pub_key, false, self.height, valid_round, valid_id)[1];
+                self.check_and_incorporate_msg(self.height, valid_round, 0, valid_id, -2, roster, roster_i, PACKET_TYPE_PREVOTE_SIGNATURES, &signed_data, sig);
+            }
+        }
+        self.own_msgs = wal.msgs;
+        for msg in self.own_msgs.clone() {
+            let round = msg.round();
+            resume_round = resume_round.max(round);
+            let round_i = match self.rounds_data.binary_search_by_key(&(self.height, round), |rd| (rd.height, rd.round)) {
+                Ok(round_i)  => round_i,
+                Err(round_i) => self.insert_round(round_i, round, roster),
+            };
+            match msg {
+                WalMsg::Vote { is_precommit, value_id, .. } => {
+                    self.broadcast(roster, round_i, if is_precommit { TMMsgData::Precommit(value_id) } else { TMMsgData::Prevote(value_id) });
+                }
+                WalMsg::Proposal { valid_round, value, .. } => {
+                    self.broadcast(roster, round_i, TMMsgData::Proposal(value, valid_round));
+                }
+            }
+        }
+        resume_round
+    }
+
+    /// The round to start the current height at: where a stored record of it left off, or 0.
+    fn take_wal_for_height(&mut self, roster: &[SortedRosterMember]) -> u32 {
+        self.wal_ahead.retain(|wal| wal.height >= self.height);
+        match self.wal_ahead.iter().position(|wal| wal.height == self.height) {
+            Some(i) => { let wal = self.wal_ahead.remove(i); self.apply_wal(roster, wal) }
+            None => 0,
+        }
+    }
+
+    /// Puts a new engine where its node left off: after the decided rounds it is given, in the
+    /// state the WAL records it is given leave each later height in.
+    pub async fn start(&mut self, roster: &[SortedRosterMember], decided_rounds: Vec<RoundData>, wal: Vec<Wal>, now: Instant) {
+        self.height = startup_height(&decided_rounds);
+        self.ingest_decided_rounds(decided_rounds);
+        self.wal_ahead = wal;
+        let round = self.take_wal_for_height(roster);
+        self.start_round(roster, now, round).await;
     }
 
     // NOTE: we just add our info to our round data & have it become equivalent to everyone else's...
@@ -973,19 +1263,34 @@ impl TMState {
 
         if Self::proposer_from_height_round(&self.hash_keys, roster, self.active_roster_max_n, self.height, round).1 == self.my_pub_key {
             let ctx_str = self.ctx_str(roster);
-            let proposal = if let Some(valid_value) = self.valid_value_round.0.clone() {
-                Some(valid_value)
+            let proposal = if let Some(signed) = self.own_proposal(round) {
+                Some(signed)
             } else {
-                let ret = self.propose_closure.0().await;
-                if PRINT_BFT_PROPOSAL { if ret.is_none() { println!("{ctx_str} {ANSI_GRY}BFT_PROPOSAL{ANSI_RST}: propose closure returned None."); } }
-                ret
+                let value = if let Some(valid_value) = self.valid_value_round.0.clone() {
+                    Some(valid_value)
+                } else {
+                    let ret = self.propose_closure.0().await;
+                    if PRINT_BFT_PROPOSAL { if ret.is_none() { println!("{ctx_str} {ANSI_GRY}BFT_PROPOSAL{ANSI_RST}: propose closure returned None."); } }
+                    ret
+                };
+                match value {
+                    Some(value) => {
+                        let valid_round = self.valid_value_round.1;
+                        self.own_msgs.push(WalMsg::Proposal { round, valid_round, value: value.clone() });
+                        if self.write_wal(roster).await {
+                            Some((value, valid_round))
+                        } else {
+                            self.own_msgs.pop();
+                            None
+                        }
+                    }
+                    None => None,
+                }
             };
-            if PRINT_BFT_PROPOSAL { if let Some(proposal) = &proposal { println!("{ctx_str} {ANSI_GRY}BFT_PROPOSAL{ANSI_RST}: about to propose with status '{:?}': {:?}", self.validate_closure.0(&proposal).await, proposal); } }
+            if PRINT_BFT_PROPOSAL { if let Some((proposal, _)) = &proposal { println!("{ctx_str} {ANSI_GRY}BFT_PROPOSAL{ANSI_RST}: about to propose with status '{:?}': {:?}", self.validate_closure.0(&proposal).await, proposal); } }
 
-            // TODO: simple approach: send proposal messages to self when broadcasting
-            // self.active_proposal_value_round = (Some(proposal), self.valid_value_round.1);
-            if let Some(proposal) = proposal {
-                self.step = self.broadcast(roster, round_i, TMMsgData::Proposal(proposal, self.valid_value_round.1));
+            if let Some((proposal, valid_round)) = proposal {
+                self.step = self.broadcast(roster, round_i, TMMsgData::Proposal(proposal, valid_round));
             } else {
                 self.step = TMStep::Propose;
             }
@@ -1445,10 +1750,10 @@ impl TMState {
                     self.locked_value_round.0 == Some(self.rounds_data[i].proposal.clone())) // TODO(perf): use (previously-checked) ids for easier comparison?
                 {
                     if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 22-0: receive first proposal this height"); }
-                    self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
+                    self.step = self.vote(roster, i, false, self.rounds_data[i].proposal_id, None).await;
                 } else {
                     if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 22-1: receive first proposal this height"); }
-                    self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
+                    self.step = self.vote(roster, i, false, ValueId::NIL, None).await;
                 }
             }
 
@@ -1467,10 +1772,10 @@ impl TMState {
                     self.locked_value_round.0 == Some(self.rounds_data[i].proposal.clone()))
                 {
                     if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 28-0: received 2f+1 prevotes"); }
-                    self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
+                    self.step = self.vote(roster, i, false, self.rounds_data[i].proposal_id, None).await;
                 } else {
                     if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 28-1: received 2f+1 prevotes"); }
-                    self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
+                    self.step = self.vote(roster, i, false, ValueId::NIL, None).await;
                 }
             }
 
@@ -1503,12 +1808,16 @@ impl TMState {
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
             {
                 if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 36: seen 2f+1 valid prevotes"); }
+                // The valid value is set first so that the record the precommit is stored in holds it.
+                let proposal = self.rounds_data[i].proposal.clone();
+                let valid_moved = self.valid_value_round.1 != self.round as i64 || self.valid_value_round.0.as_ref() != Some(&proposal);
+                self.valid_value_round = (Some(proposal.clone()), self.round as i64);
                 if self.step == TMStep::Prevote {
                     if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 36-0: seen 2f+1 valid prevotes"); }
-                    self.locked_value_round = (Some(self.rounds_data[i].proposal.clone()), self.round as i64);
-                    self.step = self.broadcast(roster, i, TMMsgData::Precommit(self.rounds_data[i].proposal_id));
+                    self.step = self.vote(roster, i, true, self.rounds_data[i].proposal_id, Some(proposal)).await;
+                } else if valid_moved {
+                    self.write_wal(roster).await;
                 }
-                self.valid_value_round = (Some(self.rounds_data[i].proposal.clone()), self.round as i64);
             }
 
             // line 44: seen 2f+1 nil prevotes: precommit nil
@@ -1520,7 +1829,7 @@ impl TMState {
                 self.step == TMStep::Prevote)
             {
                 if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 44: seen 2f+1 nil prevotes"); }
-                self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
+                self.step = self.vote(roster, i, true, ValueId::NIL, None).await;
             }
 
             // line 47: last orders on precommit period
@@ -1558,7 +1867,9 @@ impl TMState {
                 self.rounds_data.retain(|r| r.height >= self.height);
                 self.locked_value_round = (None, -1);
                 self.valid_value_round = (None, -1);
-                self.start_round(roster, now, 0).await;
+                self.own_msgs.clear();
+                let round = self.take_wal_for_height(roster);
+                self.start_round(roster, now, round).await;
                 break;
             }
 
@@ -1584,11 +1895,11 @@ impl TMState {
                 match timeout.step {
                     TMStep::Propose => if self.step == TMStep::Propose {
                         if PRINT_BFT_TIMEOUTS { println!("{ctx_str} {ANSI_GRY}BFT_TIMEOUTS{ANSI_RST}: hit timeout propose"); }
-                        self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
+                        self.step = self.vote(roster, i, false, ValueId::NIL, None).await;
                     },
                     TMStep::Prevote => if self.step == TMStep::Prevote {
                         if PRINT_BFT_TIMEOUTS { println!("{ctx_str} {ANSI_GRY}BFT_TIMEOUTS{ANSI_RST}: hit timeout prevote"); }
-                        self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
+                        self.step = self.vote(roster, i, true, ValueId::NIL, None).await;
                     },
                     TMStep::Precommit => {
                         if PRINT_BFT_TIMEOUTS { println!("{ctx_str} {ANSI_GRY}BFT_TIMEOUTS{ANSI_RST}: hit timeout precommit"); }
@@ -1887,6 +2198,9 @@ async fn instance(
         })})),
 
         ClosureToFetchDecidedRound(Arc::new(|_| None)),
+        // This runner keeps nothing across a restart.
+        ClosureToWriteWal(Arc::new(|_, _| Box::pin(async { true }))),
+        Vec::new(),
         Vec::new(),
         [0u8; 32], // initial_vote_namespace: no slashforks in the sim
         false,     // initial_strict_quorum
@@ -3064,7 +3378,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          peer_cmd_closure: ClosureToUpdatePeers,
                          bft_access_closure: ClosureToAccessBft,
                          fetch_decided_round_closure: ClosureToFetchDecidedRound,
+                         write_wal_closure: ClosureToWriteWal,
                          ingest_startup_data: Vec<RoundData>,
+                         // The WAL records `write_wal_closure` stored, of the startup height and
+                         // any above it; older ones are ignored.
+                         wal_records: Vec<Vec<u8>>,
                          // Vote-namespacing domain separator for the startup height
                          // (one after the last ingested round, or 0 when none); `[0; 32]` when no slashforks are in effect.
                          initial_vote_namespace: [u8; 32],
@@ -3072,6 +3390,16 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          initial_strict_quorum: bool,
                         ) -> std::io::Result<()> {
     hook_fail_on_panic();
+
+    let mut wal = Vec::with_capacity(wal_records.len());
+    for record in &wal_records {
+        match Wal::decode(record) {
+            Some(record) => wal.push(record),
+            // Nothing this build writes. Starting without it risks what the WAL is for, but so
+            // does any other way on: the node cannot know what it signed.
+            None => eprintln!("{ANSI_RED}BFT ERROR{ANSI_RST}: a stored WAL record of {} bytes cannot be read; this node may sign against what it signed before", record.len()),
+        }
+    }
 
     let mut roster = roster.clone();
 
@@ -3141,14 +3469,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         peer_cmd_closure,
         bft_access_closure,
         fetch_decided_round_closure,
+        write_wal_closure,
     ); // TODO: double-check this is the right key
 
-    bft_state.height = startup_height(&ingest_startup_data);
     bft_state.vote_namespace = initial_vote_namespace;
     bft_state.strict_quorum = initial_strict_quorum;
-    bft_state.ingest_decided_rounds(ingest_startup_data);
-
-    bft_state.start_round(&roster, zebra_debug_time::instant_now(), 0).await;
+    bft_state.start(&roster, ingest_startup_data, wal, zebra_debug_time::instant_now()).await;
 
     const ONE_SECOND: tokio::time::Duration = tokio::time::Duration::from_secs(1);
     let mut net_stats_window_start = tokio::time::Instant::now();
@@ -4672,6 +4998,7 @@ mod tests {
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
             ClosureToFetchDecidedRound(Arc::new(|_| None)),
+            ClosureToWriteWal(Arc::new(|_, _| Box::pin(async { true }))),
         );
         state.insert_round(0, 0, &roster);
         (state, roster)
@@ -4855,6 +5182,7 @@ mod tests {
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
             ClosureToFetchDecidedRound(Arc::new(|_| None)),
+            ClosureToWriteWal(Arc::new(|_, _| Box::pin(async { true }))),
         );
         state.vote_namespace = namespace;
         for r in 0..ROUNDS_N { state.insert_round(r as usize, r, &roster); }
@@ -5078,6 +5406,7 @@ mod tests {
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
             ClosureToFetchDecidedRound(Arc::new(|_| None)),
+            ClosureToWriteWal(Arc::new(|_, _| Box::pin(async { true }))),
         );
         state.round = 2;
 
@@ -5131,6 +5460,7 @@ mod tests {
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
             ClosureToFetchDecidedRound(Arc::new(|_| None)),
+            ClosureToWriteWal(Arc::new(|_, _| Box::pin(async { true }))),
         )
     }
 
@@ -5837,6 +6167,7 @@ mod tests {
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
             ClosureToFetchDecidedRound(Arc::new(|_| None)),
+            ClosureToWriteWal(Arc::new(|_, _| Box::pin(async { true }))),
         );
         node.height = height;
         node.vote_namespace = namespace;
@@ -6361,6 +6692,8 @@ mod tests {
         loss: f64,
         /// Before GST nothing crosses between nodes on different sides.
         side: Vec<u8>,
+        /// A node that is down sends nothing, and what reaches it is lost.
+        down: Vec<bool>,
         gst: u64,
         tick: u64,
         rng: SimRng,
@@ -6417,6 +6750,7 @@ mod tests {
         let mut data_bytes = 0;
         let mut out = Vec::new();
         for i in 0..n {
+            if sim.down[i] { continue; }
             let rounds = gossip_rounds_of(&sim.nodes[i]);
             let ctx_str = sim.nodes[i].ctx_str(&sim.roster);
             for j in 0..n {
@@ -6456,6 +6790,7 @@ mod tests {
             for j in 0..n {
                 while let Some(link) = sim.links[i][j].as_mut() && link.in_flight.front().is_some_and(|&(at, _)| at <= sim.tick) {
                     let (_, packet) = link.in_flight.pop_front().unwrap();
+                    if sim.down[j] { continue; }
                     sim_deliver(&mut sim.nodes[j], &sim.roster, &mut sim.peers[j][i], sim.tick, &packet);
                 }
             }
@@ -6468,7 +6803,7 @@ mod tests {
         let n = nodes.len();
         Sim {
             roster: roster.to_vec(), nodes, peers: (0..n).map(|_| (0..n).map(|_| Peer::default()).collect()).collect(),
-            links, loss, side: vec![0; n], gst, tick: 0, rng, cov: SimCoverage::default(),
+            links, loss, side: vec![0; n], down: vec![false; n], gst, tick: 0, rng, cov: SimCoverage::default(),
         }
     }
 
@@ -6689,6 +7024,7 @@ mod tests {
             ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
             ClosureToAccessBft(Arc::new(|_, _| Box::pin(async {}))),
             ClosureToFetchDecidedRound(Arc::new(|_| None)),
+            ClosureToWriteWal(Arc::new(|_, _| Box::pin(async { true }))),
         );
         node.strict_quorum = strict_quorum;
         node
@@ -6812,6 +7148,314 @@ mod tests {
         if cases >= 8 {
             assert!(cov.strict > 0 && cov.strict < cases as usize && cov.silent > 0 && cov.partial > 0 && cov.losses > 0 && cov.cuts > 0 && cov.gated > 0 && cov.late_rounds > 0 && cov.undecided_at_gst > 0,
                 "a feature went unexercised: {cov:?}");
+        }
+    }
+
+    /// What a finalizer's host keeps across its restarts: the WAL records tenderlink stored, and,
+    /// for the test only, every decision any of its runs pushed. While `fail_every` is nonzero,
+    /// every `fail_every`th write fails, as on a full or failing disk.
+    #[derive(Default)]
+    struct SimStore {
+        wal: std::collections::BTreeMap<u64, Vec<u8>>,
+        decided: Vec<(u64, ValueId)>,
+        fail_every: u64,
+        writes: u64,
+        failed: u64,
+    }
+
+    /// `sim_live_engine`'s engine, storing its WAL records in `store` (or nowhere when `keep_wal`
+    /// is false) and logging its decisions there.
+    fn sim_restartable_engine(keys: &[SigningKey], roster: &[SortedRosterMember], i: usize, sizes: Vec<usize>, strict_quorum: bool,
+                              store: &Arc<Mutex<SimStore>>, keep_wal: bool) -> TMState {
+        let mut node = sim_live_engine(keys, roster, i, sizes, strict_quorum);
+        let decided_roster = roster.to_vec();
+        let decisions = Arc::clone(store);
+        node.push_block_closure = ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer, _| {
+            let height = u64::from_le_bytes(fat_pointer.vote_for_block_without_finalizer_public_key[32..40].try_into().unwrap());
+            decisions.lock().unwrap().decided.push((height, block.id_from_value(&HashKeys::default())));
+            let roster = decided_roster.clone();
+            Box::pin(async move { (roster, [0; 32], strict_quorum) })
+        }));
+        let records = Arc::clone(store);
+        node.write_wal_closure = ClosureToWriteWal(Arc::new(move |height, record| {
+            let mut store = records.lock().unwrap();
+            store.writes += 1;
+            let stored = store.fail_every == 0 || store.writes % store.fail_every != 0;
+            if !stored { store.failed += 1; } else if keep_wal { store.wal.insert(height, record); }
+            Box::pin(async move { stored })
+        }));
+        node
+    }
+
+    /// Every vote the finalizers have taken in so far, checked against every vote seen before:
+    /// an `honest` finalizer never signs two votes in one step of a round, whichever node saw them
+    /// and in whichever of its runs it signed them. Votes reach a node's round data only once
+    /// their signatures check, so this reads what was really signed. A NIL vote and a value vote
+    /// in one step count as two. Returns how many times a finalizer that is not `honest` did sign
+    /// two.
+    fn sim_check_votes(sim: &Sim, honest: &[bool], signed: &mut HashMap<(u64, u32, usize, usize), ValueId>, case_str: &str) -> usize {
+        let mut double_votes = 0;
+        for (observer, node) in sim.nodes.iter().enumerate() {
+            for rd in &node.rounds_data {
+                for signer in 0..rd.msg_val_sigs.len().min(honest.len()) {
+                    for step in 0..2 {
+                        let (value_id, sig) = rd.msg_val_sigs[signer][step];
+                        let nil = rd.msg_nil_sigs.get(signer).is_some_and(|sigs| sigs[step] != TMSig::NIL);
+                        let (other_id, other_sig) = rd.other_vote(signer, step);
+                        let mut votes = Vec::new();
+                        if sig != TMSig::NIL { votes.push(value_id); }
+                        if nil { votes.push(ValueId::NIL); }
+                        if other_sig != TMSig::NIL { votes.push(other_id); }
+                        if !honest[signer] {
+                            double_votes += (votes.len() > 1) as usize;
+                            continue;
+                        }
+                        let step_str = if step == 1 { "precommit" } else { "prevote" };
+                        for vote in votes {
+                            let first = *signed.entry((rd.height, rd.round, step, signer)).or_insert(vote);
+                            assert_eq!(first, vote, "{case_str}: at tick {} node {observer} holds node {signer}'s {step_str} for {vote} in round {}.{}, \
+                                after it signed one for {first}", sim.tick, rd.height, rd.round);
+                        }
+                    }
+                }
+            }
+        }
+        double_votes
+    }
+
+    /// Ends node `i`'s connections, as its crash would: what is queued or in flight either way is
+    /// lost, and each side forgets what it knew of the other.
+    fn sim_cut_sessions(sim: &mut Sim, i: usize) {
+        for j in 0..sim.nodes.len() {
+            for (a, b) in [(i, j), (j, i)] {
+                if let Some(link) = sim.links[a][b].as_mut() {
+                    link.outbox.clear();
+                    link.outbox_bytes = 0;
+                    link.in_flight.clear();
+                    link.credit = 0;
+                }
+                sim.peers[a][b] = Peer::default();
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RestartCoverage {
+        strict: usize,
+        crashes: usize,
+        all_crashes: usize,
+        quorum_crashes: usize,
+        lost_decisions: usize,
+        resumed_mid_height: usize,
+        resumed_locked: usize,
+        resumed_ahead: usize,
+        late_rounds: usize,
+        amnesiac_restarts: usize,
+        amnesiac_double_votes: usize,
+        failed_writes: u64,
+        votes_checked: usize,
+    }
+
+    /// One case of `restarted_finalizers_never_decide_two_values_at_a_height`. Before a random
+    /// tick, finalizers crash: one at a time, a quorum's worth at once, or all at once, and each
+    /// comes back after a random time with what its host kept. A host may also lose the decisions
+    /// it stored last, as when a crash comes before the row lands, so its node starts below
+    /// heights it voted at. Some hosts fail WAL writes until then. Up to as many finalizers as
+    /// the quorum tolerates are faulty: their hosts keep no WAL, so after a restart they forget
+    /// what they signed, may sign again against it, and never send their old votes again.
+    fn restart_case(seed: u64, case: u64, keep_wal: bool, cov: &mut RestartCoverage) {
+        let mut rng = SimRng::seed_from_u64(seed ^ case.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x3E57A7);
+        let n = rng.random_range(4..=7usize).min(ROSTER_MAX_N);
+        let (keys, roster) = sim_finalizers(n);
+        let strict_quorum = case % 2 == 1;
+        cov.strict += strict_quorum as usize;
+        let threshold = decision_threshold(n as u64, strict_quorum) as usize;
+        let members: Vec<usize> = (0..n).collect();
+
+        // Any two quorums share `2 * threshold - n` finalizers, and safety needs one of them
+        // honest, so at most one fewer may be faulty.
+        let most_faulty = (2 * threshold).saturating_sub(n + 1).min(TMState::f_from_n(n as u64) as usize);
+        let faulty_n = if keep_wal { rng.random_range(0..=most_faulty) } else { 0 };
+        let mut order: Vec<usize> = (0..n).collect();
+        order.shuffle(&mut rng);
+        let honest: Vec<bool> = (0..n).map(|i| keep_wal && !order[..faulty_n].contains(&i)).collect();
+
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut deadlines: Vec<HashMap<(u64, u32, u8), u64>> = vec![HashMap::new(); n];
+        let mut rosters = vec![roster.clone(); n];
+        let stores: Vec<Arc<Mutex<SimStore>>> = (0..n).map(|_| Arc::default()).collect();
+        for store in &stores {
+            if rng.random_bool(0.3) { store.lock().unwrap().fail_every = rng.random_range(2..=6); }
+        }
+        let new_engine = |rng: &mut SimRng, i: usize| {
+            let sizes = (0..4).map(|_| rng.random_range(1..=3 * PROPOSAL_CHUNK_DATA_SIZE)).collect();
+            sim_restartable_engine(&keys, &roster, i, sizes, strict_quorum, &stores[i], honest[i])
+        };
+        let nodes: Vec<TMState> = (0..n).map(|i| {
+            let mut node = new_engine(&mut rng, i);
+            rt.block_on(node.start(&roster, Vec::new(), Vec::new(), zebra_debug_time::instant_now()));
+            sim_timeouts(&mut node, &mut deadlines[i], 0);
+            node
+        }).collect();
+
+        // Crashes stop at `calm`; GST may come before or after.
+        let calm = rng.random_range(80..500u64);
+        let gst = rng.random_range(0..calm + 100);
+        let loss = if rng.random_bool(0.3) { rng.random_range(0.05..0.4) } else { 0.0 };
+        let crash_p = rng.random_range(0.01..0.06);
+        let lose_decisions = rng.random_bool(0.5);
+        let links = sim_links(&mut rng, n, &members, false, 20_000..=60_000, &mut SimCoverage::default());
+        let failing: Vec<u64> = stores.iter().map(|store| store.lock().unwrap().fail_every).collect();
+        let case_str = format!("case {case}: {n} finalizers, quorum {threshold}, faulty {:?}, failing every nth WAL write {failing:?}, calm from tick {calm}, \
+            GST at tick {gst}, loss {loss:.2}, crash chance {crash_p:.3}, losing decisions {lose_decisions}", &order[..faulty_n]);
+        let mut signed: HashMap<(u64, u32, usize, usize), ValueId> = HashMap::new();
+        let mut sim = sim_new(nodes, &roster, links, loss, gst, rng);
+        let mut up_at: Vec<Option<u64>> = vec![None; n];
+
+        let tick = |sim: &mut Sim, deadlines: &mut [HashMap<(u64, u32, u8), u64>], rosters: &mut [Vec<SortedRosterMember>]| {
+            let running: Vec<usize> = (0..n).filter(|&i| !sim.down[i]).collect();
+            sim_live_tick(sim, &rt, &running, rosters, deadlines);
+        };
+
+        while sim.tick < calm.max(gst) || up_at.iter().any(Option::is_some) {
+            for i in 0..n {
+                if up_at[i].is_some_and(|at| at <= sim.tick) {
+                    up_at[i] = None;
+                    let mut decided = sim.nodes[i].recent_commit_round_cache.clone();
+                    if lose_decisions && !decided.is_empty() {
+                        let lost = sim.rng.random_range(0..=decided.len().min(2));
+                        decided.truncate(decided.len() - lost);
+                        cov.lost_decisions += lost;
+                    }
+                    let wal: Vec<Wal> = stores[i].lock().unwrap().wal.values().map(|record| Wal::decode(record).expect("a record this engine wrote")).collect();
+                    let resume_height = startup_height(&decided);
+                    cov.resumed_mid_height += wal.iter().any(|w| w.height == resume_height && !w.msgs.is_empty()) as usize;
+                    cov.resumed_locked += wal.iter().any(|w| w.height == resume_height && w.locked.1 >= 0) as usize;
+                    cov.resumed_ahead += wal.iter().any(|w| w.height > resume_height) as usize;
+                    cov.amnesiac_restarts += (keep_wal && !honest[i]) as usize;
+                    let mut node = new_engine(&mut sim.rng, i);
+                    rt.block_on(node.start(&roster, decided, wal, zebra_debug_time::instant_now()));
+                    sim.nodes[i] = node;
+                    sim.down[i] = false;
+                    rosters[i] = roster.clone();
+                    deadlines[i].clear();
+                    sim_timeouts(&mut sim.nodes[i], &mut deadlines[i], sim.tick);
+                }
+            }
+            if sim.tick < calm && sim.rng.random_bool(crash_p) {
+                let up: Vec<usize> = (0..n).filter(|&i| !sim.down[i]).collect();
+                let kind = sim.rng.random_range(0..3);
+                let mut crashing = up.clone();
+                crashing.shuffle(&mut sim.rng);
+                match kind {
+                    0 => crashing.truncate(1),
+                    1 => { crashing.truncate(threshold); cov.quorum_crashes += 1; }
+                    _ => { cov.all_crashes += 1; }
+                }
+                let down_ticks = sim.rng.random_range(0..40u64);
+                for &i in &crashing {
+                    cov.crashes += 1;
+                    sim.down[i] = true;
+                    sim_cut_sessions(&mut sim, i);
+                    let jitter = if kind == 2 { 0 } else { sim.rng.random_range(0..20u64) };
+                    up_at[i] = Some(sim.tick + 1 + down_ticks + jitter);
+                }
+            }
+            if sim.tick >= calm {
+                for store in &stores { store.lock().unwrap().fail_every = 0; }
+            }
+            tick(&mut sim, &mut deadlines, &mut rosters);
+            cov.amnesiac_double_votes += sim_check_votes(&sim, &honest, &mut signed, &case_str);
+        }
+
+        let settled = sim.tick;
+        let target = sim.nodes.iter().map(|node| node.height).max().unwrap() + LIVE_HEIGHTS;
+        let deadline = settled + (target + 2) * LIVE_TICKS_PER_HEIGHT;
+        while !sim.nodes.iter().all(|node| node.height >= target) {
+            assert!(sim.tick <= deadline, "{case_str}: at tick {} the finalizers are at heights {:?}, rounds {:?}, short of {target}",
+                sim.tick, sim.nodes.iter().map(|node| node.height).collect::<Vec<_>>(), sim.nodes.iter().map(|node| node.round).collect::<Vec<_>>());
+            tick(&mut sim, &mut deadlines, &mut rosters);
+            cov.amnesiac_double_votes += sim_check_votes(&sim, &honest, &mut signed, &case_str);
+        }
+        cov.votes_checked += signed.len();
+        cov.failed_writes += stores.iter().map(|store| store.lock().unwrap().failed).sum::<u64>();
+
+        let mut decided_at: HashMap<u64, (usize, ValueId)> = HashMap::new();
+        for (i, store) in stores.iter().enumerate() {
+            for &(height, value_id) in &store.lock().unwrap().decided {
+                let first = *decided_at.entry(height).or_insert((i, value_id));
+                assert_eq!(first.1, value_id, "{case_str}: height {height} was decided as {} by node {} and as {value_id} by node {i}", first.1, first.0);
+            }
+        }
+        for h in 0..target as usize {
+            for node in &sim.nodes {
+                let rd = &node.recent_commit_round_cache[h];
+                assert_eq!(rd.height, h as u64, "{case_str}: a decision cache is out of order");
+                cov.late_rounds += (rd.round > 0) as usize;
+            }
+        }
+    }
+
+    /// Finalizers crash and restart, alone or all together, and some lose the decisions they
+    /// stored last or fail WAL writes. Their WAL keeps each to what it signed and locked on, so no
+    /// honest finalizer signs two votes in a step, no height is ever decided as two values, even
+    /// with faulty finalizers that forget what they signed, and once the crashes stop every
+    /// finalizer decides three more heights. `CROSSLINK_FUZZ_NO_WAL=1` runs them all without it,
+    /// to see the fuzzer catch that.
+    #[test]
+    fn restarted_finalizers_never_decide_two_values_at_a_height() {
+        let seed = gossip_fuzz_seed();
+        let cases = gossip_fuzz_cases();
+        let keep_wal = std::env::var("CROSSLINK_FUZZ_NO_WAL").is_err();
+        let mut cov = RestartCoverage::default();
+        for case in 0..cases { restart_case(seed, case, keep_wal, &mut cov); }
+        eprintln!("restart coverage: {cov:?}");
+        if cases >= 8 {
+            assert!(cov.strict > 0 && cov.strict < cases as usize && cov.crashes > 0 && cov.all_crashes > 0 && cov.quorum_crashes > 0 &&
+                    cov.lost_decisions > 0 && cov.resumed_mid_height > 0 && cov.resumed_locked > 0 && cov.late_rounds > 0 &&
+                    cov.failed_writes > 0 && (!keep_wal || (cov.amnesiac_restarts > 0 && cov.votes_checked > 0)),
+                "a feature went unexercised: {cov:?}");
+        }
+    }
+
+    /// Every record survives its encoding, and no truncation or flipped byte of one decodes as
+    /// anything but itself or nothing.
+    #[test]
+    fn wal_records_read_back_as_written_and_damaged_ones_do_not_read() {
+        let seed = gossip_fuzz_seed();
+        for case in 0..gossip_fuzz_cases() * 64 {
+            let mut rng = SimRng::seed_from_u64(seed ^ case.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x3A1);
+            let value = |rng: &mut SimRng| BlockValue((0..rng.random_range(0..=2 * PROPOSAL_CHUNK_DATA_SIZE)).map(|_| rng.random()).collect());
+            let maybe_value = |rng: &mut SimRng| if rng.random_bool(0.5) { (None, -1) } else { (Some(value(rng)), rng.random_range(0..=u32::MAX as i64)) };
+            let mut wal = Wal::new(rng.random());
+            for _ in 0..rng.random_range(0..8) {
+                let round = rng.random_range(0..=u32::MAX);
+                wal.msgs.push(if rng.random_bool(0.3) {
+                    WalMsg::Proposal { round, valid_round: rng.random_range(-1..round as i64), value: value(&mut rng) }
+                } else {
+                    WalMsg::Vote { round, is_precommit: rng.random(), value_id: ValueId(rng.random()) }
+                });
+            }
+            wal.locked = maybe_value(&mut rng);
+            wal.valid = maybe_value(&mut rng);
+            for _ in 0..rng.random_range(0..8) {
+                let mut sig = [0u8; 64];
+                rng.fill_bytes(&mut sig);
+                wal.valid_prevotes.push((rng.random(), TMSig(sig)));
+            }
+            let bytes = wal.encode();
+            assert_eq!(Wal::decode(&bytes).as_ref(), Some(&wal), "case {case}");
+            let cut = rng.random_range(0..bytes.len());
+            assert_eq!(Wal::decode(&bytes[..cut]), None, "case {case}: {cut} of {} bytes decoded", bytes.len());
+            let mut longer = bytes.clone();
+            longer.push(rng.random());
+            assert_eq!(Wal::decode(&longer), None, "case {case}: a byte past the end decoded");
+            let mut flipped = bytes.clone();
+            let at = rng.random_range(0..flipped.len());
+            flipped[at] ^= 1 << rng.random_range(0..8);
+            if let Some(decoded) = Wal::decode(&flipped) {
+                assert_eq!(decoded.encode(), flipped, "case {case}: byte {at} flipped decodes as a record that encodes otherwise");
+            }
         }
     }
 }

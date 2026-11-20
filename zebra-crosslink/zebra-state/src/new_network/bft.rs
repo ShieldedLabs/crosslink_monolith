@@ -1426,6 +1426,30 @@ fn fetch_decided_round(height: u64, active_roster_max_n: usize) -> Option<RoundD
     stored_round(db.as_ref()?, &voting, height, active_roster_max_n)
 }
 
+/// This node's tenderlink WAL records from BFT height `from` up, as tenderlink stored them.
+fn stored_tenderlink_wal(from: u64) -> Vec<Vec<u8>> {
+    let db = BFT_DB.read().unwrap();
+    let (Some(db), Ok(from)) = (db.as_ref(), u32::try_from(from)) else { return Vec::new() };
+    db.tenderlink_wal(from).into_iter().map(|(_, record)| record).collect()
+}
+
+/// Stores tenderlink's WAL record for `height`, synced to disk. `false` when it is not stored,
+/// which keeps tenderlink from sending what the record holds.
+fn write_tenderlink_wal(height: u64, record: Vec<u8>) -> bool {
+    let db = BFT_DB.read().unwrap();
+    let (Some(db), Ok(height)) = (db.as_ref(), u32::try_from(height)) else {
+        tracing::error!("there is no database to store tenderlink's WAL record for BFT height {height} in");
+        return false;
+    };
+    match db.write_tenderlink_wal(height, record) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::error!("could not store tenderlink's WAL record for BFT height {height}: {err}");
+            false
+        }
+    }
+}
+
 struct ParkedDecision {
     block: BftBlock,
     fat_pointer: FatPointerToBftBlock,
@@ -2852,6 +2876,7 @@ impl BftRunner {
         };
         let finalizer_peer_addresses: Vec<FinalizerPeerAddress> =
             seeds.into_iter().map(|address| FinalizerPeerAddress { bft_pk: PubKeyID::NIL, address }).collect();
+        let wal_records = stored_tenderlink_wal(height_after(&ingest));
         let task = self.rt.spawn(tenderlink::entry_point(
             launch.signing_key,
             shared_transport,
@@ -2923,7 +2948,12 @@ impl BftRunner {
                 let active_roster_max_n = self.params.active_roster_max_n;
                 move |height| fetch_decided_round(height, active_roster_max_n)
             })),
+            tenderlink::ClosureToWriteWal(Arc::new(move |height, record| {
+                let stored = write_tenderlink_wal(height, record);
+                Box::pin(async move { stored })
+            })),
             ingest,
+            wal_records,
             vote_namespace,
             strict_quorum,
         ));
