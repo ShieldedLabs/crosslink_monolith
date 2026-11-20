@@ -1485,62 +1485,44 @@ fn fetch_decided_round(height: u64, active_roster_max_n: usize) -> Option<RoundD
     stored_round(db.as_ref()?, &voting, height, active_roster_max_n)
 }
 
-/// The most decided heights one pull hands a tenderlink that is behind. Tenderlink pulls once per
-/// 250 ms tick, so this moves it about a thousand heights a second, each a short database read.
-const DECIDED_PULL_MAX: u64 = 256;
+/// The newest decided tip whose decision is stored: what tenderlink follows, read on its own task
+/// (`ClosureToReadDecidedTip`). A live decision publishes it after its row is written and never
+/// lowers it; `restore` replaces it with the chain it rebuilt, while tenderlink is not running.
+static DECIDED_TIP: LazyLock<tokio::sync::watch::Sender<Option<Arc<DecidedTip>>>> =
+    LazyLock::new(|| tokio::sync::watch::channel(None).0);
 
-/// The heights this node holds decided from `height` up, for a tenderlink behind them to take as
-/// decided (`tenderlink::ClosureToPullDecided`): at most `DECIDED_PULL_MAX`, each with the voting
-/// roster of the height after it. Stops at the first decision it cannot read back, which the next
-/// pull retries. Only `store_decision` stores decisions, after the checks of the path each came in by, so
-/// these are taken as tenderlink would take its own.
-///
-/// Runs on tenderlink's task, beside the sync thread that stores decisions, so it reads in the
-/// order the store writes: the rows first, then the rosters after them.
-fn pull_decided(height: u64, active_roster_max_n: usize) -> Vec<tenderlink::DecidedHeight> {
-    // The rosters that voted on the heights to pull, each stored with its block.
-    let votings: Vec<Arc<VotingRoster>> = {
-        let chain = BFT_CHAIN.read().unwrap();
-        // usize to u64 is lossless on every supported target.
-        let end = (chain.blocks.len() as u64).min(height.saturating_add(DECIDED_PULL_MAX));
-        (height..end).map_while(|h| usize::try_from(h).ok().and_then(|h| chain.voting_rosters.get(h)).map(Arc::clone)).collect()
-    };
-    if votings.is_empty() {
-        return Vec::new();
-    }
-    let rounds: Vec<RoundData> = {
-        let db = BFT_DB.read().unwrap();
-        let Some(db) = db.as_ref() else { return Vec::new() };
-        (height..).zip(&votings).map_while(|(h, voting)| stored_round(db, voting, h, active_roster_max_n)).collect()
-    };
-    // The roster after each height read back, read only now: a height's row is written after the
-    // tip that holds its successor's roster, so a row read above means that tip is in place.
-    let () = ASSUME_DECISION_ROW_AFTER_TIP;
-    let chain = BFT_CHAIN.read().unwrap();
-    let mut decided = Vec::with_capacity(rounds.len());
-    for (h, round) in (height..).zip(rounds) {
-        let next = match (usize::try_from(h + 1).ok().and_then(|n| chain.voting_rosters.get(n)), &chain.tip) {
-            (Some(voting), _) => Arc::clone(voting),
-            // The height after the newest decision: the roster the tip holds for it.
-            (None, Some(tip)) if tip.height == h => Arc::clone(&tip.next_voting),
-            _ => break,
-        };
-        decided.push(tenderlink::DecidedHeight {
-            round,
-            next_roster: next.roster.clone(),
-            next_vote_namespace: next.vote_namespace,
-            next_strict_quorum: next.strict_quorum,
-        });
-    }
-    decided
+/// The newest published decided tip.
+pub fn decided_tip() -> Option<Arc<DecidedTip>> {
+    DECIDED_TIP.borrow().clone()
 }
 
-/// Assumption, kept by `store_decision` and `finish_decision`: when a decision's row can be read from the
-/// database, `BFT_CHAIN` already holds that height and the tip it made, with the roster of the
-/// height after it. `apply_decision` sets both in one transition, and `finish_decision` writes the row
-/// after it. `pull_decided`, on another thread, relies on it: writing the row first means
-/// revisiting it.
-const ASSUME_DECISION_ROW_AFTER_TIP: () = ();
+/// Publishes `tip` once its decision's row is written, unless a higher tip is published already.
+fn publish_tip(tip: &Arc<DecidedTip>) {
+    let () = ASSUME_TIP_PUBLISHED_AFTER_ROW;
+    DECIDED_TIP.send_if_modified(|published| {
+        if published.as_ref().is_some_and(|published| published.height >= tip.height) {
+            return false;
+        }
+        *published = Some(Arc::clone(tip));
+        true
+    });
+}
+
+/// The decided tip as tenderlink takes it, if it has reached `engine_height`.
+fn host_tip(engine_height: u64) -> Option<tenderlink::HostTip> {
+    let published = DECIDED_TIP.borrow();
+    let tip = published.as_ref().filter(|tip| tip.height >= engine_height)?;
+    Some(tenderlink::HostTip {
+        height: tip.height,
+        next_roster: tip.next_roster.clone(),
+        next_vote_namespace: tip.next_voting.vote_namespace,
+        next_strict_quorum: tip.next_voting.strict_quorum,
+    })
+}
+
+/// Assumption, kept by `finish_decision` and `restore`: a published tip's decision is stored, so
+/// tenderlink can read the tip's round back (`fetch_decided_round`) once it takes the tip.
+const ASSUME_TIP_PUBLISHED_AFTER_ROW: () = ();
 
 /// Assumption: only the sync thread writes `BFT_CHAIN` and the chain state, so what `store_decision` reads
 /// from them before taking the chain lock (the snapshot, the stakes) still holds under it.
@@ -2748,17 +2730,14 @@ impl BftRunner {
         // that height is decided again on the next run. A crash after it, while the snapshot is
         // still only in the non-finalized state, leaves a row whose snapshot the next run may
         // not hold; `restore` resumes BFT below that row and decides it again.
-        let () = ASSUME_DECISION_ROW_AFTER_TIP;
-        if let Err(err) = block_writer.finalized_state.db.write_bft_decision(
-            block.height,
-            &block,
-            &fat_pointer,
-            &proposal_sigs,
-        ) {
-            tracing::error!(
+        match block_writer.finalized_state.db.write_bft_decision(block.height, &block, &fat_pointer, &proposal_sigs) {
+            Ok(()) => publish_tip(&tip),
+            // Not published: tenderlink could not read the round back. A later decision publishes
+            // a tip above it.
+            Err(err) => tracing::error!(
                 "could not store BFT decision at height {}: {err}; that height is decided again on the next start",
                 block.height,
-            );
+            ),
         }
 
         match reply {
@@ -2891,6 +2870,11 @@ impl BftRunner {
                 }
             }
             let tip = scratch.tip.clone();
+            // The chain rebuilt here is the one tenderlink starts from, so its tip is published
+            // whatever was before, lower included: a row that failed to write leaves a shorter
+            // chain. Every replayed row is stored.
+            let () = ASSUME_TIP_PUBLISHED_AFTER_ROW;
+            DECIDED_TIP.send_replace(tip.clone());
             let BftChain { blocks, hash_to_height, tip: scratch_tip, roster, voting_rosters, .. } = scratch;
             chain.blocks = blocks;
             chain.hash_to_height = hash_to_height;
@@ -3158,10 +3142,7 @@ impl BftRunner {
                 let stored = write_tenderlink_wal(height, record);
                 Box::pin(async move { stored })
             })),
-            tenderlink::ClosureToPullDecided(Arc::new({
-                let active_roster_max_n = self.params.active_roster_max_n;
-                move |height| pull_decided(height, active_roster_max_n)
-            })),
+            tenderlink::ClosureToReadDecidedTip(Arc::new(host_tip)),
             ingest,
             wal_records,
             vote_namespace,

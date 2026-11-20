@@ -4828,6 +4828,41 @@ fn crosslink_bft_engine_mid_round_takes_the_heights_the_node_stores_as_decided()
     test_bytes(tf.write_to_bytes());
 }
 
+/// A tenderlink far behind the decisions the node stores takes them all on its next tick and
+/// starts a round only at the height after the newest: 300 heights arrive from a peer while the
+/// engine is at height 1, and one tick later it is at 301. A pull of at most 256 heights a tick
+/// left it at 257, having started a round at the height it landed on.
+#[test]
+fn crosslink_bft_engine_jumps_to_the_decided_tip_in_one_tick() {
+    set_test_name(function_name!());
+    const DECIDED: u64 = 300;
+    const PEER: u64 = 7;
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let mut scene = bft_rounds_scene(&mut tf, &[false]);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_step(1, 0, None, 0);
+
+    // Height h finalizes block 20 + h - 1, so PoW must carry the last snapshot and its sigma headers.
+    let tip_needed = 20 + DECIDED as u32 - 1 + BFT_ROUNDS_PARAMETERS.bc_confirmation_depth_sigma as u32;
+    let (miner, gen) = (scene.miner.clone(), &mut scene.gen);
+    while gen.tip.coinbase_height().expect("generated blocks have a height").0 < tip_needed {
+        let block = gen.next_block(&miner);
+        tf.push_instr_load_pow(&block, 0);
+        scene.pow.push(block);
+    }
+    let decided = bft_rounds_decisions(&scene, 20, DECIDED);
+    use zebra_state::new_network::bft_sync;
+    for batch in decided.chunks(usize::from(bft_sync::MAX_DECISIONS_PER_MESSAGE)) {
+        let packet = bft_sync::bft_decisions_packet(batch.iter().map(|(height, block, fat_ptr, sigs)| (*height, block, fat_ptr, sigs.as_slice())));
+        tf.push_instr_recv_stp_packet(&packet, PEER, 0);
+    }
+    tf.push_instr_expect_pos_chain_length(DECIDED as usize + 1, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_step(DECIDED + 1, 0, None, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 /// A tenderlink that holds a quorum of precommits for one value at its height, when the node stores
 /// another as decided there, takes the stored one and moves on: finalizers precommitted both, which
 /// the node reports loudly, but stopping BFT for it would let anyone holding finalizer keys from
