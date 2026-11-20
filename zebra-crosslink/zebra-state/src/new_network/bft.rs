@@ -1426,6 +1426,96 @@ fn fetch_decided_round(height: u64, active_roster_max_n: usize) -> Option<RoundD
     stored_round(db.as_ref()?, &voting, height, active_roster_max_n)
 }
 
+/// The most decided heights one pull hands a tenderlink that is behind. Tenderlink pulls once per
+/// 250 ms tick, so this moves it about a thousand heights a second, each a short database read.
+const DECIDED_PULL_MAX: u64 = 256;
+
+/// The heights this node holds decided from `height` up, for a tenderlink behind them to take as
+/// decided (`tenderlink::ClosureToPullDecided`): at most `DECIDED_PULL_MAX`, each with the voting
+/// roster of the height after it. Stops at the first decision it cannot read back, which the next
+/// pull retries. Only `decide` stores decisions, after the checks of the path each came in by, so
+/// these are taken as tenderlink would take its own.
+fn pull_decided(height: u64, network: &Network, slashforks: &zebra_chain::parameters::SlashForkSchedule, active_roster_max_n: usize) -> Vec<tenderlink::DecidedHeight> {
+    let votings: Vec<Arc<VotingRoster>> = {
+        let chain = BFT_CHAIN.read().unwrap();
+        // usize to u64 is lossless on every supported target.
+        let decided_n = chain.blocks.len() as u64;
+        if height >= decided_n {
+            return Vec::new();
+        }
+        let end = decided_n.min(height.saturating_add(DECIDED_PULL_MAX));
+        // The rosters that voted on `height..end`, then the one the height after those votes with:
+        // stored for a decided height, and built for the next one as `next_voting_roster` builds it.
+        let mut votings = Vec::new();
+        for h in height..=end {
+            match usize::try_from(h).ok().and_then(|h| chain.voting_rosters.get(h)) {
+                Some(voting) => votings.push(Arc::clone(voting)),
+                None if h == decided_n => {
+                    let roster_snapshot_height = chain.bft_final_snapshot.map(|(height, _)| height);
+                    let next = roster_for_bft_height(network, slashforks.rules(), &chain.roster, decided_n, roster_snapshot_height).1;
+                    votings.push(Arc::new(next));
+                }
+                None => break,
+            }
+        }
+        votings
+    };
+    let db = BFT_DB.read().unwrap();
+    let Some(db) = db.as_ref() else { return Vec::new() };
+    let mut decided = Vec::new();
+    for (h, voting) in (height..).zip(votings.windows(2)) {
+        let Some(round) = stored_round(db, &voting[0], h, active_roster_max_n) else { break };
+        let next = &voting[1];
+        decided.push(tenderlink::DecidedHeight {
+            round,
+            next_roster: next.roster.clone(),
+            next_vote_namespace: next.vote_namespace,
+            next_strict_quorum: next.strict_quorum,
+        });
+    }
+    decided
+}
+
+/// The height and value of the last conflicting quorum reported, so each is reported once.
+static CONFLICTING_QUORUM_REPORTED: Mutex<Option<(u64, ValueId)>> = Mutex::new(None);
+
+/// Reports, loudly, a quorum of precommits tenderlink holds at its height for a value other than
+/// the decision this node already stored there: finalizers precommitted both. Tenderlink takes
+/// the stored decision and moves on, and BFT keeps running: stopping it here would let anyone
+/// holding finalizer keys from the past, which cost nothing once unbonded, stop BFT on every node
+/// catching up. Called just before tenderlink takes the decided heights, while it still holds its
+/// rounds at this height.
+fn note_conflicting_quorum(bft_state: &TMState) {
+    let height = bft_state.height;
+    let stored = {
+        let chain = BFT_CHAIN.read().unwrap();
+        // usize to u64 is lossless on every supported target.
+        if chain.blocks.len() as u64 <= height {
+            return;
+        }
+        let Some(block) = usize::try_from(height).ok().and_then(|h| decided_block(&chain, h)) else { return };
+        block.blake3_hash()
+    };
+    for round in bft_state.rounds_data.iter().filter(|round| round.height == height && round.proposal_is_certified(&round.roster)) {
+        if round.proposal_id.0 == stored.0 {
+            continue;
+        }
+        let mut reported = CONFLICTING_QUORUM_REPORTED.lock().unwrap();
+        if *reported == Some((height, round.proposal_id)) {
+            continue;
+        }
+        *reported = Some((height, round.proposal_id));
+        metrics::counter!("state.crosslink.bft_conflicting_quorums").increment(1);
+        tracing::error!(
+            "crosslink: CONFLICTING BFT QUORUM at height {height}. This node stored block {stored} as decided \
+             there, and tenderlink holds a quorum of precommits for block {} in round {}: at least a third of \
+             that height's stake signed both. This node keeps the stored decision and BFT keeps running. \
+             Report this with both block hashes.",
+            Blake3Hash(round.proposal_id.0), round.round,
+        );
+    }
+}
+
 /// This node's tenderlink WAL records from BFT height `from` up, as tenderlink stored them.
 fn stored_tenderlink_wal(from: u64) -> Vec<Vec<u8>> {
     let db = BFT_DB.read().unwrap();
@@ -2942,6 +3032,7 @@ impl BftRunner {
             tenderlink::ClosureToAccessBft(Arc::new(move |bft_state: &TMState, bft_key_address_map: &BftAddressMap| {
                 RECENCY_STATUS.send_replace(recency_status_from(bft_state, bft_key_address_map));
                 note_decided_missing_pow_blocks(bft_state);
+                note_conflicting_quorum(bft_state);
                 Box::pin(async {})
             })),
             tenderlink::ClosureToFetchDecidedRound(Arc::new({
@@ -2951,6 +3042,12 @@ impl BftRunner {
             tenderlink::ClosureToWriteWal(Arc::new(move |height, record| {
                 let stored = write_tenderlink_wal(height, record);
                 Box::pin(async move { stored })
+            })),
+            tenderlink::ClosureToPullDecided(Arc::new({
+                let network = self.network.clone();
+                let slashforks = Arc::clone(&self.slashforks);
+                let active_roster_max_n = self.params.active_roster_max_n;
+                move |height| pull_decided(height, &network, &slashforks, active_roster_max_n)
             })),
             ingest,
             wal_records,
