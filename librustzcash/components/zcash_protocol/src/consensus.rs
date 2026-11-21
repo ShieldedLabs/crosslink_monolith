@@ -505,6 +505,7 @@ impl Parameters for MainNetwork {
             NetworkUpgrade::FeaturenetUpgrade1 => None,
             NetworkUpgrade::FeaturenetUpgrade2 => None,
             NetworkUpgrade::FeaturenetUpgrade3 => None,
+            NetworkUpgrade::FeaturenetUpgrade4 => None,
         }
     }
 }
@@ -525,6 +526,12 @@ pub const TESTNET_FEATURENET_UPGRADE_2_HEIGHT: Option<u32> = Some(165_000);
 /// Regtest default and the wallet's [`TestNetwork`] all take it from here, so they cannot disagree
 /// on which branch ID a height uses.
 pub const TESTNET_FEATURENET_UPGRADE_3_HEIGHT: Option<u32> = Some(189_000);
+
+/// The Crosslink testnet activation height of [`NetworkUpgrade::FeaturenetUpgrade4`], or `None`
+/// while it is unscheduled. This is the one place to schedule it: the node's Testnet schedule, the
+/// Regtest default and the wallet's [`TestNetwork`] all take it from here, so they cannot disagree
+/// on which branch ID a height uses.
+pub const TESTNET_FEATURENET_UPGRADE_4_HEIGHT: Option<u32> = Some(213_000);
 
 /// Marker struct for the test network.
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
@@ -579,6 +586,9 @@ impl Parameters for TestNetwork {
             }
             NetworkUpgrade::FeaturenetUpgrade3 => {
                 TESTNET_FEATURENET_UPGRADE_3_HEIGHT.map(BlockHeight)
+            }
+            NetworkUpgrade::FeaturenetUpgrade4 => {
+                TESTNET_FEATURENET_UPGRADE_4_HEIGHT.map(BlockHeight)
             }
         }
     }
@@ -667,6 +677,8 @@ pub enum NetworkUpgrade {
     FeaturenetUpgrade2,
     /// The third Crosslink featurenet upgrade.
     FeaturenetUpgrade3,
+    /// The fourth Crosslink featurenet upgrade.
+    FeaturenetUpgrade4,
 }
 
 #[cfg(feature = "std")]
@@ -690,6 +702,7 @@ impl fmt::Display for NetworkUpgrade {
             NetworkUpgrade::FeaturenetUpgrade1 => write!(f, "FeaturenetUpgrade1"),
             NetworkUpgrade::FeaturenetUpgrade2 => write!(f, "FeaturenetUpgrade2"),
             NetworkUpgrade::FeaturenetUpgrade3 => write!(f, "FeaturenetUpgrade3"),
+            NetworkUpgrade::FeaturenetUpgrade4 => write!(f, "FeaturenetUpgrade4"),
         }
     }
 }
@@ -715,6 +728,7 @@ impl NetworkUpgrade {
             NetworkUpgrade::FeaturenetUpgrade1 => BranchId::FeaturenetUpgrade1,
             NetworkUpgrade::FeaturenetUpgrade2 => BranchId::FeaturenetUpgrade2,
             NetworkUpgrade::FeaturenetUpgrade3 => BranchId::FeaturenetUpgrade3,
+            NetworkUpgrade::FeaturenetUpgrade4 => BranchId::FeaturenetUpgrade4,
         }
     }
 }
@@ -737,6 +751,7 @@ const UPGRADES_IN_ORDER: &[NetworkUpgrade] = &[
     NetworkUpgrade::FeaturenetUpgrade1,
     NetworkUpgrade::FeaturenetUpgrade2,
     NetworkUpgrade::FeaturenetUpgrade3,
+    NetworkUpgrade::FeaturenetUpgrade4,
     #[cfg(zcash_unstable = "nu7")]
     NetworkUpgrade::Nu7,
 ];
@@ -807,6 +822,8 @@ pub enum BranchId {
     FeaturenetUpgrade2,
     /// The consensus rules deployed by [`NetworkUpgrade::FeaturenetUpgrade3`].
     FeaturenetUpgrade3,
+    /// The consensus rules deployed by [`NetworkUpgrade::FeaturenetUpgrade4`].
+    FeaturenetUpgrade4,
     /// The consensus rules to be deployed by [`NetworkUpgrade::Nu7`].
     #[cfg(zcash_unstable = "nu7")]
     Nu7,
@@ -834,6 +851,7 @@ impl TryFrom<u32> for BranchId {
             0x4654_5531 => Ok(BranchId::FeaturenetUpgrade1),
             0x4654_5532 => Ok(BranchId::FeaturenetUpgrade2),
             0x464e_5533 => Ok(BranchId::FeaturenetUpgrade3),
+            0x464e_5534 => Ok(BranchId::FeaturenetUpgrade4),
             #[cfg(zcash_unstable = "nu7")]
             0xffff_ffff => Ok(BranchId::Nu7),
             _ => Err("Unknown consensus branch ID"),
@@ -858,6 +876,7 @@ impl From<BranchId> for u32 {
             BranchId::FeaturenetUpgrade1 => 0x4654_5531,
             BranchId::FeaturenetUpgrade2 => 0x4654_5532,
             BranchId::FeaturenetUpgrade3 => 0x464e_5533,
+            BranchId::FeaturenetUpgrade4 => 0x464e_5534,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => 0xffff_ffff,
         }
@@ -900,6 +919,7 @@ impl BranchId {
             BranchId::FeaturenetUpgrade1 => NetworkUpgrade::FeaturenetUpgrade1,
             BranchId::FeaturenetUpgrade2 => NetworkUpgrade::FeaturenetUpgrade2,
             BranchId::FeaturenetUpgrade3 => NetworkUpgrade::FeaturenetUpgrade3,
+            BranchId::FeaturenetUpgrade4 => NetworkUpgrade::FeaturenetUpgrade4,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => NetworkUpgrade::Nu7,
         })
@@ -973,7 +993,8 @@ impl BranchId {
                 .map(|lower| {
                     let upper = params
                         .activation_height(NetworkUpgrade::FeaturenetUpgrade2)
-                        .or(params.activation_height(NetworkUpgrade::FeaturenetUpgrade3));
+                        .or(params.activation_height(NetworkUpgrade::FeaturenetUpgrade3))
+                        .or(params.activation_height(NetworkUpgrade::FeaturenetUpgrade4));
                     #[cfg(zcash_unstable = "nu7")]
                     let upper = upper.or(params.activation_height(NetworkUpgrade::Nu7));
                     (lower, upper)
@@ -981,13 +1002,23 @@ impl BranchId {
             BranchId::FeaturenetUpgrade2 => params
                 .activation_height(NetworkUpgrade::FeaturenetUpgrade2)
                 .map(|lower| {
-                    let upper = params.activation_height(NetworkUpgrade::FeaturenetUpgrade3);
+                    let upper = params
+                        .activation_height(NetworkUpgrade::FeaturenetUpgrade3)
+                        .or(params.activation_height(NetworkUpgrade::FeaturenetUpgrade4));
                     #[cfg(zcash_unstable = "nu7")]
                     let upper = upper.or(params.activation_height(NetworkUpgrade::Nu7));
                     (lower, upper)
                 }),
             BranchId::FeaturenetUpgrade3 => params
                 .activation_height(NetworkUpgrade::FeaturenetUpgrade3)
+                .map(|lower| {
+                    let upper = params.activation_height(NetworkUpgrade::FeaturenetUpgrade4);
+                    #[cfg(zcash_unstable = "nu7")]
+                    let upper = upper.or(params.activation_height(NetworkUpgrade::Nu7));
+                    (lower, upper)
+                }),
+            BranchId::FeaturenetUpgrade4 => params
+                .activation_height(NetworkUpgrade::FeaturenetUpgrade4)
                 .map(|lower| {
                     #[cfg(zcash_unstable = "nu7")]
                     let upper = params.activation_height(NetworkUpgrade::Nu7);
@@ -1015,7 +1046,8 @@ impl BranchId {
             BranchId::Nu6_3
             | BranchId::FeaturenetUpgrade1
             | BranchId::FeaturenetUpgrade2
-            | BranchId::FeaturenetUpgrade3 => true,
+            | BranchId::FeaturenetUpgrade3
+            | BranchId::FeaturenetUpgrade4 => true,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => false,
         }
@@ -1030,7 +1062,8 @@ impl BranchId {
             BranchId::Nu6_3
             | BranchId::FeaturenetUpgrade1
             | BranchId::FeaturenetUpgrade2
-            | BranchId::FeaturenetUpgrade3 => true,
+            | BranchId::FeaturenetUpgrade3
+            | BranchId::FeaturenetUpgrade4 => true,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => true,
         }
@@ -1045,7 +1078,8 @@ impl BranchId {
             BranchId::Nu6_3
             | BranchId::FeaturenetUpgrade1
             | BranchId::FeaturenetUpgrade2
-            | BranchId::FeaturenetUpgrade3 => true,
+            | BranchId::FeaturenetUpgrade3
+            | BranchId::FeaturenetUpgrade4 => true,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => true,
         }
@@ -1060,9 +1094,8 @@ impl BranchId {
             Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy => None,
             Nu5 | Nu6 | Nu6_1 => Some(OrchardProtocolRevision::InsecureV1),
             Nu6_2 => Some(OrchardProtocolRevision::V2),
-            Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3 => {
-                Some(OrchardProtocolRevision::V3)
-            }
+            Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3
+            | FeaturenetUpgrade4 => Some(OrchardProtocolRevision::V3),
             #[cfg(zcash_unstable = "nu7")]
             Nu7 => Some(OrchardProtocolRevision::V3),
         }
@@ -1115,6 +1148,7 @@ pub mod testing {
             BranchId::FeaturenetUpgrade1,
             BranchId::FeaturenetUpgrade2,
             BranchId::FeaturenetUpgrade3,
+            BranchId::FeaturenetUpgrade4,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7,
         ])
