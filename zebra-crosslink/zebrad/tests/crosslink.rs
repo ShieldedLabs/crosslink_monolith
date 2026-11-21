@@ -4247,7 +4247,7 @@ fn crosslink_reject_action_on_a_bond_after_it_unbonds_or_withdraws_in_the_block(
     test_bytes(tf.write_to_bytes());
 }
 
-/// From FeaturenetUpgrade3 a bond withdraws only once the chain the block extends has finalized
+/// From FeaturenetUpgrade4 a bond withdraws only once the chain the block extends has finalized
 /// the height the selected withdrawal finality rule requires (#287). A withdrawal waits while
 /// finality is stalled, so the stake stays slashable.
 ///
@@ -4258,21 +4258,32 @@ fn crosslink_reject_action_on_a_bond_after_it_unbonds_or_withdraws_in_the_block(
 /// scene holds for each of `zcash_primitives::bft::WithdrawalFinality`'s rules. With the rule off
 /// (`WITHDRAWAL_FINALITY` is `None`) both refusals are accepted and this fails.
 #[test]
-fn crosslink_withdrawal_waits_for_finality_from_featurenet_upgrade_3() {
+fn crosslink_withdrawal_waits_for_finality_from_featurenet_upgrade_4() {
     set_test_name(function_name!());
-    test_bytes(withdrawal_finality_scene(false));
+    test_bytes(withdrawal_finality_scene(false, true));
 }
 
-/// As `crosslink_withdrawal_waits_for_finality_from_featurenet_upgrade_3`, with the BFT block
+/// As `crosslink_withdrawal_waits_for_finality_from_featurenet_upgrade_4`, with the BFT block
 /// that finalizes far enough cited before the first withdrawal, which then goes through: the
 /// refusals there come from finality alone.
 #[test]
-fn crosslink_withdrawal_waits_for_finality_from_featurenet_upgrade_3_control() {
+fn crosslink_withdrawal_waits_for_finality_from_featurenet_upgrade_4_control() {
     set_test_name(function_name!());
-    test_bytes(withdrawal_finality_scene(true));
+    test_bytes(withdrawal_finality_scene(true, true));
 }
 
-fn withdrawal_finality_scene(finalized_before_withdrawal: bool) -> Vec<u8> {
+/// As `crosslink_withdrawal_waits_for_finality_from_featurenet_upgrade_4`, on a chain where
+/// FeaturenetUpgrade3 is active and FeaturenetUpgrade4 is not: the first withdrawal goes through
+/// while finality is stalled, as it does on nodes that predate the rule.
+#[test]
+fn crosslink_withdrawal_needs_no_finality_before_featurenet_upgrade_4() {
+    set_test_name(function_name!());
+    test_bytes(withdrawal_finality_scene(false, false));
+}
+
+/// `upgrade_4` schedules FeaturenetUpgrade4 the block after FeaturenetUpgrade3; otherwise it
+/// stays above every height the scene reaches.
+fn withdrawal_finality_scene(finalized_before_withdrawal: bool, upgrade_4: bool) -> Vec<u8> {
     use std::collections::BTreeMap;
     use zcash_primitives::transaction::StakingAction;
     use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
@@ -4297,6 +4308,7 @@ fn withdrawal_finality_scene(finalized_before_withdrawal: bool) -> Vec<u8> {
     let upgrade_3 = 1 + BONDED_SHIFT as u32 + 1;
     let node_config = node_config_with_activation_heights(ConfiguredActivationHeights {
         featurenet_upgrade_3: Some(upgrade_3),
+        featurenet_upgrade_4: upgrade_4.then_some(upgrade_3 + 1),
         ..Default::default()
     });
     let mut tf = TF::new_with_node_config(&params, &node_config);
@@ -4430,6 +4442,14 @@ fn withdrawal_finality_scene(finalized_before_withdrawal: bool) -> Vec<u8> {
     let block = gen.next_block(&miner);
     load(&mut tf, &mut blocks, block);
     assert_eq!(height(&gen), first_try - 1);
+
+    if !upgrade_4 {
+        assert!(NetworkUpgrade::FeaturenetUpgrade4.activation_height(&network).is_none_or(|activation| activation.0 > first_try));
+        let block = gen.next_block_with_txs(&miner, &[withdraw.clone()]);
+        load(&mut tf, &mut blocks, block);
+        tf.push_instr_expect_pow_chain_length(first_try as usize + 1, 0);
+        return tf.write_to_bytes();
+    }
 
     // Stalled: no block on the chain has cited a BFT block.
     tf.push_instr_load_pow(&gen.clone().next_block_with_txs(&miner, &[withdraw.clone()]), SHOULD_FAIL);

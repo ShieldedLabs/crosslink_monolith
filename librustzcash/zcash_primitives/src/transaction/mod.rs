@@ -1575,7 +1575,7 @@ pub const STAKING_ACTION_DELAY: u32 = STAKING_DAY_WINDOW + 1;
 // prevents bond withdrawal until next finalization, and if the stated reason to slash
 // is that a BFT stall has occurred, then a much longer window is possible & warranted,
 // but it would require chasing BFT fat pointers. For now, this is the simple answer.
-// From FeaturenetUpgrade3, once a rule is selected, withdrawal also waits for finality (see
+// From FeaturenetUpgrade4, once a rule is selected, withdrawal also waits for finality (see
 // `bft::WITHDRAWAL_FINALITY`); every rule there only makes it later, so the
 // argument below still holds, and the window has not been lengthened to use it.
 //

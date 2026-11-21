@@ -523,12 +523,17 @@ where
 
             tracing::trace!(?tx_id, "passed quick checks");
 
-            // FeaturenetUpgrade3 brings both bond versions and, once one is selected, the
+            // FeaturenetUpgrade3 brings both bond versions, and FeaturenetUpgrade4 the selected
             // withdrawal finality rule.
             let spends_versions = NetworkUpgrade::FeaturenetUpgrade3
                 .activation_height(&network)
                 .is_some_and(|activation_height| height >= activation_height);
-            Self::check_mempool_staking_action_bond_state(&tx, height, staking, spends_versions, state.clone()).await?;
+            let withdrawal_finality = zcash_primitives::bft::WITHDRAWAL_FINALITY.filter(|_| {
+                NetworkUpgrade::FeaturenetUpgrade4
+                    .activation_height(&network)
+                    .is_some_and(|activation_height| height >= activation_height)
+            });
+            Self::check_mempool_staking_action_bond_state(&tx, height, staking, spends_versions, withdrawal_finality, state.clone()).await?;
 
             // Mempool transactions are checked against the next median-time-past from state.
             Self::verify_mempool_lock_time(tx.as_ref(), height, state.clone()).await?;
@@ -652,6 +657,7 @@ where
         height: block::Height,
         staking: StakingParameters,
         spends_versions: bool,
+        withdrawal_finality: Option<zcash_primitives::bft::WithdrawalFinality>,
         state: Timeout<ZS>,
     ) -> Result<(), TransactionError> {
         use zcash_primitives::transaction::StakingActionKind;
@@ -699,7 +705,7 @@ where
             bond_info,
             height,
             staking,
-            zcash_primitives::bft::WITHDRAWAL_FINALITY.filter(|_| spends_versions),
+            withdrawal_finality,
         )
     }
 
@@ -860,7 +866,7 @@ where
 /// mempool admits an action that spoils every block template carrying it: the mined block is
 /// rejected, and the action stays pending, so the next template carries it again.
 /// `finalizer_bank` is the target finalizer's reward bank at the tip, read only for a conversion.
-/// `withdrawal_finality`, given from FeaturenetUpgrade3 once a rule is selected, also holds a
+/// `withdrawal_finality`, given from FeaturenetUpgrade4 once a rule is selected, also holds a
 /// withdrawal until the chain `bond_info` was read from has finalized the height that rule
 /// requires.
 fn check_staking_action_bond_state(

@@ -4987,7 +4987,7 @@ mod staking_signature {
         assert!(check(WithdrawDelegationBond, 500, bond(0), ready).is_err());
         assert!(check(WithdrawDelegationBond, 500, bond(2), ready).is_err());
 
-        // Under a withdrawal finality rule (from FeaturenetUpgrade3, once one is selected), a
+        // Under a withdrawal finality rule (from FeaturenetUpgrade4, once one is selected), a
         // withdrawal also needs the chain to have finalized the height the rule requires, and is
         // held while it finalizes nothing. Each rule is checked, as none is selected yet.
         use zcash_primitives::bft::WithdrawalFinality::*;

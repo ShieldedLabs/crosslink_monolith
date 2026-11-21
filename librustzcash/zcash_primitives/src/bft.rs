@@ -540,7 +540,7 @@ pub enum WithdrawalFinality {
     NextStakingPeriod,
 }
 
-/// The withdrawal finality rule FeaturenetUpgrade3 applies: keep exactly one of these lines.
+/// The withdrawal finality rule FeaturenetUpgrade4 applies: keep exactly one of these lines.
 /// `None` leaves the rule off, so withdrawals follow the older rules even after the upgrade.
 /// B is the provisional choice (#287).
 // pub const WITHDRAWAL_FINALITY: Option<WithdrawalFinality> = None;

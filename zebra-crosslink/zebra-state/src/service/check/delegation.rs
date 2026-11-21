@@ -254,12 +254,16 @@ impl InBlockBonds {
                 self.unbonded_or_withdrawn.insert(bond_key);
             }
             StakingActionKind::WithdrawDelegationBond => {
-                // From FeaturenetUpgrade3, once a rule is selected, a withdrawal also waits for the
+                // From FeaturenetUpgrade4, once a rule is selected, a withdrawal also waits for the
                 // chain the block extends to finalize past its unbonding, so it cannot happen while
                 // finality is stalled. The extended chain, not the block, so the mempool's check at
                 // the tip is exactly the next block's.
                 let finality = zcash_primitives::bft::WITHDRAWAL_FINALITY
-                    .filter(|_| spends_versions)
+                    .filter(|_| {
+                        NetworkUpgrade::FeaturenetUpgrade4
+                            .activation_height(&non_finalized_chain.network())
+                            .is_some_and(|activation_height| height >= activation_height)
+                    })
                     .map(|rule| ChainFinality {
                         rule,
                         finalized_height: *self
