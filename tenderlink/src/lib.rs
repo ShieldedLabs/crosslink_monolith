@@ -276,7 +276,8 @@ pub struct Wal {
     pub valid_prevotes: Vec<(u16, TMSig)>,
 }
 
-const WAL_VERSION: u8 = 1;
+const WAL_VERSION: u8 = 2;
+const WAL_CHECKSUM_SIZE: usize = 16;
 const WAL_MSG_PREVOTE:   u8 = 0;
 const WAL_MSG_PRECOMMIT: u8 = 1;
 const WAL_MSG_PROPOSAL:  u8 = 2;
@@ -324,7 +325,16 @@ impl Wal {
             out.extend_from_slice(&roster_i.to_le_bytes());
             out.extend_from_slice(&sig.0);
         }
+        let checksum = Self::checksum(&out);
+        out.extend_from_slice(&checksum);
         out
+    }
+
+    // A flipped bit in a stored vote's value id would otherwise read back as a vote for another
+    // value, which the node then sends again: a second vote in that step.
+    fn checksum(body: &[u8]) -> [u8; WAL_CHECKSUM_SIZE] {
+        let hash = blake3::Hasher::new_derive_key("Tenderlink WAL Record Checksum").update(body).finalize();
+        hash.as_bytes()[..WAL_CHECKSUM_SIZE].try_into().unwrap()
     }
 
     /// `None` for anything `encode` cannot have written.
@@ -350,7 +360,9 @@ impl Wal {
             }
         }
 
-        let buf = &mut &bytes[..];
+        let (body, checksum) = bytes.split_at_checked(bytes.len().checked_sub(WAL_CHECKSUM_SIZE)?)?;
+        if checksum != Self::checksum(body) { return None; }
+        let buf = &mut &body[..];
         if take_n::<1>(buf)?[0] != WAL_VERSION { return None; }
         let height = u64::from_le_bytes(take_n(buf)?);
         let msgs_n = u32::from_le_bytes(take_n(buf)?) as usize;
@@ -926,6 +938,8 @@ pub struct TMState {
     /// The stored records of heights above the current one, taken in as the node reaches them.
     /// Only a start whose decided chain ended below heights it had voted at has any.
     wal_ahead: Vec<Wal>,
+    /// The heights, from the current one up, whose stored record cannot be read.
+    wal_unreadable: Vec<u64>,
 
     pub rounds_data: Vec<RoundData>,
 
@@ -979,6 +993,7 @@ impl TMState {
             locked_value_round: (None, -1),
             own_msgs: Vec::new(),
             wal_ahead: Vec::new(),
+            wal_unreadable: Vec::new(),
 
             rounds_data: Vec::new(),
             recent_commit_round_cache: Vec::new(),
@@ -1039,6 +1054,7 @@ impl TMState {
     }
 
     async fn write_wal(&mut self, roster: &[SortedRosterMember]) -> bool {
+        if self.wal_unreadable.contains(&self.height) { return false; }
         let stored = (self.write_wal_closure.0)(self.height, self.wal_record().encode()).await;
         if !stored {
             eprintln!("{} {ANSI_RED}BFT ERROR{ANSI_RST}: could not store this node's WAL record; signing nothing until it can", self.ctx_str(roster));
@@ -1116,6 +1132,7 @@ impl TMState {
     /// The round to start the current height at: where a stored record of it left off, or 0.
     fn take_wal_for_height(&mut self, roster: &[SortedRosterMember]) -> u32 {
         self.wal_ahead.retain(|wal| wal.height >= self.height);
+        self.wal_unreadable.retain(|&height| height >= self.height);
         match self.wal_ahead.iter().position(|wal| wal.height == self.height) {
             Some(i) => { let wal = self.wal_ahead.remove(i); self.apply_wal(roster, wal) }
             None => 0,
@@ -1123,11 +1140,23 @@ impl TMState {
     }
 
     /// Puts a new engine where its node left off: after the decided rounds it is given, in the
-    /// state the WAL records it is given leave each later height in.
-    pub async fn start(&mut self, roster: &[SortedRosterMember], decided_rounds: Vec<RoundData>, wal: Vec<Wal>, now: Instant) {
+    /// state the WAL records it is given, each with the height it was stored at, leave each later
+    /// height in. At a height whose record cannot be read, as one written by a newer build, the
+    /// node cannot know what it signed, so it signs nothing there and only follows the others.
+    pub async fn start(&mut self, roster: &[SortedRosterMember], decided_rounds: Vec<RoundData>, wal_records: &[(u64, Vec<u8>)], now: Instant) {
         self.height = startup_height(&decided_rounds);
         self.ingest_decided_rounds(decided_rounds);
-        self.wal_ahead = wal;
+        for (height, record) in wal_records {
+            if *height < self.height { continue; }
+            match Wal::decode(record) {
+                Some(wal) if wal.height == *height => self.wal_ahead.push(wal),
+                _ => {
+                    eprintln!("{} {ANSI_RED}BFT ERROR{ANSI_RST}: the stored WAL record of {} bytes for height {height} cannot be read; this node signs nothing at that height",
+                        self.ctx_str(roster), record.len());
+                    self.wal_unreadable.push(*height);
+                }
+            }
+        }
         let round = self.take_wal_for_height(roster);
         self.start_round(roster, now, round).await;
     }
@@ -3442,9 +3471,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          write_wal_closure: ClosureToWriteWal,
                          read_tip_closure: ClosureToReadDecidedTip,
                          ingest_startup_data: Vec<RoundData>,
-                         // The WAL records `write_wal_closure` stored, of the startup height and
-                         // any above it; older ones are ignored.
-                         wal_records: Vec<Vec<u8>>,
+                         // The WAL records `write_wal_closure` stored, each with the height it was
+                         // stored at, of the startup height and any above it; older ones are ignored.
+                         wal_records: Vec<(u64, Vec<u8>)>,
                          // Vote-namespacing domain separator for the startup height
                          // (one after the last ingested round, or 0 when none); `[0; 32]` when no slashforks are in effect.
                          initial_vote_namespace: [u8; 32],
@@ -3452,16 +3481,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          initial_strict_quorum: bool,
                         ) -> std::io::Result<()> {
     hook_fail_on_panic();
-
-    let mut wal = Vec::with_capacity(wal_records.len());
-    for record in &wal_records {
-        match Wal::decode(record) {
-            Some(record) => wal.push(record),
-            // Nothing this build writes. Starting without it risks what the WAL is for, but so
-            // does any other way on: the node cannot know what it signed.
-            None => eprintln!("{ANSI_RED}BFT ERROR{ANSI_RST}: a stored WAL record of {} bytes cannot be read; this node may sign against what it signed before", record.len()),
-        }
-    }
 
     let mut roster = roster.clone();
 
@@ -3537,7 +3556,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     bft_state.vote_namespace = initial_vote_namespace;
     bft_state.strict_quorum = initial_strict_quorum;
-    bft_state.start(&roster, ingest_startup_data, wal, zebra_debug_time::instant_now()).await;
+    bft_state.start(&roster, ingest_startup_data, &wal_records, zebra_debug_time::instant_now()).await;
 
     const ONE_SECOND: tokio::time::Duration = tokio::time::Duration::from_secs(1);
     let mut net_stats_window_start = tokio::time::Instant::now();
@@ -7354,6 +7373,7 @@ mod tests {
         late_rounds: usize,
         amnesiac_restarts: usize,
         amnesiac_double_votes: usize,
+        unreadable_records: usize,
         failed_writes: u64,
         votes_checked: usize,
     }
@@ -7364,7 +7384,10 @@ mod tests {
     /// it stored last, as when a crash comes before the row lands, so its node starts below
     /// heights it voted at. Some hosts fail WAL writes until then. Up to as many finalizers as
     /// the quorum tolerates are faulty: their hosts keep no WAL, so after a restart they forget
-    /// what they signed, may sign again against it, and never send their old votes again.
+    /// what they signed, may sign again against it, and never send their old votes again. Up to
+    /// as many honest finalizers as a quorum can do without may find a stored record unreadable on
+    /// a restart, damaged or from a newer build, and must sit that height out. Without the WAL, no
+    /// finalizer is faulty and every one is held to never signing twice, which should fail.
     fn restart_case(seed: u64, case: u64, keep_wal: bool, cov: &mut RestartCoverage) {
         let mut rng = SimRng::seed_from_u64(seed ^ case.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x3E57A7);
         let n = rng.random_range(4..=7usize).min(ROSTER_MAX_N);
@@ -7380,7 +7403,9 @@ mod tests {
         let faulty_n = if keep_wal { rng.random_range(0..=most_faulty) } else { 0 };
         let mut order: Vec<usize> = (0..n).collect();
         order.shuffle(&mut rng);
-        let honest: Vec<bool> = (0..n).map(|i| keep_wal && !order[..faulty_n].contains(&i)).collect();
+        let honest: Vec<bool> = (0..n).map(|i| !order[..faulty_n].contains(&i)).collect();
+        let rotten_n = if keep_wal { rng.random_range(0..=n - threshold) } else { 0 };
+        let rotten: Vec<bool> = (0..n).map(|i| order[faulty_n..faulty_n + rotten_n].contains(&i)).collect();
 
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let mut deadlines: Vec<HashMap<(u64, u32, u8), u64>> = vec![HashMap::new(); n];
@@ -7391,11 +7416,11 @@ mod tests {
         }
         let new_engine = |rng: &mut SimRng, i: usize| {
             let sizes = (0..4).map(|_| rng.random_range(1..=3 * PROPOSAL_CHUNK_DATA_SIZE)).collect();
-            sim_restartable_engine(&keys, &roster, i, sizes, strict_quorum, &stores[i], honest[i])
+            sim_restartable_engine(&keys, &roster, i, sizes, strict_quorum, &stores[i], keep_wal && honest[i])
         };
         let nodes: Vec<TMState> = (0..n).map(|i| {
             let mut node = new_engine(&mut rng, i);
-            rt.block_on(node.start(&roster, Vec::new(), Vec::new(), zebra_debug_time::instant_now()));
+            rt.block_on(node.start(&roster, Vec::new(), &[], zebra_debug_time::instant_now()));
             sim_timeouts(&mut node, &mut deadlines[i], 0);
             node
         }).collect();
@@ -7408,8 +7433,9 @@ mod tests {
         let lose_decisions = rng.random_bool(0.5);
         let links = sim_links(&mut rng, n, &members, false, 20_000..=60_000, &mut SimCoverage::default());
         let failing: Vec<u64> = stores.iter().map(|store| store.lock().unwrap().fail_every).collect();
-        let case_str = format!("case {case}: {n} finalizers, quorum {threshold}, faulty {:?}, failing every nth WAL write {failing:?}, calm from tick {calm}, \
-            GST at tick {gst}, loss {loss:.2}, crash chance {crash_p:.3}, losing decisions {lose_decisions}", &order[..faulty_n]);
+        let case_str = format!("case {case}: {n} finalizers, quorum {threshold}, faulty {:?}, unreadable records {:?}, failing every nth WAL write {failing:?}, \
+            calm from tick {calm}, GST at tick {gst}, loss {loss:.2}, crash chance {crash_p:.3}, losing decisions {lose_decisions}",
+            &order[..faulty_n], &order[faulty_n..faulty_n + rotten_n]);
         let mut signed: HashMap<(u64, u32, usize, usize), ValueId> = HashMap::new();
         let mut sim = sim_new(nodes, &roster, links, loss, gst, rng);
         let mut up_at: Vec<Option<u64>> = vec![None; n];
@@ -7429,14 +7455,33 @@ mod tests {
                         decided.truncate(decided.len() - lost);
                         cov.lost_decisions += lost;
                     }
-                    let wal: Vec<Wal> = stores[i].lock().unwrap().wal.values().map(|record| Wal::decode(record).expect("a record this engine wrote")).collect();
                     let resume_height = startup_height(&decided);
+                    let records: Vec<(u64, Vec<u8>)> = {
+                        let mut store = stores[i].lock().unwrap();
+                        if rotten[i] && sim.rng.random_bool(0.5) &&
+                           let Some(record) = store.wal.range_mut(resume_height..).map(|(_, record)| record).find(|record| Wal::decode(record).is_some())
+                        {
+                            if sim.rng.random_bool(0.5) {
+                                record.truncate(sim.rng.random_range(0..record.len()));
+                            } else {
+                                // A record a newer build wrote, intact but of a later version.
+                                record.truncate(record.len() - WAL_CHECKSUM_SIZE);
+                                record[0] = WAL_VERSION + 1;
+                                let checksum = Wal::checksum(record);
+                                record.extend_from_slice(&checksum);
+                            }
+                            cov.unreadable_records += 1;
+                        }
+                        store.wal.iter().map(|(&height, record)| (height, record.clone())).collect()
+                    };
+                    let wal: Vec<Wal> = records.iter().filter_map(|(_, record)| Wal::decode(record)).collect();
+                    assert!(rotten[i] || wal.len() == records.len(), "{case_str}: node {i} cannot read a record it wrote");
                     cov.resumed_mid_height += wal.iter().any(|w| w.height == resume_height && !w.msgs.is_empty()) as usize;
                     cov.resumed_locked += wal.iter().any(|w| w.height == resume_height && w.locked.1 >= 0) as usize;
                     cov.resumed_ahead += wal.iter().any(|w| w.height > resume_height) as usize;
                     cov.amnesiac_restarts += (keep_wal && !honest[i]) as usize;
                     let mut node = new_engine(&mut sim.rng, i);
-                    rt.block_on(node.start(&roster, decided, wal, zebra_debug_time::instant_now()));
+                    rt.block_on(node.start(&roster, decided, &records, zebra_debug_time::instant_now()));
                     sim.nodes[i] = node;
                     sim.down[i] = false;
                     rosters[i] = roster.clone();
@@ -7451,8 +7496,8 @@ mod tests {
                 crashing.shuffle(&mut sim.rng);
                 match kind {
                     0 => crashing.truncate(1),
-                    1 => { crashing.truncate(threshold); cov.quorum_crashes += 1; }
-                    _ => { cov.all_crashes += 1; }
+                    1 => { crashing.truncate(threshold); cov.quorum_crashes += (crashing.len() == threshold) as usize; }
+                    _ => { cov.all_crashes += (crashing.len() == n) as usize; }
                 }
                 let down_ticks = sim.rng.random_range(0..40u64);
                 for &i in &crashing {
@@ -7503,25 +7548,33 @@ mod tests {
     /// honest finalizer signs two votes in a step, no height is ever decided as two values, even
     /// with faulty finalizers that forget what they signed, and once the crashes stop every
     /// finalizer decides three more heights. `CROSSLINK_FUZZ_NO_WAL=1` runs them all without it,
-    /// to see the fuzzer catch that.
+    /// to see the fuzzer catch a finalizer signing two votes in a step.
     #[test]
     fn restarted_finalizers_never_decide_two_values_at_a_height() {
         let seed = gossip_fuzz_seed();
         let cases = gossip_fuzz_cases();
         let keep_wal = std::env::var("CROSSLINK_FUZZ_NO_WAL").is_err();
         let mut cov = RestartCoverage::default();
-        for case in 0..cases { restart_case(seed, case, keep_wal, &mut cov); }
+        for case in 0..cases {
+            let started = std::time::Instant::now();
+            restart_case(seed, case, keep_wal, &mut cov);
+            eprintln!("restart case {case} took {:.1}s", started.elapsed().as_secs_f64());
+        }
         eprintln!("restart coverage: {cov:?}");
         if cases >= 8 {
+            // Without the WAL nothing is stored to resume from, so only the rest is checked. A
+            // faulty finalizer signs twice only if it restarts mid-step and then sees another
+            // value, which a few cases may never bring about.
+            let wal_features = !keep_wal || (cov.resumed_mid_height > 0 && cov.resumed_locked > 0 && cov.resumed_ahead > 0 &&
+                                             cov.amnesiac_restarts > 0 && (cases < 32 || cov.amnesiac_double_votes > 0) && cov.unreadable_records > 0);
             assert!(cov.strict > 0 && cov.strict < cases as usize && cov.crashes > 0 && cov.all_crashes > 0 && cov.quorum_crashes > 0 &&
-                    cov.lost_decisions > 0 && cov.resumed_mid_height > 0 && cov.resumed_locked > 0 && cov.late_rounds > 0 &&
-                    cov.failed_writes > 0 && (!keep_wal || (cov.amnesiac_restarts > 0 && cov.votes_checked > 0)),
+                    cov.lost_decisions > 0 && cov.late_rounds > 0 && cov.failed_writes > 0 && cov.votes_checked > 0 && wal_features,
                 "a feature went unexercised: {cov:?}");
         }
     }
 
-    /// Every record survives its encoding, and no truncation or flipped byte of one decodes as
-    /// anything but itself or nothing.
+    /// Every record survives its encoding, and no truncation, extra byte or flipped bit of one
+    /// decodes at all.
     #[test]
     fn wal_records_read_back_as_written_and_damaged_ones_do_not_read() {
         let seed = gossip_fuzz_seed();
@@ -7555,9 +7608,7 @@ mod tests {
             let mut flipped = bytes.clone();
             let at = rng.random_range(0..flipped.len());
             flipped[at] ^= 1 << rng.random_range(0..8);
-            if let Some(decoded) = Wal::decode(&flipped) {
-                assert_eq!(decoded.encode(), flipped, "case {case}: byte {at} flipped decodes as a record that encodes otherwise");
-            }
+            assert_eq!(Wal::decode(&flipped), None, "case {case}: a bit of byte {at} of {} flipped decoded", bytes.len());
         }
     }
 }
