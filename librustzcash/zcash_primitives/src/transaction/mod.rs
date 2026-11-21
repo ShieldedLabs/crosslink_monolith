@@ -227,7 +227,8 @@ impl TxVersion {
             BranchId::Nu6_3
             | BranchId::FeaturenetUpgrade1
             | BranchId::FeaturenetUpgrade2
-            | BranchId::FeaturenetUpgrade3 => TxVersion::V6,
+            | BranchId::FeaturenetUpgrade3
+            | BranchId::FeaturenetUpgrade4 => TxVersion::V6,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => TxVersion::V6,
         }
@@ -243,26 +244,30 @@ impl TxVersion {
             TxVersion::V3 => consensus_branch_id == Overwinter,
             TxVersion::VCrosslink => matches!(
                 consensus_branch_id,
-                Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3
+                Nu6_3
+                    | FeaturenetUpgrade1
+                    | FeaturenetUpgrade2
+                    | FeaturenetUpgrade3
+                    | FeaturenetUpgrade4
             ),
             TxVersion::V4 => match consensus_branch_id {
                 Sprout | Overwinter => false,
                 Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
-                Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3 => true,
+                Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3 | FeaturenetUpgrade4 => true,
                 #[cfg(zcash_unstable = "nu7")]
                 Nu7 => false, // ZIP 2003
             },
             TxVersion::V5 => match consensus_branch_id {
                 Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy => false,
                 Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
-                Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3 => true,
+                Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3 | FeaturenetUpgrade4 => true,
                 #[cfg(zcash_unstable = "nu7")]
                 Nu7 => true,
             },
             TxVersion::V6 => match consensus_branch_id {
                 Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6
                 | Nu6_1 | Nu6_2 => false,
-                Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3 => true, // Ironwood / NU6.3
+                Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3 | FeaturenetUpgrade4 => true, // Ironwood / NU6.3
                 #[cfg(zcash_unstable = "nu7")]
                 Nu7 => true, // ZIP 230 or ZIP 248, whichever is chosen for activation
             },
@@ -2136,7 +2141,8 @@ pub mod testing {
             BranchId::Nu6_3
             | BranchId::FeaturenetUpgrade1
             | BranchId::FeaturenetUpgrade2
-            | BranchId::FeaturenetUpgrade3 => Just(TxVersion::V6).boxed(),
+            | BranchId::FeaturenetUpgrade3
+            | BranchId::FeaturenetUpgrade4 => Just(TxVersion::V6).boxed(),
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => Just(TxVersion::V6).boxed(),
             #[cfg(zcash_unstable = "zfuture")]

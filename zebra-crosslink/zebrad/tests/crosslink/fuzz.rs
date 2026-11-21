@@ -2257,10 +2257,17 @@ pub(crate) fn generate(c: &mut Choices) -> Vec<u8> {
     let upgrades = c.below(3);
     let node_config = match upgrades {
         0 => String::new(),
-        1 => node_config_with_activation_heights(ConfiguredActivationHeights {
-            featurenet_upgrade_3: Some(FUZZ_UTXO_UPGRADE_FROM + c.below(FUZZ_UTXO_UPGRADE_SPAN) as u32),
-            ..Default::default()
-        }),
+        1 => {
+            let featurenet_upgrade_3 = FUZZ_UTXO_UPGRADE_FROM + c.below(FUZZ_UTXO_UPGRADE_SPAN) as u32;
+            // Half of those also schedule FeaturenetUpgrade4, which carries no rule: everything
+            // FeaturenetUpgrade3 switches on must hold on past it, under the new branch ID.
+            let featurenet_upgrade_4 = c.unusual(128).then(|| featurenet_upgrade_3 + 1 + c.below(FUZZ_UTXO_UPGRADE_SPAN) as u32);
+            node_config_with_activation_heights(ConfiguredActivationHeights {
+                featurenet_upgrade_3: Some(featurenet_upgrade_3),
+                featurenet_upgrade_4,
+                ..Default::default()
+            })
+        }
         _ => node_config_with_activation_heights(ConfiguredActivationHeights {
             featurenet_upgrade_2: Some(FUZZ_UTXO_UPGRADE_FROM + c.below(FUZZ_UTXO_UPGRADE_SPAN) as u32),
             ..Default::default()
