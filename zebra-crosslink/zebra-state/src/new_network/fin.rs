@@ -14,7 +14,7 @@ use zcash_primitives::bft::FatPointerToBftBlock;
 use zebra_chain::block::{Hash, Height};
 
 use crate::service::finalized_state::ZebraDb;
-use crate::service::non_finalized_state::NonFinalizedState;
+use crate::service::non_finalized_state::{Chain, NonFinalizedState};
 
 static FIN: RwLock<Option<(Height, Hash)>> = RwLock::new(None);
 
@@ -111,13 +111,7 @@ pub(crate) fn finality_at_height(height: Height) -> crate::crosslink::TFLBlockFi
 
 /// `candidate(H) = lca(snapshot(LF(H)), prune_σ(H))` for the best chain `H` (FINALITY.md §3.1).
 ///
-/// Both arguments are ancestors of `H` -- Last Final Snapshot puts the snapshot on `H`'s own
-/// chain, and `prune_σ(H)` is `H` walked back -- so their lca is whichever of the two is lower,
-/// and no ancestry walk is needed. The clamp is what keeps a subverted `Π_bft` from finalizing a
-/// block this node has buried only a block or two deep (FINALITY.md §3.2).
-///
-/// `None` while the tip carries no bft pointer, while the bft-block it names has not reached
-/// this node, or while the snapshot it finalizes is not a block this node holds.
+/// `None` while the best chain is empty, and otherwise as [`chain_candidate`].
 pub fn candidate(
     chain: &crate::new_network::bft::BftChain,
     non_finalized_state: &NonFinalizedState,
@@ -125,29 +119,72 @@ pub fn candidate(
     sigma: u64,
 ) -> Option<(Height, Hash)> {
     let best_chain = non_finalized_state.best_chain()?;
-    let tip = best_chain.tip_block()?;
-    let tip_height = tip.height;
+    best_chain.tip_block()?;
+    chain_candidate(chain, Some(best_chain), db, sigma)
+}
 
-    let fat_pointer = &tip.block.header.fat_pointer_to_bft_block;
+/// `candidate(H) = lca(snapshot(LF(H)), prune_σ(H))` for `H` the tip of `chain`, or the finalized
+/// tip when `chain` holds no blocks or is `None` (FINALITY.md §3.1).
+///
+/// Both arguments are ancestors of `H` -- Last Final Snapshot puts the snapshot on `H`'s own
+/// chain, and `prune_σ(H)` is `H` walked back -- so their lca is whichever of the two is lower,
+/// and no ancestry walk is needed. The clamp is what keeps a subverted `Π_bft` from finalizing a
+/// block this node has buried only a block or two deep (FINALITY.md §3.2).
+///
+/// A function of `H` and its ancestry alone, unlike `fin`, so a consensus rule may read it: a
+/// node that accepted `H` resolved `H`'s bft pointer against its store of decided bft-blocks, and
+/// the database keeps every decided block memory has let go of.
+///
+/// `None` while the tip carries no bft pointer, while the bft-block it names has not reached
+/// this node, or while the snapshot it finalizes is not a block this node holds.
+pub(crate) fn chain_candidate(
+    bft: &crate::new_network::bft::BftChain,
+    chain: Option<&Chain>,
+    db: &ZebraDb,
+    sigma: u64,
+) -> Option<(Height, Hash)> {
+    let (tip_height, header) = match chain.and_then(Chain::tip_block) {
+        Some(tip) => (tip.height, tip.block.header.clone()),
+        None => {
+            let (height, _) = db.tip()?;
+            (height, db.block_header(height.into())?)
+        }
+    };
+
+    let fat_pointer = &header.fat_pointer_to_bft_block;
     if *fat_pointer == FatPointerToBftBlock::null() {
         return None;
     }
-    let bft_height = *chain.hash_to_height.get(&fat_pointer.points_at_block_hash())?;
-    let bft_block = crate::new_network::bft::decided_block(chain, bft_height as usize)?;
+    let bft_block_hash = fat_pointer.points_at_block_hash();
+    let bft_block = match bft.hash_to_height.get(&bft_block_hash) {
+        Some(&bft_height) => crate::new_network::bft::decided_block(bft, bft_height as usize)?,
+        // The bft-chain is empty until the sync runner restores it, after the state has replayed
+        // its non-finalized backup through block validation. The pointer names the height, and
+        // the database holds every decided block.
+        None => {
+            let decision = db.bft_decision(u32::try_from(fat_pointer.get_vote_template().height).ok()?)?;
+            if decision.block.blake3_hash() != bft_block_hash {
+                return None;
+            }
+            std::borrow::Cow::Owned(decision.block)
+        }
+    };
     if bft_block.headers.is_empty() {
         return None;
     }
     let snapshot_hash = Hash(bft_block.snapshot_block_hash().0);
 
-    let snapshot_height = best_chain
-        .height_by_hash(snapshot_hash)
+    let snapshot_height = chain
+        .and_then(|chain| chain.height_by_hash(snapshot_hash))
         .or_else(|| db.height(snapshot_hash))?;
     let sigma_height = Height(tip_height.0.saturating_sub(sigma as u32));
 
     if snapshot_height <= sigma_height {
         Some((snapshot_height, snapshot_hash))
     } else {
-        let hash = best_chain.hash_by_height(sigma_height).or_else(|| db.hash(sigma_height))?;
+        let hash = chain
+            .and_then(|chain| chain.hash_by_height(sigma_height))
+            .or_else(|| db.hash(sigma_height))?;
         Some((sigma_height, hash))
     }
 }

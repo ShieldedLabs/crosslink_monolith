@@ -4197,6 +4197,212 @@ fn crosslink_reject_action_on_a_bond_after_it_unbonds_or_withdraws_in_the_block(
     test_bytes(tf.write_to_bytes());
 }
 
+/// From FeaturenetUpgrade3 a bond withdraws only once the chain the block extends has finalized
+/// the height the selected withdrawal finality rule requires (#287). A withdrawal waits while
+/// finality is stalled, so the stake stays slashable.
+///
+/// The bond unbonds on one staking day and is withdrawn on the next. No block cites a BFT block,
+/// so finality is stalled and the withdrawal is refused. Then the tip cites a BFT block finalizing
+/// the block just below the required height, which is still refused, and then one finalizing the
+/// required height itself, which lets it through. The heights follow the selected rule, so the
+/// scene holds for each of `zcash_primitives::bft::WithdrawalFinality`'s rules. With the rule off
+/// (`WITHDRAWAL_FINALITY` is `None`) both refusals are accepted and this fails.
+#[test]
+fn crosslink_withdrawal_waits_for_finality_from_featurenet_upgrade_3() {
+    set_test_name(function_name!());
+    test_bytes(withdrawal_finality_scene(false));
+}
+
+/// As `crosslink_withdrawal_waits_for_finality_from_featurenet_upgrade_3`, with the BFT block
+/// that finalizes far enough cited before the first withdrawal, which then goes through: the
+/// refusals there come from finality alone.
+#[test]
+fn crosslink_withdrawal_waits_for_finality_from_featurenet_upgrade_3_control() {
+    set_test_name(function_name!());
+    test_bytes(withdrawal_finality_scene(true));
+}
+
+fn withdrawal_finality_scene(finalized_before_withdrawal: bool) -> Vec<u8> {
+    use std::collections::BTreeMap;
+    use zcash_primitives::transaction::StakingAction;
+    use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
+
+    const BOND: &[u8] = b"withdrawal-finality-bond";
+    const REFUSAL: &str = "withdrawal waits for finality";
+
+    // `bonded_start` bonds the supplied finalizer at height BONDED_SHIFT, which the day window
+    // must reach, and three withdrawals must fit in a staking day after finality reaches the
+    // start of it (rule D, or C with one period), which takes sigma + 1 blocks and one more for
+    // the BFT block that says so. The short calendar's window is shorter than either.
+    let params = HARNESS_PARAMETERS;
+    let sigma = params.bc_confirmation_depth_sigma as u32;
+    let short = short_staking(&params);
+    let day_window = short.day_window.max(BONDED_SHIFT as u32 + 1).max(2 * sigma + 4);
+    let action_delay = short.action_delay.max(day_window + 1);
+    let staking = zcash_primitives::bft::StakingParameters { day_window, action_delay, period: short.period.max(day_window + action_delay) };
+    assert!(staking.is_valid());
+    let params = zcash_primitives::bft::ZcashCrosslinkParameters { staking, ..params };
+    // While no rule is selected the scene is built for D, so the control still runs.
+    let rule = zcash_primitives::bft::WITHDRAWAL_FINALITY.unwrap_or(zcash_primitives::bft::WithdrawalFinality::NextStakingPeriod);
+    let upgrade_3 = 1 + BONDED_SHIFT as u32 + 1;
+    let node_config = node_config_with_activation_heights(ConfiguredActivationHeights {
+        featurenet_upgrade_3: Some(upgrade_3),
+        ..Default::default()
+    });
+    let mut tf = TF::new_with_node_config(&params, &node_config);
+    let network = test_network(&params, &node_config);
+
+    let key = TestKey::new(b"crosslink test miner");
+    let miner = key.address();
+    let mut gen = bonded_start(&mut tf, network.clone());
+    let height = |gen: &BlockGen| gen.tip.coinbase_height().expect("generated blocks have a height").0;
+    assert!(height(&gen) < upgrade_3);
+
+    // The bond is created on one staking day, unbonds on the next and withdraws on the one after,
+    // where the action delay has passed. A withdrawal needs the chain to have finalized
+    // `required`. A BFT block finalizing it carries the sigma blocks above it, and a block may cite
+    // it from sigma + 1 above that, so the first attempt, at `first_try`, is late enough for the
+    // control to cite it the block before.
+    let (created_at, unbonded_at) = (staking.period, 2 * staking.period);
+    let required = staking.withdrawal_required_finalized(rule, unbonded_at);
+    let first_try = (3 * staking.period).max(required + sigma + 2);
+    assert!(first_try >= unbonded_at + staking.action_delay);
+    assert!(first_try + 2 < 3 * staking.period + staking.day_window, "three withdrawal attempts fit in one staking day under {rule:?}");
+
+    // Every block loaded from here on, by height, for the BFT blocks to carry.
+    let mut blocks: BTreeMap<u32, Arc<Block>> = BTreeMap::new();
+    fn load(tf: &mut TF, blocks: &mut BTreeMap<u32, Arc<Block>>, block: Arc<Block>) {
+        tf.push_instr_load_pow(&block, 0);
+        blocks.insert(block.coinbase_height().expect("generated blocks have a height").0, block);
+    }
+    let mine_until = |gen: &mut BlockGen, tf: &mut TF, blocks: &mut BTreeMap<u32, Arc<Block>>, next_height: u32| {
+        while height(gen) + 1 < next_height {
+            load(tf, blocks, gen.next_block(&miner));
+        }
+    };
+    // The next block with `txs`, citing `fat_ptr`. Once a block cites a BFT block, every block
+    // after it must cite one at least as far on (Extension), and a new block cites none.
+    let next_citing = |gen: &mut BlockGen, txs: &[Arc<Transaction>], fat_ptr: &FatPointerToBftBlock| {
+        gen.next_block_with_txs(&miner, txs);
+        point_tip_at_bft(gen, fat_ptr)
+    };
+    let signing_key = zebra_crosslink::rng_private_public_key_from_address(synthetic_finalizer_seed(SUPPLIED_FINALIZER).as_bytes()).0;
+    let target = zcash_primitives::bft::FinalizerAddress::create(&signing_key);
+
+    // Decides the next BFT block, finalizing `snapshot`: it carries the sigma blocks above it.
+    // FeaturenetUpgrade2 is active here, so the genesis has the empty certificate at round 0, and
+    // a later height is signed by SUPPLIED_FINALIZER, the whole roster, under the namespace and
+    // quorum the stake at the previous snapshot decides by.
+    // `previous_snapshot` is what the BFT block below finalized, whose stake is this one's roster.
+    let finalizing = |tf: &mut TF, blocks: &BTreeMap<u32, Arc<Block>>, pos_h: &mut u32, fat_ptr: &mut FatPointerToBftBlock, previous_snapshot: Option<u32>, snapshot: u32| {
+        let tail: Vec<Arc<Block>> = (snapshot + 1..=snapshot + sigma).map(|height| blocks[&height].clone()).collect();
+        let mut bft = create_pos_and_ptr_to_finalize_pow_at_round(*pos_h, fat_ptr.clone(), &tail, 0, &[]);
+        assert_eq!(bft.0.block.snapshot_block_hash().0, blocks[&snapshot].hash().0);
+        assert_eq!(previous_snapshot.is_none(), *pos_h == 0);
+        let sigs = match *pos_h {
+            0 => Vec::new(),
+            bft_height => {
+                let strict = zebra_state::new_network::bft::strict_quorum_at(&network, previous_snapshot.map(zebra_chain::block::Height));
+                let namespace = zebra_state::new_network::bft::namespace_for_bft_height(&[], bft_height.into(), strict);
+                let seed = synthetic_finalizer_seed(SUPPLIED_FINALIZER);
+                bft.0.fat_ptr = signed_fat_pointer(&bft.0.block, bft_height.into(), 0, &[seed.as_bytes()], &namespace);
+                bft_proposal_sigs(&signing_key, &bft.0.block, 0, -1, &namespace)
+            }
+        };
+        tf.push_instr_load_pos_signed(&bft, &sigs, -1, 0);
+        *pos_h += 1;
+        *fat_ptr = bft.0.fat_ptr.clone();
+        bft
+    };
+
+    // A bond earns from the block that creates it to the one before it unbonds, and withdraws
+    // exactly what it then holds. `bonded_start` bonded the supplied finalizer at BONDED_SHIFT.
+    const BONDED: u64 = 10_000_000;
+    let bond_key = zebra_crosslink::rng_private_public_key_from_address(BOND).1 .0;
+    let withdrawn = {
+        let upgrade_1 = NetworkUpgrade::FeaturenetUpgrade1.activation_height(&network).map(|height| height.0);
+        let mut model = PayoutModel {
+            bonds: vec![(zebra_crosslink::rng_private_public_key_from_address(b"supplied-bond").1 .0, SUPPLIED_STAKE, target.pub_key.0)],
+            banks: Default::default(),
+            active_roster_max_n: params.active_roster_max_n,
+        };
+        for height in BONDED_SHIFT as u32..unbonded_at {
+            if height == created_at {
+                model.bonds.push((bond_key, BONDED, target.pub_key.0));
+            }
+            match upgrade_1.is_some_and(|upgrade_1| height >= upgrade_1) {
+                true => model.pay_split(pos_issuance(&network, height)),
+                false => model.pay_per_bond(pos_issuance(&network, height)),
+            }
+        }
+        model.bonds.iter().find(|bond| bond.0 == bond_key).expect("the bond was made above").1
+    };
+
+    mine_until(&mut gen, &mut tf, &mut blocks, created_at);
+    let input = gen.mature_coinbase_for(&key).expect("a coinbase has matured since bonded_start's");
+    let create = staking_tx_create_bond_funded(gen.next_upgrade(), BOND, target, BONDED, &key, input);
+    let block = gen.next_block_with_txs(&miner, &[create.clone()]);
+    load(&mut tf, &mut blocks, block);
+    assert_eq!(height(&gen), created_at);
+
+    mine_until(&mut gen, &mut tf, &mut blocks, unbonded_at);
+    let unbond = signed_staking_tx(gen.next_upgrade(), BOND, 0, |unique_pubkey, signature| StakingAction::BeginDelegationUnbonding {
+        unique_pubkey,
+        signature,
+        spends: Some(create.hash().0),
+    });
+    let block = gen.next_block_with_txs(&miner, &[unbond.clone()]);
+    load(&mut tf, &mut blocks, block);
+    assert_eq!(height(&gen), unbonded_at);
+
+    let withdraw = signed_staking_tx(gen.next_upgrade(), BOND, 0, |unique_pubkey, signature| StakingAction::WithdrawDelegationBond {
+        amount_zats: withdrawn,
+        unique_pubkey,
+        signature,
+        spends: Some(unbond.hash().0),
+    });
+
+    mine_until(&mut gen, &mut tf, &mut blocks, first_try - 1);
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+
+    if finalized_before_withdrawal {
+        let enough = finalizing(&mut tf, &blocks, pos_h, fat_ptr, None, required);
+        let block = next_citing(&mut gen, &[], &enough.0.fat_ptr);
+        load(&mut tf, &mut blocks, block);
+        assert_eq!(height(&gen), first_try - 1);
+
+        let block = next_citing(&mut gen, &[withdraw.clone()], &enough.0.fat_ptr);
+        load(&mut tf, &mut blocks, block);
+        tf.push_instr_expect_pow_chain_length(first_try as usize + 1, 0);
+        return tf.write_to_bytes();
+    }
+
+    let block = gen.next_block(&miner);
+    load(&mut tf, &mut blocks, block);
+    assert_eq!(height(&gen), first_try - 1);
+
+    // Stalled: no block on the chain has cited a BFT block.
+    tf.push_instr_load_pow(&gen.clone().next_block_with_txs(&miner, &[withdraw.clone()]), SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason(REFUSAL, 0);
+
+    // The tip cites a BFT block finalizing the block just below `required`.
+    let just_short = finalizing(&mut tf, &blocks, pos_h, fat_ptr, None, required - 1);
+    let block = next_citing(&mut gen, &[], &just_short.0.fat_ptr);
+    load(&mut tf, &mut blocks, block);
+    tf.push_instr_load_pow(&next_citing(&mut gen.clone(), &[withdraw.clone()], &just_short.0.fat_ptr), SHOULD_FAIL);
+    tf.push_instr_expect_rejection_reason(REFUSAL, 0);
+
+    let enough = finalizing(&mut tf, &blocks, pos_h, fat_ptr, Some(required - 1), required);
+    let block = next_citing(&mut gen, &[], &enough.0.fat_ptr);
+    load(&mut tf, &mut blocks, block);
+    let block = next_citing(&mut gen, &[withdraw.clone()], &enough.0.fat_ptr);
+    load(&mut tf, &mut blocks, block);
+    assert_eq!(height(&gen), first_try + 2);
+    tf.push_instr_expect_pow_chain_length(first_try as usize + 3, 0);
+
+    tf.write_to_bytes()
+}
+
 /// A test can mine to a key it holds and spend the matured coinbase with a fee: first a plain
 /// transparent spend, then a bond creation funded the same way. Each passes the mempool's ZIP-317
 /// rules, and the block that mines it credits the fee to its coinbase (NU6 onward requires coinbase

@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 
 use hex::ToHex;
 use libnghttp2_sys as ng;
@@ -56,6 +56,49 @@ pub struct Ctx {
     pub network: Network,
 }
 
+/// Where lightwallet_server listens, and what callers from other hosts must present.
+#[derive(Clone)]
+pub struct Listen {
+    /// The gRPC address the operator chose. Loopback on its port is served beside it.
+    pub grpc: SocketAddr,
+    /// The readiness endpoint's port, always on loopback.
+    pub ready_port: u16,
+    /// What a caller from another host must send as `authorization: Bearer <token>`.
+    pub token: Option<String>,
+}
+
+/// Shows whether a token is set, never the token.
+impl std::fmt::Debug for Listen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Listen")
+            .field("grpc", &self.grpc)
+            .field("ready_port", &self.ready_port)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+impl Listen {
+    /// The gRPC addresses to bind: the chosen one first, then each loopback address it does
+    /// not cover, so the node's own wallet reaches the server however `localhost` resolves.
+    /// `[::]` is dual-stack on Linux and macOS, where the 0.0.0.0 bind after it fails
+    /// harmlessly with AddrInUse, but v6-only on Windows, where it is needed.
+    fn grpc_binds(&self) -> Vec<SocketAddr> {
+        let port = self.grpc.port();
+        let v6_loopback = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+        let v4_loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let mut binds = vec![self.grpc];
+        match self.grpc.ip() {
+            IpAddr::V6(ip) if ip.is_unspecified() => binds.push(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))),
+            IpAddr::V4(ip) if ip.is_unspecified() => binds.push(v6_loopback),
+            ip if ip == v6_loopback.ip() => binds.push(v4_loopback),
+            ip if ip == v4_loopback.ip() => binds.push(v6_loopback),
+            _ => binds.extend([v6_loopback, v4_loopback]),
+        }
+        binds
+    }
+}
+
 // -------------------------------------------------------------------------
 // gRPC basics
 
@@ -68,6 +111,8 @@ const GRPC_OUT_OF_RANGE: u32 = 11;
 const GRPC_UNIMPLEMENTED: u32 = 12;
 const GRPC_INTERNAL: u32 = 13;
 const GRPC_UNAVAILABLE: u32 = 14;
+const GRPC_PERMISSION_DENIED: u32 = 7;
+const GRPC_UNAUTHENTICATED: u32 = 16;
 
 /// gRPC error: (status code, message).
 type Grr = (u32, String);
@@ -77,6 +122,40 @@ const OUT_BUDGET: usize = 256 * 1024;
 /// Backend reads per spawned task for the streaming generators.
 const CHUNK: i64 = 32;
 const PATH_PREFIX: &[u8] = b"/cash.z.wallet.sdk.rpc.CompactTxStreamer/";
+
+/// Connections from other hosts, in all and from any one address. Loopback connections, the
+/// node's own wallet's among them, are not counted, so other hosts cannot crowd them out.
+const MAX_REMOTE_CONNS: usize = 256;
+const MAX_CONNS_PER_IP: usize = 16;
+/// A connection from another host with no request in progress and no new request for this
+/// long is closed. Tests use seconds, so they can wait the timers out.
+#[cfg(not(test))]
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+#[cfg(test)]
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+/// A connection that has sent nothing for KEEPALIVE_INTERVAL is sent a PING, and closed if
+/// the ACK takes longer than KEEPALIVE_TIMEOUT.
+#[cfg(not(test))]
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(test)]
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(not(test))]
+const KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(test)]
+const KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Readiness-probe connections at once, and how long one may take to send its request.
+const MAX_READY_CONNS: usize = 32;
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// The longest `authorization` header kept; a longer one cannot match the token.
+const AUTHORIZATION_MAX: usize = 1024;
+
+/// Transparent addresses one request may name.
+const MAX_ADDRESSES: usize = 256;
+/// UTXOs one GetAddressUtxos(Stream) answer may carry, whatever `max_entries` asks.
+const MAX_UTXO_ENTRIES: usize = 10_000;
+/// Blocks one GetBlockRange(Nullifiers) request may span. The node's own wallet asks for
+/// 1,024 at a time.
+const MAX_BLOCK_RANGE: u32 = 10_000;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Method {
@@ -146,6 +225,14 @@ fn dec<M: Message + Default>(bytes: &[u8]) -> Result<M, Grr> {
     M::decode(bytes).map_err(|e| (GRPC_INVALID, format!("bad request proto: {e}")))
 }
 
+/// Refuses a request naming more than MAX_ADDRESSES transparent addresses.
+fn too_many_addresses(count: usize) -> Result<(), Grr> {
+    if count > MAX_ADDRESSES {
+        return Err((GRPC_INVALID, format!("a request may name at most {MAX_ADDRESSES} addresses")));
+    }
+    Ok(())
+}
+
 fn internal(e: impl std::fmt::Display) -> Grr {
     (GRPC_INTERNAL, e.to_string())
 }
@@ -200,6 +287,8 @@ enum Work {
 
 struct Stream {
     path: Vec<u8>,
+    /// The `authorization` header, empty if absent or over AUTHORIZATION_MAX.
+    authorization: Vec<u8>,
     req: Vec<u8>,
     req_done: bool,
     dispatched: bool,
@@ -232,6 +321,25 @@ struct Conn {
     pending: Vec<u8>,
     pending_off: usize,
     dead: bool,
+    /// The peer's address, IPv4 rather than v4-mapped.
+    peer_ip: IpAddr,
+    /// The peer is on this host, as the node's own wallet is: trusted and not counted.
+    loopback: bool,
+    /// When the peer last sent anything.
+    last_recv: std::time::Instant,
+    /// When the peer last began or closed a request.
+    last_used: std::time::Instant,
+    /// When the keepalive PING still unanswered was sent.
+    ping_sent: Option<std::time::Instant>,
+    /// GOAWAY is queued; the connection closes once it is sent.
+    closing: bool,
+}
+
+/// Whether `authorization` is `Bearer <token>`, compared in time that depends only on lengths.
+fn bearer_matches(authorization: &[u8], token: &str) -> bool {
+    let expected = [b"Bearer ".as_slice(), token.as_bytes()].concat();
+    authorization.len() == expected.len()
+        && authorization.iter().zip(&expected).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
 
 impl Drop for Conn {
@@ -245,28 +353,40 @@ impl Drop for Conn {
 // -------------------------------------------------------------------------
 // Server loop
 
-/// Spawn the server thread. Binds loopback on `port`, IPv6 + IPv4 (h2c plaintext), or
-/// every interface when `public`. Also answers any HTTP/1.1 POST on `ready_port`
-/// (lightwallet_server's legacy JSON-RPC port, always loopback) with a 200, which is what
-/// the wallet's `wait_for_lightwalletd()` readiness probe needs.
-pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) -> std::thread::JoinHandle<()> {
+/// Spawn the server thread. Serves gRPC (h2c plaintext) on `listen.grpc` and on loopback at its
+/// port. Also answers any HTTP/1.1 POST on `listen.ready_port` (lightwallet_server's legacy
+/// JSON-RPC port, always loopback) with a 200, which is what the wallet's
+/// `wait_for_lightwalletd()` readiness probe needs.
+pub fn lightwalletd_spawn(ctx: Ctx, listen: Listen) -> std::thread::JoinHandle<()> {
+    spawn_server(ctx, listen, true, Default::default())
+}
+
+/// [`lightwalletd_spawn`], with loopback peers treated as other hosts unless
+/// `loopback_trusted`, which lets tests reach the paths other hosts take. The server also
+/// stops when `stop` is set, so a test can end it before its runtime goes away.
+fn spawn_server(
+    ctx: Ctx,
+    listen: Listen,
+    loopback_trusted: bool,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("lightwallet_server-grpc".into())
         .spawn(move || {
             // serve
-            //
-            // The server has no auth or limits (#293), so it stays on loopback unless the
-            // operator opts in. "[::]" first: on Linux/macOS it is dual-stack by default
-            // (v4 peers arrive v4-mapped) and the following v4 bind fails harmlessly with
-            // AddrInUse. On Windows "[::]" is v6-only, so the v4 bind succeeds and both
-            // stacks are served from two sockets. "[::1]" is v6-only everywhere.
-            let (v6, v4) = if public { ("[::]", "0.0.0.0") } else { ("[::1]", "127.0.0.1") };
+            let port = listen.grpc.port();
+            let ready_port = listen.ready_port;
             let mut listeners: Vec<TcpListener> = Vec::new();
-            for addr in [format!("{v6}:{port}"), format!("{v4}:{port}")] {
-                if let Ok(l) = TcpListener::bind(&*addr) {
-                    l.set_nonblocking(true).expect("nonblocking listener");
-                    tracing::info!("lightwallet_server gRPC serving on {addr}");
-                    listeners.push(l);
+            for (i, addr) in listen.grpc_binds().into_iter().enumerate() {
+                match TcpListener::bind(addr) {
+                    Ok(l) => {
+                        l.set_nonblocking(true).expect("nonblocking listener");
+                        tracing::info!("lightwallet_server gRPC serving on {addr}");
+                        listeners.push(l);
+                    }
+                    // The rest are loopback addresses the chosen one may already cover.
+                    Err(e) if i == 0 => tracing::error!("lightwallet_server: cannot serve gRPC on {addr}: {e}"),
+                    Err(_) => {}
                 }
             }
             if listeners.is_empty() {
@@ -281,21 +401,28 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                     ready_listeners.push(l);
                 }
             }
-            // (sock, request bytes so far)
-            let mut ready_conns: Vec<(TcpStream, Vec<u8>)> = Vec::new();
+            // (sock, request bytes so far, accepted at)
+            let mut ready_conns: Vec<(TcpStream, Vec<u8>, std::time::Instant)> = Vec::new();
 
             let mut conns: Vec<Box<Conn>> = Vec::new();
+            let token = listen.token.clone();
+            // Connections refused for the caps since the last warning, which goes out at most
+            // once a minute.
+            let mut refused: u64 = 0;
+            let mut refused_warned: Option<std::time::Instant> = None;
 
-            while !zebra_chain::shutdown::is_shutting_down() {
+            while !zebra_chain::shutdown::is_shutting_down() && !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let mut progress = false;
+                let now = std::time::Instant::now();
 
                 // readiness probe endpoint: 200 any complete HTTP request
                 for l in &ready_listeners {
                     loop {
                         match l.accept() {
                             Ok((sock, _)) => {
-                                if sock.set_nonblocking(true).is_ok() {
-                                    ready_conns.push((sock, Vec::new()));
+                                // dropping the socket closes it
+                                if ready_conns.len() < MAX_READY_CONNS && sock.set_nonblocking(true).is_ok() {
+                                    ready_conns.push((sock, Vec::new(), now));
                                     progress = true;
                                 }
                             }
@@ -303,7 +430,10 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                         }
                     }
                 }
-                ready_conns.retain_mut(|(sock, buf)| {
+                ready_conns.retain_mut(|(sock, buf, accepted)| {
+                    if now.duration_since(*accepted) > READY_TIMEOUT {
+                        return false;
+                    }
                     let mut tmp = [0u8; 4096];
                     loop {
                         match sock.read(&mut tmp) {
@@ -351,7 +481,27 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                 for listener in &listeners {
                     loop {
                         match listener.accept() {
-                            Ok((sock, _peer)) => {
+                            Ok((sock, peer)) => {
+                                let peer_ip = peer.ip().to_canonical();
+                                let loopback = loopback_trusted && peer_ip.is_loopback();
+                                if !loopback {
+                                    let remote = conns.iter().filter(|c| !c.loopback).count();
+                                    let from_ip = conns.iter().filter(|c| c.peer_ip == peer_ip).count();
+                                    if remote >= MAX_REMOTE_CONNS || from_ip >= MAX_CONNS_PER_IP {
+                                        // dropping the socket closes it
+                                        refused += 1;
+                                        if refused_warned.is_none_or(|warned| now.duration_since(warned) >= std::time::Duration::from_secs(60)) {
+                                            tracing::warn!(
+                                                "lightwallet_server: refused {refused} connection(s) over the caps \
+                                                 ({MAX_REMOTE_CONNS} from other hosts, {MAX_CONNS_PER_IP} from one address); \
+                                                 the last from {peer_ip}",
+                                            );
+                                            refused = 0;
+                                            refused_warned = Some(now);
+                                        }
+                                        continue;
+                                    }
+                                }
                                 // new_conn
                                 let conn = 'mk: {
                                     if sock.set_nonblocking(true).is_err() {
@@ -366,6 +516,12 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                                         pending: Vec::new(),
                                         pending_off: 0,
                                         dead: false,
+                                        peer_ip,
+                                        loopback,
+                                        last_recv: now,
+                                        last_used: now,
+                                        ping_sent: None,
+                                        closing: false,
                                     });
                                     let user_data: *mut Conn = &mut *conn;
 
@@ -448,6 +604,32 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                             let mut lap = false;
                             let session = (*c).session;
 
+                            // 0. keepalive, and closing what is dead or idle. A request in
+                            // progress, long-polls included, keeps a connection open; one that
+                            // never finished arriving does not. Loopback connections, the
+                            // node's own wallet's among them, are never closed as idle.
+                            if let Some(sent) = (*c).ping_sent {
+                                if now.duration_since(sent) > KEEPALIVE_TIMEOUT {
+                                    (*c).dead = true;
+                                    break 'pump true;
+                                }
+                            } else if now.duration_since((*c).last_recv) > KEEPALIVE_INTERVAL {
+                                ng::nghttp2_submit_ping(session, ng::NGHTTP2_FLAG_NONE as u8, std::ptr::null());
+                                (*c).ping_sent = Some(now);
+                                lap = true;
+                            }
+                            if !(*c).closing
+                                && !(*c).loopback
+                                && !(*c).streams.values().any(|s| s.dispatched)
+                                && now.duration_since((*c).last_used) > IDLE_TIMEOUT
+                            {
+                                // GOAWAY goes out below; the session then wants neither read
+                                // nor write, and the connection is dropped.
+                                ng::nghttp2_session_terminate_session(session, ng::NGHTTP2_NO_ERROR);
+                                (*c).closing = true;
+                                lap = true;
+                            }
+
                             // 1. flush bytes the socket wouldn't take last lap
                             if !(*c).pending.is_empty() {
                                 // flush_pending
@@ -506,6 +688,7 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                                     }
                                     Ok(n) => {
                                         lap = true;
+                                        (*c).last_recv = now;
                                         let rc =
                                             ng::nghttp2_session_mem_recv(session, buf.as_ptr(), n);
                                         if rc < 0 {
@@ -599,7 +782,24 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                                     // park Work (usually a spawned task) on the stream. The
                                     // immediately-called closure exists only so the arms can
                                     // use `?` — its Err lands in s.finish below.
+                                    let authorized = (*c).loopback
+                                        || token.as_deref().is_some_and(|t| bearer_matches(&s.authorization, t));
                                     let r: Result<(), Grr> = (|| {
+                                        // With a token, other hosts need it for everything; without
+                                        // one, they may use everything but the faucet, which spends
+                                        // this node's funds.
+                                        if token.is_some() && !authorized {
+                                            return Err((
+                                                GRPC_UNAUTHENTICATED,
+                                                "this lightwallet_server needs `authorization: Bearer <token>` from other hosts".into(),
+                                            ));
+                                        }
+                                        if method == Method::RequestFaucetDonation && !authorized {
+                                            return Err((
+                                                GRPC_PERMISSION_DENIED,
+                                                "RequestFaucetDonation answers only this host, or other hosts with the token".into(),
+                                            ));
+                                        }
                                         match method {
                                             Method::GetLatestBlock => {
                                                 // get_latest_block
@@ -730,13 +930,19 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                                             }
 
                                             Method::SendTransaction => {
-                                                // send_transaction
-                                                let req: RawTransaction = dec(one_msg(&body)?)?;
-                                                let tx = Transaction::zcash_deserialize(&req.data[..])
-                                                    .map_err(|e| (GRPC_INVALID, format!("bad transaction bytes: {e}")))?;
-                                                let txid = tx.hash();
+                                                // send_transaction: a transaction is up to REQ_MAX bytes,
+                                                // so it is parsed on the blocking pool, not this thread,
+                                                // where it would hold up every other client.
                                                 let c = ctx.clone();
                                                 s.work = Work::Pending(ctx.rt.spawn(async move {
+                                                    let tx = tokio::task::spawn_blocking(move || {
+                                                        let req: RawTransaction = dec(one_msg(&body)?)?;
+                                                        Transaction::zcash_deserialize(&req.data[..])
+                                                            .map_err(|e| (GRPC_INVALID, format!("bad transaction bytes: {e}")))
+                                                    })
+                                                    .await
+                                                    .map_err(internal)??;
+                                                    let txid = tx.hash();
                                                     let queued = {
                                                             let mut svc = c.mempool.clone();
                                                             svc.ready().await.map_err(internal)?
@@ -773,6 +979,7 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                                             Method::GetTaddressBalance => {
                                                 // get_taddress_balance / balance_of
                                                 let req: AddressList = dec(one_msg(&body)?)?;
+                                                too_many_addresses(req.addresses.len())?;
                                                 let mut set = HashSet::new();
                                                 for a in &req.addresses {
                                                     set.insert(
@@ -810,7 +1017,10 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                                                 // split_msgs: the request side is N Address messages
                                                 let mut set = HashSet::new();
                                                 let mut p = 0usize;
+                                                let mut count = 0usize;
                                                 while p < body.len() {
+                                                    count += 1;
+                                                    too_many_addresses(count)?;
                                                     if body.len() - p < 5 {
                                                         return Err((GRPC_INVALID, "truncated grpc frame".into()));
                                                     }
@@ -939,6 +1149,14 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                                                 // get_address_utxos / begin_address_utxos_stream
                                                 let unary = method == Method::GetAddressUtxos;
                                                 let req: GetAddressUtxosArg = dec(one_msg(&body)?)?;
+                                                too_many_addresses(req.addresses.len())?;
+                                                // A caller asking for no more than the cap gets the first
+                                                // `max_entries`, as lightwalletd answers. One asking for more,
+                                                // or for all (0), gets an error rather than an answer the
+                                                // cap cut short, which would read as a smaller balance.
+                                                let asked = req.max_entries as usize;
+                                                let caller_limits = asked != 0 && asked <= MAX_UTXO_ENTRIES;
+                                                let limit = if caller_limits { asked } else { MAX_UTXO_ENTRIES };
 
                                                 let mut set = HashSet::new();
                                                 for a in &req.addresses {
@@ -971,6 +1189,20 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                                                         if height < req.start_height {
                                                             continue;
                                                         }
+                                                        if replies.len() == limit {
+                                                            if caller_limits {
+                                                                break;
+                                                            }
+                                                            return Err((
+                                                                GRPC_RESOURCE,
+                                                                format!(
+                                                                    "these addresses have more than {MAX_UTXO_ENTRIES} UTXOs from \
+                                                                     height {}: ask for at most {MAX_UTXO_ENTRIES} with max_entries, \
+                                                                     or fewer addresses",
+                                                                    req.start_height,
+                                                                ),
+                                                            ));
+                                                        }
                                                         replies.push(GetAddressUtxosReply {
                                                             address: address.to_string(),
                                                             txid: txid.0.to_vec(),
@@ -979,11 +1211,6 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                                                             value_zat: u64::from(output.value) as i64,
                                                             height,
                                                         });
-                                                        if req.max_entries > 0
-                                                            && replies.len() >= req.max_entries as usize
-                                                        {
-                                                            break;
-                                                        }
                                                     }
                                                     if unary {
                                                         Ok(Work::Items(
@@ -1017,7 +1244,7 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                                                             [enc(&BondInfoResponse {
                                                                 amount: u64::from(info.amount),
                                                                 status: info.status as u32,
-                                                                last_action_height: info.last_action_height,
+                                                                last_action_height: info.last_action_height.0,
                                                                 version: info.version.to_vec(),
                                                             })]
                                                             .into(),
@@ -1102,6 +1329,13 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16, public: bool) ->
                                                     .height
                                                     .try_into()
                                                     .map_err(|_| (GRPC_INVALID, "end height out of range".to_string()))?;
+                                                let span = u64::from(start.abs_diff(end)) + 1;
+                                                if span > u64::from(MAX_BLOCK_RANGE) {
+                                                    return Err((
+                                                        GRPC_INVALID,
+                                                        format!("the range spans {span} blocks; one request may span at most {MAX_BLOCK_RANGE}"),
+                                                    ));
+                                                }
                                                 let step = if end >= start { 1 } else { -1 };
                                                 s.work = Work::Blocks { next: start, end, step, nulls, inflight: None };
                                             }
@@ -1815,10 +2049,12 @@ unsafe extern "C" fn cb_begin_headers(
     let conn = &mut *(user_data as *mut Conn);
     let hd = (*frame).hd;
     if hd.type_ as u32 == ng::NGHTTP2_HEADERS && hd.stream_id > 0 {
+        conn.last_used = std::time::Instant::now();
         conn.streams.entry(hd.stream_id).or_insert_with(|| {
             // Stream::new
             Stream {
                 path: Vec::new(),
+                authorization: Vec::new(),
                 req: Vec::new(),
                 req_done: false,
                 dispatched: false,
@@ -1850,6 +2086,12 @@ unsafe extern "C" fn cb_header(
     if name == b":path" {
         if let Some(s) = conn.streams.get_mut(&id) {
             s.path = std::slice::from_raw_parts(value, valuelen).to_vec();
+        }
+    }
+    // nghttp2 hands header names over lowercased
+    if name == b"authorization" && valuelen <= AUTHORIZATION_MAX {
+        if let Some(s) = conn.streams.get_mut(&id) {
+            s.authorization = std::slice::from_raw_parts(value, valuelen).to_vec();
         }
     }
     0
@@ -1887,6 +2129,9 @@ unsafe extern "C" fn cb_frame_recv(
 ) -> std::os::raw::c_int {
     let conn = &mut *(user_data as *mut Conn);
     let hd = (*frame).hd;
+    if hd.type_ as u32 == ng::NGHTTP2_PING && hd.flags & (ng::NGHTTP2_FLAG_ACK as u8) != 0 {
+        conn.ping_sent = None;
+    }
     if hd.flags & (ng::NGHTTP2_FLAG_END_STREAM as u8) != 0 {
         if let Some(s) = conn.streams.get_mut(&hd.stream_id) {
             s.req_done = true;
@@ -1902,6 +2147,7 @@ unsafe extern "C" fn cb_stream_close(
     user_data: *mut std::os::raw::c_void,
 ) -> std::os::raw::c_int {
     let conn = &mut *(user_data as *mut Conn);
+    conn.last_used = std::time::Instant::now();
     if let Some(s) = conn.streams.remove(&stream_id) {
         // a dead client's in-flight backend call shouldn't keep running
         match s.work {
@@ -2104,5 +2350,294 @@ fn compact_block(b: &Block, nulls: bool) -> CompactBlock {
         header: Vec::new(),
         vtx,
         chain_metadata: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tonic::{metadata::MetadataValue, Code, Request};
+    use zcash_client_backend::proto::service::{compact_tx_streamer_client::CompactTxStreamerClient, Empty};
+
+    type Client = CompactTxStreamerClient<tonic::transport::Channel>;
+
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0").expect("a free port").local_addr().expect("bound").port()
+    }
+
+    /// A running test server, stopped and joined when dropped, while the test's runtime its
+    /// handlers use is still alive.
+    struct Server {
+        port: u16,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// A server on loopback whose faucet always pays 42, with no mempool, over an empty state.
+    /// Unless `loopback_trusted`, its loopback callers are treated as other hosts.
+    async fn serve(token: Option<&str>, loopback_trusted: bool) -> Server {
+        let network = Network::new_default_testnet();
+        let (_state, read_state, tip, _changes) = zebra_state::init_test_services(&network).await;
+        let mempool: MempoolSvc = tower::buffer::Buffer::new(
+            BoxService::new(tower::service_fn(|_: mempool::Request| async {
+                Err::<mempool::Response, BoxError>("no mempool in this test".into())
+            })),
+            8,
+        );
+        let tfl: TflSvc = tower::buffer::Buffer::new(
+            BoxService::new(tower::service_fn(|request: TFLServiceRequest| async move {
+                match request {
+                    TFLServiceRequest::Faucet(_) => Ok(TFLServiceResponse::Faucet(Ok(42))),
+                    _ => Err(TFLServiceError::NotImplemented),
+                }
+            })),
+            8,
+        );
+        let ctx = Ctx {
+            rt: tokio::runtime::Handle::current(),
+            read_state,
+            mempool,
+            tfl,
+            tip,
+            mempool_events: MempoolTxSubscriber::new(tokio::sync::broadcast::channel(8).0),
+            network,
+        };
+        let port = free_port();
+        let listen = Listen {
+            grpc: SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+            ready_port: free_port(),
+            token: token.map(str::to_owned),
+        };
+        let stop = std::sync::Arc::<std::sync::atomic::AtomicBool>::default();
+        let thread = spawn_server(ctx, listen, loopback_trusted, stop.clone());
+        Server { port, stop, thread: Some(thread) }
+    }
+
+    async fn client(server: &Server) -> Client {
+        let port = server.port;
+        for _ in 0..200 {
+            let endpoint = tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{port}")).expect("a URL");
+            if let Ok(channel) = endpoint.connect().await {
+                return CompactTxStreamerClient::new(channel);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("lightwallet_server never accepted a connection on {port}");
+    }
+
+    fn with_authorization<T>(message: T, authorization: &str) -> Request<T> {
+        let mut request = Request::new(message);
+        let value: MetadataValue<_> = authorization.parse().expect("ASCII header value");
+        request.metadata_mut().insert("authorization", value);
+        request
+    }
+
+    fn faucet() -> FaucetRequest {
+        FaucetRequest { address: "any".into() }
+    }
+
+    /// The code a streaming call ends with: its own, or its first message's.
+    async fn code_of_stream<T>(result: Result<tonic::Response<tonic::Streaming<T>>, tonic::Status>) -> Code {
+        match result {
+            Err(status) => status.code(),
+            Ok(response) => match response.into_inner().message().await {
+                Err(status) => status.code(),
+                Ok(_) => Code::Ok,
+            },
+        }
+    }
+
+    #[test]
+    fn grpc_binds_cover_both_loopback_addresses() {
+        let listen = |grpc: &str| Listen { grpc: grpc.parse().expect("an address"), ready_port: 1, token: None };
+        let addrs = |list: &[&str]| list.iter().map(|a| a.parse().expect("an address")).collect::<Vec<SocketAddr>>();
+        assert_eq!(listen("[::1]:9").grpc_binds(), addrs(&["[::1]:9", "127.0.0.1:9"]));
+        assert_eq!(listen("127.0.0.1:9").grpc_binds(), addrs(&["127.0.0.1:9", "[::1]:9"]));
+        assert_eq!(listen("[::]:9").grpc_binds(), addrs(&["[::]:9", "0.0.0.0:9"]));
+        assert_eq!(listen("0.0.0.0:9").grpc_binds(), addrs(&["0.0.0.0:9", "[::1]:9"]));
+        assert_eq!(listen("192.0.2.7:9").grpc_binds(), addrs(&["192.0.2.7:9", "[::1]:9", "127.0.0.1:9"]));
+    }
+
+    #[test]
+    fn bearer_matches_only_the_exact_token() {
+        assert!(bearer_matches(b"Bearer secret", "secret"));
+        assert!(!bearer_matches(b"Bearer secreT", "secret"));
+        assert!(!bearer_matches(b"Bearer secret2", "secret"));
+        assert!(!bearer_matches(b"bearer secret", "secret"));
+        assert!(!bearer_matches(b"secret", "secret"));
+        assert!(!bearer_matches(b"", "secret"));
+    }
+
+    /// With no token, another host may read but not spend from the faucet; this host may.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn faucet_answers_only_this_host_without_a_token() {
+        let remote_server = serve(None, false).await;
+        let remote = client(&remote_server).await;
+        remote.clone().get_lightd_info(Empty {}).await.expect("answered");
+        let refused = remote.clone().request_faucet_donation(faucet()).await.expect_err("refused");
+        assert_eq!(refused.code(), Code::PermissionDenied, "{refused:?}");
+
+        let local_server = serve(None, true).await;
+        let local = client(&local_server).await;
+        assert_eq!(local.clone().request_faucet_donation(faucet()).await.expect("paid").into_inner().amount, 42);
+    }
+
+    /// With a token, another host needs it for every call, the faucet included.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn token_gates_every_call_from_another_host() {
+        let remote_server = serve(Some("s3cret"), false).await;
+        let remote = client(&remote_server).await;
+        for request in [Request::new(Empty {}), with_authorization(Empty {}, "Bearer wrong")] {
+            let refused = remote.clone().get_lightd_info(request).await.expect_err("refused");
+            assert_eq!(refused.code(), Code::Unauthenticated, "{refused:?}");
+        }
+        remote.clone().get_lightd_info(with_authorization(Empty {}, "Bearer s3cret")).await.expect("answered");
+        let paid = remote.clone().request_faucet_donation(with_authorization(faucet(), "Bearer s3cret")).await;
+        assert_eq!(paid.expect("paid").into_inner().amount, 42);
+
+        // this host never needs it
+        let local_server = serve(Some("s3cret"), true).await;
+        let local = client(&local_server).await;
+        local.clone().get_lightd_info(Empty {}).await.expect("answered");
+    }
+
+    /// Whether the server keeps `sock` open: it sends its SETTINGS first, so a kept connection
+    /// has bytes to read, and a refused one reads as closed.
+    fn kept(sock: &mut TcpStream) -> bool {
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).expect("a timeout");
+        let mut byte = [0u8; 1];
+        matches!(sock.read(&mut byte), Ok(1))
+    }
+
+    /// Another host gets MAX_CONNS_PER_IP connections; this host is not counted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connections_from_one_other_host_are_capped() {
+        for loopback_trusted in [false, true] {
+            let server = serve(None, loopback_trusted).await;
+            drop(client(&server).await);
+            let port = server.port;
+            let mut socks = Vec::new();
+            for _ in 0..MAX_CONNS_PER_IP {
+                let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+                assert!(kept(&mut sock), "trusted: {loopback_trusted}");
+                socks.push(sock);
+            }
+            let mut over = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            assert_eq!(kept(&mut over), loopback_trusted, "trusted: {loopback_trusted}");
+        }
+    }
+
+    /// A peer that never answers the keepalive PING is closed, before the idle timeout would.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_peer_is_closed() {
+        let server = serve(None, true).await;
+        drop(client(&server).await);
+        let mut sock = TcpStream::connect(("127.0.0.1", server.port)).expect("connects");
+        sock.set_read_timeout(Some(KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT + std::time::Duration::from_secs(3)))
+            .expect("a timeout");
+        let started = std::time::Instant::now();
+        let mut buf = [0u8; 256];
+        loop {
+            match sock.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+                Err(e) => panic!("still open after {:?}: {e}", started.elapsed()),
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(elapsed >= KEEPALIVE_INTERVAL, "closed too soon: {elapsed:?}");
+        assert!(elapsed < IDLE_TIMEOUT, "closed by the idle timeout, not the keepalive: {elapsed:?}");
+    }
+
+    /// A peer from another host that answers every PING but sends no request is kept past the
+    /// keepalive, then sent GOAWAY once IDLE_TIMEOUT passes: the silent peer's control.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idle_peer_gets_goaway() {
+        const PING: u8 = 6;
+        const GOAWAY: u8 = 7;
+        const ACK: u8 = 1;
+        let server = serve(None, false).await;
+        drop(client(&server).await);
+        let mut sock = TcpStream::connect(("127.0.0.1", server.port)).expect("connects");
+        sock.set_read_timeout(Some(IDLE_TIMEOUT + std::time::Duration::from_secs(5))).expect("a timeout");
+        // the client preface and an empty SETTINGS frame
+        sock.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0").expect("writes");
+        let started = std::time::Instant::now();
+        let mut pings = 0;
+        loop {
+            let mut head = [0u8; 9];
+            sock.read_exact(&mut head).unwrap_or_else(|e| panic!("closed without GOAWAY after {:?}: {e}", started.elapsed()));
+            let len = usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
+            let mut payload = vec![0u8; len];
+            sock.read_exact(&mut payload).expect("a whole frame");
+            match head[3] {
+                PING if head[4] & ACK == 0 => {
+                    pings += 1;
+                    let mut ack = vec![0, 0, 8, PING, ACK, 0, 0, 0, 0];
+                    ack.extend_from_slice(&payload);
+                    sock.write_all(&ack).expect("writes");
+                }
+                GOAWAY => break,
+                _ => {}
+            }
+        }
+        assert!(pings >= 1, "no keepalive PING before GOAWAY");
+        assert!(started.elapsed() >= IDLE_TIMEOUT, "GOAWAY too soon: {:?}", started.elapsed());
+    }
+
+    /// One request may name at most MAX_ADDRESSES addresses; the control shows the address
+    /// count is what refuses it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn too_many_addresses_are_refused() {
+        let server = serve(None, true).await;
+        let client = client(&server).await;
+        for (count, needle) in [(MAX_ADDRESSES + 1, "at most"), (MAX_ADDRESSES, "bad transparent address")] {
+            let addresses = vec!["not an address".to_string(); count];
+            let refused = client.clone().get_taddress_balance(AddressList { addresses: addresses.clone() }).await;
+            let refused = refused.expect_err("refused");
+            assert_eq!(refused.code(), Code::InvalidArgument);
+            assert!(refused.message().contains(needle), "{count}: {refused:?}");
+            let utxos = client.clone().get_address_utxos(GetAddressUtxosArg { addresses, start_height: 0, max_entries: 0 }).await;
+            assert!(utxos.expect_err("refused").message().contains(needle), "{count}");
+        }
+    }
+
+    /// One block range may span at most MAX_BLOCK_RANGE blocks. The control span is allowed,
+    /// and ends only because the empty state has no blocks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn long_block_ranges_are_refused() {
+        let server = serve(None, true).await;
+        let client = client(&server).await;
+        let range = |end: u64| BlockRange {
+            start: Some(BlockId { height: 0, hash: Vec::new() }),
+            end: Some(BlockId { height: end, hash: Vec::new() }),
+            pool_types: Vec::new(),
+        };
+        let over = u64::from(MAX_BLOCK_RANGE);
+        assert_eq!(code_of_stream(client.clone().get_block_range(range(over)).await).await, Code::InvalidArgument);
+        assert_eq!(code_of_stream(client.clone().get_block_range(range(over - 1)).await).await, Code::OutOfRange);
+    }
+
+    /// SendTransaction still refuses bytes that are not a transaction, now parsed off the
+    /// server thread.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_transaction_refuses_bad_bytes() {
+        let server = serve(None, true).await;
+        let client = client(&server).await;
+        let refused = client.clone().send_transaction(RawTransaction { data: vec![1, 2, 3], height: 0 }).await;
+        let refused = refused.expect_err("refused");
+        assert_eq!(refused.code(), Code::InvalidArgument);
+        assert!(refused.message().contains("bad transaction bytes"), "{refused:?}");
     }
 }

@@ -201,6 +201,50 @@ impl StartCmd {
         }
     }
 
+    /// Where lightwallet_server listens, from the `[crosslink]` options. Unset ports default to
+    /// the P2P listen port + 10001 (gRPC) and + 10000 (readiness).
+    ///
+    /// Fails where a default doesn't fit in a port number, where the gRPC port is 0 (the
+    /// node's own wallet could not find it), where both ports are the same, or where the
+    /// token is empty.
+    fn lightwallet_server_listen(config: &ZebradConfig) -> Result<crate::lightwalletd::Listen, String> {
+        let crosslink = &config.crosslink;
+        let p2p_port = config.network.listen_addr.port();
+        let past_p2p = |offset: u16, option: &str| {
+            p2p_port.checked_add(offset).ok_or_else(|| {
+                format!(
+                    "network.listen_addr port {p2p_port} is too high for lightwallet_server's \
+                     default port, the P2P port + {offset}: set crosslink.{option}"
+                )
+            })
+        };
+        let grpc = match crosslink.lightwallet_server_listen_addr {
+            Some(addr) => addr,
+            None => {
+                let ip = if crosslink.public_lightwallet_server { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::LOCALHOST };
+                SocketAddr::from((ip, past_p2p(10001, "lightwallet_server_listen_addr")?))
+            }
+        };
+        let ready_port = match crosslink.lightwallet_server_ready_port {
+            Some(port) => port,
+            None => past_p2p(10000, "lightwallet_server_ready_port")?,
+        };
+        if grpc.port() == 0 {
+            return Err("crosslink.lightwallet_server_listen_addr needs a port other than 0".to_owned());
+        }
+        if ready_port == grpc.port() {
+            return Err(format!(
+                "lightwallet_server's gRPC and readiness ports are both {ready_port}: set \
+                 crosslink.lightwallet_server_listen_addr or crosslink.lightwallet_server_ready_port"
+            ));
+        }
+        let token = crosslink.lightwallet_server_token.as_ref().map(|token| token.as_str().to_owned());
+        if token.as_deref() == Some("") {
+            return Err("crosslink.lightwallet_server_token is empty".to_owned());
+        }
+        Ok(crate::lightwalletd::Listen { grpc, ready_port, token })
+    }
+
     /// Returns the default inbound peer IPs that always receive block gossip in
     /// zcashd-compat mode.
     fn zcashd_compat_default_block_gossip_peer_ips() -> Vec<IpAddr> {
@@ -992,8 +1036,12 @@ impl StartCmd {
         // service and mempool. This is lightwallet_server; it takes over the
         // legacy port, and the wallet connects to it unchanged.
         let lightwalletd_thread_handle = {
-            let zebra_port_base = config.network.listen_addr.port();
-            let lwd_port = zebra_port_base + 10001;
+            let listen = Self::lightwallet_server_listen(&config).map_err(|err| eyre!(err))?;
+            if config.crosslink.public_lightwallet_server && config.crosslink.lightwallet_server_listen_addr.is_some() {
+                warn!("crosslink.public_lightwallet_server is ignored: crosslink.lightwallet_server_listen_addr is set");
+            }
+            let lwd_port = listen.grpc.port();
+            let lwd_ready_port = listen.ready_port;
             let lwd_ctx = crate::lightwalletd::Ctx {
                 rt: tokio::runtime::Handle::current(),
                 read_state: read_only_state_service.clone(),
@@ -1003,8 +1051,9 @@ impl StartCmd {
                 mempool_events: mempool_transaction_subscriber.clone(),
                 network: config.network.network.clone(),
             };
-            let thread = crate::lightwalletd::lightwalletd_spawn(lwd_ctx, lwd_port, zebra_port_base + 10000, config.crosslink.public_lightwallet_server);
+            let thread = crate::lightwalletd::lightwalletd_spawn(lwd_ctx, listen);
             *zebra_crosslink::wallet::wallet_main_lightwalletd_port.lock().unwrap() = lwd_port;
+            *zebra_crosslink::wallet::wallet_main_lightwalletd_ready_port.lock().unwrap() = lwd_ready_port;
             thread
         };
 
@@ -1263,6 +1312,8 @@ impl config::Override<ZebradConfig> for StartCmd {
             .into());
         }
 
+        Self::lightwallet_server_listen(&config).map_err(std::io::Error::other)?;
+
         if config.zcashd_compat.enabled && config.zcashd_compat.manage_zcashd {
             zcashd_compat::reject_peer_selection_extra_args(
                 &config.zcashd_compat.zcashd_extra_args,
@@ -1296,6 +1347,64 @@ mod tests {
     use super::StartCmd;
     use crate::components::zcashd_compat;
     use crate::config::ZebradConfig;
+
+    /// lightwallet_server serves loopback on the P2P port + 10001 and + 10000 by default,
+    /// every interface with `public_lightwallet_server`, and what the options say otherwise.
+    #[test]
+    fn lightwallet_server_listens_where_configured() {
+        let mut config = ZebradConfig::default();
+        config.network.listen_addr.set_port(18233);
+        let listen = StartCmd::lightwallet_server_listen(&config).expect("valid");
+        assert_eq!((listen.grpc.to_string(), listen.ready_port, listen.token), ("[::1]:28234".to_owned(), 28233, None));
+
+        config.crosslink.public_lightwallet_server = true;
+        assert_eq!(StartCmd::lightwallet_server_listen(&config).expect("valid").grpc.to_string(), "[::]:28234");
+
+        config.crosslink.lightwallet_server_listen_addr = Some("192.0.2.7:9067".parse().expect("an address"));
+        config.crosslink.lightwallet_server_ready_port = Some(9068);
+        config.crosslink.lightwallet_server_token = Some("s3cret".into());
+        let listen = StartCmd::lightwallet_server_listen(&config).expect("valid");
+        assert_eq!(
+            (listen.grpc.to_string(), listen.ready_port, listen.token.as_deref()),
+            ("192.0.2.7:9067".to_owned(), 9068, Some("s3cret"))
+        );
+    }
+
+    /// A config lightwallet_server could not serve is refused when it loads, before start.
+    #[test]
+    fn unservable_lightwallet_server_configs_are_refused() {
+        let cmd = StartCmd { filters: Vec::new(), zcashd_compat: false, unsafe_low_specs: false };
+        let refused = |change: &dyn Fn(&mut ZebradConfig), needle: &str| {
+            let mut config = ZebradConfig::default();
+            change(&mut config);
+            let error = StartCmd::lightwallet_server_listen(&config).expect_err("refused");
+            assert!(error.contains(needle), "{error}");
+            assert!(cmd.override_config(config).expect_err("refused at load").to_string().contains(needle));
+        };
+        // the defaults past the P2P port don't fit in a port number
+        refused(&|c| c.network.listen_addr.set_port(55535), "lightwallet_server_listen_addr");
+        refused(
+            &|c| {
+                c.network.listen_addr.set_port(55536);
+                c.crosslink.lightwallet_server_listen_addr = Some("[::1]:9067".parse().expect("an address"));
+            },
+            "lightwallet_server_ready_port",
+        );
+        refused(&|c| c.crosslink.lightwallet_server_listen_addr = Some("[::1]:0".parse().expect("an address")), "other than 0");
+        refused(
+            &|c| {
+                c.crosslink.lightwallet_server_listen_addr = Some("[::1]:9067".parse().expect("an address"));
+                c.crosslink.lightwallet_server_ready_port = Some(9067);
+            },
+            "both 9067",
+        );
+        refused(&|c| c.crosslink.lightwallet_server_token = Some("".into()), "token is empty");
+
+        // the highest P2P port whose defaults fit
+        let mut config = ZebradConfig::default();
+        config.network.listen_addr.set_port(55534);
+        assert_eq!(StartCmd::lightwallet_server_listen(&config).expect("valid").grpc.port(), u16::MAX);
+    }
 
     #[test]
     fn zcashd_compat_flag_enables_mode() {

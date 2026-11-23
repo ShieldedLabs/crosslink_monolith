@@ -498,6 +498,18 @@ impl StakingParameters {
         2 * self.period - self.day_window
     }
 
+    /// The height the chain a withdrawal extends must have finalized, at least, before a bond
+    /// unbonded at `unbonded_at` can be withdrawn under `rule`.
+    pub const fn withdrawal_required_finalized(&self, rule: WithdrawalFinality, unbonded_at: u32) -> u32 {
+        match rule {
+            WithdrawalFinality::PastUnbonding => unbonded_at.saturating_add(1),
+            WithdrawalFinality::PeriodsPastUnbonding(n) => {
+                unbonded_at.saturating_add(n.saturating_mul(self.period)).saturating_add(1)
+            }
+            WithdrawalFinality::NextStakingPeriod => (unbonded_at / self.period + 1).saturating_mul(self.period),
+        }
+    }
+
     /// Whether consensus can run on this calendar: a non-empty day window no longer than the
     /// period (which also keeps the `height % period` checks off zero), and an action delay longer
     /// than the day window.
@@ -510,6 +522,31 @@ impl StakingParameters {
         self.day_window > 0 && self.day_window <= self.period && self.action_delay > self.day_window
     }
 }
+
+/// What the chain a withdrawal extends must have finalized before an unbonded bond can be
+/// withdrawn, from FeaturenetUpgrade3 (#287). Each asks that some block after the unbonding is
+/// final, which shows BFT stayed live after it: a withdrawal waits while finality is stalled, so
+/// the stake stays slashable. See [`StakingParameters::withdrawal_required_finalized`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WithdrawalFinality {
+    /// The book's provisional B: the finalized height is past the unbonding.
+    PastUnbonding,
+    /// The book's provisional C: the finalized height is more than this many staking periods
+    /// past the unbonding. An unbonding late in a staking day can then miss the next day's window
+    /// and wait a further period.
+    PeriodsPastUnbonding(u32),
+    /// Option D (#287): the first block of the staking period after the unbonding's is final, so
+    /// every unbonding in a staking day is withdrawable from the same point in the next one.
+    NextStakingPeriod,
+}
+
+/// The withdrawal finality rule FeaturenetUpgrade3 applies: keep exactly one of these lines.
+/// `None` leaves the rule off, so withdrawals follow the older rules even after the upgrade.
+/// B is the provisional choice (#287).
+// pub const WITHDRAWAL_FINALITY: Option<WithdrawalFinality> = None;
+pub const WITHDRAWAL_FINALITY: Option<WithdrawalFinality> = Some(WithdrawalFinality::PastUnbonding); // B
+// pub const WITHDRAWAL_FINALITY: Option<WithdrawalFinality> = Some(WithdrawalFinality::PeriodsPastUnbonding(1)); // C, N = 1
+// pub const WITHDRAWAL_FINALITY: Option<WithdrawalFinality> = Some(WithdrawalFinality::NextStakingPeriod); // D
 
 /// The staking calendar every real network uses.
 pub const PROTOTYPE_STAKING: StakingParameters = StakingParameters {
@@ -1470,6 +1507,26 @@ pub struct ScanInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each withdrawal finality rule's threshold for an unbonding at the start and at the end of
+    /// a staking day. Only the selected rule runs end to end, so this keeps the others checked.
+    #[test]
+    fn withdrawal_finality_rules_name_their_thresholds() {
+        use WithdrawalFinality::*;
+        let s = PROTOTYPE_STAKING;
+        let (first, last) = (2 * s.period, 2 * s.period + s.day_window - 1);
+        let required = |rule, unbonded_at| s.withdrawal_required_finalized(rule, unbonded_at);
+
+        assert_eq!(required(PastUnbonding, first), first + 1);
+        assert_eq!(required(PastUnbonding, last), last + 1);
+        assert_eq!(required(PeriodsPastUnbonding(1), first), first + s.period + 1);
+        assert_eq!(required(PeriodsPastUnbonding(1), last), last + s.period + 1);
+        // C with one period puts a late unbonding past the next staking day's window.
+        assert!(required(PeriodsPastUnbonding(1), last) >= 3 * s.period + s.day_window);
+        // D gives every unbonding in a staking day the first block of the next period.
+        assert_eq!(required(NextStakingPeriod, first), 3 * s.period);
+        assert_eq!(required(NextStakingPeriod, last), 3 * s.period);
+    }
 
     // The Nightly network's live finalizers, from their `explicit_bft_key_seed` strings.
     #[test]
