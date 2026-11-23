@@ -908,6 +908,8 @@ fn feed_ready_decisions(
     }
     let mut fed = 0;
     loop {
+        // Rows this node stored before it stopped come first: they need nothing from a peer.
+        bft_runner.feed_stored(read_state, block_writer);
         let next = bft::decided_len();
         // Heights decided meanwhile, by tenderlink or an earlier feed, are no longer wanted.
         while fetched.first_key_value().is_some_and(|(&height, _)| height < next) {
