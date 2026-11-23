@@ -497,6 +497,22 @@ pub fn bft_recency_status() -> TFLRecencyStatus {
 // republish the status then: the sync thread publishes this part itself, and the engine copies it.
 static PARKED_DECISION_HEIGHT: Mutex<Option<u64>> = Mutex::new(None);
 
+/// How many times `restore` has run since this node started, for the recency status.
+static BFT_RESTORES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Tenderlink is held back while catching up, for the recency status.
+static TENDERLINK_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn publish_restored() {
+    let restores = BFT_RESTORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    RECENCY_STATUS.send_modify(|status| status.bft_restores = restores);
+}
+
+fn publish_tenderlink_held(held: bool) {
+    TENDERLINK_HELD.store(held, std::sync::atomic::Ordering::Relaxed);
+    RECENCY_STATUS.send_modify(|status| status.tenderlink_held = held);
+}
+
 fn publish_parked_decision_height(height: Option<u64>) {
     *PARKED_DECISION_HEIGHT.lock().unwrap() = height;
     RECENCY_STATUS.send_modify(|status| status.parked_decision_height = height);
@@ -2865,6 +2881,7 @@ impl BftRunner {
     /// stored bytes: a roster that disagreed with the stored votes would re-index every one of
     /// them through seats that never voted (FINALITY.md §8.1).
     fn restore(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
+        publish_restored();
         // The stored chain is taken in one decision at a time, and only its newest blocks are kept
         // (`HeldBlocks`), so it is never all in memory.
         let stored = |height: usize| block_writer.finalized_state.db.bft_decision(u32::try_from(height).ok()?);
@@ -3115,9 +3132,11 @@ impl BftRunner {
             }
             // `tick` starts it from the decided tip once caught up.
             self.spawn_deferred = true;
+            publish_tenderlink_held(true);
             return;
         }
         let Some(launch) = self.launch.take() else { return; };
+        publish_tenderlink_held(false);
         tracing::info!("starting tenderlink at BFT height {} with {} finalizer(s)", height_after(&ingest), roster.len());
         BFT_CHAIN.write().unwrap().is_activated = true;
 
@@ -3290,6 +3309,8 @@ fn recency_status_from(bft_state: &TMState, bft_key_address_map: &BftAddressMap)
         my_valid_round: bft_state.valid_value_round.1,
         finalizer_statuses,
         parked_decision_height: *PARKED_DECISION_HEIGHT.lock().unwrap(),
+        bft_restores: BFT_RESTORES.load(std::sync::atomic::Ordering::Relaxed),
+        tenderlink_held: TENDERLINK_HELD.load(std::sync::atomic::Ordering::Relaxed),
     }
 }
 
