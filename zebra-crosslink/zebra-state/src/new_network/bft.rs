@@ -2049,6 +2049,37 @@ impl BftRunner {
         }
     }
 
+    /// What a fetched or stored decision waits on before anything about it can be settled, in
+    /// this order: a parked decision holds the height; genesis is never fetched (judged by our
+    /// bootstrap config, so not the peer's fault); it must be the next height; and its snapshot
+    /// must be held. Checking those first keeps a decision waiting in the fetch window from being
+    /// verified again on every PoW commit. A stored decision's missing snapshot is marked to be
+    /// fetched, since this node decided it; a fetched one's is not, as it is missing only for now.
+    /// Returns the chain these were read against.
+    fn fetch_window(&self, source: Source, block: &BftBlock, read_state: &ReadState) -> Result<std::sync::RwLockReadGuard<'static, BftChain>, Refusal> {
+        let height = u64::from(block.height);
+        if self.parked_decision.is_some() {
+            return Err(Refusal::not_yet("a decided BFT block is waiting for its snapshot".to_string()));
+        }
+        if source == Source::Fetched && height == 0 && !self.fetches_genesis() {
+            return Err(Refusal::refused("genesis is derived from the chain, never fetched".to_string()));
+        }
+        let chain = BFT_CHAIN.read().unwrap();
+        // usize to u64 is lossless on every supported target.
+        if height != chain.blocks.len() as u64 {
+            return Err(Refusal::not_yet(format!("BFT height {height} is not the next height to decide")));
+        }
+        let snapshot = Hash(block.snapshot_block_hash().0);
+        if read_state.known_block(snapshot).is_none() {
+            if source == Source::Stored {
+                // On the decided chain: fetched whatever height a peer alleges, and never expired.
+                DECIDED_MISSING_POW_BLOCKS.lock().unwrap().insert(snapshot);
+            }
+            return Err(Refusal::not_yet(format!("the snapshot of BFT height {height} is not held yet")));
+        }
+        Ok(chain)
+    }
+
     /// The checks a decision gets before it is stored, by where it comes from. Each check any path
     /// ran before `store_decision` existed still runs on that path, once, and in the same order
     /// where the order decides the answer or the cost. Nothing is written here. Tenderlink's own
@@ -2072,14 +2103,7 @@ impl BftRunner {
         // it is one `restore` would have replayed had its snapshot been held.
         if source == Source::Stored {
             let () = ASSUME_REPLAY_ROWS_ARE_THIS_NODES;
-            if self.parked_decision.is_some() {
-                return Err(Refusal::not_yet("a decided BFT block is waiting for its snapshot".to_string()));
-            }
-            let chain = BFT_CHAIN.read().unwrap();
-            // usize to u64 is lossless on every supported target.
-            if height != chain.blocks.len() as u64 {
-                return Err(Refusal::not_yet(format!("BFT height {height} is not the next height to decide")));
-            }
+            let chain = self.fetch_window(source, block, read_state)?;
             if !links_to_tip(&chain, block) {
                 return Err(Refusal::refused(format!("the stored decision at BFT height {height} does not link to the decided tip")));
             }
@@ -2087,37 +2111,12 @@ impl BftRunner {
             if block.headers.is_empty() {
                 return Err(Refusal::refused(format!("BFT height {height} is stored without headers")));
             }
-            let snapshot = Hash(block.snapshot_block_hash().0);
-            if read_state.known_block(snapshot).is_none() {
-                // This node stored the decision, so the snapshot is on the decided chain: fetched
-                // whatever height a peer alleges, and never expired.
-                DECIDED_MISSING_POW_BLOCKS.lock().unwrap().insert(snapshot);
-                return Err(Refusal::not_yet(format!("the snapshot of BFT height {height} is not held yet")));
-            }
             let voting = self.next_voting_roster(&chain);
             return Ok(Admitted::New { block_hash: block.blake3_hash(), voting, proposal_sigs: proposal_sigs.to_vec() });
         }
 
         if source == Source::Fetched {
-            // A parked decision holds this height until its snapshot is back.
-            if self.parked_decision.is_some() {
-                return Err(Refusal::not_yet("a decided BFT block is waiting for its snapshot".to_string()));
-            }
-            // Judged by our bootstrap config, so not the peer's fault.
-            if height == 0 && !self.fetches_genesis() {
-                return Err(Refusal::refused("genesis is derived from the chain, never fetched".to_string()));
-            }
-            let chain = BFT_CHAIN.read().unwrap();
-            // usize to u64 is lossless on every supported target.
-            if height != chain.blocks.len() as u64 {
-                return Err(Refusal::not_yet(format!("BFT height {height} is not the next height to decide")));
-            }
-            // Nothing about it settles before its snapshot is committed. Checking first would
-            // verify its signatures and carried headers again on every PoW commit while it waits
-            // in the fetch window, and mark the snapshot as missing, which it is only for now.
-            if read_state.known_block(Hash(block.snapshot_block_hash().0)).is_none() {
-                return Err(Refusal::not_yet(format!("the snapshot of BFT height {height} is not committed yet")));
-            }
+            drop(self.fetch_window(source, block, read_state)?);
         }
         // Hashing re-serializes the block, so it is done once here, after the fetch-window checks.
         let block_hash = block.blake3_hash();
@@ -2177,8 +2176,9 @@ impl BftRunner {
                 return Ok(Admitted::AlreadyDecided);
             }
             // A decision at this height is already final and waits only for its snapshot;
-            // storing another one here would fork the chain under it. (A fetched decision was
-            // held back for it above.)
+            // storing another one here would fork the chain under it. Fetched and stored ones were
+            // held back for it in `fetch_window`; an import is checked only here, after the
+            // already-decided answer above, so an import of the decided block is told so.
             if matches!(source, Source::Imported { .. }) && self.parked_decision.is_some() {
                 return Err(Refusal::not_yet("a decided BFT block is waiting for its snapshot".to_string()));
             }
