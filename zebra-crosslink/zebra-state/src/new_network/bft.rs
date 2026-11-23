@@ -360,7 +360,42 @@ pub(super) fn missing_pow_blocks(read_state: &ReadState) -> Vec<Hash> {
     retain_missing_pow_blocks(&mut missing, super::clock(), |hash| read_state.known_block(hash).is_some());
     let mut decided = DECIDED_MISSING_POW_BLOCKS.lock().unwrap();
     decided.retain(|hash| read_state.known_block(*hash).is_none());
+    metrics::gauge!("state.crosslink.bft_decided_missing_pow_blocks").set(decided.len() as f64);
+    let report = decided_missing_report(&mut DECIDED_MISSING_SINCE.lock().unwrap(), decided.len(), super::clock());
+    if let (Some(waited), Some(example)) = (report, decided.iter().next()) {
+        tracing::warn!(
+            "crosslink: BFT has waited {} min for {} PoW block(s) on the decided chain that no peer has \
+             supplied (one is {example}); it finalizes nothing until they arrive. Check that this node \
+             has peers holding that chain.",
+            waited.as_secs() / 60, decided.len(),
+        );
+    }
     missing.keys().chain(decided.iter().filter(|hash| !missing.contains_key(*hash))).copied().collect()
+}
+
+/// While `DECIDED_MISSING_POW_BLOCKS` is not empty: since when, and when it was last reported.
+/// The set as a whole is timed, not each hash, because following previous-block hashes swaps one
+/// hash for its parent while the wait goes on.
+static DECIDED_MISSING_SINCE: Mutex<Option<(std::time::Instant, std::time::Instant)>> = Mutex::new(None);
+
+/// How long the decided chain has waited, when that is due to be reported again: every
+/// `DROPPED_BFT_REPORT_INTERVAL` while `missing` blocks are still missing, as a dropped BFT is.
+/// The start of a wait is not reported here; restore and parking say so when it begins.
+fn decided_missing_report(
+    waiting: &mut Option<(std::time::Instant, std::time::Instant)>,
+    missing: usize,
+    now: std::time::Instant,
+) -> Option<std::time::Duration> {
+    if missing == 0 {
+        *waiting = None;
+        return None;
+    }
+    let (since, last_report) = waiting.get_or_insert((now, now));
+    if now.saturating_duration_since(*last_report) < DROPPED_BFT_REPORT_INTERVAL {
+        return None;
+    }
+    *last_report = now;
+    Some(now.saturating_duration_since(*since))
 }
 
 /// PoW blocks this node lacks that are a decided snapshot or one of its ancestors.
@@ -1482,6 +1517,10 @@ pub(super) struct BftRunner {
     stored_from: Option<u64>,
     /// `restore` is feeding the stored chain in.
     restoring: bool,
+    /// The height and certificate of the last fetched decision `fetch_window` found valid. A
+    /// decision waiting for its snapshot is fed again on every PoW commit, and its signatures need
+    /// checking only once there; `admit_decision` checks them again before it is stored.
+    screened_certificate: std::cell::RefCell<Option<(u64, FatPointerToBftBlock)>>,
 }
 
 /// The BFT height after the last of `rounds`: where tenderlink starts when it is given them.
@@ -1827,6 +1866,7 @@ impl BftRunner {
             has_wal: false,
             stored_from: None,
             restoring: false,
+            screened_certificate: std::cell::RefCell::new(None),
         };
         metrics::gauge!("state.crosslink.bft_dropped").set(0.0);
         *BFT_DB.write().unwrap() = Some(block_writer.finalized_state.db.clone());
@@ -2044,12 +2084,12 @@ impl BftRunner {
 
     /// What a fetched or stored decision waits on before anything about it can be settled, in
     /// this order: a parked decision holds the height; genesis is never fetched (judged by our
-    /// bootstrap config, so not the peer's fault); it must be the next height; and its snapshot
-    /// must be held. Checking those first keeps a decision waiting in the fetch window from being
-    /// verified again on every PoW commit. A stored decision's missing snapshot is marked to be
-    /// fetched, since this node decided it; a fetched one's is not, as it is missing only for now.
-    /// Returns the chain these were read against.
-    fn fetch_window(&self, source: Source, block: &BftBlock, read_state: &ReadState) -> Result<std::sync::RwLockReadGuard<'static, BftChain>, Refusal> {
+    /// bootstrap config, so not the peer's fault); it must be the next height; a fetched one must
+    /// have a roster with stake, name its block and carry a valid certificate; and its snapshot
+    /// must be held. A stored decision's missing snapshot is marked to be fetched, since this node
+    /// decided it; a fetched one's is not, as it is missing only for now. Returns the chain these
+    /// were read against.
+    fn fetch_window(&self, source: Source, block: &BftBlock, fat_pointer: &FatPointerToBftBlock, read_state: &ReadState) -> Result<std::sync::RwLockReadGuard<'static, BftChain>, Refusal> {
         let height = u64::from(block.height);
         if self.parked_decision.is_some() {
             return Err(Refusal::not_yet("a decided BFT block is waiting for its snapshot".to_string()));
@@ -2061,6 +2101,38 @@ impl BftRunner {
         // usize to u64 is lossless on every supported target.
         if height != chain.blocks.len() as u64 {
             return Err(Refusal::not_yet(format!("BFT height {height} is not the next height to decide")));
+        }
+        if source == Source::Fetched {
+            let voting = self.next_voting_roster(&chain);
+            // Past genesis, a roster with no stake has no honest decision to accept: the chain
+            // has failed, and only an operator can move it on (an import). Hold the decision,
+            // say so once.
+            if height > 0 && voting.roster.iter().map(|member| member.stake).sum::<u64>() == 0 {
+                if !ZERO_STAKE_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::error!(
+                        "crosslink: BFT height {} has no stake in its roster, so no decision there is accepted from peers. \
+                         BFT cannot continue without manual intervention.",
+                        height,
+                    );
+                }
+                return Err(Refusal::not_yet(format!("BFT height {height} has no stake in its roster")));
+            }
+            // A decision that waits here keeps its height in the sync loop's fetch window,
+            // and the loop asks nobody else for a height it holds. So before one may wait, it must
+            // name its block and be a valid certificate for this height, which need only what this
+            // node holds; otherwise any peer could hold a height with a block on a made-up
+            // snapshot. The certificate is checked once per decision, not on every PoW commit
+            // while it waits; `admit_decision` checks it again before it is stored.
+            if fat_pointer.points_at_block_hash() != block.blake3_hash() {
+                return Err(Refusal::fault(format!("the fat pointer for BFT height {height} names another block")));
+            }
+            let mut screened = self.screened_certificate.borrow_mut();
+            if screened.as_ref() != Some(&(height, fat_pointer.clone())) {
+                if !certificate_is_valid(fat_pointer, height, &voting) {
+                    return Err(Refusal::refused(format!("the fat pointer is not a valid certificate for BFT height {height}")));
+                }
+                *screened = Some((height, fat_pointer.clone()));
+            }
         }
         let snapshot = Hash(block.snapshot_block_hash().0);
         if read_state.known_block(snapshot).is_none() {
@@ -2096,7 +2168,7 @@ impl BftRunner {
         // it is one `restore` would have replayed had its snapshot been held.
         if source == Source::Stored {
             let () = ASSUME_REPLAY_ROWS_ARE_THIS_NODES;
-            let chain = self.fetch_window(source, block, read_state)?;
+            let chain = self.fetch_window(source, block, fat_pointer, read_state)?;
             if !links_to_tip(&chain, block) {
                 return Err(Refusal::refused(format!("the stored decision at BFT height {height} does not link to the decided tip")));
             }
@@ -2109,29 +2181,14 @@ impl BftRunner {
         }
 
         if source == Source::Fetched {
-            drop(self.fetch_window(source, block, read_state)?);
+            drop(self.fetch_window(source, block, fat_pointer, read_state)?);
         }
         // Hashing re-serializes the block, so it is done once here, after the fetch-window checks.
         let block_hash = block.blake3_hash();
 
         match source {
-            Source::Fetched => {
-                let chain = BFT_CHAIN.read().unwrap();
-                // Past genesis, a roster with no stake has no honest decision to accept: the chain
-                // has failed, and only an operator can move it on (an import). Hold the decision,
-                // say so once.
-                let voting = self.next_voting_roster(&chain);
-                if height > 0 && voting.roster.iter().map(|member| member.stake).sum::<u64>() == 0 {
-                    if !ZERO_STAKE_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        tracing::error!(
-                            "crosslink: BFT height {} has no stake in its roster, so no decision there is accepted from peers. \
-                             BFT cannot continue without manual intervention.",
-                            height,
-                        );
-                    }
-                    return Err(Refusal::not_yet(format!("BFT height {height} has no stake in its roster")));
-                }
-            }
+            // Its next-height, stake and certificate checks ran in `fetch_window`.
+            Source::Fetched => {}
             Source::Imported { .. } => {}
             Source::Stored => unreachable!("returned above"),
             Source::Tenderlink => {
@@ -3367,6 +3424,26 @@ mod tests {
         assert!(chain.voting_rosters[4].strict_quorum, "an unknown snapshot keeps watermark 50");
         assert_eq!(tip.final_snapshot, final_at(55));
         assert!(*tip.next_voting == *next_voting(&chain, &network, slashforks), "the tip holds the next height's roster");
+    }
+
+    /// While decided-chain PoW blocks stay missing, the wait is reported every
+    /// `DROPPED_BFT_REPORT_INTERVAL` with how long it has lasted, and a wait that ends starts the
+    /// clock again.
+    #[test]
+    fn a_wait_for_decided_pow_blocks_is_reported_every_interval() {
+        let start = std::time::Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        let interval = DROPPED_BFT_REPORT_INTERVAL.as_secs();
+        let mut waiting = None;
+        assert_eq!(decided_missing_report(&mut waiting, 0, at(0)), None, "nothing missing");
+        assert_eq!(decided_missing_report(&mut waiting, 2, at(0)), None, "the start of a wait is reported elsewhere");
+        assert_eq!(decided_missing_report(&mut waiting, 2, at(interval - 1)), None);
+        assert_eq!(decided_missing_report(&mut waiting, 1, at(interval)), Some(std::time::Duration::from_secs(interval)));
+        assert_eq!(decided_missing_report(&mut waiting, 1, at(interval + 10)), None, "reported once per interval");
+        assert_eq!(decided_missing_report(&mut waiting, 3, at(2 * interval)), Some(std::time::Duration::from_secs(2 * interval)));
+        assert_eq!(decided_missing_report(&mut waiting, 0, at(2 * interval + 1)), None, "the wait ended");
+        assert_eq!(decided_missing_report(&mut waiting, 1, at(3 * interval)), None, "a new wait starts its own clock");
+        assert_eq!(decided_missing_report(&mut waiting, 1, at(4 * interval)), Some(std::time::Duration::from_secs(interval)));
     }
 
     #[test]

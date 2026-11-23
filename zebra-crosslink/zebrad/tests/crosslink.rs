@@ -5125,6 +5125,66 @@ fn crosslink_bft_own_candidate_failing_the_block_rules_is_refused_without_a_cras
     test_bytes(tf.write_to_bytes());
 }
 
+/// A peer answering the node's BFT request with a decision for the next height on a
+/// snapshot nobody has, signed by nobody, must not keep the node from fetching that height from
+/// others. The honest peer's decision finalizes a PoW block that is loaded only at the end, so the
+/// node keeps it only if it asked that peer for it: an unasked decision that cannot be stored at
+/// once is dropped. A made-up decision allowed to wait for its snapshot would hold the height in
+/// the fetch window, the node would ask nobody else for it, and the honest decision would be
+/// dropped.
+fn fetched_decision_on_a_made_up_snapshot_scene(test_name: &'static str, bad_peer_answers: bool) {
+    set_test_name(test_name);
+    use zebra_state::new_network::bft_sync;
+    const BAD: u64 = 7;
+    const HONEST: u64 = 8;
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let mut scene = bft_rounds_scene(&mut tf, &[false]);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    let genesis = FatPointerToBftBlock::from_parts(scene.genesis().blake3_hash(), 0, 0, &[]);
+    let sigma = BFT_ROUNDS_PARAMETERS.bc_confirmation_depth_sigma;
+    let miner = scene.miner.clone();
+    let mut made_up_gen = scene.gen.clone();
+    // Above the node's tip, loaded only at the end.
+    let later: Vec<Arc<Block>> = (0..1 + sigma).map(|_| scene.gen.next_block(&miner)).collect();
+    let honest = bft_proposal(&BFT_ROUNDS_PARAMETERS, 1, genesis.clone(), 0, &later[1..]);
+    let honest_fat_ptr = scene_certificate(&scene, &honest, 1);
+    let decision_packet = |block: &BftBlock, fat_ptr: &FatPointerToBftBlock| {
+        bft_sync::bft_decisions_packet(std::iter::once((1u64, block, fat_ptr, &[][..])))
+    };
+
+    if bad_peer_answers {
+        // On a branch no node has, and signed by nobody.
+        let other = Address::Transparent(zcash_transparent::address::TransparentAddress::PublicKeyHash([9u8; 20]));
+        let made_up: Vec<Arc<Block>> = (0..1 + sigma).map(|_| made_up_gen.next_block(&other)).collect();
+        let bogus = bft_proposal(&BFT_ROUNDS_PARAMETERS, 1, genesis, 0, &made_up[1..]);
+        let bogus_fat_ptr = FatPointerToBftBlock::from_parts(bogus.blake3_hash(), 1, 0, &[]);
+        tf.push_instr_recv_stp_packet(&bft_sync::bft_status_packet(3), BAD, 0);
+        tf.push_instr_recv_stp_packet(&decision_packet(&bogus, &bogus_fat_ptr), BAD, 0);
+        tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    }
+    tf.push_instr_recv_stp_packet(&bft_sync::bft_status_packet(3), HONEST, 0);
+    tf.push_instr_recv_stp_packet(&decision_packet(&honest, &honest_fat_ptr), HONEST, 0);
+    tf.push_instr_expect_pos_chain_length(1, 0);
+    for block in &later {
+        tf.push_instr_load_pow(block, 0);
+    }
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+    tf.push_instr_expect_bft_dropped(false, None, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+#[test]
+fn crosslink_bft_fetched_decision_on_a_made_up_snapshot_does_not_hold_its_height() {
+    fetched_decision_on_a_made_up_snapshot_scene(function_name!(), true);
+}
+
+#[test]
+fn crosslink_bft_fetched_decision_on_a_made_up_snapshot_does_not_hold_its_height_control() {
+    fetched_decision_on_a_made_up_snapshot_scene(function_name!(), false);
+}
+
 /// An imported decision whose snapshot this node does not hold is refused at once, as it always
 /// was, not parked: a parked import would hold the node's BFT intake until its snapshot showed up,
 /// before its signatures were even checked. A valid import of the same height right after it is
