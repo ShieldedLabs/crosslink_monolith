@@ -503,11 +503,6 @@ static BFT_RESTORES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 /// Tenderlink is held back while catching up, for the recency status.
 static TENDERLINK_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn publish_restored() {
-    let restores = BFT_RESTORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    RECENCY_STATUS.send_modify(|status| status.bft_restores = restores);
-}
-
 fn publish_tenderlink_held(held: bool) {
     TENDERLINK_HELD.store(held, std::sync::atomic::Ordering::Relaxed);
     RECENCY_STATUS.send_modify(|status| status.tenderlink_held = held);
@@ -1677,24 +1672,6 @@ fn stakes_at(block_writer: &WriteBlockWorkerTask, snapshot: Hash) -> Vec<RosterM
         .into_iter()
         .map(|s| RosterMember { pub_key: s.0, voting_power: s.1, txids: Vec::new(), finalizer_address: None })
         .collect()
-}
-
-/// Adds a stored decision to `chain` as `restore` replays it: voted on by the roster the chain
-/// holds for its height, as when it was decided, and applied by `apply_decision`, as when it was
-/// decided. `final_snapshot` is `None` only where BFT was dropped and this state no longer holds
-/// the snapshot.
-fn replay_decision(
-    chain: &mut BftChain,
-    network: &Network,
-    slashforks: &[SlashForkConfig],
-    block: BftBlock,
-    fat_pointer: FatPointerToBftBlock,
-    final_snapshot: Option<(Height, Hash)>,
-    stakes: Vec<RosterMember>,
-) -> Arc<DecidedTip> {
-    let voted = next_voting(chain, network, slashforks);
-    let block_hash = block.blake3_hash();
-    apply_decision(chain, network, slashforks, block, block_hash, fat_pointer, voted, stakes, final_snapshot)
 }
 
 /// The rounds tenderlink starts with: those that decided the newest
@@ -2881,7 +2858,8 @@ impl BftRunner {
     /// stored bytes: a roster that disagreed with the stored votes would re-index every one of
     /// them through seats that never voted (FINALITY.md §8.1).
     fn restore(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
-        publish_restored();
+        let restores = BFT_RESTORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        RECENCY_STATUS.send_modify(|status| status.bft_restores = restores);
         // The stored chain is taken in one decision at a time, and only its newest blocks are kept
         // (`HeldBlocks`), so it is never all in memory.
         let stored = |height: usize| block_writer.finalized_state.db.bft_decision(u32::try_from(height).ok()?);
@@ -2969,7 +2947,10 @@ impl BftRunner {
             let snapshot = Hash(block.snapshot_block_hash().0);
             let final_snapshot = read_state.known_block(snapshot).map(|known| (known.height, snapshot));
             let stakes = stakes_at(block_writer, snapshot);
-            let tip = replay_decision(&mut chain, &self.network, slashforks, block, fat_pointer, final_snapshot, stakes);
+            // Voted on by the roster the chain holds for its height, as when it was decided.
+            let voted = next_voting(&chain, &self.network, slashforks);
+            let block_hash = block.blake3_hash();
+            let tip = apply_decision(&mut chain, &self.network, slashforks, block, block_hash, fat_pointer, voted, stakes, final_snapshot);
             let () = ASSUME_TIP_PUBLISHED_AFTER_ROW;
             publish_tip(&tip);
         }
@@ -3340,16 +3321,14 @@ mod tests {
         }
     }
 
-    /// `restore` replays the stored chain through `replay_decision`; a live decision goes through
-    /// `apply_decision` voted on by the roster `next_voting` gives. Both must build the same
-    /// chain: the same voting roster at every height, the same stakes and the same tip, with the
-    /// same roster for the next height. Restore's own derivation once drifted from the live one
-    /// (a finalizer jailed a certificate early at a slashfork boundary); this pins them together.
-    /// The steps cover changed stakes, empty stakes (the ghost roster carries the last forward),
-    /// a watermark crossing FeaturenetUpgrade2 (the strict quorum starts), and an unknown snapshot
-    /// with BFT dropped (the last final snapshot stands).
+    /// A chain decided through `apply_decision`, each height voted on by the roster `next_voting`
+    /// gives, follows the roster rules. Restore takes stored decisions in through the same step
+    /// (`Source::Stored`), so there is no separate derivation to drift; one once did (a finalizer
+    /// jailed a certificate early at a slashfork boundary). The steps cover changed stakes, empty
+    /// stakes (the ghost roster carries the last forward), a watermark crossing FeaturenetUpgrade2
+    /// (the strict quorum starts), and an unknown snapshot (the last final snapshot stands).
     #[test]
-    fn replaying_stored_decisions_builds_the_chain_deciding_them_built() {
+    fn deciding_a_chain_follows_the_roster_rules() {
         let network = Network::new_regtest(zebra_chain::parameters::testnet::RegtestParameters::from(
             zebra_chain::parameters::testnet::ConfiguredActivationHeights { featurenet_upgrade_2: Some(50), ..Default::default() },
         ));
@@ -3363,8 +3342,7 @@ mod tests {
             (vec![member(3, 30)], None),
             (vec![member(3, 30), member(5, 50)], final_at(55)),
         ];
-        let mut live = BftChain::new();
-        let mut replayed = BftChain::new();
+        let mut chain = BftChain::new();
         let mut previous = FatPointerToBftBlock::null();
         for (height, (stakes, final_snapshot)) in steps.into_iter().enumerate() {
             let mut block = test_block(2);
@@ -3373,37 +3351,22 @@ mod tests {
             let block_hash = block.blake3_hash();
             let fat_pointer = FatPointerToBftBlock::from_parts(block_hash, height as u64, 0, &[]);
             previous = fat_pointer.clone();
-            let voted = next_voting(&live, &network, slashforks);
-            apply_decision(&mut live, &network, slashforks, block.clone(), block_hash, fat_pointer.clone(), voted, stakes.clone(), final_snapshot);
-            replay_decision(&mut replayed, &network, slashforks, block, fat_pointer, final_snapshot, stakes);
+            let voted = next_voting(&chain, &network, slashforks);
+            apply_decision(&mut chain, &network, slashforks, block, block_hash, fat_pointer, voted, stakes, final_snapshot);
         }
 
-        let members = |roster: &[SortedRosterMember]| roster.iter().map(|m| (m.pub_key, m.stake)).collect::<Vec<_>>();
-        assert_eq!(live.voting_rosters.len(), 5);
-        assert_eq!(replayed.voting_rosters.len(), 5);
-        for (height, (a, b)) in live.voting_rosters.iter().zip(&replayed.voting_rosters).enumerate() {
-            assert!(**a == **b, "the roster that voted at height {height} differs");
-        }
-        let stakes = |roster: &[RosterMember]| roster.iter().map(|m| (m.pub_key, m.voting_power)).collect::<Vec<_>>();
-        assert_eq!(stakes(&live.roster), stakes(&replayed.roster));
-        let (live_tip, replayed_tip) = (live.tip.expect("five decisions"), replayed.tip.expect("five decisions"));
-        assert_eq!(
-            (live_tip.height, live_tip.block_hash, live_tip.final_snapshot),
-            (replayed_tip.height, replayed_tip.block_hash, replayed_tip.final_snapshot),
-        );
-        assert!(*live_tip.next_voting == *replayed_tip.next_voting);
-        assert_eq!(members(&live_tip.next_roster), members(&replayed_tip.next_roster));
-
-        // And what both built is what the rules say.
+        assert_eq!(chain.voting_rosters.len(), 5);
+        let tip = chain.tip.clone().expect("five decisions");
         let keys = |voting: &VotingRoster| voting.roster.iter().map(|m| m.pub_key.0[0]).collect::<Vec<_>>();
-        assert!(keys(&live.voting_rosters[0]).is_empty(), "genesis is decided by the nil roster");
-        let mut ghost = keys(&live.voting_rosters[2]);
+        assert!(keys(&chain.voting_rosters[0]).is_empty(), "genesis is decided by the nil roster");
+        let mut ghost = keys(&chain.voting_rosters[2]);
         ghost.sort();
         assert_eq!(ghost, vec![1, 2], "empty stakes at height 1's snapshot carry height 0's forward");
-        assert!(!live.voting_rosters[2].strict_quorum, "watermark 45: before FeaturenetUpgrade2");
-        assert!(live.voting_rosters[3].strict_quorum, "watermark 50: FeaturenetUpgrade2");
-        assert!(live.voting_rosters[4].strict_quorum, "an unknown snapshot keeps watermark 50");
-        assert_eq!(live_tip.final_snapshot, final_at(55));
+        assert!(!chain.voting_rosters[2].strict_quorum, "watermark 45: before FeaturenetUpgrade2");
+        assert!(chain.voting_rosters[3].strict_quorum, "watermark 50: FeaturenetUpgrade2");
+        assert!(chain.voting_rosters[4].strict_quorum, "an unknown snapshot keeps watermark 50");
+        assert_eq!(tip.final_snapshot, final_at(55));
+        assert!(*tip.next_voting == *next_voting(&chain, &network, slashforks), "the tip holds the next height's roster");
     }
 
     #[test]
