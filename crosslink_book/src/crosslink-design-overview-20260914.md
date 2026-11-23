@@ -62,7 +62,7 @@ Most specific choices below are downstream of one of those five goals.
 
 ## 2. THE ONE-PARAGRAPH VERSION
 
-There are two chains. The PoW chain gets a new field, the "fat pointer", that names a BFT certificate by hash and carries signatures attesting to it. The BFT chain is a sequence of certificates, each of which finalizes one PoW block and carries a few PoW headers above it as evidence of work. Each chain therefore points at the other. Nodes follow the "sticky choice" rule: most-work still picks the best chain, but once a finalized block is on your best chain you never reorg past it, so finality is a ratchet rather than an override. BFT participants are "finalizers"; anyone can delegate stake to them by creating anonymous, fixed-denomination bonds from shielded funds. Rewards are paid uniformly and only while the system is working; there is no in-protocol slashing, because the protocol cannot agree on who voted for what. Instead, slashing is a user-coordinated hard fork that burns all stake delegated to a named finalizer and jails it. All ledger state lives on the PoW chain, and every economic effect is computed from what the PoW chain can see through the fat pointer.
+There are two chains. The PoW chain gets a new field, the "fat pointer", that names a BFT certificate by hash and carries signatures attesting to it. The BFT chain is a sequence of certificates, each of which finalizes one PoW block and carries a few PoW headers above it as evidence of work. Each chain therefore points at the other. Nodes follow the "sticky choice" rule: most-work still picks the best chain, but once a finalized block is on your best chain you never reorg past it, so finality is a ratchet rather than an override. BFT participants are "finalizers"; anyone can delegate stake to them by creating anonymous, fixed-denomination bonds from shielded funds. Rewards are paid on every block; there is no in-protocol slashing, because the protocol cannot agree on who voted for what. Instead, slashing is a user-coordinated hard fork that burns all stake delegated to a named finalizer and jails it. All ledger state lives on the PoW chain, and every economic effect is computed from what the PoW chain can see through the fat pointer.
 
 <a id="part-ii"></a>
 
@@ -131,7 +131,7 @@ A PoW block at height P may cite (via `context_bft`) a TFC whose snapshot is at 
 An honest proposer carries the `σ`-block tail of its own best chain. If that tail would break Linearity (e.g. after a PoW reorg below the last final snapshot), it repeats its parent's headers instead. A decision at PoW tip T therefore finalizes T - `σ`. Each decision advances the snapshot by however many PoW blocks arrived since the last decision. It repeats the snapshot when no block arrived and jumps several blocks when decisions are slow. This rolling window is how the construction already works; it does not depend on incentives.
 
 **Deviations from the *TFL Book*'s honest proposer:**
-- Our proposer clamps the snapshot to at most 40 blocks above the previous final snapshot. When the clamp binds, the proposal is a window ending below the tip. That still satisfies Tail Confirmation. The clamp is a heuristic, not part of Crosslink 2.
+- Our proposer clamps the snapshot to at most 40 blocks above the previous final snapshot. When the clamp binds, the proposal is a window ending below the tip. That still satisfies Tail Confirmation. The clamp is a proposer heuristic, not part of Crosslink 2 and not a validity rule.
 - Where the honest proposer would repeat its parent's headers, ours makes no proposal. It declines when the tail would break Linearity, when the candidate would not improve on the last final snapshot, and when a PoW reorg lands between reading the tip and reading the tail. How often a proposer should repeat instead is not yet decided. Both are proposer behavior, not validity rules: a validator cannot tell whether the headers were the proposer's best-chain tail.
 
 ### Finality lag
@@ -350,7 +350,7 @@ A possible built-in feature: since finalizers already have keys, they could sign
 
 ### Uniformity, and no automatic slashing
 
-Because peers do not agree on exact vote sets (section 6), the protocol cannot reward or punish individual votes. So there is no automatic slashing, and all active finalizers are paid uniformly at the same time. Punishment is a social process (section 16).
+Because peers do not agree on exact vote sets (section 6), the protocol cannot reward or punish individual votes. So there is no automatic slashing, and all active finalizers are paid together on every block, by stake. Punishment is a social process (section 16).
 
 <a id="section-12"></a>
 
@@ -401,33 +401,23 @@ The slash window (section 16) is also measured in staking days.
 
 ## 14. REWARDS
 
-### Design stance: smooth enforcement
+### Design stance
 
-The economic design leans on withheld income rather than destroyed funds. Uniform, conditional payouts make staking feel like mining: put money in, earn while the system works, and if the system is attacked or stalls you lose income, not principal. Missed income is a far smoother enforcement mechanism than burning, and it means stakers are rewarded or not for the mechanism as a whole working — never for particular finalizer or miner behaviour. Destruction of funds is reserved for the case where users identify a staker as having aided or been totally negligent in an attack, via a slash fork (Part V).
+Every PoW block pays the staking reward, so staking feels like mining: put money in and earn. Stakers are rewarded for the mechanism as a whole — never for particular finalizer or miner behaviour. Destruction of funds is reserved for the case where users identify a staker as having aided or been totally negligent in an attack, via a slash fork (Part V).
 
 ### Proposed issuance split
 
 Of post-dev-fund issuance (ignoring the initial 20% deduction):
 
-48%  miner subsidy 48%  staking rewards (finalizers and stakers) 4%  miner bounty for including a new finality
+- 50% — miner subsidy
+- 50% — staking rewards (finalizers and stakers)
 
-Within the 48% staking share, the split is 90/10:
+Within the 50% staking share, the split is 90/10:
 
-90%  to bonds, pro rata by size against total stake 10%  to active finalizers, uniformly
+- 90% — to bonds, pro rata by size against total stake
+- 10% — to active finalizers, pro rata by their stake
 
 The 90% includes finalizers staking to themselves. Rewards come from a fixed pool; there is no guaranteed percentage yield.
-
-### Proposed issuance rule
-
-IF a PoW block points at a new certificate, AND that certificate finalizes a PoW block close to the tip, THEN stakers and finalizers receive the 48% staking reward and the miner receives the 4% bounty; OTHERWISE the 52% is NSM-burned.
-
-"Close to the tip" is measured entirely on the PoW chain: this block points to a certificate, which points to a PoW block; the delta between those two PoW heights is the distance.
-
-This one rule serves several purposes:
-- First-inclusion miner bounty: miners are paid to advance finality monotonically rather than reuse a stale pointer (audit item R2).
-- Anti-jackpot: rewards cannot accumulate while finality is stalled (R4). Because the reward is single-shot per block, nothing is ever accrued or recalculated; accumulated values need not be stored anywhere. Bounty sniping is not an issue in steady state and at most a flaky-finalizer concern.
-- Certificate aging by another route: instead of expiring old certificates, catch-up is incentivized by withholding rewards from finalizations far behind the tip (R6). During catch-up the current heuristic is roughly 40 blocks per certificate; finalizers are incentivized to coordinate quickly on a known shared prefix rather than skip ahead to unshared tips, because otherwise they earn nothing. This is an incentive, not a consensus constraint. (Aside: FlyClient-style proofs might help finalizers establish a shared prefix fast.)
-- Slash forks suspend payouts for their duration, since the pointer stops advancing. This does not disincentivize spring-cleaning forks: their BFT activation is `u32::MAX`, so they are a single point of cremation rather than a stall.
 
 ### Bonds always earn
 
@@ -438,8 +428,6 @@ Open: is delegating to a non-active finalizer a "vote of no confidence" in the a
 ### Finalizer lockboxes (bank accounts)
 
 The 10% goes into a per-finalizer lockbox balance on the ledger. A staking action turns lockbox balance into a bond. The lockbox itself also behaves as a virtual bond delegated to its finalizer, so it accrues from both sources: from the 90% like any bond (per total), and from the 10% (per total, or per active-roster member on each new block — open). Ordinary bonds accrue only from the 90%.
-
-Burns are an extra complication: normal burns come from transactions, whereas these would be implicit or a new data member, and different burn designs have different complexity costs.
 
 Because the active roster is bounded, lockboxes should not need the acceleration structure of section 15, though computing "active" as well as "total" stake is a small addition that is needed for Tenderlink anyway.
 
@@ -453,7 +441,7 @@ Very many unmergeable bonds; finalizers, miners and wallets need fast answers (f
 
 ### Defer everything
 
-Bond creation is cheap; ongoing work is per-finalizer and global; an individual bond's value is computed only on query or at unbond. Single-shot rewards (section 14) help here: nothing accumulates.
+Bond creation is cheap; ongoing work is per-finalizer and global; an individual bond's value is computed only on query or at unbond.
 
 ### Rounding
 
@@ -559,14 +547,12 @@ No stall, but the stake-weighted share actually voting drifts down toward two th
 - Confirm the one-period bootstrap gaps versus ~100,000 for mainnet (section 8).
 - How the active roster is selected (section 11).
 - Other anti-tail-thrashing mechanisms (section 1).
-- Precise definition of "close to the tip" (section 14).
 - 10% denominator: active-roster stake or total (section 14).
 - Lockbox accrual from the 10%: per total or per active (section 14).
-- Burn representation for withheld rewards (section 14).
-- Acceleration structure design once payouts are fixed (section 15).
+- Acceleration structure design (section 15).
 - Non-liveness misbehaviour slashing should cover (section 16).
 - Certificates produced between slash-config creation and application (section 16).
-- Why the parameters are what they are: `σ` = 3, 48/48/4, 90/10, weekly cadence, two-staking-day window, power-of-ten sizes.
+- Why the parameters are what they are: `σ` = 3, 50/50, 90/10, weekly cadence, two-staking-day window, power-of-ten sizes.
 
 ### Networking
 

@@ -25,7 +25,6 @@ It keeps three layers apart:
 | §6 Divergences | current tree, measured against Zebra Crosslink |
 | §7 Names and consumer contracts | Zebra Crosslink |
 | §8 Implementation status and pitfalls | current-tree facts that constrain the implementation |
-| §9 Open decisions | outside this document's implementation work |
 
 Where a section mixes layers, a paragraph opens with its layer in bold.
 A companion visual explanation is in
@@ -339,7 +338,8 @@ first downloads the bc-blocks for `P.headers_bc` and checks their bc-block valid
 **Zebra Crosslink.** A proposer clamps its candidate height to at most 40 blocks above the
 previous final snapshot. When the clamp binds, `P.headers_bc` is a window of `bc_best` ending
 below its tip rather than its tail, which breaks honest proposal. The clamp is a design
-heuristic, not part of the Crosslink 2 specification. The window still satisfies Tail
+heuristic, not part of the Crosslink 2 specification and not a validity rule: no validator
+checks it, so a proposal that advances further is still valid. The window still satisfies Tail
 Confirmation.
 
 **Linearity and bc reorganizations.** Let `B` be the newest final bft-block. Linearity requires
@@ -847,70 +847,15 @@ At the end of `Chain::push` in
 - otherwise every block distributes its `pos_subsidy` (the staking share of the block subsidy:
   50 % of post-dev-fund issuance from the Crosslink activation height on, which
   `miner_fees_are_valid` withholds from the coinbase; the miner keeps the other 50 % plus all
-  transaction fees). Of each bond's share, 90 % is added to the bond and 10 %
-  (`FINALIZER_COMMISSION_DIVISOR`) goes to its finalizer's reward bank. Pools and the per-bond
+  transaction fees). From FeaturenetUpgrade1, 90 % goes to active bonds pro rata by stake and
+  10 % (`FINALIZER_COMMISSION_DIVISOR`) goes to the reward banks of the active roster's
+  finalizers, weighted by their stake. Pools and the per-bond
   and per-finalizer amounts are recorded for exact reorg reversal. Issuance is conserved: when
   nothing is staked the share is burned, the miner never gets it.
 
 `update_bonds_with_pos_issuance` in `zebra-crosslink/zebra-state/src/service.rs` allocates the
 total pro rata with integer division, gives the remainder to the largest active bond (then
 smallest key on a tie), and adds rewards to bond principal. Rewards therefore compound.
-
-#### The variable payout rule (DISABLED)
-
-**Currently disabled**: every PoW block pays. The gate is commented out in
-`zebra-state/src/new_network/bft.rs` (`pos_payout` is always true), `Chain::push` and
-`stake_fixup.rs`; the description below is what re-enabling it restores.
-
-With the rule enabled, issuance is not paid per PoW block. A block `P` pays exactly when it
-*advances* finality and does so *promptly*:
-
-```text
-payout(P)  iff  cert(P) != cert(parent(P))  and  height(P) - F <= σ + FINALITY_LIVENESS_ALLOWANCE
-```
-
-where `cert(P)` is the BFT block named by `P.context_bft` (compared by BFT block hash, not by
-the whole fat pointer: two honest nodes can carry different signature sets for the same
-decision) and `F` is the height of the PoW block that certificate finalizes — its snapshot.
-`FINALITY_LIVENESS_ALLOWANCE = 3`, in `librustzcash/zcash_primitives/src/bft.rs`.
-
-Both inputs are objective functions of committed chain data, so every node computes the same
-answer for the same block, as §9.1 requires. The fat-pointer check (§6.2) already refuses any
-`P` below `F + σ + 1`, so `height(P) − F` is at least `σ + 1`: with σ = 4 the paying gaps are 5,
-6 and 7, i.e. 4, 5 or 6 blocks strictly between `F` and `P`, and a seventh earns nothing.
-
-The decision is made in `new_network::bft::admit_fat_pointer`
-(`zebra-crosslink/zebra-state/src/new_network/bft.rs`), which is the one place that can resolve both
-facts, and travels with the block as `SemanticallyVerifiedBlock::pos_payout` →
-`ContextuallyVerifiedBlock::pos_payout` → `Chain::push`. Paths that never run that check
-(checkpoint sync, tests, blocks rebuilt from raw bytes) carry `pos_payout: false` and mint
-nothing.
-
-Because the verdict cannot be recovered from the block bytes, it is **persisted in the
-non-finalized state backup** alongside the deferred pool change
-(`zebra-state/src/service/non_finalized_state/backup.rs`), and restored with the block. Without
-that, a node that restarts re-enters its non-finalized blocks through
-`SemanticallyVerifiedBlock::from(Arc<Block>)`, which defaults to `pos_payout: false`: the
-restarted node mints nothing for blocks every other node has already paid. That is not a local
-accounting slip. It changes the bonded stake, the bonded stake is the voting power, and the
-roster derived from it then differs between nodes — which in a two-node roster is enough to
-make both nodes believe they are the proposer, prevote different values forever and stall
-finality permanently. This was observed on a dilated two-node testnet: node two restarted,
-restored 4 backed-up blocks, and came back exactly 4 blocks' staking reward short, after
-which BFT never decided another block.
-
-The same per-block calculation is replayed by the wallet projection path in
-`zebra-crosslink/zebra-crosslink/src/lib.rs`, which recomputes the rule from committed data in
-`block_pays_pos_issuance`, and by `fixup_aggregated_stakes` in
-`zebra-crosslink/zebra-state/src/service/stake_fixup.rs` (reached through the `--fixup-db-stake`
-entry point). Any future consensus change must keep all three paths identical.
-
-The repair tool is the one path that cannot evaluate the rule in full: it has the PoW database
-and nothing else, and `F` lives inside the BFT block. It applies the half it can see — a block
-that does not advance the certificate pays nothing — and assumes an advancing block was
-prompt. That is correct whenever BFT kept up. When it did not, the replay disagrees with the
-rows already stored and its existing cross-check refuses to write anything, so the failure mode
-is a repair that declines, never a repair that corrupts.
 
 ### 5.5 The Crosslink service crate
 
@@ -946,8 +891,8 @@ channel where it used to sleep, so `propose`, `validate` and `decide` run on the
 holds the best chain, the non-finalized state, the finalized database and the commit path. A
 decision commits nothing, so nothing on that path can reject one or hold up the round (§5.2).
 
-`admit_fat_pointer` answers the Extension, Last Final Snapshot and σ-confirmation verdicts and
-the `pos_payout` flag (§5.4, §6.2) as a pure function of the `BftChain` and a `ReadStateService`,
+`admit_fat_pointer` answers the Extension, Last Final Snapshot and σ-confirmation verdicts
+(§6.2) as a pure function of the `BftChain` and a `ReadStateService`,
 called under the read lock from the retain loop that filters blocks about to be committed.
 
 The decided bft-chain is persisted in the finalized database, in three column families keyed by
@@ -1211,7 +1156,7 @@ default for "confirmed" presentation. Each consumer needs a contract:
 | visualization paging | operational paging cursor | do not overload a finality value merely to bound a window |
 | canonical state activation | `fin` | sticky fork choice floor (§4.3) |
 | physical database status | database finalized tip | higher of `fin` and the reorg-depth commit; never reported as Crosslink finality |
-| staking rewards | objective per-block source | never use node-local `fin`; see §9.1 |
+| staking rewards | every PoW block | paid on every block; never depends on `fin` |
 | validator roster and slashfork membership | bonds at `snapshot(B_{H−1})` | objective; see below |
 | block-template BFT context | newest qualifying decided bft-block | the σ-confirmation and Last Final Snapshot tests are the ones bc-block admission runs, so a template never carries a certificate its own chain would refuse (§6.2) |
 | BFT round diagnostics | `tenderlink` round state | display only; a published snapshot, never an input to consensus |
@@ -1379,8 +1324,9 @@ stored, or consumed.
   operates only within that window. Nothing reaches past it: a decision that would need to is
   the one the node drops BFT over.
 - **The `+40` candidate clamp breaks honest proposal (§6.2).** It stays, as a design heuristic
-  outside the specification (§3.4). With it, one bft-block's snapshot advances by at most 40 bc-blocks; the commit, the
-  roster lookup, and `terminated_finalizers_at` handle steps of any size regardless.
+  outside the specification (§3.4). With it, this node's own proposals advance the snapshot by at most 40 bc-blocks; other
+  proposers may advance it further, and the commit, the roster lookup, and
+  `terminated_finalizers_at` handle steps of any size.
 - **Block status never reports `bft_final_snapshot` as finalized.** A block at or below
   `bft_final_snapshot` but above `local_finalized_tip` is `InBestChain` or `NotInBestChain`,
   because `fin` is the view Assured Finality covers (§2).
@@ -1402,61 +1348,7 @@ stored, or consumed.
   `zebrad/tests/crosslink.rs` run headless unless `ZEBRA_TEST_GUI` is set to something
   non-empty.
 
-## 9. Open decisions
-
-Payout design belongs to separate work, recorded here for context.
-
-### 9.1 Objective reward trigger and reward economics
-
-Consensus issuance cannot depend on node-local `fin`. Honest nodes can reach the same chain
-through different best-chain and reorg histories, so they need not observe the same sequence
-of `fin` transitions. They must nevertheless compute identical value pools for the same
-chain.
-
-An objective per-block event can instead be derived from block data, for example:
-
-```text
-payout boundary at H  iff  candidate(H) != candidate(parent(H))
-```
-
-**Implemented, currently disabled** (every block pays; see §5.4). The prototype takes this trigger, with a liveness bound added to it:
-a block pays iff its certificate differs from its parent's *and* the certificate is at most
-`σ + FINALITY_LIVENESS_ALLOWANCE` blocks behind it. §5.4 states the rule and where each path
-evaluates it. The consequences listed below under "payout amount" are the ones this choice
-accepts: a flat reward per advance, so a BFT stall lowers issuance for as long as it lasts and
-never pays the missed blocks back.
-
-This is not literally the event "local `fin` advanced." It is a block-local event that would
-permit `fin` to advance if `H` were observed as best and its candidate were ahead of that
-node's current `fin`. `snapshot(LF(H))` is another objective candidate source. The selected
-function must be monotone along a chain under the enforced validity rules. Extension makes
-`LF(H)` monotone along a chain; Linearity then makes `snapshot(LF(H))` monotone, and
-`candidate(H)` follows because `prune_σ(H)` is monotone and an lca of two monotone arguments is
-monotone. The current tree enforces both Extension and Linearity (§6.2). Without a Finality
-Depth rule, a bc-block producer can also keep a stale `context_bft` at no validity cost (§3.3), so an
-objective advance trigger lets whoever dominates `bc_best` delay payouts while `Π_bft` is live.
-
-Payout amount is a separate decision:
-
-- The `pos_subsidy` of each advancing block, burned when the block does not advance, lowers
-  issuance during a BFT stall and leaves it permanently lower if advances never resume.
-- A deferred amount based on elapsed PoW height can catch up only when a later payout occurs
-  and only under an explicit accrual rule. Issuance is still lower at intermediate heights,
-  remains lower after a permanent stall, and intervals with no active bonds need a rule: drop,
-  burn, or carry their nominal reward.
-- Current rewards increase bond principal every rewarded block. A lump delays that
-  compounding and allocates the whole amount among bonds active at payout time. Individual
-  allocations therefore change, even if aggregate eventual base issuance is preserved under
-  stated assumptions.
-- Non-payout blocks must still append empty `bond_rewards` entries so positional reorg reversal
-  remains aligned.
-
-The choice of objective trigger does not depend on resolving the amount formula. Conversely,
-the amount decision must not obscure the already-settled requirement that a consensus trigger
-be replayable from the chain alone. Detailed reward economics should live in a separate
-decision document once a concrete policy is proposed.
-
-## 10. Source appendix
+## 9. Source appendix
 
 - [Original TFL Book: `candidate`, `fin`, and syncing](https://github.com/daira/tfl-book/blob/fe6e1d6f403f62da46c64e8f5a7db3cb188ffae2/src/design/crosslink/construction.md#L423-L562);
   the same range defines the omitted `ba_μ`
