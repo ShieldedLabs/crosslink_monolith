@@ -10,6 +10,7 @@ set "project=%1"
 if "%project%"=="" ( echo No project specified! && exit /b 1 )
 if "%project%"=="Debug" ( echo No project specified! && exit /b 1 )
 if "%project%"=="Release" ( echo No project specified! && exit /b 1 )
+if "%project%"=="Ship" ( echo No project specified! && exit /b 1 )
 
 set "config=%2"
 set "platform=%3"
@@ -18,11 +19,20 @@ if defined CARGO_BUILD_JOBS set "flags=-j %CARGO_BUILD_JOBS%"
 
 if "%platform%"=="" set "platform=Win64"
 
+rem Release is the fast-rebuilding release-iter profile where the project defines one, and Ship
+rem is the real release profile that published binaries are built with.
+set "build_folder=debug"
 if "%config%"=="Release" (
+    set "build_folder=release"
+    findstr /b /l /c:"[profile.release-iter]" "%root%%project%\Cargo.toml" >nul && (
+        set "flags=%flags% --profile release-iter"
+    ) || (
+        set "flags=%flags% --release"
+    )
+)
+if "%config%"=="Ship" (
     set "flags=%flags% --release"
     set "build_folder=release"
-) else (
-    set "build_folder=debug"
 )
 
 if "%PH_SUBCOMMAND%"=="" ( echo PH_SUBCOMMAND not set, do not call this directly! && exit /b 1 )
