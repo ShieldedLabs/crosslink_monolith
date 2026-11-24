@@ -21,8 +21,8 @@ permissions: {}
 # Secrets: ANTHROPIC_API_KEY, from a Console workspace with a monthly spend limit, or
 # CLAUDE_CODE_OAUTH_TOKEN, from `claude setup-token`, which draws on that person's plan limits instead
 # of billing, runs Claude Code. Without either, or if Claude fails, XAI_API_KEY runs Grok through the
-# tool loop below; the XAI_MODEL variable overrides its model. PROJECT_TOKEN is the one
-# project-timeframe-done.yml uses.
+# tool loop below; the XAI_MODEL variable overrides its model. PROJECT_TOKEN writes to
+# the Crosslink board.
 env:
   ISSUE: ${{ github.event.issue.number || inputs.issue }}
   PROJECT_ID: PVT_kwDOB2JXZM4Bl0RE
@@ -288,7 +288,7 @@ jobs:
           GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
         run: |
           set -euo pipefail
-          # Plain GraphQL, like project-timeframe-done.yml: `gh project` fails with this token ("unknown owner type").
+          # Plain GraphQL: `gh project` fails with this token ("unknown owner type").
           info=$(gh api graphql -F number="$ISSUE" -f owner="$GITHUB_REPOSITORY_OWNER" -f name="${GITHUB_REPOSITORY#*/}" \
             -f query='query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { id projectItems(first: 20) { nodes { id project { id } area: fieldValueByName(name: "Area") { ... on ProjectV2ItemFieldSingleSelectValue { name } } urgency: fieldValueByName(name: "Urgency") { ... on ProjectV2ItemFieldTextValue { text } } } } } } }' \
             --jq '.data.repository.issue')
