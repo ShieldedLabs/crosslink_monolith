@@ -174,6 +174,7 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::BFT_PUSH_CANDIDATE as usize] = "BFT_PUSH_CANDIDATE";
     strs[TFInstr::EXPECT_BFT_CONFLICTS as usize] = "EXPECT_BFT_CONFLICTS";
     strs[TFInstr::RESTART as usize] = "RESTART";
+    strs[TFInstr::EXPECT_BFT_RESTORES as usize] = "EXPECT_BFT_RESTORES";
 
     let mut retired_i = 0;
     while retired_i < TFInstr::RETIRED.len() {
@@ -181,7 +182,7 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
         retired_i += 1;
     }
 
-    const_assert!(TFInstr::COUNT == 43);
+    const_assert!(TFInstr::COUNT == 44);
     strs
 };
 
@@ -355,11 +356,17 @@ impl TFInstr {
     /// Restarts the node: the instructions after it run in a new process, on the same state, with
     /// the same identity (see # Restarts). With `val[0]` 0 the node exits once the sync loop has
     /// settled; with 1 it aborts at once, as a crash does. Both keep what the database committed.
+    /// The non-finalized blocks are kept too, as their backup holds them, except with `val[1]` n
+    /// above 0, when those at height n and above are lost, as from a backup that had not caught up.
     pub const RESTART: TFInstrKind = 41;
     /// The node has reported exactly `val[0]` distinct conflicting BFT quorums (another block
     /// with a valid certificate at a height it decided); no data.
     pub const EXPECT_BFT_CONFLICTS: TFInstrKind = 42;
-    pub const COUNT: TFInstrKind = 43;
+    /// The node has restored its stored BFT chain exactly `val[0]` times since it started (this
+    /// life, after a RESTART), and tenderlink is held back catching up (`val[1]` 1) or is not (0);
+    /// `val[1]` `TF_BFT_HELD_ANY` does not look. Read once the sync loop has settled.
+    pub const EXPECT_BFT_RESTORES: TFInstrKind = 43;
+    pub const COUNT: TFInstrKind = 44;
 
     pub fn str_from_kind(kind: TFInstrKind) -> &'static str {
         let kind = kind as usize;
@@ -496,7 +503,15 @@ impl TFInstr {
             Some(TestInstr::RecvTxStp { tx, peer }) => str += &format!("{} via STP peer {peer}", tx.hash()),
             Some(TestInstr::ClockStepDuring { millis, ticks }) => str += &format!("{millis} ms after {ticks} tick(s)"),
             Some(TestInstr::MempoolLag { tips }) => str += &format!("{tips} tip(s)"),
-            Some(TestInstr::Restart { abort }) => str += if abort { "abort" } else { "exit" },
+            Some(TestInstr::Restart { abort, lose_from }) => {
+                str += if abort { "abort" } else { "exit" };
+                if let Some(height) = lose_from {
+                    str += &format!(", losing non-finalized blocks from {height}");
+                }
+            }
+            Some(TestInstr::ExpectBftRestores { restores, held }) => {
+                str += &format!("{restores} restore(s), held {}", held.map_or("any".to_string(), |held| held.to_string()))
+            }
             Some(TestInstr::ExpectBftConflicts { count }) => str += &format!("{count}"),
             Some(TestInstr::ExpectBftDropped { dropped, hash }) => {
                 str += &format!("{dropped}");
@@ -572,6 +587,9 @@ impl StpClaim {
         Some((StpClaim { hash, parent, height }, &data[Self::SIZE..]))
     }
 }
+
+/// EXPECT_BFT_RESTORES's `val[1]` when it does not look at whether tenderlink is held.
+pub const TF_BFT_HELD_ANY: u64 = 2;
 
 /// SUBMIT_TX's doorways, in `val[1]`.
 pub const TF_TX_LOCAL: u64 = 0;
@@ -988,9 +1006,21 @@ impl TF {
         self.push_instr_ex(TFInstr::CLOCK_STEP_DURING, 0, &[0; 0], [millis, ticks])
     }
 
+    /// `held`: whether tenderlink must be held back catching up; `None` does not look.
+    pub fn push_instr_expect_bft_restores(&mut self, restores: u32, held: Option<bool>, flags: u32) {
+        let held = held.map_or(TF_BFT_HELD_ANY, u64::from);
+        self.push_instr_ex(TFInstr::EXPECT_BFT_RESTORES, flags, &[0; 0], [u64::from(restores), held])
+    }
+
     /// `abort`: the node aborts, as a crash does, rather than exiting once the sync loop settles.
     pub fn push_instr_restart(&mut self, abort: bool) {
         self.push_instr_ex(TFInstr::RESTART, 0, &[0; 0], [u64::from(abort), 0])
+    }
+
+    /// As `push_instr_restart`, losing the non-finalized blocks at `lose_from` and above.
+    pub fn push_instr_restart_losing(&mut self, abort: bool, lose_from: u32) {
+        assert!(lose_from > 0, "the genesis block is always finalized");
+        self.push_instr_ex(TFInstr::RESTART, 0, &[0; 0], [u64::from(abort), u64::from(lose_from)])
     }
 
     pub fn push_instr_mempool_lag(&mut self, tips: u64) {
@@ -1383,7 +1413,7 @@ pub fn read_load_pos(bytes: &[u8], instr: &TFInstr) -> Option<(BftBlock, FatPoin
 }
 
 pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> {
-    const_assert!(TFInstr::COUNT == 43);
+    const_assert!(TFInstr::COUNT == 44);
     match instr.kind {
         TFInstr::LOAD_POW => {
             let data = instr.data_slice(bytes);
@@ -1557,8 +1587,20 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
         TFInstr::EXPECT_BFT_CONFLICTS => Some(TestInstr::ExpectBftConflicts { count: instr.val[0] }),
         TFInstr::CLOCK_STEP_DURING => Some(TestInstr::ClockStepDuring { millis: instr.val[0], ticks: instr.val[1] }),
         TFInstr::MEMPOOL_LAG => Some(TestInstr::MempoolLag { tips: instr.val[0] }),
+        TFInstr::EXPECT_BFT_RESTORES => Some(TestInstr::ExpectBftRestores {
+            restores: u32::try_from(instr.val[0]).ok()?,
+            held: match instr.val[1] {
+                0 => Some(false),
+                1 => Some(true),
+                TF_BFT_HELD_ANY => None,
+                _ => return None,
+            },
+        }),
         TFInstr::RESTART => match instr.val[0] {
-            0 | 1 => Some(TestInstr::Restart { abort: instr.val[0] == 1 }),
+            0 | 1 => Some(TestInstr::Restart {
+                abort: instr.val[0] == 1,
+                lose_from: (instr.val[1] != 0).then(|| u32::try_from(instr.val[1]).ok()).flatten(),
+            }),
             _ => None,
         },
 
@@ -1619,7 +1661,8 @@ pub(crate) enum TestInstr {
     ExpectBftConflicts { count: u64 },
     ClockStepDuring { millis: u64, ticks: u64 },
     MempoolLag { tips: u64 },
-    Restart { abort: bool },
+    Restart { abort: bool, lose_from: Option<u32> },
+    ExpectBftRestores { restores: u32, held: Option<bool> },
     RosterForceInclude([u8; 32], u64),   // public address
     ExpectRosterIncludes([u8; 32], u64), // public address
 }
@@ -2334,6 +2377,18 @@ pub(crate) async fn handle_instr(
         TestInstr::ClockStepDuring { millis, ticks } => {
             *TEST_CLOCK_STEP_DURING_NEXT.lock().unwrap() = Some((millis, ticks));
             test_check(flags, true, &format!("CLOCK_STEP_DURING: the next instruction sees the clock move {millis} ms after {ticks} sync tick(s)"));
+        }
+
+        TestInstr::ExpectBftRestores { restores, held } => {
+            sync_settle().await;
+            let status = zebra_state::new_network::bft::bft_recency_status();
+            let holds = status.bft_restores == restores && held.is_none_or(|held| held == status.tenderlink_held);
+            test_check(flags, holds, &format!(
+                "BFT restores: expected {restores}, held {}; the node has restored {} time(s), held {}",
+                held.map_or("any".to_string(), |held| held.to_string()),
+                status.bft_restores,
+                status.tenderlink_held,
+            ));
         }
 
         // read_instrs ends the life at a RESTART before it gets here.
@@ -3373,9 +3428,9 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
                 );
             }
         }
-        if let Some(TestInstr::Restart { abort }) = parsed {
+        if let Some(TestInstr::Restart { abort, lose_from }) = parsed {
             futures::future::join_all(racing.drain(..)).await;
-            restart(instr_i, abort).await;
+            restart(instr_i, abort, lose_from).await;
             continue;
         }
         if options.race {
@@ -3522,6 +3577,9 @@ pub struct LifeCarry {
     block_slots: Vec<(u64, [u8; 32])>,
     supplied_time: i64,
     instant_advanced_nanos: Option<u64>,
+    /// The height from which the driver drops the non-finalized backup's blocks before the next
+    /// life starts.
+    pub lose_from: Option<u32>,
 }
 
 /// The directory of the restarting test this process is a life of, if it is one.
@@ -3544,7 +3602,7 @@ static TEST_LIFE_START: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 
 /// Ends this life at the RESTART at `instr_i`: hands the next one what it needs and exits or
 /// aborts. Outside a restarting test there is no next life, which is a failure of the file's.
-async fn restart(instr_i: usize, abort: bool) {
+async fn restart(instr_i: usize, abort: bool, lose_from: Option<u32>) {
     let Some(dir) = test_life_dir() else {
         test_check_outcome(false, false, "RESTART: this test does not run as lives (test_start runs a file with a RESTART that way)");
         *TEST_INSTR_C.lock().unwrap() = instr_i + 1;
@@ -3562,6 +3620,7 @@ async fn restart(instr_i: usize, abort: bool) {
         supplied_time: zebra_debug_time::supplied_time(),
         // u128 nanoseconds to u64: the supplied clock is kept in u64 nanoseconds.
         instant_advanced_nanos: zebra_debug_time::instant_advanced().map(|by| by.as_nanos() as u64),
+        lose_from,
     };
     let bytes = serde_json::to_vec(&carry).expect("the carry serializes");
     let tmp = dir.join("carry.json.tmp");

@@ -172,7 +172,11 @@ fn run_lives() -> ! {
             edges.extend(bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])));
             let _ = std::fs::remove_file(path);
         }
-        if read_life_carry(&dir).restarts > restarts {
+        let carry = read_life_carry(&dir);
+        if carry.restarts > restarts {
+            if let Some(height) = carry.lose_from {
+                lose_backed_up_blocks(&dir.join("state"), height);
+            }
             continue;
         }
         break status.code().unwrap_or(101);
@@ -183,6 +187,35 @@ fn run_lives() -> ! {
     }
     let _ = std::fs::remove_dir_all(&dir);
     std::process::exit(code);
+}
+
+/// Deletes the non-finalized backup's blocks at `from` and above, under the state directory `state`,
+/// so the next life comes back without them. A backup file is named by its block's hash and holds
+/// the block after 9 bytes (a deferred pool amount and a payout flag; see zebra-state's backup).
+fn lose_backed_up_blocks(state: &std::path::Path, from: u32) {
+    fn walk(dir: &std::path::Path, from: u32) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, from);
+                continue;
+            }
+            let named_by_hash = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.len() == 64 && n.bytes().all(|b| b.is_ascii_hexdigit()));
+            let in_backup = path.components().any(|c| c.as_os_str() == "non_finalized_state");
+            if !named_by_hash || !in_backup {
+                continue;
+            }
+            let height = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| Block::zcash_deserialize(bytes.get(9..)?).ok())
+                .and_then(|block| block.coinbase_height());
+            if height.is_some_and(|height| height.0 >= from) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    walk(state, from);
 }
 
 /// In a life of a restarting test, ends this process if its driver goes: a fuzz campaign that gives
@@ -911,6 +944,45 @@ fn restart_keeps_the_pow_chain(restart: Option<bool>) -> Vec<u8> {
     tf.write_to_bytes()
 }
 
+/// The example chain, then a restart that loses the non-finalized blocks from height `LOST_FROM`
+/// (`None` for the control: no restart), so the node comes back with the chain below it, and then
+/// takes the lost blocks again.
+fn restart_losing_blocks(restart: bool) -> Vec<u8> {
+    const LOST_FROM: u32 = 5;
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let all = REGTEST_BLOCK_BYTES.len();
+    for block in REGTEST_BLOCK_BYTES {
+        tf.push_instr_load_pow_bytes(block, 0);
+    }
+    tf.push_instr_expect_pow_chain_length(example_chain_length(all), 0);
+    if restart {
+        tf.push_instr_restart_losing(false, LOST_FROM);
+        // The chain's length counts the genesis block, so it ends just below the lost height.
+        tf.push_instr_expect_pow_chain_length(LOST_FROM as usize, 0);
+        tf.push_instr_expect_node_alive(0);
+    }
+    for block in REGTEST_BLOCK_BYTES {
+        tf.push_instr_load_pow_bytes(block, 0);
+    }
+    tf.push_instr_expect_pow_chain_length(example_chain_length(all), 0);
+    tf.write_to_bytes()
+}
+
+/// A node whose backup had not caught up comes back with the chain below the blocks it lost, and
+/// takes them again.
+#[test]
+fn crosslink_restart_losing_blocks_keeps_the_chain_below_them() {
+    set_test_name(function_name!());
+    test_bytes(restart_losing_blocks(true));
+}
+
+/// As `crosslink_restart_losing_blocks_keeps_the_chain_below_them`, without the restart.
+#[test]
+fn crosslink_restart_losing_blocks_keeps_the_chain_below_them_control() {
+    set_test_name(function_name!());
+    test_bytes(restart_losing_blocks(false));
+}
+
 /// A node that exits and comes back keeps its PoW chain and takes the blocks after it.
 #[test]
 fn crosslink_restart_keeps_the_pow_chain() {
@@ -933,7 +1005,7 @@ fn crosslink_restart_keeps_the_pow_chain_control() {
 }
 
 /// Decided BFT blocks, then a restart (`Some(abort)`; `None` for the control), then the node holds
-/// the same decided chain, restored from its state, and takes the next decision.
+/// the same decided chain, restored once from its state, and takes the next decision.
 fn restart_keeps_the_pos_chain(restart: Option<bool>) -> Vec<u8> {
     let mut tf = TF::new(&HARNESS_PARAMETERS);
     let nw = regtest_network(&HARNESS_PARAMETERS);
@@ -952,9 +1024,13 @@ fn restart_keeps_the_pos_chain(restart: Option<bool>) -> Vec<u8> {
         push_decided_pos(&mut tf, &bft, 0);
     }
     tf.push_instr_expect_pos_chain_length((*pos_h).try_into().unwrap(), 0);
+    // The node runs its restore once each time it starts, finding nothing stored the first time.
+    tf.push_instr_expect_bft_restores(1, Some(false), 0);
     if let Some(abort) = restart {
         tf.push_instr_restart(abort);
     }
+    // Once after the restart too, not a second time over the chain it restored.
+    tf.push_instr_expect_bft_restores(1, Some(false), 0);
     tf.push_instr_expect_pow_chain_length(8 + BONDED_SHIFT, 0);
     tf.push_instr_expect_pos_chain_length((*pos_h).try_into().unwrap(), 0);
     let bft = next_signed_pos(pos_h, fat_ptr, &pow_common[4..7]);
