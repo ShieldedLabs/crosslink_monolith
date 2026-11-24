@@ -123,10 +123,11 @@ const OUT_BUDGET: usize = 256 * 1024;
 const CHUNK: i64 = 32;
 const PATH_PREFIX: &[u8] = b"/cash.z.wallet.sdk.rpc.CompactTxStreamer/";
 
-/// Connections from other hosts, in all and from any one address. Loopback connections, the
-/// node's own wallet's among them, are not counted, so other hosts cannot crowd them out.
+/// Connections from other hosts, in all and from any one prefix (`peer_prefix`). Loopback
+/// connections, the node's own wallet's among them, are not counted, so other hosts cannot crowd
+/// them out.
 const MAX_REMOTE_CONNS: usize = 256;
-const MAX_CONNS_PER_IP: usize = 16;
+const MAX_CONNS_PER_PREFIX: usize = 16;
 /// A connection from another host with no request in progress and no new request for this
 /// long is closed. Tests use seconds, so they can wait the timers out.
 #[cfg(not(test))]
@@ -321,8 +322,8 @@ struct Conn {
     pending: Vec<u8>,
     pending_off: usize,
     dead: bool,
-    /// The peer's address, IPv4 rather than v4-mapped.
-    peer_ip: IpAddr,
+    /// The prefix the peer's connections are counted under (`peer_prefix`).
+    peer_prefix: IpAddr,
     /// The peer is on this host, as the node's own wallet is: trusted and not counted.
     loopback: bool,
     /// When the peer last sent anything.
@@ -333,6 +334,21 @@ struct Conn {
     ping_sent: Option<std::time::Instant>,
     /// GOAWAY is queued; the connection closes once it is sent.
     closing: bool,
+}
+
+/// The prefix a peer's connections are counted under for MAX_CONNS_PER_PREFIX: an IPv4 address
+/// alone, since many users can share one behind NAT, and an IPv6 address's /64, since one host or
+/// site is routinely given a whole /64 and could otherwise open MAX_CONNS_PER_PREFIX from each of
+/// its addresses. `ip` is canonical, so a v4-mapped peer counts as IPv4.
+fn peer_prefix(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let mut segments = v6.segments();
+            segments[4..].fill(0);
+            IpAddr::V6(Ipv6Addr::from(segments))
+        }
+    }
 }
 
 /// Whether `authorization` is `Bearer <token>`, compared in time that depends only on lengths.
@@ -483,17 +499,19 @@ fn spawn_server(
                         match listener.accept() {
                             Ok((sock, peer)) => {
                                 let peer_ip = peer.ip().to_canonical();
+                                let peer_prefix = peer_prefix(peer_ip);
                                 let loopback = loopback_trusted && peer_ip.is_loopback();
                                 if !loopback {
                                     let remote = conns.iter().filter(|c| !c.loopback).count();
-                                    let from_ip = conns.iter().filter(|c| c.peer_ip == peer_ip).count();
-                                    if remote >= MAX_REMOTE_CONNS || from_ip >= MAX_CONNS_PER_IP {
+                                    let from_prefix = conns.iter().filter(|c| c.peer_prefix == peer_prefix).count();
+                                    if remote >= MAX_REMOTE_CONNS || from_prefix >= MAX_CONNS_PER_PREFIX {
                                         // dropping the socket closes it
                                         refused += 1;
                                         if refused_warned.is_none_or(|warned| now.duration_since(warned) >= std::time::Duration::from_secs(60)) {
                                             tracing::warn!(
                                                 "lightwallet_server: refused {refused} connection(s) over the caps \
-                                                 ({MAX_REMOTE_CONNS} from other hosts, {MAX_CONNS_PER_IP} from one address); \
+                                                 ({MAX_REMOTE_CONNS} from other hosts, {MAX_CONNS_PER_PREFIX} from one IPv4 address \
+                                                 or IPv6 /64); \
                                                  the last from {peer_ip}",
                                             );
                                             refused = 0;
@@ -516,7 +534,7 @@ fn spawn_server(
                                         pending: Vec::new(),
                                         pending_off: 0,
                                         dead: false,
-                                        peer_ip,
+                                        peer_prefix,
                                         loopback,
                                         last_recv: now,
                                         last_used: now,
@@ -2468,6 +2486,18 @@ mod tests {
         assert_eq!(listen("192.0.2.7:9").grpc_binds(), addrs(&["192.0.2.7:9", "[::1]:9", "127.0.0.1:9"]));
     }
 
+    /// IPv6 addresses in one /64 share a prefix and those in another don't; IPv4 addresses, and
+    /// v4-mapped ones once made canonical, each count alone.
+    #[test]
+    fn peer_prefix_groups_ipv6_by_64_and_keeps_ipv4_whole() {
+        let prefix = |ip: &str| peer_prefix(ip.parse::<IpAddr>().expect("an address").to_canonical());
+        assert_eq!(prefix("2001:db8:1:2:aaaa::1"), prefix("2001:db8:1:2:ffff:ffff:ffff:ffff"));
+        assert_eq!(prefix("2001:db8:1:2:aaaa::1").to_string(), "2001:db8:1:2::");
+        assert_ne!(prefix("2001:db8:1:2::1"), prefix("2001:db8:1:3::1"));
+        assert_ne!(prefix("192.0.2.7"), prefix("192.0.2.8"));
+        assert_eq!(prefix("::ffff:192.0.2.7"), prefix("192.0.2.7"));
+    }
+
     #[test]
     fn bearer_matches_only_the_exact_token() {
         assert!(bearer_matches(b"Bearer secret", "secret"));
@@ -2519,7 +2549,8 @@ mod tests {
         matches!(sock.read(&mut byte), Ok(1))
     }
 
-    /// Another host gets MAX_CONNS_PER_IP connections; this host is not counted.
+    /// Another host gets MAX_CONNS_PER_PREFIX connections from one IPv4 address; this host is not
+    /// counted.
     #[tokio::test(flavor = "multi_thread")]
     async fn connections_from_one_other_host_are_capped() {
         for loopback_trusted in [false, true] {
@@ -2527,7 +2558,7 @@ mod tests {
             drop(client(&server).await);
             let port = server.port;
             let mut socks = Vec::new();
-            for _ in 0..MAX_CONNS_PER_IP {
+            for _ in 0..MAX_CONNS_PER_PREFIX {
                 let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connects");
                 assert!(kept(&mut sock), "trusted: {loopback_trusted}");
                 socks.push(sock);
