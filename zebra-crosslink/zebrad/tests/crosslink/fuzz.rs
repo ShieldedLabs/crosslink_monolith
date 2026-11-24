@@ -933,6 +933,13 @@ fn move_staking(g: &mut FuzzGen, c: &mut Choices) {
     };
     let delay_met = bond.at.0 == 0 || h >= bond.at.0 + staking.action_delay;
     let valid = valid && (action == 3 || (delay_met && is_staking_day(h)));
+    // From FeaturenetUpgrade4 a withdrawal waits until the chain it extends has finalized past the
+    // unbonding (zcash_primitives::bft::WITHDRAWAL_FINALITY, #287). The fuzz inputs that stake
+    // run no BFT, so their chain finalizes nothing and every withdrawal there is refused.
+    let withdrawal_held = action == 2
+        && zcash_primitives::bft::WITHDRAWAL_FINALITY.is_some()
+        && NetworkUpgrade::FeaturenetUpgrade4.activation_height(&g.network).is_some_and(|activation| BlockHeight(h) >= activation);
+    let valid = valid && !withdrawal_held;
 
     if !bond.known {
         // The node may hold this bond in another state: the action may or may not apply. If it
@@ -2259,8 +2266,9 @@ pub(crate) fn generate(c: &mut Choices) -> Vec<u8> {
         0 => String::new(),
         1 => {
             let featurenet_upgrade_3 = FUZZ_UTXO_UPGRADE_FROM + c.below(FUZZ_UTXO_UPGRADE_SPAN) as u32;
-            // Half of those also schedule FeaturenetUpgrade4, which carries no rule: everything
-            // FeaturenetUpgrade3 switches on must hold on past it, under the new branch ID.
+            // Half of those also schedule FeaturenetUpgrade4: everything FeaturenetUpgrade3
+            // switches on must hold on past it, under the new branch ID, and withdrawals then wait
+            // for finality (see move_staking).
             let featurenet_upgrade_4 = c.unusual(128).then(|| featurenet_upgrade_3 + 1 + c.below(FUZZ_UTXO_UPGRADE_SPAN) as u32);
             node_config_with_activation_heights(ConfiguredActivationHeights {
                 featurenet_upgrade_3: Some(featurenet_upgrade_3),

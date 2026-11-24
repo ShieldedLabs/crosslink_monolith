@@ -113,7 +113,7 @@ jobs:
           END=$(( START + FUZZ_SEEDS_PER_RUN ))
           echo "guided iterations $START..$END for ${FUZZ_SECS}s on $(nproc) workers, corpus of $(ls ~/crosslink-fuzz-corpus | wc -l)" | tee -a "$GITHUB_STEP_SUMMARY"
           # Findings from an earlier run on this build directory would be uploaded again.
-          rm -rf target/cov/tmp/crosslink-fuzz
+          rm -rf target/cov/x86_64-unknown-linux-gnu/tmp/crosslink-fuzz
           # The step shell stops at the first failing command, so the campaign's status is caught
           # rather than left to stop it before the summary.
           set -o pipefail
@@ -139,7 +139,7 @@ jobs:
         with:
           name: crosslink-fuzz-findings-${{ github.run_number }}
           path: |
-            zebra-crosslink/target/cov/tmp/crosslink-fuzz
+            zebra-crosslink/target/cov/x86_64-unknown-linux-gnu/tmp/crosslink-fuzz
             zebra-crosslink/fuzz.log
           if-no-files-found: ignore
           retention-days: 30
