@@ -63,8 +63,11 @@ pub struct Listen {
     pub grpc: SocketAddr,
     /// The readiness endpoint's port, always on loopback.
     pub ready_port: u16,
-    /// What a caller from another host must send as `authorization: Bearer <token>`.
+    /// What a caller from another host sends as `authorization: Bearer <token>`.
     pub token: Option<String>,
+    /// A public lightwalletd: callers from other hosts may use every method but the faucet
+    /// without the token.
+    pub public: bool,
 }
 
 /// Shows whether a token is set, never the token.
@@ -74,6 +77,7 @@ impl std::fmt::Debug for Listen {
             .field("grpc", &self.grpc)
             .field("ready_port", &self.ready_port)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("public", &self.public)
             .finish()
     }
 }
@@ -426,6 +430,7 @@ fn spawn_server(
 
             let mut conns: Vec<Box<Conn>> = Vec::new();
             let token = listen.token.clone();
+            let public = listen.public;
             // Connections refused for the caps since the last warning, which goes out at most
             // once a minute.
             let mut refused: u64 = 0;
@@ -807,10 +812,10 @@ fn spawn_server(
                                     let authorized = (*c).loopback
                                         || token.as_deref().is_some_and(|t| bearer_matches(&s.authorization, t));
                                     let r: Result<(), Grr> = (|| {
-                                        // With a token, other hosts need it for everything; without
-                                        // one, they may use everything but the faucet, which spends
-                                        // this node's funds.
-                                        if token.is_some() && !authorized {
+                                        // Other hosts need the token, unless the server is public;
+                                        // even then the faucet, which spends this node's funds,
+                                        // needs it.
+                                        if !authorized && !public {
                                             return Err((
                                                 GRPC_UNAUTHENTICATED,
                                                 "this lightwallet_server needs `authorization: Bearer <token>` from other hosts".into(),
@@ -2408,6 +2413,11 @@ mod tests {
     /// A server on loopback whose faucet always pays 42, with no mempool, over an empty state.
     /// Unless `loopback_trusted`, its loopback callers are treated as other hosts.
     async fn serve(token: Option<&str>, loopback_trusted: bool) -> Server {
+        serve_as(token, loopback_trusted, false).await
+    }
+
+    /// `serve`, as a public lightwalletd when `public`.
+    async fn serve_as(token: Option<&str>, loopback_trusted: bool, public: bool) -> Server {
         let network = Network::new_default_testnet();
         let (_state, read_state, tip, _changes) = zebra_state::init_test_services(&network).await;
         let mempool: MempoolSvc = tower::buffer::Buffer::new(
@@ -2439,6 +2449,7 @@ mod tests {
             grpc: SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
             ready_port: free_port(),
             token: token.map(str::to_owned),
+            public,
         };
         let stop = std::sync::Arc::<std::sync::atomic::AtomicBool>::default();
         let thread = spawn_server(ctx, listen, loopback_trusted, stop.clone());
@@ -2481,7 +2492,7 @@ mod tests {
 
     #[test]
     fn grpc_binds_cover_both_loopback_addresses() {
-        let listen = |grpc: &str| Listen { grpc: grpc.parse().expect("an address"), ready_port: 1, token: None };
+        let listen = |grpc: &str| Listen { grpc: grpc.parse().expect("an address"), ready_port: 1, token: None, public: false };
         let addrs = |list: &[&str]| list.iter().map(|a| a.parse().expect("an address")).collect::<Vec<SocketAddr>>();
         assert_eq!(listen("[::1]:9").grpc_binds(), addrs(&["[::1]:9", "127.0.0.1:9"]));
         assert_eq!(listen("127.0.0.1:9").grpc_binds(), addrs(&["127.0.0.1:9", "[::1]:9"]));
@@ -2514,16 +2525,41 @@ mod tests {
         assert!(!bearer_matches(b"", "secret"));
     }
 
-    /// With no token, another host may read but not spend from the faucet; this host may.
+    /// By default another host is refused every call without a token, the faucet included; this
+    /// host is not.
     #[tokio::test(flavor = "multi_thread")]
-    async fn faucet_answers_only_this_host_without_a_token() {
+    async fn another_host_needs_a_token_by_default() {
         let remote_server = serve(None, false).await;
+        let remote = client(&remote_server).await;
+        let refused = remote.clone().get_lightd_info(Empty {}).await.expect_err("refused");
+        assert_eq!(refused.code(), Code::Unauthenticated, "{refused:?}");
+        let refused = remote.clone().request_faucet_donation(faucet()).await.expect_err("refused");
+        assert_eq!(refused.code(), Code::Unauthenticated, "{refused:?}");
+
+        let local_server = serve(None, true).await;
+        let local = client(&local_server).await;
+        local.clone().get_lightd_info(Empty {}).await.expect("answered");
+    }
+
+    /// A public server answers another host without a token, except the faucet, which needs the
+    /// token if there is one and is refused if not; this host may use the faucet either way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn public_server_answers_another_host_but_not_its_faucet() {
+        let remote_server = serve_as(None, false, true).await;
         let remote = client(&remote_server).await;
         remote.clone().get_lightd_info(Empty {}).await.expect("answered");
         let refused = remote.clone().request_faucet_donation(faucet()).await.expect_err("refused");
         assert_eq!(refused.code(), Code::PermissionDenied, "{refused:?}");
 
-        let local_server = serve(None, true).await;
+        let tokened_server = serve_as(Some("s3cret"), false, true).await;
+        let tokened = client(&tokened_server).await;
+        tokened.clone().get_lightd_info(Empty {}).await.expect("answered without the token");
+        let refused = tokened.clone().request_faucet_donation(faucet()).await.expect_err("refused");
+        assert_eq!(refused.code(), Code::PermissionDenied, "{refused:?}");
+        let paid = tokened.clone().request_faucet_donation(with_authorization(faucet(), "Bearer s3cret")).await;
+        assert_eq!(paid.expect("paid").into_inner().amount, 42);
+
+        let local_server = serve_as(None, true, true).await;
         let local = client(&local_server).await;
         assert_eq!(local.clone().request_faucet_donation(faucet()).await.expect("paid").into_inner().amount, 42);
     }
