@@ -63,6 +63,9 @@ pub fn test_start() {
                 None => zebra_crosslink::TEST_INSTR_BYTES.lock().unwrap().clone(),
             }
         };
+        if zebra_crosslink::test_format::bytes_restart(&bytes) && zebra_crosslink::test_format::test_life_dir().is_none() {
+            run_lives();
+        }
         let crosslink = crosslink_parameters_for_test(&bytes);
         let node_config = node_config_for_test(&bytes);
         *CROSSLINK_TEST_CONFIG_OVERRIDE.lock().unwrap() = {
@@ -81,6 +84,18 @@ pub fn test_start() {
                 base.crosslink.explicit_bft_key_seed = Some(zebra_crosslink::test_format::TEST_NODE_FINALIZER_SEED.to_string());
             }
             base.state.ephemeral = true;
+            if let Some(dir) = zebra_crosslink::test_format::test_life_dir() {
+                // A restarting test's lives share one state, and the node keeps one identity, as
+                // across a restart.
+                base.state.ephemeral = false;
+                base.state.cache_dir = dir.join("state");
+                base.state.network_identity_seed_string = Some("crosslink test node".to_string());
+                // Every non-finalized block is backed up as it commits, not every 5 s, so a restart
+                // keeps all of them, the same in every run.
+                base.state.should_backup_non_finalized_state = true;
+                base.state.debug_skip_non_finalized_state_backup_task = true;
+                watch_the_driver();
+            }
             // getblocktemplate refuses to build a coinbase without one (LOAD_POW from the template). The
             // test miner's key, so scenarios can spend what the node's templates pay out.
             base.mining.miner_address = Some(
@@ -129,6 +144,61 @@ const BOOTSTRAP_HARNESS_PARAMETERS: zcash_primitives::bft::ZcashCrosslinkParamet
         bootstrap: PROTOTYPE_PARAMETERS.bootstrap,
         ..HARNESS_PARAMETERS
     };
+
+/// Runs a test file with a RESTART as lives (see `test_format`'s # Restarts): this test again, in
+/// a new process for each life, on one directory, until a life ends other than at a RESTART, whose
+/// exit code is the test's. With CROSSLINK_FUZZ_COVERAGE, each life writes its own edges and the
+/// test's are all of them; an aborted life writes none.
+fn run_lives() -> ! {
+    use zebra_crosslink::test_format::{read_life_carry, TEST_LIFE_DIR_ENV};
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos());
+    let dir = std::env::temp_dir().join(format!("crosslink-lives-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("the lives directory creates");
+    let exe = std::env::current_exe().expect("the test binary path");
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let coverage = std::env::var_os("CROSSLINK_FUZZ_COVERAGE").map(PathBuf::from);
+    let mut edges = std::collections::BTreeSet::new();
+    let code = loop {
+        let restarts = read_life_carry(&dir).restarts;
+        let mut life = std::process::Command::new(&exe);
+        life.args(&args).env(TEST_LIFE_DIR_ENV, &dir);
+        let life_coverage = coverage.as_ref().map(|path| path.with_extension(format!("life{restarts}")));
+        if let Some(path) = &life_coverage {
+            life.env("CROSSLINK_FUZZ_COVERAGE", path);
+        }
+        let status = life.status().expect("a life of the test runs");
+        if let Some(path) = &life_coverage {
+            let bytes = std::fs::read(path).unwrap_or_default();
+            edges.extend(bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+            let _ = std::fs::remove_file(path);
+        }
+        if read_life_carry(&dir).restarts > restarts {
+            continue;
+        }
+        break status.code().unwrap_or(101);
+    };
+    if let Some(path) = &coverage {
+        let bytes: Vec<u8> = edges.iter().flat_map(|edge| edge.to_le_bytes()).collect();
+        let _ = std::fs::write(path, bytes);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    std::process::exit(code);
+}
+
+/// In a life of a restarting test, ends this process if its driver goes: a fuzz campaign that gives
+/// up on an input kills the driver, and the life would otherwise run on with the node.
+fn watch_the_driver() {
+    #[cfg(unix)]
+    {
+        let driver = std::os::unix::process::parent_id();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if std::os::unix::process::parent_id() != driver {
+                std::process::exit(101);
+            }
+        });
+    }
+}
 
 /// Run a Crosslink Test from a dynamic byte array.
 pub fn test_bytes(bytes: Vec<u8>) {
@@ -813,6 +883,106 @@ fn crosslink_push_example_pow_chain_only() {
     tf.push_instr_expect_pow_chain_length(1 - 1 + REGTEST_BLOCK_BYTES.len(), 0);
 
     test_bytes(tf.write_to_bytes());
+}
+
+/// The regtest example chain's length once its first `n` blocks are loaded: block index 2 is a fork.
+fn example_chain_length(n: usize) -> usize {
+    1 + n - usize::from(n >= 4)
+}
+
+/// Half the example chain, then a restart (`Some(abort)`; `None` for the control), then the node is
+/// at the same tip on the same state and takes the rest.
+fn restart_keeps_the_pow_chain(restart: Option<bool>) -> Vec<u8> {
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let half = REGTEST_BLOCK_BYTES.len() / 2;
+    for block in &REGTEST_BLOCK_BYTES[..half] {
+        tf.push_instr_load_pow_bytes(block, 0);
+    }
+    tf.push_instr_expect_pow_chain_length(example_chain_length(half), 0);
+    if let Some(abort) = restart {
+        tf.push_instr_restart(abort);
+    }
+    tf.push_instr_expect_pow_chain_length(example_chain_length(half), 0);
+    tf.push_instr_expect_node_alive(0);
+    for block in &REGTEST_BLOCK_BYTES[half..] {
+        tf.push_instr_load_pow_bytes(block, 0);
+    }
+    tf.push_instr_expect_pow_chain_length(example_chain_length(REGTEST_BLOCK_BYTES.len()), 0);
+    tf.write_to_bytes()
+}
+
+/// A node that exits and comes back keeps its PoW chain and takes the blocks after it.
+#[test]
+fn crosslink_restart_keeps_the_pow_chain() {
+    set_test_name(function_name!());
+    test_bytes(restart_keeps_the_pow_chain(Some(false)));
+}
+
+/// As `crosslink_restart_keeps_the_pow_chain`, with the node aborting, as a crash does.
+#[test]
+fn crosslink_restart_by_abort_keeps_the_pow_chain() {
+    set_test_name(function_name!());
+    test_bytes(restart_keeps_the_pow_chain(Some(true)));
+}
+
+/// As `crosslink_restart_keeps_the_pow_chain`, without the restart.
+#[test]
+fn crosslink_restart_keeps_the_pow_chain_control() {
+    set_test_name(function_name!());
+    test_bytes(restart_keeps_the_pow_chain(None));
+}
+
+/// Decided BFT blocks, then a restart (`Some(abort)`; `None` for the control), then the node holds
+/// the same decided chain, restored from its state, and takes the next decision.
+fn restart_keeps_the_pos_chain(restart: Option<bool>) -> Vec<u8> {
+    let mut tf = TF::new(&HARNESS_PARAMETERS);
+    let nw = regtest_network(&HARNESS_PARAMETERS);
+    let miner_addr = Address::decode(&nw, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen = bonded_start(&mut tf, nw);
+    let mut pow_common = vec![gen.tip.clone()];
+    for _ in 2..8 {
+        pow_common.push(gen.next_block(&miner_addr));
+    }
+    for pow in &pow_common {
+        tf.push_instr_load_pow(pow, 0);
+    }
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
+    for i in 1..4 {
+        let bft = next_signed_pos(pos_h, fat_ptr, &pow_common[i..i + 3]);
+        push_decided_pos(&mut tf, &bft, 0);
+    }
+    tf.push_instr_expect_pos_chain_length((*pos_h).try_into().unwrap(), 0);
+    if let Some(abort) = restart {
+        tf.push_instr_restart(abort);
+    }
+    tf.push_instr_expect_pow_chain_length(8 + BONDED_SHIFT, 0);
+    tf.push_instr_expect_pos_chain_length((*pos_h).try_into().unwrap(), 0);
+    let bft = next_signed_pos(pos_h, fat_ptr, &pow_common[4..7]);
+    push_decided_pos(&mut tf, &bft, 0);
+    tf.push_instr_expect_pos_chain_length((*pos_h).try_into().unwrap(), 0);
+    tf.push_instr_expect_node_alive(0);
+    tf.write_to_bytes()
+}
+
+/// A node that exits and comes back restores its decided BFT chain and takes the next decision.
+#[test]
+fn crosslink_restart_keeps_the_pos_chain() {
+    set_test_name(function_name!());
+    test_bytes(restart_keeps_the_pos_chain(Some(false)));
+}
+
+/// As `crosslink_restart_keeps_the_pos_chain`, with the node aborting.
+#[test]
+fn crosslink_restart_by_abort_keeps_the_pos_chain() {
+    set_test_name(function_name!());
+    test_bytes(restart_keeps_the_pos_chain(Some(true)));
+}
+
+/// As `crosslink_restart_keeps_the_pos_chain`, without the restart.
+#[test]
+fn crosslink_restart_keeps_the_pos_chain_control() {
+    set_test_name(function_name!());
+    test_bytes(restart_keeps_the_pos_chain(None));
 }
 
 #[test]

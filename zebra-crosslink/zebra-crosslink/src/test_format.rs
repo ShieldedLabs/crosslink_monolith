@@ -173,6 +173,7 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::MEMPOOL_LAG as usize] = "MEMPOOL_LAG";
     strs[TFInstr::BFT_PUSH_CANDIDATE as usize] = "BFT_PUSH_CANDIDATE";
     strs[TFInstr::EXPECT_BFT_CONFLICTS as usize] = "EXPECT_BFT_CONFLICTS";
+    strs[TFInstr::RESTART as usize] = "RESTART";
 
     let mut retired_i = 0;
     while retired_i < TFInstr::RETIRED.len() {
@@ -350,8 +351,11 @@ impl TFInstr {
     /// thread has taken it; what became of it is for the instructions after it to check. Fails
     /// when there is no sync thread to take it.
     pub const BFT_PUSH_CANDIDATE: TFInstrKind = 39;
-    // 40 is reserved for BFT_FAIL_DECISION_WRITES and 41 for RESTART, which are not on this
-    // branch yet.
+    // 40 is reserved for BFT_FAIL_DECISION_WRITES, which is not on this branch yet.
+    /// Restarts the node: the instructions after it run in a new process, on the same state, with
+    /// the same identity (see # Restarts). With `val[0]` 0 the node exits once the sync loop has
+    /// settled; with 1 it aborts at once, as a crash does. Both keep what the database committed.
+    pub const RESTART: TFInstrKind = 41;
     /// The node has reported exactly `val[0]` distinct conflicting BFT quorums (another block
     /// with a valid certificate at a height it decided); no data.
     pub const EXPECT_BFT_CONFLICTS: TFInstrKind = 42;
@@ -492,6 +496,7 @@ impl TFInstr {
             Some(TestInstr::RecvTxStp { tx, peer }) => str += &format!("{} via STP peer {peer}", tx.hash()),
             Some(TestInstr::ClockStepDuring { millis, ticks }) => str += &format!("{millis} ms after {ticks} tick(s)"),
             Some(TestInstr::MempoolLag { tips }) => str += &format!("{tips} tip(s)"),
+            Some(TestInstr::Restart { abort }) => str += if abort { "abort" } else { "exit" },
             Some(TestInstr::ExpectBftConflicts { count }) => str += &format!("{count}"),
             Some(TestInstr::ExpectBftDropped { dropped, hash }) => {
                 str += &format!("{dropped}");
@@ -981,6 +986,11 @@ impl TF {
 
     pub fn push_instr_clock_step_during(&mut self, millis: u64, ticks: u64) {
         self.push_instr_ex(TFInstr::CLOCK_STEP_DURING, 0, &[0; 0], [millis, ticks])
+    }
+
+    /// `abort`: the node aborts, as a crash does, rather than exiting once the sync loop settles.
+    pub fn push_instr_restart(&mut self, abort: bool) {
+        self.push_instr_ex(TFInstr::RESTART, 0, &[0; 0], [u64::from(abort), 0])
     }
 
     pub fn push_instr_mempool_lag(&mut self, tips: u64) {
@@ -1547,6 +1557,10 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
         TFInstr::EXPECT_BFT_CONFLICTS => Some(TestInstr::ExpectBftConflicts { count: instr.val[0] }),
         TFInstr::CLOCK_STEP_DURING => Some(TestInstr::ClockStepDuring { millis: instr.val[0], ticks: instr.val[1] }),
         TFInstr::MEMPOOL_LAG => Some(TestInstr::MempoolLag { tips: instr.val[0] }),
+        TFInstr::RESTART => match instr.val[0] {
+            0 | 1 => Some(TestInstr::Restart { abort: instr.val[0] == 1 }),
+            _ => None,
+        },
 
         // An instruction this build doesn't know. The caller decides whether that is fatal
         // (a test) or skippable (the fuzzer, the GUI viewer).
@@ -1605,6 +1619,7 @@ pub(crate) enum TestInstr {
     ExpectBftConflicts { count: u64 },
     ClockStepDuring { millis: u64, ticks: u64 },
     MempoolLag { tips: u64 },
+    Restart { abort: bool },
     RosterForceInclude([u8; 32], u64),   // public address
     ExpectRosterIncludes([u8; 32], u64), // public address
 }
@@ -2320,6 +2335,9 @@ pub(crate) async fn handle_instr(
             *TEST_CLOCK_STEP_DURING_NEXT.lock().unwrap() = Some((millis, ticks));
             test_check(flags, true, &format!("CLOCK_STEP_DURING: the next instruction sees the clock move {millis} ms after {ticks} sync tick(s)"));
         }
+
+        // read_instrs ends the life at a RESTART before it gets here.
+        TestInstr::Restart { .. } => test_check(flags, false, "RESTART: reached handle_instr, which cannot restart the node"),
 
         TestInstr::MempoolLag { tips } => {
             TEST_MEMPOOL_LAG.store(tips, std::sync::atomic::Ordering::Release);
@@ -3336,7 +3354,7 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
     let mut racing_peers: Vec<u64> = Vec::new();
     let mut mempool_tip = None;
     let handle = &internal_handle;
-    for instr_i in 0..instrs.len() {
+    for instr_i in TEST_LIFE_START.load(std::sync::atomic::Ordering::Acquire)..instrs.len() {
         // info!(
         //     "Loading instruction {}: {} ({})",
         //     instr_i,
@@ -3354,6 +3372,11 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
                     instrs[instr_i].kind
                 );
             }
+        }
+        if let Some(TestInstr::Restart { abort }) = parsed {
+            futures::future::join_all(racing.drain(..)).await;
+            restart(instr_i, abort).await;
+            continue;
         }
         if options.race {
             if let Some(instr) = parsed.clone() {
@@ -3471,6 +3494,108 @@ pub async fn read_instrs(internal_handle: TFLServiceHandle, bytes: &[u8], instrs
     futures::future::join_all(racing.drain(..)).await;
 }
 
+// # Restarts
+//
+// A file with a RESTART runs each stretch of instructions between them (a life) in a process of its
+// own, on one state directory, as a node does when it is restarted. The test binary's test_start
+// sees the RESTART and, as a driver, runs the binary again once per life with
+// CROSSLINK_TEST_LIFE_DIR naming that directory. A life ends at a RESTART by writing to it what the
+// harness holds and the node does not (the failures so far, the block slots, the supplied clock),
+// then exiting or aborting. The next life starts the node on the same state, reads that, and goes on
+// from the instruction after the RESTART. A file without a RESTART runs as it always did.
+
+/// The environment variable that names a restarting test's directory, which holds the node's state
+/// and what one life hands the next.
+pub const TEST_LIFE_DIR_ENV: &str = "CROSSLINK_TEST_LIFE_DIR";
+
+/// The exit code of a life that ended at a RESTART by exiting.
+pub const RESTART_EXIT_CODE: i32 = 75;
+
+/// What one life hands the next.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub struct LifeCarry {
+    /// How many lives have ended at a RESTART.
+    pub restarts: u32,
+    /// The instruction the next life starts at.
+    pub next_instr: usize,
+    failed: Vec<(usize, String)>,
+    block_slots: Vec<(u64, [u8; 32])>,
+    supplied_time: i64,
+    instant_advanced_nanos: Option<u64>,
+}
+
+/// The directory of the restarting test this process is a life of, if it is one.
+pub fn test_life_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os(TEST_LIFE_DIR_ENV).map(std::path::PathBuf::from)
+}
+
+/// What the lives before this one handed on; nothing in the first.
+pub fn read_life_carry(dir: &std::path::Path) -> LifeCarry {
+    std::fs::read(dir.join("carry.json")).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
+}
+
+/// Whether a test file asks for a restart, so it must run as lives.
+pub fn bytes_restart(bytes: &[u8]) -> bool {
+    TF::read_from_bytes(bytes).is_ok_and(|tf| tf.instrs.iter().any(|instr| instr.kind == TFInstr::RESTART))
+}
+
+/// The instruction this life starts at.
+static TEST_LIFE_START: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Ends this life at the RESTART at `instr_i`: hands the next one what it needs and exits or
+/// aborts. Outside a restarting test there is no next life, which is a failure of the file's.
+async fn restart(instr_i: usize, abort: bool) {
+    let Some(dir) = test_life_dir() else {
+        test_check_outcome(false, false, "RESTART: this test does not run as lives (test_start runs a file with a RESTART that way)");
+        *TEST_INSTR_C.lock().unwrap() = instr_i + 1;
+        return;
+    };
+    if !abort {
+        // A quiet point to stop at: what the instructions before led to is done.
+        sync_settle().await;
+    }
+    let carry = LifeCarry {
+        restarts: read_life_carry(&dir).restarts + 1,
+        next_instr: instr_i + 1,
+        failed: TEST_FAILED_INSTR_IDXS.lock().unwrap().clone(),
+        block_slots: TEST_BLOCK_SLOTS.lock().unwrap().iter().map(|(slot, hash)| (*slot, hash.0)).collect(),
+        supplied_time: zebra_debug_time::supplied_time(),
+        // u128 nanoseconds to u64: the supplied clock is kept in u64 nanoseconds.
+        instant_advanced_nanos: zebra_debug_time::instant_advanced().map(|by| by.as_nanos() as u64),
+    };
+    let bytes = serde_json::to_vec(&carry).expect("the carry serializes");
+    let tmp = dir.join("carry.json.tmp");
+    std::fs::write(&tmp, bytes).expect("the carry writes");
+    std::fs::rename(&tmp, dir.join("carry.json")).expect("the carry is put in place");
+    #[allow(clippy::print_stdout)]
+    {
+        println!("RESTART at instruction {instr_i}: {}", if abort { "aborting" } else { "exiting" });
+    }
+    if abort {
+        std::process::abort();
+    }
+    std::process::exit(RESTART_EXIT_CODE);
+}
+
+/// Takes up what the life before handed on, in a life after the first.
+fn resume_life() {
+    let Some(dir) = test_life_dir() else { return };
+    let carry = read_life_carry(&dir);
+    if carry.restarts == 0 {
+        return;
+    }
+    *TEST_FAILED_INSTR_IDXS.lock().unwrap() = carry.failed;
+    *TEST_BLOCK_SLOTS.lock().unwrap() = carry.block_slots.into_iter().map(|(slot, hash)| (slot, ZebBlockHash(hash))).collect();
+    if carry.supplied_time != 0 {
+        zebra_debug_time::supply_time(carry.supplied_time);
+    }
+    if let Some(nanos) = carry.instant_advanced_nanos {
+        zebra_debug_time::advance_instant(Duration::from_nanos(nanos));
+    }
+    TEST_LIFE_START.store(carry.next_instr, std::sync::atomic::Ordering::Release);
+    *TEST_INSTR_C.lock().unwrap() = carry.next_instr;
+}
+
 pub(crate) async fn instr_reader(internal_handle: TFLServiceHandle) {
     use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize};
     let call = internal_handle.call.clone();
@@ -3507,6 +3632,7 @@ pub(crate) async fn instr_reader(internal_handle: TFLServiceHandle) {
     };
 
     *TEST_INSTRS.lock().unwrap() = tf.instrs.clone();
+    resume_life();
 
     let params = internal_handle.params;
     let options = *crate::TEST_READ_OPTIONS.lock().unwrap();

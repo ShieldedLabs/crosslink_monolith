@@ -103,6 +103,11 @@ pub fn supply_time(unix_time: i64) {
     SUPPLIED_UNIX_TIME.store(unix_time, Ordering::Relaxed);
 }
 
+/// The time [`supply_time`] last supplied, in whole UNIX seconds; `0` when none is.
+pub fn supplied_time() -> i64 {
+    SUPPLIED_UNIX_TIME.load(Ordering::Relaxed)
+}
+
 /// The current apparent time.
 pub fn now() -> DateTime<Utc> {
     let supplied = SUPPLIED_UNIX_TIME.load(Ordering::Relaxed);
@@ -240,6 +245,15 @@ pub fn advance_instant(by: std::time::Duration) {
         Some(if nanos == u64::MAX { by } else { nanos.saturating_add(by).min(u64::MAX - 1) })
     });
     INSTANT_ADVANCED.notify_waiters();
+}
+
+/// How far [`advance_instant`] has moved the supplied instant in all, or `None` while it follows
+/// the real clock. A test that runs the node again in a new process supplies this much again, so
+/// the clock goes on from where it was.
+#[cfg(feature = "timers")]
+pub fn instant_advanced() -> Option<std::time::Duration> {
+    let nanos = SUPPLIED_INSTANT_NANOS.load(Ordering::Acquire);
+    (nanos != u64::MAX).then(|| std::time::Duration::from_nanos(nanos))
 }
 
 /// Whether a test supplies the monotonic clock.
