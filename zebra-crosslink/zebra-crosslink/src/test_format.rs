@@ -2912,16 +2912,86 @@ async fn sync_settle() {
 
 /// Records what the node has sent the synthetic finalizers since the last call.
 fn record_bft_sent() {
-    let mut sent = TEST_BFT_SENT.lock().unwrap();
-    for peer in TEST_BFT_PEERS.lock().unwrap().iter() {
-        while let Ok(packet) = peer.link.outbound.try_recv() {
-            for item in tenderlink::sent_consensus(&packet) {
-                if !sent.contains(&item) {
-                    sent.push(item);
+    let mut votes = Vec::new();
+    {
+        let mut sent = TEST_BFT_SENT.lock().unwrap();
+        for peer in TEST_BFT_PEERS.lock().unwrap().iter() {
+            while let Ok(packet) = peer.link.outbound.try_recv() {
+                for item in tenderlink::sent_consensus(&packet) {
+                    if !sent.contains(&item) {
+                        if let tenderlink::SentConsensus::Vote { is_precommit, height, round, value_id, roster_i } = item {
+                            votes.push((NodeVote { is_precommit, height, round, value_id: value_id.0 }, roster_i));
+                        }
+                        sent.push(item);
+                    }
                 }
             }
         }
     }
+    for (vote, roster_i) in votes {
+        note_node_vote(vote, roster_i);
+    }
+}
+
+/// One of the node's own votes, as it sent it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct NodeVote {
+    is_precommit: bool,
+    height: u64,
+    round: u32,
+    value_id: [u8; 32],
+}
+
+/// Every vote the node has sent, in this life and in the lives before it: it votes once per
+/// height, round and step, so a second vote there for another value is an equivocation, after a
+/// restart as much as before one.
+static TEST_NODE_VOTES: Mutex<Vec<NodeVote>> = Mutex::new(Vec::new());
+
+/// The node's BFT key seed, to tell its own votes from the ones it relays.
+static TEST_NODE_BFT_SEED: Mutex<Option<String>> = Mutex::new(None);
+
+/// The vote in `votes` that `vote` conflicts with: one at its height, round and step, for another
+/// value (nil being a value).
+fn conflicting_vote(votes: &[NodeVote], vote: &NodeVote) -> Option<NodeVote> {
+    votes
+        .iter()
+        .find(|seen| (seen.is_precommit, seen.height, seen.round) == (vote.is_precommit, vote.height, vote.round) && seen.value_id != vote.value_id)
+        .copied()
+}
+
+/// Takes in a vote the node sent, by `roster_i`, failing the instruction in hand if it is the
+/// node's own and conflicts with one the node sent before. The node relays the votes it receives,
+/// so a vote is its own only if `roster_i` is the node's seat at the vote's height, by the engine
+/// view the harness saw there; a vote at a height it saw no view of is left alone.
+fn note_node_vote(vote: NodeVote, roster_i: u16) {
+    let Some(seed) = TEST_NODE_BFT_SEED.lock().unwrap().clone() else { return };
+    let own = TEST_BFT_HEIGHT_VIEWS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|view| view.height == vote.height)
+        .is_some_and(|view| roster_index(&view.roster, &finalizer_key_from_seed(seed.as_bytes()).0) == Some(usize::from(roster_i)));
+    if !own {
+        return;
+    }
+    let mut votes = TEST_NODE_VOTES.lock().unwrap();
+    if votes.contains(&vote) {
+        return;
+    }
+    if let Some(earlier) = conflicting_vote(&votes, &vote) {
+        let step = if vote.is_precommit { "precommit" } else { "prevote" };
+        let message = format!(
+            "BFT equivocation: the node sent a {step} at {}.{} for {}, having sent one there for {}",
+            vote.height,
+            vote.round,
+            hex32(&vote.value_id),
+            hex32(&earlier.value_id),
+        );
+        error!("{message}");
+        let instr_i = *TEST_INSTR_C.lock().unwrap();
+        TEST_FAILED_INSTR_IDXS.lock().unwrap().push((instr_i, message));
+    }
+    votes.push(vote);
 }
 
 fn take_stp_peer(index: u64) -> Result<HarnessStpPeer, String> {
@@ -3580,6 +3650,9 @@ pub struct LifeCarry {
     /// The height from which the driver drops the non-finalized backup's blocks before the next
     /// life starts.
     pub lose_from: Option<u32>,
+    /// The node's own votes so far, which those it sends after the restart must not conflict with.
+    #[serde(default)]
+    node_votes: Vec<NodeVote>,
 }
 
 /// The directory of the restarting test this process is a life of, if it is one.
@@ -3621,6 +3694,7 @@ async fn restart(instr_i: usize, abort: bool, lose_from: Option<u32>) {
         // u128 nanoseconds to u64: the supplied clock is kept in u64 nanoseconds.
         instant_advanced_nanos: zebra_debug_time::instant_advanced().map(|by| by.as_nanos() as u64),
         lose_from,
+        node_votes: TEST_NODE_VOTES.lock().unwrap().clone(),
     };
     let bytes = serde_json::to_vec(&carry).expect("the carry serializes");
     let tmp = dir.join("carry.json.tmp");
@@ -3644,6 +3718,7 @@ fn resume_life() {
         return;
     }
     *TEST_FAILED_INSTR_IDXS.lock().unwrap() = carry.failed;
+    *TEST_NODE_VOTES.lock().unwrap() = carry.node_votes;
     *TEST_BLOCK_SLOTS.lock().unwrap() = carry.block_slots.into_iter().map(|(slot, hash)| (slot, ZebBlockHash(hash))).collect();
     if carry.supplied_time != 0 {
         zebra_debug_time::supply_time(carry.supplied_time);
@@ -3691,6 +3766,8 @@ pub(crate) async fn instr_reader(internal_handle: TFLServiceHandle) {
     };
 
     *TEST_INSTRS.lock().unwrap() = tf.instrs.clone();
+    *TEST_NODE_BFT_SEED.lock().unwrap() =
+        Some(internal_handle.config.explicit_bft_key_seed.clone().unwrap_or_else(|| TEST_NODE_FINALIZER_SEED.to_string()));
     resume_life();
 
     let params = internal_handle.params;
@@ -3726,6 +3803,19 @@ mod tests {
     use super::*;
 
     const SHORT: StakingParameters = StakingParameters { period: 10, day_window: 5, action_delay: 6 };
+
+    /// A vote conflicts with the node's earlier one only at the same height, round and step, for
+    /// another value: nil counts as one, and the same vote again does not conflict.
+    #[test]
+    fn a_node_vote_conflicts_only_at_its_own_step_for_another_value() {
+        let vote = |is_precommit, height, round, value: u8| NodeVote { is_precommit, height, round, value_id: [value; 32] };
+        let earlier = [vote(false, 5, 0, 1), vote(true, 5, 0, 1)];
+        assert_eq!(conflicting_vote(&earlier, &vote(false, 5, 0, 2)), Some(earlier[0]));
+        assert_eq!(conflicting_vote(&earlier, &vote(true, 5, 0, 0)), Some(earlier[1]), "nil after a value");
+        assert_eq!(conflicting_vote(&earlier, &vote(false, 5, 0, 1)), None, "the same vote");
+        assert_eq!(conflicting_vote(&earlier, &vote(false, 5, 1, 2)), None, "another round");
+        assert_eq!(conflicting_vote(&earlier, &vote(false, 6, 0, 2)), None, "another height");
+    }
 
     /// The signature count is the block's chunk count or nothing, whatever the file says: a
     /// fuzzed file reaches this parser, and the node indexes signatures by chunk.
