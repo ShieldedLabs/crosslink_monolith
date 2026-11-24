@@ -56,30 +56,13 @@ pub struct Ctx {
     pub network: Network,
 }
 
-/// Where lightwallet_server listens, and what callers from other hosts must present.
-#[derive(Clone)]
+/// Where lightwallet_server listens.
+#[derive(Clone, Debug)]
 pub struct Listen {
     /// The gRPC address the operator chose. Loopback on its port is served beside it.
     pub grpc: SocketAddr,
     /// The readiness endpoint's port, always on loopback.
     pub ready_port: u16,
-    /// What a caller from another host sends as `authorization: Bearer <token>`.
-    pub token: Option<String>,
-    /// A public lightwalletd: callers from other hosts may use every method but the faucet
-    /// without the token.
-    pub public: bool,
-}
-
-/// Shows whether a token is set, never the token.
-impl std::fmt::Debug for Listen {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Listen")
-            .field("grpc", &self.grpc)
-            .field("ready_port", &self.ready_port)
-            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
-            .field("public", &self.public)
-            .finish()
-    }
 }
 
 impl Listen {
@@ -115,8 +98,6 @@ const GRPC_OUT_OF_RANGE: u32 = 11;
 const GRPC_UNIMPLEMENTED: u32 = 12;
 const GRPC_INTERNAL: u32 = 13;
 const GRPC_UNAVAILABLE: u32 = 14;
-const GRPC_PERMISSION_DENIED: u32 = 7;
-const GRPC_UNAUTHENTICATED: u32 = 16;
 
 /// gRPC error: (status code, message).
 type Grr = (u32, String);
@@ -151,8 +132,6 @@ const KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1)
 /// Readiness-probe connections at once, and how long one may take to send its request.
 const MAX_READY_CONNS: usize = 32;
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// The longest `authorization` header kept; a longer one cannot match the token.
-const AUTHORIZATION_MAX: usize = 1024;
 
 /// Transparent addresses one request may name.
 const MAX_ADDRESSES: usize = 256;
@@ -292,8 +271,6 @@ enum Work {
 
 struct Stream {
     path: Vec<u8>,
-    /// The `authorization` header, empty if absent or over AUTHORIZATION_MAX.
-    authorization: Vec<u8>,
     req: Vec<u8>,
     req_done: bool,
     dispatched: bool,
@@ -328,7 +305,7 @@ struct Conn {
     dead: bool,
     /// The prefix the peer's connections are counted under (`peer_prefix`).
     peer_prefix: IpAddr,
-    /// The peer is on this host, as the node's own wallet is: trusted and not counted.
+    /// The peer is on this host, as the node's own wallet is: not counted against the caps.
     loopback: bool,
     /// When the peer last sent anything.
     last_recv: std::time::Instant,
@@ -357,13 +334,6 @@ fn peer_prefix(ip: IpAddr) -> IpAddr {
             IpAddr::V6(Ipv6Addr::from(segments))
         }
     }
-}
-
-/// Whether `authorization` is `Bearer <token>`, compared in time that depends only on lengths.
-fn bearer_matches(authorization: &[u8], token: &str) -> bool {
-    let expected = [b"Bearer ".as_slice(), token.as_bytes()].concat();
-    authorization.len() == expected.len()
-        && authorization.iter().zip(&expected).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
 
 impl Drop for Conn {
@@ -429,8 +399,6 @@ fn spawn_server(
             let mut ready_conns: Vec<(TcpStream, Vec<u8>, std::time::Instant)> = Vec::new();
 
             let mut conns: Vec<Box<Conn>> = Vec::new();
-            let token = listen.token.clone();
-            let public = listen.public;
             // Connections refused for the caps since the last warning, which goes out at most
             // once a minute.
             let mut refused: u64 = 0;
@@ -809,24 +777,7 @@ fn spawn_server(
                                     // park Work (usually a spawned task) on the stream. The
                                     // immediately-called closure exists only so the arms can
                                     // use `?` — its Err lands in s.finish below.
-                                    let authorized = (*c).loopback
-                                        || token.as_deref().is_some_and(|t| bearer_matches(&s.authorization, t));
                                     let r: Result<(), Grr> = (|| {
-                                        // Other hosts need the token, unless the server is public;
-                                        // even then the faucet, which spends this node's funds,
-                                        // needs it.
-                                        if !authorized && !public {
-                                            return Err((
-                                                GRPC_UNAUTHENTICATED,
-                                                "this lightwallet_server needs `authorization: Bearer <token>` from other hosts".into(),
-                                            ));
-                                        }
-                                        if method == Method::RequestFaucetDonation && !authorized {
-                                            return Err((
-                                                GRPC_PERMISSION_DENIED,
-                                                "RequestFaucetDonation answers only this host, or other hosts with the token".into(),
-                                            ));
-                                        }
                                         match method {
                                             Method::GetLatestBlock => {
                                                 // get_latest_block
@@ -2081,7 +2032,6 @@ unsafe extern "C" fn cb_begin_headers(
             // Stream::new
             Stream {
                 path: Vec::new(),
-                authorization: Vec::new(),
                 req: Vec::new(),
                 req_done: false,
                 dispatched: false,
@@ -2113,12 +2063,6 @@ unsafe extern "C" fn cb_header(
     if name == b":path" {
         if let Some(s) = conn.streams.get_mut(&id) {
             s.path = std::slice::from_raw_parts(value, valuelen).to_vec();
-        }
-    }
-    // nghttp2 hands header names over lowercased
-    if name == b"authorization" && valuelen <= AUTHORIZATION_MAX {
-        if let Some(s) = conn.streams.get_mut(&id) {
-            s.authorization = std::slice::from_raw_parts(value, valuelen).to_vec();
         }
     }
     0
@@ -2412,12 +2356,7 @@ mod tests {
 
     /// A server on loopback whose faucet always pays 42, with no mempool, over an empty state.
     /// Unless `loopback_trusted`, its loopback callers are treated as other hosts.
-    async fn serve(token: Option<&str>, loopback_trusted: bool) -> Server {
-        serve_as(token, loopback_trusted, false).await
-    }
-
-    /// `serve`, as a public lightwalletd when `public`.
-    async fn serve_as(token: Option<&str>, loopback_trusted: bool, public: bool) -> Server {
+    async fn serve(loopback_trusted: bool) -> Server {
         let network = Network::new_default_testnet();
         let (_state, read_state, tip, _changes) = zebra_state::init_test_services(&network).await;
         let mempool: MempoolSvc = tower::buffer::Buffer::new(
@@ -2448,8 +2387,6 @@ mod tests {
         let listen = Listen {
             grpc: SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
             ready_port: free_port(),
-            token: token.map(str::to_owned),
-            public,
         };
         let stop = std::sync::Arc::<std::sync::atomic::AtomicBool>::default();
         let thread = spawn_server(ctx, listen, loopback_trusted, stop.clone());
@@ -2468,10 +2405,12 @@ mod tests {
         panic!("lightwallet_server never accepted a connection on {port}");
     }
 
-    fn with_authorization<T>(message: T, authorization: &str) -> Request<T> {
+    fn with_header<T>(message: T, authorization: &Option<String>) -> Request<T> {
         let mut request = Request::new(message);
-        let value: MetadataValue<_> = authorization.parse().expect("ASCII header value");
-        request.metadata_mut().insert("authorization", value);
+        if let Some(authorization) = authorization {
+            let value: MetadataValue<_> = authorization.parse().expect("ASCII header value");
+            request.metadata_mut().insert("authorization", value);
+        }
         request
     }
 
@@ -2492,7 +2431,7 @@ mod tests {
 
     #[test]
     fn grpc_binds_cover_both_loopback_addresses() {
-        let listen = |grpc: &str| Listen { grpc: grpc.parse().expect("an address"), ready_port: 1, token: None, public: false };
+        let listen = |grpc: &str| Listen { grpc: grpc.parse().expect("an address"), ready_port: 1 };
         let addrs = |list: &[&str]| list.iter().map(|a| a.parse().expect("an address")).collect::<Vec<SocketAddr>>();
         assert_eq!(listen("[::1]:9").grpc_binds(), addrs(&["[::1]:9", "127.0.0.1:9"]));
         assert_eq!(listen("127.0.0.1:9").grpc_binds(), addrs(&["127.0.0.1:9", "[::1]:9"]));
@@ -2515,72 +2454,38 @@ mod tests {
         assert_eq!(prefix("::ffff:192.0.2.7"), prefix("192.0.9.9"));
     }
 
-    #[test]
-    fn bearer_matches_only_the_exact_token() {
-        assert!(bearer_matches(b"Bearer secret", "secret"));
-        assert!(!bearer_matches(b"Bearer secreT", "secret"));
-        assert!(!bearer_matches(b"Bearer secret2", "secret"));
-        assert!(!bearer_matches(b"bearer secret", "secret"));
-        assert!(!bearer_matches(b"secret", "secret"));
-        assert!(!bearer_matches(b"", "secret"));
-    }
-
-    /// By default another host is refused every call without a token, the faucet included; this
-    /// host is not.
+    /// Every caller, from this host or another, is answered on every method, the faucet included,
+    /// whatever `authorization` header it sends or omits.
     #[tokio::test(flavor = "multi_thread")]
-    async fn another_host_needs_a_token_by_default() {
-        let remote_server = serve(None, false).await;
-        let remote = client(&remote_server).await;
-        let refused = remote.clone().get_lightd_info(Empty {}).await.expect_err("refused");
-        assert_eq!(refused.code(), Code::Unauthenticated, "{refused:?}");
-        let refused = remote.clone().request_faucet_donation(faucet()).await.expect_err("refused");
-        assert_eq!(refused.code(), Code::Unauthenticated, "{refused:?}");
-
-        let local_server = serve(None, true).await;
-        let local = client(&local_server).await;
-        local.clone().get_lightd_info(Empty {}).await.expect("answered");
-    }
-
-    /// A public server answers another host without a token, except the faucet, which needs the
-    /// token if there is one and is refused if not; this host may use the faucet either way.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn public_server_answers_another_host_but_not_its_faucet() {
-        let remote_server = serve_as(None, false, true).await;
-        let remote = client(&remote_server).await;
-        remote.clone().get_lightd_info(Empty {}).await.expect("answered");
-        let refused = remote.clone().request_faucet_donation(faucet()).await.expect_err("refused");
-        assert_eq!(refused.code(), Code::PermissionDenied, "{refused:?}");
-
-        let tokened_server = serve_as(Some("s3cret"), false, true).await;
-        let tokened = client(&tokened_server).await;
-        tokened.clone().get_lightd_info(Empty {}).await.expect("answered without the token");
-        let refused = tokened.clone().request_faucet_donation(faucet()).await.expect_err("refused");
-        assert_eq!(refused.code(), Code::PermissionDenied, "{refused:?}");
-        let paid = tokened.clone().request_faucet_donation(with_authorization(faucet(), "Bearer s3cret")).await;
-        assert_eq!(paid.expect("paid").into_inner().amount, 42);
-
-        let local_server = serve_as(None, true, true).await;
-        let local = client(&local_server).await;
-        assert_eq!(local.clone().request_faucet_donation(faucet()).await.expect("paid").into_inner().amount, 42);
-    }
-
-    /// With a token, another host needs it for every call, the faucet included.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn token_gates_every_call_from_another_host() {
-        let remote_server = serve(Some("s3cret"), false).await;
-        let remote = client(&remote_server).await;
-        for request in [Request::new(Empty {}), with_authorization(Empty {}, "Bearer wrong")] {
-            let refused = remote.clone().get_lightd_info(request).await.expect_err("refused");
-            assert_eq!(refused.code(), Code::Unauthenticated, "{refused:?}");
+    async fn fuzz_every_caller_is_answered_whatever_it_sends() {
+        let remote_server = serve(false).await;
+        let local_server = serve(true).await;
+        let callers = [client(&remote_server).await, client(&local_server).await];
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..256 {
+            let caller = callers[(next() % 2) as usize].clone();
+            let header: Option<String> = match next() % 3 {
+                0 => None,
+                1 => Some(format!("Bearer {:x}", next())),
+                _ => Some((0..next() % 64).map(|_| (b'!' + (next() % 94) as u8) as char).collect()),
+            };
+            match next() % 2 {
+                0 => {
+                    let answered = caller.clone().get_lightd_info(with_header(Empty {}, &header)).await;
+                    answered.unwrap_or_else(|e| panic!("case {case}: {e:?}"));
+                }
+                _ => {
+                    let paid = caller.clone().request_faucet_donation(with_header(faucet(), &header)).await;
+                    assert_eq!(paid.unwrap_or_else(|e| panic!("case {case}: {e:?}")).into_inner().amount, 42, "case {case}");
+                }
+            }
         }
-        remote.clone().get_lightd_info(with_authorization(Empty {}, "Bearer s3cret")).await.expect("answered");
-        let paid = remote.clone().request_faucet_donation(with_authorization(faucet(), "Bearer s3cret")).await;
-        assert_eq!(paid.expect("paid").into_inner().amount, 42);
-
-        // this host never needs it
-        let local_server = serve(Some("s3cret"), true).await;
-        let local = client(&local_server).await;
-        local.clone().get_lightd_info(Empty {}).await.expect("answered");
     }
 
     /// Whether the server keeps `sock` open: it sends its SETTINGS first, so a kept connection
@@ -2596,7 +2501,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn connections_from_one_other_host_are_capped() {
         for loopback_trusted in [false, true] {
-            let server = serve(None, loopback_trusted).await;
+            let server = serve(loopback_trusted).await;
             drop(client(&server).await);
             let port = server.port;
             let mut socks = Vec::new();
@@ -2613,7 +2518,7 @@ mod tests {
     /// A peer that never answers the keepalive PING is closed, before the idle timeout would.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_silent_peer_is_closed() {
-        let server = serve(None, true).await;
+        let server = serve(true).await;
         drop(client(&server).await);
         let mut sock = TcpStream::connect(("127.0.0.1", server.port)).expect("connects");
         sock.set_read_timeout(Some(KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT + std::time::Duration::from_secs(3)))
@@ -2640,7 +2545,7 @@ mod tests {
         const PING: u8 = 6;
         const GOAWAY: u8 = 7;
         const ACK: u8 = 1;
-        let server = serve(None, false).await;
+        let server = serve(false).await;
         drop(client(&server).await);
         let mut sock = TcpStream::connect(("127.0.0.1", server.port)).expect("connects");
         sock.set_read_timeout(Some(IDLE_TIMEOUT + std::time::Duration::from_secs(5))).expect("a timeout");
@@ -2673,7 +2578,7 @@ mod tests {
     /// count is what refuses it.
     #[tokio::test(flavor = "multi_thread")]
     async fn too_many_addresses_are_refused() {
-        let server = serve(None, true).await;
+        let server = serve(true).await;
         let client = client(&server).await;
         for (count, needle) in [(MAX_ADDRESSES + 1, "at most"), (MAX_ADDRESSES, "bad transparent address")] {
             let addresses = vec!["not an address".to_string(); count];
@@ -2690,7 +2595,7 @@ mod tests {
     /// and ends only because the empty state has no blocks.
     #[tokio::test(flavor = "multi_thread")]
     async fn long_block_ranges_are_refused() {
-        let server = serve(None, true).await;
+        let server = serve(true).await;
         let client = client(&server).await;
         let range = |end: u64| BlockRange {
             start: Some(BlockId { height: 0, hash: Vec::new() }),
@@ -2706,7 +2611,7 @@ mod tests {
     /// server thread.
     #[tokio::test(flavor = "multi_thread")]
     async fn send_transaction_refuses_bad_bytes() {
-        let server = serve(None, true).await;
+        let server = serve(true).await;
         let client = client(&server).await;
         let refused = client.clone().send_transaction(RawTransaction { data: vec![1, 2, 3], height: 0 }).await;
         let refused = refused.expect_err("refused");

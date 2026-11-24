@@ -205,9 +205,8 @@ impl StartCmd {
     /// the P2P listen port + 10001 (gRPC) and + 10000 (readiness).
     ///
     /// Fails where a default doesn't fit in a port number, where the gRPC port is 0 (the
-    /// node's own wallet could not find it), where both ports are the same, where the token is
-    /// empty, or where other hosts can reach a server that is neither public nor has a token:
-    /// serving them unauthenticated is something an operator opts in to.
+    /// node's own wallet could not find it), where both ports are the same, or where other hosts
+    /// can reach a server that isn't public: serving them is something an operator opts in to.
     fn lightwallet_server_listen(config: &ZebradConfig) -> Result<crate::lightwalletd::Listen, String> {
         let crosslink = &config.crosslink;
         let p2p_port = config.network.listen_addr.port();
@@ -239,19 +238,13 @@ impl StartCmd {
                  crosslink.lightwallet_server_listen_addr or crosslink.lightwallet_server_ready_port"
             ));
         }
-        let token = crosslink.lightwallet_server_token.as_ref().map(|token| token.as_str().to_owned());
-        if token.as_deref() == Some("") {
-            return Err("crosslink.lightwallet_server_token is empty".to_owned());
-        }
-        let public = crosslink.public_lightwallet_server;
-        if !grpc.ip().is_loopback() && !public && token.is_none() {
+        if !grpc.ip().is_loopback() && !crosslink.public_lightwallet_server {
             return Err(format!(
                 "lightwallet_server listens on {grpc}, which other hosts can reach: set \
-                 crosslink.lightwallet_server_token to require a token from them, or \
-                 crosslink.public_lightwallet_server = true to serve them without one"
+                 crosslink.public_lightwallet_server = true to serve them"
             ));
         }
-        Ok(crate::lightwalletd::Listen { grpc, ready_port, token, public })
+        Ok(crate::lightwalletd::Listen { grpc, ready_port })
     }
 
     /// Returns the default inbound peer IPs that always receive block gossip in
@@ -1361,28 +1354,57 @@ mod tests {
         let mut config = ZebradConfig::default();
         config.network.listen_addr.set_port(18233);
         let listen = StartCmd::lightwallet_server_listen(&config).expect("valid");
-        assert_eq!((listen.grpc.to_string(), listen.ready_port, listen.token), ("[::1]:28234".to_owned(), 28233, None));
+        assert_eq!((listen.grpc.to_string(), listen.ready_port), ("[::1]:28234".to_owned(), 28233));
 
         config.crosslink.public_lightwallet_server = true;
         let listen = StartCmd::lightwallet_server_listen(&config).expect("valid");
-        assert_eq!((listen.grpc.to_string(), listen.public), ("[::]:28234".to_owned(), true));
+        assert_eq!(listen.grpc.to_string(), "[::]:28234");
 
-        // a token alone lets other hosts reach a server that isn't public
-        config.crosslink.public_lightwallet_server = false;
         config.crosslink.lightwallet_server_listen_addr = Some("192.0.2.7:9067".parse().expect("an address"));
         config.crosslink.lightwallet_server_ready_port = Some(9068);
-        config.crosslink.lightwallet_server_token = Some("s3cret".into());
         let listen = StartCmd::lightwallet_server_listen(&config).expect("valid");
-        assert_eq!(
-            (listen.grpc.to_string(), listen.ready_port, listen.token.as_deref(), listen.public),
-            ("192.0.2.7:9067".to_owned(), 9068, Some("s3cret"), false)
-        );
+        assert_eq!((listen.grpc.to_string(), listen.ready_port), ("192.0.2.7:9067".to_owned(), 9068));
+    }
 
-        // public still applies with an address of its own, token or not
-        config.crosslink.public_lightwallet_server = true;
-        config.crosslink.lightwallet_server_token = None;
-        let listen = StartCmd::lightwallet_server_listen(&config).expect("valid");
-        assert_eq!((listen.grpc.to_string(), listen.public), ("192.0.2.7:9067".to_owned(), true));
+    /// Over random configs, lightwallet_server reaches other hosts only when public: a server
+    /// that isn't public listens on loopback by default and refuses an address other hosts can
+    /// reach, and a public one listens on every interface by default and takes any address.
+    #[test]
+    fn fuzz_lightwallet_server_reaches_other_hosts_only_when_public() {
+        let addrs = ["[::1]", "127.0.0.1", "127.3.4.5", "[::]", "0.0.0.0", "192.0.2.7", "[2001:db8::7]"];
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..1024 {
+            let mut config = ZebradConfig::default();
+            config.network.listen_addr.set_port(1 + (next() % 40_000) as u16);
+            config.crosslink.public_lightwallet_server = next() % 2 == 0;
+            let public = config.crosslink.public_lightwallet_server;
+            let chosen = (next() % 2 == 0).then(|| {
+                let addr = addrs[(next() % addrs.len() as u64) as usize];
+                format!("{addr}:{}", 1 + next() % 1000).parse::<std::net::SocketAddr>().expect("an address")
+            });
+            config.crosslink.lightwallet_server_listen_addr = chosen;
+            let result = StartCmd::lightwallet_server_listen(&config);
+            match chosen {
+                None => {
+                    let listen = result.unwrap_or_else(|e| panic!("case {case}: {e}"));
+                    assert_eq!(listen.grpc.ip().is_unspecified(), public, "case {case}: {listen:?}");
+                    assert_eq!(listen.grpc.ip().is_loopback(), !public, "case {case}: {listen:?}");
+                }
+                Some(addr) if addr.ip().is_loopback() || public => {
+                    assert_eq!(result.unwrap_or_else(|e| panic!("case {case}: {e}")).grpc, addr, "case {case}");
+                }
+                Some(addr) => {
+                    let error = result.expect_err("refused");
+                    assert!(error.contains("other hosts can reach"), "case {case}, {addr}: {error}");
+                }
+            }
+        }
     }
 
     /// A config lightwallet_server could not serve is refused when it loads, before start.
@@ -1413,8 +1435,7 @@ mod tests {
             },
             "both 9067",
         );
-        refused(&|c| c.crosslink.lightwallet_server_token = Some("".into()), "token is empty");
-        // other hosts can reach it, and it is neither public nor has a token
+        // other hosts can reach it, and it isn't public
         for addr in ["192.0.2.7:9067", "[::]:9067", "0.0.0.0:9067"] {
             refused(
                 &|c| c.crosslink.lightwallet_server_listen_addr = Some(addr.parse().expect("an address")),

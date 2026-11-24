@@ -190,11 +190,10 @@ pub mod config {
         pub bft_peers: Vec<String>,
         /// Disable the headless wallet.
         pub disable_the_headless_wallet: bool,
-        /// Run lightwallet_server as a public lightwalletd: callers from other hosts may use every
-        /// method but `RequestFaucetDonation` without a token. Unless
-        /// `lightwallet_server_listen_addr` is set, it also listens on every interface (`[::]` on
-        /// the default port) instead of loopback only. Off by default: a server other hosts can
-        /// reach then needs `lightwallet_server_token`, and a config with neither is refused.
+        /// Serve lightwallet_server to other hosts: every caller may use every method, the faucet
+        /// included. Unless `lightwallet_server_listen_addr` is set, it listens on every interface
+        /// (`[::]` on the default port) instead of loopback only. Off by default, and a
+        /// `lightwallet_server_listen_addr` other hosts can reach is refused without it.
         pub public_lightwallet_server: bool,
         /// The address and port lightwallet_server's gRPC server listens on. Loopback on the
         /// same port is always served too, for the node's own wallet. Unset: loopback only (or
@@ -203,11 +202,6 @@ pub mod config {
         /// The loopback port of lightwallet_server's readiness endpoint. Unset: the P2P port +
         /// 10000.
         pub lightwallet_server_ready_port: Option<u16>,
-        /// A token callers from other hosts send as `authorization: Bearer <token>`. On a server
-        /// that isn't public (`public_lightwallet_server`), every call from another host needs it;
-        /// on a public one, only `RequestFaucetDonation` does. Loopback callers never need it.
-        /// Hidden from logs, and not settable from the environment.
-        pub lightwallet_server_token: Option<zebra_state::RedactedString>,
         /// User-led slashfork rules, as supplied in the config file. These are
         /// merged with [`shipped_slashforks`] and validated by building a
         /// [`SlashForkSchedule`]; after loading, this holds the canonical, merged
@@ -231,7 +225,6 @@ pub mod config {
                 public_lightwallet_server: false,
                 lightwallet_server_listen_addr: None,
                 lightwallet_server_ready_port: None,
-                lightwallet_server_token: None,
                 slashforks: Vec::new(),
                 disable_shipped_slashforks: false,
             }
