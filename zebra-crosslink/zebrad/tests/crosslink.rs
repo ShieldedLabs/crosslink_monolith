@@ -5441,6 +5441,52 @@ fn crosslink_bft_own_candidate_failing_the_block_rules_is_refused_without_a_cras
     test_bytes(tf.write_to_bytes());
 }
 
+/// A finalizer that crashes after precommitting a value at 1.0 and restarts must not vote anything
+/// else at 1.0: it replays the votes its WAL holds instead of voting afresh. Time then runs past
+/// the round's timeouts, where a node that had forgotten its votes would prevote nil at 1.0. The
+/// harness fails the test if the node sends two different votes for one height, round and step,
+/// across the restart as well as within a life.
+fn finalizer_restarting_mid_round_scene(test_name: &'static str, restart: bool) {
+    set_test_name(test_name);
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene(&mut tf, &[false]);
+    let proposer = u16::try_from(scene.proposer(1, 0)).expect("the node does not propose 1.0");
+    let decided = bft_rounds_decisions(&scene, 20, 1);
+    let value = bft_proposal_value(&decided[0].1);
+    let id = bft_value_id(&value);
+
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_bft_recv_proposal(proposer, 1, 0, -1, 0, &value, 0);
+    for k in scene.finalizers {
+        tf.push_instr_bft_recv_vote(k, 0, 1, 0, &id, 0);
+    }
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_step(1, 0, Some(TMStep::Precommit), 0);
+
+    if restart {
+        tf.push_instr_restart(true);
+        tf.push_instr_expect_bft_restores(1, Some(false), 0);
+    }
+    for _ in 0..40 {
+        tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    }
+    tf.push_instr_expect_bft_dropped(false, None, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+#[test]
+fn crosslink_bft_finalizer_restarting_mid_round_votes_nothing_else_at_that_round() {
+    finalizer_restarting_mid_round_scene(function_name!(), true);
+}
+
+#[test]
+fn crosslink_bft_finalizer_restarting_mid_round_votes_nothing_else_at_that_round_control() {
+    finalizer_restarting_mid_round_scene(function_name!(), false);
+}
+
 /// A finalizer that restarts starts tenderlink at once when it holds WAL records: whatever it
 /// signed at a height it passes while catching up is in them. One that has signed nothing is held
 /// back while it catches up. Either way the node restores its decided chain once per start.
