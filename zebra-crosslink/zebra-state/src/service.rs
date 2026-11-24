@@ -411,6 +411,9 @@ impl StateService {
             chain_tip_sender,
             non_finalized_state_sender,
             backup_task,
+            // Crosslink commits through this writer, not the upstream write task, so the
+            // synchronous backup the option asks for is written here.
+            backup_dir_path.filter(|_| config.debug_skip_non_finalized_state_backup_task),
         );
 
         let read_service =

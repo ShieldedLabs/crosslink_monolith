@@ -122,6 +122,9 @@ pub struct WriteBlockWorkerTask {
     chain_tip_sender: ChainTipSender,
     non_finalized_state_sender: watch::Sender<NonFinalizedState>,
     backup_task: Option<super::non_finalized_state::BackupTask>,
+    /// Where the non-finalized state is backed up before each channel update, when
+    /// `debug_skip_non_finalized_state_backup_task` puts the backup there instead of in the task.
+    sync_backup_dir: Option<std::path::PathBuf>,
 
     // Carried across messages. These were locals inside `run()`; they became fields so the
     // per-message work could be extracted into methods without changing what it does.
@@ -153,6 +156,7 @@ impl WriteBlockWorkerTask {
         chain_tip_sender: ChainTipSender,
         non_finalized_state_sender: watch::Sender<NonFinalizedState>,
         backup_task: Option<super::non_finalized_state::BackupTask>,
+        sync_backup_dir: Option<std::path::PathBuf>,
     ) -> WriteBlockWorkerTask {
         WriteBlockWorkerTask {
             finalized_state,
@@ -160,6 +164,7 @@ impl WriteBlockWorkerTask {
             chain_tip_sender,
             non_finalized_state_sender,
             backup_task,
+            sync_backup_dir,
             prev_finalized_note_commitment_trees: None,
             parent_error_map: IndexMap::new(),
             last_best_tip: None,
@@ -324,7 +329,7 @@ impl WriteBlockWorkerTask {
                 &self.non_finalized_state,
                 &mut self.chain_tip_sender,
                 &self.non_finalized_state_sender,
-                None,
+                self.sync_backup_dir.as_deref(),
             );
 
             info!("finalized {}, which implicitly finalizes:", hash);
@@ -410,7 +415,7 @@ impl WriteBlockWorkerTask {
             &self.non_finalized_state,
             &mut self.chain_tip_sender,
             &self.non_finalized_state_sender,
-            None,
+            self.sync_backup_dir.as_deref(),
         );
 
         while self
