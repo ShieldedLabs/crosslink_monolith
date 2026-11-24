@@ -336,13 +336,17 @@ struct Conn {
     closing: bool,
 }
 
-/// The prefix a peer's connections are counted under for MAX_CONNS_PER_PREFIX: an IPv4 address
-/// alone, since many users can share one behind NAT, and an IPv6 address's /64, since one host or
-/// site is routinely given a whole /64 and could otherwise open MAX_CONNS_PER_PREFIX from each of
-/// its addresses. `ip` is canonical, so a v4-mapped peer counts as IPv4.
+/// The prefix a peer's connections are counted under for MAX_CONNS_PER_PREFIX: an IPv4 address's
+/// /16, as Bitcoin groups peers, so one holder of many addresses in a block counts once, and an
+/// IPv6 address's /64, since one host or site is routinely given a whole /64 and could otherwise
+/// open MAX_CONNS_PER_PREFIX from each of its addresses. `ip` is canonical, so a v4-mapped peer
+/// counts as IPv4.
 fn peer_prefix(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V4(_) => ip,
+        IpAddr::V4(v4) => {
+            let [a, b, _, _] = v4.octets();
+            IpAddr::V4(Ipv4Addr::new(a, b, 0, 0))
+        }
         IpAddr::V6(v6) => {
             let mut segments = v6.segments();
             segments[4..].fill(0);
@@ -510,7 +514,7 @@ fn spawn_server(
                                         if refused_warned.is_none_or(|warned| now.duration_since(warned) >= std::time::Duration::from_secs(60)) {
                                             tracing::warn!(
                                                 "lightwallet_server: refused {refused} connection(s) over the caps \
-                                                 ({MAX_REMOTE_CONNS} from other hosts, {MAX_CONNS_PER_PREFIX} from one IPv4 address \
+                                                 ({MAX_REMOTE_CONNS} from other hosts, {MAX_CONNS_PER_PREFIX} from one IPv4 /16 \
                                                  or IPv6 /64); \
                                                  the last from {peer_ip}",
                                             );
@@ -2486,16 +2490,18 @@ mod tests {
         assert_eq!(listen("192.0.2.7:9").grpc_binds(), addrs(&["192.0.2.7:9", "[::1]:9", "127.0.0.1:9"]));
     }
 
-    /// IPv6 addresses in one /64 share a prefix and those in another don't; IPv4 addresses, and
-    /// v4-mapped ones once made canonical, each count alone.
+    /// IPv6 addresses in one /64 share a prefix and IPv4 addresses in one /16 share one; those in
+    /// different blocks don't, and a v4-mapped address, once canonical, counts as IPv4.
     #[test]
-    fn peer_prefix_groups_ipv6_by_64_and_keeps_ipv4_whole() {
+    fn peer_prefix_groups_ipv6_by_64_and_ipv4_by_16() {
         let prefix = |ip: &str| peer_prefix(ip.parse::<IpAddr>().expect("an address").to_canonical());
         assert_eq!(prefix("2001:db8:1:2:aaaa::1"), prefix("2001:db8:1:2:ffff:ffff:ffff:ffff"));
         assert_eq!(prefix("2001:db8:1:2:aaaa::1").to_string(), "2001:db8:1:2::");
         assert_ne!(prefix("2001:db8:1:2::1"), prefix("2001:db8:1:3::1"));
-        assert_ne!(prefix("192.0.2.7"), prefix("192.0.2.8"));
-        assert_eq!(prefix("::ffff:192.0.2.7"), prefix("192.0.2.7"));
+        assert_eq!(prefix("192.0.2.7"), prefix("192.0.255.200"));
+        assert_eq!(prefix("192.0.2.7").to_string(), "192.0.0.0");
+        assert_ne!(prefix("192.0.2.7"), prefix("192.1.2.7"));
+        assert_eq!(prefix("::ffff:192.0.2.7"), prefix("192.0.9.9"));
     }
 
     #[test]
@@ -2549,7 +2555,7 @@ mod tests {
         matches!(sock.read(&mut byte), Ok(1))
     }
 
-    /// Another host gets MAX_CONNS_PER_PREFIX connections from one IPv4 address; this host is not
+    /// Another host gets MAX_CONNS_PER_PREFIX connections from one IPv4 /16; this host is not
     /// counted.
     #[tokio::test(flavor = "multi_thread")]
     async fn connections_from_one_other_host_are_capped() {
