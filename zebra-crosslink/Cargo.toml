@@ -76,7 +76,7 @@ console-subscriber = "0.5"
 criterion = "0.5"
 crossbeam-channel = "0.5.14"
 derive-getters = "0.5"
-derive-new = "0.5"
+derive-new = "0.7"
 dirs = "6.0"
 ed25519-zebra = "4.2"
 elasticsearch = { version = "8.17.0-alpha.1", default-features = false }
@@ -188,7 +188,7 @@ x25519-dalek = "2.0.1"
 zcash_note_encryption = "0.4.1"
 zcash_script = "0.4.5"
 zip32 = { version = "0.2.1", default-features = false }
-config = { version = "0.15.14", features = ["toml"] }
+config = { version = "0.15.14", default-features = false, features = ["toml"] }
 which = "8.0.0"
 
 [workspace.metadata.release]
@@ -199,8 +199,15 @@ allow-branch = ["main"]
 # Compilation settings
 
 [profile.dev]
-panic = "abort"
-codegen-units = 1
+panic = "unwind"
+# The debugging build: minimal optimization. Line tables only is the default, so backtraces and
+# stepping work but locals cannot be inspected; every first-party crate opts back into full
+# debug info below. Drop a crate to line tables by removing it from that list, or for yourself
+# with --config 'profile.dev.package.<crate>.debug="line-tables-only"' or ~/.cargo/config.toml.
+debug = "line-tables-only"
+# One unit makes every edit regenerate the whole crate; 256 (the incremental default)
+# costs test builds on 2-core machines. Dependencies keep one unit below.
+codegen-units = 16
 opt-level = 0
 
 [profile.dev.build-override]
@@ -215,7 +222,50 @@ debug = false
 codegen-units = 1
 # opt-level = 1
 
+# Full debug info for every first-party crate. zebra-gui's is with its opt-level below.
 [profile.dev.package.tenderlink]
+debug = true
+
+[profile.dev.package.zebrad]
+debug = true
+
+[profile.dev.package.zebra-chain]
+debug = true
+
+[profile.dev.package.zebra-script]
+debug = true
+
+[profile.dev.package.zebra-consensus]
+debug = true
+
+[profile.dev.package.zebra-rpc]
+debug = true
+
+[profile.dev.package.zebra-node-services]
+debug = true
+
+[profile.dev.package.zebra-test]
+debug = true
+
+[profile.dev.package.zebra-utils]
+debug = true
+
+[profile.dev.package.zebra-crosslink]
+debug = true
+
+[profile.dev.package.zebra-debug-time]
+debug = true
+
+[profile.dev.package.tower-batch-control]
+debug = true
+
+[profile.dev.package.tower-fallback]
+debug = true
+
+[profile.dev.package.zebra-state]
+debug = true
+
+[profile.dev.package.zebra-network]
 debug = true
 
 # Speed up tests by optimizing performance-critical crates
@@ -245,6 +295,7 @@ opt-level = 3
 
 [profile.dev.package.zebra-gui]
 opt-level = 3
+debug = true
 
 [profile.dev.package.orchard]
 opt-level = 3
@@ -292,10 +343,15 @@ overflow-checks = false
 incremental = false
 codegen-units = 16
 
+# Server release: full debug info and every optimization. Each build takes much longer than
+# with thin LTO; to iterate on optimized code use `--profile release-iter`, and for binaries
+# to distribute use `--profile public-release`.
 [profile.release]
 panic = "abort"
 debug = "full" # Don't change. We need debug=full for server debugging!
 strip = "none"
+# One codegen unit lets LLVM optimize across the whole crate, and fat LTO across all crates.
+codegen-units = 1
 
 # Speed up release builds and sync tests using link-time optimization.
 # Some of Zebra's code is CPU-intensive, and needs extra optimizations for peak performance.
@@ -307,7 +363,7 @@ strip = "none"
 #     - use clang to compile all C/C++ code
 #     - add "-flto=thin" to all C/C++ code builds
 #     - see https://doc.rust-lang.org/rustc/linker-plugin-lto.html#cc-code-as-a-dependency-in-rust
-lto = "thin"
+lto = "fat"
 
 # The CI fuzz campaign (.github/workflows/crosslink-fuzz.yml): optimized like release, but with only
 # the line tables backtraces need, no LTO and incremental builds, so the build directory the runner
@@ -322,6 +378,30 @@ incremental = true
 # [profile.release-debug]
 # inherits = "release"
 
+
+# Optimized builds for iterating on code that needs optimization, with `--profile release-iter`.
+# Without LTO and with incremental compilation, an edit rebuilds in about the time a debug
+# build takes, instead of re-running thin LTO over the whole program. Ship `release` builds.
+[profile.release-iter]
+inherits = "release"
+lto = "off"
+incremental = true
+# Not release's one unit: with one, an edit regenerates the whole crate.
+codegen-units = 256
+# Workspace crates at opt-level 2, which compiles faster than 3; dependencies, which hold the
+# hot cryptography and rarely rebuild, stay at release's 3.
+opt-level = 2
+
+[profile.release-iter.package."*"]
+opt-level = 3
+
+# Public release: the release optimizations without debug info, and with symbols stripped, for
+# the smallest binary to distribute. Panics still print their message, but backtraces have no
+# function names.
+[profile.public-release]
+inherits = "release"
+debug = false
+strip = "symbols"
 
 [workspace.lints.rust]
 # The linter should ignore these expected config flags/values

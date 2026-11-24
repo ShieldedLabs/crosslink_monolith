@@ -1424,6 +1424,17 @@ pub struct TFLRecencyStatus {
     /// node validated the proposal.
     #[serde(default)]
     pub parked_decision_height: Option<u64>,
+    /// How many times this node has restored its decided BFT chain from its store since it
+    /// started: 1 once a stored chain was restored, 0 for a node with none.
+    #[serde(default)]
+    pub bft_restores: u32,
+    /// Tenderlink is held back while this node catches up (a node without WAL records only).
+    #[serde(default)]
+    pub tenderlink_held: bool,
+    /// How many distinct quorums this node has seen for a block other than the one it decided at
+    /// that height: finalizers signed two blocks at one height. Not 0 is a reason to alert.
+    #[serde(default)]
+    pub conflicting_quorums: u32,
     // pub round_step_utc_rngs: Vec<[(u32, u32); 3]>,
 }
 

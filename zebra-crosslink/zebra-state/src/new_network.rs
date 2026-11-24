@@ -908,10 +908,16 @@ fn feed_ready_decisions(
     }
     let mut fed = 0;
     loop {
+        // Rows this node stored before it stopped come first: they need nothing from a peer.
+        bft_runner.feed_stored(read_state, block_writer);
         let next = bft::decided_len();
-        // Heights decided meanwhile, by tenderlink or an earlier feed, are no longer wanted.
+        // Heights decided meanwhile, by tenderlink or an earlier feed, are not stored again: each
+        // is the decided block or a conflicting quorum.
         while fetched.first_key_value().is_some_and(|(&height, _)| height < next) {
-            fetched.pop_first();
+            let Some((_, (from, decision))) = fetched.pop_first() else { break };
+            if let bft::DecidedCheck::Invalid { .. } = bft_runner.check_decided_height(&decision.block, &decision.fat_pointer, "a peer served") {
+                note_rejection(bft_peer_rejections, from);
+            }
         }
         let Some((from, decision)) = fetched.remove(&next) else { return fed; };
         match bft_runner.feed_fetched(decision, read_state, block_writer) {
@@ -4236,7 +4242,15 @@ pub fn sync(
                     // for, and who sent them.
                     for decision in decisions {
                         let height = decision.height;
-                        if height >= from.max(first_fetchable) && height < from + u64::from(count) && height >= next && height < next + BFT_FETCH_AHEAD {
+                        if height < from.max(first_fetchable) || height >= from + u64::from(count) {
+                            continue;
+                        }
+                        if height < next {
+                            // Decided here since we asked: the same block, or a conflicting quorum.
+                            if let bft::DecidedCheck::Invalid { .. } = bft_runner.check_decided_height(&decision.block, &decision.fat_pointer, "a peer served") {
+                                note_rejection(&mut bft_peer_rejections, connection_key);
+                            }
+                        } else if height < next + BFT_FETCH_AHEAD {
                             bft_fetched.insert(height, (connection_key, decision));
                         }
                     }
@@ -4251,7 +4265,19 @@ pub fn sync(
                         continue 'process_packets;
                     }
                     for decision in decisions {
-                        if decision.height != bft::decided_len() || decision.height < first_fetchable {
+                        if decision.height < first_fetchable {
+                            continue;
+                        }
+                        if decision.height < bft::decided_len() {
+                            // A height decided here: the same block, or a conflicting quorum. A peer
+                            // whose certificate does not hold is backed off, and so not heard here.
+                            if let bft::DecidedCheck::Invalid { .. } = bft_runner.check_decided_height(&decision.block, &decision.fat_pointer, "a peer sent") {
+                                note_rejection(&mut bft_peer_rejections, connection_key);
+                                break;
+                            }
+                            continue;
+                        }
+                        if decision.height != bft::decided_len() {
                             continue;
                         }
                         match bft_runner.feed_fetched(decision, &read_state, &mut block_writer) {

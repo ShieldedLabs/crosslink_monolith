@@ -5039,19 +5039,24 @@ type SceneDecision = (u64, BftBlock, FatPointerToBftBlock, Vec<zcash_primitives:
 /// `n` heights from 1 decided on the scene's chain by its three synthetic finalizers: height `h`
 /// finalizes block `first_snapshot + h - 1`, proposed in round 0 by that round's proposer and
 /// certified by the three. The node votes in none of them.
-fn bft_rounds_decisions(scene: &BftRoundsScene, first_snapshot: u32, n: u64) -> Vec<SceneDecision> {
-    // A certificate lists its signers in roster order, by stake and then key, both descending; the
-    // three synthetic finalizers have the same stake.
+/// The certificate the scene's three synthetic finalizers make for `block` at `height`, round 0:
+/// their precommits, listed in roster order (by stake and then key, both descending; the three
+/// have the same stake).
+fn scene_certificate(scene: &BftRoundsScene, block: &BftBlock, height: u64) -> FatPointerToBftBlock {
     let mut signers: Vec<u64> = scene.finalizers.iter().map(|&k| u64::from(k)).collect();
     signers.sort_by_key(|&k| std::cmp::Reverse(synthetic_finalizer_pub_key(k)));
     let seeds: Vec<String> = signers.iter().map(|&k| synthetic_finalizer_seed(k)).collect();
     let seeds: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_bytes()).collect();
+    signed_fat_pointer(block, height, 0, &seeds, &[0; 32])
+}
+
+fn bft_rounds_decisions(scene: &BftRoundsScene, first_snapshot: u32, n: u64) -> Vec<SceneDecision> {
     let mut parent = FatPointerToBftBlock::from_parts(scene.genesis().blake3_hash(), 0, 0, &[]);
     let mut decided = Vec::new();
     for height in 1..=n {
         let snapshot = first_snapshot + u32::try_from(height - 1).expect("a small height");
         let block = bft_proposal(&BFT_ROUNDS_PARAMETERS, height as u32, parent.clone(), 0, &scene.tail_above(snapshot));
-        let fat_ptr = signed_fat_pointer(&block, height, 0, &seeds, &[0; 32]);
+        let fat_ptr = scene_certificate(scene, &block, height);
         let proposer_seed = match scene.proposer(height, 0) {
             TF_BFT_THE_NODE => TEST_NODE_FINALIZER_SEED.to_string(),
             k => synthetic_finalizer_seed(k),
@@ -5135,6 +5140,213 @@ fn crosslink_bft_engine_jumps_to_the_decided_tip_in_one_tick() {
     tf.push_instr_expect_pos_chain_length(DECIDED as usize + 1, 0);
     tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
     tf.push_instr_expect_bft_step(DECIDED + 1, 0, None, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// A decision this node's tenderlink reaches for another block at a height the node already
+/// stored is a conflicting quorum: finalizers precommitted both. The node reports it loudly and
+/// keeps the stored decision, and BFT keeps running. Halting would let anyone holding finalizer
+/// keys from the past stop BFT for free. (Before step 3 of the decided-tip plan the node stopped
+/// BFT here.) The candidate is handed over directly: the race that makes tenderlink reach one in a
+/// live run cannot be scheduled.
+#[test]
+fn crosslink_bft_own_candidate_conflicting_with_a_stored_decision_warns_and_keeps_bft_running() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene(&mut tf, &[false]);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    let stored = bft_rounds_decisions(&scene, 20, 1);
+    let other = bft_rounds_decisions(&scene, 30, 1);
+    assert_ne!(stored[0].1.blake3_hash(), other[0].1.blake3_hash());
+    push_scene_decision(&mut tf, &stored[0], 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+
+    let (_, block, fat_ptr, sigs) = &other[0];
+    let candidate = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block: block.clone(), fat_ptr: fat_ptr.clone() });
+    tf.push_instr_bft_push_candidate(&candidate, sigs, 0);
+    tf.push_instr_expect_bft_dropped(false, None, 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// A decision this node's tenderlink hands over that this node's block rules refuse is not stored,
+/// and the node keeps running: tenderlink waits at that height until it is decided from peers.
+/// (Before step 3 of the decided-tip plan the node panicked here.) The candidate's previous-block
+/// pointer does not name the decided tip, a rule tenderlink's own validation would have caught, so
+/// it is handed over directly.
+#[test]
+fn crosslink_bft_own_candidate_failing_the_block_rules_is_refused_without_a_crash() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene(&mut tf, &[false]);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+
+    let block = bft_proposal(&BFT_ROUNDS_PARAMETERS, 1, FatPointerToBftBlock::null(), 0, &scene.tail_above(20));
+    let fat_ptr = scene_certificate(&scene, &block, 1);
+    let candidate = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr });
+    tf.push_instr_bft_push_candidate(&candidate, &[], 0);
+    tf.push_instr_expect_pos_chain_length(1, 0);
+    tf.push_instr_expect_bft_dropped(false, None, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+/// What arrives for BFT height 2 once the node has decided it.
+#[derive(Clone, Copy, PartialEq)]
+enum AtDecidedHeight {
+    /// Another block, with a valid certificate from that height's roster.
+    Conflicting,
+    /// Another block, signed by nobody.
+    Unsigned,
+    /// The block the node decided there.
+    Same,
+}
+
+/// The node decides heights 1 to 3 from imports. Then height 2 arrives again, from a peer or as
+/// an import. Another block with a valid certificate is a conflicting quorum: at least a third of
+/// the stake signed two blocks at one height. It is reported, the stored decision stands and BFT
+/// keeps running, since stopping would let anyone holding old finalizer keys stop it. Signed by
+/// nobody it is refused and nothing is reported, and the decided block itself is nothing new.
+fn decision_at_a_decided_height_scene(test_name: &'static str, sent: AtDecidedHeight, as_import: bool) {
+    set_test_name(test_name);
+    use zebra_state::new_network::bft_sync;
+    const PEER: u64 = 7;
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene(&mut tf, &[false]);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    let decided = bft_rounds_decisions(&scene, 20, 3);
+    for decision in &decided {
+        push_scene_decision(&mut tf, decision, 0);
+    }
+    tf.push_instr_expect_pos_chain_length(4, 0);
+
+    // On the same parent as the decided height 2, finalizing a later snapshot.
+    let other = bft_proposal(&BFT_ROUNDS_PARAMETERS, 2, decided[0].2.clone(), 0, &scene.tail_above(30));
+    let (block, fat_ptr) = match sent {
+        AtDecidedHeight::Conflicting => (other.clone(), scene_certificate(&scene, &other, 2)),
+        AtDecidedHeight::Unsigned => (other.clone(), FatPointerToBftBlock::from_parts(other.blake3_hash(), 2, 0, &[])),
+        AtDecidedHeight::Same => (decided[1].1.clone(), decided[1].2.clone()),
+    };
+    if as_import {
+        // An import of a decided height is refused whatever it carries.
+        push_scene_decision(&mut tf, &(2, block, fat_ptr, Vec::new()), SHOULD_FAIL);
+    } else {
+        let packet = bft_sync::bft_decisions_packet(std::iter::once((2u64, &block, &fat_ptr, &[][..])));
+        tf.push_instr_recv_stp_packet(&packet, PEER, 0);
+    }
+    tf.push_instr_expect_bft_conflicts(u64::from(sent == AtDecidedHeight::Conflicting), 0);
+    tf.push_instr_expect_pos_chain_length(4, 0);
+    tf.push_instr_expect_bft_dropped(false, None, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+#[test]
+fn crosslink_bft_peer_decision_at_a_decided_height_with_a_valid_certificate_is_reported_as_a_conflict() {
+    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Conflicting, false);
+}
+
+#[test]
+fn crosslink_bft_peer_decision_at_a_decided_height_with_a_valid_certificate_is_reported_as_a_conflict_control() {
+    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Same, false);
+}
+
+#[test]
+fn crosslink_bft_peer_decision_at_a_decided_height_signed_by_nobody_is_not_reported() {
+    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Unsigned, false);
+}
+
+#[test]
+fn crosslink_bft_import_at_a_decided_height_with_a_valid_certificate_is_reported_as_a_conflict() {
+    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Conflicting, true);
+}
+
+/// A peer answering the node's BFT request with a decision for the next height on a
+/// snapshot nobody has, signed by nobody, must not keep the node from fetching that height from
+/// others. The honest peer's decision finalizes a PoW block that is loaded only at the end, so the
+/// node keeps it only if it asked that peer for it: an unasked decision that cannot be stored at
+/// once is dropped. A made-up decision allowed to wait for its snapshot would hold the height in
+/// the fetch window, the node would ask nobody else for it, and the honest decision would be
+/// dropped.
+fn fetched_decision_on_a_made_up_snapshot_scene(test_name: &'static str, bad_peer_answers: bool) {
+    set_test_name(test_name);
+    use zebra_state::new_network::bft_sync;
+    const BAD: u64 = 7;
+    const HONEST: u64 = 8;
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let mut scene = bft_rounds_scene(&mut tf, &[false]);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    let genesis = FatPointerToBftBlock::from_parts(scene.genesis().blake3_hash(), 0, 0, &[]);
+    let sigma = BFT_ROUNDS_PARAMETERS.bc_confirmation_depth_sigma;
+    let miner = scene.miner.clone();
+    let mut made_up_gen = scene.gen.clone();
+    // Above the node's tip, loaded only at the end.
+    let later: Vec<Arc<Block>> = (0..1 + sigma).map(|_| scene.gen.next_block(&miner)).collect();
+    let honest = bft_proposal(&BFT_ROUNDS_PARAMETERS, 1, genesis.clone(), 0, &later[1..]);
+    let honest_fat_ptr = scene_certificate(&scene, &honest, 1);
+    let decision_packet = |block: &BftBlock, fat_ptr: &FatPointerToBftBlock| {
+        bft_sync::bft_decisions_packet(std::iter::once((1u64, block, fat_ptr, &[][..])))
+    };
+
+    if bad_peer_answers {
+        // On a branch no node has, and signed by nobody.
+        let other = Address::Transparent(zcash_transparent::address::TransparentAddress::PublicKeyHash([9u8; 20]));
+        let made_up: Vec<Arc<Block>> = (0..1 + sigma).map(|_| made_up_gen.next_block(&other)).collect();
+        let bogus = bft_proposal(&BFT_ROUNDS_PARAMETERS, 1, genesis, 0, &made_up[1..]);
+        let bogus_fat_ptr = FatPointerToBftBlock::from_parts(bogus.blake3_hash(), 1, 0, &[]);
+        tf.push_instr_recv_stp_packet(&bft_sync::bft_status_packet(3), BAD, 0);
+        tf.push_instr_recv_stp_packet(&decision_packet(&bogus, &bogus_fat_ptr), BAD, 0);
+        tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    }
+    tf.push_instr_recv_stp_packet(&bft_sync::bft_status_packet(3), HONEST, 0);
+    tf.push_instr_recv_stp_packet(&decision_packet(&honest, &honest_fat_ptr), HONEST, 0);
+    tf.push_instr_expect_pos_chain_length(1, 0);
+    for block in &later {
+        tf.push_instr_load_pow(block, 0);
+    }
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+    tf.push_instr_expect_bft_dropped(false, None, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+#[test]
+fn crosslink_bft_fetched_decision_on_a_made_up_snapshot_does_not_hold_its_height() {
+    fetched_decision_on_a_made_up_snapshot_scene(function_name!(), true);
+}
+
+#[test]
+fn crosslink_bft_fetched_decision_on_a_made_up_snapshot_does_not_hold_its_height_control() {
+    fetched_decision_on_a_made_up_snapshot_scene(function_name!(), false);
+}
+
+/// An imported decision whose snapshot this node does not hold is refused at once, as it always
+/// was, not parked: a parked import would hold the node's BFT intake until its snapshot showed up,
+/// before its signatures were even checked. A valid import of the same height right after it is
+/// taken.
+#[test]
+fn crosslink_load_pos_with_an_unknown_snapshot_is_refused_not_parked() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let mut scene = bft_rounds_scene(&mut tf, &[false]);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    // A snapshot and its sigma headers above the node's tip, never loaded.
+    let (miner, gen) = (scene.miner.clone(), &mut scene.gen);
+    let unheld: Vec<Arc<Block>> = (0..1 + BFT_ROUNDS_PARAMETERS.bc_confirmation_depth_sigma).map(|_| gen.next_block(&miner)).collect();
+    let genesis = FatPointerToBftBlock::from_parts(scene.genesis().blake3_hash(), 0, 0, &[]);
+    let block = bft_proposal(&BFT_ROUNDS_PARAMETERS, 1, genesis, 0, &unheld[1..]);
+    let fat_ptr = scene_certificate(&scene, &block, 1);
+    push_scene_decision(&mut tf, &(1, block, fat_ptr, Vec::new()), SHOULD_FAIL);
+
+    let decided = bft_rounds_decisions(&scene, 20, 1);
+    push_scene_decision(&mut tf, &decided[0], 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
 
     test_bytes(tf.write_to_bytes());
 }
