@@ -5125,6 +5125,77 @@ fn crosslink_bft_own_candidate_failing_the_block_rules_is_refused_without_a_cras
     test_bytes(tf.write_to_bytes());
 }
 
+/// What arrives for BFT height 2 once the node has decided it.
+#[derive(Clone, Copy, PartialEq)]
+enum AtDecidedHeight {
+    /// Another block, with a valid certificate from that height's roster.
+    Conflicting,
+    /// Another block, signed by nobody.
+    Unsigned,
+    /// The block the node decided there.
+    Same,
+}
+
+/// The node decides heights 1 to 3 from imports. Then height 2 arrives again, from a peer or as
+/// an import. Another block with a valid certificate is a conflicting quorum: at least a third of
+/// the stake signed two blocks at one height. It is reported, the stored decision stands and BFT
+/// keeps running, since stopping would let anyone holding old finalizer keys stop it. Signed by
+/// nobody it is refused and nothing is reported, and the decided block itself is nothing new.
+fn decision_at_a_decided_height_scene(test_name: &'static str, sent: AtDecidedHeight, as_import: bool) {
+    set_test_name(test_name);
+    use zebra_state::new_network::bft_sync;
+    const PEER: u64 = 7;
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene(&mut tf, &[false]);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    let decided = bft_rounds_decisions(&scene, 20, 3);
+    for decision in &decided {
+        push_scene_decision(&mut tf, decision, 0);
+    }
+    tf.push_instr_expect_pos_chain_length(4, 0);
+
+    // On the same parent as the decided height 2, finalizing a later snapshot.
+    let other = bft_proposal(&BFT_ROUNDS_PARAMETERS, 2, decided[0].2.clone(), 0, &scene.tail_above(30));
+    let (block, fat_ptr) = match sent {
+        AtDecidedHeight::Conflicting => (other.clone(), scene_certificate(&scene, &other, 2)),
+        AtDecidedHeight::Unsigned => (other.clone(), FatPointerToBftBlock::from_parts(other.blake3_hash(), 2, 0, &[])),
+        AtDecidedHeight::Same => (decided[1].1.clone(), decided[1].2.clone()),
+    };
+    if as_import {
+        // An import of a decided height is refused whatever it carries.
+        push_scene_decision(&mut tf, &(2, block, fat_ptr, Vec::new()), SHOULD_FAIL);
+    } else {
+        let packet = bft_sync::bft_decisions_packet(std::iter::once((2u64, &block, &fat_ptr, &[][..])));
+        tf.push_instr_recv_stp_packet(&packet, PEER, 0);
+    }
+    tf.push_instr_expect_bft_conflicts(u64::from(sent == AtDecidedHeight::Conflicting), 0);
+    tf.push_instr_expect_pos_chain_length(4, 0);
+    tf.push_instr_expect_bft_dropped(false, None, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+#[test]
+fn crosslink_bft_peer_decision_at_a_decided_height_with_a_valid_certificate_is_reported_as_a_conflict() {
+    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Conflicting, false);
+}
+
+#[test]
+fn crosslink_bft_peer_decision_at_a_decided_height_with_a_valid_certificate_is_reported_as_a_conflict_control() {
+    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Same, false);
+}
+
+#[test]
+fn crosslink_bft_peer_decision_at_a_decided_height_signed_by_nobody_is_not_reported() {
+    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Unsigned, false);
+}
+
+#[test]
+fn crosslink_bft_import_at_a_decided_height_with_a_valid_certificate_is_reported_as_a_conflict() {
+    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Conflicting, true);
+}
+
 /// A peer answering the node's BFT request with a decision for the next height on a
 /// snapshot nobody has, signed by nobody, must not keep the node from fetching that height from
 /// others. The honest peer's decision finalizes a PoW block that is loaded only at the end, so the

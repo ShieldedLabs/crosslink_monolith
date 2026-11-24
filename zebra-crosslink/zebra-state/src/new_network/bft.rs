@@ -538,6 +538,9 @@ static BFT_RESTORES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 /// Tenderlink is held back while catching up, for the recency status.
 static TENDERLINK_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// How many distinct conflicting quorums this node has reported, for the recency status.
+static CONFLICTING_QUORUMS_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn publish_tenderlink_held(held: bool) {
     TENDERLINK_HELD.store(held, std::sync::atomic::Ordering::Relaxed);
     RECENCY_STATUS.send_modify(|status| status.tenderlink_held = held);
@@ -1385,6 +1388,18 @@ struct DecidedBlock {
 /// decisions are not answered; it follows the published decided tip.
 type ImportReply = tokio::sync::oneshot::Sender<Result<(), String>>;
 
+/// What [`BftRunner::check_decided_height`] made of a decision for a height this node decided.
+pub(super) enum DecidedCheck {
+    /// The height is not decided here, or it is genesis, which is derived and carries no quorum.
+    NotChecked,
+    /// The block this node decided there.
+    Same,
+    /// Another block with a valid certificate for that height: reported as a conflicting quorum.
+    Conflict,
+    /// Another block whose fat pointer names another block or is not a valid certificate.
+    Invalid { why: String },
+}
+
 /// What [`BftRunner::feed_fetched`] did with a decision.
 pub(super) enum FeedOutcome {
     Fed,
@@ -1744,6 +1759,12 @@ static CONFLICTING_QUORUMS_REPORTED: Mutex<VecDeque<(u64, Blake3Hash)>> = Mutex:
 /// How many conflicting quorums `CONFLICTING_QUORUMS_REPORTED` remembers.
 const CONFLICTING_QUORUMS_REMEMBERED: usize = 16;
 
+/// Whether a conflicting quorum for `other` at `height` was reported already: its certificate
+/// was found valid then, so it need not be verified again.
+fn conflicting_quorum_reported(height: u64, other: Blake3Hash) -> bool {
+    CONFLICTING_QUORUMS_REPORTED.lock().unwrap().contains(&(height, other))
+}
+
 /// Reports, loudly and once per height and block, a quorum for block `other` at a height where
 /// this node stored `stored`: finalizers precommitted both. The stored decision stands and BFT
 /// keeps running: stopping it would let anyone holding finalizer keys from the past, which cost
@@ -1759,6 +1780,8 @@ fn report_conflicting_quorum(height: u64, stored: Blake3Hash, other: Blake3Hash,
     }
     reported.push_back((height, other));
     metrics::counter!("state.crosslink.bft_conflicting_quorums").increment(1);
+    let seen = CONFLICTING_QUORUMS_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    RECENCY_STATUS.send_modify(|status| status.conflicting_quorums = seen);
     tracing::error!(
         "crosslink: CONFLICTING BFT QUORUM at height {height}. This node stored block {stored} as decided \
          there, and {how} block {other}: at least a third of that height's stake signed both. This node \
@@ -1905,6 +1928,42 @@ impl BftRunner {
     /// node derives genesis itself (`bootstrap`), so it is never fetched.
     pub(super) fn fetches_genesis(&self) -> bool {
         !matches!(self.params.bootstrap, BftBootstrap::FromChain { .. })
+    }
+
+    /// Checks a decision for a height this node has already decided against the roster that voted
+    /// there. Another block with a valid certificate means at least a third of that height's stake
+    /// signed two blocks: it is reported loudly, and the stored decision stands; BFT never stops
+    /// for it, since stopping would let anyone holding old finalizer keys stop BFT on every node
+    /// (decisions table, 2026-11-19). `how` says where the other block was seen, for the report.
+    /// The same block costs a hash; a conflict reported already is not verified again.
+    pub(super) fn check_decided_height(&self, block: &BftBlock, fat_pointer: &FatPointerToBftBlock, how: &str) -> DecidedCheck {
+        let height = u64::from(block.height);
+        let chain = BFT_CHAIN.read().unwrap();
+        // usize to u64 is lossless on every supported target.
+        if height == 0 || height >= chain.blocks.len() as u64 {
+            return DecidedCheck::NotChecked;
+        }
+        let block_hash = block.blake3_hash();
+        if chain.hash_to_height.get(&block_hash) == Some(&height) {
+            return DecidedCheck::Same;
+        }
+        if fat_pointer.points_at_block_hash() != block_hash {
+            return DecidedCheck::Invalid { why: format!("the fat pointer for BFT height {height} names another block") };
+        }
+        if conflicting_quorum_reported(height, block_hash) {
+            return DecidedCheck::Conflict;
+        }
+        let Some(voting) = chain.voting_rosters.get(height as usize).cloned() else {
+            return DecidedCheck::NotChecked;
+        };
+        let stored = decided_block(&chain, height as usize).map(|stored| stored.blake3_hash());
+        drop(chain);
+        if !certificate_is_valid(fat_pointer, height, &voting) {
+            return DecidedCheck::Invalid { why: format!("the fat pointer is not a valid certificate for BFT height {height}") };
+        }
+        let Some(stored) = stored else { return DecidedCheck::NotChecked };
+        report_conflicting_quorum(height, stored, block_hash, how);
+        DecidedCheck::Conflict
     }
 
     /// Takes in the rows `restore` stopped at, in order, each once it is the next height and its
@@ -2224,6 +2283,19 @@ impl BftRunner {
         if source != Source::Tenderlink {
             if BFT_CHAIN.read().unwrap().hash_to_height.get(&block_hash) == Some(&height) {
                 return Ok(Admitted::AlreadyDecided);
+            }
+            // Another block at a height decided here: only its certificate is of interest.
+            if matches!(source, Source::Imported { .. }) && height < decided_len() {
+                return Err(match self.check_decided_height(block, fat_pointer, "an import carried") {
+                    DecidedCheck::Conflict => Refusal::refused(format!(
+                        "BFT height {height} is decided already with another block; this one's certificate is valid, \
+                         so it is reported as a conflicting quorum",
+                    )),
+                    DecidedCheck::Invalid { why } => Refusal::refused(why),
+                    DecidedCheck::NotChecked | DecidedCheck::Same => {
+                        Refusal::refused(format!("BFT height {height} is decided already with another block"))
+                    }
+                });
             }
             // A decision at this height is already final and waits only for its snapshot;
             // storing another one here would fork the chain under it. Fetched and stored ones were
@@ -3349,6 +3421,7 @@ fn recency_status_from(bft_state: &TMState, bft_key_address_map: &BftAddressMap)
         parked_decision_height: *PARKED_DECISION_HEIGHT.lock().unwrap(),
         bft_restores: BFT_RESTORES.load(std::sync::atomic::Ordering::Relaxed),
         tenderlink_held: TENDERLINK_HELD.load(std::sync::atomic::Ordering::Relaxed),
+        conflicting_quorums: CONFLICTING_QUORUMS_SEEN.load(std::sync::atomic::Ordering::Relaxed),
     }
 }
 

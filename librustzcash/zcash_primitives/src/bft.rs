@@ -1431,6 +1431,10 @@ pub struct TFLRecencyStatus {
     /// Tenderlink is held back while this node catches up (a node without WAL records only).
     #[serde(default)]
     pub tenderlink_held: bool,
+    /// How many distinct quorums this node has seen for a block other than the one it decided at
+    /// that height: finalizers signed two blocks at one height. Not 0 is a reason to alert.
+    #[serde(default)]
+    pub conflicting_quorums: u32,
     // pub round_step_utc_rngs: Vec<[(u32, u32); 3]>,
 }
 

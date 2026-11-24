@@ -172,6 +172,7 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
     strs[TFInstr::CLOCK_STEP_DURING as usize] = "CLOCK_STEP_DURING";
     strs[TFInstr::MEMPOOL_LAG as usize] = "MEMPOOL_LAG";
     strs[TFInstr::BFT_PUSH_CANDIDATE as usize] = "BFT_PUSH_CANDIDATE";
+    strs[TFInstr::EXPECT_BFT_CONFLICTS as usize] = "EXPECT_BFT_CONFLICTS";
 
     let mut retired_i = 0;
     while retired_i < TFInstr::RETIRED.len() {
@@ -179,7 +180,7 @@ static TF_INSTR_KIND_STRS: [&str; TFInstr::COUNT as usize] = {
         retired_i += 1;
     }
 
-    const_assert!(TFInstr::COUNT == 40);
+    const_assert!(TFInstr::COUNT == 43);
     strs
 };
 
@@ -349,7 +350,12 @@ impl TFInstr {
     /// thread has taken it; what became of it is for the instructions after it to check. Fails
     /// when there is no sync thread to take it.
     pub const BFT_PUSH_CANDIDATE: TFInstrKind = 39;
-    pub const COUNT: TFInstrKind = 40;
+    // 40 is reserved for BFT_FAIL_DECISION_WRITES and 41 for RESTART, which are not on this
+    // branch yet.
+    /// The node has reported exactly `val[0]` distinct conflicting BFT quorums (another block
+    /// with a valid certificate at a height it decided); no data.
+    pub const EXPECT_BFT_CONFLICTS: TFInstrKind = 42;
+    pub const COUNT: TFInstrKind = 43;
 
     pub fn str_from_kind(kind: TFInstrKind) -> &'static str {
         let kind = kind as usize;
@@ -486,6 +492,7 @@ impl TFInstr {
             Some(TestInstr::RecvTxStp { tx, peer }) => str += &format!("{} via STP peer {peer}", tx.hash()),
             Some(TestInstr::ClockStepDuring { millis, ticks }) => str += &format!("{millis} ms after {ticks} tick(s)"),
             Some(TestInstr::MempoolLag { tips }) => str += &format!("{tips} tip(s)"),
+            Some(TestInstr::ExpectBftConflicts { count }) => str += &format!("{count}"),
             Some(TestInstr::ExpectBftDropped { dropped, hash }) => {
                 str += &format!("{dropped}");
                 if let Some(hash) = hash {
@@ -981,6 +988,11 @@ impl TF {
     }
 
     /// `hash`, when given, is the block the dropped-BFT record must name.
+    /// `EXPECT_BFT_CONFLICTS`: the node has reported exactly `count` distinct conflicting quorums.
+    pub fn push_instr_expect_bft_conflicts(&mut self, count: u64, flags: u32) {
+        self.push_instr_ex(TFInstr::EXPECT_BFT_CONFLICTS, flags, &[0; 0], [count, 0])
+    }
+
     pub fn push_instr_expect_bft_dropped(&mut self, dropped: bool, hash: Option<&ZebBlockHash>, flags: u32) {
         let data = hash.map_or(&[][..], |hash| &hash.0[..]);
         self.push_instr_ex(TFInstr::EXPECT_BFT_DROPPED, flags, data, [u64::from(dropped), 0])
@@ -1361,7 +1373,7 @@ pub fn read_load_pos(bytes: &[u8], instr: &TFInstr) -> Option<(BftBlock, FatPoin
 }
 
 pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> {
-    const_assert!(TFInstr::COUNT == 40);
+    const_assert!(TFInstr::COUNT == 43);
     match instr.kind {
         TFInstr::LOAD_POW => {
             let data = instr.data_slice(bytes);
@@ -1532,6 +1544,7 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
             let hash = if data.is_empty() { None } else { Some(ZebBlockHash(data.try_into().ok()?)) };
             Some(TestInstr::ExpectBftDropped { dropped: instr.val[0] != 0, hash })
         }
+        TFInstr::EXPECT_BFT_CONFLICTS => Some(TestInstr::ExpectBftConflicts { count: instr.val[0] }),
         TFInstr::CLOCK_STEP_DURING => Some(TestInstr::ClockStepDuring { millis: instr.val[0], ticks: instr.val[1] }),
         TFInstr::MEMPOOL_LAG => Some(TestInstr::MempoolLag { tips: instr.val[0] }),
 
@@ -1589,6 +1602,7 @@ pub(crate) enum TestInstr {
     ExpectBftSent { kind: u64, height: u64, round: u32, value_id: Option<[u8; 32]> },
     ExpectBftProposer { finalizer: u64, height: u64, round: u32 },
     ExpectBftDropped { dropped: bool, hash: Option<ZebBlockHash> },
+    ExpectBftConflicts { count: u64 },
     ClockStepDuring { millis: u64, ticks: u64 },
     MempoolLag { tips: u64 },
     RosterForceInclude([u8; 32], u64),   // public address
@@ -2035,6 +2049,14 @@ pub(crate) async fn handle_instr(
         TestInstr::ExpectNodeAlive => {
             let (alive, message) = node_alive(internal_handle).await;
             test_check(flags, alive, &message);
+        }
+
+        TestInstr::ExpectBftConflicts { count } => {
+            // Reported on the sync thread as a decision is checked; a settled pass has checked
+            // what arrived before this instruction.
+            sync_settle().await;
+            let seen = u64::from(zebra_state::new_network::bft::bft_recency_status().conflicting_quorums);
+            test_check(flags, seen == count, &format!("conflicting BFT quorums: expected {count}, actually {seen}"));
         }
 
         TestInstr::ExpectBftDropped { dropped, hash } => {
