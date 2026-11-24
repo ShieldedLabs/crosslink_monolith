@@ -5441,6 +5441,84 @@ fn crosslink_bft_own_candidate_failing_the_block_rules_is_refused_without_a_cras
     test_bytes(tf.write_to_bytes());
 }
 
+/// A finalizer that restarts starts tenderlink at once when it holds WAL records: whatever it
+/// signed at a height it passes while catching up is in them. One that has signed nothing is held
+/// back while it catches up. Either way the node restores its decided chain once per start.
+fn restarted_finalizer_scene(test_name: &'static str, signed_before_restart: bool) {
+    set_test_name(test_name);
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    // The node proposes at 1.0 and prevotes it, which writes a WAL record before it is sent.
+    bft_rounds_scene(&mut tf, &[signed_before_restart]);
+    if signed_before_restart {
+        tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+        tf.push_instr_expect_bft_proposer(TF_BFT_THE_NODE, 1, 0, 0);
+        tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+        tf.push_instr_expect_bft_sent(2, 1, 0, None, 0);
+    }
+    tf.push_instr_restart(false);
+    tf.push_instr_expect_bft_restores(1, Some(!signed_before_restart), 0);
+    tf.push_instr_expect_pos_chain_length(1, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+#[test]
+fn crosslink_bft_restarted_finalizer_with_a_wal_is_not_held_back() {
+    restarted_finalizer_scene(function_name!(), true);
+}
+
+#[test]
+fn crosslink_bft_restarted_finalizer_with_a_wal_is_not_held_back_control() {
+    restarted_finalizer_scene(function_name!(), false);
+}
+
+/// The node decides heights 1 to 3, then restarts having lost the PoW blocks from height 3's
+/// snapshot up, as a crash before the non-finalized backup caught up does. Restore stops below
+/// height 3, whose next roster comes from that snapshot. Once the blocks are back, height 3 is
+/// taken in from the node's own store: no peer serves it, and restore does not run again.
+fn restart_losing_a_decided_snapshot_scene(test_name: &'static str, lose_snapshot: bool) {
+    set_test_name(test_name);
+    // Height 3 finalizes the block at 22.
+    const SNAPSHOT_OF_3: u32 = 22;
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let scene = bft_rounds_scene(&mut tf, &[false]);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    for decision in &bft_rounds_decisions(&scene, 20, 3) {
+        push_scene_decision(&mut tf, decision, 0);
+    }
+    tf.push_instr_expect_pos_chain_length(4, 0);
+
+    if lose_snapshot {
+        tf.push_instr_restart_losing(true, SNAPSHOT_OF_3);
+        tf.push_instr_expect_pos_chain_length(3, 0);
+    } else {
+        tf.push_instr_restart(true);
+        tf.push_instr_expect_pos_chain_length(4, 0);
+    }
+    tf.push_instr_expect_bft_restores(1, None, 0);
+    for block in scene.pow.iter().filter(|block| block.coinbase_height().is_some_and(|height| height.0 >= SNAPSHOT_OF_3)) {
+        tf.push_instr_load_pow(block, 0);
+    }
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_pos_chain_length(4, 0);
+    tf.push_instr_expect_bft_restores(1, None, 0);
+    tf.push_instr_expect_bft_dropped(false, None, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
+#[test]
+fn crosslink_bft_restart_losing_a_decided_snapshot_takes_the_stored_decision_in_once_it_is_back() {
+    restart_losing_a_decided_snapshot_scene(function_name!(), true);
+}
+
+#[test]
+fn crosslink_bft_restart_losing_a_decided_snapshot_takes_the_stored_decision_in_once_it_is_back_control() {
+    restart_losing_a_decided_snapshot_scene(function_name!(), false);
+}
+
 /// What arrives for BFT height 2 once the node has decided it.
 #[derive(Clone, Copy, PartialEq)]
 enum AtDecidedHeight {

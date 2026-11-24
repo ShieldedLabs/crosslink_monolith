@@ -1424,8 +1424,9 @@ pub struct TFLRecencyStatus {
     /// node validated the proposal.
     #[serde(default)]
     pub parked_decision_height: Option<u64>,
-    /// How many times this node has restored its decided BFT chain from its store since it
-    /// started: 1 once a stored chain was restored, 0 for a node with none.
+    /// How many times this node has run its restore of the decided BFT chain since it started:
+    /// once at every start, an empty store included, so 1 in every life. More would mean it
+    /// rebuilt the chain while running.
     #[serde(default)]
     pub bft_restores: u32,
     /// Tenderlink is held back while this node catches up (a node without WAL records only).
