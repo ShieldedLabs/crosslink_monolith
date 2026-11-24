@@ -63,8 +63,11 @@ pub struct Listen {
     pub grpc: SocketAddr,
     /// The readiness endpoint's port, always on loopback.
     pub ready_port: u16,
-    /// What a caller from another host must send as `authorization: Bearer <token>`.
+    /// What a caller from another host sends as `authorization: Bearer <token>`.
     pub token: Option<String>,
+    /// A public lightwalletd: callers from other hosts may use every method but the faucet
+    /// without the token.
+    pub public: bool,
 }
 
 /// Shows whether a token is set, never the token.
@@ -74,6 +77,7 @@ impl std::fmt::Debug for Listen {
             .field("grpc", &self.grpc)
             .field("ready_port", &self.ready_port)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("public", &self.public)
             .finish()
     }
 }
@@ -123,10 +127,11 @@ const OUT_BUDGET: usize = 256 * 1024;
 const CHUNK: i64 = 32;
 const PATH_PREFIX: &[u8] = b"/cash.z.wallet.sdk.rpc.CompactTxStreamer/";
 
-/// Connections from other hosts, in all and from any one address. Loopback connections, the
-/// node's own wallet's among them, are not counted, so other hosts cannot crowd them out.
+/// Connections from other hosts, in all and from any one prefix (`peer_prefix`). Loopback
+/// connections, the node's own wallet's among them, are not counted, so other hosts cannot crowd
+/// them out.
 const MAX_REMOTE_CONNS: usize = 256;
-const MAX_CONNS_PER_IP: usize = 16;
+const MAX_CONNS_PER_PREFIX: usize = 16;
 /// A connection from another host with no request in progress and no new request for this
 /// long is closed. Tests use seconds, so they can wait the timers out.
 #[cfg(not(test))]
@@ -321,8 +326,8 @@ struct Conn {
     pending: Vec<u8>,
     pending_off: usize,
     dead: bool,
-    /// The peer's address, IPv4 rather than v4-mapped.
-    peer_ip: IpAddr,
+    /// The prefix the peer's connections are counted under (`peer_prefix`).
+    peer_prefix: IpAddr,
     /// The peer is on this host, as the node's own wallet is: trusted and not counted.
     loopback: bool,
     /// When the peer last sent anything.
@@ -333,6 +338,25 @@ struct Conn {
     ping_sent: Option<std::time::Instant>,
     /// GOAWAY is queued; the connection closes once it is sent.
     closing: bool,
+}
+
+/// The prefix a peer's connections are counted under for MAX_CONNS_PER_PREFIX: an IPv4 address's
+/// /16, as Bitcoin groups peers, so one holder of many addresses in a block counts once, and an
+/// IPv6 address's /64, since one host or site is routinely given a whole /64 and could otherwise
+/// open MAX_CONNS_PER_PREFIX from each of its addresses. `ip` is canonical, so a v4-mapped peer
+/// counts as IPv4.
+fn peer_prefix(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, _, _] = v4.octets();
+            IpAddr::V4(Ipv4Addr::new(a, b, 0, 0))
+        }
+        IpAddr::V6(v6) => {
+            let mut segments = v6.segments();
+            segments[4..].fill(0);
+            IpAddr::V6(Ipv6Addr::from(segments))
+        }
+    }
 }
 
 /// Whether `authorization` is `Bearer <token>`, compared in time that depends only on lengths.
@@ -406,6 +430,7 @@ fn spawn_server(
 
             let mut conns: Vec<Box<Conn>> = Vec::new();
             let token = listen.token.clone();
+            let public = listen.public;
             // Connections refused for the caps since the last warning, which goes out at most
             // once a minute.
             let mut refused: u64 = 0;
@@ -483,17 +508,19 @@ fn spawn_server(
                         match listener.accept() {
                             Ok((sock, peer)) => {
                                 let peer_ip = peer.ip().to_canonical();
+                                let peer_prefix = peer_prefix(peer_ip);
                                 let loopback = loopback_trusted && peer_ip.is_loopback();
                                 if !loopback {
                                     let remote = conns.iter().filter(|c| !c.loopback).count();
-                                    let from_ip = conns.iter().filter(|c| c.peer_ip == peer_ip).count();
-                                    if remote >= MAX_REMOTE_CONNS || from_ip >= MAX_CONNS_PER_IP {
+                                    let from_prefix = conns.iter().filter(|c| c.peer_prefix == peer_prefix).count();
+                                    if remote >= MAX_REMOTE_CONNS || from_prefix >= MAX_CONNS_PER_PREFIX {
                                         // dropping the socket closes it
                                         refused += 1;
                                         if refused_warned.is_none_or(|warned| now.duration_since(warned) >= std::time::Duration::from_secs(60)) {
                                             tracing::warn!(
                                                 "lightwallet_server: refused {refused} connection(s) over the caps \
-                                                 ({MAX_REMOTE_CONNS} from other hosts, {MAX_CONNS_PER_IP} from one address); \
+                                                 ({MAX_REMOTE_CONNS} from other hosts, {MAX_CONNS_PER_PREFIX} from one IPv4 /16 \
+                                                 or IPv6 /64); \
                                                  the last from {peer_ip}",
                                             );
                                             refused = 0;
@@ -516,7 +543,7 @@ fn spawn_server(
                                         pending: Vec::new(),
                                         pending_off: 0,
                                         dead: false,
-                                        peer_ip,
+                                        peer_prefix,
                                         loopback,
                                         last_recv: now,
                                         last_used: now,
@@ -785,10 +812,10 @@ fn spawn_server(
                                     let authorized = (*c).loopback
                                         || token.as_deref().is_some_and(|t| bearer_matches(&s.authorization, t));
                                     let r: Result<(), Grr> = (|| {
-                                        // With a token, other hosts need it for everything; without
-                                        // one, they may use everything but the faucet, which spends
-                                        // this node's funds.
-                                        if token.is_some() && !authorized {
+                                        // Other hosts need the token, unless the server is public;
+                                        // even then the faucet, which spends this node's funds,
+                                        // needs it.
+                                        if !authorized && !public {
                                             return Err((
                                                 GRPC_UNAUTHENTICATED,
                                                 "this lightwallet_server needs `authorization: Bearer <token>` from other hosts".into(),
@@ -2386,6 +2413,11 @@ mod tests {
     /// A server on loopback whose faucet always pays 42, with no mempool, over an empty state.
     /// Unless `loopback_trusted`, its loopback callers are treated as other hosts.
     async fn serve(token: Option<&str>, loopback_trusted: bool) -> Server {
+        serve_as(token, loopback_trusted, false).await
+    }
+
+    /// `serve`, as a public lightwalletd when `public`.
+    async fn serve_as(token: Option<&str>, loopback_trusted: bool, public: bool) -> Server {
         let network = Network::new_default_testnet();
         let (_state, read_state, tip, _changes) = zebra_state::init_test_services(&network).await;
         let mempool: MempoolSvc = tower::buffer::Buffer::new(
@@ -2417,6 +2449,7 @@ mod tests {
             grpc: SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
             ready_port: free_port(),
             token: token.map(str::to_owned),
+            public,
         };
         let stop = std::sync::Arc::<std::sync::atomic::AtomicBool>::default();
         let thread = spawn_server(ctx, listen, loopback_trusted, stop.clone());
@@ -2459,13 +2492,27 @@ mod tests {
 
     #[test]
     fn grpc_binds_cover_both_loopback_addresses() {
-        let listen = |grpc: &str| Listen { grpc: grpc.parse().expect("an address"), ready_port: 1, token: None };
+        let listen = |grpc: &str| Listen { grpc: grpc.parse().expect("an address"), ready_port: 1, token: None, public: false };
         let addrs = |list: &[&str]| list.iter().map(|a| a.parse().expect("an address")).collect::<Vec<SocketAddr>>();
         assert_eq!(listen("[::1]:9").grpc_binds(), addrs(&["[::1]:9", "127.0.0.1:9"]));
         assert_eq!(listen("127.0.0.1:9").grpc_binds(), addrs(&["127.0.0.1:9", "[::1]:9"]));
         assert_eq!(listen("[::]:9").grpc_binds(), addrs(&["[::]:9", "0.0.0.0:9"]));
         assert_eq!(listen("0.0.0.0:9").grpc_binds(), addrs(&["0.0.0.0:9", "[::1]:9"]));
         assert_eq!(listen("192.0.2.7:9").grpc_binds(), addrs(&["192.0.2.7:9", "[::1]:9", "127.0.0.1:9"]));
+    }
+
+    /// IPv6 addresses in one /64 share a prefix and IPv4 addresses in one /16 share one; those in
+    /// different blocks don't, and a v4-mapped address, once canonical, counts as IPv4.
+    #[test]
+    fn peer_prefix_groups_ipv6_by_64_and_ipv4_by_16() {
+        let prefix = |ip: &str| peer_prefix(ip.parse::<IpAddr>().expect("an address").to_canonical());
+        assert_eq!(prefix("2001:db8:1:2:aaaa::1"), prefix("2001:db8:1:2:ffff:ffff:ffff:ffff"));
+        assert_eq!(prefix("2001:db8:1:2:aaaa::1").to_string(), "2001:db8:1:2::");
+        assert_ne!(prefix("2001:db8:1:2::1"), prefix("2001:db8:1:3::1"));
+        assert_eq!(prefix("192.0.2.7"), prefix("192.0.255.200"));
+        assert_eq!(prefix("192.0.2.7").to_string(), "192.0.0.0");
+        assert_ne!(prefix("192.0.2.7"), prefix("192.1.2.7"));
+        assert_eq!(prefix("::ffff:192.0.2.7"), prefix("192.0.9.9"));
     }
 
     #[test]
@@ -2478,16 +2525,41 @@ mod tests {
         assert!(!bearer_matches(b"", "secret"));
     }
 
-    /// With no token, another host may read but not spend from the faucet; this host may.
+    /// By default another host is refused every call without a token, the faucet included; this
+    /// host is not.
     #[tokio::test(flavor = "multi_thread")]
-    async fn faucet_answers_only_this_host_without_a_token() {
+    async fn another_host_needs_a_token_by_default() {
         let remote_server = serve(None, false).await;
+        let remote = client(&remote_server).await;
+        let refused = remote.clone().get_lightd_info(Empty {}).await.expect_err("refused");
+        assert_eq!(refused.code(), Code::Unauthenticated, "{refused:?}");
+        let refused = remote.clone().request_faucet_donation(faucet()).await.expect_err("refused");
+        assert_eq!(refused.code(), Code::Unauthenticated, "{refused:?}");
+
+        let local_server = serve(None, true).await;
+        let local = client(&local_server).await;
+        local.clone().get_lightd_info(Empty {}).await.expect("answered");
+    }
+
+    /// A public server answers another host without a token, except the faucet, which needs the
+    /// token if there is one and is refused if not; this host may use the faucet either way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn public_server_answers_another_host_but_not_its_faucet() {
+        let remote_server = serve_as(None, false, true).await;
         let remote = client(&remote_server).await;
         remote.clone().get_lightd_info(Empty {}).await.expect("answered");
         let refused = remote.clone().request_faucet_donation(faucet()).await.expect_err("refused");
         assert_eq!(refused.code(), Code::PermissionDenied, "{refused:?}");
 
-        let local_server = serve(None, true).await;
+        let tokened_server = serve_as(Some("s3cret"), false, true).await;
+        let tokened = client(&tokened_server).await;
+        tokened.clone().get_lightd_info(Empty {}).await.expect("answered without the token");
+        let refused = tokened.clone().request_faucet_donation(faucet()).await.expect_err("refused");
+        assert_eq!(refused.code(), Code::PermissionDenied, "{refused:?}");
+        let paid = tokened.clone().request_faucet_donation(with_authorization(faucet(), "Bearer s3cret")).await;
+        assert_eq!(paid.expect("paid").into_inner().amount, 42);
+
+        let local_server = serve_as(None, true, true).await;
         let local = client(&local_server).await;
         assert_eq!(local.clone().request_faucet_donation(faucet()).await.expect("paid").into_inner().amount, 42);
     }
@@ -2519,7 +2591,8 @@ mod tests {
         matches!(sock.read(&mut byte), Ok(1))
     }
 
-    /// Another host gets MAX_CONNS_PER_IP connections; this host is not counted.
+    /// Another host gets MAX_CONNS_PER_PREFIX connections from one IPv4 /16; this host is not
+    /// counted.
     #[tokio::test(flavor = "multi_thread")]
     async fn connections_from_one_other_host_are_capped() {
         for loopback_trusted in [false, true] {
@@ -2527,7 +2600,7 @@ mod tests {
             drop(client(&server).await);
             let port = server.port;
             let mut socks = Vec::new();
-            for _ in 0..MAX_CONNS_PER_IP {
+            for _ in 0..MAX_CONNS_PER_PREFIX {
                 let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connects");
                 assert!(kept(&mut sock), "trusted: {loopback_trusted}");
                 socks.push(sock);
