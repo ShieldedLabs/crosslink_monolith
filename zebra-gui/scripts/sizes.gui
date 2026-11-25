@@ -26,3 +26,17 @@ size 40 900
 frame 2
 size 1 1
 frame 2
+
+# A drag that starts on the height strip beside the block map, in a window too short for the strip.
+scale 1.25
+size 1013 156
+move 33 112
+frame
+move 301 78
+frame
+down mouse
+frame
+move 675 71
+frame
+up mouse
+frame

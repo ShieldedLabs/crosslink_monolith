@@ -1374,7 +1374,9 @@ fn minimap_screen_rect(draw_ctx: &DrawCtx, ui: &ui::Context, lane: MinimapLane) 
         }
     };
     let y0 = 50.0 * ds;
-    let y1 = h - 86.0 * ds;
+    // In a window too short to hold the strip its bottom would lie above its top, and a clamp
+    // between the two panics.
+    let y1 = (h - 86.0 * ds).max(y0);
     (x0, y0, x1, y1)
 }
 
