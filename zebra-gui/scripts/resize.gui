@@ -5,14 +5,16 @@
 # one is a reflow.
 settle 300
 
-resize narrower 640 900
-size 1600 900
-resize shorter 1600 420
-size 1600 900
+# From the window the GUI is designed for down to the smallest it has to stay whole in. A
+# fault either of these brings is one to fix.
+resize narrower 1280 1000
+size mainline
+resize shorter 1920 640
+size minspec
 settle 60
 
-# Each pane from its narrowest to its widest. With both at their widest the block map between
-# them has the least room it can have.
+# Each pane from its narrowest to its widest, in the smallest window, where there is the
+# least room. With both at their widest the block map between them has the least it can have.
 drag left_pane_narrower "Left Pane Divider" -300 0
 drag left_pane_wider "Left Pane Divider" 600 0
 drag right_pane_wider "Right Pane Divider" -330 0

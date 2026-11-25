@@ -1,0 +1,5 @@
+# Every screen and dialog again, in the smallest window the GUI has to stay whole in: a
+# maximized one on a 1280x720 display at scale 1. A fault here that tour.gui does not have
+# is one of fit.
+size minspec
+include tour.gui

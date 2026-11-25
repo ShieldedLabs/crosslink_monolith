@@ -151,6 +151,15 @@ with what is happening now. Its character comes from its subject, not from ornam
 locked for a time can look locked and show its time running; a block that is final can look
 final; an amount is a number someone will check twice.
 
+The working targets are a 1920x1080 display at scale 1 and 60 Hz to design for, and a
+1280x720 display at scale 1 to stay whole on. A title bar and a task bar take about 80 px
+of a display's height, so the window to design for is 1920x1000 and the smallest to stay
+whole in is 1280x640. The tools call the two `mainline` and `minspec`. The displays this is
+built on are sharper than most it runs on. A text that reads well at scale 1.25 or 2 can be
+too small at scale 1, where a pixel of it is a pixel of the screen. Choose sizes at scale 1
+and at `mainline`, then see that nothing is lost at `minspec`. A scripted run starts at
+`mainline`.
+
 ## Freedom, and keeping it whole
 
 You may add what the design needs: a typeface, an icon, an image, a sound, an animation, a
@@ -209,10 +218,11 @@ bash zebra-gui/gui.sh run '<commands to reach the screen>; squint x; targets; li
 - **`targets`** lists everything that can be pressed: where, how big, and whether it shows
   anything when the pointer is on it. Is the most-used one the biggest and the nearest?
 - **`lint x`** marks text that is cut off, crowded, faint or tiny, targets under 24 px
-  (`target`), and targets that stop just short of the window's left or right side (`edge`).
+  (`target`), targets that stop just short of the window's left or right side (`edge`), and
+  targets the window cuts off where nothing scrolls them back (`outside`).
 - **`style`** lists the sizes, colours and radii on the screen. Did you add one? Why?
 - **`film`** and **`settle`** show movement frame by frame and how long it takes.
-- **`resize x 640 900`** and **`drag x "<grip>" -300 0`** make the window or a pane smaller
+- **`resize x minspec`** and **`drag x "<grip>" -300 0`** make the window or a pane smaller
   a step at a time, and say from what size text is cut off or overlaps, and what jumps.
 - **`scripts/sizes.gui`** and `--scene empty` show the small window, the large display and
   the wallet with nothing in it. Design the empty, the loading, the failed and the

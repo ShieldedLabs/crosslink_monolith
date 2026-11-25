@@ -9,7 +9,7 @@ settle 300
 # Scrolling the wallet history.
 move 200 500
 wheel -3
-film scroll_history 12 0 290 440 600
+film scroll_history 12 0 290 530 710
 settle 120
 wheel 3
 settle 120
@@ -26,9 +26,9 @@ up esc
 settle 60
 
 # Panning and zooming the block view.
-move 800 450
+move 960 500
 wheel -5
-film pan_blocks 12 440 0 720 900
+film pan_blocks 12 530 0 934 1000
 settle 240
 down ctrl
 wheel 2

@@ -42,5 +42,5 @@ key esc
 key f3
 expect "Rate:"
 # The top two lines are live frame timings, which differ every run.
-shot debug_overlay 0 32 1600 868
+shot debug_overlay 0 32 8192 8192
 key f3

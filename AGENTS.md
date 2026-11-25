@@ -131,6 +131,10 @@ bash zebra-gui/gui.sh run '<commands>'   Try one thing, e.g. 'click "Send"; shot
 - Check what moves (an animation, a scroll, a delay) with `settle`, `film` and
   `track`; speed with `gui.sh bench`; a real window's frame timing with
   `gui.sh pace`.
+- Design the GUI for a 1920x1080 display at scale 1 and 60 Hz, and keep it whole on a
+  1280x720 display at scale 1. The windows those leave room for are what the tools call
+  `mainline` (1920x1000, where every scripted run starts) and `minspec` (1280x640). `check`
+  runs every screen at both. Choose text sizes at scale 1.
 - Check how a screen takes a change of size with `resize` (the window) and
   `drag` (a pane's divider). Each moves a step at a time, as a hand does, and
   says from what size text is cut off or overlaps, what jumps, and what

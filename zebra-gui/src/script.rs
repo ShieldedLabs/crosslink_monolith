@@ -240,6 +240,26 @@ fn split_args(s: &str) -> Vec<String> {
     out
 }
 
+/// The window the GUI is designed for, and the smallest it has to stay whole in: the room a
+/// maximized window has on a 1920x1080 and on a 1280x720 display at scale 1. A title bar and
+/// a task bar take about 80 px of the display's height.
+const MAINLINE: (usize, usize) = (1920, 1000);
+const MINSPEC: (usize, usize) = (1280, 640);
+
+/// A window size among a command's arguments, from argument `at`: `mainline`, `minspec`, or a
+/// width and a height. Also gives where the arguments after it start.
+fn size_arg(args: &[String], at: usize) -> Option<(usize, usize, usize)> {
+    match args.get(at).map(|a| a.as_str()) {
+        Some("mainline") => Some((MAINLINE.0, MAINLINE.1, at + 1)),
+        Some("minspec") => Some((MINSPEC.0, MINSPEC.1, at + 1)),
+        _ => {
+            let w = args.get(at)?.parse::<f64>().ok()?;
+            let h = args.get(at + 1)?.parse::<f64>().ok()?;
+            if w >= 1.0 && h >= 1.0 && w <= 8192.0 && h <= 8192.0 { Some((w as usize, h as usize, at + 2)) } else { None }
+        }
+    }
+}
+
 impl ScriptWindow {
     /// `script` is a file of commands, one per line, or the commands themselves separated by `;`.
     pub fn open(script: &str, out_dir: &str) -> Option<ScriptWindow> {
@@ -248,8 +268,22 @@ impl ScriptWindow {
             Err(_) if !Path::new(script).exists() => script.replace(';', "\n"),
             Err(e) => { eprintln!("{}: {}", script, e); return None; }
         };
+        // `include <file>` stands for the lines of another script beside this one.
+        let mut lines = Vec::new();
+        for l in text.lines().map(str::trim) {
+            match l.strip_prefix("include ") {
+                Some(name) => {
+                    let file = Path::new(script).parent().unwrap_or(Path::new("")).join(name.trim());
+                    match std::fs::read_to_string(&file) {
+                        Ok(t) => lines.extend(t.lines().map(|l| l.trim().to_string())),
+                        Err(e) => { eprintln!("include {}: {}", file.display(), e); return None; }
+                    }
+                }
+                None => lines.push(l.to_string()),
+            }
+        }
         let mut w = ScriptWindow {
-            lines: text.lines().map(|l| l.trim().to_string()).collect(),
+            lines,
             pc: 0,
             injected: VecDeque::new(),
             monkey: None,
@@ -275,7 +309,7 @@ impl ScriptWindow {
             sweep: None,
             reflow: None,
         };
-        w.resize(1600, 900);
+        w.resize(MAINLINE.0, MAINLINE.1);
         report_crashes();
         Some(w)
     }
@@ -432,9 +466,9 @@ impl ScriptWindow {
         let num = |i: usize| -> Option<f64> { args.get(i).and_then(|a| a.parse::<f64>().ok()) };
 
         match cmd {
-            "size" => match (num(0), num(1)) {
-                (Some(w), Some(h)) if w >= 1.0 && h >= 1.0 && w <= 8192.0 && h <= 8192.0 => self.resize(w as usize, h as usize),
-                _ => fail(&format!("line {}: size <width> <height>", self.pc + 1)),
+            "size" => match size_arg(&args, 0) {
+                Some((w, h, _)) => self.resize(w, h),
+                None => fail(&format!("line {}: size <width> <height>, or size mainline, or size minspec", self.pc + 1)),
             },
             "scale" => match num(0) {
                 Some(s) if s > 0.0 => { self.scale = s as f32; self.fresh = false; }
@@ -740,11 +774,11 @@ impl ScriptWindow {
                 let window = cmd == "resize";
                 if self.reflow.is_none() {
                     if !self.need_fresh() { return false; }
-                    let usage = if window { "resize <name> <width> <height> [steps]" } else { "drag <name> <\"grip\" or \"text\", or x y> <dx> <dy> [steps]" };
+                    let usage = if window { "resize <name> <width> <height> [steps], or resize <name> minspec [steps]" } else { "drag <name> <\"grip\" or \"text\", or x y> <dx> <dy> [steps]" };
                     let (from, to, count) = if window {
-                        match (num(1), num(2)) {
-                            (Some(w), Some(h)) if w >= 1.0 && h >= 1.0 && w <= 8192.0 && h <= 8192.0 => ((self.width as i32, self.height as i32), (w as i32, h as i32), num(3)),
-                            _ => { fail(&format!("line {}: {}", self.pc + 1, usage)); return true; }
+                        match size_arg(&args, 1) {
+                            Some((w, h, next)) => ((self.width as i32, self.height as i32), (w as i32, h as i32), num(next)),
+                            None => { fail(&format!("line {}: {}", self.pc + 1, usage)); return true; }
                         }
                     } else {
                         let by_point = args.len() >= 5 && num(1).is_some() && num(2).is_some();
@@ -833,7 +867,10 @@ impl ScriptWindow {
                     if v.is_empty() { return "none".to_string(); }
                     format!("min {} med {} p95 {} max {}", v[0], v[v.len() / 2], v[(v.len() * 95 / 100).min(v.len() - 1)], v[v.len() - 1])
                 };
-                println!("{} {} frames {}x{} us: layout [{}] total [{}]", cmd, b.samples.len(), self.width, self.height, stat(|s| s.0), stat(|s| s.1));
+                let mut totals: Vec<usize> = b.samples.iter().map(|s| s.1).collect();
+                totals.sort();
+                let p95 = totals.get((totals.len() * 95 / 100).min(totals.len().saturating_sub(1))).copied().unwrap_or(0);
+                println!("{} {} frames {}x{} us: layout [{}] total [{}]; p95 is {}% of a 60 Hz frame", cmd, b.samples.len(), self.width, self.height, stat(|s| s.0), stat(|s| s.1), p95 * 100 * 60 / 1_000_000);
             }
             "monkey" => {
                 if self.monkey.is_none() {
@@ -906,7 +943,7 @@ impl ScriptWindow {
     /// Says what a finished `resize` or `drag` found, and keeps its film and its findings.
     fn reflow_report(&mut self, cmd: &str, name: &str, r: &Reflow) {
         // The faults a change of size can cause. A text too faint or too small is so at any size.
-        const BROUGHT: [&str; 5] = ["clipped", "overflow", "overlap", "margin", "target"];
+        const BROUGHT: [&str; 6] = ["clipped", "outside", "overflow", "overlap", "margin", "target"];
         let n = r.steps.len();
         let place = |i: usize| { let at = r.steps[i].at; if r.window { format!("{}x{}", at.0, at.1) } else { format!("{},{}", at.0, at.1) } };
         let texts = |n: usize| if n == 1 { "1 text".to_string() } else { format!("{} texts", n) };
@@ -1103,19 +1140,21 @@ impl ScriptWindow {
         seen
     }
 
+    /// A target's place in the drawing order: that of the last thing drawn inside it.
+    fn drawn_at(&self, b: [i32; 4]) -> Option<usize> {
+        self.rects.iter().filter(|r| inside(r.b, b)).map(|r| r.at)
+            .chain(self.texts.iter().filter(|x| inside(cut([x.x, x.y, x.x + x.w as i32, x.y + x.h as i32], self.clip_at(x.at)), b)).map(|x| x.at)).max()
+    }
+
     /// The click targets a person can reach: on screen, and not under something drawn later.
-    /// A target's place in the drawing order is that of the last thing drawn inside it.
     fn shown_targets(&self) -> Vec<LoggedTarget> {
         let window = [0, 0, self.width as i32, self.height as i32];
         let mut out: Vec<LoggedTarget> = Vec::new();
         for t in &self.targets {
             let vis = cut(t.b, window);
             if area(vis) == 0 || !t.grip.is_empty() || out.iter().any(|o| o.b == t.b) { continue; }
-            let inside = |b: [i32; 4]| area(b) > 0 && b[0] >= t.b[0] - 2 && b[1] >= t.b[1] - 2 && b[2] <= t.b[2] + 2 && b[3] <= t.b[3] + 2;
-            let own = self.rects.iter().filter(|r| inside(r.b)).map(|r| r.at)
-                .chain(self.texts.iter().filter(|x| inside(cut([x.x, x.y, x.x + x.w as i32, x.y + x.h as i32], self.clip_at(x.at)))).map(|x| x.at)).max();
-            let Some(own) = own else { continue };
-            if self.rects.iter().any(|r| r.at > own && r.color >> 24 >= 0x30 && !inside(r.b) && area(cut(r.b, vis)) * 2 > area(vis)) { continue; }
+            let Some(own) = self.drawn_at(t.b) else { continue };
+            if self.rects.iter().any(|r| r.at > own && r.color >> 24 >= 0x30 && !inside(r.b, t.b) && area(cut(r.b, vis)) * 2 > area(vis)) { continue; }
             out.push(t.clone());
         }
         out
@@ -1213,6 +1252,13 @@ impl ScriptWindow {
             for (gap, side) in [(t.b[0], "left"), (wide - t.b[2], "right")] {
                 if gap >= 1 && gap <= reach { out.push(Finding { kind: "edge", b, text: label.clone(), detail: format!("stops {} px short of the window's {} side", gap, side) }); }
             }
+            // What a scrolling list cuts off can be scrolled back. What the window itself cuts
+            // off, as of a dialog taller than the window, cannot be reached at all.
+            let clip = self.clip_at(self.drawn_at(t.b).unwrap_or(0));
+            let past = [(t.b[3] - high, clip[3] >= high, "bottom"), (t.b[2] - wide, clip[2] >= wide, "right"), (-t.b[1], clip[1] <= 0, "top"), (-t.b[0], clip[0] <= 0, "left")];
+            if let Some((by, _, side)) = past.into_iter().filter(|p| p.0 > 1 && p.1).max() {
+                out.push(Finding { kind: "outside", b, text: label.clone(), detail: format!("{} px past the window's {}, where nothing scrolls it back", by, side) });
+            }
         }
 
         for (i, a) in seen.iter().enumerate() {
@@ -1257,7 +1303,7 @@ struct Finding {
 }
 
 fn lint_colour(kind: &str) -> [u8; 3] {
-    match kind { "clipped" => [255, 40, 40], "overlap" => [255, 0, 255], "overflow" => [255, 140, 0], "margin" => [255, 230, 0], "contrast" => [0, 220, 255], "target" => [90, 255, 90], "edge" => [110, 150, 255], _ => [150, 150, 150] }
+    match kind { "clipped" => [255, 40, 40], "outside" => [255, 255, 255], "overlap" => [255, 0, 255], "overflow" => [255, 140, 0], "margin" => [255, 230, 0], "contrast" => [0, 220, 255], "target" => [90, 255, 90], "edge" => [110, 150, 255], _ => [150, 150, 150] }
 }
 
 /// Draws the one-pixel outline of a box, its far edges included, on an RGB image.
@@ -1274,6 +1320,8 @@ fn outline(rgb: &mut [u8], w: usize, h: usize, b: [i32; 4], c: [u8; 3]) {
 fn cut(a: [i32; 4], b: [i32; 4]) -> [i32; 4] { [a[0].max(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].min(b[3])] }
 fn area(b: [i32; 4]) -> i64 { if b[2] > b[0] && b[3] > b[1] { (b[2] - b[0]) as i64 * (b[3] - b[1]) as i64 } else { 0 } }
 fn holds(b: [i32; 4], p: [i32; 2]) -> bool { b[0] <= p[0] && p[0] < b[2] && b[1] <= p[1] && p[1] < b[3] }
+/// Whether box `b` lies inside box `t`, give or take two pixels.
+fn inside(b: [i32; 4], t: [i32; 4]) -> bool { area(b) > 0 && b[0] >= t[0] - 2 && b[1] >= t[1] - 2 && b[2] <= t[2] + 2 && b[3] <= t[3] + 2 }
 
 /// Of the texts shown inside a box, the one a person would call it by: the tallest that is not
 /// an icon, the one nearest the top left among equals. Text drawn across the box by something
@@ -1814,7 +1862,7 @@ fn moved_far(a: &[Shown], b: &[Shown], allow: (i32, i32)) -> (usize, Option<(Str
 fn severity(kind: &str, detail: &str) -> f64 {
     let end = detail.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(detail.len());
     let n: f64 = detail[..end].parse().unwrap_or(0.0);
-    if kind == "clipped" || kind == "overflow" { n } else { -n }
+    if kind == "clipped" || kind == "overflow" || kind == "outside" { n } else { -n }
 }
 
 /// Follows each fault over the steps of a sweep. A step lists the faults it showed, each with
@@ -2350,16 +2398,24 @@ mod tests {
             w.texts = vec![LoggedText { x: tx, y: ty, w: tw as u32, h: th as u32, color: ink | (rng_next(&mut s) as u32) << 24, at: 5, text: "text".into() }];
 
             let mut pick = |n: u64| (rng_next(&mut s) % n) as i32;
-            let (gap_right, gap_bottom, target_w, target_h, hidden) = (pick(20), pick(20), 10 + pick(60), 10 + pick(60), pick(4) == 0);
+            // Something to press near the window's bottom right corner, anywhere from clear of
+            // both sides to wholly past them. What it is drawn under is the window, or a list
+            // that stops short of the window's bottom, of its right side, or of both.
+            let (gap_right, gap_bottom, target_w, target_h, hidden) = (pick(50) - 30, pick(50) - 30, 10 + pick(60), 10 + pick(60), pick(4) == 0);
             let target = [512 - gap_right - target_w, 512 - gap_bottom - target_h, 512 - gap_right, 512 - gap_bottom];
+            let (list_right, list_bottom) = (pick(3) == 0, pick(3) == 0);
+            let under = [0, 0, if list_right { 508 } else { 512 }, if list_bottom { 508 } else { 512 }];
+            w.clips.push((35, under));
             w.targets = vec![LoggedTarget { b: target, enabled: true, pointer: false, grip: String::new() }];
-            w.rects.push(LoggedRect { b: target, color: 0xff000000 | bg, at: 40, radius: 0 });
+            w.rects.push(LoggedRect { b: cut(target, under), color: 0xff000000 | bg, at: 40, radius: 0 });
             if hidden { w.rects.push(LoggedRect { b: [250, 250, 512, 512], color: 0xff000000 | bg, at: 50, radius: 0 }); }
 
             let mut want: Vec<&str> = Vec::new();
-            if !hidden {
+            // One with nothing of it drawn has no place in the drawing order, and is left out.
+            if !hidden && area(cut(target, under)) > 0 {
                 if target_w.min(target_h) < 24 { want.push("target"); }
                 if (1..=12).contains(&gap_right) { want.push("edge"); }
+                if (gap_bottom < -1 && !list_bottom) || (gap_right < -1 && !list_right) { want.push("outside"); }
             }
             if area(vis) > 0 && !covered {
                 if cut_right > 1 { want.push("clipped"); }

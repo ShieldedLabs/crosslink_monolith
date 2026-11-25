@@ -1,5 +1,6 @@
 # Frame cost on the mock scene. "bench" rasterises every tile each frame; "bench_idle" redraws
-# an unchanged frame, which is layout plus tile hashing with no rasterising.
+# an unchanged frame, which is layout plus tile hashing with no rasterising. First in the
+# window the GUI is designed for, then on a display four times as large.
 frame 30
 bench 200
 bench_idle 200

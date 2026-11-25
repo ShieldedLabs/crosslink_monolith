@@ -25,14 +25,22 @@ would report that nothing differs. `gui.sh` refuses that while `base` is good. I
 feeds 400 steps of random input, and says what differs from `base`. It ends in `check: ok`
 or `check: FAIL, <why>`, and keeps its whole output in `target/gui/check.txt`.
 
+**Sizes.** The working targets are a 1920x1080 display at scale 1 and 60 Hz to design for,
+and a 1280x720 display at scale 1 to stay whole on. A title bar and a task bar take about
+80 px of a display's height, so the two windows to check are 1920x1000 and 1280x640. The
+tools call them `mainline` and `minspec`; `MAINLINE` and `MINSPEC` in `src/script.rs` set
+them, and nothing else has to change if the targets do. A run starts at `mainline`, so a
+`shot` shows what most people see. `check` runs every screen at both sizes, and sweeps the
+window from one to the other.
+
 ```text
-snap now: 19 screenshots in .../target/gui/now, 0 scripts failed
+snap now: 34 screenshots in .../target/gui/now, 0 scripts failed
 random input: no crash (monkey seed 1795626457009387801)
-differs: sizes/800x600: new text "Hide"; new to press "Hide" 111x32 at 49,228; 14 texts moved 44 px down; 1 went out of view; 29867 px in x 9..200 y 228..600 -> .../now/sizes/diff_800x600.png
-    the same cause changed sizes/1024x600, tour/main, tour/faucet_wallet and 9 more
+differs: minspec/main: new text "Hide"; new to press "Hide" 111x32 at 49,228; 14 texts moved 44 px down; 1 went out of view; 29867 px in x 9..200 y 228..600 -> .../now/minspec/diff_main.png
+    the same cause changed sizes/minspec, tour/main, tour/faucet_wallet and 9 more
 differs: tour/modal_send: 2 texts moved 56 px up; 2 came into view; 6847 px in x 12..421 y 298..876 -> .../now/tour/diff_modal_send.png
-14 of 19 screenshots differ, in 2 ways
-lint new: sizes/800x600  margin  Hide  67,270  2 px from the side of the box behind it
+14 of 34 screenshots differ, in 2 ways
+lint new: minspec/main  margin  Hide  67,270  2 px from the side of the box behind it
     the same fault 12 more times, on 12 more screenshots
 style new: text size 13 px (first in tour/main, used 1 times)
 check: ok
@@ -91,7 +99,9 @@ gives the same pixels every time.
 
 | Command | Meaning |
 | --- | --- |
-| `size <w> <h>`, `scale <factor>` | Window size in pixels; display scale (1, 1.25, 2). |
+| `size <w> <h>`, `size mainline`, `size minspec` | Window size in pixels. `mainline` is 1920x1000 and `minspec` 1280x640. |
+| `scale <factor>` | Display scale (1, 1.25, 2). A run starts at `mainline` and scale 1. |
+| `include <file>` | The lines of another script beside this one. |
 | `frame [n]` | Draw n frames. |
 | `move <x> <y>` | Move the pointer. |
 | `click "text" [nth]`, `click <x> <y>` | Move to the text (exact match wins) and press. |
@@ -110,7 +120,7 @@ gives the same pixels every time.
 | `settle [max frames]` | Draw until three frames change nothing; fail if still changing at max. |
 | `film <name> [frames] [x y w h]` | One image of that many frames in a row. |
 | `track "text" [frames]` | Where the text is in each frame. |
-| `resize <name> <w> <h> [steps]` | Move the window's side to that size a step at a time, as a hand dragging it does, and say what breaks on the way. |
+| `resize <name> <w> <h> [steps]`, `resize <name> minspec [steps]` | Move the window's side to that size a step at a time, as a hand dragging it does, and say what breaks on the way. |
 | `drag <name> "grip" <dx> <dy> [steps]` | The same for a pane: press the grip, or a text, or `<x> <y>`, and move the pointer that far a step at a time. |
 | `bench [frames]`, `bench_idle [frames]` | Time full redraws; time frames where nothing changed. |
 | `monkey [steps] [seed]` | Random input. Writes its commands to `monkey.gui` as it goes. |
@@ -128,6 +138,7 @@ A script whose first lines include `# scene empty` runs on the empty wallet.
 | Kind | Fault |
 | --- | --- |
 | `clipped` | Text cut off at the side by its container. |
+| `outside` | Something to press that the window itself cuts off, as in a dialog taller than the window. Nothing scrolls it back, so it cannot be reached. |
 | `overflow` | Text wider or taller than the box drawn behind it. |
 | `margin` | Text under 4 px (times scale) from the side of its box. |
 | `contrast` | Text under 3:1 against what is behind it. |
@@ -138,7 +149,9 @@ A script whose first lines include `# scene empty` runs on the empty wallet.
 
 The mock screens have many findings as they stand; `check` reports only new ones. Lint does
 not see: thin margins above and below text, misalignment, uneven spacing, or anything about
-icons and the block map's shapes. Look at the screenshot for those.
+icons and the block map's shapes. Look at the screenshot for those. It also does not see a
+control that lies wholly past the window's side: put the `minspec` screenshot beside the
+`mainline` one and see that nothing is missing.
 
 **Style.** Each `shot` also records the text sizes, colours and corner radii on screen.
 `check` prints `style new:` for a value no screen of `base` used: a new word in the design's
@@ -146,32 +159,33 @@ vocabulary, or a slip. `GUI_DESIGN.md` says which is which.
 
 **Motion.** `settle` prints the changed pixels per frame, so an animation that never stops, or
 takes three times as long, shows in numbers. `film` shows the frames side by side. `track`
-shows a jump or a stutter in one element's path. The mock main screen settles in 78 frames
-(1.3 s) at start-up and 12 frames after a wheel click.
+shows a jump or a stutter in one element's path. The mock main screen settles in 86 frames
+(1.4 s) at start-up.
 
 **Resizing.** `resize` moves the window's side, and `drag` a pane's divider, a step at a
 time as a hand does. Every step is drawn twice with nothing changed in between: the first
 frame is what a person sees mid-drag, the second is what that size comes to rest at.
 
 ```text
-bash zebra-gui/gui.sh run 'settle 300; resize narrower 640 900'
-bash zebra-gui/gui.sh run 'settle 300; targets; drag left "Left Pane Divider" -300 0'
+bash zebra-gui/gui.sh run 'settle 300; resize narrower 1280 1000'
+bash zebra-gui/gui.sh run 'size minspec; settle 300; targets; drag left "Left Pane Divider" -300 0'
 ```
 
 ```text
-resize narrower: window 1600x900 -> 640x900 in 24 steps; faults the change brings, at each step: 0 0 0 1 3 3 5 5 5 6 12 ...
-resize fault overlap  first at 1480x900 on "cTAZ"; on 7 texts in all; worst on "0.000 " at 1240x900: on top of "<e827>"
-resize fault clipped  first at 1200x900 on "-100.000 "; on 38 texts in all; worst on "-100.000 " at 800x900: 60 px cut off on the right
-resize jump  from 960x900 to 920x900: 27 texts moved further than the window's side did, most of all "+1.000 " by -6,18 px
-drag trail: at 23 of 24 steps part of the screen follows a frame late: the frame after, with nothing changed, moved 4 texts, ...
-resize narrower: no new fault until 1520x900, then 74 by 640x900 (.../narrower.txt); 5 jumps; 0 of 24 steps follow late; ...
-resize narrower.png: the window at 1600x900 1480x900 ... 640x900, left to right then down, each 1/4 size, a box round each fault the change brings
+resize narrower: window 1920x1000 -> 1280x1000 in 24 steps; faults the change brings, at each step: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 3 3 3 5 5 5 5
+resize fault overlap  first at 1467x1000 on "cTAZ"; on 6 texts in all; worst on "cTAZ" at 1360x1000: on top of "Fee:"
+resize jump  from 1494x1000 to 1467x1000: 3 texts moved further than the window's side did, most of all "-1.000 cTAZ" by -7,-9 px
+drag trail: at 18 of 24 steps part of the screen follows a frame late: the frame after, with nothing changed, moved 4 texts, ...
+resize narrower: no new fault until 1494x1000, then 6 by 1280x1000 (.../narrower.txt); 1 jumps; 0 of 24 steps follow late; ...
+resize narrower.png: the window at 1920x1000 1840x1000 ... 1280x1000, left to right then down, each 1/5 size, a box round each fault the change brings
 ```
 
 - **`fault`** counts only what the change brought: a fault the first step already had is
   left to `lint`. There is one line for each kind, and `<name>.txt` lists every text. The
   last line's "no new fault until" is the smallest size the screen holds at. To look at one
-  size closely: `size 800 900; lint x`.
+  size closely: `size 1360 1000; lint x`.
+- A sweep from `mainline` to `minspec` should bring no fault at all: people use every size
+  between the two.
 - **`jump`** is a reflow: texts that moved further than the side or the pointer that pushed
   them, as when a line wraps and everything under it drops. One is how a wrap looks. Several
   close together, or one that takes a control out from under the pointer, is a layout that
@@ -202,8 +216,13 @@ Random input that crashes leaves `target/gui/now/monkey/monkey.gui`; `gui.sh run
 replays it. A crash that depends on thread timing may need several replays.
 
 **Speed.** `bench` prints layout and whole-frame times (min, median, 95th percentile, max, in
-microseconds). Run it before and after a speed change and compare medians; a difference
-under 5% is noise.
+microseconds), at `mainline` and at 3840x2160, and what share of a 60 Hz frame the 95th
+percentile takes. Over 100% there, the screen cannot keep up with the display. Run it before
+and after a speed change and compare medians; a difference under 5% is noise.
+
+```text
+bench 200 frames 1920x1000 us: layout [min 626 med 732 p95 914 max 1325] total [min 5954 med 6861 p95 7469 max 7664]; p95 is 44% of a 60 Hz frame
+```
 
 **A real window.** `pace 5` shows every frame for five seconds and prints the gaps between
 them. It measures the machine it runs on: say which display it was.
@@ -229,7 +248,8 @@ The tools find what is broken. These they cannot find; check them by reading you
   existing one.
 - Does the new widget follow its neighbours: same padding, same text size, same hover and
   pressed colours, pointer cursor if it can be clicked?
-- Does it work at `scale 1.25` and `scale 2`, and at 800x600? `scripts/sizes.gui` shows.
+- Does it hold at `minspec`, and at `scale 1.25` and `scale 2`? `scripts/minspec.gui` and
+  `scripts/sizes.gui` show.
 - Does it hold while the window or its pane is made smaller? `resize` and `drag` show.
 - Does anything depend on frame count where it should depend on time?
 - Did you add state that must be reset when a dialog closes or the wallet changes?
@@ -245,10 +265,11 @@ The tools find what is broken. These they cannot find; check them by reading you
 | `src/script.rs` | 2,500 | The scripted window, lint, design, motion and resize checks, PNG, crash reports. |
 | `src/style.rs` | 25 | Named colours. Named sizes, spaces and times belong here too. |
 | `src/main.rs` | 140 | The standalone program and its mock wallet data. |
-| `scripts/tour.gui` | | Every screen and dialog. |
-| `scripts/sizes.gui` | | The main screen at six window sizes and scales. |
+| `scripts/tour.gui` | | Every screen and dialog, at `mainline`. |
+| `scripts/minspec.gui` | | The same tour at `minspec`. |
+| `scripts/sizes.gui` | | The main screen at `minspec`, at `mainline` and on three sharper displays. |
 | `scripts/motion.gui` | | Start-up, scrolling, a dialog, the block map. |
-| `scripts/resize.gui` | | The window made narrower and shorter, and each pane's divider dragged. |
+| `scripts/resize.gui` | | The window from `mainline` down to `minspec`, and each pane's divider dragged at `minspec`. |
 | `scripts/bench.gui` | | What `bench` times. |
 
 Layout is by `clay` (`../clay-rs`); the window, input and pixels are by `softer_gui`, a
@@ -262,11 +283,19 @@ through the messages in `viz_gui.rs`.
 
 Found with these tools and not yet fixed. Each is a good first task.
 
-- **The main screen holds only down to about 1,500 px wide.** Below that, amounts overlap their
-  labels in the history; below 1,240 they are cut off; at 640 there are 74 such faults
-  (`resize narrower`). Both panes take a share of the window's width whatever is in them.
-- **Narrowing the left pane below 425 px** brings the same faults (`drag`), and the pane can
-  go on to 160.
+- **The main screen does not hold at `minspec`.** It holds from `mainline` down to about
+  1,500 px wide and 820 px high. Narrower, amounts in the history lie on top of their fee
+  labels (`resize narrower`). Shorter, the block map's two buttons, the faucet's Receive
+  button and the end of the history list lie past the window's bottom (`outside`, `resize
+  shorter`). At `minspec` the finalizer identity is also cut off at both sides. Both panes
+  take a share of the window's width whatever is in them.
+- **The Send and Stake dialogs are taller than the `minspec` window.** Their last buttons
+  lie past its bottom (`outside`, `scripts/minspec.gui`), and the Stake dialog's warning
+  lies under its first button.
+- **A pane can be dragged narrower than what is in it, or wider than the window has room
+  for.** At `minspec`, narrowing the left pane cuts off or crowds 56 texts, the balance
+  among them, and widening the right pane pushes its second tab past the window's right
+  side (`drag`).
 - **Pressing a pane's divider moves it 11 px** before the pointer moves: the pane's width is
   taken from the pointer and not from how far it has gone.
 - **The layout reaches a dragged divider a frame late** (`trail`).
