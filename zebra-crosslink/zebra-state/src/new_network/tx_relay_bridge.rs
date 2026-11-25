@@ -157,7 +157,7 @@ struct AnswerSender(std::sync::mpsc::Sender<FromBridge>);
 impl AnswerSender {
     fn send(&self, answer: FromBridge) -> Result<(), std::sync::mpsc::SendError<FromBridge>> {
         let sent = self.0.send(answer);
-        super::bft::wake_sync_thread();
+        super::wake_sync_thread();
         sent
     }
 }

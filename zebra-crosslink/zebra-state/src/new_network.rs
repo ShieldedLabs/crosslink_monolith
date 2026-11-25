@@ -795,7 +795,7 @@ const IDLE_MS: u64 = 100;
 // sending STATUS after STATUS cannot run the pass every tick. Real time, not `clock()`: it paces
 // the CPU, and a test's supplied clock may stand still.
 const DL_INIT_WOKEN_MIN_MS: u64 = 5;
-// The least time from one tick's start to the next when wakes (bft::wake_sync_thread) end the idle
+// The least time from one tick's start to the next when wakes (wake_sync_thread) end the idle
 // wait early, so a stream of them shares ticks instead of spinning the loop.
 const WOKEN_TICK_MIN_MS: u64 = 2;
 
@@ -891,6 +891,96 @@ fn initial_peer(peer_str: &str) -> InitialPeer {
     ))
 }
 
+/// What reaches the sync thread while it waits out the idle part of its tick.
+pub(crate) enum SyncWake {
+    /// Served where it arrives, without ending the wait.
+    Bft(bft::BftRequest),
+    /// Work the next tick takes up, such as a packet: the wait ends early for it, though no
+    /// sooner than WOKEN_TICK_MIN_MS after the tick began, so a stream of them shares ticks.
+    Work,
+    /// Work a local caller is waiting on, such as a submitted block: the wait ends at once. Local
+    /// callers are this node's own (RPC, miner), not peers, so they cannot spin the loop.
+    Now,
+}
+
+// A std channel rather than a tokio one: the receiver blocks the sync thread in the idle part of
+// its tick (`SyncWakes::wait`), which a tokio receiver cannot do.
+pub(crate) static SYNC_WAKE_SENDER: std::sync::OnceLock<std::sync::mpsc::Sender<SyncWake>> = std::sync::OnceLock::new();
+
+/// Start the sync thread's next tick now rather than at the end of its idle wait, for work it
+/// takes up only at the top of a tick. Wakes that arrive together share one tick.
+pub(crate) fn wake_sync_thread() {
+    if let Some(tx) = SYNC_WAKE_SENDER.get() {
+        let _ = tx.send(SyncWake::Work);
+    }
+}
+
+/// As [`wake_sync_thread`], for work a local caller waits on: the next tick starts at once.
+pub(crate) fn wake_sync_thread_now() {
+    if let Some(tx) = SYNC_WAKE_SENDER.get() {
+        let _ = tx.send(SyncWake::Now);
+    }
+}
+
+/// The receiving end of the sync thread's wakes, and the wakes it has met but not acted on.
+struct SyncWakes {
+    rx: std::sync::mpsc::Receiver<SyncWake>,
+    /// A `SyncWake::Work` arrived and the tick it asks for has not started yet.
+    woken: bool,
+    /// The same for a `SyncWake::Now`.
+    woken_now: bool,
+}
+
+impl SyncWakes {
+    /// Serve tenderlink's requests until `deadline`: the idle part of the tick, so a BFT round
+    /// does not wait out the whole tick for its answer. A wake for other work ends it sooner, at
+    /// `earliest` or once it arrives, whichever is later, so a stream of wakes cannot spin the tick.
+    fn wait(
+        &mut self,
+        earliest: std::time::Instant,
+        deadline: std::time::Instant,
+        bft_runner: &mut bft::BftRunner,
+        read_state: &ReadState,
+        block_writer: &mut crate::service::write::WriteBlockWorkerTask,
+    ) {
+        loop {
+            let now = std::time::Instant::now();
+            let until = if self.woken_now { now } else if self.woken { earliest.min(deadline) } else { deadline };
+            if now >= until {
+                self.woken = false;
+                self.woken_now = false;
+                return;
+            }
+            match self.rx.recv_timeout(until - now) {
+                Ok(SyncWake::Bft(request)) => bft_runner.handle(request, read_state, block_writer),
+                Ok(SyncWake::Work) => self.woken = true,
+                Ok(SyncWake::Now) => self.woken_now = true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    std::thread::sleep(until - now);
+                    self.woken = false;
+                    self.woken_now = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Serve every request of tenderlink's already waiting, without blocking. A wake met here is
+    /// kept for the next `wait`, since the work it announces may have arrived after the tick
+    /// looked for it.
+    fn drain(&mut self, bft_runner: &mut bft::BftRunner, read_state: &ReadState, block_writer: &mut crate::service::write::WriteBlockWorkerTask) {
+        loop {
+            match self.rx.try_recv() {
+                Ok(SyncWake::Bft(request)) => bft_runner.handle(request, read_state, block_writer),
+                Ok(SyncWake::Work) => self.woken = true,
+                Ok(SyncWake::Now) => self.woken_now = true,
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 /// Store every fetched decision that is ready: the next height, its snapshot committed. Called
 /// between PoW commits, so a decision lands as soon as its snapshot does and the PoW blocks
 /// citing it find it decided.
@@ -909,7 +999,10 @@ fn feed_ready_decisions(
     let mut fed = 0;
     loop {
         // Rows this node stored before it stopped come first: they need nothing from a peer.
-        bft_runner.feed_stored(read_state, block_writer);
+        let taken = bft_runner.feed_stored(read_state, block_writer);
+        if taken > 0 {
+            tracing::info!("took in {taken} stored BFT decision(s) that restore had stopped below");
+        }
         let next = bft::decided_len();
         // Heights decided meanwhile, by tenderlink or an earlier feed, are not stored again: each
         // is the decided block or a conflicting quorum.
@@ -1876,7 +1969,7 @@ impl SyntheticPeer {
     /// transport does, so it is read on the next tick rather than after the tick's idle wait.
     pub fn send(&self, packet: Vec<u8>) {
         let _ = self.inbound.send(packet);
-        bft::wake_sync_thread();
+        wake_sync_thread();
     }
 }
 
@@ -2030,7 +2123,7 @@ pub static SYNC_TICKS_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 
 /// Starts the sync loop's next tick at once, as a local block submission does.
 pub fn wake_sync_loop_now() {
-    bft::wake_sync_thread_now();
+    wake_sync_thread_now();
 }
 
 /// Submit a block to new_network and wait for its verdict.
@@ -2076,7 +2169,7 @@ async fn submit_to_new_network(
 
     let (reply, rx) = tokio::sync::oneshot::channel();
     permit.send(BlockSubmission { block, reply, trusted });
-    bft::wake_sync_thread_now();
+    wake_sync_thread_now();
 
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(outcome)) => Ok(outcome),
@@ -2330,7 +2423,7 @@ pub fn sync(
     let shared_transport = SharedTransport::new(my_keypairs.clone(), actual_network_local_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
     // Packets that arrive between ticks start the next tick (WOKEN_TICK_MIN_MS apart), rather
     // than waiting out the tick's idle part.
-    let mut network_thread_handle = shared_transport.attach_with_waker(Consumer::Base, std::sync::Arc::new(bft::wake_sync_thread));
+    let mut network_thread_handle = shared_transport.attach_with_waker(Consumer::Base, std::sync::Arc::new(wake_sync_thread));
     // Sized from the per-(peer, channel) byte cap the transport actually enforces, which is
     // what bounds the responder's Bulk backlog ahead of our block (see `block_response_deadline`).
     let block_response_deadline = block_response_deadline(network_thread_handle.limits().peer_outbox_bytes as u64);
@@ -2390,8 +2483,11 @@ pub fn sync(
         });
     }
     // BFT restores its persisted chain against the bc-chain, so this runs after genesis is in.
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+    let _ = SYNC_WAKE_SENDER.set(wake_tx);
+    let mut sync_wakes = SyncWakes { rx: wake_rx, woken: false, woken_now: false };
     let mut bft_runner = bft::BftRunner::new(bft, config, &read_state, &mut block_writer, rt.clone());
-    let mut bft_startup_hold_until = bft_runner.held_at_startup().then(|| clock() + BFT_STARTUP_HOLD);
+    let mut bft_startup_hold_until = bft_runner.spawn_deferred.then(|| clock() + BFT_STARTUP_HOLD);
     let crosslink_params = read_state.network().crosslink_parameters();
 
     // Sync state
@@ -2482,8 +2578,9 @@ pub fn sync(
         let catching_up = !bft::bft_is_dropped()
             && (bft_startup_hold_until.is_some()
                 || bft_catching_up(&peers, &bft_peer_rejections, bft::decided_len(), clock()));
-        bft_runner.set_catching_up(catching_up);
+        bft_runner.catching_up = catching_up;
         bft_runner.tick(&read_state, &mut block_writer);
+        sync_wakes.drain(&mut bft_runner, &read_state, &mut block_writer);
         feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer, &mut peers_to_kill, &mut bft_peer_rejections);
 
         if loop_start > next_console_status_print {
@@ -3834,7 +3931,7 @@ pub fn sync(
                 // BLOCK_SEND_MS pass: on a real network each hop of a block's relay waited for it.
                 if tips_moved {
                     dl_init_wanted = true;
-                    bft::wake_sync_thread();
+                    wake_sync_thread();
                 }
 
                 // A far-behind peer learns what to fetch only from historical windows, 100 hashes
@@ -4351,7 +4448,7 @@ pub fn sync(
             // A pass can verify many blocks, and tenderlink waits on this thread for every
             // Validate and Decided answer. Serve it between blocks, not only between ticks; a
             // decision stored here can also let the next block's fat pointer resolve.
-            bft_runner.drain(&read_state, &mut block_writer);
+            sync_wakes.drain(&mut bft_runner, &read_state, &mut block_writer);
             feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer, &mut peers_to_kill, &mut bft_peer_rejections);
             let hash = *hash;
             let block_arc = block_arc.clone();
@@ -4600,7 +4697,7 @@ pub fn sync(
         });
 
         feed_ready_decisions(&mut bft_fetched, &mut bft_runner, &read_state, &mut block_writer, &mut peers_to_kill, &mut bft_peer_rejections);
-        sync_profile.record_tick(commit_head, committed_this_tick, commit_start.elapsed(), bft_runner.has_parked_decision());
+        sync_profile.record_tick(commit_head, committed_this_tick, commit_start.elapsed(), bft_runner.parked_decision.is_some());
         sync_profile.report_if_due(
             read_state.best_tip().map_or(0, |(h, _)| h.0),
             bft::bft_chain().read().unwrap().blocks.len(),
@@ -4665,7 +4762,7 @@ pub fn sync(
                 std::time::Instant::now() + next_dl_init.saturating_duration_since(clock())
             };
             let idle_until = (loop_start + tick_duration).min(dl_due_at.max(loop_start + woken_tick_min));
-            bft_runner.wait(loop_start + woken_tick_min, idle_until, &read_state, &mut block_writer);
+            sync_wakes.wait(loop_start + woken_tick_min, idle_until, &mut bft_runner, &read_state, &mut block_writer);
         }
     }
     rt.block_on(block_writer.finish_backup());

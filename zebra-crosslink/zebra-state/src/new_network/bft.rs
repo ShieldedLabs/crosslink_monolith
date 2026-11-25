@@ -13,7 +13,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasherDefault;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use chrono::{DateTime, Utc};
 use tenderlink::{
@@ -565,41 +565,10 @@ pub enum BftRequest {
     },
 }
 
-/// What reaches the sync thread while it waits out the idle part of its tick.
-pub(super) enum SyncWake {
-    /// Served where it arrives, without ending the wait.
-    Bft(BftRequest),
-    /// Work the next tick takes up, such as a packet: the wait ends early for it, though no
-    /// sooner than WOKEN_TICK_MIN_MS after the tick began, so a stream of them shares ticks.
-    Work,
-    /// Work a local caller is waiting on, such as a submitted block: the wait ends at once. Local
-    /// callers are this node's own (RPC, miner), not peers, so they cannot spin the loop.
-    Now,
-}
-
-// A std channel rather than a tokio one: the receiver blocks the sync thread in the idle part of
-// its tick (`BftRunner::wait`), which a tokio receiver cannot do.
-static SYNC_WAKE_SENDER: OnceLock<std::sync::mpsc::Sender<SyncWake>> = OnceLock::new();
-
 fn send_request(request: BftRequest) -> bool {
-    match SYNC_WAKE_SENDER.get() {
-        Some(tx) => tx.send(SyncWake::Bft(request)).is_ok(),
+    match super::SYNC_WAKE_SENDER.get() {
+        Some(tx) => tx.send(super::SyncWake::Bft(request)).is_ok(),
         None => false,
-    }
-}
-
-/// Start the sync thread's next tick now rather than at the end of its idle wait, for work it
-/// takes up only at the top of a tick. Wakes that arrive together share one tick.
-pub(super) fn wake_sync_thread() {
-    if let Some(tx) = SYNC_WAKE_SENDER.get() {
-        let _ = tx.send(SyncWake::Work);
-    }
-}
-
-/// As [`wake_sync_thread`], for work a local caller waits on: the next tick starts at once.
-pub(super) fn wake_sync_thread_now() {
-    if let Some(tx) = SYNC_WAKE_SENDER.get() {
-        let _ = tx.send(SyncWake::Now);
     }
 }
 
@@ -1511,11 +1480,6 @@ pub(super) fn decided_len() -> u64 {
 /// The BFT side of the sync thread: answers tenderlink's requests against the writer's chains,
 /// bootstraps BFT from the bc-chain, and persists decisions.
 pub(super) struct BftRunner {
-    rx: std::sync::mpsc::Receiver<SyncWake>,
-    /// A `SyncWake::Work` arrived and the tick it asks for has not started yet.
-    woken: bool,
-    /// The same for a `SyncWake::Now`.
-    woken_now: bool,
     rt: tokio::runtime::Handle,
     network: Network,
     params: ZcashCrosslinkParameters,
@@ -1531,16 +1495,15 @@ pub(super) struct BftRunner {
     /// tenderlink validated the proposal and has been dropped from the non-finalized state since.
     /// The decision is final either way, so it is retried at the start of every tick until the
     /// snapshot is back, and answered only then.
-    parked_decision: Option<ParkedDecision>,
+    pub(super) parked_decision: Option<ParkedDecision>,
     /// Set while `tick` retries the parked decision, so only the first park is a warning.
-    retrying_parked_decision: bool,
     next_diagnostic: std::time::Instant,
     /// Set by the sync loop while peers hold many more decided heights than this node. It fetches
     /// them as data then, and tenderlink would only crawl after them one height per exchange.
-    catching_up: bool,
+    pub(super) catching_up: bool,
     /// Tenderlink was due to start while catching up. It starts from the stored chain once the
     /// node has caught up.
-    spawn_deferred: bool,
+    pub(super) spawn_deferred: bool,
     /// This node held tenderlink WAL records when it started: what it signed at every height it
     /// may pass while catching up is in them, so tenderlink starts at once, never held back.
     /// Without them (a new node, one that never signed, or one whose state was wiped while its
@@ -1550,8 +1513,6 @@ pub(super) struct BftRunner {
     /// state lacked a snapshot: `feed_stored` takes them in, one by one, as they become the next
     /// height with their snapshot held. `None` once no stored row is left above the chain.
     stored_from: Option<u64>,
-    /// `restore` is feeding the stored chain in.
-    restoring: bool,
     /// The height and certificate of the last fetched decision `fetch_window` found valid. A
     /// decision waiting for its snapshot is fed again on every PoW commit, and its signatures need
     /// checking only once there; the quorum check runs again before it is stored.
@@ -1863,7 +1824,7 @@ fn write_tenderlink_wal(height: u64, record: Vec<u8>) -> bool {
     }
 }
 
-struct ParkedDecision {
+pub(super) struct ParkedDecision {
     source: Source,
     block: BftBlock,
     fat_pointer: FatPointerToBftBlock,
@@ -1888,12 +1849,7 @@ impl BftRunner {
         block_writer: &mut WriteBlockWorkerTask,
         rt: tokio::runtime::Handle,
     ) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let _ = SYNC_WAKE_SENDER.set(tx);
         let mut runner = BftRunner {
-            rx,
-            woken: false,
-            woken_now: false,
             rt,
             network: read_state.network().clone(),
             params: read_state.network().crosslink_parameters(),
@@ -1901,13 +1857,11 @@ impl BftRunner {
             launch,
             pending_bootstrap: None,
             parked_decision: None,
-            retrying_parked_decision: false,
             next_diagnostic: std::time::Instant::now(),
             catching_up: false,
             spawn_deferred: false,
             has_wal: false,
             stored_from: None,
-            restoring: false,
             screened_certificate: None,
         };
         metrics::gauge!("state.crosslink.bft_dropped").set(0.0);
@@ -1925,22 +1879,6 @@ impl BftRunner {
             runner.restore(read_state, block_writer);
         }
         runner
-    }
-
-    /// Whether tenderlink is held back at startup: a chain was restored and is waiting for the
-    /// sync loop to say whether we are behind.
-    pub(super) fn held_at_startup(&self) -> bool {
-        self.spawn_deferred
-    }
-
-    /// Whether a decided block is waiting for its snapshot PoW block before it can be stored.
-    pub(super) fn has_parked_decision(&self) -> bool {
-        self.parked_decision.is_some()
-    }
-
-    /// Tell BFT whether the node is catching up on decided heights it fetches from peers.
-    pub(super) fn set_catching_up(&mut self, catching_up: bool) {
-        self.catching_up = catching_up;
     }
 
     /// Whether this network's BFT genesis comes from peers. On a chain-bootstrapped network every
@@ -1993,31 +1931,33 @@ impl BftRunner {
     /// snapshot is held. A height decided meanwhile from a peer rewrote its row, so the next height
     /// is always read from the store. Stops for good at the first row that is missing or refused;
     /// a missing snapshot or a parked decision only waits.
-    pub(super) fn feed_stored(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
+    pub(super) fn feed_stored(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) -> usize {
+        let mut taken = 0;
         while self.stored_from.is_some() {
             let next = decided_len();
             let decision = u32::try_from(next).ok().and_then(|height| block_writer.finalized_state.db.bft_decision(height));
             let Some(StoredDecision { block, fat_pointer, proposal_sigs }) = decision else {
                 self.stored_from = None;
-                return;
+                return taken;
             };
             match self.store_decision(Source::Stored, &block, &fat_pointer, &proposal_sigs, None, read_state, block_writer) {
-                Ok(Stored::Decided) => {}
+                Ok(Stored::Decided) => taken += 1,
                 Ok(Stored::AlreadyDecided | Stored::Parked) => {
                     self.stored_from = None;
-                    return;
+                    return taken;
                 }
-                Err(Refusal { kind: RefusalKind::NotYet, .. }) => return,
+                Err(Refusal { kind: RefusalKind::NotYet, .. }) => return taken,
                 Err(refusal) => {
                     tracing::warn!(
                         "crosslink: the stored BFT decision at height {next} cannot be taken in ({}); its height is decided from peers",
                         refusal.why,
                     );
                     self.stored_from = None;
-                    return;
+                    return taken;
                 }
             }
         }
+        taken
     }
 
     /// Store a decided height fetched from a peer, if it is the next one and its snapshot is
@@ -2074,9 +2014,7 @@ impl BftRunner {
 
         if let Some(ParkedDecision { source, block, fat_pointer, proposal_sigs, reply }) = self.parked_decision.take() {
             // With BFT dropped, the refusal answers the reply as it would have been answered.
-            self.retrying_parked_decision = true;
             let _ = self.store_decision(source, &block, &fat_pointer, &proposal_sigs, reply, read_state, block_writer);
-            self.retrying_parked_decision = false;
             publish_parked_decision_height(self.parked_decision.as_ref().map(|parked| u64::from(parked.block.height)));
         }
 
@@ -2092,56 +2030,10 @@ impl BftRunner {
             }
         }
 
-        self.drain(read_state, block_writer);
     }
 
-    /// Serve requests until `deadline`: the idle part of the tick, so a BFT round does not wait
-    /// out the whole tick for its answer. A wake for other work ends it sooner, at `earliest`
-    /// or once it arrives, whichever is later, so a stream of wakes cannot spin the tick.
-    pub(super) fn wait(
-        &mut self,
-        earliest: std::time::Instant,
-        deadline: std::time::Instant,
-        read_state: &ReadState,
-        block_writer: &mut WriteBlockWorkerTask,
-    ) {
-        loop {
-            let now = std::time::Instant::now();
-            let until = if self.woken_now { now } else if self.woken { earliest.min(deadline) } else { deadline };
-            if now >= until {
-                self.woken = false;
-                self.woken_now = false;
-                return;
-            }
-            match self.rx.recv_timeout(until - now) {
-                Ok(SyncWake::Bft(request)) => self.handle(request, read_state, block_writer),
-                Ok(SyncWake::Work) => self.woken = true,
-                Ok(SyncWake::Now) => self.woken_now = true,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    std::thread::sleep(until - now);
-                    self.woken = false;
-                    self.woken_now = false;
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Serve every request already waiting, without blocking. A wake met here is kept for the
-    /// next `wait`, since the work it announces may have arrived after the tick looked for it.
-    pub(super) fn drain(&mut self, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
-        loop {
-            match self.rx.try_recv() {
-                Ok(SyncWake::Bft(request)) => self.handle(request, read_state, block_writer),
-                Ok(SyncWake::Work) => self.woken = true,
-                Ok(SyncWake::Now) => self.woken_now = true,
-                Err(_) => break,
-            }
-        }
-    }
-
-    fn handle(&mut self, request: BftRequest, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
+    /// Serves one of tenderlink's requests, on the sync thread (see `SyncWakes`).
+    pub(super) fn handle(&mut self, request: BftRequest, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
         match request {
             BftRequest::Propose { reply } => {
                 let _ = reply.send(if bft_is_dropped() { None } else { self.propose(read_state) });
@@ -2765,7 +2657,8 @@ impl BftRunner {
                     // back. Recording it now with the last roster would guess the next height's
                     // validator set, which is the stake at a snapshot this node does not hold.
                     TMStatus::Indeterminate if does(PARK_UNSETTLED) => {
-                        if self.retrying_parked_decision {
+                        // Its height is published while it is parked, so a retry says so quietly.
+                        if *PARKED_DECISION_HEIGHT.lock().unwrap() == Some(height) {
                             tracing::debug!("decided BFT block {} at height {} is still parked: {reason:?}", block_hash, block.height);
                         } else {
                             tracing::warn!("parking decided BFT block {} at height {}: {reason:?}", block_hash, block.height);
@@ -2915,11 +2808,7 @@ impl BftRunner {
         };
         if source == Source::Stored {
             // Its row is the one it was read from.
-            if self.restoring {
-                tracing::debug!("restored the stored BFT decision at height {}", block.height);
-            } else {
-                tracing::info!("took in the stored BFT decision at height {} that restore could not replay", block.height);
-            }
+            tracing::debug!("took in the stored BFT decision at height {}", block.height);
             let () = ASSUME_TIP_PUBLISHED_AFTER_ROW;
             publish_tip(&tip);
             return Ok(Stored::Decided);
@@ -3004,10 +2893,8 @@ impl BftRunner {
         // Every stored decision comes in through `store_decision`, oldest first, as any other
         // decision does. It stops at the first one whose snapshot this state lacks: the next
         // height's roster is the stake there. `feed_stored` takes it and the rest in later.
-        self.restoring = true;
         self.stored_from = Some(0);
         self.feed_stored(read_state, block_writer);
-        self.restoring = false;
         let decided_n = decided_len();
         if self.stored_from.is_some() {
             // A decision's row is written before its snapshot is durable: the snapshot can still
