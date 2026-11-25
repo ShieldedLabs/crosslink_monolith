@@ -447,8 +447,8 @@ pub struct VizState {
     pub instr_strings: Vec<String>,
     pub instr_done_n: usize,
     pub instr_failed: Vec<(usize, String)>,
-    pub on_screen_bcs: HashMap<Hash32, OnScreenBc>,
-    pub on_screen_bfts: HashMap<Hash32, OnScreenBft>,
+    pub on_screen_bcs: HashMap<Hash32, OnScreenBc, ahash::RandomState>,
+    pub on_screen_bfts: HashMap<Hash32, OnScreenBft, ahash::RandomState>,
     pub did_initial_tip_jump: bool, // "reset view" to the tip once, as soon as the first blocks load
     pub bc_best_heights: std::collections::HashSet<u64>, // heights with a best-chain full block on screen: the loaded-coverage set that camera paging fills in; coverage may be any number of disjoint islands
     pub bc_wanted_page_end: u64, // jump target: ask for the page of best-chain blocks ending at this height until it arrives; 0 = none
@@ -710,7 +710,10 @@ pub fn apply_viz_op(state: &VizState, block: Hash32, op: InteractiveVizOp) -> Ve
 }
 
 
-pub fn viz_gui_init(fake_data: bool) -> VizState {
+pub fn viz_gui_init(fake_data: bool, same_every_run: bool) -> VizState {
+    // Blocks are drawn in the maps' own order, so a run that must repeat exactly needs fixed keys.
+    // A node keeps random ones: peers pick the hashes they announce.
+    let block_hasher = if same_every_run { ahash::RandomState::with_seeds(1, 2, 3, 4) } else { ahash::RandomState::new() };
     let (me_send, zebra_receive) = std::sync::mpsc::sync_channel(128);
     let (zebra_send, me_receive) = std::sync::mpsc::sync_channel(128);
 
@@ -732,8 +735,8 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         instr_strings: Vec::new(),
         instr_done_n: 0,
         instr_failed: Vec::new(),
-        on_screen_bcs: HashMap::new(),
-        on_screen_bfts: HashMap::new(),
+        on_screen_bcs: HashMap::with_hasher(block_hasher.clone()),
+        on_screen_bfts: HashMap::with_hasher(block_hasher),
         did_initial_tip_jump: false,
         bc_best_heights: std::collections::HashSet::new(),
         bc_wanted_page_end: 0,
@@ -2070,7 +2073,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         }
         off_chain.sort_by_key(|x| u64::MAX - x.0);
 
-        fn recurse_layout_children_then_self(this_index: usize, off_chain: &Vec<(u64, Hash32)>, working_map: &mut HashMap<Hash32, u16>, width_map: &mut HashMap<u64, u16>, on_screen_bcs: &HashMap<Hash32, OnScreenBc>, min_width: u16) {
+        fn recurse_layout_children_then_self(this_index: usize, off_chain: &Vec<(u64, Hash32)>, working_map: &mut HashMap<Hash32, u16>, width_map: &mut HashMap<u64, u16>, on_screen_bcs: &HashMap<Hash32, OnScreenBc, ahash::RandomState>, min_width: u16) {
             let (this_height, this_hash) = off_chain[this_index];
             let here_width = *width_map.get(&this_height).unwrap_or(&0).max(&min_width);
 

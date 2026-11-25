@@ -1,0 +1,28 @@
+# The main screen at the window sizes and display scales people run it at.
+settle 300
+
+size 800 600
+shot 800x600
+size 1024 600
+shot 1024x600
+size 1366 768
+scale 1.25
+shot 1366x768_125
+size 1920 1080
+scale 1
+shot 1920x1080
+size 2560 1440
+scale 1.5
+shot 2560x1440_150
+size 3840 2160
+scale 2
+shot 3840x2160_200
+
+# Windows this small draw nothing useful; they only have to not crash.
+scale 1
+size 300 200
+frame 2
+size 40 900
+frame 2
+size 1 1
+frame 2

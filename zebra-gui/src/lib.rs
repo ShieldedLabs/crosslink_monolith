@@ -18,6 +18,8 @@ pub use viz_gui::*;
 
 pub mod audio;
 
+pub mod script;
+
 const TURN_OFF_HASH_BASED_LAZY_RENDER: usize = 0;
 
 #[derive(Clone, Copy, PartialOrd, PartialEq, Ord, Eq, Debug, Default)]
@@ -173,6 +175,9 @@ impl Drop for RenderWorkers {
     fn drop(&mut self) {
         unsafe {
             let context = &*(self.context as *const ThreadContext);
+            // A worker still waking up for the last frame would see the stop flag and return
+            // without coming back to the barrier, and the wait below would never end.
+            while context.workers_that_have_passed_the_wake_up_gate.load(Ordering::Relaxed) != context.thread_count - 1 { spin_loop(); }
             context.stop.store(true, Ordering::Release);
             context.wake_up_barrier.wait();
         }
@@ -559,6 +564,11 @@ impl DrawCtx {
             }
             let text_shape_cache = self.text_shape_cache.borrow();
             let glyph_run = text_shape_cache.get(&shape_key).unwrap();
+
+            if let Some(log) = self.text_log.borrow_mut().as_mut() {
+                let w: usize = glyph_run.iter().map(|(_, px_advance)| *px_advance as usize).sum();
+                log.push(script::LoggedText { x: text_x as i32, y: text_y as i32, w: w as u32, h: text_height as u32, color, at: *self.draw_command_count, text: script::loggable(text_line) });
+            }
 
             let glyph_bitmap_run_start = self.glyph_bitmap_run_allocator.add(*self.glyph_bitmap_run_allocator_position);
             let mut glyph_bitmap_run_count = 0usize;
@@ -959,6 +969,8 @@ struct DrawCtx {
     debug_pixel_inspector_last_color: *mut u32,
     measure_cache: HashMap<MeasureKey, f32>,
     text_shape_cache: RefCell<HashMap<TextShapeKey, Vec<(u16, u16)>>>,
+    /// What `text_line` was asked to draw this frame; Some only under a script.
+    text_log: RefCell<Option<Vec<script::LoggedText>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1140,8 +1152,24 @@ pub static DEV_WIN32_WINDOW_RIGHT: AtomicBool = AtomicBool::new(false);
 /// Overrides the window title when set before the window is created (e.g. "TEST: <name>").
 pub static WINDOW_TITLE: Mutex<String> = Mutex::new(String::new());
 
-/// The visualizer's window, open but not yet drawn into.
-pub type Window = softer_gui::Gui;
+/// The visualizer's window, open but not yet drawn into: a real one, or one a script drives
+/// with no display at all (see script.rs).
+pub enum Window {
+    Os(softer_gui::Gui),
+    Script(script::ScriptWindow),
+}
+
+impl Window {
+    fn wait_ms(&mut self, ms: u64) { if let Window::Os(g) = self { g.wait_ms(ms) } }
+    fn request_frame(&mut self) { if let Window::Os(g) = self { g.request_frame() } }
+    fn submit(&mut self) { if let Window::Os(g) = self { g.submit() } }
+    fn set_icon(&mut self, images: &[softer_gui::icon::IconImage]) { if let Window::Os(g) = self { g.set_icon(images) } }
+    // A script's frames are all drawn, so its run is the same every time.
+    fn take_full_redraw(&mut self) -> bool { match self { Window::Os(g) => g.take_full_redraw(), Window::Script(_) => true } }
+    fn clipboard(&self) -> softer_gui::Clipboard { match self { Window::Os(g) => g.clipboard(), Window::Script(_) => softer_gui::Clipboard::default() } }
+    fn next_event(&mut self, ev: &mut Event) -> bool { match self { Window::Os(g) => g.next_event(ev), Window::Script(s) => s.next_event(ev) } }
+    fn get_framebuffer(&mut self) -> softer_gui::Framebuffer { match self { Window::Os(g) => g.get_framebuffer(), Window::Script(s) => s.get_framebuffer() } }
+}
 
 /// Open the visualizer's window, or None when this machine has no display to put one on (no
 /// Wayland or X server, a Windows service session, a macOS host without AppKit). Call it on the
@@ -1149,16 +1177,19 @@ pub type Window = softer_gui::Gui;
 /// Nothing else about the program has started yet when this is asked, so a None can still
 /// become an ordinary headless run.
 pub fn open_window() -> Option<Window> {
+    if let Ok(script) = std::env::var("ZEBRA_GUI_SCRIPT") {
+        return script::ScriptWindow::open(&script, &std::env::var("ZEBRA_GUI_OUT").unwrap_or_default()).map(Window::Script);
+    }
     let title = {
         let t = WINDOW_TITLE.lock().unwrap();
         if t.is_empty() { "Zcash Crosslink Visualizer".to_string() } else { t.clone() }
     };
-    softer_gui::open(&title, "org.zfnd.crosslink_visualizer", 1600, 900)
+    softer_gui::open(&title, "org.zfnd.crosslink_visualizer", 1600, 900).map(Window::Os)
 }
 
 pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::WalletState>>, fake_data: bool, should_stop: impl Fn() -> bool) {
 
-    let mut viz_state = viz_gui_init(fake_data);
+    let mut viz_state = viz_gui_init(fake_data, matches!(gui, Window::Script(_)));
 
     // Create window + event loop.
 
@@ -1262,6 +1293,7 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
         debug_pixel_inspector_last_color: (&mut _debug_pixel_inspector_last_color) as *mut u32,
         measure_cache: HashMap::new(),
         text_shape_cache: RefCell::new(HashMap::new()),
+        text_log: RefCell::new(if matches!(gui, Window::Script(_)) { Some(Vec::new()) } else { None }),
     }};
 
     draw_ctx._init_font_tracker(FONT_PIXEL_3X3_MONO, 2, FontKind::Mono,  4);
@@ -1519,7 +1551,7 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                         let mut dt = 1000.0 / (frame_interval_milli_hertz as f64);
                         {
                             let cpu_dt = prev_frame_time_total_us as f64 / 1000000.0;
-                            if cpu_dt > dt*2.0 { dt = cpu_dt; }
+                            if cpu_dt > dt*2.0 && matches!(gui, Window::Os(_)) { dt = cpu_dt; }
                         }
 
                         draw_ctx.window_width = window_width as isize;
@@ -2239,7 +2271,18 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                         prev_frame_time_single_thread_us_max_5_seconds = prev_frame_time_single_thread_us_max_5_seconds.max(prev_frame_time_single_threaded_us);
                         prev_frame_time_total_us_max_5_seconds = prev_frame_time_total_us_max_5_seconds.max(prev_frame_time_total_us);
 
-                        if let Some((x, y)) = *draw_ctx.debug_pixel_inspector {
+                        if let Window::Script(s) = &mut gui {
+                            let commands = std::slice::from_raw_parts(draw_ctx.draw_command_buffer, *draw_ctx.draw_command_count);
+                            s.frame_done(draw_ctx.text_log.borrow_mut().as_mut().unwrap(), commands, script::FrameReport {
+                                single_us: prev_frame_time_single_threaded_us,
+                                total_us: prev_frame_time_total_us,
+                                draw_commands: *draw_ctx.draw_command_count,
+                                cursor: ui.cursor,
+                            });
+                        }
+
+                        // The inspected pixel was picked at an earlier window size and can lie outside this one.
+                        if let Some((x, y)) = (*draw_ctx.debug_pixel_inspector).filter(|(x, y)| *x < draw_area_pixel_wide && *y < draw_area_pixel_wide) {
                             let pixel_src = render_target_0.byte_add((x+y*draw_area_pixel_wide)*4);
                             *draw_ctx.debug_pixel_inspector_last_color = *(pixel_src as *mut u32);
                         }
@@ -2347,7 +2390,7 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                         let frame_pace_us = last_call_to_present_instant.elapsed().as_micros() as u64;
                         last_call_to_present_instant = Instant::now();
 
-                        let need_buffer_flip = need_buffer_flip || ui.debug;
+                        let need_buffer_flip = script::pace_frame(frame_pace_us) || need_buffer_flip || ui.debug;
                         if need_buffer_flip {
                             gui.submit();   // one present per vblank; this is what paces the next RENDER
                         }

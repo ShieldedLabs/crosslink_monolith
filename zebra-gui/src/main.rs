@@ -10,8 +10,27 @@ extern crate cosmo_compat as _;
 use wallet::{WalletRosterMember, WalletTx, WalletTxKind};
 
 fn main() {
+    // zebra-gui diff <dir> <dir> compares two scripted runs' screenshots; zebra-gui --scene empty
+    // starts with no mock data. GUI_DEV.md covers both.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 4 && args[1] == "diff" {
+        let differ = zebra_gui::script::diff_dirs(std::path::Path::new(&args[2]), std::path::Path::new(&args[3]));
+        std::process::exit((differ != 0) as i32);
+    }
+    if args.len() >= 3 && args[1] == "dup" {
+        let min = args[2].parse::<usize>().ok();
+        zebra_gui::script::duplicates(&args[if min.is_some() { 3 } else { 2 }..], min.unwrap_or(8));
+        return;
+    }
+    let pace = args.iter().position(|a| a == "--pace").and_then(|i| args.get(i + 1)).and_then(|s| s.parse::<f64>().ok());
+    let scene = args.iter().position(|a| a == "--scene").and_then(|i| args.get(i + 1)).map(|s| s.as_str()).unwrap_or("default");
+    if scene != "default" && scene != "empty" {
+        eprintln!("unknown scene {:?}: expected default or empty", scene);
+        std::process::exit(2);
+    }
+
     let wallet_state: Arc<Mutex<wallet::WalletState>> = Arc::<Mutex::<wallet::WalletState>>::new(Mutex::<wallet::WalletState>::new(wallet::WalletState::new()));
-    if true {
+    if scene == "default" {
         let mut txs = vec![
             WalletTx::with_fake_data(WalletTxKind::Send, 100_000_000, 0, false, false, "Hello, world!", 0),
             WalletTx::with_fake_data(WalletTxKind::Receive, 0, 100_000_000, false, false, "Other things", 10),
@@ -59,6 +78,20 @@ fn main() {
         mined.sort_by(|a, b| b.h.cmp(&a.h));
         pending.extend_from_slice(&mined);
 
+        {
+            let mut ws = wallet_state.lock().unwrap();
+            ws.wallet_is_init = true;
+            ws.user_txs = pending.iter().take(40).cloned().collect();
+            ws.user_unshielded_funds = 250_000_000;
+            ws.user_shielded_spendable_funds = 12_345_600_000;
+            ws.user_shielded_pending_funds = 100_000_000;
+            ws.staked_balance = 400_000_000;
+            ws.withdrawable_balance = 50_000_000;
+            ws.miner_unshielded_funds = 625_000_000;
+            ws.miner_shielded_spendable_funds = 98_700_000_000;
+            ws.wallets_sync_h = 9001;
+            ws.wallets_tip_h = 9001;
+        }
         wallet_state.lock().unwrap().miner_txs = pending;
         wallet_state.lock().unwrap().roster = vec![
             WalletRosterMember{ pub_key: [0xAAu8; 32], voting_power: 25540_000_000, txids: vec![], finalizer_address: None },
@@ -96,5 +129,9 @@ fn main() {
         eprintln!("could not open a window");
         std::process::exit(1);
     };
-    zebra_gui::main_thread_run_program(window, wallet_state, true, || false);
+    let started = std::time::Instant::now();
+    if pace.is_some() { zebra_gui::script::pace_start(); }
+    zebra_gui::main_thread_run_program(window, wallet_state, scene == "default", move || pace.is_some_and(|s| started.elapsed().as_secs_f64() >= s));
+    if pace.is_some() { zebra_gui::script::pace_report(); }
+    std::process::exit((zebra_gui::script::FAILURES.load(std::sync::atomic::Ordering::Relaxed) != 0) as i32);
 }

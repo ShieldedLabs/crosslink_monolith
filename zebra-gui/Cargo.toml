@@ -76,3 +76,23 @@ overflow-checks = true
 incremental = false      # incremental confuses symbol mapping
 codegen-units = 1        # easier to debug single unit
 split-debuginfo = "unpacked"  # produce separate .pdb files
+
+# What `phuild.bat zebra-gui Release` builds, and what gui.sh builds and tests with: release
+# speed with fast rebuilds. An edit to this crate rebuilds only the codegen units it touched.
+[profile.release-iter]
+inherits = "release"
+lto = "off"
+incremental = true
+codegen-units = 256
+opt-level = 2
+debug = "line-tables-only"
+
+[profile.release-iter.package."*"]
+opt-level = 3
+debug = false
+
+[profile.release-iter.package.clay-layout]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false

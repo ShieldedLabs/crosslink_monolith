@@ -1,0 +1,9 @@
+# Frame cost on the mock scene. "bench" rasterises every tile each frame; "bench_idle" redraws
+# an unchanged frame, which is layout plus tile hashing with no rasterising.
+frame 30
+bench 200
+bench_idle 200
+size 3840 2160
+frame 10
+bench 100
+bench_idle 100
