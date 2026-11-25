@@ -10,6 +10,11 @@ workspace.
 
 ## [Unreleased]
 
+### Fixed
+- `bft::FatPointerToBftBlock::try_from_bytes` now decodes valid encodings without
+  panicking and rejects truncated input, trailing bytes, and signature counts above
+  `bft::FAT_POINTER_SIGNATURES_MAX`.
+
 ## [0.30.0] - 2026-07-23
 
 ### Added
