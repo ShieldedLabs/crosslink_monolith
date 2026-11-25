@@ -413,7 +413,7 @@ impl Wal {
     }
 }
 
-fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMember]) -> FatPointerToBftBlock {
+pub fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMember]) -> FatPointerToBftBlock {
     let vote_for_block_without_finalizer_public_key: [u8; 76 - 32];
     {
         let mut sign_data = [0; 76 - 32];

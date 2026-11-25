@@ -3643,6 +3643,14 @@ pub fn ui_right_pane(ui: &mut Context,
                  dummy_2: &mut Id) {
 
     let bft_status = &viz.bft_recency_status;
+    // Finalizers signed two blocks at one height. BFT keeps running on the block this node
+    // decided, so nothing else would show it.
+    for conflict in &bft_status.conflicts {
+        ui.text(
+            frame_strf!(data, "CONFLICTING BFT QUORUM at height {}: finalizers signed two blocks there; see the node log", conflict.height),
+            TextDecl { font: Mono, h: ui.scale(16.0), colour: crate::style::RED, wrap: Wrap::None, align: AlignX::Left, ..TextDecl },
+        );
+    }
     let terminated_finalizers = &viz.terminated_finalizer_ids;
     // ui.text(frame_strf!(data, "BFT recency: {bft_recency:#?}"), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
 

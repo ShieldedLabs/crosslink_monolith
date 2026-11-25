@@ -126,7 +126,11 @@ fn format_upgrades(
             "add tenderlink_wal_by_height column family",
             Version::new(31, 5, 0),
         )),
-    ] as [Box<dyn DiskFormatUpgrade>; 10])
+        Box::new(no_migration::NoMigration::new(
+            "add bft_conflicting_certificates column family",
+            Version::new(31, 6, 0),
+        )),
+    ] as [Box<dyn DiskFormatUpgrade>; 11])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }

@@ -109,6 +109,35 @@ impl FromDisk for ProposalSignatures {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TenderlinkWalRecord(pub Vec<u8>);
 
+/// The key of a conflicting certificate this node keeps: the BFT height, then the block the
+/// certificate is for. Heights sort first, big-endian.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BftConflictKey {
+    pub height: u32,
+    pub other: [u8; 32],
+}
+
+impl IntoDisk for BftConflictKey {
+    type Bytes = [u8; 36];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        let mut bytes = [0; 36];
+        bytes[..4].copy_from_slice(&self.height.to_be_bytes());
+        bytes[4..].copy_from_slice(&self.other);
+        bytes
+    }
+}
+
+impl FromDisk for BftConflictKey {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        let bytes = bytes.as_ref();
+        BftConflictKey {
+            height: u32::from_be_bytes(bytes[..4].try_into().expect("a conflict key is 36 bytes")),
+            other: bytes[4..36].try_into().expect("a conflict key is 36 bytes"),
+        }
+    }
+}
+
 impl IntoDisk for TenderlinkWalRecord {
     type Bytes = Vec<u8>;
 

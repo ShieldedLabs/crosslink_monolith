@@ -22,7 +22,7 @@ use tenderlink::{
 };
 use zcash_primitives::bft::{
     BftBlock, BftBootstrap, Blake3Hash, FatPointerToBftBlock, FinalizerRecencyStatus,
-    SlashForkConfig, HashKeys, PubKeyID, TFLRecencyStatus, TMSig, ZcashCrosslinkParameters,
+    ConflictingQuorum, SlashForkConfig, HashKeys, PubKeyID, TFLRecencyStatus, TMSig, ZcashCrosslinkParameters,
     // FINALITY_LIVENESS_ALLOWANCE, // only used by the disabled variable-reward gate
 };
 use zcash_primitives::block::{
@@ -340,6 +340,20 @@ fn retain_missing_pow_blocks(
 }
 
 pub(super) fn missing_pow_blocks(read_state: &ReadState) -> Vec<Hash> {
+    // Known conflicting quorums are reported again every DROPPED_BFT_REPORT_INTERVAL.
+    {
+        let mut last = CONFLICTING_QUORUMS_LAST_REPORTED.lock().unwrap();
+        if last.is_some_and(|at| at.elapsed() >= DROPPED_BFT_REPORT_INTERVAL) {
+            *last = Some(std::time::Instant::now());
+            for (conflict, _) in CONFLICTING_QUORUMS_REPORTED.lock().unwrap().iter() {
+                tracing::error!(
+                    "crosslink: CONFLICTING BFT QUORUM at height {} is still known: this node stored block {}, \
+                     and {} block {}. Report this with both block hashes.",
+                    conflict.height, Blake3Hash(conflict.stored), conflict.seen_as, Blake3Hash(conflict.other),
+                );
+            }
+        }
+    }
     // A dropped BFT is reported again every DROPPED_BFT_REPORT_INTERVAL.
     if let Some((message, last_report)) = DROPPED_BFT.lock().unwrap().as_mut() {
         if last_report.elapsed() >= DROPPED_BFT_REPORT_INTERVAL {
@@ -1738,9 +1752,19 @@ const ASSUME_REPLAY_ROWS_ARE_THIS_NODES: () = ();
 /// rule itself.
 const ASSUME_ADMITTED_BEFORE_APPLY: () = ();
 
-/// The conflicting quorums reported most recently, newest last, so each height and block is
-/// reported once, even when two of them alternate.
-static CONFLICTING_QUORUMS_REPORTED: Mutex<VecDeque<(u64, Blake3Hash)>> = Mutex::new(VecDeque::new());
+/// The conflicting quorums reported most recently, newest last, with the other block's
+/// certificate, so each height and block is reported once, even when two of them alternate.
+static CONFLICTING_QUORUMS_REPORTED: Mutex<VecDeque<(ConflictingQuorum, FatPointerToBftBlock)>> = Mutex::new(VecDeque::new());
+
+/// When the known conflicting quorums were last reported, to report them again every
+/// `DROPPED_BFT_REPORT_INTERVAL` while any is known.
+static CONFLICTING_QUORUMS_LAST_REPORTED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Publishes the known conflicting quorums in the recency status.
+fn publish_conflicts(reported: &VecDeque<(ConflictingQuorum, FatPointerToBftBlock)>) {
+    let conflicts: Vec<ConflictingQuorum> = reported.iter().map(|(conflict, _)| conflict.clone()).collect();
+    RECENCY_STATUS.send_modify(|status| status.conflicts = conflicts);
+}
 
 /// How many conflicting quorums `CONFLICTING_QUORUMS_REPORTED` remembers.
 const CONFLICTING_QUORUMS_REMEMBERED: usize = 16;
@@ -1750,15 +1774,32 @@ const CONFLICTING_QUORUMS_REMEMBERED: usize = 16;
 /// keeps running: stopping it would let anyone holding finalizer keys from the past, which cost
 /// nothing once unbonded, stop BFT on every node that sees such a quorum. `how` says where the
 /// other quorum was seen.
-fn report_conflicting_quorum(height: u64, stored: Blake3Hash, other: Blake3Hash, how: &str) {
+fn report_conflicting_quorum(height: u64, stored: Blake3Hash, certificate: &FatPointerToBftBlock, how: &str) {
+    let other = certificate.points_at_block_hash();
     let mut reported = CONFLICTING_QUORUMS_REPORTED.lock().unwrap();
-    if reported.contains(&(height, other)) {
+    if reported.iter().any(|(conflict, _)| (conflict.height, conflict.other) == (height, other.0)) {
         return;
     }
     if reported.len() == CONFLICTING_QUORUMS_REMEMBERED {
         reported.pop_front();
     }
-    reported.push_back((height, other));
+    let conflict = ConflictingQuorum {
+        height,
+        stored: stored.0,
+        other: other.0,
+        seen_as: how.to_string(),
+        other_signers: certificate.signatures.iter().map(|signature| signature.pub_key).collect(),
+    };
+    reported.push_back((conflict, certificate.clone()));
+    publish_conflicts(&reported);
+    *CONFLICTING_QUORUMS_LAST_REPORTED.lock().unwrap() = Some(std::time::Instant::now());
+    // The evidence outlives a restart. A write that fails loses only the evidence: the conflict
+    // is still reported, here and in the status.
+    if let (Some(db), Ok(height32)) = (BFT_DB.read().unwrap().as_ref(), u32::try_from(height)) {
+        if let Err(err) = db.write_bft_conflicting_certificate(height32, other.0, certificate) {
+            tracing::error!("crosslink: could not store the certificate of the conflicting BFT quorum at height {height}: {err}");
+        }
+    }
     metrics::counter!("state.crosslink.bft_conflicting_quorums").increment(1);
     let seen = CONFLICTING_QUORUMS_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     RECENCY_STATUS.send_modify(|status| status.conflicting_quorums = seen);
@@ -1791,7 +1832,8 @@ fn note_conflicting_quorum(bft_state: &TMState) {
             continue;
         }
         let how = format!("tenderlink holds a quorum of precommits in round {} for", round.round);
-        report_conflicting_quorum(height, stored, Blake3Hash(round.proposal_id.0), &how);
+        let certificate = tenderlink::round_data_to_fat_pointer(round, &round.roster);
+        report_conflicting_quorum(height, stored, &certificate, &how);
     }
 }
 
@@ -1878,6 +1920,33 @@ impl BftRunner {
             runner.catching_up = !runner.fetches_genesis() && !runner.has_wal;
             runner.restore(read_state, block_writer);
         }
+        // Conflicting quorums seen before this start, from the certificates the state keeps.
+        {
+            let chain = BFT_CHAIN.read().unwrap();
+            let mut reported = CONFLICTING_QUORUMS_REPORTED.lock().unwrap();
+            for (height, other, certificate) in block_writer.finalized_state.db.bft_conflicting_certificates() {
+                let Some(stored) = decided_block(&chain, height as usize).map(|block| block.blake3_hash()) else { continue };
+                if reported.len() == CONFLICTING_QUORUMS_REMEMBERED {
+                    reported.pop_front();
+                }
+                let conflict = ConflictingQuorum {
+                    height: u64::from(height),
+                    stored: stored.0,
+                    other,
+                    seen_as: "a certificate kept before this start is for".to_string(),
+                    other_signers: certificate.signatures.iter().map(|signature| signature.pub_key).collect(),
+                };
+                reported.push_back((conflict, certificate));
+            }
+            if !reported.is_empty() {
+                let seen = u32::try_from(reported.len()).unwrap_or(u32::MAX);
+                CONFLICTING_QUORUMS_SEEN.store(seen, std::sync::atomic::Ordering::Relaxed);
+                RECENCY_STATUS.send_modify(|status| status.conflicting_quorums = seen);
+                publish_conflicts(&reported);
+                // Reported again on the interval, starting now.
+                *CONFLICTING_QUORUMS_LAST_REPORTED.lock().unwrap() = Some(std::time::Instant::now() - DROPPED_BFT_REPORT_INTERVAL);
+            }
+        }
         runner
     }
 
@@ -1911,7 +1980,7 @@ impl BftRunner {
             return DecidedCheck::Invalid { why: format!("the fat pointer for BFT height {height} names another block") };
         }
         // Reported already: its certificate was found valid then, so it need not be verified again.
-        if CONFLICTING_QUORUMS_REPORTED.lock().unwrap().contains(&(height, block_hash)) {
+        if CONFLICTING_QUORUMS_REPORTED.lock().unwrap().iter().any(|(conflict, _)| (conflict.height, conflict.other) == (height, block_hash.0)) {
             return DecidedCheck::Conflict;
         }
         let Some(voting) = chain.voting_rosters.get(height as usize).cloned() else {
@@ -1923,7 +1992,7 @@ impl BftRunner {
             return DecidedCheck::Invalid { why: format!("the fat pointer is not a valid certificate for BFT height {height}") };
         }
         let Some(stored) = stored else { return DecidedCheck::NotChecked };
-        report_conflicting_quorum(height, stored, block_hash, how);
+        report_conflicting_quorum(height, stored, fat_pointer, how);
         DecidedCheck::Conflict
     }
 
@@ -3281,6 +3350,7 @@ fn recency_status_from(bft_state: &TMState, bft_key_address_map: &BftAddressMap)
         bft_restores: BFT_RESTORES.load(std::sync::atomic::Ordering::Relaxed),
         tenderlink_held: TENDERLINK_HELD.load(std::sync::atomic::Ordering::Relaxed),
         conflicting_quorums: CONFLICTING_QUORUMS_SEEN.load(std::sync::atomic::Ordering::Relaxed),
+        conflicts: CONFLICTING_QUORUMS_REPORTED.lock().unwrap().iter().map(|(conflict, _)| conflict.clone()).collect(),
     }
 }
 

@@ -126,6 +126,8 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "crosslink_bft_dropped",
     // This node's tenderlink WAL, by BFT height.
     "tenderlink_wal_by_height",
+    // The certificates of conflicting BFT quorums this node has seen, kept as evidence.
+    "bft_conflicting_certificates",
     // Legacy slash-index column families, empty and unused since Retarget actions
     // began carrying their `from` finalizer (burn sets are computed lazily at
     // activation now); still registered so existing databases open.

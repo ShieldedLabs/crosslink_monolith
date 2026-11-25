@@ -1407,6 +1407,22 @@ pub struct FinalizerRecencyStatus {
     // TODO: locked, valid
 }
 
+/// A quorum certificate for a block other than the one this node decided at that height: at
+/// least a third of that height's stake signed both. The node keeps the other certificate as
+/// evidence.
+#[derive(Default, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConflictingQuorum {
+    pub height: u64,
+    /// The block this node decided at `height`.
+    pub stored: [u8; 32],
+    /// The other block.
+    pub other: [u8; 32],
+    /// Where this node saw the other certificate.
+    pub seen_as: alloc::string::String,
+    /// Who signed the other block's certificate.
+    pub other_signers: Vec<PubKeyID>,
+}
+
 #[derive(Default, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TFLRecencyStatus {
     /// reference point for other absolute times
@@ -1436,6 +1452,10 @@ pub struct TFLRecencyStatus {
     /// that height: finalizers signed two blocks at one height. Not 0 is a reason to alert.
     #[serde(default)]
     pub conflicting_quorums: u32,
+    /// The newest conflicting quorums this node knows of, kept since it first saw each (its
+    /// state stores their certificates).
+    #[serde(default)]
+    pub conflicts: Vec<ConflictingQuorum>,
     // pub round_step_utc_rngs: Vec<[(u32, u32); 3]>,
 }
 

@@ -6,7 +6,7 @@ use zebra_chain::block::{self, Height};
 
 use crate::service::finalized_state::{
     disk_db::DiskWriteBatch,
-    disk_format::bft::{BftHeight, ProposalSignatures, StoredBftBlock, StoredFatPointer, TenderlinkWalRecord},
+    disk_format::bft::{BftConflictKey, BftHeight, ProposalSignatures, StoredBftBlock, StoredFatPointer, TenderlinkWalRecord},
     disk_format::fin::{FinKey, FinMarker},
     zebra_db::ZebraDb,
     TypedColumnFamily,
@@ -27,6 +27,10 @@ pub const CROSSLINK_BFT_DROPPED: &str = "crosslink_bft_dropped";
 /// The name of this node's tenderlink WAL column family, by BFT height.
 pub const TENDERLINK_WAL_BY_HEIGHT: &str = "tenderlink_wal_by_height";
 
+/// The certificate of each conflicting quorum this node has seen: one for a block other than the
+/// one it decided at that height. Kept as evidence of who signed both.
+pub const BFT_CONFLICTING_CERTIFICATES: &str = "bft_conflicting_certificates";
+
 /// How many BFT heights below the newest WAL record keep theirs. Not only the height being
 /// decided needs its record: `restore` resumes BFT below a stored decision whose snapshot this
 /// state lost, and there the record is what keeps this node to the lock it held.
@@ -34,6 +38,8 @@ pub const TENDERLINK_WAL_HEIGHTS_KEPT: u32 = 64;
 
 /// The type for reading this node's tenderlink WAL records.
 pub type TenderlinkWalByHeightCf<'cf> = TypedColumnFamily<'cf, BftHeight, TenderlinkWalRecord>;
+
+pub type BftConflictingCertificatesCf<'cf> = TypedColumnFamily<'cf, BftConflictKey, StoredFatPointer>;
 
 /// The type for reading decided BFT blocks from the database.
 pub type BftBlockByHeightCf<'cf> = TypedColumnFamily<'cf, BftHeight, StoredBftBlock>;
@@ -79,6 +85,31 @@ impl ZebraDb {
     fn tenderlink_wal_by_height_cf(&self) -> TenderlinkWalByHeightCf<'_> {
         TenderlinkWalByHeightCf::new(&self.db, TENDERLINK_WAL_BY_HEIGHT)
             .expect("column family was created when database was created")
+    }
+
+    fn bft_conflicting_certificates_cf(&self) -> BftConflictingCertificatesCf<'_> {
+        BftConflictingCertificatesCf::new(&self.db, BFT_CONFLICTING_CERTIFICATES)
+            .expect("column family was created when database was created")
+    }
+
+    /// Keeps the certificate of a conflicting quorum at `height` for block `other`.
+    pub fn write_bft_conflicting_certificate(&self, height: u32, other: [u8; 32], fat_pointer: &FatPointerToBftBlock) -> Result<(), rocksdb::Error> {
+        let mut batch = DiskWriteBatch::new();
+        // zs_insert writes into the batch and returns it; the batch is committed below.
+        let _ = self
+            .bft_conflicting_certificates_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_insert(&BftConflictKey { height, other }, &StoredFatPointer(fat_pointer.clone()));
+        self.db.write(batch)
+    }
+
+    /// Every conflicting certificate this node keeps, by height then block.
+    pub fn bft_conflicting_certificates(&self) -> Vec<(u32, [u8; 32], FatPointerToBftBlock)> {
+        self.bft_conflicting_certificates_cf()
+            .zs_items_in_range_ordered(..)
+            .into_iter()
+            .map(|(key, fat_pointer)| (key.height, key.other, fat_pointer.0))
+            .collect()
     }
 
     /// This node's tenderlink WAL records from BFT height `from` up, ascending.

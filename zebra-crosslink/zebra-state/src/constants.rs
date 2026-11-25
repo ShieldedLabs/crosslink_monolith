@@ -69,6 +69,10 @@ const DATABASE_FORMAT_VERSION: u64 = 31;
 /// - breaking changes with compatibility code in all supported Zebra versions.
 ///
 /// Version history:
+/// - 31.6.0: Adds the `bft_conflicting_certificates` column family: the certificate of each
+///   conflicting BFT quorum this node has seen (a block other than the one it decided at that
+///   height, with a valid certificate), by height and block, kept as evidence. Created empty when
+///   the database is opened; no migration.
 /// - 31.5.0: Adds the `tenderlink_wal_by_height` column family: this node's tenderlink WAL record
 ///   for each recent BFT height, holding what it signed there and what it is locked on, so a
 ///   restarted finalizer neither signs a second vote in a step nor votes against its lock.
@@ -99,7 +103,7 @@ const DATABASE_FORMAT_VERSION: u64 = 31;
 ///   the current width). New CFs are created and the wider records are read in place when the
 ///   database is opened, so this is a major bump that is restorable from the previous major
 ///   database format version (no resync, no data migration).
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 5;
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 6;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.

@@ -5657,7 +5657,7 @@ enum AtDecidedHeight {
 /// the stake signed two blocks at one height. It is reported, the stored decision stands and BFT
 /// keeps running, since stopping would let anyone holding old finalizer keys stop it. Signed by
 /// nobody it is refused and nothing is reported, and the decided block itself is nothing new.
-fn decision_at_a_decided_height_scene(test_name: &'static str, sent: AtDecidedHeight, as_import: bool) {
+fn decision_at_a_decided_height_scene(test_name: &'static str, sent: AtDecidedHeight, as_import: bool, restart: bool) {
     set_test_name(test_name);
     use zebra_state::new_network::bft_sync;
     const PEER: u64 = 7;
@@ -5685,6 +5685,11 @@ fn decision_at_a_decided_height_scene(test_name: &'static str, sent: AtDecidedHe
         tf.push_instr_recv_stp_packet(&packet, PEER, 0);
     }
     tf.push_instr_expect_bft_conflicts(u64::from(sent == AtDecidedHeight::Conflicting), 0);
+    if restart {
+        // The other certificate is kept in the state, so the conflict is still known.
+        tf.push_instr_restart(false);
+        tf.push_instr_expect_bft_conflicts(u64::from(sent == AtDecidedHeight::Conflicting), 0);
+    }
     tf.push_instr_expect_pos_chain_length(4, 0);
     tf.push_instr_expect_bft_dropped(false, None, 0);
     tf.push_instr_expect_node_alive(0);
@@ -5694,22 +5699,34 @@ fn decision_at_a_decided_height_scene(test_name: &'static str, sent: AtDecidedHe
 
 #[test]
 fn crosslink_bft_peer_decision_at_a_decided_height_with_a_valid_certificate_is_reported_as_a_conflict() {
-    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Conflicting, false);
+    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Conflicting, false, false);
 }
 
 #[test]
 fn crosslink_bft_peer_decision_at_a_decided_height_with_a_valid_certificate_is_reported_as_a_conflict_control() {
-    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Same, false);
+    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Same, false, false);
 }
 
 #[test]
 fn crosslink_bft_peer_decision_at_a_decided_height_signed_by_nobody_is_not_reported() {
-    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Unsigned, false);
+    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Unsigned, false, false);
+}
+
+/// A conflicting quorum the node has seen is still known after it restarts: it keeps the other
+/// block's certificate in its state, and reads it back at startup.
+#[test]
+fn crosslink_bft_conflicting_quorum_is_still_known_after_a_restart() {
+    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Conflicting, false, true);
+}
+
+#[test]
+fn crosslink_bft_conflicting_quorum_is_still_known_after_a_restart_control() {
+    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Same, false, true);
 }
 
 #[test]
 fn crosslink_bft_import_at_a_decided_height_with_a_valid_certificate_is_reported_as_a_conflict() {
-    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Conflicting, true);
+    decision_at_a_decided_height_scene(function_name!(), AtDecidedHeight::Conflicting, true, false);
 }
 
 /// A peer answering the node's BFT request with a decision for the next height on a
