@@ -380,16 +380,12 @@ Found with these tools and not yet fixed. Each is a good first task.
 - **Buttons disagree about the pointer.** 14 call sites of `button_ex` ask for the hand
   pointer; every plain `Context::button` asks for none. Pick one rule.
 - **Two block hash labels are drawn on top of each other** in the block map (`overlap`).
-- **"Finalizer Filters", open, runs to the window's right side**: "seconds ago" ends 2 px
-  from it, and "Voted at latest height" is a 14 px tall thing to press (`explore`).
-- **At `minspec`, the open "Network Info" panel lies over the PoW bar and the block map's
-  text**, and with "Finalizer Filters" open too, "Jump To Height..." and the last history
-  row are cut off by the window's bottom (`explore`, `minspec_all_open.png`).
+- **At `minspec`, the open "Network Info" panel covers "Jump To Height..."**: it drops
+  down over the block map, and in a 640 px window reaches the block map's buttons.
 - **Esc does not close "Jump To Height..." once its text field was pressed.** Its close
   button does.
-- **A bond's row in "Edit Stake", expanded, has two things to press under 24 px**, 16x18
-  and 17x18. At `minspec` the expanded row brings a scroll bar that moves the whole list
-  6 px left. The row stays expanded when the dialog is closed and opened again.
+- **A bond's row in "Edit Stake" stays expanded** when the dialog is closed and opened
+  again.
 - **Unmuting sets the volume to 100%**, not to what it was before the mute.
 - **"Receive cTAZ" turns grey when pressed and stays so**, with nothing on screen saying
   why.

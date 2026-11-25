@@ -231,7 +231,7 @@ pub fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum Direction { #[default] LeftToRight, TopToBottom }
-#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum Floating  { #[default] None, Parent, Root(f32, f32) }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum Floating  { #[default] None, Parent, Root(f32, f32), Below(f32) }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum ClipMode  { #[default] None, ClipX, ClipY, Clip, Scroll(f32), ScrollBoth(f32, f32) }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub struct Align   { x: AlignX, y: AlignY }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum AlignX    { #[default] Left, Right, Center }
@@ -476,6 +476,16 @@ pub const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Cl
                 };
                 // TODO: decl.floating.pointerCaptureMode = clay::Clay_PointerCaptureMode_CLAY_POINTER_CAPTURE_MODE_PASSTHROUGH;
             },
+            Floating::Below(gap) => {
+                // Hangs under its parent's bottom edge, right sides aligned, and takes no room
+                // in the layout: a dropdown.
+                decl.floating.attachTo = clay::Clay_FloatingAttachToElement_CLAY_ATTACH_TO_PARENT;
+                decl.floating.offset.y = gap;
+                decl.floating.attachPoints = clay::Clay_FloatingAttachPoints {
+                    element: clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_RIGHT_TOP,
+                    parent:  clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_RIGHT_BOTTOM,
+                };
+            },
             Floating::Root(x, y) => {
                 decl.floating.attachTo = clay::Clay_FloatingAttachToElement_CLAY_ATTACH_TO_ROOT;
                 decl.floating.offset.x = x;
@@ -651,6 +661,7 @@ impl Context {
             align: Center,
             direction: LeftToRight,
             width: fit!(width),
+            height: fixed!(self.scale(BUTTON_H)),
             ..Decl
         }) {
             self.text(icon, TextDecl {
@@ -1211,7 +1222,8 @@ impl Context {
             let _ = elem().decl(Decl {                                                                            height: fixed!(handle_offset), ..Decl });
             let _ = elem().decl(Decl { id: button_id, colour, radius: radius.dup4(), width: fixed!(radius * 2.0), height: fixed!(handle_height), ..Decl });
         } else {
-            let _ = elem().decl(Decl { width: fixed!(padding.1), ..Decl });
+            // As wide as the scroll bar, so a list that comes to need one does not shift.
+            let _ = elem().decl(Decl { width: fixed!(self.scale(SCROLLBAR_W)), ..Decl });
         }
 
         self.nav_skip = false; // @Hack.
@@ -1383,8 +1395,8 @@ fn modal_clickable_icon(
         child_gap,
         align: Center,
         direction: TopToBottom,
-        width: fit!(),
-        height: fit!(),
+        width: fixed!(ui.scale(BUTTON_H)),
+        height: fixed!(ui.scale(BUTTON_H)),
         ..Decl
     }) {
         ui.text(icon, TextDecl { font: Icons, colour, h: ui.scale(TEXT_HEADING), align: AlignX::Center, ..TextDecl });
@@ -2773,7 +2785,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 let key_w = {
                                                     let h = ui.scale(TEXT_BODY);
                                                     let amount_w = ui.draw_mut().measure_text_line(Mono, h, "0000.000 cTAZ");
-                                                    ui.left_pane_px - ui.scale(188.0) - amount_w
+                                                    ui.left_pane_px - ui.scale(236.0) - amount_w
                                                 };
                                                 let key = fit_text(ui, &display_str(&chunkify(&bond_key)), Mono, ui.scale(TEXT_BODY), key_w);
                                                 ui.text(frame_strf!(data, "{}", key), TextDecl { font: Mono, h: ui.scale(TEXT_BODY), wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
@@ -2807,7 +2819,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                     height: fit!(),
                                                     ..Decl
                                                 }) {
-                                                    ui.text(str, TextDecl { font: Mono, h: ui.scale(TEXT_BODY), colour, align: AlignX::Right, ..TextDecl });
+                                                    ui.text(str, TextDecl { font: Mono, h: ui.scale(TEXT_BODY), colour, wrap: Wrap::None, align: AlignX::Right, ..TextDecl });
                                                 }
                                             }
                                         }
@@ -2936,12 +2948,13 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 let h      = ui.scale(TEXT_BODY);
                                                 let chip_h = ui.scale(24.0);
                                                 let pct = 100.0 * (total_bonded_to_finalizer as f64 / total_bonded as f64);
-                                                let amount = frame_strf!(data, "{} cTAZ ({:.2}%)", str_from_ctaz(total_bonded_to_finalizer), pct).clone();
+                                                let amount = frame_strf!(data, "{} cTAZ", str_from_ctaz(total_bonded_to_finalizer)).clone();
+                                                let share = frame_strf!(data, "({:.2}%)", pct).clone();
                                                 let label = {
                                                     let small = ui.scale(TEXT_SMALL);
                                                     let draw = ui.draw_mut();
-                                                    let used = draw.measure_text_line(Mono, small, &amount) + draw.measure_text_line(Mono, small, address_prefix);
-                                                    let label_w = ui.left_pane_px - ui.scale(188.0) - used;
+                                                    let used = draw.measure_text_line(Mono, small, &amount).max(draw.measure_text_line(Mono, small, &share)) + draw.measure_text_line(Mono, small, address_prefix);
+                                                    let label_w = ui.left_pane_px - ui.scale(224.0) - used;
                                                     fit_text(ui, &address_label, Mono, h, label_w)
                                                 };
 
@@ -2965,7 +2978,10 @@ pub fn ui_left_pane(ui: &mut Context,
                                                     ui_roster_identity_text(ui, data, address_prefix, &label, text_colour, h);
                                                 }
                                                 let colour = (0xff, 0xaf, 0x0e, 0xff);
-                                                ui.text(frame_strf!(data, "{}", amount), TextDecl { font: Mono, colour, h: ui.scale(TEXT_SMALL), align: AlignX::Right, ..TextDecl });
+                                                if let _ = elem().decl(Decl { direction: TopToBottom, align: Right, width: fit!(), height: fit!(), ..Decl }) {
+                                                    ui.text(frame_strf!(data, "{}", amount), TextDecl { font: Mono, colour, h: ui.scale(TEXT_SMALL), wrap: Wrap::None, align: AlignX::Right, ..TextDecl });
+                                                    ui.text(frame_strf!(data, "{}", share), TextDecl { font: Mono, colour, h: ui.scale(TEXT_SMALL), wrap: Wrap::None, align: AlignX::Right, ..TextDecl });
+                                                }
                                             }
 
                                             if header_hovered {
@@ -3050,7 +3066,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 let key_w = {
                                                     let h = ui.scale(TEXT_BODY);
                                                     let amount_w = ui.draw_mut().measure_text_line(Mono, h, "0000.000 cTAZ");
-                                                    ui.left_pane_px - ui.scale(188.0) - amount_w
+                                                    ui.left_pane_px - ui.scale(236.0) - amount_w
                                                 };
                                                 let key = fit_text(ui, &display_str(&chunkify(&bond_key)), Mono, ui.scale(TEXT_BODY), key_w);
                                                 ui.text(frame_strf!(data, "{}", key), TextDecl { font: Mono, h: ui.scale(TEXT_BODY), wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
@@ -3084,7 +3100,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                     height: fit!(),
                                                     ..Decl
                                                 }) {
-                                                    ui.text(str, TextDecl { font: Mono, h: ui.scale(TEXT_BODY), colour, align: AlignX::Right, ..TextDecl });
+                                                    ui.text(str, TextDecl { font: Mono, h: ui.scale(TEXT_BODY), colour, wrap: Wrap::None, align: AlignX::Right, ..TextDecl });
                                                 }
                                             }
                                         }
@@ -3943,7 +3959,7 @@ pub fn ui_right_pane(ui: &mut Context,
             }
 
             if filters.show_popup {
-                let width = inner_w;
+                let width = inner_w - 2.0 * ui.scale(10.0);
                 let radius = ui.scale(BUTTON_H / 2.0);
                 if let _ = elem().decl(Decl {
                     id: id("Finalizer Popup Container"),
@@ -4660,178 +4676,180 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                 ui.text(frame_strf!(data, "{}%", volume_pct), TextDecl { font: Mono, h: ui.scale(TEXT_BODY), align: AlignX::Center, colour: WHITE.mul(0.8), ..TextDecl });
                             }
                         }
-                    }
 
-                    if ui.openable(data, combo_id, net_activated, false) {
-                        if let _ = elem().decl(Decl {
-                            colour: BUTTON_GREY.mul(0.90),
-                            radius: ui.scale(16.0).dup4(),
-                            padding: (ui.scale(12.0), ui.scale(16.0), ui.scale(12.0), ui.scale(16.0)),
-                            child_gap: ui.scale(10.0),
-                            direction: TopToBottom,
-                            width: fit!(ui.scale(400.0)),
-                            height: fit!(),
-                            align: TopRight,
-                            ..Decl
-                        }) {
-                            let row = |ui: &mut Context, data: &mut UiData, label: &str, value: &str| {
-                                if let _ = elem().decl(Decl {
-                                    direction: LeftToRight,
+                        if ui.openable(data, combo_id, net_activated, false) {
+                            if let _ = elem().decl(Decl {
+                                colour: BUTTON_GREY.mul(0.90),
+                                radius: ui.scale(16.0).dup4(),
+                                padding: (ui.scale(12.0), ui.scale(16.0), ui.scale(12.0), ui.scale(16.0)),
+                                child_gap: ui.scale(10.0),
+                                direction: TopToBottom,
+                                // No wider than the room between the PoW and PoS height strips.
+                                width: fixed!(ui.scale(400.0).min(window_w - ui.left_pane_px - ui.right_pane_px - ui.scale(172.0))),
+                                height: fit!(),
+                                align: TopRight,
+                                floating: Floating::Below(ui.scale(6.0)),
+                                ..Decl
+                            }) {
+                                let row = |ui: &mut Context, data: &mut UiData, label: &str, value: &str| {
+                                    if let _ = elem().decl(Decl {
+                                        direction: LeftToRight,
+                                        width: grow!(),
+                                        height: fit!(),
+                                        ..Decl
+                                    }) {
+                                        ui.text(label, TextDecl { h: ui.scale(TEXT_BODY), colour: WHITE.mul(0.78), align: AlignX::Left, ..TextDecl });
+                                        let _ = elem().decl(Decl { width: grow!(), ..Decl });
+                                        ui.text(frame_strf!(data, "{}", value), TextDecl { font: Mono, h: ui.scale(TEXT_BODY), align: AlignX::Right, ..TextDecl });
+                                    }
+                                };
+
+                                let group_decl = Decl {
+                                    colour: BUTTON_GREY.mul(0.72),
+                                    radius: ui.scale(12.0).dup4(),
+                                    padding: (ui.scale(10.0), ui.scale(12.0), ui.scale(10.0), ui.scale(12.0)),
+                                    child_gap: ui.scale(6.0),
+                                    direction: TopToBottom,
                                     width: grow!(),
                                     height: fit!(),
                                     ..Decl
-                                }) {
-                                    ui.text(label, TextDecl { h: ui.scale(TEXT_BODY), colour: WHITE.mul(0.78), align: AlignX::Left, ..TextDecl });
-                                    let _ = elem().decl(Decl { width: grow!(), ..Decl });
-                                    ui.text(frame_strf!(data, "{}", value), TextDecl { font: Mono, h: ui.scale(TEXT_BODY), align: AlignX::Right, ..TextDecl });
-                                }
-                            };
-
-                            let group_decl = Decl {
-                                colour: BUTTON_GREY.mul(0.72),
-                                radius: ui.scale(12.0).dup4(),
-                                padding: (ui.scale(10.0), ui.scale(12.0), ui.scale(10.0), ui.scale(12.0)),
-                                child_gap: ui.scale(6.0),
-                                direction: TopToBottom,
-                                width: grow!(),
-                                height: fit!(),
-                                ..Decl
-                            };
-                            let hdr_text_decl = TextDecl { h: ui.scale(TEXT_BODY), colour: WHITE.mul(0.70), align: AlignX::Left, ..TextDecl };
-
-                            if let _ = elem().decl(group_decl) {
-                                ui.text("Network", hdr_text_decl);
-                                row(ui, data, "PoS Height", &format!("{}", viz.bft_tip_height));
-                                row(ui, data, "PoW Height", &format!("{}", viz.bc_tip_height));
-                                row(ui, data, "PoW Finalized", &format!("{}", viz.bc_finalized_tip_height));
-                                row(ui, data, "BFT Peers", &format!("{}", pos_peer_count));
-                                row(ui, data, "PoW Peers", &format!("{}", pow_peer_count));
-                            }
-
-                            if let _ = elem().decl(group_decl) {
-                                ui.text("Wallet", hdr_text_decl);
-                                row(ui, data, "Wallet Sync", &format!("{}/{} ({:.1}%)", wallets_sync_h, wallets_tip_h, sync_pct));
-                                row(ui, data, "Blocks Behind Known PoW", &format!("{}", behind));
-                            }
-
-                            if let _ = elem().decl(group_decl) {
-                                ui.text("Pool Balances", hdr_text_decl);
-                                row(ui, data, "Ironwood", &format!("{}", viz.ironwood_pool_balance));
-                                row(ui, data, "Staking Bonded", &format!("{}", viz.staking_bonded_pool_balance));
-                                row(ui, data, "Staking Unbonded", &format!("{}", viz.staking_unbonded_pool_balance));
-                            }
-
-                            if let _ = elem().decl(group_decl) {
-                                ui.text(frame_strf!(data, "Mempool ({})", viz.mempool_tx_strings.len()), hdr_text_decl);
-                                let mono_text_decl = TextDecl { font: Mono, h: ui.scale(TEXT_SMALL), colour: WHITE.mul(0.85), wrap: Wrap::None, align: AlignX::Left, ..TextDecl };
-                                for tx_str in viz.mempool_tx_strings.iter().take(16) {
-                                    ui.text(frame_strf!(data, "{}", tx_str), mono_text_decl);
-                                }
-                                if viz.mempool_tx_strings.len() > 16 {
-                                    ui.text(frame_strf!(data, "... and {} more", viz.mempool_tx_strings.len() - 16), hdr_text_decl);
-                                }
-                            }
-
-                            if ui.debug {
-                                let pause_id = id("Pause Incoming Blocks");
-                                ui.checkbox_pill(pause_id, &mut viz.pause_incoming, "Pause Incoming Blocks", grow!());
-                                if ui.hovered(pause_id) {
-                                    set_tooltip_text!(data, "Freeze the chain display so it can be inspected while the node keeps syncing.");
-                                }
-                            }
-
-                            if ui.debug {
-                                let bft_pause_id = id("Pause BFT Proposals");
-                                ui.checkbox_pill(bft_pause_id, &mut viz.bft_paused, "Pause BFT Proposals", grow!());
-                                if ui.hovered(bft_pause_id) {
-                                    set_tooltip_text!(data, "Stop this node from proposing new BFT blocks.");
-                                }
-                            }
-
-                            if ui.debug && let _ = elem().decl(group_decl) {
-                                ui.text("Test Format", hdr_text_decl);
-
-                                let path_tb_id = ui::id("Test Format Path Textbox");
-                                let path_str = ui.textbox(
-                                    data,
-                                    path_tb_id,
-                                    "blocks.zeccltf",
-                                    TextDecl { font: Mono, h: ui.scale(TEXT_BODY), colour: WHITE, align: AlignX::Left, ..TextDecl },
-                                );
-                                let path = if path_str.trim().is_empty() { "blocks.zeccltf".to_string() } else { path_str.trim().to_string() };
-
-                                let tf_button = |ui: &mut Context, label: &str| -> bool {
-                                    let button_id = id(label);
-                                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, button_id, true, CursorIcon::Default);
-                                    let radius = ui.scale(16.0);
-                                    if ui.hovered(button_id) { ui.capture = true; }
-                                    if let _ = elem().decl(Decl {
-                                        id: button_id,
-                                        colour,
-                                        radius: radius.dup4(),
-                                        align: Center,
-                                        width:  fit!(ui.scale(150.0)),
-                                        height: fit!(radius * 2.0),
-                                        ..Decl
-                                    }) {
-                                        ui.text(label, TextDecl { h: ui.scale(TEXT_BODY), colour: text_colour, align: AlignX::Center, ..TextDecl });
-                                    }
-                                    clicked
                                 };
+                                let hdr_text_decl = TextDecl { h: ui.scale(TEXT_BODY), colour: WHITE.mul(0.70), align: AlignX::Left, ..TextDecl };
 
-                                if let _ = elem().decl(Decl { direction: LeftToRight, child_gap: ui.scale(8.0), width: grow!(), height: fit!(), ..Decl }) {
-                                    if tf_button(ui, "Load into zebra") {
-                                        viz.load_instrs_path_pending = path.clone();
+                                if let _ = elem().decl(group_decl) {
+                                    ui.text("Network", hdr_text_decl);
+                                    row(ui, data, "PoS Height", &format!("{}", viz.bft_tip_height));
+                                    row(ui, data, "PoW Height", &format!("{}", viz.bc_tip_height));
+                                    row(ui, data, "PoW Finalized", &format!("{}", viz.bc_finalized_tip_height));
+                                    row(ui, data, "BFT Peers", &format!("{}", pos_peer_count));
+                                    row(ui, data, "PoW Peers", &format!("{}", pow_peer_count));
+                                }
+
+                                if let _ = elem().decl(group_decl) {
+                                    ui.text("Wallet", hdr_text_decl);
+                                    row(ui, data, "Wallet Sync", &format!("{}/{} ({:.1}%)", wallets_sync_h, wallets_tip_h, sync_pct));
+                                    row(ui, data, "Blocks Behind Known PoW", &format!("{}", behind));
+                                }
+
+                                if let _ = elem().decl(group_decl) {
+                                    ui.text("Pool Balances", hdr_text_decl);
+                                    row(ui, data, "Ironwood", &format!("{}", viz.ironwood_pool_balance));
+                                    row(ui, data, "Staking Bonded", &format!("{}", viz.staking_bonded_pool_balance));
+                                    row(ui, data, "Staking Unbonded", &format!("{}", viz.staking_unbonded_pool_balance));
+                                }
+
+                                if let _ = elem().decl(group_decl) {
+                                    ui.text(frame_strf!(data, "Mempool ({})", viz.mempool_tx_strings.len()), hdr_text_decl);
+                                    let mono_text_decl = TextDecl { font: Mono, h: ui.scale(TEXT_SMALL), colour: WHITE.mul(0.85), wrap: Wrap::None, align: AlignX::Left, ..TextDecl };
+                                    for tx_str in viz.mempool_tx_strings.iter().take(16) {
+                                        ui.text(frame_strf!(data, "{}", tx_str), mono_text_decl);
                                     }
-                                    if tf_button(ui, "Serialize chains") {
-                                        viz.serialize_instrs_path_pending = path.clone();
+                                    if viz.mempool_tx_strings.len() > 16 {
+                                        ui.text(frame_strf!(data, "... and {} more", viz.mempool_tx_strings.len() - 16), hdr_text_decl);
                                     }
                                 }
 
-                                // Viewing draws the file's blocks directly, without the node
-                                // accepting them, so states this node rejects by policy -- a best
-                                // chain forking below the finalized block, most of all -- can still
-                                // be looked at.
-                                if let _ = elem().decl(Decl { direction: LeftToRight, child_gap: ui.scale(8.0), width: grow!(), height: fit!(), ..Decl }) {
-                                    if tf_button(ui, "View (no consensus)") {
-                                        viz.view_instrs_path_pending = path.clone();
-                                    }
-                                    if viz.view_mode && tf_button(ui, "Back to live chain") {
-                                        viz.view_exit_pending = true;
+                                if ui.debug {
+                                    let pause_id = id("Pause Incoming Blocks");
+                                    ui.checkbox_pill(pause_id, &mut viz.pause_incoming, "Pause Incoming Blocks", grow!());
+                                    if ui.hovered(pause_id) {
+                                        set_tooltip_text!(data, "Freeze the chain display so it can be inspected while the node keeps syncing.");
                                     }
                                 }
 
-                                if viz.view_mode {
-                                    ui.text("Viewing a file: these blocks are drawn from it, not accepted by this node.",
-                                            TextDecl { h: ui.scale(TEXT_SMALL), colour: (244u8, 196u8, 94u8, 255u8), align: AlignX::Left, ..TextDecl });
-                                }
-
-                                if viz.instr_strings.len() > 0 {
-                                    ui.text(frame_strf!(data, "{}/{} done, {} failed",
-                                        viz.instr_done_n.min(viz.instr_strings.len()), viz.instr_strings.len(), viz.instr_failed.len()), hdr_text_decl);
-                                    let done_colour   = (100u8, 220u8, 120u8, 255u8);
-                                    let failed_colour = (235u8,  90u8,  90u8, 255u8);
-                                    let todo_colour   = WHITE.mul(0.5);
-                                    let first = viz.instr_done_n.saturating_sub(12).min(viz.instr_strings.len().saturating_sub(16));
-                                    for (i, instr_str) in viz.instr_strings.iter().enumerate().skip(first).take(16) {
-                                        let colour = if viz.instr_failed.iter().any(|(failed_i, _)| *failed_i == i) { failed_colour }
-                                                     else if i < viz.instr_done_n { done_colour }
-                                                     else { todo_colour };
-                                        ui.text(frame_strf!(data, "{}", instr_str), TextDecl { font: Mono, h: ui.scale(TEXT_SMALL), colour, wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
-                                    }
-                                    for (_, failed_msg) in viz.instr_failed.iter().take(4) {
-                                        ui.text(frame_strf!(data, "{}", failed_msg), TextDecl { font: Mono, h: ui.scale(TEXT_SMALL), colour: failed_colour, wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
+                                if ui.debug {
+                                    let bft_pause_id = id("Pause BFT Proposals");
+                                    ui.checkbox_pill(bft_pause_id, &mut viz.bft_paused, "Pause BFT Proposals", grow!());
+                                    if ui.hovered(bft_pause_id) {
+                                        set_tooltip_text!(data, "Stop this node from proposing new BFT blocks.");
                                     }
                                 }
-                            }
 
-                            let decl = TextDecl { h: ui.scale(TEXT_BODY), align: AlignX::Center, ..TextDecl };
-                            if ui.viz_op != InteractiveVizOp::None {
-                                ui.text(frame_strf!(data, "Visualizing op: {:?}", ui.viz_op), decl);
-                            }
-                            if ui.debug {
-                                for peer in &viz.peer_strings {
-                                    ui.text(peer, decl);
+                                if ui.debug && let _ = elem().decl(group_decl) {
+                                    ui.text("Test Format", hdr_text_decl);
+
+                                    let path_tb_id = ui::id("Test Format Path Textbox");
+                                    let path_str = ui.textbox(
+                                        data,
+                                        path_tb_id,
+                                        "blocks.zeccltf",
+                                        TextDecl { font: Mono, h: ui.scale(TEXT_BODY), colour: WHITE, align: AlignX::Left, ..TextDecl },
+                                    );
+                                    let path = if path_str.trim().is_empty() { "blocks.zeccltf".to_string() } else { path_str.trim().to_string() };
+
+                                    let tf_button = |ui: &mut Context, label: &str| -> bool {
+                                        let button_id = id(label);
+                                        let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, button_id, true, CursorIcon::Default);
+                                        let radius = ui.scale(16.0);
+                                        if ui.hovered(button_id) { ui.capture = true; }
+                                        if let _ = elem().decl(Decl {
+                                            id: button_id,
+                                            colour,
+                                            radius: radius.dup4(),
+                                            align: Center,
+                                            width:  fit!(ui.scale(150.0)),
+                                            height: fit!(radius * 2.0),
+                                            ..Decl
+                                        }) {
+                                            ui.text(label, TextDecl { h: ui.scale(TEXT_BODY), colour: text_colour, align: AlignX::Center, ..TextDecl });
+                                        }
+                                        clicked
+                                    };
+
+                                    if let _ = elem().decl(Decl { direction: LeftToRight, child_gap: ui.scale(8.0), width: grow!(), height: fit!(), ..Decl }) {
+                                        if tf_button(ui, "Load into zebra") {
+                                            viz.load_instrs_path_pending = path.clone();
+                                        }
+                                        if tf_button(ui, "Serialize chains") {
+                                            viz.serialize_instrs_path_pending = path.clone();
+                                        }
+                                    }
+
+                                    // Viewing draws the file's blocks directly, without the node
+                                    // accepting them, so states this node rejects by policy -- a best
+                                    // chain forking below the finalized block, most of all -- can still
+                                    // be looked at.
+                                    if let _ = elem().decl(Decl { direction: LeftToRight, child_gap: ui.scale(8.0), width: grow!(), height: fit!(), ..Decl }) {
+                                        if tf_button(ui, "View (no consensus)") {
+                                            viz.view_instrs_path_pending = path.clone();
+                                        }
+                                        if viz.view_mode && tf_button(ui, "Back to live chain") {
+                                            viz.view_exit_pending = true;
+                                        }
+                                    }
+
+                                    if viz.view_mode {
+                                        ui.text("Viewing a file: these blocks are drawn from it, not accepted by this node.",
+                                                TextDecl { h: ui.scale(TEXT_SMALL), colour: (244u8, 196u8, 94u8, 255u8), align: AlignX::Left, ..TextDecl });
+                                    }
+
+                                    if viz.instr_strings.len() > 0 {
+                                        ui.text(frame_strf!(data, "{}/{} done, {} failed",
+                                            viz.instr_done_n.min(viz.instr_strings.len()), viz.instr_strings.len(), viz.instr_failed.len()), hdr_text_decl);
+                                        let done_colour   = (100u8, 220u8, 120u8, 255u8);
+                                        let failed_colour = (235u8,  90u8,  90u8, 255u8);
+                                        let todo_colour   = WHITE.mul(0.5);
+                                        let first = viz.instr_done_n.saturating_sub(12).min(viz.instr_strings.len().saturating_sub(16));
+                                        for (i, instr_str) in viz.instr_strings.iter().enumerate().skip(first).take(16) {
+                                            let colour = if viz.instr_failed.iter().any(|(failed_i, _)| *failed_i == i) { failed_colour }
+                                                         else if i < viz.instr_done_n { done_colour }
+                                                         else { todo_colour };
+                                            ui.text(frame_strf!(data, "{}", instr_str), TextDecl { font: Mono, h: ui.scale(TEXT_SMALL), colour, wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
+                                        }
+                                        for (_, failed_msg) in viz.instr_failed.iter().take(4) {
+                                            ui.text(frame_strf!(data, "{}", failed_msg), TextDecl { font: Mono, h: ui.scale(TEXT_SMALL), colour: failed_colour, wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
+                                        }
+                                    }
+                                }
+
+                                let decl = TextDecl { h: ui.scale(TEXT_BODY), align: AlignX::Center, ..TextDecl };
+                                if ui.viz_op != InteractiveVizOp::None {
+                                    ui.text(frame_strf!(data, "Visualizing op: {:?}", ui.viz_op), decl);
+                                }
+                                if ui.debug {
+                                    for peer in &viz.peer_strings {
+                                        ui.text(peer, decl);
+                                    }
                                 }
                             }
                         }

@@ -1590,7 +1590,7 @@ fn draw_chain_minimap_overlay(
         .max(draw_ctx.measure_text_line(FontKind::Mono, tick_h, &s_mid))
         .max(draw_ctx.measure_text_line(FontKind::Mono, tick_h, &s_bot));
     let label_x = (track_r - 3.0 * ds - max_lab_w).max(track_l + 6.0 * ds);
-    let y_top_lab = chain_minimap_h_to_y(h_max, h_min, h_max, my0, my1) - tick_h * 0.35;
+    let y_top_lab = my0 - outer_pad - tick_h - 1.0 * ds;
     let y_mid_lab = chain_minimap_h_to_y(h_mid, h_min, h_max, my0, my1) - tick_h * 0.35;
     let y_bot_lab = chain_minimap_h_to_y(h_min, h_min, h_max, my0, my1) - tick_h;
     draw_ctx.text_line(FontKind::Mono, label_x, y_top_lab, tick_h, &s_top, label_mute);
@@ -1709,7 +1709,7 @@ fn draw_pos_minimap_overlay(
         .max(draw_ctx.measure_text_line(FontKind::Mono, tick_h, &s_mid))
         .max(draw_ctx.measure_text_line(FontKind::Mono, tick_h, &s_bot));
     let label_x = (track_r - 3.0 * ds - max_lab_w).max(track_l + 6.0 * ds);
-    let y_top_lab = chain_minimap_h_to_y(h_max, h_min, h_max, my0, my1) - tick_h * 0.35;
+    let y_top_lab = my0 - outer_pad - tick_h - 1.0 * ds;
     let y_mid_lab = chain_minimap_h_to_y(h_mid, h_min, h_max, my0, my1) - tick_h * 0.35;
     let y_bot_lab = chain_minimap_h_to_y(h_min, h_min, h_max, my0, my1) - tick_h;
     draw_ctx.text_line(FontKind::Mono, label_x, y_top_lab, tick_h, &s_top, label_mute);
