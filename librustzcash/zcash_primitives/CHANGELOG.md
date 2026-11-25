@@ -11,6 +11,9 @@ workspace.
 ## [Unreleased]
 
 ### Fixed
+- `bft::SlashForkConfig` config parsing now also accepts verified 134-character
+  `zfinv1` finalizer addresses. Legacy 64-character hex keys remain supported;
+  serialized rules and BFT blocks still contain only public keys.
 - `bft::FatPointerToBftBlock::try_from_bytes` now decodes valid encodings without
   panicking and rejects truncated input, trailing bytes, and signature counts above
   `bft::FAT_POINTER_SIGNATURES_MAX`.
