@@ -10,26 +10,45 @@ or changing anything a person sees.
 ## The loop
 
 ```text
-bash zebra-gui/gui.sh snap base     Once, before the first edit.
+bash zebra-gui/gui.sh run 'shot before'   Before the first edit: look at the screen as it is.
   ...edit...
-bash zebra-gui/gui.sh check         After each edit.
+bash zebra-gui/gui.sh check               After each edit.
 ```
 
+Whenever `gui.sh` runs and the GUI has no uncommitted change, it records every screen under
+`base`, once for each commit. That is what a change is compared with, so run it once before
+the first edit. `gui.sh snap base` records one by hand, from a tree that has changes already.
+
 `check` rebuilds if a source file is newer than the binary, runs every script in `scripts/`,
-feeds 400 steps of random input, and compares every screenshot and every lint finding with
-`base`. It ends in `check: ok` or `check: FAIL, <why>`.
+feeds 400 steps of random input, and says what differs from `base`. It ends in `check: ok`
+or `check: FAIL, <why>`, and keeps its whole output in `target/gui/check.txt`.
 
 ```text
 snap now: 19 screenshots in .../target/gui/now, 0 scripts failed
-random input: no crash (monkey seed 1795623091612353501)
-tour: differs: main.png 5120 px in x 40..420 y 250..300 -> .../now/tour/diff_main.png
-tour: lint new: main  margin  Send  67,270  2 px from the side of the box behind it
+random input: no crash (monkey seed 1795626457009387801)
+differs: sizes/800x600: new text "Hide"; new to press "Hide" 111x32 at 49,228; 14 texts moved 44 px down; 1 went out of view; 29867 px in x 9..200 y 228..600 -> .../now/sizes/diff_800x600.png
+    the same cause changed sizes/1024x600, tour/main, tour/faucet_wallet and 9 more
+differs: tour/modal_send: 2 texts moved 56 px up; 2 came into view; 6847 px in x 12..421 y 298..876 -> .../now/tour/diff_modal_send.png
+14 of 19 screenshots differ, in 2 ways
+lint new: tour/main  margin  Hide  67,270  2 px from the side of the box behind it
+style new: text size 13 px (first in tour/main, used 1 times)
 check: ok
 ```
 
 `check: ok` means nothing crashed and no script's `expect` failed. It does not mean the
-change looks right: read each `diff_*.png` (the changed region, before on the left, after on
-the right) and each `lint new:` line, and decide whether you meant it.
+change looks right. Read the report:
+
+- **`differs`** has one line for each cause, not for each screenshot. `new text` and `new to
+  press` are what no screenshot had before, `gone text` what none has now. `moved`, `came
+  into view` and `went out of view` are what followed from that. A change that moves the
+  whole page shows here as a large count of texts moved: ask whether it had to.
+- **The image** a line names is of the smallest window that cause changed, where there is
+  the least room: the changed region before, after, and with the changed pixels marked. Read
+  each one. The other screenshots' images lie beside it as `diff_<name>.png`.
+- **`lint new`** and **`style new`** are findings and values no screenshot had before. Each
+  is yours to fix or to mean.
+- A line that says `no text and nothing to press changed` is a change of drawing only: a
+  colour, a shape, a size. A film has no record of its texts, and says so.
 
 To try one thing, give `run` commands in place of a script file, separated by `;`:
 
@@ -48,7 +67,7 @@ Output goes to `zebra-gui/target/gui/run/`. Read the PNG a command names; crop w
 | --- | --- | --- |
 | `build` after an edit | 16 to 30 s | 5 s of compiling; the rest is the machine's build lock. |
 | `build` from nothing | 8 min | Happens when the target directory was cleaned. |
-| `run` | under 1 s | Plus a build if a source file changed. |
+| `run` | under 1 s | Plus a build if a source file changed, and 5 s to record `base` the first time after a commit. |
 | `snap <label>` | 5 s | Every script, into `target/gui/<label>/<script>/`. |
 | `check` | 11 s | `snap now`, random input, `diff base now`. |
 | `lint` | 5 s | Every finding on every screenshot, one line each. |

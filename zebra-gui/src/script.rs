@@ -141,6 +141,7 @@ pub struct ScriptWindow {
     lint_lines: Vec<String>,
     targets: Vec<LoggedTarget>,
     style_lines: Vec<String>,
+    content_lines: Vec<String>,
     sweep: Option<Sweep>,
 }
 
@@ -229,6 +230,7 @@ impl ScriptWindow {
             lint_lines: Vec::new(),
             targets: Vec::new(),
             style_lines: Vec::new(),
+            content_lines: Vec::new(),
             sweep: None,
         };
         w.resize(1600, 900);
@@ -301,6 +303,11 @@ impl ScriptWindow {
                     let mut text = self.style_lines.join("\n");
                     text.push('\n');
                     self.write_file("style.txt", text.as_bytes());
+                }
+                if !self.content_lines.is_empty() {
+                    let mut text = self.content_lines.join("\n");
+                    text.push('\n');
+                    self.write_file("content.txt", text.as_bytes());
                 }
                 self.closed = true;
                 self.events.push_back(Event { kind: EVENT_CLOSE, ..Event::default() });
@@ -505,7 +512,10 @@ impl ScriptWindow {
                 self.keep_shot(&name, &rgb, w, h);
                 let found = self.lint();
                 self.keep_lint(&name, &found);
-                for (kind, value, uses) in self.style([x as i32, y as i32, (x + w) as i32, (y + h) as i32]) { self.style_lines.push(format!("{}\t{}\t{}\t{}", name, kind, value, uses)); }
+                let part = [x as i32, y as i32, (x + w) as i32, (y + h) as i32];
+                for (kind, value, uses) in self.style(part) { self.style_lines.push(format!("{}\t{}\t{}\t{}", name, kind, value, uses)); }
+                let shown = self.content(&name, part);
+                self.content_lines.extend(shown);
             }
             "style" => {
                 if !self.need_fresh() { return false; }
@@ -845,15 +855,19 @@ impl ScriptWindow {
         self.clips[self.clips.partition_point(|c| c.0 < at).max(1) - 1].1
     }
 
-    /// The texts a person can see: on screen, inside their clip, not under something drawn later.
-    fn shown_texts(&self) -> Vec<Seen<'_>> {
+    /// The texts a person can read: on screen, inside their clip, not under something drawn later.
+    fn shown_texts(&self) -> Vec<Seen<'_>> { self.texts_under(0x30) }
+
+    /// The texts on screen that nothing drawn later covers with at least that much alpha. A
+    /// dialog dims the page behind it: that page is hard to read, and still there to see.
+    fn texts_under(&self, hides: u32) -> Vec<Seen<'_>> {
         let mut seen = Vec::new();
         for t in &self.texts {
             if t.w == 0 || t.text.trim().is_empty() { continue; }
             let full = [t.x, t.y, t.x + t.w as i32, t.y + t.h as i32];
             let vis = cut(full, self.clip_at(t.at));
             if area(vis) == 0 { continue; }
-            if self.rects.iter().any(|r| r.at >= t.at && r.color >> 24 >= 0x30 && area(cut(r.b, vis)) * 2 > area(vis)) { continue; }
+            if self.rects.iter().any(|r| r.at >= t.at && r.color >> 24 >= hides && area(cut(r.b, vis)) * 2 > area(vis)) { continue; }
             seen.push(Seen { t, full, vis });
         }
         seen
@@ -877,10 +891,22 @@ impl ScriptWindow {
         out
     }
 
-    /// The text drawn inside a box, to name the box by in a report.
-    fn label_of(&self, b: [i32; 4]) -> String {
-        self.texts.iter().find(|t| !t.text.trim().is_empty() && holds(b, [t.x + t.w as i32 / 2, t.y + t.h as i32 / 2]))
-            .map(|t| t.text.clone()).unwrap_or_else(|| "(no text)".to_string())
+    /// The text that names a box in a report.
+    fn label_of(&self, b: [i32; 4]) -> String { label_among(&self.shown_texts(), b) }
+
+    /// What a part of the screen shows, a line each: its texts, then what can be pressed.
+    fn content(&self, name: &str, part: [i32; 4]) -> Vec<String> {
+        let mut out = Vec::new();
+        for s in self.texts_under(0xf0) {
+            if area(cut(s.vis, part)) == 0 { continue; }
+            out.push(format!("{}\tT\t{}\t{}\t{}\t{}\t{:06x}\t{}", name, s.t.x, s.t.y, s.t.w, s.t.h, s.t.color & 0xffffff, s.t.text.replace(['\t', '\n'], " ")));
+        }
+        let shown = self.shown_texts();
+        for t in self.shown_targets() {
+            if area(cut(t.b, part)) == 0 { continue; }
+            out.push(format!("{}\tP\t{}\t{}\t{}\t{}\t-\t{}", name, t.b[0], t.b[1], t.b[2] - t.b[0], t.b[3] - t.b[1], label_among(&shown, t.b).replace(['\t', '\n'], " ")));
+        }
+        out
     }
 
     /// The text sizes, colours and corner radii that part of the screen is made of, and how
@@ -1011,6 +1037,17 @@ struct Finding {
 fn cut(a: [i32; 4], b: [i32; 4]) -> [i32; 4] { [a[0].max(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].min(b[3])] }
 fn area(b: [i32; 4]) -> i64 { if b[2] > b[0] && b[3] > b[1] { (b[2] - b[0]) as i64 * (b[3] - b[1]) as i64 } else { 0 } }
 fn holds(b: [i32; 4], p: [i32; 2]) -> bool { b[0] <= p[0] && p[0] < b[2] && b[1] <= p[1] && p[1] < b[3] }
+
+/// Of the texts shown inside a box, the one a person would call it by: the tallest that is not
+/// an icon, the one nearest the top left among equals. Text drawn across the box by something
+/// else does not lie inside it, and counts only when nothing does.
+fn label_among(shown: &[Seen<'_>], b: [i32; 4]) -> String {
+    let best = |of: &dyn Fn(&Seen<'_>) -> bool| shown.iter().filter(|s| of(s))
+        .min_by_key(|s| (s.t.text.starts_with('<'), std::cmp::Reverse(s.t.h), s.t.y, s.t.x)).map(|s| s.t.text.clone());
+    best(&|s| s.vis[0] >= b[0] - 2 && s.vis[1] >= b[1] - 2 && s.vis[2] <= b[2] + 2 && s.vis[3] <= b[3] + 2)
+        .or_else(|| best(&|s| holds(b, [(s.vis[0] + s.vis[2]) / 2, (s.vis[1] + s.vis[3]) / 2])))
+        .unwrap_or_else(|| "(no text)".to_string())
+}
 
 fn short(s: &str) -> String {
     if s.chars().count() > 40 { format!("{}...", s.chars().take(37).collect::<String>()) } else { s.to_string() }
@@ -1440,6 +1477,122 @@ pub fn png_decode(png: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
     Some((rgb, width, height))
 }
 
+/// A text, or a thing to press, that a screenshot showed, as `content.txt` keeps it.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct Shown { x: i32, y: i32, w: i32, h: i32, color: String, text: String }
+
+/// What each screenshot of a run showed: its texts, and what could be pressed.
+fn read_content(dir: &Path) -> HashMap<String, (Vec<Shown>, Vec<Shown>)> {
+    let mut all: HashMap<String, (Vec<Shown>, Vec<Shown>)> = HashMap::new();
+    for l in std::fs::read_to_string(dir.join("content.txt")).unwrap_or_default().lines() {
+        let f: Vec<&str> = l.splitn(8, '\t').collect();
+        if f.len() < 8 { continue; }
+        let n = |i: usize| f[i].parse::<i32>().unwrap_or(0);
+        let item = Shown { x: n(2), y: n(3), w: n(4), h: n(5), color: f[6].to_string(), text: f[7].to_string() };
+        let of = all.entry(f[0].to_string()).or_default();
+        if f[1] == "P" { of.1.push(item) } else { of.0.push(item) }
+    }
+    all
+}
+
+/// Pairs what two recordings of a screen share: the same text, in the same order down the
+/// screen. Returns the pairs, what only the second has, and what only the first has.
+fn pair_up(a: &[Shown], b: &[Shown]) -> (Vec<(Shown, Shown)>, Vec<Shown>, Vec<Shown>) {
+    let order = |v: &[Shown]| -> Vec<Shown> {
+        let mut o = v.to_vec();
+        o.sort_by(|p, q| (&p.text, p.y, p.x).cmp(&(&q.text, q.y, q.x)));
+        o
+    };
+    let (oa, ob) = (order(a), order(b));
+    let (mut i, mut j) = (0, 0);
+    let (mut pairs, mut added, mut gone) = (Vec::new(), Vec::new(), Vec::new());
+    while i < oa.len() || j < ob.len() {
+        if j == ob.len() || (i < oa.len() && oa[i].text < ob[j].text) { gone.push(oa[i].clone()); i += 1; }
+        else if i == oa.len() || ob[j].text < oa[i].text { added.push(ob[j].clone()); j += 1; }
+        else { pairs.push((oa[i].clone(), ob[j].clone())); i += 1; j += 1; }
+    }
+    (pairs, added, gone)
+}
+
+fn quoted(s: &str) -> String { format!("\"{}\"", short(s)) }
+
+/// Every text, and every name of a thing to press, on any screenshot of the first run and of
+/// the second.
+#[derive(Default)]
+struct Known { texts: [std::collections::HashSet<String>; 2], press: [std::collections::HashSet<String>; 2] }
+
+/// What changed between two recordings of one screen, in words, and a key that is the same for
+/// every screen changed by the same cause. Both are empty when no text and nothing to press
+/// changed. The key holds the texts no screen had before, and those no screen has any more.
+/// What follows from that differs with each window size and is left out of it: the rest
+/// moving over, and what that brings into view or pushes out. A text that is gone from a
+/// screen where others moved may have been pushed out, so there it is left out as well.
+fn describe_change(a: &(Vec<Shown>, Vec<Shown>), b: &(Vec<Shown>, Vec<Shown>), known: &Known) -> (String, String) {
+    let names = |v: &[Shown]| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for s in v { let q = quoted(&s.text); if !out.contains(&q) { out.push(q); } }
+        out
+    };
+    let some = |v: &[String], most: usize| -> String {
+        let rest = if v.len() > most { format!(" and {} more", v.len() - most) } else { String::new() };
+        format!("{}{}", v.iter().take(most).cloned().collect::<Vec<_>>().join(", "), rest)
+    };
+    let (mut words, mut key): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    let (pairs, added, gone) = pair_up(&a.0, &b.0);
+    let (_, press_added, press_gone) = pair_up(&a.1, &b.1);
+
+    let fresh: Vec<Shown> = added.iter().filter(|s| !known.texts[0].contains(&s.text)).cloned().collect();
+    let lost: Vec<Shown> = gone.iter().filter(|s| !known.texts[1].contains(&s.text)).cloned().collect();
+    let fresh_names = names(&fresh);
+    if !fresh.is_empty() { words.push(format!("new text {}", some(&fresh_names, 4))); key.push(format!("+{}", fresh_names.join(","))); }
+    if !lost.is_empty() { words.push(format!("gone text {}", some(&names(&lost), 4))); }
+
+    // A scroll bar's thumb has no text, and comes and goes with what it scrolls.
+    let fresh_press: Vec<Shown> = press_added.iter().filter(|s| s.text != "(no text)" && !known.press[0].contains(&s.text)).cloned().collect();
+    let lost_press: Vec<Shown> = press_gone.iter().filter(|s| s.text != "(no text)" && !known.press[1].contains(&s.text)).cloned().collect();
+    if !fresh_press.is_empty() {
+        let n: Vec<String> = fresh_press.iter().map(|s| format!("{} {}x{} at {},{}", quoted(&s.text), s.w, s.h, s.x, s.y)).collect();
+        words.push(format!("new to press {}", some(&n, 4)));
+    }
+    if !lost_press.is_empty() { words.push(format!("no longer to press {}", some(&names(&lost_press), 4))); }
+
+    // Only a text the screen shows once: of two alike, which is which is a guess.
+    let once = |v: &[Shown], text: &str| v.iter().filter(|s| s.text == text).count() == 1;
+    let mut restyled: Vec<String> = Vec::new();
+    for (p, q) in &pairs {
+        if !once(&a.0, &p.text) || !once(&b.0, &p.text) { continue; }
+        if p.h != q.h { restyled.push(format!("{} {} -> {} px tall", quoted(&p.text), p.h, q.h)); }
+        else if p.color != q.color { restyled.push(format!("{} {} -> {}", quoted(&p.text), p.color, q.color)); }
+    }
+    if !restyled.is_empty() { words.push(format!("restyled {}", some(&restyled, 3))); key.push(format!("~{}", restyled.join(","))); }
+
+    let mut moves: Vec<((i32, i32), usize)> = Vec::new();
+    for (p, q) in &pairs {
+        let d = (q.x - p.x, q.y - p.y);
+        if d == (0, 0) { continue; }
+        match moves.iter_mut().find(|m| m.0 == d) { Some(m) => m.1 += 1, None => moves.push((d, 1)) }
+    }
+    moves.sort_by_key(|m| (std::cmp::Reverse(m.1), m.0));
+    if let Some(&((dx, dy), n)) = moves.first() {
+        let way = match (dx, dy) {
+            (0, d) if d > 0 => format!("{} px down", d),
+            (0, d) => format!("{} px up", -d),
+            (d, 0) if d > 0 => format!("{} px right", d),
+            (d, 0) => format!("{} px left", -d),
+            (x, y) => format!("by {},{} px", x, y),
+        };
+        let others: usize = moves[1..].iter().map(|m| m.1).sum();
+        let rest = if others > 0 { format!(", {} moved otherwise", others) } else { String::new() };
+        words.push(format!("{} text{} moved {}{}", n, if n == 1 { "" } else { "s" }, way, rest));
+    }
+    if moves.is_empty() && !lost.is_empty() { key.push(format!("-{}", names(&lost).join(","))); }
+    let (came, went) = (added.len() - fresh.len(), gone.len() - lost.len());
+    if came > 0 { words.push(format!("{} came into view", came)); }
+    if went > 0 { words.push(format!("{} went out of view", went)); }
+    if key.is_empty() && !words.is_empty() { key.push("follows".to_string()); }
+    (words.join("; "), key.join(" | "))
+}
+
 fn read_shots(dir: &Path) -> Vec<(String, String)> {
     // A later line for the same file wins: a rerun into the same folder appends.
     let mut out: Vec<(String, String)> = Vec::new();
@@ -1453,28 +1606,88 @@ fn read_shots(dir: &Path) -> Vec<(String, String)> {
     out
 }
 
-/// Compares the screenshots of two scripted runs by the `shots.txt` each wrote. For every pair
-/// that differs it writes `diff_<name>.png` into `dir_b`: the changed region before, after, and
-/// with the changed pixels marked. Returns how many differ or are missing on one side.
+/// What one scripted run wrote, or a folder of such runs: there, a screenshot's name is led by
+/// its run's, as in `tour/main`.
+#[derive(Default)]
+struct Recorded {
+    /// Name, size and hash, and the image file.
+    shots: Vec<(String, String, PathBuf)>,
+    content: HashMap<String, (Vec<Shown>, Vec<Shown>)>,
+    lint: Vec<Vec<String>>,
+    /// Kind and value, the first screenshot with it, and its uses.
+    style: Vec<(String, String, usize)>,
+    has_style: bool,
+}
+
+fn read_recorded(dir: &Path) -> Recorded {
+    let mut runs: Vec<(String, PathBuf)> = Vec::new();
+    if dir.join("shots.txt").exists() {
+        runs.push((String::new(), dir.to_path_buf()));
+    } else {
+        let mut names: Vec<String> = std::fs::read_dir(dir).into_iter().flatten().flatten()
+            .filter(|e| e.path().join("shots.txt").exists()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        for n in names { runs.push((format!("{}/", n), dir.join(&n))); }
+    }
+    let mut r = Recorded::default();
+    for (lead, run) in &runs {
+        for (file, meta) in read_shots(run) { r.shots.push((format!("{}{}", lead, file.trim_end_matches(".png")), meta, run.join(&file))); }
+        for (shot, shown) in read_content(run) { r.content.insert(format!("{}{}", lead, shot), shown); }
+        for l in std::fs::read_to_string(run.join("lint.txt")).unwrap_or_default().lines() {
+            let mut f: Vec<String> = l.split('\t').map(str::to_string).collect();
+            f[0] = format!("{}{}", lead, f[0]);
+            r.lint.push(f);
+        }
+        r.has_style |= run.join("style.txt").exists();
+        for l in std::fs::read_to_string(run.join("style.txt")).unwrap_or_default().lines() {
+            let f: Vec<&str> = l.split('\t').collect();
+            if f.len() < 4 { continue; }
+            let (key, uses) = (format!("{} {}", f[1], f[2]), f[3].parse().unwrap_or(0));
+            match r.style.iter_mut().find(|s| s.0 == key) { Some(s) => s.2 += uses, None => r.style.push((key, format!("{}{}", lead, f[0]), uses)) }
+        }
+    }
+    r
+}
+
+/// Says what differs between two scripted runs, or two folders of runs, from the files each
+/// wrote. For every screenshot that differs it writes `diff_<name>.png` beside the second one:
+/// the changed region before, after, and with the changed pixels marked. Screenshots changed
+/// by the same cause share one line, which names one image. Returns how many things differ.
 pub fn diff_dirs(dir_a: &Path, dir_b: &Path) -> usize {
-    let (a, b) = (read_shots(dir_a), read_shots(dir_b));
-    let (mut same, mut differ) = (0, 0);
-    for (file, _) in b.iter().filter(|(f, _)| !a.iter().any(|(g, _)| g == f)) { println!("only in {}: {}", dir_b.display(), file); differ += 1; }
-    for (file, meta_a) in &a {
-        let Some((_, meta_b)) = b.iter().find(|(f, _)| f == file) else {
-            println!("only in {}: {}", dir_a.display(), file);
+    let (a, b) = (read_recorded(dir_a), read_recorded(dir_b));
+    let shows = |file: &Path| file.display().to_string().replace('\\', "/");
+    let mut known = Known::default();
+    for (side, run) in [&a, &b].iter().enumerate() {
+        for (texts, press) in run.content.values() {
+            known.texts[side].extend(texts.iter().map(|s| s.text.clone()));
+            known.press[side].extend(press.iter().map(|s| s.text.clone()));
+        }
+    }
+    let (mut same, mut changed, mut differ) = (0, 0, 0);
+    let mut new_shots: Vec<String> = Vec::new();
+    for (shot, _, file) in b.shots.iter().filter(|s| !a.shots.iter().any(|t| t.0 == s.0)) {
+        println!("new screenshot: {} -> {}", shot, shows(file));
+        new_shots.push(shot.clone());
+        differ += 1;
+    }
+    // One entry for each cause of change: its key, and the screenshots it changed, each with
+    // its size in pixels, its name and its line.
+    let mut ways: Vec<(String, Vec<(usize, String, String)>)> = Vec::new();
+    for (shot, meta_a, file_a) in &a.shots {
+        let Some((_, meta_b, file_b)) = b.shots.iter().find(|s| &s.0 == shot) else {
+            println!("gone screenshot: {}", shot);
             differ += 1;
             continue;
         };
         if meta_a == meta_b { same += 1; continue; }
-        differ += 1;
-        let load = |dir: &Path| std::fs::read(dir.join(file)).ok().and_then(|bytes| png_decode(&bytes));
-        let (Some((pa, wa, ha)), Some((pb, wb, hb))) = (load(dir_a), load(dir_b)) else {
-            println!("differs: {} (could not read both images)", file);
+        changed += 1;
+        let load = |file: &Path| std::fs::read(file).ok().and_then(|bytes| png_decode(&bytes));
+        let (Some((pa, wa, ha)), Some((pb, wb, hb))) = (load(file_a), load(file_b)) else {
+            println!("differs: {} (could not read both images)", shot);
             continue;
         };
         if (wa, ha) != (wb, hb) {
-            println!("differs: {} size {}x{} -> {}x{}", file, wa, ha, wb, hb);
+            println!("differs: {} size {}x{} -> {}x{}", shot, wa, ha, wb, hb);
             continue;
         }
         let (mut x1, mut y1, mut x2, mut y2, mut count) = (wa, ha, 0, 0, 0usize);
@@ -1496,51 +1709,67 @@ pub fn diff_dirs(dir_a: &Path, dir_b: &Path) -> usize {
         for y in 0..ch {
             for x in 0..cw {
                 let src = ((cy1 + y) * wa + cx1 + x) * 3;
-                let changed = pa[src..src + 3] != pb[src..src + 3];
-                let mark = if changed { [0xff, 0x00, 0xff] } else { [pb[src] / 3, pb[src + 1] / 3, pb[src + 2] / 3] };
+                let differs = pa[src..src + 3] != pb[src..src + 3];
+                let mark = if differs { [0xff, 0x00, 0xff] } else { [pb[src] / 3, pb[src + 1] / 3, pb[src + 2] / 3] };
                 for (panel, px) in [&pa[src..src + 3], &pb[src..src + 3], &mark[..]].iter().enumerate() {
                     let dst = (y * ow + panel * (cw + gap) + x) * 3;
                     out[dst..dst + 3].copy_from_slice(px);
                 }
             }
         }
-        let name = format!("diff_{}", file.replace(['/', '\\'], "_"));
-        let _ = std::fs::write(dir_b.join(&name), png_encode(&out, ow, ch));
-        println!("differs: {} {} px in x {}..{} y {}..{} -> {}", file, count, x1, x2, y1, y2, dir_b.join(&name).display());
+        let image = file_b.with_file_name(format!("diff_{}", file_b.file_name().unwrap_or_default().to_string_lossy()));
+        let _ = std::fs::write(&image, png_encode(&out, ow, ch));
+
+        // A film, or a crop with no text in it, has no record of what it shows.
+        let (mut words, mut key) = match (a.content.get(shot), b.content.get(shot)) {
+            (Some(was), Some(is)) => describe_change(was, is, &known),
+            _ => ("there is no record of its texts".to_string(), "unrecorded".to_string()),
+        };
+        if words.is_empty() {
+            words = "no text and nothing to press changed".to_string();
+            key = format!("pixels {} {} {} {} {}", count, x1, x2, y1, y2);
+        }
+        let line = format!("differs: {}: {}; {} px in x {}..{} y {}..{} -> {}", shot, words, count, x1, x2, y1, y2, shows(&image));
+        match ways.iter_mut().find(|w| w.0 == key) {
+            Some(w) => w.1.push((wa * ha, shot.clone(), line)),
+            None => ways.push((key, vec![(wa * ha, shot.clone(), line)])),
+        }
     }
-    println!("{} identical, {} differ", same, differ);
+    // Of the screenshots one cause changed, the smallest window is shown: there the change has
+    // the least room, and the image is the cheapest to read.
+    for (_, shots) in &mut ways {
+        shots.sort_by_key(|s| s.0);
+        println!("{}", shots[0].2);
+        if shots.len() == 1 { continue; }
+        let rest = if shots.len() > 9 { format!(" and {} more", shots.len() - 9) } else { String::new() };
+        println!("    the same cause changed {}{}", shots[1..].iter().take(8).map(|s| s.1.clone()).collect::<Vec<_>>().join(", "), rest);
+    }
+    println!("{} of {} screenshots differ, in {} ways", changed, same + changed, ways.len());
+    differ += changed;
 
     // A finding is the same one in both runs if its screenshot, kind and text match; where it
-    // sits and by how much it is off can move without it being news.
-    let lint = |dir: &Path| -> Vec<(String, String)> {
-        std::fs::read_to_string(dir.join("lint.txt")).unwrap_or_default().lines().map(|l| {
-            let f: Vec<&str> = l.split('\t').collect();
-            (f.iter().take(3).copied().collect::<Vec<_>>().join(" | "), l.replace('\t', "  "))
-        }).collect()
-    };
-    let (la, lb) = (lint(dir_a), lint(dir_b));
-    let new: Vec<&String> = lb.iter().filter(|(k, _)| !la.iter().any(|(j, _)| j == k)).map(|(_, l)| l).collect();
-    let gone = la.iter().filter(|(k, _)| !lb.iter().any(|(j, _)| j == k)).count();
+    // sits and by how much it is off can move without it being news. On a screenshot the first
+    // run did not take, a finding is news only if no screenshot of the first run had its like.
+    let alike = |f: &[String], g: &[String], from: usize| f.len() >= 3 && g.len() >= 3 && f[from..3] == g[from..3];
+    let mut new: Vec<String> = Vec::new();
+    for f in &b.lint {
+        let from = if new_shots.contains(&f[0]) { 1 } else { 0 };
+        if !a.lint.iter().any(|g| alike(f, g, from)) { new.push(f.join("  ")); }
+    }
+    let gone = a.lint.iter().filter(|g| !b.lint.iter().any(|f| alike(f, g, 0))).count();
     for l in new.iter().take(30) { println!("lint new: {}", l); }
     if new.len() > 30 { println!("lint new: ... and {} more", new.len() - 30); }
-    if !new.is_empty() || gone != 0 { println!("lint: {} new findings, {} gone, {} in all", new.len(), gone, lb.len()); }
+    if !new.is_empty() || gone != 0 { println!("lint: {} new findings, {} gone, {} in all", new.len(), gone, b.lint.len()); }
+    for shot in &new_shots {
+        let of = b.lint.iter().filter(|f| &f[0] == shot).count();
+        if of > 0 { println!("lint: {} is a new screenshot with {} findings; listed are those no screenshot had before", shot, of); }
+    }
     differ += new.len();
 
     // A size, colour or corner radius that no screen of the first run used.
-    if dir_a.join("style.txt").exists() {
-        let style = |dir: &Path| -> Vec<(String, String, usize)> {
-            let mut all: Vec<(String, String, usize)> = Vec::new();
-            for l in std::fs::read_to_string(dir.join("style.txt")).unwrap_or_default().lines() {
-                let f: Vec<&str> = l.split('\t').collect();
-                if f.len() < 4 { continue; }
-                let (key, uses) = (format!("{} {}", f[1], f[2]), f[3].parse().unwrap_or(0));
-                match all.iter_mut().find(|s| s.0 == key) { Some(s) => s.2 += uses, None => all.push((key, f[0].to_string(), uses)) }
-            }
-            all
-        };
-        let (sa, sb) = (style(dir_a), style(dir_b));
-        let new: Vec<&(String, String, usize)> = sb.iter().filter(|s| !sa.iter().any(|a| a.0 == s.0)).collect();
-        let gone = sa.iter().filter(|a| !sb.iter().any(|s| s.0 == a.0)).count();
+    if a.has_style {
+        let new: Vec<&(String, String, usize)> = b.style.iter().filter(|s| !a.style.iter().any(|t| t.0 == s.0)).collect();
+        let gone = a.style.iter().filter(|t| !b.style.iter().any(|s| s.0 == t.0)).count();
         for s in new.iter().take(20) { println!("style new: {} (first in {}, used {} times)", s.0, s.1, s.2); }
         if new.len() > 20 { println!("style new: ... and {} more", new.len() - 20); }
         if !new.is_empty() || gone != 0 { println!("style: {} new values, {} gone", new.len(), gone); }
@@ -1555,6 +1784,96 @@ mod tests {
 
     fn seed() -> u64 {
         std::env::var("FUZZ_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or_else(fresh_seed)
+    }
+
+    #[test]
+    fn fuzz_describe_change() {
+        let seed = seed();
+        println!("fuzz_describe_change FUZZ_SEED={}", seed);
+        let mut s = seed;
+        for round in 0..600 {
+            // A screen of texts with unlike names, some of them shown more than once, and
+            // things to press. Then the same screen with a known set of changes made to it.
+            let mut pick = |n: u64| (rng_next(&mut s) % n) as i32;
+            let mut before: (Vec<Shown>, Vec<Shown>) = (Vec::new(), Vec::new());
+            for i in 0..3 + pick(30) {
+                let copies = if pick(5) == 0 { 2 + pick(3) } else { 1 };
+                for c in 0..copies {
+                    before.0.push(Shown { x: pick(1500), y: i * 40 + c * 7, w: 10 + pick(200), h: 8 + pick(40), color: format!("{:06x}", pick(0xffffff)), text: format!("text {}", i) });
+                }
+            }
+            for i in 0..pick(8) { before.1.push(Shown { x: pick(1500), y: i * 50, w: 24 + pick(200), h: 24 + pick(60), color: "-".into(), text: format!("press {}", i) }); }
+            let mut after = before.clone();
+
+            let (dx, dy) = if pick(3) == 0 { (0, 0) } else { (if pick(2) == 0 { 0 } else { pick(400) - 200 }, pick(400) - 200) };
+            for t in after.0.iter_mut().chain(after.1.iter_mut()) { t.x += dx; t.y += dy; }
+            let add = pick(3);
+            for i in 0..add { after.0.push(Shown { x: pick(1500), y: pick(900), w: 50, h: 12, color: "ffffff".into(), text: format!("added {}", i) }); }
+            // Only a text shown once is dropped: dropping one copy of several leaves the rest
+            // paired with each other's places, which is a move of its own.
+            let once: Vec<usize> = (0..after.0.len()).filter(|&i| after.0.iter().filter(|t| t.text == after.0[i].text).count() == 1 && after.0[i].text.starts_with("text")).collect();
+            let dropped = if pick(3) == 0 && !once.is_empty() { Some(after.0.remove(once[pick(once.len() as u64) as usize]).text) } else { None };
+            let button = pick(4) == 0;
+            if button { after.1.push(Shown { x: 5, y: 5, w: 80, h: 30, color: "-".into(), text: "new button".into() }); }
+            // Order in the file is draw order, which a change may shuffle.
+            if pick(2) == 0 { after.0.reverse(); }
+            let moved = (dx, dy) != (0, 0);
+            let way = match (dx, dy) {
+                (0, d) if d > 0 => format!("moved {} px down", d),
+                (0, d) => format!("moved {} px up", -d),
+                (d, 0) if d > 0 => format!("moved {} px right", d),
+                (d, 0) => format!("moved {} px left", -d),
+                (x, y) => format!("moved by {},{} px", x, y),
+            };
+
+            // With no other screen: what was added is new, and what was dropped is gone.
+            let mut alone = Known::default();
+            for (side, screen) in [&before, &after].iter().enumerate() {
+                alone.texts[side].extend(screen.0.iter().map(|t| t.text.clone()));
+                alone.press[side].extend(screen.1.iter().map(|t| t.text.clone()));
+            }
+            let (words, key) = describe_change(&before, &after, &alone);
+            let ctx = format!("seed {} round {}: {:?}", seed, round, words);
+            if !moved && add == 0 && dropped.is_none() && !button {
+                assert!(words.is_empty() && key.is_empty(), "{}", ctx);
+                continue;
+            }
+            assert!(!words.is_empty() && !key.is_empty(), "{}", ctx);
+            for i in 0..add { assert!(words.contains(&format!("\"added {}\"", i)), "{}", ctx); }
+            assert_eq!(words.contains("new text"), add > 0, "{}", ctx);
+            if let Some(name) = &dropped { assert!(words.contains(&format!("gone text \"{}\"", name)), "{}", ctx); }
+            else { assert!(!words.contains("gone text"), "{}", ctx); }
+            assert_eq!(words.contains("new to press \"new button\" 80x30 at 5,5"), button, "{}", ctx);
+            assert!(!words.contains("no longer to press") && !words.contains("restyled") && !words.contains("came into view") && !words.contains("went out"), "{}", ctx);
+            assert_eq!(words.contains(&way), moved, "{} wants {:?}", ctx, way);
+            // A new thing to press is in the words and not in the key; so is a text that is
+            // gone where the rest moved.
+            assert_eq!(key == "follows", add == 0 && (dropped.is_none() || moved), "{} key {:?}", ctx, key);
+
+            // The key leaves the distance out, so the same change at another window size has
+            // the same key.
+            let mut twice = before.clone();
+            for t in twice.0.iter_mut().chain(twice.1.iter_mut()) { t.x += dx * 2; t.y += dy * 2; }
+            twice.0.retain(|t| Some(&t.text) != dropped.as_ref());
+            twice.0.extend(after.0.iter().filter(|t| t.text.starts_with("added")).cloned());
+            if button { twice.1.push(Shown { x: 9, y: 9, w: 160, h: 60, color: "-".into(), text: "new button".into() }); }
+            assert_eq!(describe_change(&before, &twice, &alone).1, key, "{}", ctx);
+
+            // With every name on some other screen of both runs, nothing is new and nothing is
+            // gone: what was added came into view, what was dropped went out of it.
+            let mut elsewhere = Known::default();
+            for side in 0..2 {
+                elsewhere.texts[side].extend(before.0.iter().chain(after.0.iter()).map(|t| t.text.clone()));
+                elsewhere.press[side].extend(before.1.iter().chain(after.1.iter()).map(|t| t.text.clone()));
+            }
+            let (words, key) = describe_change(&before, &after, &elsewhere);
+            let ctx = format!("seed {} round {} elsewhere: {:?}", seed, round, words);
+            assert!(!words.contains("new text") && !words.contains("gone text") && !words.contains("to press"), "{}", ctx);
+            assert_eq!(words.contains(&format!("{} came into view", add)), add > 0, "{}", ctx);
+            assert_eq!(words.contains("1 went out of view"), dropped.is_some(), "{}", ctx);
+            assert_eq!(words.contains(&way), moved, "{}", ctx);
+            assert_eq!(key.as_str(), if words.is_empty() { "" } else { "follows" }, "{}", ctx);
+        }
     }
 
     #[test]

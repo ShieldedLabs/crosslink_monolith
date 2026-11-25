@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # The standalone GUI's build, scripted run, checks, benchmark and tests. GUI_DEV.md is the manual.
 #
-#   bash zebra-gui/gui.sh snap base                  Before editing: record every screen as it is.
 #   bash zebra-gui/gui.sh check                      After editing: build, run every script and random
-#                                                    input, and say what changed since `base`.
+#                                                    input, and say what changed on screen since `base`.
+#   bash zebra-gui/gui.sh snap base                  Record `base` by hand. Any command here records it
+#                                                    when the GUI has no uncommitted change.
 #   bash zebra-gui/gui.sh run <script|commands>      Run one script with no window; rebuilds if stale.
 #        [--scene default|empty] [--out <dir>]       Output goes to target/gui/run unless --out.
 #   bash zebra-gui/gui.sh snap <label>               Run every scripts/*.gui into target/gui/<label>.
@@ -88,23 +89,60 @@ snap() {
         echo "$log" > "$gui_out/$1/$name/log.txt"
         shots=$((shots + $(echo "$log" | grep -c '^shot ')))
     done
+    echo "$(head_now)$(gui_dirty && echo ' with uncommitted changes')" > "$gui_out/$1/head"
     echo "snap $1: $shots screenshots in $gui_out/$1, $failed scripts failed"
     [ $failed -eq 0 ]
 }
 
+head_now() { git -C "$root" rev-parse --short HEAD 2>/dev/null; }
+gui_dirty() { [ -n "$(git -C "$root" status --porcelain -- zebra-gui wallet clay-rs 2>/dev/null | head -1)" ]; }
+
+# With no uncommitted change to the GUI, the screens as they are now are what the next change
+# gets compared with, so `base` is recorded without being asked for.
+auto_base() {
+    gui_dirty && return 0
+    local h; h="$(head_now)"
+    [ -n "$h" ] || return 0
+    [ "$(cat "$gui_out/base/head" 2>/dev/null)" = "$h" ] && return 0
+    snap base > /dev/null && echo "base recorded at $h: the tree has no uncommitted GUI change"
+}
+
 # diff_snaps <label> <label>
 diff_snaps() {
-    local result=0 dir name log
-    for dir in "$gui_out/$2"/*/; do
-        name="$(basename "$dir")"
-        [ -f "$dir/shots.txt" ] || continue
-        if ! log="$("$exe" diff "$gui_out/$1/$name" "$gui_out/$2/$name" 2>&1)"; then
-            result=1
-            echo "$log" | sed "s|^|$name: |"
+    local log
+    if log="$("$exe" diff "$gui_out/$1" "$gui_out/$2" 2>&1)"; then
+        echo "no screen or lint finding differs between $1 and $2"
+    else
+        echo "$log"
+        return 1
+    fi
+}
+
+check_all() {
+    fresh || { echo "check: FAIL, it does not build"; return 1; }
+    auto_base
+    local bad="" log base_head
+    snap now || bad="$bad a script failed;"
+    if log="$(run_script default "$gui_out/now/monkey" "monkey ${1:-400}" 2>&1)"; then
+        echo "random input: no crash ($(echo "$log" | grep '^monkey seed' | cut -d' ' -f1-3))"
+    else
+        bad="$bad random input crashed or failed;"
+        echo "$log" | grep -vE '^(shot|lint:) ' | tail -12
+        echo "replay it with: bash zebra-gui/gui.sh run $gui_out/now/monkey/monkey.gui"
+    fi
+    if [ -d "$gui_out/base" ]; then
+        base_head="$(cat "$gui_out/base/head" 2>/dev/null)"
+        [ "${base_head%% *}" = "$(head_now)" ] || echo "note: base is from ${base_head:-an unknown commit} and HEAD is $(head_now), so what other commits changed is listed below as well"
+        if ! diff_snaps base now; then
+            echo "Read each image named above, one for each way the screens changed, and each line that says 'new'."
+            echo "Report: which changes you meant; for each new thing on screen the form and place you chose, and why (GUI_DESIGN.md); the one image a person should look at."
+            echo "This list is kept in $gui_out/check.txt."
         fi
-    done
-    [ $result -eq 0 ] && echo "no screen or lint finding differs between $1 and $2"
-    return $result
+    else
+        echo "No base to compare with: the tree already had uncommitted GUI changes when gui.sh first ran. 'gui.sh snap base' records one."
+    fi
+    if [ -n "$bad" ]; then echo "check: FAIL,$bad"; return 1; fi
+    echo "check: ok"
 }
 
 cmd=$1; shift
@@ -121,11 +159,13 @@ case "$cmd" in
         done
         [ $# -eq 1 ] || { echo "usage: gui.sh run [--scene default|empty] [--out <dir>] <script|commands>"; exit 2; }
         fresh || exit 1
+        auto_base
         run_script "$scene" "$out" "$1"
         ;;
     snap)
         [ $# -eq 1 ] || { echo "usage: gui.sh snap <label>"; exit 2; }
         fresh || exit 1
+        [ "$1" = base ] || auto_base
         snap "$1"
         ;;
     diff)
@@ -133,26 +173,13 @@ case "$cmd" in
         diff_snaps "$1" "$2"
         ;;
     check)
-        fresh || { echo "check: FAIL, it does not build"; exit 1; }
-        bad=""
-        snap now || bad="$bad a script failed;"
-        if log="$(run_script default "$gui_out/now/monkey" "monkey ${1:-400}" 2>&1)"; then
-            echo "random input: no crash ($(echo "$log" | grep '^monkey seed' | cut -d' ' -f1-3))"
-        else
-            bad="$bad random input crashed or failed;"
-            echo "$log" | grep -vE '^(shot|lint:) ' | tail -12
-            echo "replay it with: bash zebra-gui/gui.sh run $gui_out/now/monkey/monkey.gui"
-        fi
-        if [ -d "$gui_out/base" ]; then
-            diff_snaps base now || echo "Read each diff_*.png and each new lint finding above, and say which you meant to cause."
-        else
-            echo "No base to compare with. Run 'gui.sh snap base' before editing to see what an edit changes."
-        fi
-        if [ -n "$bad" ]; then echo "check: FAIL,$bad"; exit 1; fi
-        echo "check: ok"
+        mkdir -p "$gui_out"
+        check_all "$@" 2>&1 | tee "$gui_out/check.txt"
+        exit "${PIPESTATUS[0]}"
         ;;
     lint)
         fresh || exit 1
+        auto_base
         snap lint > /dev/null
         for f in "$gui_out"/lint/*/lint.txt; do
             [ -f "$f" ] || continue
@@ -197,7 +224,7 @@ case "$cmd" in
         fresh || exit 1
         "$exe" "$@"
         ;;
-    *) sed -n '2,19p' "$0"; exit 2 ;;
+    *) sed -n '2,20p' "$0"; exit 2 ;;
 esac
 exit $?
 }

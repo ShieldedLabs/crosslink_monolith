@@ -100,21 +100,29 @@ the manual: read it before the first GUI change of a session.
 Whoever adds a GUI feature is its designer, even when the request says only to
 implement it. Read `zebra-gui/GUI_DESIGN.md` first and decide what the person
 sees first, what their hand does, and what form each control's job calls for.
-The screens as they stand are not the standard to copy. Add a typeface, an
-icon, an image, an animation or a new kind of control when the design calls
-for one, and write it into that file's vocabulary. Say your design decisions
-in your report, with the one image a person should look at.
+The screens as they stand are not the standard to copy. A new button in a new
+row is the first idea and seldom the best: ask whether something already on
+screen can do the job, and what the change pushes out of place. Add a
+typeface, an icon, an image, an animation or a new kind of control when the
+design calls for one, and write it into that file's vocabulary.
+
+The report of a GUI change has a part headed `Design`: for each new thing on
+screen, the form and place you chose, one you turned down, and why; then the
+one image a person should look at.
 
 ```text
-bash zebra-gui/gui.sh snap base          Before the first edit: record every screen as it is.
+bash zebra-gui/gui.sh run 'shot before'  Before the first edit: look at the screen as it is.
+                                         With no uncommitted GUI change, any gui.sh command
+                                         also records every screen, to compare with later.
 bash zebra-gui/gui.sh check              After each edit: build, run every script and random
-                                         input, list what changed on screen since base.
+                                         input, say what changed on screen.
 bash zebra-gui/gui.sh run '<commands>'   Try one thing, e.g. 'click "Send"; shot send; lint send'
 ```
 
 - A GUI change is done only when `check` ends in `check: ok` and you have read
-  every `diff_*.png` and every `lint new:` line it printed. Say in your report
-  which of them you meant to cause.
+  every image it names and every line of it that says `new`. It names one
+  image for each way the screens changed, not one for each screenshot. Say in
+  your report which changes you meant to cause.
 - Look at the result yourself: read the PNG that `shot`, `lint` or `diff`
   names. Do not report a visual change you have not seen.
 - Judge a design with `squint` (what the eye lands on first), `targets` (what

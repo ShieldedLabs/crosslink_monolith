@@ -102,6 +102,8 @@ jobs look different. Consistency means the first; it never meant one shape for e
 - Before drawing a button, ask whether it should be one. The row itself can be pressed. The
   divider can be dragged. The value can be edited where it stands. A switch, a tab, a link
   and a key are all different things from a button.
+- A new row for a new control moves everything under it, on every screen. First look for a
+  place that costs nothing: on the thing the control acts on, or beside it.
 - A row of identical buttons has no rank. The person must read every label to find theirs.
 - What cannot be undone differs from the routine in shape, in place and in colour.
 - An icon stands alone only when everyone knows it. Otherwise it has a label.
