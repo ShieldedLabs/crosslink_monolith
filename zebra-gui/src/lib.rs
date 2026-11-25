@@ -2297,6 +2297,10 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                         }
 
                         if ui.debug {
+                            // The overlay bypasses the tiles, so the tiles under it are marked
+                            // stale in this buffer afterwards; else they keep its pixels for good.
+                            let mut overlay_x2 = 0usize;
+                            let mut overlay_y2 = 0usize;
                             *draw_ctx.draw_command_count = 0;
                             draw_ctx.text_line(FontKind::Mono, 8.0, 8.0, 13.0,
                                 &format!(
@@ -2341,6 +2345,8 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                                                 x1 = 0;
                                             }
                                             if x1 >= x2 { continue; }
+                                            overlay_x2 = overlay_x2.max(x2 as usize);
+                                            overlay_y2 = overlay_y2.max(y as usize + 1);
                                             let len = x2 - x1;
                                             debug_assert!(len != 0);
                                             for _ in 0..len {
@@ -2372,6 +2378,8 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                                 let full_color = if stat.full_time_us < target_frame_time_us { 0x1133ff } else { 0x991111 };
                                 for t in 0..thick {
                                     if y+t >= window_height { continue; }
+                                    overlay_x2 = overlay_x2.max(single_w + work_w + full_w);
+                                    overlay_y2 = overlay_y2.max(y + t + 1);
                                     let mut put_ptr = final_output_blit_buffer.byte_add((y+t)*fb_side*4) as *mut u32;
                                     for x in 0..single_w {
                                         *put_ptr = blend_u32(*put_ptr, single_color, 128);
@@ -2387,6 +2395,12 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                                     }
                                 }
                             }
+
+                            let tx2 = overlay_x2.div_ceil(RENDER_TILE_SIZE).min(tiles_wide);
+                            let ty2 = overlay_y2.div_ceil(RENDER_TILE_SIZE).min(tiles_wide);
+                            for ty in 0..ty2 {
+                                for tx in 0..tx2 { saved_tile_hashes[ty*tiles_wide + tx] = 0; }
+                            }
                         }
 
                         if prev_frame_time_total_us_max_5_seconds_last_reset.elapsed().as_secs() >= 5 {
@@ -2401,7 +2415,9 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
 
                         let need_buffer_flip = script::pace_frame(frame_pace_us) || need_buffer_flip || ui.debug;
                         if need_buffer_flip {
-                            shown_frame_hash = frame_hash;
+                            // A frame with the overlay on it matches no frame without, so turning
+                            // the overlay off still submits.
+                            shown_frame_hash = if ui.debug { 0 } else { frame_hash };
                             gui.submit();   // one present per vblank; this is what paces the next RENDER
                         }
 
