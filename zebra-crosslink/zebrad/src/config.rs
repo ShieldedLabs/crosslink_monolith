@@ -254,18 +254,7 @@ impl ZebradConfig {
             // .push("crosslink_nightly_20261102"); // @Nightly
             .push("crosslink_featurenet_20260929_staking3d"); // @Featurenet
 
-        // Merge user-led slashforks with the ones shipped in the executable, validate
-        // them, and store the canonical (sorted, deduplicated) list back. Building
-        // the schedule panics on conflicting/interleaving rules, so a bad config is
-        // rejected at load time. `disable_shipped_slashforks` skips the built-in rules
-        // so a testnet operator can specify the whole schedule manually.
-        let user_slashforks = config.crosslink.slashforks.clone();
-        let schedule = if config.crosslink.disable_shipped_slashforks {
-            zebra_chain::parameters::SlashForkSchedule::new_without_shipped(user_slashforks)
-        } else {
-            zebra_chain::parameters::SlashForkSchedule::new(user_slashforks)
-        };
-        config.crosslink.slashforks = schedule.rules().to_vec();
+        config.resolve_slashforks();
 
         // Install the debug clock before anything reads it. Every command loads its
         // config through here, so this is the one place it can be done once.
@@ -282,6 +271,28 @@ impl ZebradConfig {
 
         // if let zcash_protocol::consensus::Network::TestNetwork(_) = config.network.network
         Ok(config)
+    }
+
+    /// Merges the configured slashforks with the ones shipped in the executable, validates
+    /// them, and stores the canonical (sorted, deduplicated) list back, as well as the
+    /// schedule in `state`, which every command that opens the state or runs BFT reads.
+    /// This is the one place the schedule is built, so the state service, BFT, `export-chain`
+    /// and `fixup-db-stake` cannot apply different rules.
+    ///
+    /// Building the schedule panics on conflicting/interleaving rules, so a bad config is
+    /// rejected at load time. `disable_shipped_slashforks` skips the built-in rules so a
+    /// testnet operator can specify the whole schedule manually.
+    pub fn resolve_slashforks(&mut self) {
+        use zebra_chain::parameters::SlashForkSchedule;
+
+        let user_slashforks = self.crosslink.slashforks.clone();
+        let schedule = if self.crosslink.disable_shipped_slashforks {
+            SlashForkSchedule::new_without_shipped(user_slashforks)
+        } else {
+            SlashForkSchedule::new(user_slashforks)
+        };
+        self.crosslink.slashforks = schedule.rules().to_vec();
+        self.state.slashfork_schedule = std::sync::Arc::new(schedule);
     }
 
     /// Config used by the crosslink testnet: known peers, a local RPC, and the internal miner on.

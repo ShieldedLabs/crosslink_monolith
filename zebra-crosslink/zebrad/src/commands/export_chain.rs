@@ -1,11 +1,11 @@
 //! `export-chain` subcommand - writes the chain on disk, from genesis to a height, to a chain
 //! prefix file that `import-chain` loads into a fresh state (#241).
 
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
 use abscissa_core::{Application, Command, Runnable};
 use clap::Parser;
-use zebra_chain::{block::Height, parameters::SlashForkSchedule};
+use zebra_chain::block::Height;
 use zebra_state::BftCutoff;
 
 use crate::prelude::APPLICATION;
@@ -72,10 +72,8 @@ impl ExportChainCmd {
         if let Some(cache_dir) = self.cache_dir.clone() {
             state_config.cache_dir = cache_dir;
         }
-        // As `start` builds it: restoring the blocks above `fin` validates them against it.
-        state_config.slashfork_schedule = Arc::new(SlashForkSchedule::from_canonical(
-            config.crosslink.slashforks.clone(),
-        ));
+        // `state_config` carries the slashfork schedule `start` runs with: restoring the blocks
+        // above `fin` validates them against it.
         // Read the backup of the blocks above `fin`, but leave its directory as it is.
         state_config.debug_skip_non_finalized_state_backup_task = true;
 

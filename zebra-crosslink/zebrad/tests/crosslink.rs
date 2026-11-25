@@ -78,6 +78,8 @@ pub fn test_start() {
                 base.state.network_checkpoint = file.state.network_checkpoint;
                 base.crosslink.explicit_bft_key_seed = file.crosslink.explicit_bft_key_seed;
             }
+            // As ZebradConfig::load does, which this config skips.
+            base.resolve_slashforks();
             // A finalizer identity the test knows, so a scenario can bond to the node and the BFT
             // instructions can find it on the roster.
             if base.crosslink.explicit_bft_key_seed.is_none() {
