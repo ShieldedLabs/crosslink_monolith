@@ -180,7 +180,9 @@ The vocabulary today:
 | | In `assets/`, unused: Source Serif 4, Gohu 11 and 14, Tiny5, 3x3 Mono, Public Pixel | None yet. |
 | Colour | `src/style.rs`: red, green, blue, gold, each with a dark | Loss, gain, action, reward. |
 | | Greys, as literals in `ui.rs` | Surfaces and text. Not yet named. |
-| Text size | 12 sizes on the main screen, as literals | Too many. Aim for five or six with clear jumps. |
+| Text size | `TEXT_SMALL` 12, `TEXT_BODY` 14, `TEXT_HEADING` 18, `TEXT_HERO` 36, in `style.rs` | What is read second; body, buttons and list titles; a dialog's title; the balance. The block map's own labels (10 px on the height strips, the zoom-scaled block text) are drawn apart from these. |
+| Control size | `BUTTON_H` 32, `ACTION_D` 40, `TAB_H`, `HISTORY_ROW_H` 64, `ROSTER_ROW_H` 36, `SCROLLBAR_W` | A labelled button; a round action under the balance; a list row. |
+| Pane width | `LEFT_PANE_W` 400, `RIGHT_PANE_W` 380, each with a `_MIN`, and `CENTRE_MIN_W` | Each side pane is as wide as its content needs; the block map takes what is left and gives up room first. |
 | Spacing, corner radius, timing | Literals in `ui.rs` | Not yet named. |
 
 Names live in `src/style.rs`. When you work on a screen, move the sizes, spaces, radii and

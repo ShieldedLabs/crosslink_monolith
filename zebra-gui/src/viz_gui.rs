@@ -1365,11 +1365,11 @@ fn minimap_screen_rect(draw_ctx: &DrawCtx, ui: &ui::Context, lane: MinimapLane) 
     let strip = 46.0 * ds;
     let (x0, x1) = match lane {
         MinimapLane::Pow => {
-            let x0 = w * ui.left_pane_width + gx;
+            let x0 = ui.left_pane_px + gx;
             (x0, x0 + strip)
         }
         MinimapLane::Pos => {
-            let x1 = w * (1.0 - ui.right_pane_width) - gx;
+            let x1 = w - ui.right_pane_px - gx;
             (x1 - strip, x1)
         }
     };
@@ -1497,11 +1497,11 @@ fn draw_chain_minimap_overlay(
     let track_l = mx0 + 3.5 * ds;
     let track_r = mx1 - 2.0 * ds;
     let xc = (track_l + track_r) * 0.5;
-    let title_h = (11.0 * ds).max(9.0);
-    let tick_h = (9.0 * ds).max(7.0);
+    let title_h = (12.0 * ds).max(9.0);
+    let tick_h = (10.0 * ds).ceil();
     let outer_pad = 4.0 * ds;
     let title_band = title_h + 6.0 * ds;
-    let legend_h = tick_h + 4.0 * ds;
+    let legend_h = 2.0 * tick_h + 6.0 * ds;
     let ox0 = mx0 - outer_pad;
     let oy0 = my0 - outer_pad - title_band;
     let ox1 = mx1 + outer_pad;
@@ -1592,7 +1592,7 @@ fn draw_chain_minimap_overlay(
     let label_x = (track_r - 3.0 * ds - max_lab_w).max(track_l + 6.0 * ds);
     let y_top_lab = chain_minimap_h_to_y(h_max, h_min, h_max, my0, my1) - tick_h * 0.35;
     let y_mid_lab = chain_minimap_h_to_y(h_mid, h_min, h_max, my0, my1) - tick_h * 0.35;
-    let y_bot_lab = chain_minimap_h_to_y(h_min, h_min, h_max, my0, my1) - tick_h * 0.35;
+    let y_bot_lab = chain_minimap_h_to_y(h_min, h_min, h_max, my0, my1) - tick_h;
     draw_ctx.text_line(FontKind::Mono, label_x, y_top_lab, tick_h, &s_top, label_mute);
     draw_ctx.text_line(FontKind::Mono, label_x, y_mid_lab, tick_h, &s_mid, label_mute);
     draw_ctx.text_line(FontKind::Mono, label_x, y_bot_lab, tick_h, &s_bot, label_mute);
@@ -1602,10 +1602,10 @@ fn draw_chain_minimap_overlay(
     let dot = 4.0 * ds;
     let leg_y = my1 + 5.0 * ds;
     draw_ctx.rectangle(mx0, leg_y, mx0 + dot, leg_y + dot, tick_final);
-    draw_ctx.text_line(FontKind::Mono, mx0 + dot + 5.0 * ds, leg_y - 1.0 * ds, tick_h * 0.88, "finalized", label_mute);
-    let lx2 = mx0 + 56.0 * ds;
-    draw_ctx.rectangle(lx2, leg_y, lx2 + dot, leg_y + dot, tick_open);
-    draw_ctx.text_line(FontKind::Mono, lx2 + dot + 5.0 * ds, leg_y - 1.0 * ds, tick_h * 0.88, "open", label_mute);
+    draw_ctx.text_line(FontKind::Mono, mx0 + dot + 4.0 * ds, leg_y - 2.0 * ds, tick_h, "final", label_mute);
+    let ly2 = leg_y + tick_h + 3.0 * ds;
+    draw_ctx.rectangle(mx0, ly2, mx0 + dot, ly2 + dot, tick_open);
+    draw_ctx.text_line(FontKind::Mono, mx0 + dot + 4.0 * ds, ly2 - 2.0 * ds, tick_h, "open", label_mute);
 }
 
 fn draw_pos_minimap_overlay(
@@ -1628,11 +1628,11 @@ fn draw_pos_minimap_overlay(
     let track_l = mx0 + 3.5 * ds;
     let track_r = mx1 - 2.0 * ds;
     let xc = (track_l + track_r) * 0.5;
-    let title_h = (11.0 * ds).max(9.0);
-    let tick_h = (9.0 * ds).max(7.0);
+    let title_h = (12.0 * ds).max(9.0);
+    let tick_h = (10.0 * ds).ceil();
     let outer_pad = 4.0 * ds;
     let title_band = title_h + 6.0 * ds;
-    let legend_h = tick_h + 4.0 * ds;
+    let legend_h = 2.0 * tick_h + 6.0 * ds;
     let ox0 = mx0 - outer_pad;
     let oy0 = my0 - outer_pad - title_band;
     let ox1 = mx1 + outer_pad;
@@ -1711,7 +1711,7 @@ fn draw_pos_minimap_overlay(
     let label_x = (track_r - 3.0 * ds - max_lab_w).max(track_l + 6.0 * ds);
     let y_top_lab = chain_minimap_h_to_y(h_max, h_min, h_max, my0, my1) - tick_h * 0.35;
     let y_mid_lab = chain_minimap_h_to_y(h_mid, h_min, h_max, my0, my1) - tick_h * 0.35;
-    let y_bot_lab = chain_minimap_h_to_y(h_min, h_min, h_max, my0, my1) - tick_h * 0.35;
+    let y_bot_lab = chain_minimap_h_to_y(h_min, h_min, h_max, my0, my1) - tick_h;
     draw_ctx.text_line(FontKind::Mono, label_x, y_top_lab, tick_h, &s_top, label_mute);
     draw_ctx.text_line(FontKind::Mono, label_x, y_mid_lab, tick_h, &s_mid, label_mute);
     draw_ctx.text_line(FontKind::Mono, label_x, y_bot_lab, tick_h, &s_bot, label_mute);
@@ -1721,7 +1721,7 @@ fn draw_pos_minimap_overlay(
     let dot = 4.0 * ds;
     let leg_y = my1 + 5.0 * ds;
     draw_ctx.rectangle(mx0, leg_y, mx0 + dot, leg_y + dot, tick_col);
-    draw_ctx.text_line(FontKind::Mono, mx0 + dot + 5.0 * ds, leg_y - 1.0 * ds, tick_h * 0.88, "bft blocks", label_mute);
+    draw_ctx.text_line(FontKind::Mono, mx0 + dot + 4.0 * ds, leg_y - 2.0 * ds, tick_h, "BFT", label_mute);
 }
 
 pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui: &mut ui::Context, draw_ctx: &mut DrawCtx, dt: f32, input_ctx: &InputCtx) {
@@ -1885,7 +1885,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             let mut bft_keys = viz_state.on_screen_bfts.keys();
             let bft_x = viz_state.on_screen_bfts.get(bft_keys.nth(0).unwrap_or(&Hash32::from_u64(0))).unwrap_or(&OnScreenBft::default()).x;
 
-            let right_margin = draw_ctx.window_width as f32 - (draw_ctx.window_width as f32 * PANE_PERCENT_RIGHT);
+            let right_margin = draw_ctx.window_width as f32 - ui.right_pane_px;
 
             // window
             draw_ctx.rectangle_r(0.0, origin_y + y1, draw_ctx.window_width as f32, origin_y + y2, 1, 0x06ffffff);
@@ -2371,7 +2371,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
 
     let ww = draw_ctx.window_width as f32;
     let in_center_column =
-        mx_scr >= ww * PANE_PERCENT_LEFT && mx_scr <= ww * (1.0 - PANE_PERCENT_RIGHT);
+        mx_scr >= ui.left_pane_px && mx_scr <= ww - ui.right_pane_px;
     let wheelish =
         input_ctx.scroll_delta != (0.0, 0.0) || input_ctx.zoom_delta != 0.0;
     ui.suppress_scroll_for_clay = ((inside_any_minimap && wheelish) || minimap_wheel_scrubbed)

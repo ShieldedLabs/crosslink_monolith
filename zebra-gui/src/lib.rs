@@ -1185,7 +1185,10 @@ pub fn open_window() -> Option<Window> {
         let t = WINDOW_TITLE.lock().unwrap();
         if t.is_empty() { "Zcash Crosslink Visualizer".to_string() } else { t.clone() }
     };
-    softer_gui::open(&title, "org.zfnd.crosslink_visualizer", 1600, 900).map(Window::Os)
+    // The smallest window the screens hold whole in, which fits on a 1280x720 display with a
+    // title bar and a task bar; a 1600x900 window would run off one. softer_gui cannot yet
+    // ask the display's size or open maximized, so a larger display starts small too.
+    softer_gui::open(&title, "org.zfnd.crosslink_visualizer", 1280, 640).map(Window::Os)
 }
 
 pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::WalletState>>, fake_data: bool, should_stop: impl Fn() -> bool) {
@@ -1595,7 +1598,9 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                         ui.draw  = &draw_ctx;
                         ui.dpi_scale = dpi_scale as f32;
                         ui.delta = dt as f32;
-                        
+                        ui.scale = ui.zoom * ui.dpi_scale;
+                        ui::resolve_pane_widths(&mut ui);
+
                         // NOTE(Giovanni): Timer thingy //
                         //{
                         //    let timer = Timer::scope_("viz_gui_draw_the_stuff_for_the_things", true);

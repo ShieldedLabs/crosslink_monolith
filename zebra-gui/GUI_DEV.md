@@ -263,7 +263,7 @@ The tools find what is broken. These they cannot find; check them by reading you
 | `src/lib.rs` | 2,800 | The frame loop, input, the rasteriser and its worker threads. |
 | `src/viz_gui.rs` | 2,450 | The block map, and the messages to and from the node. |
 | `src/script.rs` | 2,500 | The scripted window, lint, design, motion and resize checks, PNG, crash reports. |
-| `src/style.rs` | 25 | Named colours. Named sizes, spaces and times belong here too. |
+| `src/style.rs` | 70 | Named colours, text sizes, control sizes and pane widths. Spaces and times belong here too. |
 | `src/main.rs` | 140 | The standalone program and its mock wallet data. |
 | `scripts/tour.gui` | | Every screen and dialog, at `mainline`. |
 | `scripts/minspec.gui` | | The same tour at `minspec`. |
@@ -283,28 +283,18 @@ through the messages in `viz_gui.rs`.
 
 Found with these tools and not yet fixed. Each is a good first task.
 
-- **The main screen does not hold at `minspec`.** It holds from `mainline` down to about
-  1,500 px wide and 820 px high. Narrower, amounts in the history lie on top of their fee
-  labels (`resize narrower`). Shorter, the block map's two buttons, the faucet's Receive
-  button and the end of the history list lie past the window's bottom (`outside`, `resize
-  shorter`). At `minspec` the finalizer identity is also cut off at both sides. Both panes
-  take a share of the window's width whatever is in them.
-- **The Send and Stake dialogs are taller than the `minspec` window.** Their last buttons
-  lie past its bottom (`outside`, `scripts/minspec.gui`), and the Stake dialog's warning
-  lies under its first button.
-- **A pane can be dragged narrower than what is in it, or wider than the window has room
-  for.** At `minspec`, narrowing the left pane cuts off or crowds 56 texts, the balance
-  among them, and widening the right pane pushes its second tab past the window's right
-  side (`drag`).
-- **Pressing a pane's divider moves it 11 px** before the pointer moves: the pane's width is
-  taken from the pointer and not from how far it has gone.
-- **The layout reaches a dragged divider a frame late** (`trail`).
+- **Nothing stops the window shrinking below `minspec`.** softer_gui has no least window
+  size; below it the block map gives up its room first and then the panes clip.
+- **Block-map text shows in the gap under the left pane** at 1280x1000 and narrower
+  (`outside` in `resize narrower`). The block map pans, so it is not lost, but text of a
+  block hidden behind a pane should not show at all.
+- **Controls at the side panes' outer edges stop 12 px short of the window's sides**
+  (`edge`): the panes' margin. Reaching the side needs their hit areas to run past the pane.
+- **A dropped transaction's row is drawn at 2.3:1** against its background (`contrast`), on
+  purpose to show it is gone; a clearer form would pass the lint.
 - **The block inspector's resize handle resizes nothing.** A drag on it pans the block map
   behind it.
 - **Buttons disagree about the pointer.** 14 call sites of `button_ex` ask for the hand
   pointer; every plain `Context::button` asks for none. Pick one rule.
-- **Finalizer keys are cut off** in the Finalizers panel (`clipped`, 7 lines).
 - **Two block hash labels are drawn on top of each other** in the block map (`overlap`).
-- **Inactive tabs are faint**: 2.7:1 against their background (`contrast`).
-- **Labels of 7 to 9 px** on the staking bars (`tiny`).
 - 321 of 9,700 lines of code are a second copy of another run of 8 or more lines (`dup`).
