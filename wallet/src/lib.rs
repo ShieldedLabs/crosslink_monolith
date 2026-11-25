@@ -3190,7 +3190,7 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
 
 
 fn t_addr_belongs_to_ufvk_index(ufvk: &UnifiedFullViewingKey, index: u32, t_addr: TransparentAddress) -> bool {
-    if let Some((p2pkh, p2sh, _ua)) = addrs_from_ufvk(ufvk, 0) {
+    if let Some((p2pkh, p2sh, _ua)) = addrs_from_ufvk(ufvk, index) {
         t_addr == p2pkh || t_addr == p2sh
     } else {
         println!("Couldn't determine account t-addresses");
