@@ -32,7 +32,8 @@ differs: sizes/800x600: new text "Hide"; new to press "Hide" 111x32 at 49,228; 1
     the same cause changed sizes/1024x600, tour/main, tour/faucet_wallet and 9 more
 differs: tour/modal_send: 2 texts moved 56 px up; 2 came into view; 6847 px in x 12..421 y 298..876 -> .../now/tour/diff_modal_send.png
 14 of 19 screenshots differ, in 2 ways
-lint new: tour/main  margin  Hide  67,270  2 px from the side of the box behind it
+lint new: sizes/800x600  margin  Hide  67,270  2 px from the side of the box behind it
+    the same fault 12 more times, on 12 more screenshots
 style new: text size 13 px (first in tour/main, used 1 times)
 check: ok
 ```
@@ -48,7 +49,8 @@ change looks right. Read the report:
   the least room: the changed region before, after, and with the changed pixels marked. Read
   each one. The other screenshots' images lie beside it as `diff_<name>.png`.
 - **`lint new`** and **`style new`** are findings and values no screenshot had before. Each
-  is yours to fix or to mean.
+  is yours to fix or to mean. A fault that shows on many screenshots has one line, so there
+  are few: skip none.
 - A line that says `no text and nothing to press changed` is a change of drawing only: a
   colour, a shape, a size. A film has no record of its texts, and says so.
 

@@ -1516,6 +1516,18 @@ fn pair_up(a: &[Shown], b: &[Shown]) -> (Vec<(Shown, Shown)>, Vec<Shown>, Vec<Sh
 
 fn quoted(s: &str) -> String { format!("\"{}\"", short(s)) }
 
+/// What makes two lint findings the same fault: their kind, and their message with each
+/// number in it taken out, since the number differs with the window's size and scale.
+fn lint_fault(f: &[String]) -> String {
+    let mut out = format!("{} ", f.get(1).map(|k| k.as_str()).unwrap_or(""));
+    let mut in_number = false;
+    for c in f.get(4).map(|m| m.as_str()).unwrap_or("").chars() {
+        if !c.is_ascii_digit() { out.push(c); } else if !in_number { out.push('N'); }
+        in_number = c.is_ascii_digit();
+    }
+    out
+}
+
 /// Every text, and every name of a thing to press, on any screenshot of the first run and of
 /// the second.
 #[derive(Default)]
@@ -1751,15 +1763,40 @@ pub fn diff_dirs(dir_a: &Path, dir_b: &Path) -> usize {
     // sits and by how much it is off can move without it being news. On a screenshot the first
     // run did not take, a finding is news only if no screenshot of the first run had its like.
     let alike = |f: &[String], g: &[String], from: usize| f.len() >= 3 && g.len() >= 3 && f[from..3] == g[from..3];
-    let mut new: Vec<String> = Vec::new();
+    let mut new: Vec<&Vec<String>> = Vec::new();
     for f in &b.lint {
         let from = if new_shots.contains(&f[0]) { 1 } else { 0 };
-        if !a.lint.iter().any(|g| alike(f, g, from)) { new.push(f.join("  ")); }
+        if !a.lint.iter().any(|g| alike(f, g, from)) { new.push(f); }
     }
     let gone = a.lint.iter().filter(|g| !b.lint.iter().any(|f| alike(f, g, 0))).count();
-    for l in new.iter().take(30) { println!("lint new: {}", l); }
-    if new.len() > 30 { println!("lint new: ... and {} more", new.len() - 30); }
-    if !new.is_empty() || gone != 0 { println!("lint: {} new findings, {} gone, {} in all", new.len(), gone, b.lint.len()); }
+    // One fault shows on every screenshot that has its screen, at every scale, so the findings
+    // are listed by fault: those of one kind whose messages differ only in their numbers.
+    let mut faults: Vec<(String, Vec<&Vec<String>>)> = Vec::new();
+    for f in &new {
+        let key = lint_fault(f);
+        match faults.iter_mut().find(|g| g.0 == key) {
+            Some(g) => g.1.push(f),
+            None => faults.push((key, vec![f])),
+        }
+    }
+    for (_, found) in faults.iter().take(30) {
+        println!("lint new: {}", found[0].join("  "));
+        if found.len() == 1 { continue; }
+        let (mut texts, mut shots): (Vec<String>, Vec<&String>) = (Vec::new(), Vec::new());
+        for f in &found[1..] {
+            if f[0] != found[0][0] && !shots.contains(&&f[0]) { shots.push(&f[0]); }
+            let Some(text) = f.get(2) else { continue };
+            let q = quoted(text);
+            if found[0].get(2) != Some(text) && !texts.contains(&q) { texts.push(q); }
+        }
+        let also = if texts.is_empty() { String::new() } else {
+            let rest = if texts.len() > 5 { format!(" and {} more", texts.len() - 5) } else { String::new() };
+            format!(", also on {}{}", texts.iter().take(5).cloned().collect::<Vec<_>>().join(", "), rest)
+        };
+        println!("    the same fault {} more times, on {} more screenshots{}", found.len() - 1, shots.len(), also);
+    }
+    if faults.len() > 30 { println!("lint new: ... and {} more faults", faults.len() - 30); }
+    if !new.is_empty() || gone != 0 { println!("lint: {} new findings of {} faults, {} gone, {} in all", new.len(), faults.len(), gone, b.lint.len()); }
     for shot in &new_shots {
         let of = b.lint.iter().filter(|f| &f[0] == shot).count();
         if of > 0 { println!("lint: {} is a new screenshot with {} findings; listed are those no screenshot had before", shot, of); }
