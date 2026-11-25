@@ -16,6 +16,10 @@ workspace.
 - `TxId::from_hex`, parsing the canonical (byte-reversed) hexadecimal display
   form produced by `TxId`'s `Display` impl.
 
+### Changed
+- `zcash_protocol::consensus::COINBASE_MATURITY_BLOCKS` is now 2 (was 100), the
+  value Crosslink enforces on every network.
+
 ## [0.10.4] - 2026-08-03
 
 ### Added
