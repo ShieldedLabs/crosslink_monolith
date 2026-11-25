@@ -38,6 +38,32 @@ struct LoggedRect {
     b: [i32; 4],
     color: u32,
     at: usize,
+    radius: u32,
+}
+
+/// Something the last frame let the pointer press: its box, and what its widget said of it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LoggedTarget {
+    pub b: [i32; 4],
+    pub enabled: bool,
+    /// Whether the widget asks for the hand pointer while the pointer is on it.
+    pub pointer: bool,
+}
+
+/// A text a person can see, with its whole box and the part of it inside its clip.
+struct Seen<'a> { t: &'a LoggedText, full: [i32; 4], vis: [i32; 4] }
+
+/// `targets` in progress: the pointer visits each target in turn to see how it answers.
+struct Sweep {
+    list: Vec<LoggedTarget>,
+    i: usize,
+    /// Whether the frames just drawn had the pointer on the target, or parked off every target.
+    on: bool,
+    rest: (i32, i32),
+    home: (i32, i32),
+    before: Vec<u32>,
+    rows: Vec<String>,
+    quiet: usize,
 }
 
 pub struct FrameReport {
@@ -113,6 +139,9 @@ pub struct ScriptWindow {
     bench: Option<Bench>,
     watch: Option<Watch>,
     lint_lines: Vec<String>,
+    targets: Vec<LoggedTarget>,
+    style_lines: Vec<String>,
+    sweep: Option<Sweep>,
 }
 
 fn fail(msg: &str) {
@@ -198,6 +227,9 @@ impl ScriptWindow {
             bench: None,
             watch: None,
             lint_lines: Vec::new(),
+            targets: Vec::new(),
+            style_lines: Vec::new(),
+            sweep: None,
         };
         w.resize(1600, 900);
         report_crashes();
@@ -221,9 +253,11 @@ impl ScriptWindow {
     }
 
     /// The frame loop calls this once per drawn frame, handing over the text that frame drew.
-    pub(crate) fn frame_done(&mut self, texts: &mut Vec<LoggedText>, commands: &[crate::DrawCommand], report: FrameReport) {
+    pub(crate) fn frame_done(&mut self, texts: &mut Vec<LoggedText>, commands: &[crate::DrawCommand], targets: &[LoggedTarget], report: FrameReport) {
         std::mem::swap(&mut self.texts, texts);
         texts.clear();
+        self.targets.clear();
+        self.targets.extend_from_slice(targets);
         let window = [0, 0, self.width as i32, self.height as i32];
         let mut clip = window;
         self.rects.clear();
@@ -235,11 +269,12 @@ impl ScriptWindow {
                     clip = cut([*x1 as i32, *y1 as i32, *x2 as i32, *y2 as i32], window);
                     self.clips.push((at, clip));
                 }
-                crate::DrawCommand::RoundedRectangle { x, x2, y, y2, color, .. } => {
+                crate::DrawCommand::RoundedRectangle { x, x2, y, y2, color, radius_tl, radius_tr, radius_bl, radius_br } => {
                     let b = cut([*x as i32, *y as i32, *x2 as i32, *y2 as i32], clip);
-                    if area(b) > 0 { self.rects.push(LoggedRect { b, color: *color, at }); }
+                    let radius = (*radius_tl).max(*radius_tr).max(*radius_bl).max(*radius_br).max(0) as u32;
+                    if area(b) > 0 { self.rects.push(LoggedRect { b, color: *color, at, radius }); }
                 }
-                crate::DrawCommand::ClearScreenToColor { color } => self.rects.push(LoggedRect { b: window, color: *color, at }),
+                crate::DrawCommand::ClearScreenToColor { color } => self.rects.push(LoggedRect { b: window, color: *color, at, radius: 0 }),
                 _ => {}
             }
         }
@@ -261,6 +296,11 @@ impl ScriptWindow {
                     text.push('\n');
                     self.write_file("lint.txt", text.as_bytes());
                     println!("lint: {} findings -> {}", self.lint_lines.len(), self.out_dir.join("lint.txt").display());
+                }
+                if !self.style_lines.is_empty() {
+                    let mut text = self.style_lines.join("\n");
+                    text.push('\n');
+                    self.write_file("style.txt", text.as_bytes());
                 }
                 self.closed = true;
                 self.events.push_back(Event { kind: EVENT_CLOSE, ..Event::default() });
@@ -465,6 +505,88 @@ impl ScriptWindow {
                 self.keep_shot(&name, &rgb, w, h);
                 let found = self.lint();
                 self.keep_lint(&name, &found);
+                for (kind, value, uses) in self.style() { self.style_lines.push(format!("{}\t{}\t{}\t{}", name, kind, value, uses)); }
+            }
+            "style" => {
+                if !self.need_fresh() { return false; }
+                let all = self.style();
+                for kind in ["text size", "text colour", "fill", "corner radius"] {
+                    let of: Vec<String> = all.iter().filter(|s| s.0 == kind).map(|s| format!("{} x{}", s.1, s.2)).collect();
+                    let more = if of.len() > 16 { format!(" ... and {} more", of.len() - 16) } else { String::new() };
+                    println!("style {} ({} values): {}{}", kind, of.len(), of.iter().take(16).cloned().collect::<Vec<_>>().join(", "), more);
+                }
+            }
+            "squint" => {
+                if !self.need_fresh() { return false; }
+                let name = args.first().cloned().unwrap_or_else(|| format!("frame{}", self.frame_count));
+                let f = self.width.div_ceil(400).max(1);
+                let (rgb, w, h) = self.small([0, 0, self.width, self.height], f);
+                let file = format!("squint_{}.png", name);
+                self.write_file(&file, &png_encode(&rgb, w, h));
+                // What pulls the eye first is big text that stands out from what is behind it.
+                // Past 7:1 more contrast adds little.
+                let seen = self.shown_texts();
+                let mut pull: Vec<(f64, f64, &LoggedText)> = seen.iter().filter_map(|s| {
+                    let ink = s.t.color & 0xffffff;
+                    let ratio = contrast(ink, self.background(s.vis, ink)?);
+                    Some((s.t.h as f64 * ratio.min(7.0), ratio, s.t))
+                }).collect();
+                pull.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                for (i, (_, ratio, t)) in pull.iter().take(8).enumerate() {
+                    println!("squint {}. {:>3} px {:>4.1}:1 at {:>5},{:<5} {:?}", i + 1, t.h, ratio, t.x, t.y, short(&t.text));
+                }
+                println!("squint {}: the screen at 1/{} size is {}. Listed is the text that pulls the eye first, by height and contrast: it should be what matters most here, in that order.",
+                    name, f, self.out_dir.join(&file).display());
+            }
+            "targets" => {
+                let window = [0, 0, self.width as i32, self.height as i32];
+                if self.sweep.is_none() {
+                    if !self.need_fresh() { return false; }
+                    let mut list = self.shown_targets();
+                    list.truncate(120);
+                    // Somewhere to park the pointer that is on no target.
+                    let mut rest = (0, 0);
+                    'find: for y in (4..self.height as i32).step_by(16) {
+                        for x in (4..self.width as i32).step_by(16) {
+                            if !self.targets.iter().any(|t| holds(t.b, [x, y])) { rest = (x, y); break 'find; }
+                        }
+                    }
+                    self.sweep = Some(Sweep { list, i: 0, on: false, rest, home: self.mouse, before: Vec::new(), rows: Vec::new(), quiet: 0 });
+                    self.push_move(rest.0, rest.1);
+                    for _ in 0..3 { self.push_render(); }
+                    return false;
+                }
+                let mut s = self.sweep.take().unwrap();
+                if s.i < s.list.len() {
+                    let t = s.list[s.i].clone();
+                    let b = cut(t.b, window);
+                    let mut now: Vec<u32> = Vec::new();
+                    for y in b[1]..b[3] {
+                        let row = y as usize * self.side;
+                        now.extend(self.pixels[row + b[0] as usize..row + b[2] as usize].iter().map(|p| p & 0xffffff));
+                    }
+                    if !s.on {
+                        s.before = now;
+                        self.push_move((b[0] + b[2]) / 2, (b[1] + b[3]) / 2);
+                    } else {
+                        let changed = now.iter().zip(&s.before).filter(|(a, b)| a != b).count();
+                        if changed == 0 { s.quiet += 1; }
+                        s.rows.push(format!("{:>5},{:<5} {:>4}x{:<4} cursor {:<10} hover changes {:>6} px{}  {:?}", t.b[0], t.b[1], t.b[2] - t.b[0], t.b[3] - t.b[1],
+                            format!("{:?}", self.report.cursor).to_lowercase(), changed, if t.enabled { "" } else { " (disabled)" }, short(&self.label_of(t.b))));
+                        self.push_move(s.rest.0, s.rest.1);
+                        s.i += 1;
+                    }
+                    s.on = !s.on;
+                    for _ in 0..3 { self.push_render(); }
+                    self.renders_without_frame = 0;
+                    self.sweep = Some(s);
+                    return false;
+                }
+                for row in &s.rows { println!("target {}", row); }
+                println!("targets: {} on screen; {} show nothing when the pointer is on them", s.list.len(), s.quiet);
+                self.push_move(s.home.0, s.home.1);
+                self.push_render();
+                self.fresh = false;
             }
             "lint" => {
                 if !self.need_fresh() { return false; }
@@ -716,22 +838,76 @@ impl ScriptWindow {
         best.1
     }
 
-    /// Faults a person sees at a glance and a test of behaviour does not: text cut off, text on
-    /// top of text, text crowding or leaving the box behind it, text too faint or too small.
-    /// Text that something drawn later hides, a dialog over the page for one, is left out.
-    fn lint(&self) -> Vec<Finding> {
-        struct Seen<'a> { t: &'a LoggedText, full: [i32; 4], vis: [i32; 4] }
-        let mut seen: Vec<Seen> = Vec::new();
+    /// The clip in force when the frame issued its draw command number `at`: a clip change at
+    /// command k governs what is drawn after it.
+    fn clip_at(&self, at: usize) -> [i32; 4] {
+        if self.clips.is_empty() { return [0, 0, self.width as i32, self.height as i32]; }
+        self.clips[self.clips.partition_point(|c| c.0 < at).max(1) - 1].1
+    }
+
+    /// The texts a person can see: on screen, inside their clip, not under something drawn later.
+    fn shown_texts(&self) -> Vec<Seen<'_>> {
+        let mut seen = Vec::new();
         for t in &self.texts {
             if t.w == 0 || t.text.trim().is_empty() { continue; }
-            // A clip change at command k governs what is drawn after it.
-            let clip = self.clips[self.clips.partition_point(|c| c.0 < t.at).max(1) - 1].1;
             let full = [t.x, t.y, t.x + t.w as i32, t.y + t.h as i32];
-            let vis = cut(full, clip);
+            let vis = cut(full, self.clip_at(t.at));
             if area(vis) == 0 { continue; }
             if self.rects.iter().any(|r| r.at >= t.at && r.color >> 24 >= 0x30 && area(cut(r.b, vis)) * 2 > area(vis)) { continue; }
             seen.push(Seen { t, full, vis });
         }
+        seen
+    }
+
+    /// The click targets a person can reach: on screen, and not under something drawn later.
+    /// A target's place in the drawing order is that of the last thing drawn inside it.
+    fn shown_targets(&self) -> Vec<LoggedTarget> {
+        let window = [0, 0, self.width as i32, self.height as i32];
+        let mut out: Vec<LoggedTarget> = Vec::new();
+        for t in &self.targets {
+            let vis = cut(t.b, window);
+            if area(vis) == 0 || out.iter().any(|o| o.b == t.b) { continue; }
+            let inside = |b: [i32; 4]| area(b) > 0 && b[0] >= t.b[0] - 2 && b[1] >= t.b[1] - 2 && b[2] <= t.b[2] + 2 && b[3] <= t.b[3] + 2;
+            let own = self.rects.iter().filter(|r| inside(r.b)).map(|r| r.at)
+                .chain(self.texts.iter().filter(|x| inside(cut([x.x, x.y, x.x + x.w as i32, x.y + x.h as i32], self.clip_at(x.at)))).map(|x| x.at)).max();
+            let Some(own) = own else { continue };
+            if self.rects.iter().any(|r| r.at > own && r.color >> 24 >= 0x30 && !inside(r.b) && area(cut(r.b, vis)) * 2 > area(vis)) { continue; }
+            out.push(t.clone());
+        }
+        out
+    }
+
+    /// The text drawn inside a box, to name the box by in a report.
+    fn label_of(&self, b: [i32; 4]) -> String {
+        self.texts.iter().find(|t| !t.text.trim().is_empty() && holds(b, [t.x + t.w as i32 / 2, t.y + t.h as i32 / 2]))
+            .map(|t| t.text.clone()).unwrap_or_else(|| "(no text)".to_string())
+    }
+
+    /// The text sizes, colours and corner radii the screen is made of, and how often each is
+    /// used, commonest first within its kind.
+    fn style(&self) -> Vec<(&'static str, String, usize)> {
+        let mut uses: HashMap<(&'static str, String), usize> = HashMap::new();
+        for s in self.shown_texts() {
+            *uses.entry(("text size", format!("{} px", s.t.h))).or_default() += 1;
+            *uses.entry(("text colour", format!("{:06x}", s.t.color & 0xffffff))).or_default() += 1;
+        }
+        let window = (self.width * self.height) as i64;
+        for r in &self.rects {
+            if r.color >> 24 < 0x20 || area(r.b) >= window { continue; }
+            let fill = if r.color >> 24 == 0xff { format!("{:06x}", r.color & 0xffffff) } else { format!("{:06x}/{:02x}", r.color & 0xffffff, r.color >> 24) };
+            *uses.entry(("fill", fill)).or_default() += 1;
+            if r.radius > 0 { *uses.entry(("corner radius", format!("{} px", r.radius))).or_default() += 1; }
+        }
+        let mut all: Vec<(&'static str, String, usize)> = uses.into_iter().map(|((kind, value), n)| (kind, value, n)).collect();
+        all.sort_by(|a, b| (a.0, std::cmp::Reverse(a.2), &a.1).cmp(&(b.0, std::cmp::Reverse(b.2), &b.1)));
+        all
+    }
+
+    /// Faults a person sees at a glance and a test of behaviour does not: text cut off, text on
+    /// top of text, text crowding or leaving the box behind it, text too faint or too small.
+    /// Text that something drawn later hides, a dialog over the page for one, is left out.
+    fn lint(&self) -> Vec<Finding> {
+        let seen = self.shown_texts();
 
         let scale = self.scale.max(0.25) as f64;
         let margin = (4.0 * scale).round() as i32;
@@ -767,6 +943,19 @@ impl ScriptWindow {
             if (t.h as f64) < 10.0 * scale { add("tiny", format!("{} px tall", t.h)); }
         }
 
+        let (wide, high) = (self.width as i32, self.height as i32);
+        let (least, reach) = ((24.0 * scale).round() as i32, (12.0 * scale).round() as i32);
+        for t in self.shown_targets() {
+            let (w, h) = (t.b[2] - t.b[0], t.b[3] - t.b[1]);
+            let (b, label) = (cut(t.b, [0, 0, wide, high]), self.label_of(t.b));
+            if w.min(h) < least { out.push(Finding { kind: "target", b, text: label.clone(), detail: format!("{}x{} px to click, under {} px", w, h, least) }); }
+            // A pointer thrown at the side of a full-size window stops there, so a target that
+            // reaches the side cannot be overshot. One that stops just short of it can.
+            for (gap, side) in [(t.b[0], "left"), (wide - t.b[2], "right"), (high - t.b[3], "bottom")] {
+                if gap >= 1 && gap <= reach { out.push(Finding { kind: "edge", b, text: label.clone(), detail: format!("stops {} px short of the window's {} side", gap, side) }); }
+            }
+        }
+
         for (i, a) in seen.iter().enumerate() {
             for b in &seen[i + 1..] {
                 let o = cut(a.vis, b.vis);
@@ -791,7 +980,7 @@ impl ScriptWindow {
             for px in &self.pixels[row * self.side..row * self.side + w] { rgb.extend_from_slice(&[(px >> 16) as u8, (px >> 8) as u8, *px as u8]); }
         }
         for f in found {
-            let c: [u8; 3] = match f.kind { "clipped" => [255, 40, 40], "overlap" => [255, 0, 255], "overflow" => [255, 140, 0], "margin" => [255, 230, 0], "contrast" => [0, 220, 255], _ => [150, 150, 150] };
+            let c: [u8; 3] = match f.kind { "clipped" => [255, 40, 40], "overlap" => [255, 0, 255], "overflow" => [255, 140, 0], "margin" => [255, 230, 0], "contrast" => [0, 220, 255], "target" => [90, 255, 90], "edge" => [110, 150, 255], _ => [150, 150, 150] };
             let b = [f.b[0] - 2, f.b[1] - 2, f.b[2] + 1, f.b[3] + 1];
             let mut dot = |x: i32, y: i32| if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
                 let i = (y as usize * w + x as usize) * 3;
@@ -1335,6 +1524,27 @@ pub fn diff_dirs(dir_a: &Path, dir_b: &Path) -> usize {
     if new.len() > 30 { println!("lint new: ... and {} more", new.len() - 30); }
     if !new.is_empty() || gone != 0 { println!("lint: {} new findings, {} gone, {} in all", new.len(), gone, lb.len()); }
     differ += new.len();
+
+    // A size, colour or corner radius that no screen of the first run used.
+    if dir_a.join("style.txt").exists() {
+        let style = |dir: &Path| -> Vec<(String, String, usize)> {
+            let mut all: Vec<(String, String, usize)> = Vec::new();
+            for l in std::fs::read_to_string(dir.join("style.txt")).unwrap_or_default().lines() {
+                let f: Vec<&str> = l.split('\t').collect();
+                if f.len() < 4 { continue; }
+                let (key, uses) = (format!("{} {}", f[1], f[2]), f[3].parse().unwrap_or(0));
+                match all.iter_mut().find(|s| s.0 == key) { Some(s) => s.2 += uses, None => all.push((key, f[0].to_string(), uses)) }
+            }
+            all
+        };
+        let (sa, sb) = (style(dir_a), style(dir_b));
+        let new: Vec<&(String, String, usize)> = sb.iter().filter(|s| !sa.iter().any(|a| a.0 == s.0)).collect();
+        let gone = sa.iter().filter(|a| !sb.iter().any(|s| s.0 == a.0)).count();
+        for s in new.iter().take(20) { println!("style new: {} (first in {}, used {} times)", s.0, s.1, s.2); }
+        if new.len() > 20 { println!("style new: ... and {} more", new.len() - 20); }
+        if !new.is_empty() || gone != 0 { println!("style: {} new values, {} gone", new.len(), gone); }
+        differ += new.len();
+    }
     differ
 }
 
@@ -1444,15 +1654,26 @@ mod tests {
             for y in vis[1]..vis[3] { for x in (vis[0] + 1..vis[2]).step_by(3) { w.pixels[y as usize * w.side + x as usize] = ink; } }
             w.clips = vec![(0, window), (2, clip)];
             w.rects = vec![
-                LoggedRect { b: [0, 0, 150, 512], color: 0xff000000 | !bg & 0xffffff, at: 1 },
-                LoggedRect { b: cut([tx - left, ty - 5, tx + tw + right, ty + th + 5], clip), color: 0xff000000 | bg, at: 3 },
+                LoggedRect { b: [0, 0, 150, 512], color: 0xff000000 | !bg & 0xffffff, at: 1, radius: 0 },
+                LoggedRect { b: cut([tx - left, ty - 5, tx + tw + right, ty + th + 5], clip), color: 0xff000000 | bg, at: 3, radius: 0 },
                 // Too faint to hide anything.
-                LoggedRect { b: window, color: 0x10ffffff, at: 20 },
+                LoggedRect { b: window, color: 0x10ffffff, at: 20, radius: 0 },
             ];
-            if covered { w.rects.push(LoggedRect { b: [tx - 50, ty - 50, tx + tw + 50, ty + th + 50], color: 0xff000000 | bg, at: 30 }); }
+            if covered { w.rects.push(LoggedRect { b: [tx - 50, ty - 50, tx + tw + 50, ty + th + 50], color: 0xff000000 | bg, at: 30, radius: 0 }); }
             w.texts = vec![LoggedText { x: tx, y: ty, w: tw as u32, h: th as u32, color: ink | (rng_next(&mut s) as u32) << 24, at: 5, text: "text".into() }];
 
+            let (gap_right, gap_bottom, target_w, target_h, hidden) = (r(20), r(20), 10 + r(60), 10 + r(60), r(4) == 0);
+            let target = [512 - gap_right - target_w, 512 - gap_bottom - target_h, 512 - gap_right, 512 - gap_bottom];
+            w.targets = vec![LoggedTarget { b: target, enabled: true, pointer: false }];
+            w.rects.push(LoggedRect { b: target, color: 0xff000000 | bg, at: 40, radius: 0 });
+            if hidden { w.rects.push(LoggedRect { b: [250, 250, 512, 512], color: 0xff000000 | bg, at: 50, radius: 0 }); }
+
             let mut want: Vec<&str> = Vec::new();
+            if !hidden {
+                if target_w.min(target_h) < 24 { want.push("target"); }
+                if (1..=12).contains(&gap_right) { want.push("edge"); }
+                if (1..=12).contains(&gap_bottom) { want.push("edge"); }
+            }
             if area(vis) > 0 && !covered {
                 if cut_right > 1 { want.push("clipped"); }
                 else {

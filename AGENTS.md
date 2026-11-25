@@ -97,6 +97,14 @@ text and small images. Never build zebrad to look at a GUI change, and never
 write a new script to drive or screenshot the GUI. `zebra-gui/GUI_DEV.md` is
 the manual: read it before the first GUI change of a session.
 
+Whoever adds a GUI feature is its designer, even when the request says only to
+implement it. Read `zebra-gui/GUI_DESIGN.md` first and decide what the person
+sees first, what their hand does, and what form each control's job calls for.
+The screens as they stand are not the standard to copy. Add a typeface, an
+icon, an image, an animation or a new kind of control when the design calls
+for one, and write it into that file's vocabulary. Say your design decisions
+in your report, with the one image a person should look at.
+
 ```text
 bash zebra-gui/gui.sh snap base          Before the first edit: record every screen as it is.
 bash zebra-gui/gui.sh check              After each edit: build, run every script and random
@@ -109,6 +117,9 @@ bash zebra-gui/gui.sh run '<commands>'   Try one thing, e.g. 'click "Send"; shot
   which of them you meant to cause.
 - Look at the result yourself: read the PNG that `shot`, `lint` or `diff`
   names. Do not report a visual change you have not seen.
+- Judge a design with `squint` (what the eye lands on first), `targets` (what
+  can be pressed, how big, how it answers the pointer) and `style` (the sizes
+  and colours in use).
 - Check what moves (an animation, a scroll, a delay) with `settle`, `film` and
   `track`; speed with `gui.sh bench`; a real window's frame timing with
   `gui.sh pace`.

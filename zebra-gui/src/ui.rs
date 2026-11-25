@@ -701,6 +701,14 @@ impl Context {
         }
     }
 
+    fn log_target(&mut self, id: Id, enabled: bool, pointer: bool) {
+        let Some(log) = self.targets.as_mut() else { return };
+        let e = unsafe { clay::Clay_GetElementData(id.clay().id) };
+        if !e.found { return; }
+        let b = e.boundingBox;
+        log.push(crate::script::LoggedTarget { b: [b.x as i32, b.y as i32, (b.x + b.width) as i32, (b.y + b.height) as i32], enabled, pointer });
+    }
+
     pub fn button_ex(&mut self, act_on_press: bool, colour: (u8, u8, u8, u8), id: Id, enabled: bool, pointer_on_hover: CursorIcon) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) {
 
         let mouse_hover = self.hovered_raw(id);
@@ -723,6 +731,7 @@ impl Context {
             (self.mouse_pressed_id == Id::default() || self.mouse_pressed_id == id) {
             self.cursor = pointer_on_hover;
         }
+        self.log_target(id, enabled, pointer_on_hover != CursorIcon::Default);
 
         let held      = mouse_held      || key_held;
         let hover     = mouse_hover     || key_hover;
@@ -970,6 +979,7 @@ impl Context {
         let track_length = self.scale(96.0);
         let mut new_value = value;
         let mouse_hover = self.hovered_raw(id);
+        self.log_target(id, true, true);
         if mouse_hover && self.input().mouse_pressed(BTN_LEFT) {
             self.mouse_pressed_id = id;
         }
@@ -4317,6 +4327,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
     ui.scale = ui.zoom * ui.dpi_scale;
 
     ui.cursor = CursorIcon::Default;
+    if let Some(log) = ui.targets.as_mut() { log.clear(); }
 
     let shift_held = (ui.input().key_held(KEY_LEFTSHIFT)   || ui.input().key_held(KEY_RIGHTSHIFT));
     let ctrl_held  = (ui.input().key_held(KEY_LEFTCTRL) || ui.input().key_held(KEY_RIGHTCTRL));
@@ -5553,6 +5564,8 @@ pub struct Context {
 
     pub cursor: CursorIcon,
     pub prev_cursor: CursorIcon,
+    /// What this frame lets the pointer press. Only a scripted run keeps it, for its checks.
+    pub targets: Option<Vec<crate::script::LoggedTarget>>,
 
     pub debug: bool,
     pub frame_graph: bool,

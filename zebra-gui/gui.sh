@@ -9,6 +9,7 @@
 #   bash zebra-gui/gui.sh snap <label>               Run every scripts/*.gui into target/gui/<label>.
 #   bash zebra-gui/gui.sh diff <label> <label>       What differs between two snaps: screens and lint.
 #   bash zebra-gui/gui.sh lint                       Every visual fault the scripts' screens have now.
+#   bash zebra-gui/gui.sh style                      Every text size, colour and corner radius in use.
 #   bash zebra-gui/gui.sh bench                      Frame timings from scripts/bench.gui.
 #   bash zebra-gui/gui.sh dup [min lines]            Repeated runs of code in src/.
 #   bash zebra-gui/gui.sh pace [seconds]             Opens a real window and times its frames.
@@ -156,6 +157,17 @@ case "$cmd" in
         done
         echo "lint: $(cat "$gui_out"/lint/*/lint.txt 2>/dev/null | grep -c '') findings. To see one screen's marked in an image: gui.sh run '<commands to reach it>; lint x'"
         ;;
+    style)
+        fresh || exit 1
+        snap style > /dev/null
+        cat "$gui_out"/style/*/style.txt 2>/dev/null \
+            | awk -F'\t' '{ uses[$2 "\t" $3] += $4 } END { for (k in uses) print k "\t" uses[k] }' \
+            | sort -t"$(printf '\t')" -k1,1 -k3,3nr \
+            | awk -F'\t' '
+                $1 != kind { if (kind != "") print kind " (" n " values): " line; kind = $1; line = ""; n = 0 }
+                { line = line (n ? ", " : "") $2 " x" $3; n++ }
+                END { if (kind != "") print kind " (" n " values): " line }'
+        ;;
     bench)
         fresh || exit 1
         locked Gui-bench env ZEBRA_GUI_SCRIPT="$here/scripts/bench.gui" ZEBRA_GUI_OUT="$gui_out/bench" "$exe" --scene default | grep -E '^(bench|FAIL)'
@@ -182,5 +194,5 @@ case "$cmd" in
         fresh || exit 1
         "$exe" "$@"
         ;;
-    *) sed -n '2,18p' "$0"; exit 2 ;;
+    *) sed -n '2,19p' "$0"; exit 2 ;;
 esac

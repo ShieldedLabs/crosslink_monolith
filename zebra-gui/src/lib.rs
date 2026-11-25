@@ -1319,6 +1319,7 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
     
     let mut gui_clay = clay_layout::Clay::new((1280., 720.).into());
     let mut ui   = ui::Context::new();
+    if matches!(gui, Window::Script(_)) { ui.targets = Some(Vec::new()); }
     let mut data = ui::UiData::default();
 
     ui.clay = &mut gui_clay;
@@ -2273,7 +2274,7 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
 
                         if let Window::Script(s) = &mut gui {
                             let commands = std::slice::from_raw_parts(draw_ctx.draw_command_buffer, *draw_ctx.draw_command_count);
-                            s.frame_done(draw_ctx.text_log.borrow_mut().as_mut().unwrap(), commands, script::FrameReport {
+                            s.frame_done(draw_ctx.text_log.borrow_mut().as_mut().unwrap(), commands, ui.targets.as_deref().unwrap_or(&[]), script::FrameReport {
                                 single_us: prev_frame_time_single_threaded_us,
                                 total_us: prev_frame_time_total_us,
                                 draw_commands: *draw_ctx.draw_command_count,
