@@ -505,11 +505,11 @@ impl ScriptWindow {
                 self.keep_shot(&name, &rgb, w, h);
                 let found = self.lint();
                 self.keep_lint(&name, &found);
-                for (kind, value, uses) in self.style() { self.style_lines.push(format!("{}\t{}\t{}\t{}", name, kind, value, uses)); }
+                for (kind, value, uses) in self.style([x as i32, y as i32, (x + w) as i32, (y + h) as i32]) { self.style_lines.push(format!("{}\t{}\t{}\t{}", name, kind, value, uses)); }
             }
             "style" => {
                 if !self.need_fresh() { return false; }
-                let all = self.style();
+                let all = self.style([0, 0, self.width as i32, self.height as i32]);
                 for kind in ["text size", "text colour", "fill", "corner radius"] {
                     let of: Vec<String> = all.iter().filter(|s| s.0 == kind).map(|s| format!("{} x{}", s.1, s.2)).collect();
                     let more = if of.len() > 16 { format!(" ... and {} more", of.len() - 16) } else { String::new() };
@@ -883,17 +883,18 @@ impl ScriptWindow {
             .map(|t| t.text.clone()).unwrap_or_else(|| "(no text)".to_string())
     }
 
-    /// The text sizes, colours and corner radii the screen is made of, and how often each is
-    /// used, commonest first within its kind.
-    fn style(&self) -> Vec<(&'static str, String, usize)> {
+    /// The text sizes, colours and corner radii that part of the screen is made of, and how
+    /// often each is used, commonest first within its kind.
+    fn style(&self, part: [i32; 4]) -> Vec<(&'static str, String, usize)> {
         let mut uses: HashMap<(&'static str, String), usize> = HashMap::new();
         for s in self.shown_texts() {
+            if area(cut(s.vis, part)) == 0 { continue; }
             *uses.entry(("text size", format!("{} px", s.t.h))).or_default() += 1;
             *uses.entry(("text colour", format!("{:06x}", s.t.color & 0xffffff))).or_default() += 1;
         }
         let window = (self.width * self.height) as i64;
         for r in &self.rects {
-            if r.color >> 24 < 0x20 || area(r.b) >= window { continue; }
+            if r.color >> 24 < 0x20 || area(r.b) >= window || area(cut(r.b, part)) == 0 { continue; }
             let fill = if r.color >> 24 == 0xff { format!("{:06x}", r.color & 0xffffff) } else { format!("{:06x}/{:02x}", r.color & 0xffffff, r.color >> 24) };
             *uses.entry(("fill", fill)).or_default() += 1;
             if r.radius > 0 { *uses.entry(("corner radius", format!("{} px", r.radius))).or_default() += 1; }
@@ -1662,7 +1663,8 @@ mod tests {
             if covered { w.rects.push(LoggedRect { b: [tx - 50, ty - 50, tx + tw + 50, ty + th + 50], color: 0xff000000 | bg, at: 30, radius: 0 }); }
             w.texts = vec![LoggedText { x: tx, y: ty, w: tw as u32, h: th as u32, color: ink | (rng_next(&mut s) as u32) << 24, at: 5, text: "text".into() }];
 
-            let (gap_right, gap_bottom, target_w, target_h, hidden) = (r(20), r(20), 10 + r(60), 10 + r(60), r(4) == 0);
+            let mut pick = |n: u64| (rng_next(&mut s) % n) as i32;
+            let (gap_right, gap_bottom, target_w, target_h, hidden) = (pick(20), pick(20), 10 + pick(60), 10 + pick(60), pick(4) == 0);
             let target = [512 - gap_right - target_w, 512 - gap_bottom - target_h, 512 - gap_right, 512 - gap_bottom];
             w.targets = vec![LoggedTarget { b: target, enabled: true, pointer: false }];
             w.rects.push(LoggedRect { b: target, color: 0xff000000 | bg, at: 40, radius: 0 });

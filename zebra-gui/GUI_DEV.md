@@ -4,6 +4,9 @@
 script with no window, and reports in text and small images. One edit, checked, costs about
 30 seconds.
 
+This file is how to build and check. `GUI_DESIGN.md` is what to build: read it before adding
+or changing anything a person sees.
+
 ## The loop
 
 ```text
@@ -49,6 +52,7 @@ Output goes to `zebra-gui/target/gui/run/`. Read the PNG a command names; crop w
 | `snap <label>` | 5 s | Every script, into `target/gui/<label>/<script>/`. |
 | `check` | 11 s | `snap now`, random input, `diff base now`. |
 | `lint` | 5 s | Every finding on every screenshot, one line each. |
+| `style` | 5 s | Every text size, colour and corner radius the screens use, with counts. |
 | `bench` | 10 s | Frame timings; takes the build lock so nothing else skews it. |
 | `dup` | under 1 s | Repeated runs of code in `src/`. |
 | `pace [seconds]` | the seconds | Opens a real window. The only command that does. |
@@ -77,6 +81,9 @@ gives the same pixels every time.
 | `find "text"`, `dump [file]` | Print matching texts, or all: `x y height colour text`. |
 | `shot <name> [x y w h]` | Save `<name>.png`, and lint the screen under that name. |
 | `lint [name]` | Print the screen's findings and save `lint_<name>.png` with each one boxed. |
+| `squint [name]` | Save `squint_<name>.png`, the screen shrunk to its masses, and list the text that pulls the eye first. |
+| `targets` | List what can be pressed: place, size, the cursor it asks for, and how many pixels change when the pointer is on it. |
+| `style` | List the screen's text sizes, text colours, fills and corner radii, with counts. |
 | `settle [max frames]` | Draw until three frames change nothing; fail if still changing at max. |
 | `film <name> [frames] [x y w h]` | One image of that many frames in a row. |
 | `track "text" [frames]` | Where the text is in each frame. |
@@ -101,11 +108,16 @@ A script whose first lines include `# scene empty` runs on the empty wallet.
 | `contrast` | Text under 3:1 against what is behind it. |
 | `tiny` | Text under 10 px (times scale) tall. |
 | `overlap` | Two texts drawn on top of each other. |
+| `target` | Something to press that is under 24 px (times scale) wide or tall. |
+| `edge` | Something to press that stops 1 to 12 px short of the window's left, right or bottom side. Reaching the side makes it impossible to overshoot in a full-size window. |
 
-It also prints how many text sizes and colours the screen uses. The mock screens have about
-30 findings each as they stand, 500 across the scripts; `check` reports only new ones. Lint does not see: thin margins
-above and below text, misalignment, uneven spacing, small click targets, or anything about
+The mock screens have many findings as they stand; `check` reports only new ones. Lint does
+not see: thin margins above and below text, misalignment, uneven spacing, or anything about
 icons and the block map's shapes. Look at the screenshot for those.
+
+**Style.** Each `shot` also records the text sizes, colours and corner radii on screen.
+`check` prints `style new:` for a value no screen of `base` used: a new word in the design's
+vocabulary, or a slip. `GUI_DESIGN.md` says which is which.
 
 **Motion.** `settle` prints the changed pixels per frame, so an animation that never stops, or
 takes three times as long, shows in numbers. `film` shows the frames side by side. `track`
@@ -164,7 +176,8 @@ The tools find what is broken. These they cannot find; check them by reading you
 | `src/ui.rs` | 5,800 | Every screen and widget. `run_ui` is the whole frame's layout. |
 | `src/lib.rs` | 2,800 | The frame loop, input, the rasteriser and its worker threads. |
 | `src/viz_gui.rs` | 2,450 | The block map, and the messages to and from the node. |
-| `src/script.rs` | 1,500 | The scripted window, lint, motion checks, PNG, crash reports. |
+| `src/script.rs` | 1,750 | The scripted window, lint, design and motion checks, PNG, crash reports. |
+| `src/style.rs` | 25 | Named colours. Named sizes, spaces and times belong here too. |
 | `src/main.rs` | 140 | The standalone program and its mock wallet data. |
 | `scripts/tour.gui` | | Every screen and dialog. |
 | `scripts/sizes.gui` | | The main screen at six window sizes and scales. |

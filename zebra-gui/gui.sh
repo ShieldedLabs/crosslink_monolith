@@ -17,6 +17,9 @@
 #   bash zebra-gui/gui.sh test [filter]              The crate's tests.
 #   bash zebra-gui/gui.sh window                     Open the real window on mock data.
 
+# Bash reads a brace group whole before running it, so editing this file does not break a run
+# of it that is waiting on the build lock.
+{
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(dirname "$here")"
 gui_out="$here/target/gui"
@@ -196,3 +199,5 @@ case "$cmd" in
         ;;
     *) sed -n '2,19p' "$0"; exit 2 ;;
 esac
+exit $?
+}

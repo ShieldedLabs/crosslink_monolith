@@ -13,7 +13,9 @@ copy them. This file is the standard, and it is short enough to read before each
 1. **Say what the person is doing.** Three lines: what they came to do, what they must see to
    decide, and the one action most of them take.
 2. **Think of two or three layouts that really differ**, not one layout with variations. Pick
-   by the principles below, not by which is nearest to the code that exists.
+   by the principles below, not by which is nearest to the code that exists. For a new screen
+   or a new flow, first look up how the best programs of any decade solved the same problem,
+   and say in the report what you took from where.
 3. **Give each control the form its job calls for** (see "Each control fits its job").
 4. **Build it, then look at it as a stranger would** (see "Looking at your own design").
 5. **Report the design**: what you chose and why, in three bullets, and the one image a
@@ -167,10 +169,12 @@ vocabulary, which you add to `style.rs` with its job, or a slip, which you fix.
 How to add:
 
 - **A typeface.** Put the file in `assets/`, `include_bytes!` it beside `INTER` in `lib.rs`,
-  add a `FontKind`, and extend the two matches on `FontKind` there. Its licence must allow
+  add a `FontKind`, and extend each match on `FontKind` there. Its licence must allow
   shipping it (SIL OFL, Apache, public domain).
-- **An icon.** `icon-font/README.md` tells how to add one to `fontello.ttf`; the names land
-  in `src/fontello_icons.rs`.
+- **An icon.** The icons are glyphs of `fontello.ttf`, named in `src/fontello_icons.rs`.
+  Adding one goes through the fontello.com website (`icon-font/README.md`), which a person
+  has to do: ask for it and name the icon. Or draw the shape yourself from rectangles and
+  lines, or from a glyph of a font you add.
 - **An image.** The rasteriser draws rounded rectangles, lines and text. A picture needs a
   new `DrawCommand` in `lib.rs`. Decode the file in `build.rs`, as the window icon is, so the
   program carries no decoder.
