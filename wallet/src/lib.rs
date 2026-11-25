@@ -296,12 +296,21 @@ fn funding_quote(values: &[u64], amount: u64, staking: bool) -> FundingQuote {
     FundingQuote { can_fund, needs_merge, reason, max_amount, fee_zats: fee, eligible_balance, eligible_notes: order.len() }
 }
 
-/// Each coin's value if a new transaction may spend it, else 0, which `spend_order` passes over.
-/// A coin stays in `utxos` until the wallet scans the block that spends it, so a coin that a sent
-/// transaction spends still looks unspent; a second spend of it is refused as a double spend.
-fn spendable_utxo_values(utxos: &[Txo], in_flight: &[OutPoint]) -> Vec<u64> {
+/// A coinbase output from block h can be spent from block h + this. The node enforces the same
+/// constant (zebra-chain's `MIN_TRANSPARENT_COINBASE_MATURITY`) and rejects any earlier spend.
+const COINBASE_MATURITY: u32 = zcash_protocol::consensus::COINBASE_MATURITY_BLOCKS;
+
+fn utxo_is_mature(utxo: &Txo, spend_h: BlockHeight) -> bool {
+    !utxo.is_coinbase || (utxo.recv_h.is_in_block() && utxo.recv_h.0.saturating_add(COINBASE_MATURITY) <= spend_h.0)
+}
+
+/// Each coin's value if a new transaction mined at `spend_h` may spend it, else 0, which
+/// `spend_order` passes over. A coin stays in `utxos` until the wallet scans the block that spends
+/// it, so a coin that a sent transaction spends still looks unspent; a second spend of it is
+/// refused as a double spend.
+fn spendable_utxo_values(utxos: &[Txo], in_flight: &[OutPoint], spend_h: BlockHeight) -> Vec<u64> {
     utxos.iter().map(|utxo| match utxo.t_addr {
-        TransparentAddress::PublicKeyHash(_) if !in_flight.contains(&utxo.id) => utxo.value.into_u64(),
+        TransparentAddress::PublicKeyHash(_) if !in_flight.contains(&utxo.id) && utxo_is_mature(utxo, spend_h) => utxo.value.into_u64(),
         _ => 0,
     }).collect()
 }
@@ -409,6 +418,7 @@ struct Txo {
     // both from TxOut
     pub value: Zatoshis,
     pub t_addr: TransparentAddress, // convertible to/from pubkey_script
+    pub is_coinbase: bool,
 }
 impl Txo {
     pub fn txout(&self) -> TxOut {
@@ -2216,7 +2226,7 @@ impl ManualWallet {
             match pool {
                 TxPool::Transparent => {
                     let t_pubkey = t_pubkey.expect("checked above");
-                    let values = spendable_utxo_values(&account.utxos, &self.t_spends_in_flight());
+                    let values = spendable_utxo_values(&account.utxos, &self.t_spends_in_flight(), BlockHeight(block_h));
                     for i in spend_order(&values) {
                         if txb.transparent_inputs().len() >= MAX_TRANSPARENT_SPENDS { break; }
                         let utxo = &account.utxos[i];
@@ -3273,6 +3283,7 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
                         id: OutPoint::new(txid.into(), out_i.try_into().unwrap()),
                         value,
                         t_addr,
+                        is_coinbase,
                     };
                     t.recv(value, true)?;
 
@@ -5312,8 +5323,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // }
 
         if faucet_shield_cooldown_instant.elapsed().as_secs() > 15 && !proposed_miner_shield.is_in_progress() {
-            let utxos = &miner_wallet.accounts[0].utxos;
-            let utxo_state = (utxos.len(), utxos.iter().map(|utxo| utxo.value.into_u64()).sum::<u64>());
+            // The spendable coins, so a coinbase coming of age retries a shield it was too young for.
+            let values = spendable_utxo_values(&miner_wallet.accounts[0].utxos, &miner_wallet.t_spends_in_flight(), BlockHeight(miner_wallet.chain_tip_h.0 + 1));
+            let utxo_state = (values.iter().filter(|&&v| v > 0).count(), values.iter().sum::<u64>());
             if failed_shield_utxos != Some(utxo_state) {
                 let memo = MemoBytes::from_bytes("shielding notes".as_bytes()).unwrap();
                 let ok = miner_wallet.shield_transparent_zats(network, &mut proposed_miner_shield, &mut client, &miner_usk, 1000000000, &orchard_tree, memo).is_ok();
@@ -5327,8 +5339,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let user_spend_in_progress = proposed_stake.is_in_progress() || proposed_send.is_in_progress()
                 || rpc_stake.is_some() || rpc_send.is_some() || proposed_merge.is_in_progress();
             if !proposed_user_shield.is_in_progress() && !user_spend_in_progress {
-                let values = spendable_utxo_values(&user_wallet.accounts[0].utxos, &user_wallet.t_spends_in_flight());
-                // The spendable coins, not all of them, so a coin freed by an expired send is retried.
+                let values = spendable_utxo_values(&user_wallet.accounts[0].utxos, &user_wallet.t_spends_in_flight(), BlockHeight(user_wallet.chain_tip_h.0 + 1));
+                // The spendable coins, not all of them, so a coin freed by an expired send or a
+                // coinbase coming of age is retried.
                 let utxo_state = (values.iter().filter(|&&v| v > 0).count(), values.iter().sum::<u64>());
                 if let Some(zats) = user_shield_zats(&values) {
                     if failed_user_shield_utxos != Some(utxo_state) {
@@ -5972,10 +5985,14 @@ mod tests {
             fee(k, 1)
         }).collect();
 
-        let mut rng = ChaCha20Rng::seed_from_u64(307);
-        let (mut shielded, mut too_little, mut hit_cap) = (0, 0, 0);
+        let seed: u64 = std::env::var("WALLET_FUZZ_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| thread_rng().gen());
+        println!("user_shield_spends_every_free_coin seed {seed} (rerun with WALLET_FUZZ_SEED={seed})");
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+        let (mut shielded, mut too_little, mut hit_cap, mut immature, mut came_of_age) = (0, 0, 0, 0, 0);
         for _ in 0..5_000 {
             let n = if rng.gen_ratio(1, 4) { rng.gen_range(0..6) } else { rng.gen_range(0..250) };
+            let tip = BlockHeight(rng.gen_range(0..2_000_000));
+            let spend_h = BlockHeight(tip.0 + 1);
             let utxos: Vec<Txo> = (0..n).map(|i| {
                 let value = match rng.gen_range(0..6) {
                     0 => rng.gen_range(1..=fee_unit),
@@ -5986,15 +6003,30 @@ mod tests {
                     _ => rng.gen_range(1..1_000_000_000),
                 };
                 let t_addr = if rng.gen_ratio(1, 8) { TransparentAddress::ScriptHash([1; 20]) } else { TransparentAddress::PublicKeyHash([2; 20]) };
-                Txo { recv_h: BlockHeight(1), spent_h: BlockHeight(0), id: OutPoint::new(rng.gen(), i as u32), value: Zatoshis::const_from_u64(value), t_addr }
+                let age = match rng.gen_range(0..4) {
+                    0 => 0,
+                    1 => 1,
+                    2 => rng.gen_range(0..4),
+                    _ => rng.gen_range(0..1_000),
+                }.min(tip.0);
+                let recv_h = if rng.gen_ratio(1, 20) { BlockHeight::MEMPOOL } else { BlockHeight(tip.0 - age) };
+                // Coinbase never reaches the mempool.
+                let is_coinbase = recv_h.is_in_block() && rng.gen_ratio(1, 2);
+                Txo { recv_h, spent_h: BlockHeight(0), id: OutPoint::new(rng.gen(), i as u32), value: Zatoshis::const_from_u64(value), t_addr, is_coinbase }
             }).collect();
             let mut in_flight: Vec<OutPoint> = utxos.iter().filter(|_| rng.gen_ratio(1, 5)).map(|utxo| utxo.id.clone()).collect();
             in_flight.push(OutPoint::new(rng.gen(), 0));
 
-            let values = spendable_utxo_values(&utxos, &in_flight);
-            for (utxo, &value) in utxos.iter().zip(&values) {
+            let values = spendable_utxo_values(&utxos, &in_flight, spend_h);
+            let next_values = spendable_utxo_values(&utxos, &in_flight, BlockHeight(spend_h.0 + 1));
+            for ((utxo, &value), &next) in utxos.iter().zip(&values).zip(&next_values) {
+                // The node's rule (zebra-state check/utxo.rs): spendable from recv_h + COINBASE_MATURITY.
+                let mature = !utxo.is_coinbase || spend_h.0 >= utxo.recv_h.0 + COINBASE_MATURITY;
                 let free = matches!(utxo.t_addr, TransparentAddress::PublicKeyHash(_)) && !in_flight.contains(&utxo.id);
-                assert_eq!(value, if free { utxo.value.into_u64() } else { 0 });
+                assert_eq!(value, if free && mature { utxo.value.into_u64() } else { 0 }, "{utxo:?} at {}", spend_h.0);
+                assert!(next >= value, "a coin stopped being spendable as the chain grew: {utxo:?}");
+                immature += (free && !mature) as usize;
+                came_of_age += (free && !mature && next > 0) as usize;
             }
 
             let order = spend_order(&values);
@@ -6024,6 +6056,7 @@ mod tests {
             hit_cap += (cap == MAX_TRANSPARENT_SPENDS) as usize;
         }
         assert!(shielded > 1_000 && too_little > 100 && hit_cap > 300, "shielded {shielded}, too little {too_little}, hit the cap {hit_cap}");
+        assert!(immature > 10_000 && came_of_age > 1_000, "immature {immature}, came of age {came_of_age}");
     }
 
     fn note_fixture() -> (ManualWallet, PreparedKeys, orchard::Note, orchard::Address) {

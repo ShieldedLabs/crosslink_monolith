@@ -51,8 +51,9 @@ use proptest_derive::Arbitrary;
 /// [7.1](https://zips.z.cash/protocol/nu5.pdf#txnencodingandconsensus)
 //
 // TODO: change type to HeightDiff
-// pub const MIN_TRANSPARENT_COINBASE_MATURITY: u32 = 100;
-pub const MIN_TRANSPARENT_COINBASE_MATURITY: u32 = 2; // @TODO(JUDAH): This is hardcoded so we can spend coinbase transactions before they mature. This is very temporary!
+// @Todo: Crosslink lowers this from 100 to 2 so coinbase can be spent sooner. The value
+// lives in librustzcash so the wallet reads the same one; see the tech-debt note there.
+pub const MIN_TRANSPARENT_COINBASE_MATURITY: u32 = zcash_protocol::consensus::COINBASE_MATURITY_BLOCKS;
 
 /// The rate used to calculate the dust threshold, in zatoshis per 1000 bytes.
 ///

@@ -777,7 +777,12 @@ pub const MAX_BLOCK_REORG_HEIGHT: u32 = 100 - 1;
 /// > block less than 100 blocks prior to the spend.
 ///
 /// [txnconsensus]: https://zips.z.cash/protocol/protocol.pdf#txnconsensus
-pub const COINBASE_MATURITY_BLOCKS: u32 = 100;
+///
+/// Crosslink enforces 2 on every network instead, mainnet included; zebra-chain's
+/// `MIN_TRANSPARENT_COINBASE_MATURITY` and the Crosslink wallet both read this constant.
+// @Todo: Tech debt: restore the spec's 100 for mainnet, as a per-network parameter, before
+// Crosslink runs there.
+pub const COINBASE_MATURITY_BLOCKS: u32 = 2;
 
 /// A globally-unique identifier for a set of consensus rules within the Zcash chain.
 ///
