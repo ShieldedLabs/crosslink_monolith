@@ -131,6 +131,11 @@ bash zebra-gui/gui.sh run '<commands>'   Try one thing, e.g. 'click "Send"; shot
 - Check what moves (an animation, a scroll, a delay) with `settle`, `film` and
   `track`; speed with `gui.sh bench`; a real window's frame timing with
   `gui.sh pace`.
+- Check how a screen takes a change of size with `resize` (the window) and
+  `drag` (a pane's divider). Each moves a step at a time, as a hand does, and
+  says from what size text is cut off or overlaps, what jumps, and what
+  follows a frame late. `check` does this for the main screen; run both on a
+  screen or a pane you add or change.
 - A new screen or behaviour gets lines in a script under `zebra-gui/scripts/`,
   so `check` covers it from then on.
 - A crash or a hang prints the script line it happened on. A random-input

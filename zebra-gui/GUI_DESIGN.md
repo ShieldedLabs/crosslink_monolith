@@ -26,10 +26,16 @@ copy them. This file is the standard, and it is short enough to read before each
 - **Big and near is fast; small and far is slow.** What is used most is large and close to
   where the pointer already is. What is dangerous is small, apart, and never beside what is
   routine.
-- **The sides and corners of the screen are the largest targets there are.** The pointer
-  stops at them, so a hand can be thrown at one without aiming. A control used often belongs
-  against a side or in a corner, and must reach all the way to it: a strip of dead pixels
-  between a button and the side throws the whole advantage away.
+- **A target is as big as the room the hand has to stop in.** What counts is its size along
+  the line the pointer travels, so let the whole row take the press, label and padding and
+  the space around the glyph, and not the glyph alone. What can be pressed may be larger than
+  what is drawn.
+- **Where the pointer cannot go further, a target cannot be overshot.** That is true at a
+  side of the screen, and this app is a window. Its left and right sides are the screen's
+  only while it is maximized. Its top and bottom never are, with a title bar above and a task
+  bar below, so it has no corner of the screen either. Never place a control for the sake of
+  a side. Where one already sits against the left or right side, let what can be pressed
+  reach all the way to it, which costs nothing.
 - **Keep the hand where it is.** The next step appears where the last one ended: the result
   beside the control that made it, the confirmation beside the thing confirmed.
 - **Nothing moves under the pointer.** Layout does not shift between press and release, or
@@ -62,6 +68,12 @@ copy them. This file is the standard, and it is short enough to read before each
 - **Dense is good when it is ordered.** A person who uses this daily reads a tight table
   faster than a spaced-out stack of cards. Space separates groups; it is not decoration. Do
   not put behind a click what fits on the screen.
+- **A screen has a smallest size it holds at, and an order in which things give way.** Each
+  part gets the room its content needs, not a share of the window. As the window shrinks,
+  what matters least gives up room first: empty space, then detail, then a whole part. A
+  number is never cut off. A text that has to shorten ends in an ellipsis and can be read
+  whole somewhere. Below the smallest size the window stops shrinking, or the screen scrolls.
+  While a side is dragged things slide; a thing that jumps to a new place wants a fixed one.
 - **Movement pulls the eye harder than anything.** Use it to show where a thing came from or
   went, or that something changed. Under 200 ms, never looping, never in the way of input,
   and always cut short by the next input.
@@ -197,9 +209,11 @@ bash zebra-gui/gui.sh run '<commands to reach the screen>; squint x; targets; li
 - **`targets`** lists everything that can be pressed: where, how big, and whether it shows
   anything when the pointer is on it. Is the most-used one the biggest and the nearest?
 - **`lint x`** marks text that is cut off, crowded, faint or tiny, targets under 24 px
-  (`target`), and targets that stop just short of the window's side (`edge`).
+  (`target`), and targets that stop just short of the window's left or right side (`edge`).
 - **`style`** lists the sizes, colours and radii on the screen. Did you add one? Why?
 - **`film`** and **`settle`** show movement frame by frame and how long it takes.
+- **`resize x 640 900`** and **`drag x "<grip>" -300 0`** make the window or a pane smaller
+  a step at a time, and say from what size text is cut off or overlaps, and what jumps.
 - **`scripts/sizes.gui`** and `--scene empty` show the small window, the large display and
   the wallet with nothing in it. Design the empty, the loading, the failed and the
   very-long-number cases too.

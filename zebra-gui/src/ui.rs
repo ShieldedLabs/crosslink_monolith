@@ -701,12 +701,13 @@ impl Context {
         }
     }
 
-    fn log_target(&mut self, id: Id, enabled: bool, pointer: bool) {
+    /// `grip` names something dragged to resize what is beside it, and is empty for all else.
+    fn log_target(&mut self, id: Id, enabled: bool, pointer: bool, grip: &str) {
         let Some(log) = self.targets.as_mut() else { return };
         let e = unsafe { clay::Clay_GetElementData(id.clay().id) };
         if !e.found { return; }
         let b = e.boundingBox;
-        log.push(crate::script::LoggedTarget { b: [b.x as i32, b.y as i32, (b.x + b.width) as i32, (b.y + b.height) as i32], enabled, pointer });
+        log.push(crate::script::LoggedTarget { b: [b.x as i32, b.y as i32, (b.x + b.width) as i32, (b.y + b.height) as i32], enabled, pointer, grip: grip.to_string() });
     }
 
     pub fn button_ex(&mut self, act_on_press: bool, colour: (u8, u8, u8, u8), id: Id, enabled: bool, pointer_on_hover: CursorIcon) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) {
@@ -731,7 +732,7 @@ impl Context {
             (self.mouse_pressed_id == Id::default() || self.mouse_pressed_id == id) {
             self.cursor = pointer_on_hover;
         }
-        self.log_target(id, enabled, pointer_on_hover != CursorIcon::Default);
+        self.log_target(id, enabled, pointer_on_hover != CursorIcon::Default, "");
 
         let held      = mouse_held      || key_held;
         let hover     = mouse_hover     || key_hover;
@@ -979,7 +980,7 @@ impl Context {
         let track_length = self.scale(96.0);
         let mut new_value = value;
         let mouse_hover = self.hovered_raw(id);
-        self.log_target(id, true, true);
+        self.log_target(id, true, true, "");
         if mouse_hover && self.input().mouse_pressed(BTN_LEFT) {
             self.mouse_pressed_id = id;
         }
@@ -4440,6 +4441,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             let left_div_id = id("Left Pane Divider");
             let div_w = ui.scale(8.0);
             let div_hover = ui.hovered_raw(left_div_id);
+            ui.log_target(left_div_id, true, true, "Left Pane Divider");
             if div_hover || ui.mouse_pressed_id == left_div_id {
                 ui.cursor = CursorIcon::EwResize;
             }
@@ -4913,6 +4915,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             let right_div_id = id("Right Pane Divider");
             let right_div_w = ui.scale(8.0);
             let right_div_hover = ui.hovered_raw(right_div_id);
+            ui.log_target(right_div_id, true, true, "Right Pane Divider");
             if right_div_hover || ui.mouse_pressed_id == right_div_id {
                 ui.cursor = CursorIcon::EwResize;
             }
@@ -4970,6 +4973,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
         let inspector_h = ui.scale(420.0).min(ui.draw().window_height as f32 * 0.6);
 
         let resize_hover = ui.hovered_raw(resize_id);
+        ui.log_target(resize_id, true, true, "Block Inspector Resize");
         if resize_hover || ui.mouse_pressed_id == resize_id {
             ui.cursor = CursorIcon::NwseResize;
         }

@@ -48,6 +48,8 @@ pub struct LoggedTarget {
     pub enabled: bool,
     /// Whether the widget asks for the hand pointer while the pointer is on it.
     pub pointer: bool,
+    /// Its name, if it is dragged to resize what is beside it and not pressed.
+    pub grip: String,
 }
 
 /// A text a person can see, with its whole box and the part of it inside its clip.
@@ -94,6 +96,44 @@ struct Watch {
     cells: Vec<Vec<u8>>,
     spots: Vec<Option<(i32, i32)>>,
 }
+
+/// `resize` or `drag` in progress. The window's size, or the pointer with its button held,
+/// moves a step at a time, and every step is drawn twice with nothing changed in between: the
+/// first frame is what a person sees mid-drag, the second is what that size comes to rest at.
+struct Reflow {
+    window: bool,
+    from: (i32, i32),
+    to: (i32, i32),
+    count: usize,
+    /// How much smaller than life the film shows each step.
+    shrink: usize,
+    /// 0 before a step's first frame is asked for, 1 once it is drawn, 2 once its second is.
+    phase: u8,
+    first: Vec<Shown>,
+    first_us: usize,
+    steps: Vec<Step>,
+}
+
+/// One step of a `resize` or `drag`, as its second frame showed it.
+struct Step {
+    /// The window's size, or where the pointer was.
+    at: (i32, i32),
+    texts: Vec<Shown>,
+    shown: usize,
+    faults: Vec<Fault>,
+    /// The texts the first frame drew somewhere else, and the one furthest off.
+    trailing: (usize, Option<(String, (i32, i32))>),
+    us: usize,
+    cell: (Vec<u8>, usize, usize),
+}
+
+/// A lint finding as a sweep follows it. `key` is what makes it the same fault at another step.
+struct Fault { key: String, kind: &'static str, text: String, detail: String, b: [i32; 4] }
+
+/// A fault over a sweep: the first and last steps it held at, how many it held at, and the
+/// step it was at its worst.
+#[derive(Debug, Clone, PartialEq)]
+struct Span { key: String, first: usize, last: usize, held: usize, worst: usize }
 
 fn rng_next(state: &mut u64) -> u64 {
     *state ^= *state << 13;
@@ -143,6 +183,7 @@ pub struct ScriptWindow {
     style_lines: Vec<String>,
     content_lines: Vec<String>,
     sweep: Option<Sweep>,
+    reflow: Option<Reflow>,
 }
 
 fn fail(msg: &str) {
@@ -232,6 +273,7 @@ impl ScriptWindow {
             style_lines: Vec::new(),
             content_lines: Vec::new(),
             sweep: None,
+            reflow: None,
         };
         w.resize(1600, 900);
         report_crashes();
@@ -593,7 +635,9 @@ impl ScriptWindow {
                     return false;
                 }
                 for row in &s.rows { println!("target {}", row); }
-                println!("targets: {} on screen; {} show nothing when the pointer is on them", s.list.len(), s.quiet);
+                let grips: Vec<&LoggedTarget> = self.targets.iter().filter(|t| !t.grip.is_empty()).collect();
+                for g in &grips { println!("grip   {:>5},{:<5} {:>4}x{:<4} {:?}", g.b[0], g.b[1], g.b[2] - g.b[0], g.b[3] - g.b[1], g.grip); }
+                println!("targets: {} on screen; {} show nothing when the pointer is on them; {} grips, which `drag` takes hold of by name", s.list.len(), s.quiet, grips.len());
                 self.push_move(s.home.0, s.home.1);
                 self.push_render();
                 self.fresh = false;
@@ -692,6 +736,85 @@ impl ScriptWindow {
                     }
                 }
             }
+            "resize" | "drag" => {
+                let window = cmd == "resize";
+                if self.reflow.is_none() {
+                    if !self.need_fresh() { return false; }
+                    let usage = if window { "resize <name> <width> <height> [steps]" } else { "drag <name> <\"grip\" or \"text\", or x y> <dx> <dy> [steps]" };
+                    let (from, to, count) = if window {
+                        match (num(1), num(2)) {
+                            (Some(w), Some(h)) if w >= 1.0 && h >= 1.0 && w <= 8192.0 && h <= 8192.0 => ((self.width as i32, self.height as i32), (w as i32, h as i32), num(3)),
+                            _ => { fail(&format!("line {}: {}", self.pc + 1, usage)); return true; }
+                        }
+                    } else {
+                        let by_point = args.len() >= 5 && num(1).is_some() && num(2).is_some();
+                        let n = if by_point { 3 } else { 2 };
+                        let what = args.get(1).cloned().unwrap_or_default();
+                        let from = if by_point { Some((num(1).unwrap() as i32, num(2).unwrap() as i32)) } else if what.is_empty() { None } else {
+                            self.targets.iter().find(|t| !t.grip.is_empty() && t.grip.contains(&what)).map(|t| ((t.b[0] + t.b[2]) / 2, (t.b[1] + t.b[3]) / 2))
+                                .or_else(|| self.find_text(&what, 0).map(|t| (t.x + t.h as i32 / 2, t.y + t.h as i32 / 2)))
+                        };
+                        match (from, num(n), num(n + 1)) {
+                            (Some(from), Some(dx), Some(dy)) => (from, (from.0 + dx as i32, from.1 + dy as i32), num(n + 2)),
+                            (None, Some(_), Some(_)) => {
+                                let grips: Vec<String> = self.targets.iter().filter(|t| !t.grip.is_empty()).map(|t| format!("{:?}", t.grip)).collect();
+                                fail(&format!("line {}: drag found no grip and no text named {:?}; the grips on screen: {}", self.pc + 1, what, if grips.is_empty() { "none".to_string() } else { grips.join(", ") }));
+                                return true;
+                            }
+                            _ => { fail(&format!("line {}: {}", self.pc + 1, usage)); return true; }
+                        }
+                    };
+                    let widest = if window { from.0.max(to.0) as usize } else { self.width };
+                    self.reflow = Some(Reflow { window, from, to, count: count.unwrap_or(24.0).clamp(1.0, 120.0) as usize, shrink: widest.div_ceil(400).max(1),
+                        phase: 0, first: Vec::new(), first_us: 0, steps: Vec::new() });
+                    if !window {
+                        // The hover has to be drawn before the press, as for `click`.
+                        self.push_move(from.0, from.1);
+                        self.push_render();
+                        self.push_button(BTN_LEFT, true);
+                        self.push_render();
+                        return false;
+                    }
+                }
+                let mut r = self.reflow.take().unwrap();
+                let once = |seen: &[Seen]| shown_once(seen.iter().map(|s| Shown { x: s.t.x, y: s.t.y, w: s.t.w as i32, h: s.t.h as i32, color: String::new(), text: s.t.text.clone() }).collect());
+                if r.phase == 1 {
+                    r.first = once(&self.shown_texts());
+                    r.first_us = self.report.total_us;
+                    r.phase = 2;
+                    self.reflow = Some(r);
+                    self.renders_without_frame = 0;
+                    self.push_render();
+                    return false;
+                }
+                if r.phase == 2 {
+                    let seen = self.shown_texts();
+                    let texts = once(&seen);
+                    let faults: Vec<Fault> = self.lint().into_iter().map(|f| Fault { key: format!("{}\t{}\t{}", f.kind, f.text, no_numbers(&f.detail)), kind: f.kind, text: f.text, detail: f.detail, b: f.b }).collect();
+                    let cell = if film_steps(r.count).contains(&r.steps.len()) { self.small([0, 0, self.width, self.height], r.shrink) } else { (Vec::new(), 0, 0) };
+                    r.steps.push(Step {
+                        at: if window { (self.width as i32, self.height as i32) } else { self.mouse },
+                        trailing: moved_far(&r.first, &texts, (0, 0)),
+                        shown: seen.len(), texts, faults, us: r.first_us, cell,
+                    });
+                }
+                if r.steps.len() <= r.count {
+                    let (i, n) = (r.steps.len() as i32, r.count as i32);
+                    let at = (r.from.0 + (r.to.0 - r.from.0) * i / n, r.from.1 + (r.to.1 - r.from.1) * i / n);
+                    if window { self.resize(at.0.max(1) as usize, at.1.max(1) as usize); } else { self.push_move(at.0, at.1); }
+                    r.phase = 1;
+                    self.reflow = Some(r);
+                    self.renders_without_frame = 0;
+                    self.push_render();
+                    return false;
+                }
+                if !window {
+                    self.push_button(BTN_LEFT, false);
+                    self.push_render();
+                }
+                self.fresh = false;
+                self.reflow_report(cmd, &args[0], &r);
+            }
             "bench" | "bench_idle" => {
                 let b = self.bench.get_or_insert_with(|| Bench { left: num(0).unwrap_or(120.0) as usize, full: cmd == "bench", samples: Vec::new() });
                 if b.left > 0 {
@@ -778,6 +901,113 @@ impl ScriptWindow {
         }
         out.push("frame".into());
         out
+    }
+
+    /// Says what a finished `resize` or `drag` found, and keeps its film and its findings.
+    fn reflow_report(&mut self, cmd: &str, name: &str, r: &Reflow) {
+        // The faults a change of size can cause. A text too faint or too small is so at any size.
+        const BROUGHT: [&str; 5] = ["clipped", "overflow", "overlap", "margin", "target"];
+        let n = r.steps.len();
+        let place = |i: usize| { let at = r.steps[i].at; if r.window { format!("{}x{}", at.0, at.1) } else { format!("{},{}", at.0, at.1) } };
+        let texts = |n: usize| if n == 1 { "1 text".to_string() } else { format!("{} texts", n) };
+        let list = format!("{}.txt", name);
+        let mut all: Vec<String> = Vec::new();
+
+        // A fault the first step already shows was there before anything moved.
+        let per_step: Vec<Vec<(&str, f64)>> = r.steps.iter().map(|s| s.faults.iter().filter(|f| BROUGHT.contains(&f.kind)).map(|f| (f.key.as_str(), severity(f.kind, &f.detail))).collect()).collect();
+        let mut spans = fault_spans(&per_step);
+        spans.retain(|s| s.first > 0);
+        spans.sort_by(|a, b| (a.first, &a.key).cmp(&(b.first, &b.key)));
+        let mut brought: Vec<(&Span, &Fault)> = Vec::new();
+        for s in &spans {
+            let Some(f) = r.steps[s.worst].faults.iter().filter(|f| f.key == s.key)
+                .max_by(|a, b| severity(a.kind, &a.detail).total_cmp(&severity(b.kind, &b.detail))) else { continue };
+            let words = format!("{}; at {}: {}", span_words(s, n, &place), place(s.worst), f.detail);
+            // Worded alike whatever the span, so `check` lists the findings of one fault together.
+            self.lint_lines.push(format!("{}\t{}\t{}\t{},{}\t{}; from {} to {}", name, f.kind, f.text.replace('\t', " "), f.b[0], f.b[1], f.detail, place(s.first), place(s.last)));
+            all.push(format!("{} fault {:<8} {:?} {}", cmd, f.kind, short(&f.text), words));
+            brought.push((s, f));
+        }
+        let held = |i: usize| spans.iter().filter(|s| per_step[i].iter().any(|f| f.0 == s.key)).count();
+        println!("{} {}: {} {} -> {} in {} steps; faults the change brings, at each step: {}", cmd, name, if r.window { "window" } else { "pointer" },
+            place(0), place(n - 1), n - 1, (0..n).take(61).map(|i| held(i).to_string()).collect::<Vec<_>>().join(" "));
+        let mut kinds: Vec<&str> = Vec::new();
+        for (_, f) in &brought { if !kinds.contains(&f.kind) { kinds.push(f.kind); } }
+        for kind in &kinds {
+            let of: Vec<&(&Span, &Fault)> = brought.iter().filter(|b| b.1.kind == *kind).collect();
+            let (first, worst) = (of[0], of.iter().max_by(|a, b| severity(kind, &a.1.detail).total_cmp(&severity(kind, &b.1.detail))).unwrap());
+            if of.len() == 1 { println!("{}", all[brought.iter().position(|b| b.1.kind == *kind).unwrap()]); continue; }
+            println!("{} fault {:<8} first at {} on {:?}; on {} in all; worst on {:?} at {}: {}",
+                cmd, kind, place(first.0.first), short(&first.1.text), texts(of.len()), short(&worst.1.text), place(worst.0.worst), worst.1.detail);
+        }
+
+        // Nothing has cause to move further than the side or the pointer that pushed it.
+        let slack = (2.0 * self.scale.max(0.25)).round() as i32;
+        let mut jumps: Vec<(usize, usize, String)> = Vec::new();
+        for i in 1..n {
+            let (a, b) = (r.steps[i - 1].at, r.steps[i].at);
+            let (count, most) = moved_far(&r.steps[i - 1].texts, &r.steps[i].texts, ((b.0 - a.0).abs() + slack, (b.1 - a.1).abs() + slack));
+            let Some((text, d)) = most else { continue };
+            jumps.push((count, i, format!("{} jump  from {} to {}: {} moved further than the {} did, most of all {:?} by {},{} px",
+                cmd, place(i - 1), place(i), texts(count), if r.window { "window's side" } else { "pointer" }, short(&text), d.0, d.1)));
+        }
+        all.extend(jumps.iter().map(|j| j.2.clone()));
+        let mut biggest = jumps.clone();
+        biggest.sort_by_key(|j| (std::cmp::Reverse(j.0), j.1));
+        biggest.truncate(4);
+        biggest.sort_by_key(|j| j.1);
+        for j in &biggest { println!("{}", j.2); }
+        if jumps.len() > 4 { println!("{} jump  ... and {} more, of fewer texts", cmd, jumps.len() - 4); }
+
+        // The first step changes nothing, so its two frames differ only if the screen was moving anyway.
+        let trailing: Vec<usize> = (1..n).filter(|&i| r.steps[i].trailing.0 > 0).collect();
+        if r.steps[0].trailing.0 > 0 {
+            println!("{} trail: the screen was still moving before the first step, so what follows the {} late cannot be told apart: `settle` first", cmd, cmd);
+        } else if let Some(&i) = trailing.iter().max_by_key(|&&i| r.steps[i].trailing.0) {
+            let (count, most) = &r.steps[i].trailing;
+            let (text, d) = most.clone().unwrap_or_default();
+            let line = format!("{} trail: at {} of {} steps part of the screen follows a frame late: the frame after, with nothing changed, moved {}, at {} most of all {:?} by {},{} px",
+                cmd, trailing.len(), n - 1, texts(*count), place(i), short(&text), d.0, d.1);
+            println!("{}", line);
+            all.push(line);
+        }
+        if !all.is_empty() {
+            all.push(String::new());
+            self.write_file(&list, all.join("\n").as_bytes());
+        }
+
+        let mut us: Vec<usize> = r.steps.iter().map(|s| s.us).collect();
+        us.sort();
+        let breaks = match spans.first() {
+            Some(s) => format!("no new fault until {}, then {} by {} ({})", place(s.first - 1), spans.len(), place(n - 1), self.out_dir.join(&list).display()),
+            None => "no new fault".to_string(),
+        };
+        println!("{} {}: {}; {} jumps; {} of {} steps follow late; texts shown {} -> {}; a step's first frame took med {} max {} us",
+            cmd, name, breaks, jumps.len(), trailing.len(), n - 1, r.steps[0].shown, r.steps[n - 1].shown, us[n / 2], us[n - 1]);
+
+        let picks: Vec<usize> = film_steps(r.count).into_iter().filter(|&i| i < n && r.steps[i].cell.1 > 0).collect();
+        let (cw, ch) = picks.iter().fold((1, 1), |m, &i| (m.0.max(r.steps[i].cell.1), m.1.max(r.steps[i].cell.2)));
+        let cols = picks.len().clamp(1, 4);
+        let (sw, sh) = (cols * (cw + 4) - 4, picks.len().div_ceil(cols).max(1) * (ch + 4) - 4);
+        let mut rgb = vec![90u8; sw * sh * 3];
+        for (slot, &i) in picks.iter().enumerate() {
+            let step = &r.steps[i];
+            let (mut cell, w, h) = step.cell.clone();
+            let f = r.shrink as i32;
+            for fault in &step.faults {
+                if spans.iter().any(|s| s.key == fault.key) {
+                    outline(&mut cell, w, h, [fault.b[0] / f - 1, fault.b[1] / f - 1, fault.b[2] / f, fault.b[3] / f], lint_colour(fault.kind));
+                }
+            }
+            let (ox, oy) = ((slot % cols) * (cw + 4), (slot / cols) * (ch + 4));
+            for y in 0..h {
+                let d = ((oy + y) * sw + ox) * 3;
+                rgb[d..d + w * 3].copy_from_slice(&cell[y * w * 3..(y + 1) * w * 3]);
+            }
+        }
+        self.keep_shot(name, &rgb, sw, sh);
+        println!("{} {}.png: the {} at {}, left to right then down, each 1/{} size, a box round each fault the change brings",
+            cmd, name, if r.window { "window" } else { "pointer" }, picks.iter().map(|&i| place(i)).collect::<Vec<_>>().join(" "), r.shrink);
     }
 
     fn keep_shot(&mut self, name: &str, rgb: &[u8], w: usize, h: usize) {
@@ -880,7 +1110,7 @@ impl ScriptWindow {
         let mut out: Vec<LoggedTarget> = Vec::new();
         for t in &self.targets {
             let vis = cut(t.b, window);
-            if area(vis) == 0 || out.iter().any(|o| o.b == t.b) { continue; }
+            if area(vis) == 0 || !t.grip.is_empty() || out.iter().any(|o| o.b == t.b) { continue; }
             let inside = |b: [i32; 4]| area(b) > 0 && b[0] >= t.b[0] - 2 && b[1] >= t.b[1] - 2 && b[2] <= t.b[2] + 2 && b[3] <= t.b[3] + 2;
             let own = self.rects.iter().filter(|r| inside(r.b)).map(|r| r.at)
                 .chain(self.texts.iter().filter(|x| inside(cut([x.x, x.y, x.x + x.w as i32, x.y + x.h as i32], self.clip_at(x.at)))).map(|x| x.at)).max();
@@ -976,9 +1206,11 @@ impl ScriptWindow {
             let (w, h) = (t.b[2] - t.b[0], t.b[3] - t.b[1]);
             let (b, label) = (cut(t.b, [0, 0, wide, high]), self.label_of(t.b));
             if w.min(h) < least { out.push(Finding { kind: "target", b, text: label.clone(), detail: format!("{}x{} px to click, under {} px", w, h, least) }); }
-            // A pointer thrown at the side of a full-size window stops there, so a target that
-            // reaches the side cannot be overshot. One that stops just short of it can.
-            for (gap, side) in [(t.b[0], "left"), (wide - t.b[2], "right"), (high - t.b[3], "bottom")] {
+            // The left and right sides of a maximized window are the screen's, where the pointer
+            // stops: a target that reaches one cannot be overshot, and one that stops just short
+            // of it can. The top and bottom are never the screen's, with a title bar above and a
+            // task bar below.
+            for (gap, side) in [(t.b[0], "left"), (wide - t.b[2], "right")] {
                 if gap >= 1 && gap <= reach { out.push(Finding { kind: "edge", b, text: label.clone(), detail: format!("stops {} px short of the window's {} side", gap, side) }); }
             }
         }
@@ -1006,16 +1238,7 @@ impl ScriptWindow {
         for row in 0..h {
             for px in &self.pixels[row * self.side..row * self.side + w] { rgb.extend_from_slice(&[(px >> 16) as u8, (px >> 8) as u8, *px as u8]); }
         }
-        for f in found {
-            let c: [u8; 3] = match f.kind { "clipped" => [255, 40, 40], "overlap" => [255, 0, 255], "overflow" => [255, 140, 0], "margin" => [255, 230, 0], "contrast" => [0, 220, 255], "target" => [90, 255, 90], "edge" => [110, 150, 255], _ => [150, 150, 150] };
-            let b = [f.b[0] - 2, f.b[1] - 2, f.b[2] + 1, f.b[3] + 1];
-            let mut dot = |x: i32, y: i32| if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
-                let i = (y as usize * w + x as usize) * 3;
-                rgb[i..i + 3].copy_from_slice(&c);
-            };
-            for x in b[0]..=b[2] { dot(x, b[1]); dot(x, b[3]); }
-            for y in b[1]..=b[3] { dot(b[0], y); dot(b[2], y); }
-        }
+        for f in found { outline(&mut rgb, w, h, [f.b[0] - 2, f.b[1] - 2, f.b[2] + 1, f.b[3] + 1], lint_colour(f.kind)); }
         png_encode(&rgb, w, h)
     }
 
@@ -1031,6 +1254,20 @@ struct Finding {
     b: [i32; 4],
     text: String,
     detail: String,
+}
+
+fn lint_colour(kind: &str) -> [u8; 3] {
+    match kind { "clipped" => [255, 40, 40], "overlap" => [255, 0, 255], "overflow" => [255, 140, 0], "margin" => [255, 230, 0], "contrast" => [0, 220, 255], "target" => [90, 255, 90], "edge" => [110, 150, 255], _ => [150, 150, 150] }
+}
+
+/// Draws the one-pixel outline of a box, its far edges included, on an RGB image.
+fn outline(rgb: &mut [u8], w: usize, h: usize, b: [i32; 4], c: [u8; 3]) {
+    let mut dot = |x: i32, y: i32| if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
+        let i = (y as usize * w + x as usize) * 3;
+        rgb[i..i + 3].copy_from_slice(&c);
+    };
+    for x in b[0]..=b[2] { dot(x, b[1]); dot(x, b[3]); }
+    for y in b[1]..=b[3] { dot(b[0], y); dot(b[2], y); }
 }
 
 /// Boxes are `[x1, y1, x2, y2]`, the far edges exclusive.
@@ -1519,13 +1756,106 @@ fn quoted(s: &str) -> String { format!("\"{}\"", short(s)) }
 /// What makes two lint findings the same fault: their kind, and their message with each
 /// number in it taken out, since the number differs with the window's size and scale.
 fn lint_fault(f: &[String]) -> String {
-    let mut out = format!("{} ", f.get(1).map(|k| k.as_str()).unwrap_or(""));
+    format!("{} {}", f.get(1).map(|k| k.as_str()).unwrap_or(""), no_numbers(f.get(4).map(|m| m.as_str()).unwrap_or("")))
+}
+
+/// A message with each number in it replaced by `N`.
+fn no_numbers(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
     let mut in_number = false;
-    for c in f.get(4).map(|m| m.as_str()).unwrap_or("").chars() {
+    for c in s.chars() {
         if !c.is_ascii_digit() { out.push(c); } else if !in_number { out.push('N'); }
         in_number = c.is_ascii_digit();
     }
     out
+}
+
+/// Of the texts a frame showed, those it showed once, in the order of their text. Only those
+/// can be followed from one frame to the next: of two alike, which is which is a guess.
+fn shown_once(mut all: Vec<Shown>) -> Vec<Shown> {
+    all.sort_by(|a, b| a.text.cmp(&b.text));
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < all.len() {
+        let mut j = i + 1;
+        while j < all.len() && all[j].text == all[i].text { j += 1; }
+        if j == i + 1 { out.push(all[i].clone()); }
+        i = j;
+    }
+    out
+}
+
+/// Of the texts two frames each showed once, how many moved further than `allow` in x or in y
+/// between them, and the one that went furthest past it. Both lists are as `shown_once` gives them.
+fn moved_far(a: &[Shown], b: &[Shown], allow: (i32, i32)) -> (usize, Option<(String, (i32, i32))>) {
+    let (mut i, mut j, mut n) = (0, 0, 0);
+    let mut most: Option<(i32, String, (i32, i32))> = None;
+    while i < a.len() && j < b.len() {
+        match a[i].text.cmp(&b[j].text) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                let d = (b[j].x - a[i].x, b[j].y - a[i].y);
+                let past = (d.0.abs() - allow.0).max(d.1.abs() - allow.1);
+                if past > 0 {
+                    n += 1;
+                    if most.as_ref().is_none_or(|m| past > m.0) { most = Some((past, a[i].text.clone(), d)); }
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    (n, most.map(|m| (m.1, m.2)))
+}
+
+/// How bad a finding is, to pick the step a fault was worst at: the number its message leads
+/// with, counted against it where the smaller number is the worse one.
+fn severity(kind: &str, detail: &str) -> f64 {
+    let end = detail.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(detail.len());
+    let n: f64 = detail[..end].parse().unwrap_or(0.0);
+    if kind == "clipped" || kind == "overflow" { n } else { -n }
+}
+
+/// Follows each fault over the steps of a sweep. A step lists the faults it showed, each with
+/// how bad it was there. The faults that held longest come first.
+fn fault_spans(steps: &[Vec<(&str, f64)>]) -> Vec<Span> {
+    let mut spans: Vec<(Span, f64)> = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for (i, step) in steps.iter().enumerate() {
+        for &(key, bad) in step {
+            match index.get(key) {
+                Some(&k) => {
+                    let (s, worst) = &mut spans[k];
+                    if s.last != i { s.held += 1; s.last = i; }
+                    if bad > *worst { *worst = bad; s.worst = i; }
+                }
+                None => {
+                    index.insert(key, spans.len());
+                    spans.push((Span { key: key.to_string(), first: i, last: i, held: 1, worst: i }, bad));
+                }
+            }
+        }
+    }
+    let mut out: Vec<Span> = spans.into_iter().map(|s| s.0).collect();
+    out.sort_by(|a, b| (std::cmp::Reverse(a.held), &a.key).cmp(&(std::cmp::Reverse(b.held), &b.key)));
+    out
+}
+
+/// Over which of a sweep's `n` steps a fault held, in words. `place` names a step.
+fn span_words(s: &Span, n: usize, place: &dyn Fn(usize) -> String) -> String {
+    if s.held == n { "at every step".to_string() }
+    else if s.held < s.last - s.first + 1 { format!("at {} of the steps from {} to {}", s.held, place(s.first), place(s.last)) }
+    else if s.first == s.last { format!("only at {}", place(s.first)) }
+    else if s.last == n - 1 { format!("from {} on", place(s.first)) }
+    else if s.first == 0 { format!("until {}", place(s.last)) }
+    else { format!("from {} to {}", place(s.first), place(s.last)) }
+}
+
+/// Which steps of a sweep its film shows: all of them, or eight spread evenly from the first
+/// to the last.
+fn film_steps(count: usize) -> Vec<usize> {
+    if count < 8 { (0..=count).collect() } else { (0..8).map(|k| k * count / 7).collect() }
 }
 
 /// Every text, and every name of a thing to press, on any screenshot of the first run and of
@@ -2022,7 +2352,7 @@ mod tests {
             let mut pick = |n: u64| (rng_next(&mut s) % n) as i32;
             let (gap_right, gap_bottom, target_w, target_h, hidden) = (pick(20), pick(20), 10 + pick(60), 10 + pick(60), pick(4) == 0);
             let target = [512 - gap_right - target_w, 512 - gap_bottom - target_h, 512 - gap_right, 512 - gap_bottom];
-            w.targets = vec![LoggedTarget { b: target, enabled: true, pointer: false }];
+            w.targets = vec![LoggedTarget { b: target, enabled: true, pointer: false, grip: String::new() }];
             w.rects.push(LoggedRect { b: target, color: 0xff000000 | bg, at: 40, radius: 0 });
             if hidden { w.rects.push(LoggedRect { b: [250, 250, 512, 512], color: 0xff000000 | bg, at: 50, radius: 0 }); }
 
@@ -2030,7 +2360,6 @@ mod tests {
             if !hidden {
                 if target_w.min(target_h) < 24 { want.push("target"); }
                 if (1..=12).contains(&gap_right) { want.push("edge"); }
-                if (1..=12).contains(&gap_bottom) { want.push("edge"); }
             }
             if area(vis) > 0 && !covered {
                 if cut_right > 1 { want.push("clipped"); }
@@ -2096,5 +2425,100 @@ mod tests {
         }
         for name in ["a", "z", "0", "9", "enter", "F12", "mouse"] { assert!(key_code(name).is_some(), "{}", name); }
         assert!(key_code("nosuchkey").is_none());
+    }
+
+    #[test]
+    fn fuzz_reflow() {
+        let seed = seed();
+        println!("fuzz_reflow FUZZ_SEED={}", seed);
+        let mut s = seed;
+        for round in 0..800 {
+            let mut pick = |n: u64| (rng_next(&mut s) % n.max(1)) as usize;
+
+            // A sweep of faults, each planted over steps of its own choosing: all of them, one
+            // stretch, one step, or a stretch with holes in it.
+            let n = 1 + pick(40);
+            let mut steps: Vec<Vec<(String, f64)>> = vec![Vec::new(); n];
+            let mut want: Vec<(Span, f64)> = Vec::new();
+            for k in 0..pick(12) {
+                let key = format!("kind\ttext {}\tN px off", k);
+                let (a, b) = (pick(n as u64), pick(n as u64));
+                let (first, last) = match pick(4) { 0 => (0, n - 1), 1 => (a, a), _ => (a.min(b), a.max(b)) };
+                let holes = pick(3) == 0;
+                let mut span = Span { key: key.clone(), first: n, last: 0, held: 0, worst: 0 };
+                let mut worst = f64::MIN;
+                for i in first..=last {
+                    if holes && i != first && i != last && pick(2) == 0 { continue; }
+                    // The same fault can show more than once at a step, on texts that read alike.
+                    for _ in 0..1 + pick(3) / 2 {
+                        let bad = pick(50) as f64 - 25.0;
+                        steps[i].push((key.clone(), bad));
+                        if bad > worst { worst = bad; span.worst = i; }
+                    }
+                    span.first = span.first.min(i);
+                    span.last = i;
+                    span.held += 1;
+                }
+                want.push((span, worst));
+            }
+            for step in &mut steps { for i in (1..step.len()).rev() { step.swap(i, pick(i as u64 + 1)); } }
+            let per_step: Vec<Vec<(&str, f64)>> = steps.iter().map(|v| v.iter().map(|f| (f.0.as_str(), f.1)).collect()).collect();
+            let got = fault_spans(&per_step);
+            assert_eq!(got.len(), want.len(), "round {}", round);
+            for pair in got.windows(2) { assert!(pair[0].held >= pair[1].held, "round {}", round); }
+            for (span, worst) in &want {
+                let g = got.iter().find(|g| g.key == span.key).unwrap_or_else(|| panic!("round {}: {} is missing", round, span.key));
+                assert_eq!((g.first, g.last, g.held), (span.first, span.last, span.held), "round {}", round);
+                assert!(steps[g.worst].iter().any(|f| f.0 == span.key && f.1 == *worst), "round {}: {} was not at its worst at step {}", round, span.key, g.worst);
+
+                let words = span_words(g, n, &|i| format!("<{}>", i));
+                let names = |i: usize| words.contains(&format!("<{}>", i));
+                if g.held == n { assert_eq!(words, "at every step", "round {}", round); continue; }
+                assert!(names(g.first) || g.first == 0, "round {}: {:?} for {:?}", round, words, g);
+                assert!(names(g.last) || g.last == n - 1, "round {}: {:?} for {:?}", round, words, g);
+                assert_eq!(words.starts_with(&format!("at {} of", g.held)), g.held < g.last - g.first + 1, "round {}: {:?} for {:?}", round, words, g);
+            }
+
+            // Two frames of texts, some shown twice, some in one frame only. A known few of
+            // those shown once in both move further than allowed.
+            let allow = (pick(40) as i32, pick(40) as i32);
+            let (mut a, mut b): (Vec<Shown>, Vec<Shown>) = (Vec::new(), Vec::new());
+            let (mut far, mut most_past) = (0, 0);
+            for i in 0..pick(40) {
+                let at = Shown { x: pick(2000) as i32, y: pick(1200) as i32, w: 40, h: 12, color: String::new(), text: format!("text {}", i) };
+                let mut moved = at.clone();
+                let jump = pick(3) == 0;
+                let sign = |v: i32, k: usize| if k % 2 == 0 { v } else { -v };
+                let (dx, dy) = if jump {
+                    if pick(2) == 0 { (sign(allow.0 + 1 + pick(300) as i32, pick(2)), sign(pick(allow.1 as u64 + 1) as i32, pick(2))) }
+                    else { (sign(pick(allow.0 as u64 + 1) as i32, pick(2)), sign(allow.1 + 1 + pick(300) as i32, pick(2))) }
+                } else { (sign(pick(allow.0 as u64 + 1) as i32, pick(2)), sign(pick(allow.1 as u64 + 1) as i32, pick(2))) };
+                moved.x += dx;
+                moved.y += dy;
+                match pick(8) {
+                    0 => { a.push(at.clone()); a.push(Shown { y: at.y + 500, ..at }); b.push(moved); }
+                    1 => { a.push(at); b.push(moved.clone()); b.push(Shown { x: moved.x + 900, ..moved }); }
+                    2 => a.push(at),
+                    3 => b.push(moved),
+                    _ => {
+                        a.push(at);
+                        b.push(moved);
+                        if jump { far += 1; most_past = most_past.max((dx.abs() - allow.0).max(dy.abs() - allow.1)); }
+                    }
+                }
+            }
+            for v in [&mut a, &mut b] { for i in (1..v.len()).rev() { v.swap(i, pick(i as u64 + 1)); } }
+            let (count, most) = moved_far(&shown_once(a), &shown_once(b), allow);
+            assert_eq!(count, far, "round {}", round);
+            assert_eq!(most.map(|m| (m.1.0.abs() - allow.0).max(m.1.1.abs() - allow.1)).unwrap_or(0), most_past, "round {}", round);
+
+            let count = pick(121);
+            let film = film_steps(count);
+            assert!(film.len() <= 8 && film[0] == 0 && *film.last().unwrap() == count, "round {}: {:?}", round, film);
+            assert!(film.windows(2).all(|p| p[0] < p[1]), "round {}: {:?}", round, film);
+        }
+        assert_eq!(no_numbers("12 px, 3.5:1 on 00ff00"), "N px, N.N:N on NffN");
+        assert!(severity("clipped", "61 px cut off") > severity("clipped", "7 px cut off"));
+        assert!(severity("margin", "1 px from the side") > severity("margin", "3 px from the side"));
     }
 }

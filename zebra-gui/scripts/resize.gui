@@ -1,0 +1,19 @@
+# How the main screen takes a change of size. `resize` moves the window's side a step at a
+# time, as a hand dragging it does, and `drag` does the same with a pane's divider. Each says
+# which faults the change brings and from what size, which texts jump, and whether part of
+# the screen follows a frame late. One axis at a time, so a text that moves along the other
+# one is a reflow.
+settle 300
+
+resize narrower 640 900
+size 1600 900
+resize shorter 1600 420
+size 1600 900
+settle 60
+
+# Each pane from its narrowest to its widest. With both at their widest the block map between
+# them has the least room it can have.
+drag left_pane_narrower "Left Pane Divider" -300 0
+drag left_pane_wider "Left Pane Divider" 600 0
+drag right_pane_wider "Right Pane Divider" -330 0
+drag right_pane_narrower "Right Pane Divider" 600 0
