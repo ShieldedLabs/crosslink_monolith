@@ -205,7 +205,9 @@ pub mod config {
         /// User-led slashfork rules, as supplied in the config file. These are
         /// merged with [`shipped_slashforks`] and validated by building a
         /// [`SlashForkSchedule`]; after loading, this holds the canonical, merged
-        /// list (see `ZebradConfig::load`).
+        /// list (see `ZebradConfig::load`). `terminated_finalizers` accepts legacy
+        /// 64-character hex keys or verified 134-character `zfinv1` addresses.
+        /// Signatures are checked at config load; consensus retains only the keys.
         #[serde(alias = "hardforks")]
         pub slashforks: Vec<SlashForkConfig>,
         /// Ignore the slashfork rules shipped in the executable

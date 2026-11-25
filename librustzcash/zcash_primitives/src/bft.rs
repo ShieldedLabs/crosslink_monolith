@@ -36,9 +36,10 @@ pub struct SlashForkConfig {
     /// The BFT certificate height at which this slashfork activates, or
     /// [`SlashForkConfig::NEVER`] for a PoW-only slashfork.
     pub bft_certificate_height: u64,
-    /// Finalizers terminated by this slashfork; must list at least one. Committed
-    /// to by hash later, so this list is sorted into a canonical order when the
-    /// schedule is built.
+    /// Finalizers terminated by this slashfork; must list at least one. Config
+    /// accepts legacy 64-character hex keys or verified 134-character `zfinv1`
+    /// addresses. Only the public keys are retained and serialized, and the
+    /// schedule sorts them into canonical order.
     #[serde(deserialize_with = "deserialize_unique_finalizers")]
     pub terminated_finalizers: Vec<PubKeyID>,
 }
@@ -64,15 +65,31 @@ fn deserialize_staking_aligned<'de, D>(d: D) -> Result<u64, D::Error> where D: s
 }
 
 fn deserialize_unique_finalizers<'de, D>(d: D) -> Result<Vec<PubKeyID>, D::Error> where D: serde::Deserializer<'de> {
-    let finalizers = Vec::<PubKeyID>::deserialize(d)?;
-    if finalizers.is_empty() {
+    let entries = Vec::<std::string::String>::deserialize(d)?;
+    if entries.is_empty() {
         return Err(serde::de::Error::custom("`terminated_finalizers` must list at least one finalizer"));
     }
-    let mut seen = std::collections::HashSet::with_capacity(finalizers.len());
-    for finalizer in &finalizers {
+    let mut finalizers = Vec::with_capacity(entries.len());
+    let mut seen = std::collections::HashSet::with_capacity(entries.len());
+    for entry in entries {
+        let finalizer = match entry.len() {
+            // Preserve the existing hex parsing and byte order exactly.
+            64 => PubKeyID::deserialize(
+                serde::de::value::StrDeserializer::<D::Error>::new(&entry),
+            )?,
+            134 => FinalizerAddress::decode_and_verify(&entry)
+                .ok_or_else(|| serde::de::Error::custom(
+                    "invalid finalizer address: expected a zfinv1 address with a valid signature",
+                ))?,
+            len => return Err(serde::de::Error::invalid_length(
+                len,
+                &"64 hex characters (legacy public key) or a 134-character zfinv1 finalizer address",
+            )),
+        };
         if !seen.insert(finalizer) {
             return Err(serde::de::Error::custom(format!("`terminated_finalizers` contains duplicate finalizer \"{finalizer}\", which was already specified")));
         }
+        finalizers.push(finalizer);
     }
     Ok(finalizers)
 }
