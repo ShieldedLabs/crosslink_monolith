@@ -1164,6 +1164,7 @@ impl Window {
     fn request_frame(&mut self) { if let Window::Os(g) = self { g.request_frame() } }
     fn submit(&mut self) { if let Window::Os(g) = self { g.submit() } }
     fn set_icon(&mut self, images: &[softer_gui::icon::IconImage]) { if let Window::Os(g) = self { g.set_icon(images) } }
+    fn set_cursor(&mut self, shape: softer_gui::CursorShape) { if let Window::Os(g) = self { g.set_cursor(shape) } }
     // A script's frames are all drawn, so its run is the same every time.
     fn take_full_redraw(&mut self) -> bool { match self { Window::Os(g) => g.take_full_redraw(), Window::Script(_) => true } }
     fn clipboard(&self) -> softer_gui::Clipboard { match self { Window::Os(g) => g.clipboard(), Window::Script(_) => softer_gui::Clipboard::default() } }
@@ -1825,10 +1826,15 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                             }
                         }
 
-                        // @todo(sam): softer_gui has no cursor-shape call yet, so the widgets'
-                        // choice is tracked but not applied. Add `set_cursor` to the crate.
                         if ui.prev_cursor != ui.cursor {
                             ui.prev_cursor = ui.cursor;
+                            gui.set_cursor(match ui.cursor {
+                                CursorIcon::Default    => softer_gui::CursorShape::Arrow,
+                                CursorIcon::Pointer    => softer_gui::CursorShape::Hand,
+                                CursorIcon::Text       => softer_gui::CursorShape::Text,
+                                CursorIcon::EwResize   => softer_gui::CursorShape::ResizeEw,
+                                CursorIcon::NwseResize => softer_gui::CursorShape::ResizeNwse,
+                            });
                         }
 
                         input_ctx.mouse_moved = false;

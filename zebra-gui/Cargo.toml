@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Pinned to a commit: the clipboard, the Windows request_frame fix and the macOS close fix (EVENT_CLOSE only from the
-# red button or Quit, never from a minimized or hidden window) are in no crates.io release yet.
-softer_gui = { git = "https://github.com/ShieldedLabs/softer_gui", rev = "de63f083ea670b4e453710863c83e3d9a03d9906" }
+# Pinned to a commit: the clipboard, set_cursor, the Windows request_frame fix and the macOS close fix (EVENT_CLOSE
+# only from the red button or Quit, never from a minimized or hidden window) are in no crates.io release yet.
+softer_gui = { git = "https://github.com/ShieldedLabs/softer_gui", rev = "9b19e0e36b8e3dbca0c85b4f7ed034fc9a113bcd" }
 num_cpus = "1.17.0"
 ahash = "0.8.12"
 rustybuzz = "0.20.1"
