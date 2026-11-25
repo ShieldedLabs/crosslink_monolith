@@ -1432,7 +1432,7 @@ enum Source {
     Stored,
 }
 
-/// What `BftRunner::admit_decision` does with a decision, as bits. The low bits are the checks,
+/// What `BftRunner::store_decision` does with a decision, as bits. The low bits are the checks,
 /// numbered in the order it runs them; a source starts from all of them and opts out of those an
 /// assumption makes unnecessary, naming the assumption where it does. The high bits say how it
 /// answers some outcomes.
@@ -1490,16 +1490,6 @@ const KEEP_ONLY_FRESH_PROPOSAL_SIGS: Admission = 1 << 21;
 /// its height, stake, certificate and proposal are not run. It does run the block rules again,
 /// because the chain can move between its validation and its decision.
 const ASSUME_TENDERLINK_DECIDES_ON_ITS_OWN_QUORUM: () = ();
-
-/// What `BftRunner::admit_decision` found a decision to be.
-enum Admitted {
-    /// Store it, voted on by `voting`, keeping `proposal_sigs`.
-    New { block_hash: Blake3Hash, voting: Arc<VotingRoster>, proposal_sigs: Vec<TMSig> },
-    /// Stored already: this block, or for tenderlink's own decision possibly another (reported).
-    AlreadyDecided,
-    /// Validation cannot settle it until a missing block is back.
-    Park { block_hash: Blake3Hash, reason: TMStatusReason },
-}
 
 /// What `BftRunner::store_decision` did with a decision it did not refuse.
 enum Stored {
@@ -1594,8 +1584,8 @@ pub(super) struct BftRunner {
     restoring: bool,
     /// The height and certificate of the last fetched decision `fetch_window` found valid. A
     /// decision waiting for its snapshot is fed again on every PoW commit, and its signatures need
-    /// checking only once there; `admit_decision` checks them again before it is stored.
-    screened_certificate: std::cell::RefCell<Option<(u64, FatPointerToBftBlock)>>,
+    /// checking only once there; the quorum check runs again before it is stored.
+    screened_certificate: Option<(u64, FatPointerToBftBlock)>,
 }
 
 /// The BFT height after the last of `rounds`: where tenderlink starts when it is given them.
@@ -1808,7 +1798,7 @@ fn startup_rounds(db: &ZebraDb, voting_rosters: &[Arc<VotingRoster>], decided_n:
 const ASSUME_REPLAY_ROWS_ARE_THIS_NODES: () = ();
 
 /// Assumption, kept by `store_decision`: `apply_decision` is given only decisions
-/// `admit_decision` admitted in the same call, so it checks no signature, certificate or block
+/// `store_decision` checked in the same call, so it checks no signature, certificate or block
 /// rule itself.
 const ASSUME_ADMITTED_BEFORE_APPLY: () = ();
 
@@ -1949,7 +1939,7 @@ impl BftRunner {
             has_wal: false,
             stored_from: None,
             restoring: false,
-            screened_certificate: std::cell::RefCell::new(None),
+            screened_certificate: None,
         };
         metrics::gauge!("state.crosslink.bft_dropped").set(0.0);
         *BFT_DB.write().unwrap() = Some(block_writer.finalized_state.db.clone());
@@ -2202,232 +2192,6 @@ impl BftRunner {
                 let _ = self.store_decision(source, &block, &fat_pointer, &proposal_sigs, Some(reply), read_state, block_writer);
             }
         }
-    }
-
-    /// The checks a decision gets before it is stored, as one pipeline: its source sets which run
-    /// and how some outcomes are answered (`Admission`), then they run in one order. Each check a
-    /// source ran before still runs for it, and in the same order where the order decides the
-    /// answer. Nothing is written here. Tenderlink's own decision can still panic here on a fact
-    /// only a bug could break; a conflict or a block rule that now refuses it is reported, never a
-    /// halt or a crash.
-    fn admit_decision(
-        &self,
-        source: Source,
-        block: &BftBlock,
-        fat_pointer: &FatPointerToBftBlock,
-        proposal_sigs: &[TMSig],
-        read_state: &ReadState,
-        block_writer: &WriteBlockWorkerTask,
-    ) -> Result<Admitted, Refusal> {
-        if bft_is_dropped() {
-            return Err(Refusal::not_yet("BFT is dropped on this node".to_string()));
-        }
-        let height = u64::from(block.height);
-        // Who votes at the next height: the tip's roster for it.
-        let voting = self.next_voting_roster(&BFT_CHAIN.read().unwrap());
-
-        let (opt_out, answers, seen_as, valid_round) = match source {
-            // Nothing vouches for it but its certificate. Heights below the next are checked by
-            // the sync loop (`check_decided_height`); linkage and headers are block rules here.
-            Source::Fetched => (
-                CHECK_DECIDED_HEIGHT | CHECK_LINKS_TO_TIP | CHECK_HEADERS | CHECK_PROPOSAL_ROSTER,
-                KEEP_ONLY_FRESH_PROPOSAL_SIGS,
-                "a peer served",
-                -1,
-            ),
-            // Supplied from outside, for any height and answered at once. Linkage and headers are
-            // block rules here. A quorum is needed where the import asks for one or the roster
-            // decides by the strict quorum.
-            Source::Imported { valid_round, require_certificate } => (
-                CHECK_GENESIS_NOT_FETCHED | CHECK_NEXT_HEIGHT | CHECK_ROSTER_STAKE | CHECK_CERTIFICATE_EARLY
-                    | CHECK_SNAPSHOT_HELD | CHECK_LINKS_TO_TIP | CHECK_HEADERS
-                    | CHECK_QUORUM * Admission::from(!require_certificate && !voting.strict_quorum),
-                CONFLICT_REFUSES,
-                "an import carried",
-                valid_round,
-            ),
-            Source::Tenderlink => {
-                let () = ASSUME_TENDERLINK_DECIDES_ON_ITS_OWN_QUORUM;
-                (
-                    CHECK_PARKED | CHECK_GENESIS_NOT_FETCHED | CHECK_NEXT_HEIGHT | CHECK_ROSTER_STAKE
-                        | CHECK_CERTIFICATE_EARLY | CHECK_SNAPSHOT_HELD | CHECK_LINKS_TO_TIP | CHECK_HEADERS
-                        | CHECK_FITS_ROSTER | CHECK_QUORUM | CHECK_PROPOSAL_ROSTER,
-                    FAULTS_ARE_BUGS | PARK_UNSETTLED | REPORT_REFUSED_RULES,
-                    "this node's tenderlink decided",
-                    -1,
-                )
-            }
-            // A row this node stored: it gets the checks `restore` gives the rows it replays.
-            Source::Stored => {
-                let () = ASSUME_REPLAY_ROWS_ARE_THIS_NODES;
-                (
-                    CHECK_NAMES_BLOCK | CHECK_DECIDED_HEIGHT | CHECK_GENESIS_NOT_FETCHED | CHECK_ROSTER_STAKE
-                        | CHECK_CERTIFICATE_EARLY | CHECK_FITS_ROSTER | CHECK_BLOCK_RULES | CHECK_SIGNATURES
-                        | CHECK_QUORUM | CHECK_PROPOSAL_ROSTER,
-                    MARK_MISSING_SNAPSHOT,
-                    "this node stored",
-                    -1,
-                )
-            }
-        };
-        let admission = (CHECK_ALL & !opt_out) | answers;
-        let does = |what: Admission| admission & what != 0;
-        // A broken fact: the sender's fault, or a bug in this node.
-        let fault = |why: String| {
-            if does(FAULTS_ARE_BUGS) {
-                panic!("{why}");
-            }
-            Refusal::fault(why)
-        };
-
-        // Hashing re-serializes the block, so it is done once.
-        let block_hash = block.blake3_hash();
-        if does(CHECK_NAMES_BLOCK) && fat_pointer.points_at_block_hash() != block_hash {
-            return Err(fault(format!(
-                "Fat Pointer hash does not match block hash. fp: {} block: {}",
-                fat_pointer.points_at_block_hash(), block_hash,
-            )));
-        }
-        // Tenderlink decides one height at a time, so it can be at a height the sync loop has
-        // decided from peers since; the stored decision stands. Another block there needs a
-        // conflicting quorum: finalizers equivocated, which is reported, never a halt.
-        if does(CHECK_DECIDED_HEIGHT) && height < decided_len() {
-            return match self.check_decided_height(block, fat_pointer, seen_as) {
-                DecidedCheck::Same => Ok(Admitted::AlreadyDecided),
-                DecidedCheck::Invalid { why } if does(FAULTS_ARE_BUGS) => panic!("{why}"),
-                DecidedCheck::Invalid { why } => Err(Refusal::refused(why)),
-                DecidedCheck::Conflict if does(CONFLICT_REFUSES) => Err(Refusal::refused(format!(
-                    "BFT height {height} is decided already with another block; this one's certificate is valid, \
-                     so it is reported as a conflicting quorum",
-                ))),
-                DecidedCheck::NotChecked if does(CONFLICT_REFUSES) => {
-                    Err(Refusal::refused(format!("BFT height {height} is decided already with another block")))
-                }
-                DecidedCheck::Conflict | DecidedCheck::NotChecked => Ok(Admitted::AlreadyDecided),
-            };
-        }
-        // A decision at the next height is final already and waits only for its snapshot;
-        // storing another one there would fork the chain under it.
-        if does(CHECK_PARKED) && self.parked_decision.is_some() {
-            return Err(Refusal::not_yet("a decided BFT block is waiting for its snapshot".to_string()));
-        }
-        // Judged by our bootstrap config, so not the sender's fault.
-        if does(CHECK_GENESIS_NOT_FETCHED) && height == 0 && !self.fetches_genesis() {
-            return Err(Refusal::refused("genesis is derived from the chain, never fetched".to_string()));
-        }
-        if does(CHECK_NEXT_HEIGHT) && height != decided_len() {
-            return Err(Refusal::not_yet(format!("BFT height {height} is not the next height to decide")));
-        }
-        // Past genesis, a roster with no stake has no honest decision to accept: the chain has
-        // failed, and only an operator can move it on (an import). Hold the decision, say so once.
-        if does(CHECK_ROSTER_STAKE) && height > 0 && voting.roster.iter().map(|member| member.stake).sum::<u64>() == 0 {
-            if !ZERO_STAKE_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::error!(
-                    "crosslink: BFT height {} has no stake in its roster, so no decision there is accepted from peers. \
-                     BFT cannot continue without manual intervention.",
-                    height,
-                );
-            }
-            return Err(Refusal::not_yet(format!("BFT height {height} has no stake in its roster")));
-        }
-        // A decision that waits for its snapshot keeps its height in the sync loop's fetch
-        // window, and the loop asks nobody else for a height it holds. So before one may wait it
-        // must be a valid certificate for this height, which needs only what this node holds;
-        // otherwise any peer could hold a height with a block on a made-up snapshot. Checked once
-        // per decision, not on every PoW commit while it waits; `CHECK_QUORUM` checks it again
-        // before it is stored.
-        if does(CHECK_CERTIFICATE_EARLY) {
-            let mut screened = self.screened_certificate.borrow_mut();
-            if screened.as_ref() != Some(&(height, fat_pointer.clone())) {
-                if !certificate_is_valid(fat_pointer, height, &voting) {
-                    return Err(Refusal::refused(format!("the fat pointer is not a valid certificate for BFT height {height}")));
-                }
-                *screened = Some((height, fat_pointer.clone()));
-            }
-        }
-        // Nothing about it settles before its snapshot is committed. Checking that first keeps a
-        // decision waiting in the fetch window from being verified again on every PoW commit.
-        if does(CHECK_SNAPSHOT_HELD) {
-            let snapshot = Hash(block.snapshot_block_hash().0);
-            if read_state.known_block(snapshot).is_none() {
-                if does(MARK_MISSING_SNAPSHOT) {
-                    // On the decided chain: fetched whatever height a peer alleges, and never expired.
-                    DECIDED_MISSING_POW_BLOCKS.lock().unwrap().insert(snapshot);
-                }
-                return Err(Refusal::not_yet(format!("the snapshot of BFT height {height} is not held yet")));
-            }
-        }
-        if does(CHECK_LINKS_TO_TIP) && !links_to_tip(&BFT_CHAIN.read().unwrap(), block) {
-            return Err(Refusal::refused(format!("the stored decision at BFT height {height} does not link to the decided tip")));
-        }
-        // `store_decision` stores no block without headers.
-        if does(CHECK_HEADERS) && block.headers.is_empty() {
-            return Err(Refusal::refused(format!("BFT height {height} is stored without headers")));
-        }
-        if does(CHECK_FITS_ROSTER) && !fat_pointer.fits_active_roster(&self.params) {
-            return Err(Refusal::refused(format!(
-                "the fat pointer has {} signatures, more than the {} seats of the active roster",
-                fat_pointer.signatures.len(), self.params.active_roster_max_n,
-            )));
-        }
-        if does(CHECK_BLOCK_RULES) {
-            let (status, reason) = self.validate_with_hash(&BFT_CHAIN.read().unwrap(), read_state, block, block_hash);
-            match status {
-                TMStatus::Pass => {}
-                // Tenderlink decides only on a Pass from this node, so the block this
-                // re-validation lacks was here then and has been dropped from the non-finalized
-                // state since. The decision is final regardless; it is recorded once that block is
-                // back. Recording it now with the last roster would guess the next height's
-                // validator set, which is the stake at a snapshot this node does not hold.
-                TMStatus::Indeterminate if does(PARK_UNSETTLED) => return Ok(Admitted::Park { block_hash, reason }),
-                // A fetched decision waits in the fetch window; an import is answered at once.
-                TMStatus::Indeterminate => {
-                    return Err(Refusal::not_yet(format!("PoS validation = {status:?}: {reason:?}")));
-                }
-                TMStatus::Fail => {
-                    // Tenderlink validated the proposal against this node's chain when it arrived,
-                    // so a rule that refuses it now means that chain moved under it. Not stored and
-                    // not a crash: tenderlink waits at this height until the tip passes it.
-                    if does(REPORT_REFUSED_RULES) {
-                        metrics::counter!("state.crosslink.bft_own_decisions_refused").increment(1);
-                        tracing::error!(
-                            "crosslink: this node's tenderlink decided BFT block {} at height {}, which now fails this \
-                             node's block rules ({reason:?}). It is not stored; tenderlink waits until that height is \
-                             decided from peers.",
-                            block_hash, block.height,
-                        );
-                    }
-                    return Err(Refusal::refused(format!("PoS validation = {status:?}: {reason:?}")));
-                }
-            }
-        }
-        // Vote namespacing: the precommit signatures were made at this block's height with that
-        // height's namespace folded in, so they are verified with the same namespace. Without the
-        // quorum check, a node would hand miners, as the tip's certificate, a pointer its own
-        // admission refuses.
-        if does(CHECK_QUORUM) {
-            if !certificate_is_valid(fat_pointer, height, &voting) {
-                return Err(Refusal::refused(format!("the fat pointer is not a valid certificate for BFT height {height}")));
-            }
-        } else if does(CHECK_SIGNATURES) && !fat_pointer.validate_signatures(&voting.vote_namespace) {
-            if does(FAULTS_ARE_BUGS) {
-                panic!("Signatures are not valid. Rejecting block.");
-            }
-            return Err(Refusal::refused(format!(
-                "the fat pointer for BFT height {height} carries a signature that does not verify",
-            )));
-        }
-        if does(CHECK_PROPOSAL_ROSTER) {
-            self.check_decision_roster(block, fat_pointer, proposal_sigs, valid_round, block_writer).map_err(Refusal::refused)?;
-        }
-        // The certificate is what makes a fetched decision decided. Its proposal signatures are
-        // kept only if they verify as a fresh proposal's.
-        let proposal_sigs = if does(KEEP_ONLY_FRESH_PROPOSAL_SIGS) {
-            fresh_proposal_sigs(block, fat_pointer, proposal_sigs.to_vec(), &voting, self.params.active_roster_max_n)
-        } else {
-            proposal_sigs.to_vec()
-        };
-        Ok(Admitted::New { block_hash, voting, proposal_sigs })
     }
 
     /// A force-fed decision against the roster, as a real network has one. The genesis decision is
@@ -2887,13 +2651,15 @@ impl BftRunner {
     }
 
     /// Every decision this node stores comes through here: tenderlink's own, one fetched from a
-    /// peer, or one supplied from outside. `admit_decision` checks it by its source; a decision
-    /// it admits is applied to the chain in one step (`apply_decision`), then written and its tip
-    /// published (`finish_decision`). Its snapshot is not finalized here: a decision only moves
-    /// the final snapshot (FINALITY.md §4.3). Only an import has a `reply`, answered here whatever
-    /// happens: `Ok`, or why it was refused. Tenderlink follows the published tip instead. A
-    /// refused decision is returned as such; tenderlink's own that cannot be settled until a
-    /// missing block is back is parked.
+    /// peer, one supplied from outside, or one it stored before it restarted. Its source sets
+    /// which checks it gets and how some outcomes are answered (`Admission`); they run as one
+    /// pipeline, and nothing is written until they pass. Then it is applied to the chain in one
+    /// step (`apply_decision`), written, and its tip published (`finish_decision`). Its snapshot
+    /// is not finalized here: a decision only moves the final snapshot (FINALITY.md §4.3). Only an
+    /// import has a `reply`, answered here whatever happens: `Ok`, or why it was refused.
+    /// Tenderlink follows the published tip instead. Tenderlink's own decision can still panic
+    /// here on a fact only a bug could break; a conflict or a block rule that now refuses it is
+    /// reported, never a halt or a crash.
     fn store_decision(
         &mut self,
         source: Source,
@@ -2904,46 +2670,250 @@ impl BftRunner {
         read_state: &ReadState,
         block_writer: &mut WriteBlockWorkerTask,
     ) -> Result<Stored, Refusal> {
-        let admitted = match self.admit_decision(source, block, fat_pointer, proposal_sigs, read_state, block_writer) {
+        let admitted: Result<(Blake3Hash, Arc<VotingRoster>, Vec<TMSig>), Refusal> = 'admit: {
+            if bft_is_dropped() {
+                break 'admit Err(Refusal::not_yet("BFT is dropped on this node".to_string()));
+            }
+            let height = u64::from(block.height);
+            // Who votes at the next height: the tip's roster for it.
+            let voting = self.next_voting_roster(&BFT_CHAIN.read().unwrap());
+
+            let (opt_out, answers, seen_as, valid_round) = match source {
+                // Nothing vouches for it but its certificate. Heights below the next are checked by
+                // the sync loop (`check_decided_height`); linkage and headers are block rules here.
+                Source::Fetched => (
+                    CHECK_DECIDED_HEIGHT | CHECK_LINKS_TO_TIP | CHECK_HEADERS | CHECK_PROPOSAL_ROSTER,
+                    KEEP_ONLY_FRESH_PROPOSAL_SIGS,
+                    "a peer served",
+                    -1,
+                ),
+                // Supplied from outside, for any height and answered at once. Linkage and headers are
+                // block rules here. A quorum is needed where the import asks for one or the roster
+                // decides by the strict quorum.
+                Source::Imported { valid_round, require_certificate } => (
+                    CHECK_GENESIS_NOT_FETCHED | CHECK_NEXT_HEIGHT | CHECK_ROSTER_STAKE | CHECK_CERTIFICATE_EARLY
+                        | CHECK_SNAPSHOT_HELD | CHECK_LINKS_TO_TIP | CHECK_HEADERS
+                        | CHECK_QUORUM * Admission::from(!require_certificate && !voting.strict_quorum),
+                    CONFLICT_REFUSES,
+                    "an import carried",
+                    valid_round,
+                ),
+                Source::Tenderlink => {
+                    let () = ASSUME_TENDERLINK_DECIDES_ON_ITS_OWN_QUORUM;
+                    (
+                        CHECK_PARKED | CHECK_GENESIS_NOT_FETCHED | CHECK_NEXT_HEIGHT | CHECK_ROSTER_STAKE
+                            | CHECK_CERTIFICATE_EARLY | CHECK_SNAPSHOT_HELD | CHECK_LINKS_TO_TIP | CHECK_HEADERS
+                            | CHECK_FITS_ROSTER | CHECK_QUORUM | CHECK_PROPOSAL_ROSTER,
+                        FAULTS_ARE_BUGS | PARK_UNSETTLED | REPORT_REFUSED_RULES,
+                        "this node's tenderlink decided",
+                        -1,
+                    )
+                }
+                // A row this node stored: it gets the checks `restore` gives the rows it replays.
+                Source::Stored => {
+                    let () = ASSUME_REPLAY_ROWS_ARE_THIS_NODES;
+                    (
+                        CHECK_NAMES_BLOCK | CHECK_DECIDED_HEIGHT | CHECK_GENESIS_NOT_FETCHED | CHECK_ROSTER_STAKE
+                            | CHECK_CERTIFICATE_EARLY | CHECK_FITS_ROSTER | CHECK_BLOCK_RULES | CHECK_SIGNATURES
+                            | CHECK_QUORUM | CHECK_PROPOSAL_ROSTER,
+                        MARK_MISSING_SNAPSHOT,
+                        "this node stored",
+                        -1,
+                    )
+                }
+            };
+            let admission = (CHECK_ALL & !opt_out) | answers;
+            let does = |what: Admission| admission & what != 0;
+            // A broken fact: the sender's fault, or a bug in this node.
+            let fault = |why: String| {
+                if does(FAULTS_ARE_BUGS) {
+                    panic!("{why}");
+                }
+                Refusal::fault(why)
+            };
+
+            // Hashing re-serializes the block, so it is done once.
+            let block_hash = block.blake3_hash();
+            if does(CHECK_NAMES_BLOCK) && fat_pointer.points_at_block_hash() != block_hash {
+                break 'admit Err(fault(format!(
+                    "Fat Pointer hash does not match block hash. fp: {} block: {}",
+                    fat_pointer.points_at_block_hash(), block_hash,
+                )));
+            }
+            // Tenderlink decides one height at a time, so it can be at a height the sync loop has
+            // decided from peers since; the stored decision stands. Another block there needs a
+            // conflicting quorum: finalizers equivocated, which is reported, never a halt.
+            if does(CHECK_DECIDED_HEIGHT) && height < decided_len() {
+                match self.check_decided_height(block, fat_pointer, seen_as) {
+                    DecidedCheck::Invalid { why } if does(FAULTS_ARE_BUGS) => panic!("{why}"),
+                    DecidedCheck::Invalid { why } => break 'admit Err(Refusal::refused(why)),
+                    DecidedCheck::Conflict if does(CONFLICT_REFUSES) => break 'admit Err(Refusal::refused(format!(
+                        "BFT height {height} is decided already with another block; this one's certificate is valid, \
+                         so it is reported as a conflicting quorum",
+                    ))),
+                    DecidedCheck::NotChecked if does(CONFLICT_REFUSES) => {
+                        break 'admit Err(Refusal::refused(format!("BFT height {height} is decided already with another block")));
+                    }
+                    DecidedCheck::Same | DecidedCheck::Conflict | DecidedCheck::NotChecked => {
+                        // An import is accepted once; saying so beats a roster check of the wrong
+                        // height that would refuse it for a reason that is not true.
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Err(format!("BFT height {} is decided already with this block", block.height)));
+                        }
+                        return Ok(Stored::AlreadyDecided);
+                    }
+                }
+            }
+            // A decision at the next height is final already and waits only for its snapshot;
+            // storing another one there would fork the chain under it.
+            if does(CHECK_PARKED) && self.parked_decision.is_some() {
+                break 'admit Err(Refusal::not_yet("a decided BFT block is waiting for its snapshot".to_string()));
+            }
+            // Judged by our bootstrap config, so not the sender's fault.
+            if does(CHECK_GENESIS_NOT_FETCHED) && height == 0 && !self.fetches_genesis() {
+                break 'admit Err(Refusal::refused("genesis is derived from the chain, never fetched".to_string()));
+            }
+            if does(CHECK_NEXT_HEIGHT) && height != decided_len() {
+                break 'admit Err(Refusal::not_yet(format!("BFT height {height} is not the next height to decide")));
+            }
+            // Past genesis, a roster with no stake has no honest decision to accept: the chain has
+            // failed, and only an operator can move it on (an import). Hold the decision, say so once.
+            if does(CHECK_ROSTER_STAKE) && height > 0 && voting.roster.iter().map(|member| member.stake).sum::<u64>() == 0 {
+                if !ZERO_STAKE_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::error!(
+                        "crosslink: BFT height {} has no stake in its roster, so no decision there is accepted from peers. \
+                         BFT cannot continue without manual intervention.",
+                        height,
+                    );
+                }
+                break 'admit Err(Refusal::not_yet(format!("BFT height {height} has no stake in its roster")));
+            }
+            // A decision that waits for its snapshot keeps its height in the sync loop's fetch
+            // window, and the loop asks nobody else for a height it holds. So before one may wait it
+            // must be a valid certificate for this height, which needs only what this node holds;
+            // otherwise any peer could hold a height with a block on a made-up snapshot. Checked once
+            // per decision, not on every PoW commit while it waits; `CHECK_QUORUM` checks it again
+            // before it is stored.
+            if does(CHECK_CERTIFICATE_EARLY) && self.screened_certificate.as_ref() != Some(&(height, fat_pointer.clone())) {
+                if !certificate_is_valid(fat_pointer, height, &voting) {
+                    break 'admit Err(Refusal::refused(format!("the fat pointer is not a valid certificate for BFT height {height}")));
+                }
+                self.screened_certificate = Some((height, fat_pointer.clone()));
+            }
+            // Nothing about it settles before its snapshot is committed. Checking that first keeps a
+            // decision waiting in the fetch window from being verified again on every PoW commit.
+            if does(CHECK_SNAPSHOT_HELD) {
+                let snapshot = Hash(block.snapshot_block_hash().0);
+                if read_state.known_block(snapshot).is_none() {
+                    if does(MARK_MISSING_SNAPSHOT) {
+                        // On the decided chain: fetched whatever height a peer alleges, and never expired.
+                        DECIDED_MISSING_POW_BLOCKS.lock().unwrap().insert(snapshot);
+                    }
+                    break 'admit Err(Refusal::not_yet(format!("the snapshot of BFT height {height} is not held yet")));
+                }
+            }
+            if does(CHECK_LINKS_TO_TIP) && !links_to_tip(&BFT_CHAIN.read().unwrap(), block) {
+                break 'admit Err(Refusal::refused(format!("the stored decision at BFT height {height} does not link to the decided tip")));
+            }
+            // `store_decision` stores no block without headers.
+            if does(CHECK_HEADERS) && block.headers.is_empty() {
+                break 'admit Err(Refusal::refused(format!("BFT height {height} is stored without headers")));
+            }
+            if does(CHECK_FITS_ROSTER) && !fat_pointer.fits_active_roster(&self.params) {
+                break 'admit Err(Refusal::refused(format!(
+                    "the fat pointer has {} signatures, more than the {} seats of the active roster",
+                    fat_pointer.signatures.len(), self.params.active_roster_max_n,
+                )));
+            }
+            if does(CHECK_BLOCK_RULES) {
+                let (status, reason) = self.validate_with_hash(&BFT_CHAIN.read().unwrap(), read_state, block, block_hash);
+                match status {
+                    TMStatus::Pass => {}
+                    // Tenderlink decides only on a Pass from this node, so the block this
+                    // re-validation lacks was here then and has been dropped from the non-finalized
+                    // state since. The decision is final regardless; it is recorded once that block is
+                    // back. Recording it now with the last roster would guess the next height's
+                    // validator set, which is the stake at a snapshot this node does not hold.
+                    TMStatus::Indeterminate if does(PARK_UNSETTLED) => {
+                        if self.retrying_parked_decision {
+                            tracing::debug!("decided BFT block {} at height {} is still parked: {reason:?}", block_hash, block.height);
+                        } else {
+                            tracing::warn!("parking decided BFT block {} at height {}: {reason:?}", block_hash, block.height);
+                        }
+                        if let TMStatusReason::NeedsBlock { hash } = &reason {
+                            // The proposal holds a decision's worth of precommits, so the block it
+                            // needs is on the decided chain: fetched whatever height a peer alleges,
+                            // and BFT is dropped if it turns out to conflict with a committed block.
+                            DECIDED_MISSING_POW_BLOCKS.lock().unwrap().insert(Hash(*hash));
+                        }
+                        publish_parked_decision_height(Some(height));
+                        self.parked_decision = Some(ParkedDecision {
+                            source,
+                            block: block.clone(),
+                            fat_pointer: fat_pointer.clone(),
+                            proposal_sigs: proposal_sigs.to_vec(),
+                            reply,
+                        });
+                        return Ok(Stored::Parked);
+                    }
+                    // A fetched decision waits in the fetch window; an import is answered at once.
+                    TMStatus::Indeterminate => {
+                        break 'admit Err(Refusal::not_yet(format!("PoS validation = {status:?}: {reason:?}")));
+                    }
+                    TMStatus::Fail => {
+                        // Tenderlink validated the proposal against this node's chain when it arrived,
+                        // so a rule that refuses it now means that chain moved under it. Not stored and
+                        // not a crash: tenderlink waits at this height until the tip passes it.
+                        if does(REPORT_REFUSED_RULES) {
+                            metrics::counter!("state.crosslink.bft_own_decisions_refused").increment(1);
+                            tracing::error!(
+                                "crosslink: this node's tenderlink decided BFT block {} at height {}, which now fails this \
+                                 node's block rules ({reason:?}). It is not stored; tenderlink waits until that height is \
+                                 decided from peers.",
+                                block_hash, block.height,
+                            );
+                        }
+                        break 'admit Err(Refusal::refused(format!("PoS validation = {status:?}: {reason:?}")));
+                    }
+                }
+            }
+            // Vote namespacing: the precommit signatures were made at this block's height with that
+            // height's namespace folded in, so they are verified with the same namespace. Without the
+            // quorum check, a node would hand miners, as the tip's certificate, a pointer its own
+            // admission refuses.
+            if does(CHECK_QUORUM) {
+                if !certificate_is_valid(fat_pointer, height, &voting) {
+                    break 'admit Err(Refusal::refused(format!("the fat pointer is not a valid certificate for BFT height {height}")));
+                }
+            } else if does(CHECK_SIGNATURES) && !fat_pointer.validate_signatures(&voting.vote_namespace) {
+                if does(FAULTS_ARE_BUGS) {
+                    panic!("Signatures are not valid. Rejecting block.");
+                }
+                break 'admit Err(Refusal::refused(format!(
+                    "the fat pointer for BFT height {height} carries a signature that does not verify",
+                )));
+            }
+            if does(CHECK_PROPOSAL_ROSTER) {
+                if let Err(why) = self.check_decision_roster(block, fat_pointer, proposal_sigs, valid_round, block_writer) {
+                    break 'admit Err(Refusal::refused(why));
+                }
+            }
+            // The certificate is what makes a fetched decision decided. Its proposal signatures are
+            // kept only if they verify as a fresh proposal's.
+            let proposal_sigs = if does(KEEP_ONLY_FRESH_PROPOSAL_SIGS) {
+                fresh_proposal_sigs(block, fat_pointer, proposal_sigs.to_vec(), &voting, self.params.active_roster_max_n)
+            } else {
+                proposal_sigs.to_vec()
+            };
+            Ok((block_hash, voting, proposal_sigs))
+        };
+        let (block_hash, voted, proposal_sigs) = match admitted {
             Ok(admitted) => admitted,
             Err(refusal) => {
                 if let Some(reply) = reply {
                     let _ = reply.send(Err(refusal.why.clone()));
                 }
                 return Err(refusal);
-            }
-        };
-        let (block_hash, voted, proposal_sigs) = match admitted {
-            Admitted::New { block_hash, voting, proposal_sigs } => (block_hash, voting, proposal_sigs),
-            Admitted::AlreadyDecided => {
-                // An import is accepted once; saying so beats a roster check of the wrong height
-                // that would refuse it for a reason that is not true.
-                if let Some(reply) = reply {
-                    let _ = reply.send(Err(format!("BFT height {} is decided already with this block", block.height)));
-                }
-                return Ok(Stored::AlreadyDecided);
-            }
-            Admitted::Park { block_hash, reason } => {
-                if self.retrying_parked_decision {
-                    tracing::debug!("decided BFT block {} at height {} is still parked: {reason:?}", block_hash, block.height);
-                } else {
-                    tracing::warn!("parking decided BFT block {} at height {}: {reason:?}", block_hash, block.height);
-                }
-                if let (Source::Tenderlink, TMStatusReason::NeedsBlock { hash }) = (source, &reason) {
-                    // The proposal holds a decision's worth of precommits, so the block it needs
-                    // is on the decided chain: fetched whatever height a peer alleges, and BFT is
-                    // dropped if it turns out to conflict with a committed block.
-                    DECIDED_MISSING_POW_BLOCKS.lock().unwrap().insert(Hash(*hash));
-                }
-                publish_parked_decision_height(Some(u64::from(block.height)));
-                self.parked_decision = Some(ParkedDecision {
-                    source,
-                    block: block.clone(),
-                    fat_pointer: fat_pointer.clone(),
-                    proposal_sigs: proposal_sigs.to_vec(),
-                    reply,
-                });
-                return Ok(Stored::Parked);
             }
         };
 
@@ -2955,10 +2925,10 @@ impl BftRunner {
         let new_final_hash = Hash(block.snapshot_block_hash().0);
         let new_final_height = read_state
             .known_block(new_final_hash)
-            .expect("admit_decision validated it, and validation requires the snapshot to be known")
+            .expect("the block rules passed, and they require the snapshot to be known")
             .height;
         let stakes = stakes_at(block_writer, new_final_hash);
-        // Read before the lock, still true under it; so is what `admit_decision` checked.
+        // Read before the lock, still true under it; so is what was checked above.
         let () = ASSUME_SYNC_THREAD_SOLE_WRITER;
 
         let tip = {
