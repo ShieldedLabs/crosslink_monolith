@@ -128,12 +128,225 @@ struct Step {
 }
 
 /// A lint finding as a sweep follows it. `key` is what makes it the same fault at another step.
+#[derive(Clone)]
 struct Fault { key: String, kind: &'static str, text: String, detail: String, b: [i32; 4] }
 
 /// A fault over a sweep: the first and last steps it held at, how many it held at, and the
 /// step it was at its worst.
 #[derive(Debug, Clone, PartialEq)]
 struct Span { key: String, first: usize, last: usize, held: usize, worst: usize }
+
+/// Something `explore` presses: its box, and the text that names it.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct Aim { b: [i32; 4], label: String }
+
+impl Aim {
+    /// How a report names it: by its text, or by its place if it has no text of its own.
+    fn say(&self) -> String {
+        if self.label.starts_with('(') || self.label.starts_with('<') { format!("{} at {},{}", self.label, self.b[0], self.b[1]) } else { quoted(&self.label) }
+    }
+}
+
+/// A screen at rest, as `explore` tells one from another: its texts and what can be pressed,
+/// its lint findings, and its pixels.
+struct Look { shown: (Vec<Shown>, Vec<Shown>), faults: Vec<Fault>, pixels: Vec<u32> }
+
+/// What a press changed on a screen, by name: the texts and the things to press that it
+/// brought and that it took away, each with how many the screen had before, and whether it
+/// is something to press. A later screen has the press undone when none of what it brought
+/// is left and all it took away is back, whatever else has changed since: a press that
+/// nothing undoes, such as one on a slider, leaves its mark on every screen after it.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct Change { brought: Vec<(bool, String, usize)>, took: Vec<(bool, String, usize)>, was: (Vec<Shown>, Vec<Shown>) }
+
+impl Change {
+    fn between(was: &(Vec<Shown>, Vec<Shown>), now: &(Vec<Shown>, Vec<Shown>)) -> Change {
+        let count = |v: &[Shown], name: &str| v.iter().filter(|s| s.text == name).count();
+        let mut change = Change { was: was.clone(), ..Change::default() };
+        for (press, a, b) in [(false, &was.0, &now.0), (true, &was.1, &now.1)] {
+            let mut names: Vec<&str> = a.iter().chain(b.iter()).map(|s| s.text.as_str()).collect();
+            names.sort();
+            names.dedup();
+            for name in names {
+                // A scroll bar's thumb has no text, and comes and goes with what it scrolls.
+                if press && name == "(no text)" { continue; }
+                let (n, m) = (count(a, name), count(b, name));
+                if m > n { change.brought.push((press, name.to_string(), n)); }
+                if m < n { change.took.push((press, name.to_string(), n)); }
+            }
+        }
+        change
+    }
+
+    fn undone(&self, now: &(Vec<Shown>, Vec<Shown>)) -> bool {
+        // A press that only moved or recoloured things is undone when they are all back.
+        if self.brought.is_empty() && self.took.is_empty() { return *now == self.was; }
+        let count = |press: bool, name: &str| (if press { &now.1 } else { &now.0 }).iter().filter(|s| s.text == name).count();
+        self.brought.iter().all(|(press, name, n)| count(*press, name) <= *n) && self.took.iter().all(|(press, name, n)| count(*press, name) >= *n)
+    }
+
+    /// Whether something the press brought is on a later screen. What it took away says
+    /// less: a press that opens one menu may be what shuts another.
+    fn shows(&self, now: &(Vec<Shown>, Vec<Shown>)) -> bool {
+        let count = |press: bool, name: &str| (if press { &now.1 } else { &now.0 }).iter().filter(|s| s.text == name).count();
+        self.brought.iter().any(|(press, name, n)| count(*press, name) > *n)
+    }
+}
+
+/// The level a screen is that of, if a press has been undone on it: the level before the
+/// outermost one whose opening is undone, or else the deepest if `own` is undone.
+fn level_of(levels: &[Level], own: Option<&Change>, now: &(Vec<Shown>, Vec<Shown>)) -> Option<usize> {
+    if let Some(j) = (1..levels.len()).find(|j| levels[*j].change.undone(now)) { return Some(j - 1); }
+    own.filter(|c| c.undone(now)).map(|_| levels.len() - 1)
+}
+
+/// How many pixels differ between two screens of one size: outside a box, and inside it.
+fn differing(a: &[u32], b: &[u32], width: usize, apart: Option<[i32; 4]>) -> (usize, usize) {
+    if a.len() != b.len() { return (a.len().max(b.len()), 0); }
+    let (mut out, mut inside) = (0, 0);
+    for (i, (p, q)) in a.iter().zip(b).enumerate() {
+        if (p ^ q) & 0xffffff == 0 { continue; }
+        let at = [(i % width.max(1)) as i32, (i / width.max(1)) as i32];
+        if apart.is_some_and(|r| holds(r, at)) { inside += 1; } else { out += 1; }
+    }
+    (out, inside)
+}
+
+/// Takes a level up again on the screen as it now is. What is left of its list from `from`
+/// on is found where it now lies, by its box or else by its name and size, since a press
+/// that nothing undid may have moved it. Gives what could not be found.
+fn refit(level: &mut Level, from: usize, look: Look) -> Vec<String> {
+    let boxed = |s: &Shown| [s.x, s.y, s.x + s.w, s.y + s.h];
+    let mut rest: Vec<(Aim, bool)> = level.list.split_off(from.min(level.list.len())).into_iter().map(|a| (a, false)).collect();
+    let mut free: Vec<&Shown> = look.shown.1.iter().collect();
+    for (a, found) in &mut rest {
+        if let Some(p) = free.iter().position(|s| boxed(s) == a.b) { free.swap_remove(p); *found = true; }
+    }
+    for (a, found) in &mut rest {
+        if *found { continue; }
+        let size = (a.b[2] - a.b[0], a.b[3] - a.b[1]);
+        let near = free.iter().enumerate().filter(|(_, s)| s.text == a.label && (s.w, s.h) == size).min_by_key(|(_, s)| (s.x - a.b[0]).abs() + (s.y - a.b[1]).abs()).map(|(p, _)| p);
+        if let Some(p) = near { a.b = boxed(free[p]); free.swap_remove(p); *found = true; }
+    }
+    let lost = rest.iter().filter(|r| !r.1).map(|r| format!("{}{}", level.path, r.0.say())).collect();
+    level.list.extend(rest.into_iter().filter(|r| r.1).map(|r| r.0));
+    level.look = look;
+    lost
+}
+
+/// A screen `explore` has reached, and how far it is through what can be pressed there.
+struct Level {
+    look: Look,
+    /// The press that led here from the level above, that press's row in the report, and
+    /// what it changed.
+    via: Option<(Aim, usize)>,
+    change: Change,
+    /// What, pressed here, led back to the level above, as a close button does.
+    closers: Vec<Aim>,
+    list: Vec<Aim>,
+    i: usize,
+    /// What the names of the screenshots taken from here start with.
+    lead: String,
+    /// The presses that led here, in words, for the next press to follow.
+    path: String,
+}
+
+/// A press that led to another screen: what changed, how the press is undone, the faults the
+/// new screen has that the one before it did not, and its screenshot.
+struct Row { path: String, words: String, back: String, brought: Vec<String>, file: String }
+
+/// A way a press may be undone.
+#[derive(Debug, Clone, PartialEq)]
+enum Try { Esc, Again, Beside(Aim), Closer(Aim), Wait }
+
+#[derive(Default)]
+enum Stage {
+    #[default]
+    Start,
+    /// Press the next thing of the deepest level, or leave the level when nothing is left.
+    Press,
+    /// The press has come to rest.
+    Seen,
+    /// A second press, after a first that only redrew, has come to rest.
+    Redone,
+    /// So many of `tries` have been made, and the last has come to rest.
+    Back(usize),
+    /// Time is passing to see whether the press undoes itself: the try to check after it,
+    /// and how many frames are left, each a sixth of a second after the last.
+    Wait(usize, usize),
+    /// The screen is that of the level before this one: press the way into this one again.
+    Enter(usize),
+    Entered(usize),
+    /// Press again, one after another, each thing a second press closed.
+    Open(usize),
+    /// The one just pressed open has come to rest.
+    Opened(usize),
+    OpenSeen,
+    /// Close them, last first: how many are left.
+    Close(usize),
+    Done,
+}
+
+/// Something pressed open among the others that a second press closes: where it was pressed,
+/// the screen before that and after it, what the press changed, and the name the thing has
+/// since.
+struct Opened { aim: Aim, was: (Vec<Shown>, Vec<Shown>), after: (Vec<Shown>, Vec<Shown>), change: Change, open_as: String }
+
+/// `explore` in progress, and what it has found so far. It presses each thing on the screen
+/// in turn, looks at the screen that leaves, presses what is new there, and undoes each
+/// press before the next, so every press starts from a screen it knows.
+#[derive(Default)]
+struct Explore {
+    name: String,
+    depth: usize,
+    /// The most presses it makes.
+    most: usize,
+    /// Where the pointer waits between presses, on nothing, and where it was at the start.
+    rest: (i32, i32),
+    mouse: (i32, i32),
+    stage: Stage,
+    levels: Vec<Level>,
+    /// The press being undone with its row and what it changed, and the ways to try in order.
+    undo: (Aim, usize, Change),
+    tries: Vec<Try>,
+
+    /// Whether frames are being drawn until `need` in a row change nothing.
+    waiting: bool,
+    need: usize,
+    prev: Vec<u32>,
+    still: usize,
+    frames: usize,
+    /// How often the screen was still changing 90 frames after a press.
+    restless: usize,
+
+    rows: Vec<Row>,
+    /// Presses that led back to a screen passed on the way.
+    closes: Vec<String>,
+    /// Presses that changed pixels and no text: how many pixels, and whether a second press
+    /// put them back.
+    drawn: Vec<(String, usize, bool)>,
+    /// Presses that changed nothing.
+    quiet: Vec<String>,
+    /// What a press left drawn that a second press did not take away, as a text field its
+    /// caret. It goes when something else is pressed, and that is not the other press's doing.
+    caret: Option<[i32; 4]>,
+    /// What on the first screen a second press closed, and each of them as it was pressed
+    /// to have them all open at once.
+    toggles: Vec<(Aim, Change)>,
+    opened: Vec<Opened>,
+    /// How the screen differs from what it was once all that was open at once is closed.
+    not_closed: String,
+    /// Every press and every try made, in order, each as the script command that makes it.
+    trail: Vec<String>,
+    pressed: usize,
+    on_screen: usize,
+    disabled: usize,
+    alike: usize,
+    /// What was to be pressed and was not: the screen it was on could not be reached again,
+    /// or `most` ran out.
+    unpressed: Vec<String>,
+    used: Vec<String>,
+}
 
 fn rng_next(state: &mut u64) -> u64 {
     *state ^= *state << 13;
@@ -184,6 +397,7 @@ pub struct ScriptWindow {
     content_lines: Vec<String>,
     sweep: Option<Sweep>,
     reflow: Option<Reflow>,
+    explore: Option<Explore>,
 }
 
 fn fail(msg: &str) {
@@ -308,6 +522,7 @@ impl ScriptWindow {
             content_lines: Vec::new(),
             sweep: None,
             reflow: None,
+            explore: None,
         };
         w.resize(MAINLINE.0, MAINLINE.1);
         report_crashes();
@@ -400,7 +615,10 @@ impl ScriptWindow {
         }
     }
 
-    fn push_render(&mut self) {
+    fn push_render(&mut self) { self.push_render_of(1); }
+
+    /// A frame that many sixtieths of a second after the last, as a slow machine draws one.
+    fn push_render_of(&mut self, sixtieths: u64) {
         self.events.push_back(Event {
             kind: EVENT_RENDER,
             width: self.width as u32,
@@ -408,7 +626,7 @@ impl ScriptWindow {
             scale_fx: (self.scale * 65536.0) as u32,
             cursor_x: (self.mouse.0 as i64) << 32,
             cursor_y: (self.mouse.1 as i64) << 32,
-            dt_fs: 1_000_000_000_000_000 / 60,
+            dt_fs: 1_000_000_000_000_000 * sixtieths / 60,
             ..Event::default()
         });
     }
@@ -579,19 +797,9 @@ impl ScriptWindow {
                     w = (cw as usize).min(self.width - x);
                     h = (ch as usize).min(self.height - y);
                 }
-                let mut rgb = Vec::with_capacity(w * h * 3);
-                for row in y..y + h {
-                    for px in &self.pixels[row * self.side + x..row * self.side + x + w] {
-                        rgb.extend_from_slice(&[(px >> 16) as u8, (px >> 8) as u8, *px as u8]);
-                    }
-                }
-                self.keep_shot(&name, &rgb, w, h);
+                self.keep_screen(&name, [x, y, w, h], [x as i32, y as i32, (x + w) as i32, (y + h) as i32]);
                 let found = self.lint();
                 self.keep_lint(&name, &found);
-                let part = [x as i32, y as i32, (x + w) as i32, (y + h) as i32];
-                for (kind, value, uses) in self.style(part) { self.style_lines.push(format!("{}\t{}\t{}\t{}", name, kind, value, uses)); }
-                let shown = self.content(&name, part);
-                self.content_lines.extend(shown);
             }
             "style" => {
                 if !self.need_fresh() { return false; }
@@ -630,13 +838,7 @@ impl ScriptWindow {
                     if !self.need_fresh() { return false; }
                     let mut list = self.shown_targets();
                     list.truncate(120);
-                    // Somewhere to park the pointer that is on no target.
-                    let mut rest = (0, 0);
-                    'find: for y in (4..self.height as i32).step_by(16) {
-                        for x in (4..self.width as i32).step_by(16) {
-                            if !self.targets.iter().any(|t| holds(t.b, [x, y])) { rest = (x, y); break 'find; }
-                        }
-                    }
+                    let rest = self.rest_spot();
                     self.sweep = Some(Sweep { list, i: 0, on: false, rest, home: self.mouse, before: Vec::new(), rows: Vec::new(), quiet: 0 });
                     self.push_move(rest.0, rest.1);
                     for _ in 0..3 { self.push_render(); }
@@ -824,7 +1026,7 @@ impl ScriptWindow {
                 if r.phase == 2 {
                     let seen = self.shown_texts();
                     let texts = once(&seen);
-                    let faults: Vec<Fault> = self.lint().into_iter().map(|f| Fault { key: format!("{}\t{}\t{}", f.kind, f.text, no_numbers(&f.detail)), kind: f.kind, text: f.text, detail: f.detail, b: f.b }).collect();
+                    let faults = self.faults();
                     let cell = if film_steps(r.count).contains(&r.steps.len()) { self.small([0, 0, self.width, self.height], r.shrink) } else { (Vec::new(), 0, 0) };
                     r.steps.push(Step {
                         at: if window { (self.width as i32, self.height as i32) } else { self.mouse },
@@ -849,6 +1051,7 @@ impl ScriptWindow {
                 self.fresh = false;
                 self.reflow_report(cmd, &args[0], &r);
             }
+            "explore" => if self.explore_step(&args).is_none() { return false; },
             "bench" | "bench_idle" => {
                 let b = self.bench.get_or_insert_with(|| Bench { left: num(0).unwrap_or(120.0) as usize, full: cmd == "bench", samples: Vec::new() });
                 if b.left > 0 {
@@ -1047,6 +1250,531 @@ impl ScriptWindow {
             cmd, name, if r.window { "window" } else { "pointer" }, picks.iter().map(|&i| place(i)).collect::<Vec<_>>().join(" "), r.shrink);
     }
 
+    /// The screen as `explore` tells one from another. Lint is the dear part of it, so a
+    /// screen that shows what one of `levels` shows is given that level's findings.
+    fn look(&self, levels: &[Level]) -> Look {
+        let shown = self.showing([0, 0, self.width as i32, self.height as i32]);
+        let faults = match levels.iter().find(|l| l.look.shown == shown) { Some(l) => l.look.faults.clone(), None => self.faults() };
+        Look { shown, faults, pixels: self.window_pixels() }
+    }
+
+    /// What `explore` presses on the screen as it is: each thing a person can reach, but what
+    /// `known`, the things to press on the screen before, already had under the same name at
+    /// the same size, wherever it lies now. Of four or more of one size in a column it takes
+    /// the first and the last. Also gives how many it left out as disabled, and as alike.
+    fn aims(&self, known: &[Shown]) -> (Vec<Aim>, usize, usize) {
+        let window = [0, 0, self.width as i32, self.height as i32];
+        let shown = self.shown_texts();
+        let mut known: Vec<(&str, i32, i32)> = known.iter().map(|k| (k.text.as_str(), k.w, k.h)).collect();
+        let (mut list, mut disabled) = (Vec::new(), 0);
+        for t in self.shown_targets() {
+            let label = label_among(&shown, t.b).replace(['\t', '\n'], " ");
+            if let Some(i) = known.iter().position(|k| *k == (label.as_str(), t.b[2] - t.b[0], t.b[3] - t.b[1])) {
+                known.swap_remove(i);
+                continue;
+            }
+            // What its list has scrolled out of sight cannot be pressed.
+            if area(cut(cut(t.b, window), self.clip_at(self.drawn_at(t.b).unwrap_or(0)))) == 0 { continue; }
+            if !t.enabled { disabled += 1; continue; }
+            list.push(Aim { b: t.b, label });
+        }
+        let column = |a: &Aim| (a.b[0], a.b[2], a.b[3] - a.b[1]);
+        let all = list.clone();
+        list.retain(|a| {
+            let mut ys: Vec<i32> = all.iter().filter(|o| column(o) == column(a)).map(|o| o.b[1]).collect();
+            ys.sort();
+            ys.len() < 4 || a.b[1] == ys[0] || a.b[1] == ys[ys.len() - 1]
+        });
+        let alike = all.len() - list.len();
+        (list, disabled, alike)
+    }
+
+    /// Where a box is pressed: on a part of it that can be seen and that nothing smaller to
+    /// press lies on.
+    fn press_spot(&self, b: [i32; 4]) -> [i32; 2] {
+        let window = [0, 0, self.width as i32, self.height as i32];
+        let vis = cut(cut(b, window), self.clip_at(self.drawn_at(b).unwrap_or(0)));
+        let vis = if area(vis) > 0 { vis } else { cut(b, window) };
+        let (w, h) = (vis[2] - vis[0], vis[3] - vis[1]);
+        let spots = [(2, 2), (1, 2), (3, 2), (2, 1), (2, 3)].map(|(i, j)| [vis[0] + w * i / 4, vis[1] + h * j / 4]);
+        let free = |p: &&[i32; 2]| !self.targets.iter().any(|t| t.b != b && area(t.b) < area(b) && holds(t.b, **p));
+        *spots.iter().find(free).unwrap_or(&spots[0])
+    }
+
+    /// A line of the record of presses: the script command that presses a box, and why.
+    fn trail_press(&self, b: [i32; 4], why: &str) -> String {
+        let at = self.press_spot(b);
+        format!("{:<16}{}", format!("click {} {}", at[0], at[1]), why)
+    }
+
+    /// Presses the mouse on a box, then parks the pointer.
+    fn press_at(&mut self, b: [i32; 4], rest: (i32, i32)) {
+        let at = self.press_spot(b);
+        // The hover has to be drawn before the press, as for `click`.
+        self.push_move(at[0], at[1]);
+        self.push_render();
+        self.push_button(BTN_LEFT, true);
+        self.push_render();
+        self.push_button(BTN_LEFT, false);
+        self.push_render();
+        self.push_move(rest.0, rest.1);
+        self.push_render();
+    }
+
+    /// The ways a press may be undone, in the order to try them, given the pixels before the
+    /// press and after it. What is still there to press is pressed again first. Then come
+    /// its neighbours in a row that the press redrew, as one tab dims when another is chosen:
+    /// pressing any other neighbour would only add that one's own doing. Esc comes after
+    /// them, since it may close more than the press opened, and first for what the press
+    /// covered. Waiting is last.
+    fn undo_tries(&self, aim: &Aim, was: &[u32], after: &[u32]) -> Vec<Try> {
+        let now = self.shown_targets();
+        let there = self.still_there(aim);
+        let (w, h) = (self.width as i32, self.height as i32);
+        let redrawn = |b: [i32; 4]| {
+            let v = cut(b, [0, 0, w, h]);
+            was.len() != after.len() || was.len() != (w * h) as usize || (v[1]..v[3]).any(|y| (v[0]..v[2]).any(|x| (was[(y * w + x) as usize] ^ after[(y * w + x) as usize]) & 0xffffff != 0))
+        };
+        let mut tries = if there { vec![Try::Again] } else { vec![Try::Esc, Try::Again] };
+        let shown = self.shown_texts();
+        let mut beside: Vec<&LoggedTarget> = now.iter().filter(|t| there && t.enabled && t.b != aim.b && (t.b[1] - aim.b[1]).abs() <= 2 && (t.b[3] - aim.b[3]).abs() <= 2 && redrawn(t.b)).collect();
+        beside.sort_by_key(|t| (t.b[0] + t.b[2] - aim.b[0] - aim.b[2]).abs());
+        for t in beside.into_iter().take(3) { tries.push(Try::Beside(Aim { b: t.b, label: label_among(&shown, t.b) })); }
+        if there { tries.push(Try::Esc); }
+        tries.push(Try::Wait);
+        tries
+    }
+
+    /// Whether what was pressed can be pressed there again: its box is still one to press, or
+    /// one of its name lies where it was pressed and has about its corner, as a row does that
+    /// opens in place. The page may have grown a scroll bar as it opened, and moved it a little.
+    fn still_there(&self, aim: &Aim) -> bool {
+        let (b, at) = (aim.b, self.press_spot(aim.b));
+        let shown = self.shown_texts();
+        self.shown_targets().iter().any(|t| t.b == b
+            || ((t.b[0] - b[0]).abs() <= 16 && (t.b[1] - b[1]).abs() <= 16 && holds(t.b, at) && label_among(&shown, t.b).replace(['\t', '\n'], " ") == aim.label))
+    }
+
+    /// Where something pressed before is now: the nearest thing to press that has its name.
+    fn find_aim(&self, aim: &Aim) -> Option<[i32; 4]> {
+        let shown = self.shown_texts();
+        self.shown_targets().iter().filter(|t| t.enabled && label_among(&shown, t.b).replace(['\t', '\n'], " ") == aim.label)
+            .min_by_key(|t| (t.b[0] - aim.b[0]).abs() + (t.b[1] - aim.b[1]).abs()).map(|t| t.b)
+    }
+
+    /// Keeps a screen a press led to: its screenshot, what it shows, and the findings and the
+    /// style that the screen before it did not have. The rest is on record where that screen
+    /// was shot, so a fault of the page is not counted again for each thing that opens on it.
+    fn keep_look(&mut self, name: &str, path: String, was: &Look, now: &Look) -> Row {
+        const WORST_FIRST: [&str; 9] = ["outside", "clipped", "overlap", "overflow", "target", "margin", "edge", "contrast", "tiny"];
+        let (mut words, _) = describe_change(&was.shown, &now.shown, &Known::default());
+        if words.is_empty() { words = "the same texts, drawn otherwise".to_string(); }
+        let mut brought: Vec<&Fault> = now.faults.iter().filter(|f| !was.faults.iter().any(|g| g.key == f.key)).collect();
+        brought.sort_by_key(|f| WORST_FIRST.iter().position(|k| *k == f.kind));
+        for f in &brought { self.lint_lines.push(lint_line(name, f.kind, &f.text, f.b, &f.detail)); }
+        let (_, texts, _) = pair_up(&was.shown.0, &now.shown.0);
+        let (_, press, _) = pair_up(&was.shown.1, &now.shown.1);
+        let new = texts.iter().chain(&press).fold([i32::MAX, i32::MAX, i32::MIN, i32::MIN], |b, s| [b[0].min(s.x), b[1].min(s.y), b[2].max(s.x + s.w), b[3].max(s.y + s.h)]);
+        self.keep_screen(name, [0, 0, self.width, self.height], new);
+        Row { path, words, back: String::new(), brought: brought.iter().map(|f| format!("{} {} {}", f.kind, quoted(&f.text), f.detail)).collect(), file: format!("{}.png", name) }
+    }
+
+    /// One turn of `explore`: reads the frames the last turn asked for, then presses the next
+    /// thing or tries the next way back. Gives what it found once everything is pressed, and
+    /// nothing until then, having queued the input and the frames its next turn reads.
+    fn explore_step(&mut self, args: &[String]) -> Option<Explore> {
+        let window = [0, 0, self.width as i32, self.height as i32];
+        if self.explore.is_none() {
+            if !self.need_fresh() { return None; }
+            let num = |i: usize, or: usize| args.get(i).and_then(|a| a.parse::<usize>().ok()).unwrap_or(or);
+            let rest = self.rest_spot();
+            self.explore = Some(Explore { name: args.first().cloned().unwrap_or_else(|| "explore".to_string()), depth: num(1, 2).clamp(1, 4), most: num(2, 200),
+                rest, mouse: self.mouse, waiting: true, need: 10, ..Explore::default() });
+            self.push_move(rest.0, rest.1);
+            self.push_render();
+            return None;
+        }
+        let mut ex = self.explore.take().unwrap();
+        if ex.waiting {
+            ex.still = if self.same_pixels(&mut ex.prev) { ex.still + 1 } else { 0 };
+            ex.frames += 1;
+            // The first wait is a long one: what a change of the window's size set moving may
+            // only move once the pointer does, and comes to rest slowly.
+            if ex.still < ex.need && ex.frames < 30 * ex.need {
+                self.renders_without_frame = 0;
+                self.push_render();
+                self.explore = Some(ex);
+                return None;
+            }
+            if ex.still < ex.need { ex.restless += 1; }
+            ex.waiting = false;
+            ex.need = 3;
+            ex.prev = Vec::new();
+        }
+        loop {
+            let depth = ex.levels.len();
+            // Whether the stage queued input, to be read once the screen has come to rest.
+            let queued = match ex.stage {
+                Stage::Start => {
+                    let look = self.look(&[]);
+                    let (list, disabled, alike) = self.aims(&[]);
+                    (ex.on_screen, ex.disabled, ex.alike) = (look.shown.1.len(), disabled, alike);
+                    ex.levels.push(Level { look, via: None, change: Change::default(), closers: Vec::new(), list, i: 0, lead: ex.name.clone(), path: String::new() });
+                    ex.stage = Stage::Press;
+                    false
+                }
+                Stage::Press => {
+                    let top = &ex.levels[depth - 1];
+                    if top.i < top.list.len() && ex.pressed < ex.most {
+                        let aim = top.list[top.i].clone();
+                        note_line(self.pc, &format!("explore {}: pressing {}{}", ex.name, top.path, aim.say()));
+                        ex.trail.push(self.trail_press(aim.b, &format!("{}{}", top.path, aim.say())));
+                        ex.pressed += 1;
+                        self.press_at(aim.b, ex.rest);
+                        ex.stage = Stage::Seen;
+                        true
+                    } else {
+                        let left: Vec<String> = top.list.iter().skip(top.i).map(|a| format!("{}{}", top.path, a.say())).collect();
+                        ex.unpressed.extend(left);
+                        if depth == 1 { ex.stage = Stage::Open(0); } else {
+                            // Everything the press brought up has been pressed: undo the press.
+                            let level = ex.levels.pop().unwrap();
+                            let (aim, row) = level.via.unwrap();
+                            let aim = Aim { b: self.find_aim(&aim).unwrap_or(aim.b), ..aim };
+                            ex.tries = self.undo_tries(&aim, &ex.levels[depth - 2].look.pixels, &level.look.pixels);
+                            // What closed it before is the way out that esc may not be.
+                            let wait = ex.tries.len() - 1;
+                            for (n, closer) in level.closers.into_iter().enumerate() { ex.tries.insert(wait + n, Try::Closer(closer)); }
+                            ex.undo = (aim, row, level.change);
+                            ex.stage = Stage::Back(0);
+                        }
+                        false
+                    }
+                }
+                Stage::Seen => {
+                    let now = self.look(&ex.levels);
+                    let top = &ex.levels[depth - 1];
+                    let aim = top.list[top.i].clone();
+                    let path = format!("{}{}", top.path, aim.say());
+                    let mut second = false;
+                    if now.shown == top.look.shown {
+                        let (px, lost) = differing(&now.pixels, &top.look.pixels, self.width, ex.caret);
+                        if px == 0 {
+                            ex.quiet.push(path);
+                            // The caret it took away is gone for the presses after it too.
+                            if lost > 0 { ex.caret = None; ex.levels[depth - 1].look = now; }
+                            ex.levels[depth - 1].i += 1;
+                            ex.stage = Stage::Press;
+                        } else {
+                            // A switch that shows its state by colour alone: a second press
+                            // should put it back, and the presses after it need it back.
+                            ex.drawn.push((path, px, false));
+                            ex.trail.push(self.trail_press(aim.b, "  again, since it only redrew"));
+                            self.press_at(aim.b, ex.rest);
+                            ex.stage = Stage::Redone;
+                            second = true;
+                        }
+                    } else if let Some(j) = level_of(&ex.levels, None, &now.shown) {
+                        ex.caret = None;
+                        ex.closes.push(path);
+                        if j + 2 == depth { ex.levels[depth - 1].closers.push(aim); }
+                        ex.levels[depth - 1].i += 1;
+                        let from = ex.levels[j].i + 1;
+                        ex.unpressed.extend(refit(&mut ex.levels[j], from, now));
+                        ex.stage = Stage::Enter(j + 1);
+                    } else {
+                        ex.caret = None;
+                        let lead = fresh_name(&mut ex.used, format!("{}_{}", top.lead, slug(&aim.label)));
+                        ex.rows.push(self.keep_look(&lead, path.clone(), &top.look, &now));
+                        let change = Change::between(&top.look.shown, &now.shown);
+                        let (list, disabled, alike) = if depth < ex.depth { self.aims(&top.look.shown.1) } else { (Vec::new(), 0, 0) };
+                        ex.disabled += disabled;
+                        ex.alike += alike;
+                        let row = ex.rows.len() - 1;
+                        if list.is_empty() {
+                            ex.tries = self.undo_tries(&aim, &top.look.pixels, &now.pixels);
+                            ex.undo = (aim, row, change);
+                            ex.stage = Stage::Back(0);
+                        } else {
+                            ex.levels.push(Level { look: now, via: Some((aim, row)), change, closers: Vec::new(), list, i: 0, lead, path: format!("{} > ", path) });
+                            ex.stage = Stage::Press;
+                        }
+                    }
+                    second
+                }
+                Stage::Redone => {
+                    let now = self.look(&ex.levels);
+                    let top = &mut ex.levels[depth - 1];
+                    let same = differing(&now.pixels, &top.look.pixels, self.width, ex.caret).0 == 0 && now.shown == top.look.shown;
+                    ex.drawn.last_mut().unwrap().2 = same;
+                    let b = top.list[top.i].b;
+                    ex.caret = (!same).then_some([b[0] - 4, b[1] - 4, b[2] + 4, b[3] + 4]);
+                    // Whatever it left is the screen the next press starts from.
+                    top.i += 1;
+                    let from = top.i;
+                    ex.unpressed.extend(refit(top, from, now));
+                    ex.stage = Stage::Press;
+                    false
+                }
+                Stage::Back(k) => {
+                    // Which level's screen this is, if the last try has been made.
+                    // An outer level's screen means the try closed what the press was in. That
+                    // may take the press's change with it, or leave it standing on the page.
+                    let at = if k == 0 { None } else {
+                        let shown = self.showing(window);
+                        level_of(&ex.levels, Some(&ex.undo.2), &shown).map(|j| (j, j + 1 == depth || shown == ex.levels[j].look.shown))
+                    };
+                    if let Some((j, gone)) = at {
+                        let by = match &ex.tries[k - 1] {
+                            Try::Esc => "esc".to_string(),
+                            Try::Again => "pressing it again".to_string(),
+                            Try::Beside(a) => format!("pressing {} beside it", a.say()),
+                            Try::Closer(a) => format!("esc does not undo it once things in it were pressed; pressing {} in it", a.say()),
+                            Try::Wait => String::new(),
+                        };
+                        let row = ex.undo.1;
+                        ex.rows[row].back = match (j + 1 == depth, gone, by.is_empty()) {
+                            (true, _, false) => format!("{} undoes it", by),
+                            (true, _, true) => "it goes away by itself".to_string(),
+                            (false, true, false) => format!("{} undoes it, and what it was in with it", by),
+                            (false, true, true) => "it goes away by itself, and what it was in with it".to_string(),
+                            (false, false, false) => format!("nothing undoes it; {} closes what it was in, and the change stays", by),
+                            (false, false, true) => "nothing undoes it; what it was in goes away by itself, and the change stays".to_string(),
+                        };
+                        if depth == 1 && ex.tries[k - 1] == Try::Again { ex.toggles.push((ex.undo.0.clone(), ex.undo.2.clone())); }
+                        ex.levels[depth - 1].i += 1;
+                        // An outer level is still at the press that led further in.
+                        let from = ex.levels[j].i + (j + 1 < depth) as usize;
+                        let look = self.look(&ex.levels);
+                        ex.unpressed.extend(refit(&mut ex.levels[j], from, look));
+                        ex.stage = Stage::Enter(j + 1);
+                        false
+                    } else {
+                        // The next way that the screen as it is lets be tried.
+                        let aim = ex.undo.0.clone();
+                        let now = self.shown_targets();
+                        let there = |b: [i32; 4]| now.iter().any(|t| t.b == b);
+                        let mut k = k;
+                        while match ex.tries.get(k) { Some(Try::Again) => !self.still_there(&aim), Some(Try::Beside(a)) => !there(a.b), Some(Try::Closer(a)) => self.find_aim(a).is_none(), _ => false } { k += 1; }
+                        ex.stage = Stage::Back(k + 1);
+                        ex.trail.push(match ex.tries.get(k) {
+                            Some(Try::Esc) => format!("{:<16}  to undo it", "key esc"),
+                            Some(Try::Again) => self.trail_press(aim.b, "  to undo it: again"),
+                            Some(Try::Beside(a)) => self.trail_press(a.b, &format!("  to undo it: {} beside it", a.say())),
+                            Some(Try::Closer(a)) => self.trail_press(self.find_aim(a).unwrap_or(a.b), &format!("  to undo it: {}, which closed it before", a.say())),
+                            Some(Try::Wait) => format!("{:<16}  to undo it: wait 3 s", "frame 200"),
+                            None => format!("{:<16}  nothing undid it", ""),
+                        });
+                        match ex.tries.get(k).cloned() {
+                            Some(Try::Closer(a)) => { let b = self.find_aim(&a).unwrap_or(a.b); self.press_at(b, ex.rest); true }
+                            Some(Try::Esc) => {
+                                self.push_button(1, true);
+                                self.push_render();
+                                self.push_button(1, false);
+                                self.push_render();
+                                true
+                            }
+                            Some(Try::Again) => { self.press_at(aim.b, ex.rest); true }
+                            Some(Try::Beside(a)) => { self.press_at(a.b, ex.rest); true }
+                            Some(Try::Wait) => { ex.stage = Stage::Wait(k + 1, 20); false }
+                            None => {
+                                // Nothing undid it. What is left to press on this level is
+                                // pressed from the screen as it now is.
+                                ex.rows[ex.undo.1].back = "nothing undoes it: not esc, not pressing it again, not what is beside it or closed it before, not waiting".to_string();
+                                ex.levels[depth - 1].i += 1;
+                                let from = ex.levels[depth - 1].i;
+                                let look = self.look(&ex.levels);
+                                ex.unpressed.extend(refit(&mut ex.levels[depth - 1], from, look));
+                                ex.stage = Stage::Press;
+                                false
+                            }
+                        }
+                    }
+                }
+                Stage::Wait(next, left) => {
+                    let back = level_of(&ex.levels, Some(&ex.undo.2), &self.showing(window)).is_some();
+                    if left > 0 && !back {
+                        self.renders_without_frame = 0;
+                        self.push_render_of(10);
+                        ex.stage = Stage::Wait(next, left - 1);
+                        self.explore = Some(ex);
+                        return None;
+                    }
+                    ex.stage = Stage::Back(next);
+                    false
+                }
+                Stage::Enter(k) if k >= depth => { ex.stage = Stage::Press; false }
+                Stage::Enter(k) => {
+                    let via = &ex.levels[k].via.as_ref().unwrap().0;
+                    let b = self.find_aim(via).unwrap_or(via.b);
+                    ex.trail.push(self.trail_press(b, &format!("  back into {}", via.say())));
+                    self.press_at(b, ex.rest);
+                    ex.stage = Stage::Entered(k);
+                    true
+                }
+                Stage::Entered(k) => {
+                    let look = self.look(&ex.levels);
+                    if !ex.levels[k].change.undone(&look.shown) {
+                        // It may have kept something of what was pressed in it. The rest is
+                        // pressed from the screen as it now is.
+                        let from = ex.levels[k].i + (k + 1 < depth) as usize;
+                        ex.unpressed.extend(refit(&mut ex.levels[k], from, look));
+                        ex.stage = Stage::Enter(k + 1);
+                    } else {
+                        // An outer level is still at the press that led further in.
+                        let left: Vec<String> = ex.levels.iter().enumerate().skip(k)
+                            .flat_map(|(n, l)| l.list.iter().skip(l.i + (n + 1 < depth) as usize).map(|a| format!("{}{}", l.path, a.say()))).collect();
+                        ex.unpressed.extend(left);
+                        let row = ex.levels[k].via.as_ref().unwrap().1;
+                        if ex.rows[row].back.is_empty() { ex.rows[row].back = "it did not open a second time".to_string(); }
+                        ex.levels.truncate(k);
+                        ex.levels[k - 1].i += 1;
+                        let from = ex.levels[k - 1].i;
+                        ex.unpressed.extend(refit(&mut ex.levels[k - 1], from, look));
+                        ex.stage = Stage::Press;
+                    }
+                    false
+                }
+                Stage::Open(_) if ex.toggles.len() < 2 => { ex.stage = Stage::Done; false }
+                Stage::Open(n) if n == ex.toggles.len() => { ex.stage = Stage::OpenSeen; false }
+                Stage::Open(n) => {
+                    ex.stage = Stage::Open(n + 1);
+                    match self.find_aim(&ex.toggles[n].0) {
+                        Some(b) => {
+                            let aim = Aim { b, label: ex.toggles[n].0.label.clone() };
+                            ex.trail.push(self.trail_press(b, &format!("to have all open: {}", aim.say())));
+                            ex.opened.push(Opened { aim, was: self.showing(window), after: Default::default(), change: Change::default(), open_as: String::new() });
+                            self.press_at(b, ex.rest);
+                            ex.stage = Stage::Opened(n + 1);
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                Stage::Opened(next) => {
+                    ex.stage = Stage::Open(next);
+                    let now = self.showing(window);
+                    let last = ex.opened.last_mut().unwrap();
+                    // What it changes on a screen with the others open tells whether it is
+                    // among them: what it changed alone may be long out of date.
+                    last.change = Change::between(&last.was, &now);
+                    last.after = now;
+                    // Its own press may have moved it, as when it shuts a menu above it.
+                    let b = self.find_aim(&last.aim).unwrap_or(last.aim.b);
+                    last.open_as = label_among(&self.shown_texts(), b).replace(['\t', '\n'], " ");
+                    false
+                }
+                Stage::OpenSeen => {
+                    let now = self.look(&ex.levels);
+                    // One may have closed as another opened, as a menu does.
+                    let open = ex.opened.iter().filter(|o| o.change.shows(&now.shown)).count();
+                    if open >= 2 {
+                        let name = fresh_name(&mut ex.used, format!("{}_all_open", ex.name));
+                        let path = if open == ex.toggles.len() { format!("all {} that a second press closes, open at once", open) }
+                            else { format!("the {} of {} that a second press closes and that stay open together", open, ex.toggles.len()) };
+                        ex.rows.push(self.keep_look(&name, path, &ex.levels[0].look, &now));
+                    }
+                    ex.stage = Stage::Close(ex.opened.len());
+                    false
+                }
+                Stage::Close(0) => {
+                    if let Some(first) = ex.opened.first() {
+                        let now = self.showing(window);
+                        if now != first.was { ex.not_closed = describe_change(&first.was, &now, &Known::default()).0; }
+                    }
+                    ex.stage = Stage::Done;
+                    false
+                }
+                Stage::Close(n) => {
+                    ex.stage = Stage::Close(n - 1);
+                    let o = &ex.opened[n - 1];
+                    let now = self.showing(window);
+                    // It may have another name while it is open, as a lock has another icon.
+                    let b = self.find_aim(&o.aim).or_else(|| self.find_aim(&Aim { b: o.aim.b, label: o.open_as.clone() })).or_else(|| self.still_there(&o.aim).then_some(o.aim.b));
+                    // One that is shut already, as a menu is by the next thing pressed, would
+                    // only be pressed open again. The screen says which it is: with all
+                    // that was pressed after this one closed, it is as this one's press left
+                    // it. A screen that time changes too is never quite that, and then what
+                    // the press brought says it.
+                    let open = now == o.after || o.change.shows(&now);
+                    match b.filter(|_| open) {
+                        Some(b) => {
+                            ex.trail.push(self.trail_press(b, &format!("to close them: {}", o.aim.say())));
+                            self.press_at(b, ex.rest);
+                            true
+                        }
+                        None => {
+                            ex.trail.push(format!("{:<16}to close them: {} is left alone, being shut already or not to be found", "", o.aim.say()));
+                            false
+                        }
+                    }
+                }
+                Stage::Done => {
+                    self.push_move(ex.mouse.0, ex.mouse.1);
+                    self.push_render();
+                    self.fresh = false;
+                    self.explore_report(&ex);
+                    return Some(ex);
+                }
+            };
+            if queued {
+                (ex.waiting, ex.still, ex.frames) = (true, 0, 0);
+                self.renders_without_frame = 0;
+                self.explore = Some(ex);
+                return None;
+            }
+        }
+    }
+
+    /// Says what a finished `explore` found, and keeps the whole of it as `<name>.txt`.
+    fn explore_report(&mut self, ex: &Explore) {
+        let count = |n: usize, one: &str, many: &str| format!("{} {}", n, if n == 1 { one } else { many });
+        let some = |v: &[String], most: usize| format!("{}{}", v.iter().take(most).cloned().collect::<Vec<_>>().join(", "), if v.len() > most { format!(" and {} more", v.len() - most) } else { String::new() });
+        let (mut all, mut faults): (Vec<String>, usize) = (Vec::new(), 0);
+        for r in &ex.rows {
+            let back = if r.back.is_empty() { String::new() } else { format!("; {}", r.back) };
+            let line = format!("explore {}: {}{} -> {}", r.path, r.words, back, self.out_dir.join(&r.file).display());
+            println!("{}", line);
+            all.push(line);
+            if r.brought.is_empty() { continue; }
+            faults += r.brought.len();
+            println!("explore {}: brings {}: {}", r.path, count(r.brought.len(), "fault", "faults"), some(&r.brought, 3));
+            all.extend(r.brought.iter().map(|f| format!("    brings {}", f)));
+        }
+        let drawn: Vec<String> = ex.drawn.iter().map(|d| format!("{} ({} px{})", d.0, d.1, if d.2 { "" } else { ", and a second press did not put it back" })).collect();
+        let lists = [
+            (&ex.closes, "led back to a screen passed on the way, as a close button does"),
+            (&drawn, "changed how something is drawn and moved no text"),
+            (&ex.quiet, "changed nothing on screen"),
+        ];
+        for (list, what) in lists {
+            if list.is_empty() { continue; }
+            println!("explore {}: {} {}: {}", ex.name, count(list.len(), "press", "presses"), what, some(list, 6));
+            all.push(format!("explore {}: {} {}: {}", ex.name, count(list.len(), "press", "presses"), what, list.join(", ")));
+        }
+        let mut notes: Vec<String> = Vec::new();
+        if ex.restless > 0 { notes.push(format!("{} the screen was still changing 90 frames after a press: an animation that does not stop, or a caret", count(ex.restless, "time", "times"))); }
+        if !ex.not_closed.is_empty() { notes.push(format!("closing all that was open at once, last first, did not bring the screen back: {}", ex.not_closed)); }
+        if !ex.unpressed.is_empty() {
+            notes.push(format!("{} not pressed, since the screen each was on could not be reached again or the {} presses ran out: {}", count(ex.unpressed.len(), "thing was", "things were"), ex.most, ex.unpressed.join(", ")));
+        }
+        for note in &notes { println!("explore {}: {}", ex.name, note); }
+        all.extend(notes.iter().map(|note| format!("explore {}: {}", ex.name, note)));
+
+        let file = format!("{}.txt", ex.name);
+        let screens = ex.rows.iter().filter(|r| !r.brought.is_empty()).count();
+        let line = format!("explore {}: pressed {} at {}x{}, {} deep, of {} on screen: {} opened another screen, {} led back, {} only redrew, {} changed nothing; left out {} alike in a list and {} disabled; what opened brought {} on {} -> {}",
+            ex.name, count(ex.pressed, "thing", "things"), self.width, self.height, ex.depth, ex.on_screen, ex.rows.len(), ex.closes.len(), ex.drawn.len(), ex.quiet.len(),
+            ex.alike, ex.disabled, count(faults, "fault", "faults"), count(screens, "screen", "screens"), self.out_dir.join(&file).display());
+        println!("{}", line);
+        all.push(line);
+        all.push(String::new());
+        all.push(format!("Every press, in order, with the script command that makes it. After each, the pointer was parked (`move {} {}`) and the screen left to come to rest (`settle`).", ex.rest.0, ex.rest.1));
+        all.extend(ex.trail.iter().cloned());
+        all.push(String::new());
+        self.write_file(&file, all.join("\n").as_bytes());
+    }
+
     fn keep_shot(&mut self, name: &str, rgb: &[u8], w: usize, h: usize) {
         let file = format!("{}.png", name);
         self.write_file(&file, &png_encode(rgb, w, h));
@@ -1059,9 +1787,42 @@ impl ScriptWindow {
     }
 
     fn keep_lint(&mut self, name: &str, found: &[Finding]) {
-        for f in found {
-            self.lint_lines.push(format!("{}\t{}\t{}\t{},{}\t{}", name, f.kind, f.text.replace('\t', " "), f.b[0], f.b[1], f.detail));
+        for f in found { self.lint_lines.push(lint_line(name, f.kind, &f.text, f.b, &f.detail)); }
+    }
+
+    /// Saves part of the window, `[x, y, width, height]`, as `<name>.png`, and records under
+    /// that name what it shows and the style of what lies in `styled`.
+    fn keep_screen(&mut self, name: &str, part: [usize; 4], styled: [i32; 4]) {
+        let [x, y, w, h] = part;
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for row in y..y + h {
+            for px in &self.pixels[row * self.side + x..row * self.side + x + w] {
+                rgb.extend_from_slice(&[(px >> 16) as u8, (px >> 8) as u8, *px as u8]);
+            }
         }
+        self.keep_shot(name, &rgb, w, h);
+        for (kind, value, uses) in self.style(styled) { self.style_lines.push(format!("{}\t{}\t{}\t{}", name, kind, value, uses)); }
+        let shown = self.content(name, [x as i32, y as i32, (x + w) as i32, (y + h) as i32]);
+        self.content_lines.extend(shown);
+    }
+
+    /// Somewhere to park the pointer that is on nothing a person can press.
+    fn rest_spot(&self) -> (i32, i32) {
+        for y in (4..self.height as i32).step_by(16) {
+            for x in (4..self.width as i32).step_by(16) {
+                if !self.targets.iter().any(|t| holds(t.b, [x, y])) { return (x, y); }
+            }
+        }
+        (0, 0)
+    }
+
+    /// Whether the window shows what `prev` holds. If not, `prev` is made to hold it.
+    fn same_pixels(&self, prev: &mut Vec<u32>) -> bool {
+        let rows = |row: usize| (&self.pixels[row * self.side..row * self.side + self.width], row * self.width);
+        let same = prev.len() == self.width * self.height
+            && (0..self.height).all(|row| { let (a, at) = rows(row); a.iter().zip(&prev[at..at + self.width]).fold(0, |d, (p, q)| d | (p ^ q)) & 0xffffff == 0 });
+        if !same { *prev = self.window_pixels(); }
+        same
     }
 
     fn window_pixels(&self) -> Vec<u32> {
@@ -1154,7 +1915,13 @@ impl ScriptWindow {
             let vis = cut(t.b, window);
             if area(vis) == 0 || !t.grip.is_empty() || out.iter().any(|o| o.b == t.b) { continue; }
             let Some(own) = self.drawn_at(t.b) else { continue };
-            if self.rects.iter().any(|r| r.at > own && r.color >> 24 >= 0x30 && !inside(r.b, t.b) && area(cut(r.b, vis)) * 2 > area(vis)) { continue; }
+            let over = |r: &LoggedRect, from: usize| r.at > from && r.color >> 24 >= 0x30 && !inside(r.b, t.b) && area(cut(r.b, vis)) * 2 > area(vis);
+            if self.rects.iter().any(|r| over(r, own)) { continue; }
+            // A dialog's text may lie inside the box of a button behind the dialog, and is not
+            // the button's own. A target with a rectangle of its own size is under whatever
+            // much larger thing is drawn after that rectangle and covers it whole.
+            let face = self.rects.iter().filter(|r| inside(r.b, t.b) && inside(t.b, r.b)).map(|r| r.at).min();
+            if face.is_some_and(|at| self.rects.iter().any(|r| over(r, at) && inside(vis, r.b) && area(r.b) >= 4 * area(t.b))) { continue; }
             out.push(t.clone());
         }
         out
@@ -1163,19 +1930,27 @@ impl ScriptWindow {
     /// The text that names a box in a report.
     fn label_of(&self, b: [i32; 4]) -> String { label_among(&self.shown_texts(), b) }
 
-    /// What a part of the screen shows, a line each: its texts, then what can be pressed.
-    fn content(&self, name: &str, part: [i32; 4]) -> Vec<String> {
-        let mut out = Vec::new();
-        for s in self.texts_under(0xf0) {
-            if area(cut(s.vis, part)) == 0 { continue; }
-            out.push(format!("{}\tT\t{}\t{}\t{}\t{}\t{:06x}\t{}", name, s.t.x, s.t.y, s.t.w, s.t.h, s.t.color & 0xffffff, s.t.text.replace(['\t', '\n'], " ")));
-        }
+    /// What a part of the screen shows: its texts, then what can be pressed, each by its name.
+    fn showing(&self, part: [i32; 4]) -> (Vec<Shown>, Vec<Shown>) {
+        let flat = |s: &str| s.replace(['\t', '\n'], " ");
+        let texts = self.texts_under(0xf0).iter().filter(|s| area(cut(s.vis, part)) > 0)
+            .map(|s| Shown { x: s.t.x, y: s.t.y, w: s.t.w as i32, h: s.t.h as i32, color: format!("{:06x}", s.t.color & 0xffffff), text: flat(&s.t.text) }).collect();
         let shown = self.shown_texts();
-        for t in self.shown_targets() {
-            if area(cut(t.b, part)) == 0 { continue; }
-            out.push(format!("{}\tP\t{}\t{}\t{}\t{}\t-\t{}", name, t.b[0], t.b[1], t.b[2] - t.b[0], t.b[3] - t.b[1], label_among(&shown, t.b).replace(['\t', '\n'], " ")));
-        }
-        out
+        let press = self.shown_targets().iter().filter(|t| area(cut(t.b, part)) > 0)
+            .map(|t| Shown { x: t.b[0], y: t.b[1], w: t.b[2] - t.b[0], h: t.b[3] - t.b[1], color: "-".to_string(), text: flat(&label_among(&shown, t.b)) }).collect();
+        (texts, press)
+    }
+
+    /// What a part of the screen shows, a line each, as `content.txt` keeps it.
+    fn content(&self, name: &str, part: [i32; 4]) -> Vec<String> {
+        let (texts, press) = self.showing(part);
+        texts.iter().map(|s| ("T", s)).chain(press.iter().map(|s| ("P", s)))
+            .map(|(kind, s)| format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", name, kind, s.x, s.y, s.w, s.h, s.color, s.text)).collect()
+    }
+
+    /// The screen's lint findings, each with the key that makes it the same fault elsewhere.
+    fn faults(&self) -> Vec<Fault> {
+        self.lint().into_iter().map(|f| Fault { key: format!("{}\t{}\t{}", f.kind, f.text, no_numbers(&f.detail)), kind: f.kind, text: f.text, detail: f.detail, b: f.b }).collect()
     }
 
     /// The text sizes, colours and corner radii that part of the screen is made of, and how
@@ -1302,6 +2077,11 @@ struct Finding {
     detail: String,
 }
 
+/// A finding as `lint.txt` keeps it.
+fn lint_line(name: &str, kind: &str, text: &str, b: [i32; 4], detail: &str) -> String {
+    format!("{}\t{}\t{}\t{},{}\t{}", name, kind, text.replace('\t', " "), b[0], b[1], detail)
+}
+
 fn lint_colour(kind: &str) -> [u8; 3] {
     match kind { "clipped" => [255, 40, 40], "outside" => [255, 255, 255], "overlap" => [255, 0, 255], "overflow" => [255, 140, 0], "margin" => [255, 230, 0], "contrast" => [0, 220, 255], "target" => [90, 255, 90], "edge" => [110, 150, 255], _ => [150, 150, 150] }
 }
@@ -1336,6 +2116,24 @@ fn label_among(shown: &[Seen<'_>], b: [i32; 4]) -> String {
 
 fn short(s: &str) -> String {
     if s.chars().count() > 40 { format!("{}...", s.chars().take(37).collect::<String>()) } else { s.to_string() }
+}
+
+/// A text as part of a file's name: its letters and digits in lower case, joined by `_`.
+fn slug(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        if out.len() >= 24 { break; }
+        if c.is_ascii_alphanumeric() { out.push(c.to_ascii_lowercase()); } else if !out.is_empty() && !out.ends_with('_') { out.push('_'); }
+    }
+    let out = out.trim_end_matches('_');
+    if out.is_empty() { "unnamed".to_string() } else { out.to_string() }
+}
+
+/// `want`, or `want` with the first number after it that makes a name not used yet.
+fn fresh_name(used: &mut Vec<String>, want: String) -> String {
+    let name = (1..).map(|n| if n == 1 { want.clone() } else { format!("{}_{}", want, n) }).find(|n| !used.contains(n)).unwrap();
+    used.push(name.clone());
+    name
 }
 
 /// The WCAG contrast ratio of two RGB colours, 1 to 21.
@@ -2576,5 +3374,362 @@ mod tests {
         assert_eq!(no_numbers("12 px, 3.5:1 on 00ff00"), "N px, N.N:N on NffN");
         assert!(severity("clipped", "61 px cut off") > severity("clipped", "7 px cut off"));
         assert!(severity("margin", "1 px from the side") > severity("margin", "3 px from the side"));
+    }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Kind { Nothing, Redraw, Toggle, Menu, Grow, Field, Modal, Toast, Sticky, Count, Off, Close, Keep }
+
+    #[derive(Clone, Debug)]
+    struct Thing { kind: Kind, label: String, w: i32, on: bool, left: usize, lasts: usize, kids: Vec<Thing> }
+
+    /// A made-up screen for `fuzz_explore`: a column of things to press, each of one kind, a
+    /// row of tabs among them, the dialog one of them may have open, and at the top of the
+    /// page a count of presses that nothing takes back, wherever the press was made. A `deaf`
+    /// one does not close its dialog on esc. A menu closes when anything else is pressed, and
+    /// a field keeps the caret until then. What grows opens within its own box. A switch may sit beside one of the things, in its
+    /// row. `best` is the model as it was when the most was last open at once.
+    #[derive(Clone)]
+    struct Model {
+        things: Vec<Thing>, tabs: usize, tab_row: usize, tab: usize, modal: Option<usize>, keeps: bool, deaf: bool, count: usize,
+        focus: Option<Vec<usize>>, lock_row: Option<usize>, lock_on: bool, mouse: (i32, i32), bits: [u64; 8], most_open: usize, best: Vec<Model>,
+        /// With `slow` set, "busy" shows once two things have been open at once for that many
+        /// sixtieths of a second, as a page does that moves on by itself in some state.
+        slow: usize, together: usize,
+    }
+
+    /// What leads the place of a tab, and what is the place of the switch, among what a frame
+    /// of the model lets be pressed.
+    const TABS: usize = usize::MAX;
+    const LOCK: usize = usize::MAX - 1;
+    const MODEL: [i32; 4] = [0, 0, 400, 300];
+
+    /// One thing a frame of the model draws: a text, or a rectangle.
+    struct Piece { text: Option<String>, b: [i32; 4], color: u32 }
+
+    impl Model {
+        /// A frame: its rectangles and texts in the order drawn, and what can be pressed, each
+        /// with its place in the model, its box, and whether the pointer can reach it.
+        fn frame(&self) -> (Vec<Piece>, Vec<(Vec<usize>, [i32; 4], bool)>) {
+            let (mut pieces, mut press) = (Vec::new(), Vec::new());
+            let text = |s: String, x: i32, y: i32, w: i32| Piece { text: Some(s), b: [x, y, x + w, y + 14], color: 0xffe0e0e0 };
+            // A name is at the top of its box, so that a box the window cuts off still shows it.
+            let face = |t: &Thing, b: [i32; 4], place: &[usize]| [
+                Piece { text: None, b, color: if self.focus.as_deref() == Some(place) { 0xff203080 } else if t.kind == Kind::Redraw && t.on { 0xff805020 } else { 0xff404040 } },
+                text(t.label.clone(), b[0] + 6, b[1], 40),
+            ];
+            let free = self.modal.is_none();
+            pieces.push(text(format!("count {}", self.count), 150, 4, 100));
+            if self.slow > 0 && self.together >= self.slow { pieces.push(text("busy".to_string(), 255, 4, 40)); }
+            let mut y = 20;
+            for (i, t) in self.things.iter().enumerate() {
+                if i == self.tab_row && self.tabs > 0 {
+                    for k in 0..self.tabs {
+                        let b = [20 + 70 * k as i32, y, 80 + 70 * k as i32, y + 24];
+                        pieces.push(Piece { text: None, b, color: if k == self.tab { 0xff606060 } else { 0xff404040 } });
+                        pieces.push(text(format!("tab{}", k), b[0] + 6, y, 40));
+                        press.push((vec![TABS, k], b, free));
+                    }
+                    // What a tab shows is beside the tabs, so it is in the window whenever they are.
+                    pieces.push(text(format!("tab {} body", self.tab), 30 + 70 * self.tabs as i32, y, 100));
+                    y += 30;
+                }
+                let tall = t.kind == Kind::Grow && t.on;
+                let b = [20, y, 20 + t.w, y + if tall { 52 } else { 24 }];
+                pieces.extend(face(t, b, &[i]));
+                if tall { pieces.push(text(format!("body of {}", t.label), 40, y + 30, 100)); }
+                if self.lock_row == Some(i) {
+                    let lock = [300, y, 360, y + 24];
+                    pieces.push(Piece { text: None, b: lock, color: if self.lock_on { 0xff805020 } else { 0xff404040 } });
+                    pieces.push(text("lock".to_string(), lock[0] + 6, y, 40));
+                    press.push((vec![LOCK], lock, free));
+                }
+                if t.on && t.kind == Kind::Sticky { pieces.push(text(format!("kept {}", t.label), 30 + t.w, y, 60)); }
+                if t.left > 0 { pieces.push(text(format!("toast {}", t.label), 300, 4, 80)); }
+                press.push((vec![i], b, free));
+                y += if tall { 58 } else { 30 };
+                if matches!(t.kind, Kind::Toggle | Kind::Menu) && t.on {
+                    pieces.push(text(format!("body of {}", t.label), 40, y, 100));
+                    y += 22;
+                    for (j, c) in t.kids.iter().enumerate() {
+                        pieces.extend(face(c, [40, y, 40 + c.w, y + 24], &[i, j]));
+                        press.push((vec![i, j], [40, y, 40 + c.w, y + 24], free));
+                        y += 30;
+                        if c.kind == Kind::Toggle && c.on {
+                            pieces.push(text(format!("body of {}", c.label), 60, y, 100));
+                            y += 22;
+                        }
+                    }
+                }
+            }
+            if let Some(m) = self.modal {
+                // The page behind a dialog is dimmed, and still logs what it would let be pressed.
+                pieces.push(Piece { text: None, b: MODEL, color: 0x80000000 });
+                pieces.push(Piece { text: None, b: [100, 40, 390, 260], color: 0xff303030 });
+                pieces.push(text(format!("dialog {}", self.things[m].label), 110, 50, 100));
+                for (j, c) in self.things[m].kids.iter().enumerate() {
+                    let b = [110, 80 + 34 * j as i32, 110 + c.w, 104 + 34 * j as i32];
+                    pieces.extend(face(c, b, &[m, j]));
+                    if c.on && c.kind == Kind::Keep { pieces.push(text(format!("kept {}", c.label), 120 + c.w, b[1] + 5, 60)); }
+                    press.push((vec![m, j], b, true));
+                }
+            }
+            (pieces, press)
+        }
+
+        fn at(&self, place: &[usize]) -> Option<&Thing> {
+            if place[0] == TABS || place[0] == LOCK { return None; }
+            Some(if place.len() == 1 { &self.things[place[0]] } else { &self.things[place[0]].kids[place[1]] })
+        }
+
+        /// Draws a frame into the window and hands it over as the frame loop does.
+        fn draw(&self, w: &mut ScriptWindow) {
+            let (pieces, press) = self.frame();
+            let mut commands = vec![crate::DrawCommand::ClearScreenToColor { color: 0xff101010 }];
+            let mut texts = Vec::new();
+            for y in 0..w.height { w.pixels[y * w.side..y * w.side + w.width].fill(0xff101010); }
+            for p in &pieces {
+                let v = cut(p.b, MODEL);
+                let ink = match &p.text { Some(s) => 0xff808080 | fnv1a(s.as_bytes()) as u32, None => p.color };
+                for y in v[1]..v[3] {
+                    for px in &mut w.pixels[y as usize * w.side + v[0] as usize..y as usize * w.side + v[2] as usize] {
+                        *px = if ink >> 24 == 0xff { ink } else { 0xff000000 | (*px >> 1) & 0x7f7f7f };
+                    }
+                }
+                // A text is a command of its own in the frame loop, so each has its own place in
+                // the drawing order here too: a rectangle of no size stands in for it.
+                let b = if p.text.is_some() { [0; 4] } else { p.b };
+                if let Some(s) = &p.text {
+                    texts.push(LoggedText { x: p.b[0], y: p.b[1], w: (p.b[2] - p.b[0]) as u32, h: (p.b[3] - p.b[1]) as u32, color: p.color, at: commands.len(), text: s.clone() });
+                }
+                commands.push(crate::DrawCommand::RoundedRectangle { x: b[0] as f32, x2: b[2] as f32, y: b[1] as f32, y2: b[3] as f32,
+                    radius_tl: 0, radius_tr: 0, radius_bl: 0, radius_br: 0, color: p.color });
+            }
+            let targets: Vec<LoggedTarget> = press.iter().map(|(place, b, _)| LoggedTarget { b: *b, enabled: self.at(place).is_none_or(|t| t.kind != Kind::Off), pointer: false, grip: String::new() }).collect();
+            w.frame_done(&mut texts, &commands, &targets, FrameReport { single_us: 0, total_us: 0, draw_commands: commands.len(), cursor: CursorIcon::Default });
+        }
+
+        fn close(&mut self) {
+            let Some(m) = self.modal.take() else { return };
+            self.focus = None;
+            if !self.keeps { for c in &mut self.things[m].kids { c.on = false; } }
+        }
+
+        /// Takes one event of the window's, as the frame loop does.
+        fn feed(&mut self, w: &mut ScriptWindow, e: Event) {
+            let down = |bits: &[u64; 8], code: u32| bits[(code as usize >> 6) & 7] >> (code & 63) & 1 == 1;
+            match e.kind {
+                EVENT_AXES => for d in &e.axes[..e.axis_count as usize] {
+                    if d.axis == AXIS_MOUSE_X { self.mouse.0 = d.delta >> 8; }
+                    if d.axis == AXIS_MOUSE_Y { self.mouse.1 = d.delta >> 8; }
+                },
+                EVENT_BUTTONS => {
+                    let (press, esc) = (down(&e.bits, BTN_LEFT) && !down(&self.bits, BTN_LEFT), down(&e.bits, 1) && !down(&self.bits, 1));
+                    self.bits = e.bits;
+                    if esc && !self.deaf { self.close(); }
+                    let (_, on_screen) = self.frame();
+                    let Some((place, ..)) = on_screen.iter().rev().find(|(_, b, reach)| press && *reach && holds(*b, [self.mouse.0, self.mouse.1])) else { return };
+                    self.focus = None;
+                    for (i, t) in self.things.iter_mut().enumerate() { if t.kind == Kind::Menu && place[..] != [i] { t.on = false; } }
+                    if place[0] == LOCK { self.lock_on = !self.lock_on; return; }
+                    if place[0] == TABS { self.tab = place[1]; return; }
+                    let t = if place.len() == 1 { &mut self.things[place[0]] } else { &mut self.things[place[0]].kids[place[1]] };
+                    match t.kind {
+                        Kind::Redraw | Kind::Toggle | Kind::Menu | Kind::Grow => t.on = !t.on,
+                        Kind::Field => self.focus = Some(place.clone()),
+                        Kind::Sticky | Kind::Keep => t.on = true,
+                        Kind::Toast => t.left = t.lasts,
+                        Kind::Modal => self.modal = Some(place[0]),
+                        Kind::Close => self.close(),
+                        Kind::Count => self.count += 1,
+                        Kind::Nothing | Kind::Off => {}
+                    }
+                    let open = self.things.iter().filter(|t| matches!(t.kind, Kind::Toggle | Kind::Menu | Kind::Grow) && t.on).count();
+                    if open >= self.most_open {
+                        self.most_open = open;
+                        let mut best = self.clone();
+                        best.best.clear();
+                        self.best = vec![best];
+                    }
+                }
+                EVENT_RENDER => {
+                    let sixtieths = ((e.dt_fs * 60 + 500_000_000_000_000) / 1_000_000_000_000_000).max(1) as usize;
+                    for t in &mut self.things { t.left = t.left.saturating_sub(sixtieths); }
+                    let open = self.things.iter().filter(|t| matches!(t.kind, Kind::Toggle | Kind::Menu | Kind::Grow) && t.on).count();
+                    self.together = if open >= 2 { self.together + sixtieths } else { 0 };
+                    self.draw(w);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_explore() {
+        let seed = seed();
+        println!("fuzz_explore FUZZ_SEED={}", seed);
+        let mut s = seed;
+        let out = std::env::temp_dir().join(format!("zebra-gui-fuzz-explore-{}", seed));
+        for round in 0..120 {
+            let mut pick = |n: u64| (rng_next(&mut s) % n.max(1)) as usize;
+            let thing = |kind: Kind, label: String, w: i32, lasts: usize| Thing { kind, label, w, on: false, left: 0, lasts, kids: Vec::new() };
+            // A column of things of every kind, each of its own width so none is like another.
+            const TOP: [Kind; 14] = [Kind::Nothing, Kind::Redraw, Kind::Toggle, Kind::Toggle, Kind::Menu, Kind::Field, Kind::Modal, Kind::Modal, Kind::Toast, Kind::Sticky, Kind::Count, Kind::Off, Kind::Menu, Kind::Grow];
+            let mut things: Vec<Thing> = Vec::new();
+            for i in 0..2 + pick(6) {
+                let mut t = thing(TOP[pick(TOP.len() as u64)], format!("thing{}", i), 100 + 7 * i as i32, 30 + pick(120));
+                let inside: &[Kind] = match t.kind { Kind::Toggle => &[Kind::Nothing, Kind::Redraw, Kind::Toggle, Kind::Count, Kind::Field], Kind::Modal => &[Kind::Nothing, Kind::Redraw, Kind::Keep, Kind::Close, Kind::Count, Kind::Field], _ => &[] };
+                if !inside.is_empty() { for j in 0..pick(4) { t.kids.push(thing(inside[pick(inside.len() as u64)], format!("thing{}kid{}", i, j), 80 + 5 * j as i32, 0)); } }
+                things.push(t);
+            }
+            // A dialog that esc does not close needs its own way out.
+            let deaf = pick(4) == 0;
+            for t in things.iter_mut().filter(|t| deaf && t.kind == Kind::Modal && t.kids.iter().all(|c| c.kind != Kind::Close)) {
+                let kid = thing(Kind::Close, format!("{}kid{}", t.label, t.kids.len()), 80 + 5 * t.kids.len() as i32, 0);
+                t.kids.push(kid);
+            }
+            // Sometimes a list of rows of one width, of which only the first and last get pressed.
+            if pick(3) == 0 { for i in 0..4 + pick(3) { things.push(thing([Kind::Nothing, Kind::Redraw][pick(2)], format!("row{}", i), 90, 0)); } }
+            let tabs = [0, 2, 3][pick(3)];
+            let lock_row = if pick(2) == 0 { Some(pick(things.len() as u64)) } else { None };
+            let slow = if pick(3) == 0 { 2 + pick(40) } else { 0 };
+            let mut model = Model { tab_row: pick(things.len() as u64), things, tabs, tab: pick(tabs as u64), modal: None, keeps: pick(2) == 0, deaf, count: 0,
+                focus: None, lock_row, lock_on: false, mouse: (0, 0), bits: [0; 8], most_open: 0, best: Vec::new(), slow, together: 0 };
+            let home = model.clone();
+            // The way out of such a dialog is found by pressing what is in it.
+            let depth = 1 + (deaf || pick(4) > 0) as usize;
+
+            let mut w = ScriptWindow::open("", &out.to_string_lossy()).unwrap();
+            w.resize(MODEL[2] as usize, MODEL[3] as usize);
+            let args = vec!["made_up".to_string(), depth.to_string()];
+            let mut turns = 0;
+            let ex = loop {
+                turns += 1;
+                assert!(turns < 100_000, "round {}: explore does not end", round);
+                if let Some(ex) = w.explore_step(&args) { break ex; }
+                while let Some(e) = w.events.pop_front() { model.feed(&mut w, e); }
+            };
+
+            // What a state of the model lets be pressed: what is in reach, and in the window at
+            // least in part.
+            let named = |m: &Model| -> Vec<(Vec<usize>, [i32; 4])> { m.frame().1.into_iter().filter(|(_, b, reach)| *reach && b[1] < MODEL[3]).map(|p| (p.0, p.1)).collect() };
+            let quoted_name = |m: &Model, place: &[usize]| match m.at(place) {
+                Some(t) => format!("{:?}", t.label),
+                None if place[0] == LOCK => "\"lock\"".to_string(),
+                None => format!("{:?}", format!("tab{}", place[1])),
+            };
+            // The names of what a state leaves past the window's bottom, as lint names them.
+            let outside = |m: &Model| -> Vec<String> {
+                let mut v: Vec<String> = named(m).iter().filter(|(_, b)| b[3] - MODEL[3] > 1).map(|(place, _)| quoted_name(m, place)).collect();
+                v.sort();
+                v
+            };
+            // Whether what a thing at that place opens under itself is in the window.
+            let seen_open = |b: [i32; 4]| b[1] + 30 < MODEL[3];
+            let row = |path: &str| ex.rows.iter().find(|r| r.path == path);
+            let untouched = |path: &str| row(path).is_none() && !ex.quiet.iter().any(|q| q == path) && !ex.drawn.iter().any(|d| d.0 == path) && !ex.closes.iter().any(|c| c == path);
+            let told = |path: &str, kind: Kind, back: &str| match kind {
+                Kind::Nothing => assert!(ex.quiet.iter().any(|q| q == path), "round {}: {} should change nothing", round, path),
+                Kind::Redraw => assert!(ex.drawn.iter().any(|d| d.0 == path && d.2), "round {}: {} should only redraw, and a second press put it back", round, path),
+                Kind::Field => assert!(ex.drawn.iter().any(|d| d.0 == path && !d.2), "round {}: {} should only redraw, and a second press not put it back", round, path),
+                Kind::Close => assert!(ex.closes.iter().any(|c| c == path), "round {}: {} should lead back", round, path),
+                Kind::Off => assert!(untouched(path), "round {}: {} is disabled", round, path),
+                _ => {
+                    let r = row(path).unwrap_or_else(|| panic!("round {}: {} should lead to another screen", round, path));
+                    assert!(r.back.starts_with(back), "round {}: {} is undone otherwise than by {:?}: {:?}", round, path, back, r.back);
+                }
+            };
+
+            // Of the rows of one width, the first and the last on screen stand for the rest.
+            let first = named(&home);
+            let alike: Vec<&(Vec<usize>, [i32; 4])> = first.iter().filter(|(place, b)| place[0] != TABS && b[2] - b[0] == 90).collect();
+            let mut toggles = 0;
+            for (place, b) in &first {
+                let path = quoted_name(&home, place);
+                // Nothing is undone by pressing the switch beside it: that would leave it on.
+                if place[0] == LOCK { told(&path, Kind::Redraw, ""); continue; }
+                if place[0] == TABS {
+                    if place[1] == home.tab { told(&path, Kind::Nothing, ""); } else {
+                        let r = row(&path).unwrap_or_else(|| panic!("round {}: {} should lead to another screen", round, path));
+                        assert!(r.back.starts_with("pressing \"tab") && r.back.ends_with("beside it undoes it"), "round {}: {} {:?}", round, path, r.back);
+                    }
+                    continue;
+                }
+                if alike.len() >= 4 && b[2] - b[0] == 90 && *b != alike[0].1 && *b != alike[alike.len() - 1].1 {
+                    assert!(untouched(&path), "round {}: {} is one of a list and not its first or last", round, path);
+                    continue;
+                }
+                let t = &home.things[place[0]];
+                // What opens under the last thing in the window opens out of sight.
+                let opens = matches!(t.kind, Kind::Toggle | Kind::Menu | Kind::Grow);
+                // What grows is seen to, by its box, even when what it shows is out of sight.
+                if opens && t.kind != Kind::Grow && !seen_open(*b) { told(&path, Kind::Nothing, ""); continue; }
+                let back = match t.kind {
+                    Kind::Toggle | Kind::Menu | Kind::Grow => "pressing it again undoes it",
+                    Kind::Modal if deaf => "esc does not undo it once things in it were pressed; pressing \"thing",
+                    Kind::Modal => "esc undoes it",
+                    Kind::Toast => "it goes away by itself",
+                    _ => "nothing undoes it",
+                };
+                told(&path, t.kind, back);
+                if !opens && t.kind != Kind::Modal { continue; }
+
+                let mut opened = home.clone();
+                opened.things[place[0]].on = opens;
+                opened.modal = (t.kind == Kind::Modal).then_some(place[0]);
+                if opens {
+                    toggles += 1;
+                    assert!(ex.toggles.iter().any(|a| format!("{:?}", a.0.label) == path), "round {}: {} opens in place", round, path);
+                    // What opening it pushes past the window's bottom is a fault it brings.
+                    let was = outside(&home);
+                    let want: Vec<String> = outside(&opened).into_iter().filter(|o| !was.contains(o)).collect();
+                    let mut got: Vec<String> = row(&path).unwrap().brought.iter().filter_map(|f| f.strip_prefix("outside ")).map(|f| f[..f[1..].find('"').unwrap() + 2].to_string()).collect();
+                    got.sort();
+                    assert_eq!(got, want, "round {}: what opening {} pushes past the window's bottom", round, path);
+                }
+                for (inner, at) in named(&opened).iter().filter(|(p, _)| p.len() == 2 && p[0] == place[0]) {
+                    let kid = &t.kids[inner[1]];
+                    let inner_path = format!("{} > {:?}", path, kid.label);
+                    if depth == 1 { assert!(untouched(&inner_path), "round {}: {} is a level too deep", round, inner_path); continue; }
+                    let kind = if kid.kind == Kind::Toggle && !seen_open(*at) { Kind::Nothing } else { kid.kind };
+                    // A dialog takes what was kept in it out of sight when esc closes it. The
+                    // count is on the page, where nothing takes it back.
+                    told(&inner_path, kind, match (kind, t.kind) {
+                        (Kind::Keep | Kind::Count, Kind::Modal) if deaf => "nothing undoes it: ",
+                        (Kind::Keep, _) => "esc undoes it, and what it was in with it",
+                        (Kind::Count, Kind::Modal) => "nothing undoes it; esc closes what it was in, and the change stays",
+                        (Kind::Count, _) => "nothing undoes it: ",
+                        _ => "pressing it again undoes it",
+                    });
+                }
+            }
+            assert_eq!(ex.toggles.len(), toggles, "round {}", round);
+            // A press that nothing undoes loses none of the presses after it.
+            assert!(ex.unpressed.is_empty(), "round {}: {:?}", round, ex.unpressed);
+            assert_eq!(ex.disabled, first.iter().filter(|(place, _)| home.at(place).is_some_and(|t| t.kind == Kind::Off)).count(), "round {}", round);
+            assert_eq!(ex.alike, if alike.len() >= 4 { alike.len() - 2 } else { 0 }, "round {}", round);
+            // With all of them pressed open, a menu is shut by the next one pressed, and what
+            // opens past the window's bottom is not seen to be open.
+            let together = ex.rows.iter().map(|r| r.path.as_str()).find(|p| p.starts_with("all ") || p.starts_with("the "));
+            if home.slow > 0 {
+                // What "busy" does to the count of what is seen open together is not worked out.
+            } else if toggles >= 2 {
+                let open = model.best[0].frame().0.iter().filter(|p| p.b[1] < MODEL[3] && p.text.as_ref().is_some_and(|t| t.starts_with("body of thing") && !t.contains("kid"))).count();
+                let want = if open < 2 { None } else if open == toggles { Some(format!("all {} that ", open)) } else { Some(format!("the {} of {} that ", open, toggles)) };
+                assert_eq!(together.map(|p| p[..want.as_ref().map_or(0, |w| w.len()).min(p.len())].to_string()), want, "round {}: {:?}", round, together);
+            } else {
+                assert!(together.is_none(), "round {}: {:?}", round, together);
+            }
+            assert!(ex.not_closed.is_empty(), "round {}: {:?}", round, ex.not_closed);
+
+            // Every press is undone but one that nothing undoes, so the window ends as it began.
+            while let Some(e) = w.events.pop_front() { model.feed(&mut w, e); }
+            // The caret stays in the last field pressed, as it does for a hand.
+            model.focus = None;
+            let in_window = |m: &Model| -> Vec<(Option<String>, [i32; 4], u32)> {
+                m.frame().0.into_iter().filter(|p| p.b[1] < MODEL[3] && !p.text.as_ref().is_some_and(|t| t.starts_with("kept ") || t.starts_with("count "))).map(|p| (p.text, p.b, p.color)).collect()
+            };
+            assert!(in_window(&model) == in_window(&home), "round {}: the window is not left as it was found", round);
+        }
+        let _ = std::fs::remove_dir_all(&out);
     }
 }

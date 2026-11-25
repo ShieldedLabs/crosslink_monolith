@@ -92,17 +92,24 @@ run_script() {
 # snap <label>: every script but the benchmark, each into its own directory.
 snap() {
     rm -rf "$gui_out/$1"
-    local failed=0 shots=0 script name scene log
+    local failed=0 shots=0 script name scene dir
+    # The scripts run side by side: each is a process of its own with its own directory.
     for script in "$here"/scripts/*.gui; do
         name="$(basename "$script" .gui)"
         [ "$name" = bench ] && continue
         scene=default; grep -q '^# scene empty' "$script" && scene=empty
-        if ! log="$(run_script "$scene" "$gui_out/$1/$name" "$script" 2>&1)"; then
+        dir="$gui_out/$1/$name"
+        mkdir -p "$dir"
+        ( run_script "$scene" "$dir" "$script" > "$dir/log.txt" 2>&1; echo $? > "$dir/exit" ) &
+    done
+    wait
+    for dir in "$gui_out/$1"/*/; do
+        if [ "$(cat "$dir/exit" 2>/dev/null)" != 0 ]; then
             failed=$((failed + 1))
-            echo "$name: FAILED"; echo "$log" | grep -vE '^(shot|film|lint:|settle: still after) ' | tail -15
+            echo "$(basename "$dir"): FAILED"; grep -vE '^(shot|film|lint:|settle: still after) ' "$dir/log.txt" | tail -15
         fi
-        echo "$log" > "$gui_out/$1/$name/log.txt"
-        shots=$((shots + $(echo "$log" | grep -c '^shot ')))
+        rm -f "$dir/exit"
+        shots=$((shots + $(grep -c '^shot ' "$dir/log.txt")))
     done
     if gui_changed; then echo changed; else id_committed; fi > "$gui_out/$1/id"
     echo "snap $1: $shots screenshots in $gui_out/$1, $failed scripts failed"
@@ -142,6 +149,8 @@ check_all() {
     auto_base
     local bad="" log
     snap now || bad="$bad a script failed;"
+    # What pressing everything found, a line for each window it was done in.
+    grep -hE '^explore [^:]*: pressed [0-9]+ things? at ' "$gui_out"/now/*/log.txt 2>/dev/null
     if log="$(run_script default "$gui_out/now/monkey" "monkey ${1:-400}" 2>&1)"; then
         echo "random input: no crash ($(echo "$log" | grep '^monkey seed' | cut -d' ' -f1-3))"
     else

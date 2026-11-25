@@ -1,0 +1,5 @@
+# Everything on the main screen that can be pressed, pressed: what each opens, expands or
+# switches, what that pushes out of place, and how it is undone. In the window a 1080p
+# display leaves; explore_minspec.gui does the same in the smallest window.
+settle 300
+explore mainline

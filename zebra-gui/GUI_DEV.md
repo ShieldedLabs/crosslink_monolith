@@ -79,9 +79,9 @@ Output goes to `zebra-gui/target/gui/run/`. Read the PNG a command names; crop w
 | --- | --- | --- |
 | `build` after an edit | 16 to 30 s | 5 s of compiling; the rest is the machine's build lock. |
 | `build` from nothing | 8 min | Happens when the target directory was cleaned. |
-| `run` | under 1 s | Plus a build if a source file changed, and 5 s to record `base` the first time after a commit. |
-| `snap <label>` | 5 s | Every script, into `target/gui/<label>/<script>/`. |
-| `check` | 14 s | `snap now`, random input, `diff base now`. |
+| `run` | under 1 s | Plus a build if a source file changed, and 18 s to record `base` the first time after a commit. An `explore` of the main screen is 10 s. |
+| `snap <label>` | 18 s | Every script, side by side, into `target/gui/<label>/<script>/`. |
+| `check` | 25 s | `snap now`, random input, `diff base now`. |
 | `lint` | 5 s | Every finding on every screenshot, one line each. |
 | `style` | 5 s | Every text size, colour and corner radius the screens use, with counts. |
 | `bench` | 10 s | Frame timings; takes the build lock so nothing else skews it. |
@@ -122,6 +122,7 @@ gives the same pixels every time.
 | `track "text" [frames]` | Where the text is in each frame. |
 | `resize <name> <w> <h> [steps]`, `resize <name> minspec [steps]` | Move the window's side to that size a step at a time, as a hand dragging it does, and say what breaks on the way. |
 | `drag <name> "grip" <dx> <dy> [steps]` | The same for a pane: press the grip, or a text, or `<x> <y>`, and move the pointer that far a step at a time. |
+| `explore <name> [depth] [most]` | Press everything on the screen that can be pressed, and whatever each press brings up, `depth` levels in (2), undoing each press before the next. Say what each one opened, moved and broke, and what undoes it. |
 | `bench [frames]`, `bench_idle [frames]` | Time full redraws; time frames where nothing changed. |
 | `monkey [steps] [seed]` | Random input. Writes its commands to `monkey.gui` as it goes. |
 | `log text`, `sleep <ms>` | Print; wait. |
@@ -203,6 +204,84 @@ resize narrower.png: the window at 1920x1000 1840x1000 ... 1280x1000, left to ri
 What a real window does while its border is dragged (whether the last frame is stretched, or
 a strip is left unpainted) is the operating system's and softer_gui's, and no script sees it.
 
+**Pressing things.** A screenshot is of a screen at rest, and this GUI does not stay at
+rest: a menu drops down, a row of the history expands, a filter opens a panel, and each
+pushes the rest of the page about. `explore` presses everything that can be pressed, one
+thing at a time. After each press it parks the pointer, waits for the screen to stop
+moving, and reads it. What the press brought up it presses too, one level in. It undoes
+each press before the next as a person would: the same thing again, the tab beside it, esc,
+a close button it has seen work, or three seconds of waiting.
+
+```text
+bash zebra-gui/gui.sh run 'settle 300; explore main'
+bash zebra-gui/gui.sh run 'click "Send"; explore send'       Inside a dialog.
+```
+
+```text
+explore "Network Info": new text "0", "3", "4", "8" and 15 more; 1 text moved by -87,-585 px, 2 moved otherwise; pressing it again undoes it -> .../main_network_info.png
+explore "Finalizer Filters": new text "15 ", "Connected under" ...; 37 texts moved 128 px down, 1 moved otherwise; pressing it again undoes it -> .../main_finalizer_filters.png
+explore "Finalizer Filters": brings 4 faults: target "Voted at latest height" 348x14 px to click, under 24 px, margin "seconds ago" 2 px from the side of the box behind it, ...
+explore "Faucet Wallet": new text "993.250 cTAZ" ...; 76 texts moved 68 px up; pressing "Your Wallet" beside it undoes it -> .../main_faucet_wallet.png
+explore "Jump To Height...": new text "Jump To Height" ...; esc does not undo it once things in it were pressed; pressing <e81f> at 1172,411 in it undoes it -> .../main_jump_to_height.png
+explore "Received @ 10": new text "00000000..00000010" ...; nothing undoes it: not esc, not pressing it again, not what is beside it or closed it before, not waiting -> .../main_received_10.png
+explore all 4 that a second press closes, open at once: ... -> .../main_all_open.png
+explore main: 8 presses led back to a screen passed on the way, as a close button does: "Send" > <e81f> at 332,325, ...
+explore main: 3 presses changed how something is drawn and moved no text: "Jump To Height..." > "Enter PoW height..." (18370 px, and a second press did not put it back), ...
+explore main: 28 presses changed nothing on screen: "Your Wallet", "Send" > "Paste Address", ...
+explore main: closing all that was open at once, last first, did not bring the screen back: new text "00000000..0000000d", ...
+explore main: pressed 64 things at 1920x1000, 2 deep, of 48 on screen: 26 opened another screen, 8 led back, 3 only redrew, 28 changed nothing; left out 36 alike in a list and 17 disabled; what opened brought 20 faults on 6 screens -> .../main.txt
+```
+
+- **One line for each press that led to another screen:** what it brought, what that moved,
+  and what undoes it. `"Send" > "Paste Address"` is "Paste Address" pressed in what "Send"
+  opened. The image is the whole window in that state: read the one for each state your
+  change touches. Many texts moved is a reflow: ask whether it had to be.
+- **`brings N faults`** are the lint findings the screen did not have before the press: a
+  menu the window cuts off (`outside`), a panel drawn over text (`overlap`). They are kept
+  in lint under the screenshot's name, so `check` says `lint new` when your change adds one.
+- **`nothing undoes it`** is right for a slider, or for a row that moves the block map. For
+  a menu, a panel or a dialog it is a fault: a person cannot get out of it either. `esc
+  does not undo it` on a dialog is a fault too.
+- **`all N that a second press closes, open at once`** is the page with every menu and
+  panel open together, where there is least room. Read its image. `the N of M` means some
+  shut as others opened, as one menu shuts another.
+- **`closing all ... did not bring the screen back`** says what stayed changed after they
+  were closed again, last first. On the main screen it is the view lock: while it is on
+  the block map moves on, and switching it off leaves the map where it got to. Anything
+  else there is a panel that stays open, or that leaves something behind.
+- **`changed nothing on screen`** lists presses with no effect: a button the mock data
+  gives nothing to do, or a broken one. Find the ones you added in it.
+- **`only redrew`** is a switch that shows its state by colour alone, or a text field that
+  took the caret. A switch is pressed a second time to put it back, and the line says if
+  that did not: right for a field, a fault for a switch.
+- **`N things were not pressed`** names what it could not get back to, after a press that
+  nothing undid changed the screen they were on. Press those by hand.
+- **`the screen was still changing 90 frames after a press`** is an animation that does not
+  stop. What explore read there may be a frame from the middle of it.
+- Of four or more things of one size in a column, as the rows of a list, it presses the
+  first and the last. What is disabled is not pressed. The last line counts both.
+- It presses, and does not type. What needs an amount or an address typed first does
+  nothing here: script that by hand, as `tour.gui` does.
+- A press nothing undoes leaves its mark on the screens after it. The other presses are
+  still made and still judged, each against the screen just before it.
+- `<name>.txt` holds every line in full, and under them every press in order, each with the
+  command that makes it:
+
+  ```text
+  click 269 192   "Edit Stake"
+  click 196 269   "Edit Stake" > "Unknown (ra…"
+  click 196 269     to undo it: again
+  key esc           to undo it
+  ```
+
+  To see one state for yourself, run the commands down to it with `gui.sh run`, a
+  `move 4 4` and a `settle` after each, then `shot`, `lint` or `targets`.
+- `check` runs `scripts/explore.gui` and `scripts/explore_minspec.gui`, the main screen at
+  each size, and prints the last line of each. Every state they reach is a screenshot like
+  any other: a change to an open menu shows as `differs`, a new menu as `new screenshot`.
+- A dialog or a pane you add may hold things the main screen's run does not reach, two
+  levels in. Give it its own lines in a script: `click "Stake"; explore stake`.
+
 **Crashes.** A scripted run reports its own:
 
 ```text
@@ -251,6 +330,8 @@ The tools find what is broken. These they cannot find; check them by reading you
 - Does it hold at `minspec`, and at `scale 1.25` and `scale 2`? `scripts/minspec.gui` and
   `scripts/sizes.gui` show.
 - Does it hold while the window or its pane is made smaller? `resize` and `drag` show.
+- Does it hold with what is on the page open: each menu, each expanded row, all of them at
+  once? Does everything you added close again? `explore` shows.
 - Does anything depend on frame count where it should depend on time?
 - Did you add state that must be reset when a dialog closes or the wallet changes?
 - Is each new id unique? Two widgets with one id share hover and press.
@@ -262,7 +343,7 @@ The tools find what is broken. These they cannot find; check them by reading you
 | `src/ui.rs` | 5,800 | Every screen and widget. `run_ui` is the whole frame's layout. |
 | `src/lib.rs` | 2,800 | The frame loop, input, the rasteriser and its worker threads. |
 | `src/viz_gui.rs` | 2,450 | The block map, and the messages to and from the node. |
-| `src/script.rs` | 2,500 | The scripted window, lint, design, motion and resize checks, PNG, crash reports. |
+| `src/script.rs` | 3,800 | The scripted window, lint, design, motion and resize checks, `explore`, PNG, crash reports. |
 | `src/style.rs` | 70 | Named colours, text sizes, control sizes and pane widths. Spaces and times belong here too. |
 | `src/main.rs` | 140 | The standalone program and its mock wallet data. |
 | `scripts/tour.gui` | | Every screen and dialog, at `mainline`. |
@@ -270,6 +351,8 @@ The tools find what is broken. These they cannot find; check them by reading you
 | `scripts/sizes.gui` | | The main screen at `minspec`, at `mainline` and on three sharper displays. |
 | `scripts/motion.gui` | | Start-up, scrolling, a dialog, the block map. |
 | `scripts/resize.gui` | | The window from `mainline` down to `minspec`, and each pane's divider dragged at `minspec`. |
+| `scripts/explore.gui` | | Everything on the main screen pressed, at `mainline`. |
+| `scripts/explore_minspec.gui` | | The same at `minspec`. |
 | `scripts/bench.gui` | | What `bench` times. |
 
 Layout is by `clay` (`../clay-rs`); the window, input and pixels are by `softer_gui`, a
@@ -297,4 +380,17 @@ Found with these tools and not yet fixed. Each is a good first task.
 - **Buttons disagree about the pointer.** 14 call sites of `button_ex` ask for the hand
   pointer; every plain `Context::button` asks for none. Pick one rule.
 - **Two block hash labels are drawn on top of each other** in the block map (`overlap`).
+- **"Finalizer Filters", open, runs to the window's right side**: "seconds ago" ends 2 px
+  from it, and "Voted at latest height" is a 14 px tall thing to press (`explore`).
+- **At `minspec`, the open "Network Info" panel lies over the PoW bar and the block map's
+  text**, and with "Finalizer Filters" open too, "Jump To Height..." and the last history
+  row are cut off by the window's bottom (`explore`, `minspec_all_open.png`).
+- **Esc does not close "Jump To Height..." once its text field was pressed.** Its close
+  button does.
+- **A bond's row in "Edit Stake", expanded, has two things to press under 24 px**, 16x18
+  and 17x18. At `minspec` the expanded row brings a scroll bar that moves the whole list
+  6 px left. The row stays expanded when the dialog is closed and opened again.
+- **Unmuting sets the volume to 100%**, not to what it was before the mute.
+- **"Receive cTAZ" turns grey when pressed and stays so**, with nothing on screen saying
+  why.
 - 321 of 9,700 lines of code are a second copy of another run of 8 or more lines (`dup`).

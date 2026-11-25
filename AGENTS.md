@@ -140,6 +140,15 @@ bash zebra-gui/gui.sh run '<commands>'   Try one thing, e.g. 'click "Send"; shot
   says from what size text is cut off or overlaps, what jumps, and what
   follows a frame late. `check` does this for the main screen; run both on a
   screen or a pane you add or change.
+- A screen at rest is not the whole of it. Much of this GUI opens, expands or
+  switches when pressed ("Finalizer Filters", "Network Info", a row of the
+  history, each dialog), and what opens pushes the rest of the page about.
+  `explore` presses everything on a screen and whatever each press brings up,
+  and says for each what it opened, what that moved, which faults it brought
+  and what undoes it. `check` does this for the main screen at both sizes:
+  read the image of each state your change touches, and the one with all of
+  them open at once. Run `explore` yourself inside a dialog or a pane you add
+  or change.
 - A new screen or behaviour gets lines in a script under `zebra-gui/scripts/`,
   so `check` covers it from then on.
 - A crash or a hang prints the script line it happened on. A random-input

@@ -1,0 +1,6 @@
+# Everything on the main screen that can be pressed, pressed, in the smallest window the GUI
+# has to stay whole in. It is a run of its own, since what explore.gui presses leaves the
+# block map moved on.
+size minspec
+settle 300
+explore minspec
