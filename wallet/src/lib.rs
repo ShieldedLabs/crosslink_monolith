@@ -628,6 +628,17 @@ pub fn get_tfl_recency_status_str() -> Option<String> {
     closure.0()
 }
 
+const LIGHTWALLET_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+// Bound the entire call, including readiness, response headers, and unary bodies/trailers.
+// Endpoint::timeout alone stops timing at the response headers. For streaming calls this
+// only bounds opening the stream; each sync-stream read has its own idle timeout below.
+async fn lightwallet_rpc<T>(call: impl Future<Output = Result<T, tonic::Status>>) -> Result<T, tonic::Status> {
+    tokio::time::timeout(LIGHTWALLET_RPC_TIMEOUT, call)
+        .await
+        .unwrap_or_else(|_| Err(tonic::Status::deadline_exceeded("lightwallet RPC did not finish in 30 s")))
+}
+
 // A lightwallet server can accept a streaming request and then never send the next message, which would
 // park the sync loop forever with no error. A timeout turns that into an error the loop already handles.
 async fn next_stream_message<T>(stream: &mut tonic::Streaming<T>) -> Result<Option<T>, tonic::Status> {
@@ -1857,7 +1868,7 @@ impl ManualWallet {
         } else {
             let tx_size = raw_tx.data.len();
             let data = raw_tx.data.clone();
-            let res = client.send_transaction(raw_tx).await;
+            let res = lightwallet_rpc(client.send_transaction(raw_tx)).await;
             if DUMP_TX_SEND { println!("******* res for {:?} ({} B): {:?}", tx.txid(), tx_size, res); }
             // Transport/gRPC failures come back as Err; a node *rejection* comes back as Ok
             // with a non-zero error_code (stock lightwalletd/zaino). The bundled zebrad server
@@ -2656,7 +2667,7 @@ impl ManualWallet {
         let (_t_addr, _p2sh, ua) = addrs_from_account(account, 0).unwrap(); // @Hack
         // the payout arrives as change, which needs an ovk and our own Ironwood address
         if let (Some(_ovk), Some(&_dst)) = (keys.orchard_ovk, ua.orchard()) {
-            let amount_zats = match client.get_bond_info(zcash_client_backend::proto::service::BondInfoRequest { bond_key: bond_key.to_vec(), }).await {
+            let amount_zats = match lightwallet_rpc(client.get_bond_info(zcash_client_backend::proto::service::BondInfoRequest { bond_key: bond_key.to_vec(), })).await {
                 Ok(response) => {
                     let info = response.into_inner();
                     if let Ok(version) = <[u8; 32]>::try_from(info.version.as_slice()) {
@@ -3686,7 +3697,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
         for txid in &txids {
             let filter = TxFilter{ hash: txid.as_ref().to_vec(), ..Default::default() };
-            let Ok(rawtx) = client.get_transaction(filter).await else { continue; };
+            let Ok(rawtx) = lightwallet_rpc(client.get_transaction(filter)).await else { continue; };
             let rawtx = rawtx.into_inner();
 
             let block_h = LRZBlockHeight::from_u32(rawtx.height as u32);
@@ -4031,8 +4042,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     // @todo(judah): investigate why requests get randomly dropped in a strange way:
     // transport error, service not ready, etc.
+    let endpoint = Channel::from_shared(format!("http://localhost:{}", lightwalletd_port)).unwrap()
+        .connect_timeout(LIGHTWALLET_RPC_TIMEOUT);
     let mut client = loop {
-        if let Ok(channel) = Channel::from_shared(format!("http://localhost:{}", lightwalletd_port)).unwrap().connect().await {
+        // Include the whole connection attempt, not just opening its TCP socket.
+        if let Ok(Ok(channel)) = tokio::time::timeout(LIGHTWALLET_RPC_TIMEOUT, endpoint.connect()).await {
             break CompactTxStreamerClient::new(channel);
         }
 
@@ -4040,11 +4054,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     };
 
     if TEST_FAUCET {
-        println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
-        println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: "arosienarsoienaroisetn".to_owned() }).await);
-        println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
+        println!("faucet: {:?}", lightwallet_rpc(client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() })).await);
+        println!("faucet: {:?}", lightwallet_rpc(client.request_faucet_donation(FaucetRequest{ address: "arosienarsoienaroisetn".to_owned() })).await);
+        println!("faucet: {:?}", lightwallet_rpc(client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() })).await);
         FAUCET_Q.lock().unwrap().read_o += 1; // fake read
-        println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
+        println!("faucet: {:?}", lightwallet_rpc(client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() })).await);
     }
 
     const MAX_BLOCKS_TO_DOWNLOAD_AT_TIME: u64 = 1024;
@@ -4061,7 +4075,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let mut stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly = Vec::<TxId>::new();
 
     let genesis_hash = loop {
-        match client.get_block(BlockId { height: 0, hash: Vec::new() }).await {
+        match lightwallet_rpc(client.get_block(BlockId { height: 0, hash: Vec::new() })).await {
             Ok(block) => { break <[u8;32]>::try_from(&block.into_inner().hash[..]).unwrap() },
             Err(err) => { print!("failed to get genesis block") },
         }
@@ -4091,10 +4105,12 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let (mempool_send, mut mempool_recv) = tokio::sync::mpsc::channel::<RawTransaction>(512);
     tokio::spawn(async move {
         'mempool_reconnect: loop {
-            match mempool_client.get_mempool_stream(Empty {}).await {
+            match lightwallet_rpc(mempool_client.get_mempool_stream(Empty {})).await {
                 Ok(s) => {
                     let mut strm = s.into_inner();
                     loop {
+                        // An idle mempool is normal, unlike an incomplete sync response.
+                        // This separate task must not reconnect just because no transactions arrive.
                         match strm.message().await {
                             Ok(Some(tx)) => {
                                 // println!("MEMPOOL: got new message");
@@ -4171,8 +4187,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let mut resync_c = 0;
     'outer_sync: loop {
         if TEST_FAUCET {
-            println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
-            println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: miner_ua_str.clone() }).await);
+            println!("faucet: {:?}", lightwallet_rpc(client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() })).await);
+            println!("faucet: {:?}", lightwallet_rpc(client.request_faucet_donation(FaucetRequest{ address: miner_ua_str.clone() })).await);
         }
 
         if !just_init_new_tx && resync_c > 0 {
@@ -4212,16 +4228,16 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 // println!("cache at {}, downloading blocks: {}-{}",
                 //     pow_cache.next_tip_h-1, block_range.start.clone().unwrap().height, block_range.end.clone().unwrap().height);
                 let (tree_state_res, lightd_res, block_range_res) = tokio::join!(
-                    client.get_tree_state(BlockId {height: req_start_h, hash: Vec::new()}),
-                    client0.get_lightd_info(Empty {}),
-                    client1.get_block_range(block_rng_from_heights(req_rng)),
+                    lightwallet_rpc(client.get_tree_state(BlockId {height: req_start_h, hash: Vec::new()})),
+                    lightwallet_rpc(client0.get_lightd_info(Empty {})),
+                    lightwallet_rpc(client1.get_block_range(block_rng_from_heights(req_rng))),
                 );
                 (tree_state_res, lightd_res, block_range_res, req_rng)
             };
 
             //- ROSTER
             // TODO: batch
-            match client.get_roster(Empty{}).await {
+            match lightwallet_rpc(client.get_roster(Empty{})).await {
                 Err(err) => println!("Get roster error: {err:?}"),
                 Ok(res) => {
                     let roster_bytes = res.into_inner().data;
@@ -4338,7 +4354,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             (
                                 txid,
                                 wallet_i,
-                                match client.get_transaction(filter).await {
+                                match lightwallet_rpc(client.get_transaction(filter)).await {
                                     Err(err) => {
                                         println!("get transaction: {err:?}");
                                         None
@@ -4501,10 +4517,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         (strm_sync_h.0 as u64).saturating_sub(T_ADDR_RECHECK_WINDOW).max(1),
                         compact_block_max_h.min(strm_sync_h.0 as u64 + MAX_BLOCKS_TO_DOWNLOAD_AT_TIME)
                     );
-                    let t_txs_res = client.get_taddress_txids(TransparentAddressBlockFilter {
+                    let t_txs_res = lightwallet_rpc(client.get_taddress_txids(TransparentAddressBlockFilter {
                         address: t_addr_str.clone(),
                         range: Some(block_rng_from_heights(t_req_rng)),
-                    }).await;
+                    })).await;
 
                     let mut t_failed_at_h = None;
                     let mut new_raw_t_txs: Vec<RawTransaction> = Vec::new();
@@ -5017,7 +5033,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
         for (name, txid, data) in resends {
-            match client.send_transaction(RawTransaction { data, height: 0 }).await {
+            match lightwallet_rpc(client.send_transaction(RawTransaction { data, height: 0 })).await {
                 Ok(resp) if resp.get_ref().error_code == 0 => println!("{name} wallet: resent tx {txid}, which a reorg dropped"),
                 Ok(resp) => println!("{name} wallet: the node refused tx {txid}, which a reorg dropped: {}", resp.get_ref().error_message),
                 Err(status) => println!("{name} wallet: failed to resend tx {txid}, which a reorg dropped: {status}"),
@@ -5343,7 +5359,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             // also inspect bonds
             for bond_key in &user_wallet.care_about_bonds {
-                match client.get_bond_info(zcash_client_backend::proto::service::BondInfoRequest { bond_key: bond_key.to_vec(), }).await {
+                match lightwallet_rpc(client.get_bond_info(zcash_client_backend::proto::service::BondInfoRequest { bond_key: bond_key.to_vec(), })).await {
                     Ok(response) => {
                         let info = response.into_inner();
                         user_wallet.seen_bond_values.insert(*bond_key, info.amount);
@@ -5820,6 +5836,107 @@ mod tests {
         ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
             std::task::Poll::Pending
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RpcWait {
+        Readiness,
+        Headers,
+        Body,
+        Trailers,
+    }
+
+    // In-process transport fixtures: no sockets, node, or wallet data are involved.
+    struct WaitingRpc(RpcWait);
+    struct WaitingRpcBody(Option<tonic::codegen::Bytes>);
+
+    impl http_body::Body for WaitingRpcBody {
+        type Data = tonic::codegen::Bytes;
+        type Error = tonic::Status;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            match self.0.take() {
+                Some(message) => std::task::Poll::Ready(Some(Ok(http_body::Frame::data(message)))),
+                None => std::task::Poll::Pending,
+            }
+        }
+    }
+
+    impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> for WaitingRpc {
+        type Response = tonic::codegen::http::Response<WaitingRpcBody>;
+        type Error = tonic::Status;
+        type Future = std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            if matches!(self.0, RpcWait::Readiness) {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        fn call(&mut self, _: tonic::codegen::http::Request<tonic::body::Body>) -> Self::Future {
+            let wait = self.0;
+            Box::pin(async move {
+                if matches!(wait, RpcWait::Headers) {
+                    std::future::pending::<()>().await;
+                }
+                // A valid, empty protobuf response, followed by missing trailers.
+                let message = matches!(wait, RpcWait::Trailers)
+                    .then(|| tonic::codegen::Bytes::from_static(&[0, 0, 0, 0, 0]));
+                Ok(tonic::codegen::http::Response::new(WaitingRpcBody(message)))
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lightwallet_rpc_bounds_every_unary_wait() {
+        for wait in [RpcWait::Readiness, RpcWait::Headers, RpcWait::Body, RpcWait::Trailers] {
+            let mut client = CompactTxStreamerClient::new(WaitingRpc(wait));
+            let start = tokio::time::Instant::now();
+            let result = tokio::time::timeout(
+                LIGHTWALLET_RPC_TIMEOUT * 2,
+                lightwallet_rpc(client.get_lightd_info(Empty {})),
+            ).await.expect("the RPC deadline must fire before the test deadline");
+            assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded, "{wait:?}");
+            assert_eq!(start.elapsed(), LIGHTWALLET_RPC_TIMEOUT, "{wait:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lightwallet_rpc_bounds_opening_a_stream() {
+        for wait in [RpcWait::Readiness, RpcWait::Headers] {
+            let mut client = CompactTxStreamerClient::new(WaitingRpc(wait));
+            let result = tokio::time::timeout(
+                LIGHTWALLET_RPC_TIMEOUT * 2,
+                lightwallet_rpc(client.get_block_range(BlockRange::default())),
+            ).await.expect("opening the stream must have a deadline");
+            assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded, "{wait:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lightwallet_rpc_does_not_limit_stream_lifetime() {
+        let mut client = CompactTxStreamerClient::new(WaitingRpc(RpcWait::Trailers));
+        let mut stream = lightwallet_rpc(client.get_block_range(BlockRange::default()))
+            .await.unwrap().into_inner();
+        tokio::time::sleep(LIGHTWALLET_RPC_TIMEOUT * 2).await;
+        assert!(next_stream_message(&mut stream).await.unwrap().is_some());
+        let start = tokio::time::Instant::now();
+        assert_eq!(next_stream_message(&mut stream).await.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(start.elapsed(), Duration::from_secs(30));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lightwallet_rpc_preserves_success_and_errors() {
+        assert_eq!(lightwallet_rpc(async { Ok(42) }).await.unwrap(), 42);
+        let error = lightwallet_rpc::<()>(async { Err(tonic::Status::unavailable("retry later")) })
+            .await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert_eq!(error.message(), "retry later");
     }
 
     struct UnitDecoder;
