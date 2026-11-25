@@ -1233,13 +1233,14 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
         }));
     }
 
-    // No render target of our own any more: the tiles are rasterised straight into
-    // softer_gui's back buffer. One tile-hash set per buffer, plus the generation
-    // they belong to, so a realloc drops both.
-    let mut tile_cache_generation = u64::MAX;
-    // One damage cache per back buffer: softer_gui rotates two.
-    let mut tile_hashes: [Vec<u64>; 2] = [Vec::new(), Vec::new()];
-    let mut whole_screen_hash = [0u64; 2];
+    // The tiles are rasterised straight into softer_gui's back buffer, which holds
+    // whatever was last drawn into that buffer, not the last frame: softer_gui rotates
+    // up to three. So each buffer has its own tile hashes, kept while its key holds.
+    let mut tile_cache_key = [u64::MAX; 3];
+    let mut tile_hashes: [Vec<u64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    // The hash of the frame on screen: a frame equal to it needs no submit, whichever
+    // buffer it was drawn into.
+    let mut shown_frame_hash = 0u64;
     let mut did_window_resize = true;
 
     // staking day cosmetics
@@ -1538,16 +1539,13 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                         let (window_width, window_height) = (fb.width, fb.height);
                         if window_width == 0 || window_height == 0 { continue; }
 
-                        // Back buffers rotate, so "this tile is unchanged" has to mean unchanged
-                        // relative to what THIS buffer already holds, not to the last frame drawn.
-                        // `fb.key` is (generation << 1 | index) and is stable per buffer until a
-                        // realloc, which is exactly the identity the tile cache needs.
-                        let fb_index = (fb.key & 1) as usize;
-                        let fb_generation = fb.key >> 1;
-                        if tile_cache_generation != fb_generation || tile_hashes[fb_index].len() != tiles_wide*tiles_wide {
-                            tile_cache_generation = fb_generation;
-                            tile_hashes = [vec![0u64; tiles_wide*tiles_wide], vec![0u64; tiles_wide*tiles_wide]];
-                            whole_screen_hash = [0; 2];
+                        // `fb.key` is (generation << 2 | index), and stays put until that one
+                        // buffer is reallocated; the buffers can be reallocated at different times.
+                        let fb_index = (fb.key & 3) as usize;
+                        if tile_cache_key[fb_index] != fb.key || tile_hashes[fb_index].len() != tiles_wide*tiles_wide {
+                            tile_cache_key[fb_index] = fb.key;
+                            tile_hashes[fb_index] = vec![0u64; tiles_wide*tiles_wide];
+                            shown_frame_hash = 0;
                         }
                         let saved_tile_hashes = &mut tile_hashes[fb_index];
 
@@ -2257,16 +2255,14 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                                 }
                             });
 
-                        let need_buffer_flip;
-                        {
+                        let frame_hash = {
                             let mut hasher = ahash::AHasher::default();
                             hasher.write_usize(window_width);
                             hasher.write_usize(window_height);
                             for th in saved_tile_hashes.iter() { hasher.write_u64(*th); }
-                            let new_hash = hasher.finish();
-                            need_buffer_flip = whole_screen_hash[fb_index] != new_hash;
-                            whole_screen_hash[fb_index] = new_hash;
-                        }
+                            hasher.finish()
+                        };
+                        let need_buffer_flip = shown_frame_hash != frame_hash;
 
                         prev_frame_time_us = begin_frame_instant.elapsed().as_micros() as usize;
 
@@ -2400,6 +2396,7 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
 
                         let need_buffer_flip = script::pace_frame(frame_pace_us) || need_buffer_flip || ui.debug;
                         if need_buffer_flip {
+                            shown_frame_hash = frame_hash;
                             gui.submit();   // one present per vblank; this is what paces the next RENDER
                         }
 
