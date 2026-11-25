@@ -137,8 +137,9 @@ bash zebra-gui/gui.sh run '<commands>'   Try one thing, e.g. 'click "Send"; shot
   crash leaves `target/gui/now/monkey/monkey.gui`, which replays it.
 - The mock data is in `zebra-gui/src/main.rs`. If the screen you need cannot
   be reached from it, add to the mock data; do not start a node.
-- Use no worktree for GUI work: `gui.sh snap <label>` keeps a before and an
-  after side by side in one checkout.
+- Use no worktree for GUI work. `check` compares with the last commit's screens,
+  which `gui.sh` records by itself under `base`: never record `base` yourself
+  after editing. `gui.sh snap <label>` keeps any other state to compare with.
 - `gui.sh` takes 5 to 30 seconds. Start it in the background when you have
   reading to do meanwhile.
 - The scripted run has no real window. What only a real window shows (the

@@ -16,8 +16,10 @@ bash zebra-gui/gui.sh check               After each edit.
 ```
 
 Whenever `gui.sh` runs and the GUI has no uncommitted change, it records every screen under
-`base`, once for each commit. That is what a change is compared with, so run it once before
-the first edit. `gui.sh snap base` records one by hand, from a tree that has changes already.
+`base`. That is what `check` compares a change with, so run `gui.sh` once before the first
+edit. Never record `base` yourself after editing: your change would go into it, and `check`
+would report that nothing differs. `gui.sh` refuses that while `base` is good. It asks for
+`gui.sh snap base` only when it first ran in a tree that had GUI changes already.
 
 `check` rebuilds if a source file is newer than the binary, runs every script in `scripts/`,
 feeds 400 steps of random input, and says what differs from `base`. It ends in `check: ok`
