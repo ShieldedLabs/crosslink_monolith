@@ -1195,8 +1195,8 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
 
     let mut frame_stats = [FrameStat::_0; 512];
     let mut frame_stat_o = 0;
-    let mut frame_interval_milli_hertz = 60000;
-    let mut next_frame_deadline = Instant::now() + Duration::from_secs(1000) / frame_interval_milli_hertz;
+    // Replaced by each RENDER's own period, which softer_gui reads off the display.
+    let mut frame_period_fs: u64 = 1_000_000_000_000_000 / 60;
     let mut prev_frame_time_single_threaded_us = 0usize;
     let mut prev_frame_time_us = 0usize;
     let mut prev_frame_time_total_us = 0usize;
@@ -1460,6 +1460,7 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                 EVENT_RENDER => {
                     last_render = Instant::now();
                     if ev.scale_fx != 0 { dpi_scale = ev.scale_fx as f64 / 65536.0; }
+                    if ev.dt_fs != 0 { frame_period_fs = ev.dt_fs; }
                     if ev.width as usize != last_window_size.0 || ev.height as usize != last_window_size.1 {
                         last_window_size = (ev.width as usize, ev.height as usize);
                         did_window_resize = true;
@@ -1519,7 +1520,7 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                         //     (*p_thread_context).wake_up_gate.store(1, Ordering::Release);
                         // }
 
-                        let target_frame_time_us = (1000000000.0 / (frame_interval_milli_hertz as f64)) as usize;
+                        let target_frame_time_us = (frame_period_fs / 1_000_000_000) as usize;
                         let begin_frame_instant = Instant::now();
 
                         // softer_gui's back buffer is the layout this renderer already wanted: square,
@@ -1549,7 +1550,7 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                         }
                         let saved_tile_hashes = &mut tile_hashes[fb_index];
 
-                        let mut dt = 1000.0 / (frame_interval_milli_hertz as f64);
+                        let mut dt = frame_period_fs as f64 / 1e15;
                         {
                             let cpu_dt = prev_frame_time_total_us as f64 / 1000000.0;
                             if cpu_dt > dt*2.0 && matches!(gui, Window::Os(_)) { dt = cpu_dt; }
@@ -2293,7 +2294,7 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                             draw_ctx.text_line(FontKind::Mono, 8.0, 8.0, 13.0,
                                 &format!(
                                     "Rate: {} hz | (us) deadline: {} internal:{:>5} total:{:>5} max(5s):{:>5}",
-                                    frame_interval_milli_hertz as f32 / 1000.0,
+                                    (1e15 / frame_period_fs as f64) as f32,
                                     target_frame_time_us,
                                     prev_frame_time_us,
                                     prev_frame_time_total_us,
