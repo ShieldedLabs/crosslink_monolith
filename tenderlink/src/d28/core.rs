@@ -185,7 +185,7 @@ impl<S: Storage> Engine<S> {
         if let Some(p) = f.proposal {
             if p.header.content.height != self.d().height
                 || !p.header.verify(self.c())
-                || body_id(p.body) != p.header.content.id
+                || self.c().body_id(p.body) != p.header.content.id
             {
                 return Err(Error::Invalid);
             }
@@ -792,7 +792,17 @@ impl<S: Storage> Engine<S> {
             return Err(Error::Corrupt);
         }
         let c = self.c();
-        if Config::new(c.domain, c.members.clone(), c.max_body, c.rho, c.timeouts)?.hash != c.hash {
+        if Config::build(
+            c.domain,
+            c.members.clone(),
+            c.max_body,
+            c.rho,
+            c.timeouts,
+            c.crosslink,
+        )?
+        .hash
+            != c.hash
+        {
             return Err(Error::Corrupt);
         }
         self.validate_descriptor()?;
@@ -812,7 +822,7 @@ impl<S: Storage> Engine<S> {
                 || h.content.height != self.d().height
                 || !h.verify(self.c())
                 || self.store.body(s.index).len() > self.c().max_body
-                || body_id(self.store.body(s.index)) != h.content.id
+                || self.c().body_id(self.store.body(s.index)) != h.content.id
             {
                 return Err(Error::Corrupt);
             }
