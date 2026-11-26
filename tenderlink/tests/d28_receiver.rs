@@ -667,3 +667,114 @@ fn cancelled_transmit_ownership_blocks_refill_across_fresh_generation() {
     replies.owned.clear();
     assert_eq!(sender.outstanding(), 0);
 }
+
+#[test]
+fn latest_request_snapshot_serves_current_polka_without_asserting_body_validity() {
+    let c = config();
+    let id = body_id(BODY);
+    let (mut source, mut source_out) = engine(&c, 3);
+    let mut proposal = decision_packet(&c);
+    proposal.message = Message::Ordinary;
+    proposal.groups.clear();
+    proposal
+        .deliver(&mut source, Status::Valid, &mut source_out)
+        .unwrap();
+    // A quorum of OTHER members: the receiving member (2) has not voted yet.
+    let votes = [0, 1, 3]
+        .into_iter()
+        .map(|signer| {
+            Vote::sign(
+                &c,
+                &key(signer),
+                VoteContent {
+                    height: 0,
+                    round: 0,
+                    kind: VoteKind::Prevote,
+                    id: Some(id),
+                    signer: signer as u32,
+                },
+            )
+        })
+        .collect();
+    let polka = Packet {
+        target: Target::Peer(peer(3)),
+        message: Message::Ordinary,
+        outer: None,
+        proposal: None,
+        groups: vec![(CertKind::Polka { round: 0, id }, votes)],
+    };
+    polka
+        .deliver(&mut source, Status::Valid, &mut source_out)
+        .unwrap();
+    assert_eq!(source.status().unwrap().polka, Some((0, id)));
+
+    let (mut receiver, mut out) = engine(&c, 2);
+    let mut sender = Responder::try_new(sender_config(1, 1)).unwrap();
+    let mut replies = Replies::default();
+    // The origin's snapshot needs nothing. A newer snapshot on the SAME token
+    // exposes a missing polka: the sender must not keep using the origin state.
+    sender
+        .update(
+            request_status(peer(2), 1, 10, Some(10), source.status().unwrap()),
+            0,
+        )
+        .unwrap();
+    assert!(sender.poll(&source, 0, &mut replies).unwrap().is_empty());
+    sender
+        .update(
+            request_status(peer(2), 1, 11, Some(10), receiver.status().unwrap()),
+            1,
+        )
+        .unwrap();
+    let sent = sender.poll(&source, 1, &mut replies).unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!((sent[0].0.sequence, sent[0].1), (10, Gap::Polka));
+    assert_eq!(replies.owned.len(), 1);
+    let packet = &replies.owned[0].packet;
+    assert!(packet.proposal.is_some());
+    assert!(
+        packet
+            .groups
+            .iter()
+            .any(|(kind, _)| *kind == CertKind::Polka { round: 0, id })
+    );
+
+    let rx = AdmissionBudget::new(1);
+    let permit = rx.try_acquire().unwrap();
+    packet
+        .deliver(&mut receiver, Status::Indeterminate, &mut out)
+        .unwrap();
+    assert!(out.decisions.is_empty());
+    assert!(out.packets.iter().all(|p| {
+        !p.outer
+            .is_some_and(|v| v.content.kind == VoteKind::Precommit && v.content.id.is_some())
+    }));
+    let slot = receiver
+        .view()
+        .unwrap()
+        .slot
+        .expect("retained pending body");
+    assert_eq!(
+        receiver.view().unwrap().statuses[slot.index],
+        Status::Indeterminate
+    );
+    let tag = receiver.body_tag(slot);
+    receiver.validity(tag, Status::Valid, &mut out).unwrap();
+    assert_eq!(receiver.view().unwrap().locked_id, Some(id));
+    assert!(out.packets.iter().any(|p| {
+        p.outer
+            .is_some_and(|v| v.content.kind == VoteKind::Precommit && v.content.id == Some(id))
+    }));
+    assert!(
+        out.decisions.is_empty(),
+        "a polka is not a decision certificate"
+    );
+    drop(permit);
+    assert_eq!((rx.in_use(), rx.high_water()), (0, 1));
+    assert!(sender.poll(&source, 2, &mut replies).unwrap().is_empty());
+    assert_eq!(
+        replies.calls.len(),
+        1,
+        "no second accepted handoff on one origin"
+    );
+}
