@@ -216,11 +216,12 @@ The baseline uses runtime poll/status intervals of 25/100 ms and a receive budge
 of 32; `fast` uses 5/25 ms and 128. Both allow two concurrent source requests.
 `fast_k1` keeps the fast settings but permits only one source request; it is not
 an end-to-end RX/memory cap, and an unhelpful source can occupy that sole lease
-until the unchanged two-second expiry. All profiles keep outgoing handoffs at
-two. Consensus timers, quorum, signatures and the 1 MiB body cap are unchanged.
-These are benchmark overrides, **not changed node defaults**. Sizes and paired
-profiles are randomized within each repetition. `--offline 1` keeps four
-identities in the roster but launches only three nodes.
+until the unchanged two-second expiry. `economy` changes only baseline's polling
+interval, from 25 to 100 ms, to test lower state-replacement frequency. All profiles
+keep outgoing handoffs at two. Consensus timers, quorum, signatures and the 1 MiB
+body cap are unchanged. These are benchmark overrides, **not changed node
+defaults**. Sizes and paired profiles are randomized within each repetition.
+`--offline 1` keeps four identities in the roster but launches only three nodes.
 
 Reprocess a downloaded campaign without changing its original `summary.json`:
 
@@ -383,3 +384,74 @@ measurement boundary. The retained counters do not identify these contributions
 separately: neither TX/body nor TX minus offered bytes measures retransmissions
 or packet loss. A final-height hold still sends statuses/hellos; it is not silent
 protocol-only idle traffic.
+
+#### Near-cap blocks after the long campaign
+
+`iad-nearcap-001` returned to four IAD machines without resetting their CPU state:
+2,048 headers plus 320-byte synthetic solutions produced **1,042,791-byte bodies
+(1,018.35 KiB)**. Seed 430 randomized three profiles over three repetitions,
+12 measured heights plus two warmup, with a 90-second whole-process deadline.
+The Rust executable was unchanged; runner SHA-256 was
+`f70fcc0643af9c86cac0af9d80b15b1560c42880156a337ccd3955c5bc1d8bc8`.
+
+| Profile | Complete / trials | ACKed / planned measured heights | Chain KiB/s | All receipt p50 / p95 ms |
+|---|---:|---:|---:|---:|
+| baseline | 0 / 3 | 12 / 36 | 81.73 | 8080 / 17524 |
+| fast | 0 / 3 | 3 / 36 | 19.21 | 14369 / 16384 |
+| fast_k1 | 0 / 3 | 11 / 36 | 75.96 | 4039 / 33199 |
+
+These are **failed-attempt throughput observations**, including measured stalls,
+not successful near-1-MiB capacity measurements. K1 did not make any trial complete.
+Chronology and changing CPU conditions prevent attributing the difference from
+the first IAD sweep solely to block size. Percentiles have only 12/3/11 observed
+heights and omit uncompleted heights, so they are especially weak tail estimates.
+
+There are 17 readable partial node reports, four truncated reports and 15 missing
+reports; **no trial has all four usable counter windows**. Therefore no matched
+network/evidence/CPU ratio is reported for these arms. The controller records
+remain usable for the table. Sixteen readable reports explicitly identify the
+whole-process deadline. One reports `D28: Storage` at 90.008 s: the in-memory
+`MemoryBackend::replace` deliberately returns that error when its deadline expires
+(`bench.rs:483–495`), strongly supporting a deadline race rather than demonstrated
+image corruption. The exact failing mutation was not logged. All campaign-owned
+children reached terminal states; missing/truncated outputs are not zeros.
+
+#### Slower-polling control
+
+`iad-economy-001` compared baseline with `economy` at 374.35 KiB: three paired,
+randomized repetitions, eight measured heights plus one warmup, seed 431.
+Only polling changed (25 to 100 ms); status cadence, receive budget and source
+concurrency stayed at baseline. All six trials completed. CPU steal had fallen
+to 0.47% / 0.34%, so this short run does **not** prove recovery under sustained
+credit exhaustion. Runner SHA-256 was
+`51de3dd390e91d8a3418b14bbc5b58a9585a357b817132ae476571b4e443725b`.
+
+| Profile | Complete / trials | Measured heights | Chain KiB/s | All receipt p50 / p95 ms | VM TX / body | Offered evidence / body |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline | 3 / 3 | 24 | 724.0 | 522 / 541 | 25.31× | 18.98× |
+| economy | 3 / 3 | 24 | 342.8 | 1075 / 1202 | 24.75× | 18.52× |
+
+All 12 node counter windows are present per profile. Replacements per node-second
+fell from 79.90 to 31.96, but summed process CPU per committed block was 0.643 s
+baseline versus 0.715 s economy. Lower replacement frequency did **not** produce
+better throughput or demonstrated CPU efficiency per block. None of these
+experiments changes production defaults or establishes a reliable sustained
+maximum on this shared-CPU tier.
+
+#### Final verification and retained artifacts
+
+Across the four measured campaigns: **57 trials, 46 complete, 11 partial, 884
+ACKed measured heights**. A separate three-height smoke run is excluded. All
+184 report hashes stored by completed trials were checked; partial/missing report
+coverage remains explicit. All four downloaded archives match their remote
+SHA-256s. Raw reports, original summaries, read-only `*-analysis-v2.json`, logs,
+verification receipts and the exact deployed executable are retained under
+`/var/tmp/d28-fly-20261126-1600/`. The near-cap and slower-polling directories are
+`iad-nearcap-001` and `iad-economy-001`, each with a matching `.tar.gz` archive.
+
+The temporary Fly app `d28-perf-20261126-1600` and its six machines were destroyed;
+its absence from the live app list was verified. No public service or production
+identity was used. No remotely deployed testnet, disk-backed performance or
+transaction/TPS claim is implied. The final code passed **282 Rust release tests**
+(five existing ignored; unbounded legacy `single_rt` excluded) and **20 Python
+runner checks**, including real four-process baseline/K1/economy campaigns.
