@@ -213,10 +213,27 @@ python3 /app/d28_fly.py campaign --roster /data/roster.json \
 ```
 
 The baseline uses runtime poll/status intervals of 25/100 ms and a receive budget
-of 32; `fast` uses 5/25 ms and 128. Consensus timers, quorum, signatures and the
-1 MiB body cap are unchanged. These are benchmark overrides, **not changed node
-defaults**. Sizes and paired profiles are randomized within each repetition.
-`--offline 1` keeps four identities in the roster but launches only three nodes.
+of 32; `fast` uses 5/25 ms and 128. Both allow two concurrent source requests.
+`fast_k1` keeps the fast settings but permits only one source request; it is not
+an end-to-end RX/memory cap, and an unhelpful source can occupy that sole lease
+until the unchanged two-second expiry. All profiles keep outgoing handoffs at
+two. Consensus timers, quorum, signatures and the 1 MiB body cap are unchanged.
+These are benchmark overrides, **not changed node defaults**. Sizes and paired
+profiles are randomized within each repetition. `--offline 1` keeps four
+identities in the roster but launches only three nodes.
+
+Reprocess a downloaded campaign without changing its original `summary.json`:
+
+```sh
+python3 tenderlink/benchmarks/d28_fly.py summary /path/to/campaign
+```
+
+The Python `summarize(path, quiet=True)` API returns a JSON-ready analysis with
+`aggregation_version: 2`. Each metric has matched-trial coverage, missing-counter
+reasons and its own matched denominator; unavailable values are null, not zero.
+Measured and final-height-hold windows stay separate. Summaries show CPU seconds,
+guest steal and process-lifetime peak-RSS gauges alongside application and VM TX
+counters. Reprocessing does not change which runner version performed a trial.
 
 The unchanged production block parser caps header count at 2,048. For a separate
 near-1-MiB payload arm, use `--headers 2048 --solution-bytes 320`. This fills an
