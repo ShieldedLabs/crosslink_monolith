@@ -262,7 +262,7 @@ class Barrier:
             raise ProtocolError("ACK without unique all-online agreement")
         row.update(acknowledged=True, ack_send_ms=(ended - began) * 1000,
                    ack_begin_receipt_ms=(began - self.anchor) * 1000,
-                   cycle_ms=(ended - self.anchor) * 1000)
+                   cycle_ms=(began - self.anchor) * 1000)
         # The NEXT cycle includes previous ACK transmission/network delivery.
         self.anchor = began
         if self.height == self.config["warmup"]:
@@ -565,19 +565,36 @@ class NodeJob:
         self.interface = interface
         self.log_counts = {}
         self.log_threads = []
+        self.watcher = None
         try:
             self.child = subprocess.Popen(self.command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                           stdin=subprocess.DEVNULL, start_new_session=True)
             for label, source in (("stdout", self.child.stdout), ("stderr", self.child.stderr)):
                 thread = threading.Thread(target=self.capture, args=(label, source), daemon=True)
-                thread.start()
+                # Track before start: an interrupt can arrive after the thread starts.
                 self.log_threads.append(thread)
+                thread.start()
             self.watcher = threading.Thread(target=self.watch, name="d28-child-watch", daemon=True)
             self.watcher.start()
-        except OSError as exc:
+        except BaseException as exc:
+            # The caller cannot register this job until construction returns.
+            # Thus every post-Popen failure must retire this exact owned child here.
             if self.child is not None:
-                stop_child(self.child)
-            self.finish(None, False, str(exc))
+                with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                    stop_child(self.child)
+                for thread in [*self.log_threads, self.watcher]:
+                    if thread is not None and thread.ident is not None:
+                        with contextlib.suppress(RuntimeError):
+                            thread.join(timeout=3)
+                for source in (self.child.stdout, self.child.stderr):
+                    if source is not None:
+                        with contextlib.suppress(OSError):
+                            source.close()
+            if isinstance(exc, OSError):
+                if not self.done.is_set():
+                    self.finish(None, False, str(exc))
+            else:
+                raise
 
     def capture(self, label, source):
         count = 0
@@ -924,16 +941,35 @@ def run_trial(args, roster, token, binary, metadata, directory, case, campaign_d
                 except (OSError, ValueError, http.client.HTTPException) as exc:
                     errors.append(f"node {node} stop: {type(exc).__name__}")
         # Collection begins only after the coordinator's final ACK or failure.
+        cleanup_unconfirmed = []
         grace = args.chatter_secs + 8
         if local is not None and not local.done.wait(grace):
             local.cancel()
             errors.append("node 0 exit timeout")
+        if local is not None and not local.done.is_set():
+            cleanup_unconfirmed.append(0)
         for node in attempted:
             try:
                 collect_remote(roster["workers"][node], token, config["run_id"],
                                directory / f"node-{node:03d}", grace)
             except (OSError, ValueError, http.client.HTTPException) as exc:
                 errors.append(f"node {node} collection: {type(exc).__name__}: {exc}")
+                # Even a successful final ACK does not prove the remote process
+                # exited. Stop only this run, then require explicit done evidence.
+                confirmed = False
+                for operation in ("stop", "status"):
+                    try:
+                        reply = worker_request(roster["workers"][node], token, operation,
+                                               {"run_id": config["run_id"]})
+                        if (isinstance(reply, dict) and reply.get("run_id") == config["run_id"]
+                                and reply.get("done") is True):
+                            confirmed = True
+                            break
+                    except (OSError, ValueError, http.client.HTTPException) as cleanup_error:
+                        errors.append(f"node {node} cleanup {operation}: {type(cleanup_error).__name__}")
+                if not confirmed:
+                    cleanup_unconfirmed.append(node)
+                    errors.append(f"node {node} cleanup unconfirmed; campaign must halt")
     if controller is not None and controller.done.is_set():
         control_report = controller.report()
     else:
@@ -960,6 +996,7 @@ def run_trial(args, roster, token, binary, metadata, directory, case, campaign_d
             node_results.append({"node": node, "status": "failed"})
     status = "complete" if control_report["status"] == "complete" and not errors else "partial"
     result = {"schema_version": 1, "status": status, "errors": errors, "interrupted": interrupted,
+              "cleanup_unconfirmed_nodes": cleanup_unconfirmed,
               "elapsed_seconds": time.monotonic() - began, "finished_at": utc_now(), "nodes": node_results}
     write_json(directory / "result.json", result)
     return {"trial": directory.name, "config": config, **case, **result, "controller": control_report}
@@ -1027,7 +1064,7 @@ def campaign(args):
         result = run_trial(args, roster, token, binary, metadata, output / name, case, deadline)
         results.append({"trial": name, "status": result["status"]})
         print(f"{name}: {result['status']}", flush=True)
-        if result["interrupted"]:
+        if result["interrupted"] or result["cleanup_unconfirmed_nodes"]:
             break
     complete = len(results) == len(cases) and all(row["status"] == "complete" for row in results)
     write_json(output / "run.json", {"status": "complete" if complete else "partial",
@@ -1169,6 +1206,20 @@ finally:
         self.assertAlmostEqual(report["rate_duration_seconds"], 1.1)
         self.assertEqual([r["measured"] for r in report["heights"]], [False, True])
 
+    def test_cycles_do_not_double_count_ack_send(self):
+        state = Barrier(fixture_config(warmup=1, heights=2), 0)
+        self.ready(state)
+        for began in (3, 6, 9):
+            for node in range(4):
+                state.decision(self.decision(state, node), began - 0.5)
+            state.acked(began, began + 1)
+        report = state.report(10)
+        measured = [row for row in report["heights"] if row["measured"]]
+        self.assertEqual(report["rate_duration_seconds"], 7)
+        self.assertEqual(sum(row["cycle_ms"] for row in measured), 6000)
+        self.assertEqual(sum(row["cycle_ms"] for row in measured) + measured[-1]["ack_send_ms"],
+                         report["rate_duration_seconds"] * 1000)
+
     def test_conflict_duplicate_unready_and_height(self):
         state = Barrier(fixture_config(), 0)
         with self.assertRaises(ProtocolError):
@@ -1210,6 +1261,105 @@ finally:
         failed_ready = Barrier(config, 10)
         failed_ready.finish(12, "ready timeout")
         self.assertEqual(failed_ready.report(12)["rate_duration_seconds"], 2)
+
+    def test_post_ack_collection_failure_confirms_exact_run_cleanup(self):
+        roster = {"peers": fixture_config()["peers"], "coordinator": "[::1]:21000", "interface": "lo",
+                  "workers": [None, "[::1]:22001", "[::1]:22002", "[::1]:22003"]}
+
+        def controller(config, _ready_timeout):
+            state = Barrier(config, 0)
+            self.ready(state)
+            for node in range(4):
+                state.decision(self.decision(state, node), 3)
+            state.acked(3, 4)
+            result = mock.Mock(state=state)
+            result.done.wait.return_value = result.done.is_set.return_value = True
+            result.report.return_value = state.report(4)
+            return result
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary)
+            for confirmed in (False, True):
+                def request(_address, _token, operation, value):
+                    if operation == "start":
+                        return {"accepted": True, "node": value["node"], "run_id": value["run_id"]}
+                    self.assertIn(operation, ("stop", "status"))
+                    self.assertEqual(set(value), {"run_id"})
+                    return {"run_id": value["run_id"], "done": confirmed}
+
+                args = build_parser().parse_args(["campaign", "--binary", sys.executable, "--roster", "unused",
+                    "--token-file", "unused", "--out", "unused", "--heights", "1", "--warmup", "0"])
+                local = mock.Mock()
+                local.done.wait.return_value = local.done.is_set.return_value = True
+                with mock.patch(__name__ + ".Coordinator", side_effect=controller), \
+                        mock.patch(__name__ + ".NodeJob", return_value=local), \
+                        mock.patch(__name__ + ".worker_request", side_effect=request) as remote, \
+                        mock.patch(__name__ + ".collect_remote", side_effect=TimeoutError("synthetic post-ACK timeout")), \
+                        mock.patch(__name__ + ".validate_node_artifacts", side_effect=ValueError("synthetic absent artifact")):
+                    result = run_trial(args, roster, "not-sent", Path(sys.executable), {"binary_sha256": "a" * 64},
+                                       root / str(confirmed), {"headers": 32, "profile": "baseline", "repetition": 1},
+                                       time.monotonic() + 60)
+                self.assertEqual(result["controller"]["status"], "complete")
+                self.assertEqual(result["status"], "partial")
+                stops = [call for call in remote.call_args_list if call.args[2] == "stop"]
+                self.assertEqual(len(stops), 3)
+                self.assertTrue(all(call.args[3] == {"run_id": result["config"]["run_id"]} for call in stops))
+                self.assertEqual(result["cleanup_unconfirmed_nodes"], [] if confirmed else [1, 2, 3])
+                self.assertEqual(read_json(root / str(confirmed) / "result.json")["cleanup_unconfirmed_nodes"],
+                                 result["cleanup_unconfirmed_nodes"])
+
+    def test_campaign_halts_when_cleanup_unconfirmed(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary)
+            create_token(root / "token")
+            write_json(root / "roster.json", {"peers": ["[::1]:20000"], "workers": [None],
+                                              "coordinator": "[::1]:21000"})
+            args = build_parser().parse_args(["campaign", "--binary", sys.executable,
+                "--roster", str(root / "roster.json"), "--token-file", str(root / "token"),
+                "--out", str(root / "out"), "--headers", "32", "--repetitions", "2"])
+            with mock.patch(__name__ + ".run_trial", return_value={"status": "partial", "interrupted": False,
+                            "cleanup_unconfirmed_nodes": [1]}) as trial, \
+                    mock.patch(__name__ + ".summarize", return_value={}), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(campaign(args), 1)
+            self.assertEqual(trial.call_count, 1)
+            result = read_json(root / "out" / "run.json")
+            self.assertEqual(result["planned_trials"], 2)
+            self.assertEqual(len(result["trials"]), 1)
+
+    def test_post_popen_start_failure_stops_owned_child(self):
+        binary = Path(__file__).resolve()
+        original_start = threading.Thread.start
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            for error_type in (KeyboardInterrupt, RuntimeError, OSError):
+                for fail_at in range(3):  # First reader, second reader, watcher.
+                    with self.subTest(error=error_type.__name__, thread=fail_at):
+                        child = mock.Mock(stdout=io.BytesIO(), stderr=io.BytesIO())
+                        count = 0
+
+                        def start(thread):
+                            nonlocal count
+                            index = count
+                            count += 1
+                            if index == fail_at:
+                                raise error_type("synthetic thread start failure")
+                            return original_start(thread)
+
+                        directory = Path(temporary) / f"{error_type.__name__}-{fail_at}"
+                        with mock.patch("subprocess.Popen", return_value=child) as popen, \
+                                mock.patch("threading.Thread.start", new=start), \
+                                mock.patch(__name__ + ".machine_metadata", return_value={"binary_sha256": sha256(binary)}), \
+                                mock.patch(__name__ + ".stop_child") as stop:
+                            if error_type is OSError:
+                                job = NodeJob(binary, sha256(binary), directory, fixture_config(), "lo")
+                                self.assertTrue(job.done.is_set())
+                                self.assertIn("synthetic", job.result["error"])
+                            else:
+                                with self.assertRaises(error_type):
+                                    NodeJob(binary, sha256(binary), directory, fixture_config(), "lo")
+                            stop.assert_called_once_with(child)
+                            self.assertTrue(popen.call_args.kwargs["start_new_session"])
+                        self.assertTrue(child.stdout.closed)
+                        self.assertTrue(child.stderr.closed)
 
     def test_worker_fixed_launch_auth_and_artifacts(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
