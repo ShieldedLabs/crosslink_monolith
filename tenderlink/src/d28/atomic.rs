@@ -1,5 +1,5 @@
-//! Agreed application persistence boundary; deliberately no filesystem backend
-//! or state-image serializer in this baseline.
+//! Agreed application persistence boundary. [`super::durable`] implements the
+//! bounded workspace image; applications supply the physical durable backend.
 use super::Result;
 
 /// A single-writer store of one fixed-size committed block.
@@ -23,10 +23,10 @@ use super::Result;
 /// write must never be treated as permission to send.
 ///
 /// This is the public physical persistence contract, **not** a WAL request.
-/// The baseline's `Storage`/`MemoryStore` implement logical bounded workspace
-/// and deterministic publication/crash tests. An adapter from that workspace
-/// to this block API, its bounded image encoding, and a durable backend are
-/// intentionally deferred. `MemoryStore` alone is not durable storage.
+/// [`super::durable::DurableStore`] implements `Storage` by atomically replacing
+/// its bounded image on every mutation. The application must supply a backend
+/// meeting this contract, including exclusive writer ownership. `MemoryStore`
+/// alone remains only a logical publication/crash model, not durable storage.
 pub trait AtomicBlockStore {
     fn block_size(&self) -> usize;
     fn load(&mut self, block: &mut [u8]) -> Result<bool>;
