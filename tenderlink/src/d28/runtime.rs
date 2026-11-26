@@ -1263,7 +1263,7 @@ pub async fn run<B: AtomicBlockStore + Send + 'static>(
             continue;
         }
         engine
-            .elapse(now.saturating_sub(last_tick), &mut events)
+            .elapse_coalesced(now.saturating_sub(last_tick), &mut events)
             .map_err(core_error)?;
         last_tick = now;
         work.schedule(engine, &host, &mut events, now, config.max_body)?;

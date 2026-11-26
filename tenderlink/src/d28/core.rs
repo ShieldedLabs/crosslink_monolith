@@ -729,6 +729,78 @@ impl<S: Storage> Engine<S> {
         let r = self.elapse_inner(online, sink);
         self.finish(r)
     }
+    /// Runtime-only elapsed time for a Guided sink that retains the latest own
+    /// vote of each kind and deduplicates body retries until the next exchange.
+    /// Consume all online time at every consensus deadline, but collapse repeated
+    /// rho-only replays between deadlines. Publication/signing writes still run
+    /// synchronously; the public reference `elapse` keeps every individual tick.
+    pub(super) fn elapse_coalesced(&mut self, online: u64, sink: &mut impl Sink) -> Result<()> {
+        let r = self.elapse_coalesced_inner(online, sink);
+        self.finish(r)
+    }
+    fn elapse_coalesced_inner(&mut self, mut online: u64, sink: &mut impl Sink) -> Result<()> {
+        self.check()?;
+        if self.emission != Emission::Guided {
+            return Err(Error::Invalid);
+        }
+        self.drive(sink)?;
+        while online > 0 {
+            // Only consensus deadlines split the elapsed interval. In particular,
+            // do not replay storage wall time once for each missed rho tick.
+            let mut delta = online;
+            if self.d().step == Step::PreRound {
+                delta = delta.min(self.d().height_remaining);
+            } else if self.d().step != Step::Decided {
+                for t in self.d().timers {
+                    if t.active && t.remaining > 0 {
+                        delta = delta.min(t.remaining);
+                    }
+                }
+            }
+            let grid = self.d().grid_remaining;
+            let crossed = delta >= grid;
+            let remainder = if crossed {
+                (delta - grid) % self.c().rho
+            } else {
+                0
+            };
+            let mut d = self.d().clone();
+            // rho is nonzero. Subtract before taking the remainder, avoiding a
+            // multiplication/addition overflow even for the full u64 interval.
+            // grid == 0 is a valid reference crash cut awaiting its rho replay.
+            d.grid_remaining = if crossed {
+                self.c().rho - remainder
+            } else {
+                grid - delta
+            };
+            if d.step == Step::PreRound {
+                d.height_remaining -= delta;
+            } else if d.step != Step::Decided {
+                for t in &mut d.timers {
+                    if t.active {
+                        t.remaining = t.remaining.saturating_sub(delta);
+                    }
+                }
+            }
+            self.commit(d)?;
+            online -= delta;
+            // A strictly earlier grid tick belongs to the pre-deadline state.
+            // Keep it even when another tick coincides with the deadline: a round
+            // transition may retire a vote or retry without overwriting its event.
+            if delta > grid {
+                self.periodic(sink);
+            }
+            if self.d().step == Step::PreRound && self.d().height_remaining == 0 {
+                self.start(0, None, true, sink)?;
+            }
+            self.drive(sink)?;
+            // The reference drives consensus before a coincident rho replay.
+            if crossed && remainder == 0 {
+                self.periodic(sink);
+            }
+        }
+        Ok(())
+    }
     fn elapse_inner(&mut self, mut online: u64, sink: &mut impl Sink) -> Result<()> {
         self.check()?;
         self.drive(sink)?;
