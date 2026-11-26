@@ -35,6 +35,8 @@ use zcash_primitives::{
     block::{BlockHash, BlockHeader, BlockHeaderData},
 };
 
+pub mod distributed;
+
 const NAMESPACE: [u8; 32] = [0x28; 32];
 
 /// Finite work and allocation limits; `heights` excludes `warmup` heights.

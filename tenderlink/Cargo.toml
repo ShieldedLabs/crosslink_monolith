@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-bench = ["dep:serde", "dep:serde_json"]
+bench = ["dep:serde", "dep:serde_json", "tokio/io-util"]
 
 [[bin]]
 name = "d28_bench"
