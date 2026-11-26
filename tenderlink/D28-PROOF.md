@@ -913,6 +913,290 @@ finite-lived proposal response to be lost. No physical WAL/backend, deployment
 memory bound, end-to-end Byzantine-flood scheduler proof, or stronger wall-clock
 termination claim is supplied by this section.
 
+## Receiver-selected evidence: a separate conditional theorem
+
+This section concerns the opt-in `gossip::receiver` prototype, not the original
+`Director`. It does NOT deduce receiver-selected service from REQUEST(A).
+Previously every correct holder independently served its peer's semantic gap;
+now the receiver chooses which sources may use its directed interactions. A
+selected source need not be correct, hold the needed evidence, or reply at all.
+The unchanged `Emission::Guided` exclusion and `Engine::serve` dominance rules
+above remain essential. This is another conditional source-model theorem, not
+an STP guarantee or a Rust wall-clock refinement.
+
+### Requests, cancellation, and physical admission
+
+`RequestStatus` pairs the authenticated `StatusUpdate` with a peer-specific
+`request: Option<u64>`. `Some(j)` nominates that destination using the status
+sequence at which this request originated; the SAME j survives subsequent
+status heartbeats. `None` withdraws the nomination. Bind the request to the
+authenticated peer/connection at each endpoint, its destination, and its origin
+sequence. Peer handles and generation counters are ENDPOINT-LOCAL: the wire
+echoes the origin sequence, not an assertion that those local handles/counters
+agree. The host assigns generations; a peer may not claim an arbitrary newer
+one. Reject stale status updates and impossible future origin sequences. Wrong-
+generation, withdrawn or already-consumed tokens must not authorize new work.
+A newer heartbeat is not a fresh request, a renewed lease, a transport
+acknowledgement, or evidence of progress.
+
+There are THREE independent fixed positive bounds, each independent of N:
+K_sel source nominations at a receiver, K_rx owned receive slots, and K_tx owned
+outgoing slots at a responder. They may be configured equally, but a logical
+nomination does not reserve physical receive capacity. K_tx bounds owned output,
+not the number of peer request descriptors. Each token permits at most one
+ACCEPTED `ReplySink` ownership handoff of a complete frame from `Engine::serve`.
+A rejecting sink must return the permit and retain no payload; that declined
+borrow may be retried under the same token and is not an accepted response. The
+frame is chosen from the source's CURRENT retained state and the actual bound
+receiver snapshot. A request does not authorize a caller-selected certificate,
+force a particular gap enum, or bypass whole-frame verification. A request that
+has no actual planner gap emits no complete frame. Fair exploration may send
+control requests to every compatible roster source, including unhelpful ones;
+this is NOT an unguided sweep of bodies/certificates or a broadcast fallback.
+
+Latest status, source priority and connection/token churn must not reset service
+age for a continuously registered identity. A request has a hard finite lease;
+heartbeats do not extend it. Expiry, cancellation and bounded backoff release
+logical opportunities for other sources. Keep replay/withdrawal high-water marks
+within each authenticated generation so that a delayed old positive request
+cannot resurrect a withdrawn nomination. Trusted roster admission must preserve
+correct peers' records; repeated attacker removal/reinsertion must not create an
+unlimited supply of never-served identities. The stake bound is weighted: it
+places no useful cardinality bound on the number of faulty low-weight sources.
+A search bound must therefore retain the full finite N, not an assumed f+1
+number of sources or an assumption that any chosen source is honest.
+
+Cancellation on an actual local semantic improvement can avoid redundant work.
+It is NOT itself evidence that every remaining obligation closed: for example,
+advancing from Propose to Prevote or acquiring a mixed PV quorum need not repair
+a missing body or its exact-vr authorization. Neither a request, successful
+send, transport ACK, repeated status, nor `Engine::receive` returning success
+without the relevant state change proves a repair. The lemmas below establish
+specific facts from actual planner evaluations and complete-frame processing.
+
+Logical nomination limits do not count transport-held copies. Acquire a shared
+physical receive-admission permit BEFORE allocating/decoding a complete incoming
+evidence package, and retain its accounting while any owned copy survives.
+Charge additional owned copies separately. Cancellation, expiry or reconnection
+must not return that capacity while old work still owns it. Apply the same
+bounded admission to unsolicited, late and canceled-request evidence from ANY
+source; nomination is scheduling, not trust. Such a package may still help if
+full verification and receive guards accept it. It cannot revive an expired
+logical request or manufacture an acknowledgement. Sender serialization, queued
+output, partial reassembly and CPU admission need their own bounded ownership/
+work contracts. In this API `Responder::try_new` creates a new outgoing budget;
+drain prior outgoing payload owners before replacing a responder. Reconnection
+on the same instance preserves its pool, but replacement does not inherit old
+permits. A slot-count cap is not a byte bound: the host must bound body size AND
+aggregate decoded backing storage, including sparse rows. The core's logical
+signer-position bound does not enforce that preallocation byte limit; N+1 groups
+each with N backing positions can occupy O(N^2) storage. Bounded completion,
+abort and final release under stalled or Byzantine transfers are separate
+service obligations, not consequences of RAII or a fixed K_rx.
+
+### Observable useful-service premise, distinct from source fairness
+
+Retain the guided theorem's fixed-height/configuration, designated-correct-set,
+non-equivocation/recovery, strong M9c/M9d validity, NB/Z/ZG, clock, no-crash and
+no-higher-INIT premises. Keep STATUS(S) for candidate discovery and BARE(V) for
+the separate current PV and PC streams. Correct peers remain admitted to the
+fixed roster table, and status TTL/admission must not indefinitely exclude them
+between STATUS updates. Use the same global event order for equal timestamps.
+
+**PULL(C), bounded fresh request evaluation.** There is a finite C>0 such that
+for every distinct ordered correct pair (source p, receiver q), and every
+interval [u,u+C] wholly in the service window, if q remains undecided throughout
+that interval, the following occurs by u+C:
+
+1. p evaluates its actual retained-state planner against a truthful q snapshot
+   GENERATED AFTER u, carried by an authenticated positive request to p. That
+   request is admissible in its bound generation/token at evaluation time. A
+   newer truthful snapshot on the same still-active token may be used; an old
+   queued snapshot or evaluation before u does not qualify.
+2. If the planner has a gap, p's explicit response is the complete frame selected
+   by `Engine::serve`, actually offered after that evaluation and admitted,
+   verified and processed by q by u+C. It is not enough to receive a header, an
+   STP ACK, an offer count, or a grant. An eventual late/canceled-token package
+   can count only if it actually reaches this complete processing boundary under
+   the same physical admission budget.
+3. Otherwise the actual pure planner evaluation reports no gap. This is a local
+   evaluation result, NOT a claim of semantic progress and not a required
+   negative-acknowledgement wire message. Expiry, cancellation, lack of a request,
+   no free outgoing/receive slot, backoff, or skipping the peer is NOT this case.
+   `gap_for` returning None because the engine is invalid/sealed/exhausted is
+   likewise excluded by the model.
+
+This is deliberately stronger than the minimal service a particular execution
+may need. It requests fair fresh EVALUATIONS even for sources that turn out not
+to help; complete evidence is still emitted only for an actual gap. Its key is
+(authenticated source, receiver, pull), not gap, round, token, status sequence,
+connection attempt, certificate hash or proposal form. No key reset may avoid
+the bound. Source selection does not need to know which p is correct or which
+certificate a later deciding round needs. Both the evaluator and any emitted
+frame are observable local events. Usefulness is derived below for the correct
+witnesses supplied by the consensus proof, not assumed for arbitrary requests.
+A q that decides during the interval already supplies the terminal alternative.
+
+One sufficient decomposition makes the obligations explicit. After at most S
+for fresh candidate discovery, suppose each registered correct source receives
+a fresh positive request opportunity from q within every F time units while q
+remains undecided, with all polling, occupied nominations, expiry, backoff and
+source rotation included in F. Each opportunity GENERATES its truthful snapshot
+at that opportunity, so the first opportunity after u really carries a
+post-u snapshot. It must permit a new evaluation/response under the token rules;
+a heartbeat on an already-offered token is not a new opportunity. Suppose also
+that among any k consecutive such opportunities for a correct ordered pair, at
+least one results in the planner evaluation above and, when nonempty, complete
+response processing within delta of its opportunity. Count those k opportunities
+ACROSS successive tokens, rounds, proposal forms and connection generations;
+none of those changes restarts the count. The completion bound INCLUDES request
+delivery, the responder's fair bounded-output arbitration, the request's being
+admissible when evaluated, whole-frame loss/reassembly/admission, verification
+and receive dispatch. Then the conservative bound
+
+    C = S + k F + delta
+
+satisfies PULL for intervals containing those opportunities and their completion.
+This is a generic bounded-loss/transaction-service premise, not a consequence
+of source rotation. Source and responder fairness must both survive Byzantine
+requests, misleading priority hints and identity-preserving token/generation
+churn. Status hints are not a complete retained-evidence inventory: a source
+can hold a needed exact-vr certificate without looking highest priority, and
+received form B does not imply an installed, servable VC. A fair exploration
+lane must therefore not permanently exclude a compatible source solely on those
+hints. Bounded F may grow with N, frame size, the separate interaction/admission
+caps and competing load; no N-independent latency follows from N-independent
+interaction counts.
+
+The successful opportunity must keep the request admissible for the actual
+source evaluation and permit complete processing by the service deadline.
+Processing may be later than logical cancellation, as allowed above. A
+sufficient implementation contract can bound request delivery, sender polling/
+output admission and transfer/verification by known times and choose lease/
+release schedules with adequate margin. Without such a contract, the bounded-
+success assumption above remains an explicit premise, even if its constants
+are unknown to the protocol. In particular:
+
+* STATUS(S) alone can deliver only `None` between finite positive-request leases,
+  or reorder every `Some(j)` behind a withdrawal. Even a lossless ordered link
+  and bounded polling can place each positive-request window entirely between
+  two responder polls. Late-frame acceptance cannot help if no frame was made.
+* Independently fair receiver and sender schedulers need not provide overlapping
+  live request/output opportunities. PULL requires the actual rendezvous.
+* Peer heartbeats must not restart leases; nor may repeated local cancellations
+  be counted as successful repairs. Cancellation caused by a partial semantic
+  gain still leaves PULL's fresh useful-service obligation in force while q is
+  undecided. Keeping a fair ordinal alone does not prove that obligation.
+* Successful useless requests, small-vote delivery, or ordinary fair loss for an
+  infinitely retransmitted message can coexist with losing every finite-lived
+  proposal response. No blanket fair-loss argument replaces PULL.
+* Fixed physical slots can all remain pinned by stalled transfers, or be repeatedly
+  seized by unsolicited traffic. Physical admission/release and verification
+  scheduling must themselves provide the service inside C. Rejecting unsolicited
+  evidence solely because its source was not nominated is not required here.
+
+### Pull repair lemmas
+
+A **pull wave** is a C-long interval beginning at the relevant proof boundary.
+For a correct source p and receiver q, PULL supplies an actual post-boundary
+snapshot/evaluation and its nonempty response, or q decides. A no-gap evaluation
+closes a proof obligation ONLY when the following retained-state and planner
+arguments show that its truthful snapshot already has the required fact. An
+unrelated status gain, successful request, or no-gap evaluation on an older
+snapshot is never substituted for that argument.
+
+**P1 (progress and quorum).** G1 holds with C replacing E=S+A: if p is at M,
+its monotone current round/terminal DEC and a truthful q snapshot below M force
+a current self-carrier or ENTER+ENTRY, unless q already reached M or decided.
+Complete processing reaches >=M within C+TPC(M-1), or supplies DEC. Superseding
+the source's round does not reset service. Likewise G2's first fresh-round
+quorum holder retains a current self-carrier until the first departure. A
+post-boundary lower-round or missing-quorum snapshot forces that package, a
+quorum row, or a stronger current-polka package. No gap then means the quorum
+fact is already present, not merely that q was polled. Every q is therefore in
+r with quorum PV signer weight by s1+C, unless the prefix has already stopped.
+Start each signer's BARE service AFTER q's entry; its PV arrives by
+
+    max(a_c, s1+C) + V.
+
+**P2 (proposal and authorization).** G3 holds with at most TWO pull waves,
+not just one successful request to some source. Apply PULL specifically to the
+correct proposer p: source fairness must reach it even if other selected
+sources are Byzantine, unhelpful, or only advertise better hints. In a no-exit
+prefix p retains its unique proposal and either exact-vr authorization or its
+matching current VC. The first response may repair only a PV quorum. Start the
+second wave after that response was processed, so its evaluated snapshot is
+fresh enough that the same row gap cannot starve proposal/authorization repair.
+If an evaluation has no gap, that actual snapshot already holds the authorized
+body or matching current polka under G3's uniqueness/persistence arguments.
+Use the same correct-proposer form-A/current-VC dichotomy; a receiver still in
+Propose that merely received form B is NOT a new one-wave VC source. Thus
+
+    b_c <= max(e_c,e_p) + 2C + d.
+
+Strong M9c applies to an already-held matching body as well as a newly fetched
+copy. Source nomination, a body digest or a request result does not assert T.
+
+**P3 (stopping events, terminal repair and progress).** Put
+
+    H_rx = 4(C + V).
+
+The G4 first-nil-PC, first-exit, L11 and A5.0 arguments now apply with C in every
+place they used E and H_rx in every place they used H_g. They still use only
+service intervals finishing before the stopping event. In particular the
+first-PC-quorum witness must serve a CURRENT self-carrier, not merely
+ENTER+TIMEOUT with an extra predecessor timeout. Bare PV/PC lanes remain
+separate and are not suppressed by source selection. G5 terminal repair uses
+a fresh query to a correct decided holder: either q already decided or the
+actual planner emits complete DEC, giving decision within C+d<=H_rx+d. The
+no-exit rendezvous still uses bare votes, not a successful proposal; the
+early-exit case uses P1. These facts reproduce G4/G5 without assuming that a
+nomination or a generic completed exchange is a consensus transition.
+
+### Receiver-selected conditional termination theorem and scope
+
+Let m be the maximum designated-correct round at s. Assume a finite K_round
+such that for all r>=K_round,
+
+    TP(r)  > 2H_rx + d + TPC(r-1)
+    TPV(r) > 4H_rx + d
+    TPC(r) > TPV(r) + 2H_rx + d.
+
+K_round is a timeout threshold, unrelated to either interaction cap. Define
+
+    R_rx = max(m, K_round-1) + 2N
+    W_rx(r) = TP(r) + TPV(r) + TPC(r) + 3H_rx
+    B_rx = H_rx + TPC(m-1) + sum[r=m..R_rx] W_rx(r),  TPC(-1)=0
+    L_rx = B_rx + H_rx + d.
+
+Under the unchanged consensus/model/planner premises and STATUS, PULL(C) and
+BARE(V) on the needed intervals, P1-P3 and the guided theorem's unchanged
+signature/frontier and last-departure-lock argument give a first correct
+decision by s+B_rx and every designated-correct decision by s+L_rx. If a correct
+holder already decided before s, s+H_rx+d suffices. The premises need hold only
+through [s,s+L_rx]; outside it all traffic may be lost, and individual requests
+and responses inside it may also be lost. All quantities and the execution's
+rounds, timers, status sequences, request tokens, service ordinals and clock
+arithmetic must fit the implementation's checked domains. Exhaustion fails
+closed and is outside this finite termination conclusion.
+
+The fixed actually-correct >2/3-weight cohort corollary still works by the SAME
+complement reclassification. Require PULL/STATUS/BARE and local timeliness only
+within that fixed cohort, but retain the full roster, weights and N. Source and
+responder arbitration must not let outsiders exclude its members. No rotating
+timely quorum, honest-selected-source assumption, or timely decision by slow
+outsiders follows. A later outsider needs directed DEC/validity service or an
+authenticated archive after higher INIT retires PEND.
+
+This extension adds no consensus vote rule, persistent region, future-vote bank,
+per-peer signer inventory or broadcast evidence fallback. It separates O(N)
+control metadata, fixed logical interactions, and bounded physical frame
+ownership. The prototype API and finite tests can exercise these contracts and
+the chosen simulated service schedules; they do not establish PULL, a shared
+STP-bridge scheduler/admission guarantee, a deployment memory bound, a physical
+WAL/backend, or a stronger wall-clock theorem. The old sender-selected Guided
+and Reference/CompactLive results remain separate and unchanged.
+
 ## Persistence and memory are separate contracts
 
 `AtomicBlockStore` is the agreed fixed-size atomic replacement API. Its bounded
