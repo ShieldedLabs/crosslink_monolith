@@ -1582,6 +1582,7 @@ fn hash_vote(h: &mut blake3::Hasher, v: &Vote) {
 
 pub mod atomic;
 pub mod chain;
+pub mod durable;
 pub mod gossip;
 pub mod wire;
 pub use atomic::AtomicBlockStore;
