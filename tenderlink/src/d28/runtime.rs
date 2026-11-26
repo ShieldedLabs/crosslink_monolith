@@ -11,29 +11,30 @@
 //! `TransportLimits`/STP budgets. A handoff is NOT a delivery acknowledgement and
 //! does NOT make an STP-held copy count as a released end-to-end K_tx slot.
 use super::{
+    BodyTag, Config, Emission, Engine, Error, Frame, Group, Id, Member, Message, Proposal,
+    ProposalTag, Sink, Status, Step, Storage, Target, Timeouts, Vote, VoteKind,
     atomic::AtomicBlockStore,
     chain, durable,
     gossip::{
+        StatusSnapshot, StatusUpdate,
         receiver::{
             AdmissionBudget, Permit, Receiver, ReceiverConfig, ReplySink, RequestKey,
             RequestStatus, Responder, SenderConfig,
         },
-        StatusSnapshot, StatusUpdate,
     },
-    wire, BodyTag, Config, Emission, Engine, Error, Frame, Group, Id, Member, Message, Proposal,
-    ProposalTag, Sink, Status, Step, Storage, Target, Timeouts, Vote, VoteKind,
+    wire,
 };
 use crate::transport::Channel;
 use crate::{
-    transport::{Consumer, ConsumerHandle, NetworkThreadPull, NetworkThreadPush, SharedTransport},
     BftAddressMap, BlockValue, ClosureToProposeNewBlock, ClosureToPushDecidedBlock,
     ClosureToReadDecidedTip, ClosureToUpdatePeers, ClosureToValidateProposedBlock, ConnectionKey,
     HostTip, PeerInfo, STPAddress, SortedRosterMember, TMStatus, TMStatusReason,
+    transport::{Consumer, ConsumerHandle, NetworkThreadPull, NetworkThreadPush, SharedTransport},
 };
 use ed25519_zebra::{Signature, SigningKey, VerificationKey, VerificationKeyBytes};
 use std::{
     collections::VecDeque,
-    future::{poll_fn, Future},
+    future::{Future, poll_fn},
     io,
     pin::Pin,
     sync::Arc,
@@ -1355,10 +1356,12 @@ mod tests {
         for now in [0, 2_000, 4_000, 6_000, 8_000, 10_000] {
             network.sessions(&config, now).unwrap();
             assert_eq!(network.peers.len(), 2);
-            assert!(network
-                .peers
-                .iter()
-                .any(|p| p.member == Some(0) && p.address.connection_key() == admitted));
+            assert!(
+                network
+                    .peers
+                    .iter()
+                    .any(|p| p.member == Some(0) && p.address.connection_key() == admitted)
+            );
             assert_eq!(
                 network.pull.current_connections.len(),
                 6,
@@ -1385,10 +1388,12 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert!(network
-            .peers
-            .iter()
-            .any(|p| p.member == Some(1) && p.address.port == 40_006));
+        assert!(
+            network
+                .peers
+                .iter()
+                .any(|p| p.member == Some(1) && p.address.port == 40_006)
+        );
         assert_eq!(
             seen.len(),
             6,
