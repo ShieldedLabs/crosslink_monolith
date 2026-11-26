@@ -96,3 +96,49 @@ round number, so a pause of three minutes has cost seven minutes of BFT recovery
 - The run is a step of every change under the rules in `CRATE_REMOVAL.md`, after the node tests pass
   and before its commit is pushed. Wired to a post-commit hook or a self-hosted runner it
   becomes the system test for every commit on `dev`.
+
+## D28 on `bounded_tenderlink`
+
+On this branch, `zebrad` starts the bounded D28 runtime when BFT activates. There is no
+engine-selection flag. The existing BFT block, fat-pointer, vote-signature and namespace
+contracts are unchanged; D28 control/evidence messages are a new finalizer protocol. All
+finalizers in a test network must use this branch. The standalone `tenderlink` demonstration
+binary and legacy algorithm tests are not the node runtime.
+
+Build and run the real four-node acceptance network from the repository root:
+
+```sh
+cargo build --manifest-path zebra-crosslink/Cargo.toml --locked -p zebrad --bin zebrad
+python3 zebra-crosslink/dilated_regtest/d28_network.py selftest
+python3 zebra-crosslink/dilated_regtest/d28_network.py run \
+  --binary "$PWD/zebra-crosslink/target/debug/zebrad" \
+  --crash-restart
+# A separate fresh network also exercises late admission and a withholding/offline finalizer:
+python3 zebra-crosslink/dilated_regtest/d28_network.py run \
+  --binary "$PWD/zebra-crosslink/target/debug/zebrad" \
+  --late-finalizer --offline-finalizer --crash-restart
+```
+
+The Python 3.11+ harness requires Linux `unshare` and `ip`, and refuses to fall back from a
+fresh rootless network namespace to the host network. It creates a new private output directory,
+prints its path, and preserves configs, boot logs, certificates, PoW-prefix checks and results.
+`--out` can name a **new** directory. It starts only local owned children, funds and bonds four
+finalizers, activates the existing strict chain-certificate gate, and checks post-restart progress.
+The default deadline is one hour; debug proving and mining can be slow. `--profile release-iter`
+builds an optimized binary at `zebra-crosslink/target/release-iter/zebrad` instead.
+
+For a remotely deployed testnet, use the existing node configuration, initial-peer discovery,
+wallet/staking and bootstrap procedures with fresh chain state and fresh identities. The harness's
+predictable identities and short calendar are local test fixtures, **not deployment keys**. No
+mixed legacy/D28 finalizer deployment is supported. Active legacy signing records at or above
+D28's starting height cause an explicit refusal: never delete signer state while keeping its key
+just to get past that refusal.
+
+D28 persists one identity-bound atomic signing image in the existing local signer-state column
+family, separate from all decided-chain rows. Its payload is `4096 + 3*Bmax + 556*Nmax` bytes,
+plus a 40-byte host identity envelope; deployment limits cannot silently change on reopen.
+Every acknowledged mutation is synced before output. Ambiguous storage failure stops signing.
+The initial implementation replaces the full image per mutation rather than optimizing writes.
+D28's workspace, evidence ownership and queued host requests have explicit bounds; STP has
+separate message/reassembly/inbox/outbox bounds. These are not a whole-node RSS bound or a bound
+on the unchanged historical chain database.
