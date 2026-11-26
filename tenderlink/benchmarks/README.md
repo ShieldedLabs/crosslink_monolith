@@ -170,3 +170,82 @@ Raw local evidence (each includes manifests, original reports and counters):
 The corresponding code passed 275 release tests (five existing ignored tests;
 unbounded legacy `single_rt` excluded), 14 runner selftests including real netns
 checks, and the optimized CLI build. No PoW/ledger formats or rules were changed.
+
+## Distributed component runner on Fly
+
+`d28_bench --distributed CONFIG.json --json REPORT.json` runs **one actual D28
+validator per process**. `d28_fly.py` coordinates separate machines through a
+private IPv6 network. It never provisions machines or changes host networking.
+Use temporary machines, test identities only, no public service/IP, and collect
+artifacts before deleting the temporary app. All output directories must be new.
+
+Build and test from the repository root:
+
+```sh
+cargo build --locked --release --features bench \
+  --manifest-path tenderlink/Cargo.toml --bin d28_bench
+python3 tenderlink/benchmarks/d28_fly.py selftest \
+  --binary tenderlink/target/release/d28_bench
+```
+
+Install the same binary and `d28_fly.py` at `/app/` on every machine, plus Python
+3. Generate one private token with `d28_fly.py token --out TOKEN` and install it
+as `/run/d28-token` with mode 0600 on each machine. No production keys are used.
+Start a worker on each machine except node 0:
+
+```sh
+python3 /app/d28_fly.py worker --bind "[$PRIVATE_IPV6]:9200" \
+  --binary /app/d28_bench --token-file /run/d28-token \
+  --root /data/worker-001 --lifetime-secs 7200
+```
+
+The roster JSON contains `peers` (ordered full-roster `[IPv6]:9000` addresses),
+`workers` (`null` for node 0, then `[IPv6]:9200` for each other node),
+`coordinator` (`[node-0-IPv6]:9100`) and `interface` (`eth0`). Only literal private
+ULA IPv6 or loopback addresses are accepted. Run the campaign **on node 0**, not
+on the laptop, to avoid putting the laptop's network hop in the ACK barrier:
+
+```sh
+python3 /app/d28_fly.py campaign --roster /data/roster.json \
+  --binary /app/d28_bench --token-file /run/d28-token --out /data/sweep-001 \
+  --headers 32,128,512,2048 --profiles baseline,fast \
+  --repetitions 3 --heights 20 --warmup 3 --seed 428 --chatter-secs 1
+```
+
+The baseline uses runtime poll/status intervals of 25/100 ms and a receive budget
+of 32; `fast` uses 5/25 ms and 128. Consensus timers, quorum, signatures and the
+1 MiB body cap are unchanged. These are benchmark overrides, **not changed node
+defaults**. Sizes and paired profiles are randomized within each repetition.
+`--offline 1` keeps four identities in the roster but launches only three nodes.
+
+The unchanged production block parser caps header count at 2,048. For a separate
+near-1-MiB payload arm, use `--headers 2048 --solution-bytes 320`. This fills an
+existing synthetic header field, not a new format or a relaxed parser. These
+headers do not represent valid PoW work. Reports record actual serialized sizes,
+including the previous certificate; the full-roster parent must fit the cap.
+
+The controller carries **only readiness, decision metadata and ACKs**. Every node
+obtains and validates its own block and certificate through D28/STP. Both trusted
+tip publication and callback completion wait for matching local decisions from
+all online validators, preserving old-height evidence. This remains an explicit
+all-online-barrier component model, not an independently advancing full ledger.
+
+Read the separate measurements correctly:
+
+- Node-local latency runs from START/prior ACK tip publication to local decision
+  callback entry. It includes scheduling and INIT, but is not an exact INIT timer.
+- Controller first/quorum/all receipt latencies and chain cycles use only its own
+  monotonic clock; they include reporting/control-network overhead. Never subtract
+  wall clocks across machines or order differently started local durations.
+- Throughput counts one chain's bytes once. Failed/partial trials retain their
+  stalled durations. Measured node counters exclude warmup; worker process-window
+  counters do not. Interface TX includes controller/management traffic as well as
+  BFT/STP; it is not retransmission-only or pure wasted-chatter bandwidth.
+- Each node retains application/transport counters, CPU usage/steal, available
+  cgroup counters and RSS. Cheap shared CPU burst balances and host contention
+  are uncontrolled; guest steal does not distinguish those causes.
+
+Raw reports, exact configurations, executable/script hashes, worker metadata and
+controller traces are retained per trial. Workers run one fixed executable with
+bounded input and owned-child lifetimes; uncertain cleanup stops the campaign.
+Stop and delete only the temporary app you created after retrieving its results.
