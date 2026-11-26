@@ -4616,33 +4616,6 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                         height: fit!(),
                         ..Decl
                     }) {
-                        if let _ = elem().decl(Decl {
-                            id: combo_id,
-                            colour,
-                            radius: ui.scale(18.0).dup4(),
-                            child_gap: ui.scale(8.0),
-                            padding: ui.scale(10.0).dup4(),
-                            direction: LeftToRight,
-                            align: Left,
-                            width: grow!(),
-                            height: fit!(),
-                            ..Decl
-                        }) {
-                            ui.text("Network Info", TextDecl { h: ui.scale(TEXT_BODY), colour: WHITE.mul(0.75), align: AlignX::Left, ..TextDecl });
-                            let _ = elem().decl(Decl { width: grow!(), ..Decl });
-                            ui.text(if net_open { ICON_UP_OPEN_1 } else { ICON_DOWN_OPEN }, TextDecl { font: Icons, h: ui.scale(TEXT_SMALL), colour: WHITE.mul(0.6), align: AlignX::Center, ..TextDecl });
-                        }
-                        if ui.hovered(combo_id) {
-                            if net_open { set_tooltip_text!(data, "Click to collapse"); } else { set_tooltip_text!(data, "Click to expand"); }
-                        }
-
-                        if let _ = elem().decl(Decl {
-                            colour: BUTTON_GREY.mul(0.70),
-                            width: grow!(),
-                            height: fixed!(ui.scale(1.0)),
-                            ..Decl
-                        }) {}
-
                         let mining_id = id("MINING");
                         let mut actively_mining = *wallet::GUI_ENABLE_MINE.lock().unwrap();
                         ui.checkbox_pill(mining_id, &mut actively_mining, "MINING", grow!());
@@ -4696,6 +4669,33 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             }) {
                                 ui.text(frame_strf!(data, "{}%", volume_pct), TextDecl { font: Mono, h: ui.scale(TEXT_BODY), align: AlignX::Right, colour: WHITE.mul(0.8), ..TextDecl });
                             }
+                        }
+
+                        if let _ = elem().decl(Decl {
+                            colour: BUTTON_GREY.mul(0.70),
+                            width: grow!(),
+                            height: fixed!(ui.scale(1.0)),
+                            ..Decl
+                        }) {}
+
+                        if let _ = elem().decl(Decl {
+                            id: combo_id,
+                            colour,
+                            radius: ui.scale(18.0).dup4(),
+                            child_gap: ui.scale(8.0),
+                            padding: ui.scale(10.0).dup4(),
+                            direction: LeftToRight,
+                            align: Left,
+                            width: grow!(),
+                            height: fit!(),
+                            ..Decl
+                        }) {
+                            ui.text("Network Info", TextDecl { h: ui.scale(TEXT_BODY), colour: WHITE.mul(0.75), align: AlignX::Left, ..TextDecl });
+                            let _ = elem().decl(Decl { width: grow!(), ..Decl });
+                            ui.text(if net_open { ICON_UP_OPEN_1 } else { ICON_DOWN_OPEN }, TextDecl { font: Icons, h: ui.scale(TEXT_SMALL), colour: WHITE.mul(0.6), align: AlignX::Center, ..TextDecl });
+                        }
+                        if ui.hovered(combo_id) {
+                            if net_open { set_tooltip_text!(data, "Click to collapse"); } else { set_tooltip_text!(data, "Click to expand"); }
                         }
 
                         if net_open {
