@@ -303,10 +303,10 @@ proposers. For example:
 python3 /app/d28_fly.py campaign --roster /data/roster.json \
   --binary /app/d28_bench --token-file /run/d28-token --out /data/global-grid-001 \
   --body-bytes 131072,524288,1048576,2097152,4194304,8388608,10485760 \
-  --max-body 10485760 --timing-profile wan --profiles baseline \
-  --repetitions 3 --heights 7 --warmup 1 --seed 431 \
-  --timeout-secs 180 --chatter-secs 2 --lifetime-secs 5400 \
-  --max-trial-tx-bytes 1073741824 --max-campaign-tx-bytes 25000000000
+  --max-body 10485760 --timing-profile wan --profiles economy \
+  --repetitions 3 --heights 7 --warmup 1 --seed 432 \
+  --timeout-secs 600 --chatter-secs 2 --lifetime-secs 5400 \
+  --max-trial-tx-bytes 2147483648 --max-campaign-tx-bytes 60000000000
 ```
 
 Set the same `--max-trial-tx-bytes` on each worker. The per-node watchdog counts
@@ -506,3 +506,136 @@ identity was used. No remotely deployed testnet, disk-backed performance or
 transaction/TPS claim is implied. The final code passed **282 Rust release tests**
 (five existing ignored; unbounded legacy `single_rt` excluded) and **20 Python
 runner checks**, including real four-process baseline/K1/economy campaigns.
+
+### Seven-region, 10-MiB sweep — 2026-11-26
+
+Seven separate `performance-1x`, 2-GiB Fly machines, one validator/executor worker
+per machine, ran over private IPv6 in **IAD, SJC, GRU, FRA, JNB, SIN and SYD**.
+Node 0/the controller was in IAD. This non-burst-limited tier avoided deliberately
+reusing exhausted shared-CPU credits; it does not exclude host contention.
+A short pre-run ICMP sample had directed mean RTTs of **82–403 ms** and 124/126
+replies. It is not a UDP loss estimate. No probes ran during measured trials.
+
+The cap stayed **10,485,760 bytes** across every size, fixing the durable image
+at **31,465,268 bytes** and retaining the same large-cap transport settings.
+Bodies use deterministic padding in existing synthetic header solution fields,
+not transactions or valid PoW work. The mock store is in memory. These are not
+full-node/disk-backed results, and cannot be compared directly with the earlier
+shared-CPU, 1-MiB-cap campaigns. No PoW/ledger formats or rules changed.
+
+A separate four-trial pilot compared baseline/economy at 128 KiB and 10 MiB,
+with two measured heights plus one warmup each. All four completed. Economy's
+10-MiB measured throughput was 348.791 KiB/s versus baseline's 281.486 KiB/s;
+both small endpoints also completed. This justified a calibration choice, not a
+statistical superiority claim. Pilot observations are excluded from the table.
+
+The frozen primary used **economy** (100-ms polling/status, receive budget 32,
+K=2), benchmark WAN timers 10/5/7 seconds, seven measured heights plus one warmup,
+seed 432, three planned repetitions per size, a 600-second process deadline and
+5,400-second campaign limit. Software guards were 2 GiB TX/node/trial and 60 GB
+aggregate whole-child TX. The pilot showed the earlier 180-second/1-GiB limits
+would risk censoring the longer eight-height trials. Guards did not trigger.
+
+#### Collected results and shutdown boundary
+
+The user requested shutdown before all **21 trials / 147 measured heights** were
+collected. **Eleven trials have finalized controller records: 77 measured
+heights**, with complete seven-node counter coverage in each included trial.
+An additional 10-MiB trial completed on all nodes but collection was interrupted;
+it is reported separately below. Nine trials never started.
+
+The table uses only those eleven controller-complete trials. First/all latency
+is IAD-controller receipt time, not synchronized cross-machine event time. Rates
+count each chain body once and include the all-seven ACK barrier. Percentiles
+pool observed heights; **p95 is the observed maximum with these 7/14 samples**,
+not a stable tail estimate. Unequal repetitions and fallback rounds prevent
+calling the 10-MiB point a demonstrated optimum or capacity maximum.
+
+| Exact body | Trials / planned | Heights / planned | First receipt p50 / p95 (s) | All receipt p50 / p95 (s) | Unique chain KiB/s | VM TX / body | Offered evidence / body |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 KiB | 2 / 3 | 14 / 21 | 20.730 / 46.607 | 21.001 / 46.829 | 7.910 | 247.079× | 46.004× |
+| 512 KiB | 1 / 3 | 7 / 21 | 22.373 / 39.987 | 22.632 / 40.215 | 26.034 | 118.094× | 47.812× |
+| 1 MiB | 2 / 3 | 14 / 21 | 21.666 / 47.874 | 22.071 / 49.406 | 48.790 | 88.727× | 45.193× |
+| 2 MiB | 2 / 3 | 14 / 21 | 23.582 / 46.054 | 24.590 / 46.620 | 83.852 | 82.444× | 48.242× |
+| 4 MiB | 2 / 3 | 14 / 21 | 22.891 / 69.534 | 24.084 / 70.317 | 129.241 | 84.415× | 53.016× |
+| 8 MiB | 1 / 3 | 7 / 21 | 42.204 / 47.858 | 43.107 / 49.276 | 222.514 | 79.064× | 57.295× |
+| 10 MiB | 1 / 3 | 7 / 21 | 23.488 / 41.703 | 25.131 / 43.005 | 368.118 | 63.621× | 48.005× |
+
+Within this completed-controller cohort, 80× larger bodies (128 KiB to 10 MiB)
+bought **46.5× throughput**, while average all-ACK chain cycle rose **16.183 to
+27.817 seconds**. Median first receipt rose 20.730 to 23.488 seconds. The trend
+supports amortizing fixed costs with larger blocks; the irregular 8/10-MiB
+latencies do not establish that larger blocks intrinsically reduce latency.
+
+**Recovered trial 12, 10 MiB repetition 2:** all seven Rust reports are complete,
+exit zero, cleanup-confirmed, and agree on eight ACKed heights including seven
+measured heights. Thus **84/147 measured heights have node-ACK evidence overall**.
+SIGINT arrived during collection, so its controller/result and the campaign
+`run.json` were not finalized. Existing artifacts were preserved; remaining
+worker artifacts were recovered separately, without inventing controller times.
+This is **interrupted collection, not a protocol/deadline failure**. Node 0's
+local measured window was 242.090 seconds, yielding **296.088 KiB/s** with local
+callback median/max **26.484/51.712 seconds**. Its round-5 warmup took 120.113
+seconds. Those local measurements are not pooled with controller receipts/rates.
+
+#### What limits this prototype
+
+- **Fallback dominates many decisions:** of the 77 controller-recorded measured
+  heights, 17 decided in round 0, 44 in round 1, 14 in round 2 and two in round 3.
+  All seven additional recovered heights also used later rounds. No transition,
+  timer-expiry or proposal-arrival trace identifies the initiating cause; the
+  successful quorum path does not inherently wait out the 10/5/7-second timers.
+- Every state replacement processes the entire **31.47-MB image**, even for a
+  128-KiB block. Counted replacement work was **35.7–70.2 GiB per committed block**
+  summed across seven nodes; process CPU was **32.8–94.1 CPU-seconds/block**.
+  This is serialization/hash/copy work, not measured disk or memory-bus traffic.
+  Guest steal was 0.30–0.38%; this does not establish an always-saturated CPU or
+  prove that image work caused the fallbacks.
+- Measured receive-budget drops totaled **4,164 messages**. The transport's
+  reported wrapper/ring drop counters were zero; neither establishes UDP loss.
+  Critical small-message delays/drops remain a plausible contributor, not a
+  demonstrated single cause.
+- VM TX amplification was **63.6–247.1×** unique body bytes; evidence offers alone
+  were **45.2–57.3×**. This includes necessary replication and different framing
+  layers, not exclusively waste or retransmissions. All counter ratios have
+  full matched-trial coverage in the completed cohort.
+- During the separate two-second final-height holds, there were **zero new
+  evidence or bare-vote offers**, yet aggregate VM TX was **1.78–21.27 MB/s**.
+  Queued transfers, control, padding, probes and transport redundancy are not
+  separately identified. This is not quiescent-chain idle traffic.
+
+Whole-child TX is a separate accounting window: 22,420,830,910 bytes for the
+11 finalized primary trials and 6,898,615,893 for recovered trial 12, totaling
+**29,319,446,803 bytes**. The pilot added 4,954,105,436 bytes. These interface
+counts are not a verified billable-egress invoice and are not used as numerators
+in the table's measured-window amplification.
+
+#### Provenance, verification and resource cleanup
+
+Root: `/var/tmp/d28-fly-global-20261126-1708/`.
+
+- Binary source: `b89acd6bafb91307508a4ff1126c433f01d0608f`; integrated Rust sources
+  matched the branch. Executable SHA-256:
+  `c8481fd2ae8422ea1423e2a1548a3247f73b395e1467d5a862708a72436388ad`.
+- Runner SHA-256: `2d46af2d3f7329fe98f5a8d24b3debfa416800fa7940c13644df1bc380c48eec`.
+- `final-iad/global-grid-001/` retains original primary files;
+  `final-iad/user-stop-recovery/` retains recovered worker outputs.
+  `global-grid-001-completed-analysis-v2.json` explicitly excludes the interrupted
+  controller collection instead of manufacturing its missing metadata.
+- `primary-independent-audit.json` verifies 77 original completed-trial report
+  hashes, 616 node-height records, 154 measured/hold windows and 9,856 boundary
+  deltas. `pilot-independent-audit-338.json` audits the separate pilot.
+- All seven `data-final-REGION.tar.gz` archives were downloaded and hash-verified
+  before deletion; receipts are in `final-archives-verified.json`.
+- **The temporary app `d28-global-20261126-1708` and all seven machines were
+  destroyed**, and its absence from the live app list was verified. All benchmark
+  children were confirmed stopped before archiving. See `cleanup-receipt.json`.
+
+The pinned implementation passed **291 release Rust tests** with
+`CROSSLINK_FUZZ_SEED=428` (five existing ignored tests; unbounded `single_rt`
+excluded), plus **38 Python checks including the real-process tests**. An initial
+random-seed run reproduced an inherited legacy coverage-only assertion failure:
+seed `2960165695641715445` generated three missing-leading-signature cases versus
+its required four, after functional assertions passed (`src/lib.rs:6646`). Both
+failure logs are retained; no unrelated legacy code was changed. No additional
+performance experiments were started after the shutdown request.
