@@ -403,8 +403,9 @@ class Network:
                 actual = pow_hash_display(final["hash"])
                 require(actual == expected,
                         f"node{node.index} finalized a different PoW chain at {final['height']}: {actual} != {expected}")
+            runtime = node.rpc("get_tfl_recency_status") or {}
             rows.append({"node": node.index, "pow_height": height, "final": final,
-                         "certificate": cert, "pointer": pointer})
+                         "certificate": cert, "pointer": pointer, "runtime": runtime})
         if rows:
             common = min(r["pow_height"] for r in rows)
             hashes = [n.rpc("getblockhash", [common]) for n in self.active()]
@@ -413,7 +414,11 @@ class Network:
         self.last = rows
         with (self.root / "samples.jsonl").open("a") as output:
             output.write(json.dumps({"time": time.time(), "phase": phase, "nodes": rows}) + "\n")
-        say(phase + " " + " ".join(f"n{r['node']}:pow={r['pow_height']} bft={r['certificate']['height']} fin={r['final']['height'] if r['final'] else '-'}" for r in rows))
+        say(phase + " " + " ".join(
+            f"n{r['node']}:pow={r['pow_height']} bft={r['certificate']['height']} "
+            f"fin={r['final']['height'] if r['final'] else '-'} "
+            f"round={r['runtime'].get('my_round', '-')} step={r['runtime'].get('my_step', '-')} "
+            f"held={r['runtime'].get('tenderlink_held', '-')}" for r in rows))
         return rows
 
     def progress(self, phase, min_pow, min_bft):
@@ -808,6 +813,8 @@ def selftest():
                         return 30 if seen_finality else 10
                     if method == "getblockhash":
                         return bytes(range(32))[::-1].hex()
+                    if method == "get_tfl_recency_status":
+                        return {"my_height": 1, "my_round": 2, "my_step": 1}
                     self.fail(f"unexpected RPC {method}")
                 fake = mock.Mock(index=0, proc=object())
                 fake.rpc.side_effect = rpc
@@ -815,6 +822,7 @@ def selftest():
                 with mock.patch(__name__ + ".say"):
                     rows = net.sample("catchup-fixture")
                 self.assertEqual(rows[0]["pow_height"], 30)
+                self.assertEqual(rows[0]["runtime"], {"my_height": 1, "my_round": 2, "my_step": 1})
                 self.assertTrue((Path(temp) / "samples.jsonl").is_file())
 
     result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Tests))
