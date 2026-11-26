@@ -56,6 +56,12 @@ from unittest import mock
 MAX_BODY = 1048576  # Legacy default; never silently raised for a byte-target sweep.
 MAX_BENCH_BODY = 10 * MAX_BODY
 REPORT_GRACE_SECONDS = 8  # Shared post-failure cleanup budget, never measured time.
+MAX_TX_BUDGET = 2**40  # Bounded CLI bytes; zero disables the corresponding guard.
+TX_SAMPLE_SECONDS = 1
+TX_BUDGET_NOTE = ("VM-interface TX only, including control and unrelated VM work; whole child "
+                  "startup/warmup/tail/shutdown. Thresholds are not exact ceilings: one-second "
+                  "sampling, termination and in-flight traffic can overshoot a node threshold; "
+                  "the campaign threshold is checked after a trial and can overshoot by one batch.")
 MAX_JSON = 8 * 1024 * 1024
 MAX_LOG = 256 * 1024
 MAX_LINE = 4096
@@ -801,29 +807,55 @@ def stop_child(child):
         child.wait(timeout=3)
 
 
+def counter_snapshot(interface):
+    """Counter failures must become receipts, not an orphaned watcher thread."""
+    try:
+        return system_snapshot(interface)
+    except (OSError, ValueError, TypeError) as exc:
+        return {"interface": interface, "monotonic_seconds": time.monotonic(),
+                "network": None, "cpu_jiffies": None, "cgroup_cpu_stat": None,
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
+def snapshot_tx(snapshot):
+    network = snapshot.get("network") if isinstance(snapshot, dict) else None
+    value = network.get("tx_bytes") if isinstance(network, dict) else None
+    if type(value) is not int or value < 0:
+        raise ValueError("tx_counter_missing_or_invalid")
+    return value
+
+
 class NodeJob:
-    def __init__(self, binary, expected_sha, directory, config, interface):
+    def __init__(self, binary, expected_sha, directory, config, interface, max_trial_tx_bytes=0):
         self.directory = directory
         self.config = validate_config(config)
+        self.max_trial_tx_bytes = integer(max_trial_tx_bytes, 0, MAX_TX_BUDGET, "max_trial_tx_bytes")
         self.done = threading.Event()
+        self.lock = threading.RLock()  # Serialize cancel/watch stops and final publication.
         self.cancelled = False
         self.result = None
         self.child = None
+        self.budget_reason = None
         if sha256(binary) != expected_sha:
             raise ValueError("binary changed since manifest")
         directory.mkdir(mode=0o700)
         write_json(directory / "config.json", config)
-        self.metadata = machine_metadata(binary)
+        self.metadata = dict(machine_metadata(binary), max_trial_tx_bytes=self.max_trial_tx_bytes,
+                             interface=interface)
         write_json(directory / "manifest.json", self.metadata)
         self.command = [str(binary), "--distributed", str(directory / "config.json"),
                         "--json", str(directory / "report.json")]
         write_json(directory / "argv.json", self.command)
         self.began = time.monotonic()
-        self.before = system_snapshot(interface)
+        self.before = counter_snapshot(interface)
+        self.last = self.before
         self.interface = interface
         self.log_counts = {}
         self.log_threads = []
         self.watcher = None
+        if self.check_tx(self.before):
+            self.finish(None, False, self.budget_reason)  # No child without a usable baseline.
+            return
         try:
             self.child = subprocess.Popen(self.command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                           stdin=subprocess.DEVNULL, start_new_session=True)
@@ -838,21 +870,34 @@ class NodeJob:
             # The caller cannot register this job until construction returns.
             # Thus every post-Popen failure must retire this exact owned child here.
             if self.child is not None:
-                with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-                    stop_child(self.child)
+                self.stop_owned()
                 for thread in [*self.log_threads, self.watcher]:
                     if thread is not None and thread.ident is not None:
                         with contextlib.suppress(RuntimeError):
                             thread.join(timeout=3)
-                for source in (self.child.stdout, self.child.stderr):
-                    if source is not None:
-                        with contextlib.suppress(OSError):
-                            source.close()
-            if isinstance(exc, OSError):
-                if not self.done.is_set():
-                    self.finish(None, False, str(exc))
+                # BufferedReader.close() can wait indefinitely for a capture thread
+                # blocked in read(). Retain its pipes with the job, never steal them.
+                if self.cleanup_confirmed() and not any(thread.is_alive() for thread in self.log_threads):
+                    for source in (self.child.stdout, self.child.stderr):
+                        if source is not None:
+                            with contextlib.suppress(OSError):
+                                source.close()
+            if not self.cleanup_confirmed():
+                # Return ownership to the caller before it propagates a startup failure.
+                # Otherwise a thread-start exception could lose a still-live Popen.
+                self.startup_error = exc
+                self.finish(None, False, f"startup failed; cleanup unconfirmed: {type(exc).__name__}: {exc}")
+            elif isinstance(exc, OSError):
+                self.finish(None, False, str(exc))
             else:
                 raise
+
+    def check_startup(self):
+        error = getattr(self, "startup_error", None)
+        if isinstance(error, KeyboardInterrupt):
+            raise error
+        if error is not None:
+            raise ValueError("child startup failed; cleanup unconfirmed") from error
 
     def capture(self, label, source):
         count = 0
@@ -868,46 +913,102 @@ class NodeJob:
             self.log_counts[label] = {"total_bytes": count, "retained_limit": MAX_LOG,
                                       "truncated": count > MAX_LOG}
 
+    def check_tx(self, sample):
+        if self.max_trial_tx_bytes and self.budget_reason is None:
+            try:
+                current, previous, before = snapshot_tx(sample), snapshot_tx(self.last), snapshot_tx(self.before)
+                if current < previous:
+                    raise ValueError("tx_counter_regressed")
+                if current - before >= self.max_trial_tx_bytes:
+                    self.budget_reason = "budget_exceeded"
+            except ValueError as exc:
+                self.budget_reason = str(exc)
+        return self.budget_reason
+
+    def cleanup_confirmed(self):
+        return self.child is None or self.child.poll() is not None
+
+    def stop_owned(self):
+        with self.lock:
+            if self.child is not None:
+                try:
+                    stop_child(self.child)
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    return f"owned child cleanup unconfirmed: {type(exc).__name__}: {exc}"
+        return None
+
     def watch(self):
         timed_out = False
         error = None
         try:
-            self.child.wait(timeout=self.config["timeout_secs"] + self.config["chatter_secs"] + 45)
+            if not self.max_trial_tx_bytes:
+                self.child.wait(timeout=self.config["timeout_secs"] + self.config["chatter_secs"] + 45)
+            else:
+                deadline = self.began + self.config["timeout_secs"] + self.config["chatter_secs"] + 45
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(self.command, 0)
+                    try:
+                        self.child.wait(timeout=min(TX_SAMPLE_SECONDS, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        sample = counter_snapshot(self.interface)
+                        reason = self.check_tx(sample)
+                        self.last = sample  # Preserve even a missing/regressing raw observation.
+                        if reason:
+                            error = reason
+                            break
         except subprocess.TimeoutExpired:
             timed_out = True
-            stop_child(self.child)
         except OSError as exc:
             error = str(exc)
-            stop_child(self.child)
-        for thread in self.log_threads:
-            thread.join(timeout=3)
-        self.finish(self.child.returncode, timed_out, error)
+        finally:
+            if timed_out or error:
+                cleanup_error = self.stop_owned()
+                error = error or cleanup_error
+            for thread in self.log_threads:
+                thread.join(timeout=3)
+            self.finish(self.child.returncode, timed_out, error)
 
     def finish(self, returncode, timed_out, error):
-        after = system_snapshot(self.interface)
-        self.result = {"run_id": self.config["run_id"], "node": self.config["node"],
-                       "returncode": returncode, "timed_out": timed_out,
-                       "cancelled": self.cancelled, "error": error,
-                       "elapsed_seconds": time.monotonic() - self.began,
-                       "binary_sha256": self.metadata["binary_sha256"], "logs": self.log_counts,
-                       "process_window": {"start": self.before, "end": after,
-                                          "network_delta": deltas(self.before["network"], after["network"]),
-                                          "cpu_jiffies_delta": deltas(self.before["cpu_jiffies"], after["cpu_jiffies"]),
-                                          "cgroup_cpu_delta": deltas(self.before["cgroup_cpu_stat"], after["cgroup_cpu_stat"])}}
-        self.result["process_window"]["scope"] = "whole child incl startup/warmup/tail/shutdown; counters include control and unrelated VM work"
-        try:
-            write_json(self.directory / "worker.json", self.result)
-        except OSError as exc:
-            self.result["error"] = str(exc)
-        finally:
-            self.done.set()
+        with self.lock:
+            if self.done.is_set():
+                return
+            after = counter_snapshot(self.interface)
+            self.check_tx(after)  # A fast normal exit still cannot succeed after crossing the cap.
+            confirmed = self.cleanup_confirmed()
+            error = self.budget_reason or error or (None if confirmed else "owned child cleanup unconfirmed")
+            self.result = {"run_id": self.config["run_id"], "node": self.config["node"],
+                           "returncode": returncode, "timed_out": timed_out,
+                           "cancelled": self.cancelled, "error": error, "cleanup_confirmed": confirmed,
+                           "budget_exceeded": self.budget_reason == "budget_exceeded",
+                           "tx_budget": {"max_trial_tx_bytes": self.max_trial_tx_bytes,
+                                         "sample_interval_seconds": TX_SAMPLE_SECONDS,
+                                         "reason": self.budget_reason, "before": self.before,
+                                         "last": self.last, "after": after, "note": TX_BUDGET_NOTE},
+                           "elapsed_seconds": time.monotonic() - self.began,
+                           "binary_sha256": self.metadata["binary_sha256"], "logs": self.log_counts,
+                           "process_window": {"start": self.before, "end": after,
+                                              "network_delta": deltas(self.before["network"], after["network"]),
+                                              "cpu_jiffies_delta": deltas(self.before["cpu_jiffies"], after["cpu_jiffies"]),
+                                              "cgroup_cpu_delta": deltas(self.before["cgroup_cpu_stat"], after["cgroup_cpu_stat"])}}
+            self.result["process_window"]["scope"] = "whole child incl startup/warmup/tail/shutdown; counters include control and unrelated VM work"
+            try:
+                write_json(self.directory / "worker.json", self.result)
+            except OSError as exc:
+                self.result["error"] = str(exc)
+            finally:
+                self.done.set()
 
     def cancel(self):
-        if not self.done.is_set():
-            self.cancelled = True
-            if self.child is not None:
-                stop_child(self.child)
-            self.done.wait(6)
+        with self.lock:
+            if not self.done.is_set():
+                self.cancelled = True
+                self.stop_owned()
+            elif not self.cleanup_confirmed():
+                self.stop_owned()
+        self.done.wait(6)
 
     def artifacts(self):
         if not self.done.is_set():
@@ -925,11 +1026,13 @@ class NodeJob:
 
 
 class Worker:
-    def __init__(self, binary, root, interface, max_runs=128):
+    def __init__(self, binary, root, interface, max_runs=128, max_trial_tx_bytes=0):
+        self.max_trial_tx_bytes = integer(max_trial_tx_bytes, 0, MAX_TX_BUDGET, "max_trial_tx_bytes")
         self.binary = binary.resolve(strict=True)
         if not self.binary.is_file() or not os.access(self.binary, os.X_OK):
             raise ValueError("binary must be an executable regular file")
-        self.metadata = machine_metadata(self.binary)
+        self.metadata = dict(machine_metadata(self.binary), max_trial_tx_bytes=self.max_trial_tx_bytes,
+                             interface=interface, tx_budget_note=TX_BUDGET_NOTE)
         self.root = root.resolve()
         self.root.mkdir(mode=0o700, parents=True)
         write_json(self.root / "manifest.json", self.metadata)
@@ -944,10 +1047,12 @@ class Worker:
             raise ValueError("run_id already used; never relaunch a timed-out HTTP request")
         if len(self.jobs) >= self.max_runs:
             raise ValueError("worker run limit reached")
-        if any(not job.done.is_set() for job in self.jobs.values()):
-            raise ValueError("worker already has a running child")
-        job = NodeJob(self.binary, self.metadata["binary_sha256"], self.root / identifier, config, self.interface)
+        if any(not job.done.is_set() or not job.cleanup_confirmed() for job in self.jobs.values()):
+            raise ValueError("worker already has a running or unconfirmed child")
+        job = NodeJob(self.binary, self.metadata["binary_sha256"], self.root / identifier, config,
+                      self.interface, self.max_trial_tx_bytes)
         self.jobs[identifier] = job
+        job.check_startup()
         return {"run_id": identifier, "node": config["node"], "accepted": True}
 
     def stop_all(self):
@@ -1050,7 +1155,7 @@ def worker_request(address, token, operation, value=None, timeout=10):
 
 def serve_worker(args):
     token = read_token(args.token_file)
-    worker = Worker(args.binary, args.root, args.interface, args.max_runs)
+    worker = Worker(args.binary, args.root, args.interface, args.max_runs, args.max_trial_tx_bytes)
     deadline = time.monotonic() + args.lifetime_secs
     try:
         with WorkerServer(endpoint(args.bind), WorkerHandler) as server:
@@ -1150,6 +1255,11 @@ def failure_report_grace(began, timeout, now, started):
     return REPORT_GRACE_SECONDS if started and near_deadline else 0
 
 
+def confirmed_worker_status(status, identifier):
+    return (isinstance(status, dict) and status.get("run_id") == identifier and status.get("done") is True
+            and isinstance(status.get("result"), dict) and status["result"].get("cleanup_confirmed") is True)
+
+
 def collect_remote(address, token, identifier, directory, grace):
     deadline = time.monotonic() + grace
     request = {"run_id": identifier}
@@ -1161,10 +1271,10 @@ def collect_remote(address, token, identifier, directory, grace):
             break
         if time.monotonic() >= deadline:
             status = worker_request(address, token, "stop", request, timeout=10)
-            if not isinstance(status, dict) or status.get("run_id") != identifier or status.get("done") is not True:
-                raise ValueError("worker stop did not confirm terminal child")
             break
         time.sleep(min(0.2, max(0, deadline - time.monotonic())))  # Post-ACK/failure only.
+    if not confirmed_worker_status(status, identifier):
+        raise ValueError("worker did not confirm owned child cleanup")
     artifacts = worker_request(address, token, "result", request, timeout=10)
     if artifacts.get("run_id") != identifier or not isinstance(artifacts.get("files"), dict):
         raise ValueError("invalid worker result identity")
@@ -1178,22 +1288,85 @@ def collect_remote(address, token, identifier, directory, grace):
             stream.write(raw)
 
 
-def validate_node_artifacts(directory, config, expected_sha):
+def validate_worker_artifacts(directory, config, expected_sha):
+    # A killed/failed Rust child may have no report.json; its TX receipt is still essential.
     worker = read_json(directory / "worker.json")
-    report = read_json(directory / "report.json")
     manifest = read_json(directory / "manifest.json")
     actual = read_json(directory / "config.json")
+    if not isinstance(worker, dict) or not isinstance(manifest, dict):
+        raise ValueError("invalid worker receipt")
     if actual != config or manifest.get("binary_sha256") != expected_sha or worker.get("binary_sha256") != expected_sha:
         raise ValueError("node config/binary provenance mismatch")
     if worker.get("run_id") != config["run_id"] or worker.get("node") != config["node"]:
         raise ValueError("node result identity mismatch")
-    if worker.get("returncode") != 0 or worker.get("timed_out") or worker.get("cancelled") or worker.get("error"):
+    return worker
+
+
+def validate_node_artifacts(directory, config, expected_sha):
+    worker = validate_worker_artifacts(directory, config, expected_sha)
+    if (worker.get("returncode") != 0 or worker.get("timed_out") or worker.get("cancelled") or worker.get("error")
+            or worker.get("budget_exceeded") or worker.get("cleanup_confirmed") is False):
         raise ValueError("node process did not exit successfully")
+    report = read_json(directory / "report.json")
     if report.get("schema_version") != 1 or report.get("mode") != "distributed" or report.get("status") != "complete":
         raise ValueError("node report missing, partial or unsupported")
     if not configs_match(report.get("config"), config):
         raise ValueError("node report identity/config mismatch")
     return worker, report
+
+
+def trial_tx_ledger(directory, config, expected_sha, max_trial_tx_bytes, max_campaign_tx_bytes):
+    """Independent cost accounting, never a substitute for measured-chain counters."""
+    entries, exceeded, unconfirmed = [], [], []
+    enabled = bool(max_trial_tx_bytes or max_campaign_tx_bytes)
+    for node in range(config["nodes"] - config["offline"]):
+        entry = {"node": node, "tx_bytes": None, "reason": None,
+                 "receipt": f"node-{node:03d}/worker.json"}
+        try:
+            worker = validate_worker_artifacts(directory / f"node-{node:03d}", dict(config, node=node), expected_sha)
+            budget = worker.get("tx_budget", {})
+            if not isinstance(budget, dict):
+                raise ValueError("invalid TX budget receipt")
+            if worker.get("budget_exceeded") is True or budget.get("reason") == "budget_exceeded":
+                exceeded.append(node)
+            if worker.get("cleanup_confirmed") is False:
+                unconfirmed.append(node)
+            if enabled:
+                if worker.get("cleanup_confirmed") is not True:
+                    raise ValueError("child cleanup unconfirmed")
+                limit = budget.get("max_trial_tx_bytes")
+                if type(limit) is not int or limit != max_trial_tx_bytes:
+                    raise ValueError("worker TX limit differs from campaign")
+            window = worker["process_window"]
+            before, after = window["start"], window["end"]
+            start, end = snapshot_tx(before), snapshot_tx(after)
+            entry.update(before_tx_bytes=start, after_tx_bytes=end)
+            if before.get("interface") != after.get("interface") or end < start:
+                raise ValueError("TX counter regressed or interface changed")
+            if budget:
+                last = snapshot_tx(budget.get("last"))
+                entry["last_tx_bytes"] = last
+                if not start <= last <= end:
+                    raise ValueError("TX counter regressed during child lifetime")
+                if budget.get("before") != before or budget.get("after") != after:
+                    raise ValueError("TX boundary receipts disagree")
+                if budget.get("reason") not in (None, "budget_exceeded"):
+                    raise ValueError(str(budget["reason"]))
+            delta = window["network_delta"]["tx_bytes"]
+            if type(delta) is not int or delta < 0 or delta != end - start:
+                raise ValueError("missing/invalid whole-child TX delta")
+            entry["tx_bytes"] = delta
+            if max_trial_tx_bytes and delta >= max_trial_tx_bytes and node not in exceeded:
+                exceeded.append(node)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            entry["reason"] = f"{type(exc).__name__}: {exc}"
+        entries.append(entry)
+    complete = all(entry["tx_bytes"] is not None for entry in entries)
+    confirmed = sum(entry["tx_bytes"] for entry in entries if entry["tx_bytes"] is not None)
+    return {"max_trial_tx_bytes": max_trial_tx_bytes, "max_campaign_tx_bytes": max_campaign_tx_bytes,
+            "accounting_complete": complete, "whole_child_tx_bytes": confirmed if complete else None,
+            "confirmed_tx_bytes": confirmed, "nodes": entries, "budget_exceeded_nodes": exceeded,
+            "cleanup_unconfirmed_nodes": unconfirmed, "note": TX_BUDGET_NOTE}
 
 
 def run_trial(args, roster, token, binary, metadata, directory, case, campaign_deadline):
@@ -1208,7 +1381,11 @@ def run_trial(args, roster, token, binary, metadata, directory, case, campaign_d
     try:
         controller = Coordinator(config, args.ready_timeout_secs)
         controller.launch()
-        local = NodeJob(binary, metadata["binary_sha256"], directory / "node-000", config, roster["interface"])
+        local = NodeJob(binary, metadata["binary_sha256"], directory / "node-000", config,
+                        roster["interface"], args.max_trial_tx_bytes)
+        local.check_startup()  # Ownership is registered before a startup interrupt propagates.
+        if local.done.is_set() and isinstance(local.result, dict) and local.result.get("error"):
+            raise ValueError("node 0 stopped before remote launch: " + local.result["error"])
         for node in range(1, config["nodes"] - config["offline"]):
             remote_directory = directory / f"node-{node:03d}"
             remote_directory.mkdir(mode=0o700)
@@ -1254,7 +1431,7 @@ def run_trial(args, roster, token, binary, metadata, directory, case, campaign_d
         if local is not None and not local.done.wait(max(0, cleanup_deadline - time.monotonic())):
             local.cancel()
             errors.append("node 0 exit timeout")
-        if local is not None and not local.done.is_set():
+        if local is not None and (not local.done.is_set() or not local.cleanup_confirmed()):
             cleanup_unconfirmed.append(0)
         for node in attempted:
             try:
@@ -1262,15 +1439,14 @@ def run_trial(args, roster, token, binary, metadata, directory, case, campaign_d
                                directory / f"node-{node:03d}", max(0, cleanup_deadline - time.monotonic()))
             except (OSError, ValueError, http.client.HTTPException) as exc:
                 errors.append(f"node {node} collection: {type(exc).__name__}: {exc}")
-                # Even a successful final ACK does not prove the remote process
-                # exited. Stop only this run, then require explicit done evidence.
+                # Done means watcher finished, not necessarily child reaped. Require
+                # explicit cleanup confirmation even when artifacts are unavailable.
                 confirmed = False
                 for operation in ("stop", "status"):
                     try:
                         reply = worker_request(roster["workers"][node], token, operation,
                                                {"run_id": config["run_id"]})
-                        if (isinstance(reply, dict) and reply.get("run_id") == config["run_id"]
-                                and reply.get("done") is True):
+                        if confirmed_worker_status(reply, config["run_id"]):
                             confirmed = True
                             break
                     except (OSError, ValueError, http.client.HTTPException) as cleanup_error:
@@ -1296,8 +1472,18 @@ def run_trial(args, roster, token, binary, metadata, directory, case, campaign_d
         except (OSError, ValueError, KeyError, TypeError) as exc:
             errors.append(f"node {node} verification: {type(exc).__name__}: {exc}")
             node_results.append({"node": node, "status": "failed"})
+    budget = trial_tx_ledger(directory, config, metadata["binary_sha256"],
+                             args.max_trial_tx_bytes, args.max_campaign_tx_bytes)
+    cleanup_unconfirmed = sorted(set(cleanup_unconfirmed + budget["cleanup_unconfirmed_nodes"]))
+    if cleanup_unconfirmed:
+        errors.append("child cleanup unconfirmed; campaign must halt")
+    if budget["budget_exceeded_nodes"]:
+        errors.append("budget_exceeded: per-node whole-child TX threshold reached")
+    if (args.max_trial_tx_bytes or args.max_campaign_tx_bytes) and not budget["accounting_complete"]:
+        errors.append("tx_accounting_unavailable: campaign must halt")
     status = "complete" if control_report["status"] == "complete" and not errors else "partial"
     result = {"schema_version": 1, "status": status, "errors": errors, "interrupted": interrupted,
+              "tx_budget": budget,
               "cleanup_unconfirmed_nodes": cleanup_unconfirmed, "report_grace_seconds": grace,
               "started_at": started_at, "elapsed_seconds": time.monotonic() - began,
               "finished_at": utc_now(), "nodes": node_results,
@@ -1389,40 +1575,74 @@ def campaign(args):
     output = args.out.resolve()
     output.mkdir(mode=0o700, parents=True)
     began, started_at = time.monotonic(), utc_now()
-    metadata = machine_metadata(binary)
+    budget_config = {"max_trial_tx_bytes": args.max_trial_tx_bytes,
+                     "max_campaign_tx_bytes": args.max_campaign_tx_bytes, "note": TX_BUDGET_NOTE}
+    enabled = bool(args.max_trial_tx_bytes or args.max_campaign_tx_bytes)
+    metadata = dict(machine_metadata(binary), max_trial_tx_bytes=args.max_trial_tx_bytes,
+                    interface=roster["interface"])
     write_json(output / "manifest.json", {
         "schema_version": 1, "mode": "d28_fly_campaign", "host": metadata, "roster": roster,
         "started_at": started_at, "cases_in_order": cases, "seed": args.seed,
         "heights": args.heights, "warmup": args.warmup, "body_bytes": args.body_bytes,
         "solution_bytes": args.solution_bytes, "offline": args.offline, "max_body": args.max_body,
-        "timing_profile": args.timing_profile,
+        "timing_profile": args.timing_profile, "tx_budget": budget_config,
         "timeout_secs": args.timeout_secs, "lifetime_secs": args.lifetime_secs,
         "profiles": PROFILES, "notes": NOTES,
         "node_latency_scope": "node-local ACK/tip publication to push_decided callback, not exact INIT timing",
         "script_sha256": sha256(Path(__file__))})
-    # Pin every active VM's actual executable before any process is started.
+    # Pin every active VM's executable AND fixed local guard before any process starts.
     for node in range(1, len(roster["peers"]) - args.offline):
         info = worker_request(roster["workers"][node], token, "info")
         write_json(output / f"worker-{node:03d}-preflight.json", info)
-        if info.get("binary_sha256") != metadata["binary_sha256"]:
+        if not isinstance(info, dict) or info.get("binary_sha256") != metadata["binary_sha256"]:
             raise ValueError(f"node {node} binary hash differs from local node0")
+        limit = info.get("max_trial_tx_bytes")
+        if type(limit) is not int or limit != args.max_trial_tx_bytes:
+            raise ValueError(f"node {node} max_trial_tx_bytes differs from campaign")
+        if enabled and info.get("interface") != roster["interface"]:
+            raise ValueError(f"node {node} budget interface differs from roster")
     deadline = time.monotonic() + args.lifetime_secs
-    results = []
+    results, confirmed_tx = [], 0
+    accounting_complete = True
+    halt_reason = None
     for index, case in enumerate(cases, 1):
         if time.monotonic() >= deadline:
+            halt_reason = "campaign_deadline"
             break
         name = trial_name(index, case)
         result = run_trial(args, roster, token, binary, metadata, output / name, case, deadline)
-        results.append({"trial": name, "status": result["status"], **case,
+        ledger = dict(result.get("tx_budget", {}))
+        count = ledger.get("confirmed_tx_bytes")
+        valid_count = type(count) is int and count >= 0
+        accounted = valid_count and ledger.get("accounting_complete") is True
+        accounting_complete = accounting_complete and accounted
+        confirmed_tx += count if valid_count else 0
+        if result["cleanup_unconfirmed_nodes"] or ledger.get("cleanup_unconfirmed_nodes"):
+            halt_reason = "cleanup_unconfirmed"
+        elif ledger.get("budget_exceeded_nodes"):
+            halt_reason = "budget_exceeded"
+        elif enabled and not accounted:
+            halt_reason = "tx_accounting_unavailable"
+        elif args.max_campaign_tx_bytes and confirmed_tx >= args.max_campaign_tx_bytes:
+            halt_reason = "campaign_tx_budget_exceeded"
+        elif result["interrupted"]:
+            halt_reason = "interrupted"
+        ledger.update(campaign_confirmed_tx_bytes=confirmed_tx, campaign_halt_reason=halt_reason)
+        results.append({"trial": name, "status": result["status"], **case, "tx_budget": ledger,
                         **{key: result.get(key) for key in ("started_at", "finished_at", "elapsed_seconds")}})
         print(f"{name}: {result['status']}", flush=True)
-        if result["interrupted"] or result["cleanup_unconfirmed_nodes"]:
+        if halt_reason:
+            print(f"campaign halted: {halt_reason}; confirmed whole-child VM TX {confirmed_tx} bytes", flush=True)
             break
-    complete = len(results) == len(cases) and all(row["status"] == "complete" for row in results)
+    # An aggregate post-trial halt does NOT retroactively invalidate a completed trial.
+    complete = halt_reason is None and len(results) == len(cases) and all(row["status"] == "complete" for row in results)
     write_json(output / "run.json", {"status": "complete" if complete else "partial", "started_at": started_at,
                                      "finished_at": utc_now(), "elapsed_seconds": time.monotonic() - began,
                                      "planned_trials": len(cases), "started_trials": len(results),
                                      "complete_trials": sum(row["status"] == "complete" for row in results),
+                                     "halt_reason": halt_reason,
+                                     "tx_budget": dict(budget_config, confirmed_tx_bytes=confirmed_tx,
+                                                       accounting_complete=accounting_complete),
                                      "trials": results})
     write_json(output / "summary.json", summarize(output))
     return 0 if complete else 1
@@ -1846,12 +2066,14 @@ finally:
                         return {"accepted": True, "node": value["node"], "run_id": value["run_id"]}
                     self.assertIn(operation, ("stop", "status"))
                     self.assertEqual(set(value), {"run_id"})
-                    return {"run_id": value["run_id"], "done": confirmed}
+                    return {"run_id": value["run_id"], "done": True,
+                            "result": {"cleanup_confirmed": confirmed}}
 
                 args = build_parser().parse_args(["campaign", "--binary", sys.executable, "--roster", "unused",
                     "--token-file", "unused", "--out", "unused", "--heights", "1", "--warmup", "0"])
                 local = mock.Mock()
                 local.done.wait.return_value = local.done.is_set.return_value = True
+                local.cleanup_confirmed.return_value = confirmed
                 with mock.patch(__name__ + ".Coordinator", side_effect=controller), \
                         mock.patch(__name__ + ".NodeJob", return_value=local), \
                         mock.patch(__name__ + ".worker_request", side_effect=request) as remote, \
@@ -1862,10 +2084,11 @@ finally:
                                        time.monotonic() + 60)
                 self.assertEqual(result["controller"]["status"], "complete")
                 self.assertEqual(result["status"], "partial")
+                local.cleanup_confirmed.assert_called_once()
                 stops = [call for call in remote.call_args_list if call.args[2] == "stop"]
                 self.assertEqual(len(stops), 3)
                 self.assertTrue(all(call.args[3] == {"run_id": result["config"]["run_id"]} for call in stops))
-                self.assertEqual(result["cleanup_unconfirmed_nodes"], [] if confirmed else [1, 2, 3])
+                self.assertEqual(result["cleanup_unconfirmed_nodes"], [] if confirmed else [0, 1, 2, 3])
                 self.assertEqual(read_json(root / str(confirmed) / "result.json")["cleanup_unconfirmed_nodes"],
                                  result["cleanup_unconfirmed_nodes"])
 
@@ -1886,6 +2109,357 @@ finally:
             result = read_json(root / "out" / "run.json")
             self.assertEqual(result["planned_trials"], 2)
             self.assertEqual(len(result["trials"]), 1)
+
+    def test_tx_budget_cli_and_preflight_equality(self):
+        parser = build_parser()
+        common = ["campaign", "--binary", sys.executable, "--roster", "unused",
+                  "--token-file", "unused", "--out", "unused"]
+        self.assertEqual(parser.parse_args(common).max_trial_tx_bytes, 0)
+        self.assertEqual(parser.parse_args(common).max_campaign_tx_bytes, 0)
+        for option in ("--max-trial-tx-bytes", "--max-campaign-tx-bytes"):
+            self.assertEqual(getattr(parser.parse_args(common + [option, str(MAX_TX_BUDGET)]),
+                                     option[2:].replace("-", "_")), MAX_TX_BUDGET)
+            for value in ("-1", str(MAX_TX_BUDGET + 1), "1.5", "true"):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    parser.parse_args(common + [option, value])
+        with self.assertRaises(ValueError):
+            validate_config(fixture_config(max_trial_tx_bytes=100))  # No HTTP/Rust schema extension.
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary)
+            create_token(root / "token")
+            write_json(root / "roster.json", {"peers": fixture_config()["peers"],
+                       "workers": [None, "[::1]:22001", "[::1]:22002", "[::1]:22003"],
+                       "coordinator": "[::1]:21000", "interface": "lo"})
+            for index, limit in enumerate((None, True, "100", 99, 100)):
+                args = parser.parse_args(common + ["--roster", str(root / "roster.json"),
+                    "--token-file", str(root / "token"), "--out", str(root / str(index)),
+                    "--headers", "32", "--repetitions", "1", "--max-trial-tx-bytes", "100"])
+                infos = [{"binary_sha256": "a" * 64, "max_trial_tx_bytes": value, "interface": "lo"}
+                         for value in (100, limit, 100)]
+                result = {"status": "complete", "interrupted": False, "cleanup_unconfirmed_nodes": [],
+                          "tx_budget": {"confirmed_tx_bytes": 10, "accounting_complete": True}}
+                with mock.patch(__name__ + ".machine_metadata", return_value={"binary_sha256": "a" * 64}), \
+                        mock.patch(__name__ + ".worker_request", side_effect=infos) as requests, \
+                        mock.patch(__name__ + ".run_trial", return_value=result) as trial, \
+                        mock.patch(__name__ + ".summarize", return_value={}), contextlib.redirect_stdout(io.StringIO()):
+                    if limit == 100:
+                        self.assertEqual(campaign(args), 0)
+                        self.assertEqual(requests.call_count, 3)
+                        trial.assert_called_once()
+                    else:
+                        with self.assertRaisesRegex(ValueError, "max_trial_tx_bytes"):
+                            campaign(args)
+                        trial.assert_not_called()
+                    self.assertTrue(all(call.args[2] == "info" for call in requests.call_args_list))
+
+    def tx_receipts(self, directory, mutate=None):
+        config = fixture_config()
+        for node, delta in enumerate((10, 20, 30, 40)):
+            path = directory / f"node-{node:03d}"
+            path.mkdir(parents=True)
+            before = {"interface": "test0", "network": {"tx_bytes": 100, "rx_bytes": 0}}
+            after = {"interface": "test0", "network": {"tx_bytes": 100 + delta, "rx_bytes": 999999999}}
+            receipt = {"run_id": config["run_id"], "node": node, "binary_sha256": "a" * 64,
+                       "returncode": 0, "cleanup_confirmed": True, "budget_exceeded": False,
+                       "tx_budget": {"max_trial_tx_bytes": 1000, "before": before, "last": before,
+                                     "after": after, "reason": None},
+                       "process_window": {"start": before, "end": after,
+                                          "network_delta": {"tx_bytes": delta, "rx_bytes": 999999999}}}
+            if mutate is not None and node == 1:
+                mutate(receipt)
+            write_json(path / "config.json", dict(config, node=node))
+            write_json(path / "manifest.json", {"binary_sha256": "a" * 64})
+            write_json(path / "worker.json", receipt)  # Deliberately no Rust report.json.
+        return config
+
+    def test_tx_ledger_sums_only_whole_child_tx_without_rust_report(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary)
+            config = self.tx_receipts(root)
+            ledger = trial_tx_ledger(root, config, "a" * 64, 1000, 5000)
+            self.assertTrue(ledger["accounting_complete"])
+            self.assertEqual(ledger["whole_child_tx_bytes"], 100)
+            self.assertEqual(ledger["confirmed_tx_bytes"], 100)
+            self.assertEqual([entry["tx_bytes"] for entry in ledger["nodes"]], [10, 20, 30, 40])
+            with self.assertRaises(FileNotFoundError):
+                validate_node_artifacts(root / "node-000", config, "a" * 64)
+
+    def test_tx_ledger_invalid_missing_regressing_and_budget_receipts(self):
+        changes = [lambda w: w["process_window"].pop("end"),
+                   lambda w: w["process_window"]["end"]["network"].update(tx_bytes=99),
+                   lambda w: w["process_window"]["network_delta"].update(tx_bytes=True),
+                   lambda w: w["process_window"]["network_delta"].update(tx_bytes=1.5),
+                   lambda w: w["process_window"]["network_delta"].update(tx_bytes=21),
+                   lambda w: w["tx_budget"].update(reason="tx_counter_missing_or_invalid"),
+                   lambda w: w["tx_budget"].update(last={"network": {"tx_bytes": 121}}),
+                   lambda w: w.update(cleanup_confirmed=False)]
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            for index, change in enumerate(changes):
+                root = Path(temporary) / str(index)
+                config = self.tx_receipts(root, change)
+                ledger = trial_tx_ledger(root, config, "a" * 64, 1000, 5000)
+                self.assertFalse(ledger["accounting_complete"], index)
+                self.assertIsNone(ledger["whole_child_tx_bytes"])
+                self.assertEqual(ledger["confirmed_tx_bytes"], 80)
+                self.assertTrue(ledger["nodes"][1]["reason"])
+            root = Path(temporary) / "cap"
+            config = self.tx_receipts(root, lambda w: w.update(budget_exceeded=True, returncode=-15))
+            ledger = trial_tx_ledger(root, config, "a" * 64, 1000, 5000)
+            self.assertEqual(ledger["budget_exceeded_nodes"], [1])
+            self.assertTrue(ledger["accounting_complete"])
+            self.assertEqual(ledger["confirmed_tx_bytes"], 100)
+
+    def test_campaign_tx_halts_without_next_case_and_preserves_completed_trial(self):
+        scenarios = [(100, 40, True, [], "complete", 3, "campaign_tx_budget_exceeded"),
+                     (100, 40, True, [0], "partial", 1, "budget_exceeded"),
+                     (100, 40, False, [], "partial", 1, "tx_accounting_unavailable"),
+                     (100, True, True, [], "partial", 1, "tx_accounting_unavailable"),
+                     (0, None, False, [], "complete", 4, None)]
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary)
+            create_token(root / "token")
+            write_json(root / "roster.json", {"peers": ["[::1]:20000"], "workers": [None],
+                                              "coordinator": "[::1]:21000"})
+            for index, (cap, count, accounted, exceeded, status, calls, reason) in enumerate(scenarios):
+                args = build_parser().parse_args(["campaign", "--binary", sys.executable,
+                    "--roster", str(root / "roster.json"), "--token-file", str(root / "token"),
+                    "--out", str(root / str(index)), "--headers", "32", "--repetitions", "4",
+                    "--max-campaign-tx-bytes", str(cap)])
+                result = {"status": status, "interrupted": False, "cleanup_unconfirmed_nodes": [],
+                          "tx_budget": {"confirmed_tx_bytes": count, "accounting_complete": accounted,
+                                        "budget_exceeded_nodes": exceeded}}
+                with mock.patch(__name__ + ".run_trial", return_value=result) as trial, \
+                        mock.patch(__name__ + ".summarize", return_value={}), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(campaign(args), int(reason is not None))
+                self.assertEqual(trial.call_count, calls)
+                saved = read_json(root / str(index) / "run.json")
+                self.assertEqual(saved["halt_reason"], reason)
+                self.assertTrue(all(row["status"] == status for row in saved["trials"]))
+                self.assertEqual(saved["tx_budget"]["max_campaign_tx_bytes"], cap)
+                if index == 0:
+                    self.assertEqual(saved["status"], "partial")
+                    self.assertEqual(saved["complete_trials"], 3)
+                    self.assertEqual(saved["tx_budget"]["confirmed_tx_bytes"], 120)
+                    self.assertEqual([row["tx_budget"]["campaign_confirmed_tx_bytes"] for row in saved["trials"]],
+                                     [40, 80, 120])
+
+    def budget_job(self, values, limit=1000, timeouts=1, stubborn=False, unreapable=False):
+        """Controlled Popen/clock, bounded noisy pipes; no process or socket is created."""
+        now, waits, signals = [0.0], [], []
+        child = mock.Mock(pid=424242, stdout=io.BytesIO(b"x" * (MAX_LOG + 8192)), stderr=io.BytesIO())
+        child.returncode = None
+        child.poll.side_effect = lambda: child.returncode
+        remaining = [timeouts]
+        counters = list(values)
+
+        def snapshot(_interface):
+            value = counters.pop(0) if len(counters) > 1 else counters[0]
+            if isinstance(value, Exception):
+                raise value
+            return {"interface": "test0", "monotonic_seconds": now[0],
+                    "network": None if value is None else {"tx_bytes": value, "rx_bytes": 999999999},
+                    "cpu_jiffies": None, "cgroup_cpu_stat": None}
+
+        def wait(timeout):
+            waits.append(timeout)
+            if child.returncode is not None:
+                return child.returncode
+            if remaining[0] == 0 and not unreapable:
+                child.returncode = 0
+                return 0
+            remaining[0] -= 1
+            now[0] += timeout
+            raise subprocess.TimeoutExpired("synthetic child", timeout)
+
+        def kill(pid, sig):
+            signals.append((pid, sig))
+            if not unreapable and (not stubborn or sig == signal.SIGKILL):
+                child.returncode = -sig
+
+        child.wait.side_effect = wait
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary, \
+                mock.patch(__name__ + ".system_snapshot", side_effect=snapshot), \
+                mock.patch(__name__ + ".machine_metadata", return_value={"binary_sha256": "a" * 64}), \
+                mock.patch(__name__ + ".sha256", return_value="a" * 64), \
+                mock.patch("subprocess.Popen", return_value=child) as popen, \
+                mock.patch("threading.Thread.start"), mock.patch("time.monotonic", side_effect=lambda: now[0]), \
+                mock.patch("os.killpg", side_effect=kill):
+            directory = Path(temporary) / "job"
+            job = NodeJob(Path(sys.executable), "a" * 64, directory, fixture_config(), "test0", limit)
+            if job.child is not None:
+                for label, source in (("stdout", child.stdout), ("stderr", child.stderr)):
+                    job.capture(label, source)
+                job.log_threads = []
+                job.watch()
+                self.assertEqual((directory / "stdout.txt").stat().st_size, MAX_LOG)
+                self.assertTrue(job.result["logs"]["stdout"]["truncated"])
+                self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            else:
+                popen.assert_not_called()
+            self.assertTrue(job.done.is_set())
+            self.assertEqual(read_json(directory / "worker.json"), job.result)
+            job.finish(0, False, None)  # No duplicate publication or late success overwrite.
+            if not unreapable:
+                before_cancel = list(signals)
+                job.cancel()
+                self.assertEqual(signals, before_cancel)
+            return job.result, waits, signals
+
+    def test_tx_budget_disabled_and_missing_baseline(self):
+        result, waits, signals = self.budget_job([None], limit=0, timeouts=0)
+        self.assertEqual(waits, [50])  # Original single hard-deadline wait is unchanged.
+        self.assertFalse(signals)
+        self.assertEqual(result["returncode"], 0)
+        self.assertIsNone(result["error"])
+        result, waits, signals = self.budget_job([None])
+        self.assertFalse(waits or signals)
+        self.assertIsNone(result["returncode"])
+        self.assertEqual(result["error"], "tx_counter_missing_or_invalid")
+        self.assertTrue(result["cleanup_confirmed"])
+
+    def test_tx_budget_cap_stops_exact_owned_child(self):
+        result, waits, signals = self.budget_job([100, 1100, 1200], stubborn=True, timeouts=10)
+        self.assertEqual(signals, [(424242, signal.SIGTERM), (424242, signal.SIGKILL)])
+        self.assertEqual(waits, [1, 2, 3])
+        self.assertTrue(result["budget_exceeded"])
+        self.assertEqual(result["error"], "budget_exceeded")
+        self.assertTrue(result["cleanup_confirmed"])
+        self.assertEqual(result["process_window"]["network_delta"]["tx_bytes"], 1100)
+        self.assertEqual([result["tx_budget"][key]["network"]["tx_bytes"]
+                          for key in ("before", "last", "after")], [100, 1100, 1200])
+
+    def test_tx_budget_counter_failures_stop_owned_child(self):
+        for value, reason in ((None, "tx_counter_missing_or_invalid"),
+                              (True, "tx_counter_missing_or_invalid"),
+                              (1.5, "tx_counter_missing_or_invalid"),
+                              (-1, "tx_counter_missing_or_invalid"),
+                              (OSError("synthetic counters unavailable"), "tx_counter_missing_or_invalid"),
+                              (99, "tx_counter_regressed")):
+            with self.subTest(value=value):
+                result, waits, signals = self.budget_job([100, value, 110])
+                self.assertEqual(result["error"], reason)
+                self.assertFalse(result["budget_exceeded"])
+                self.assertEqual(signals, [(424242, signal.SIGTERM)])
+                self.assertTrue(result["cleanup_confirmed"])
+
+    def test_tx_budget_final_sample_never_succeeds_after_cap(self):
+        result, waits, signals = self.budget_job([100, 1100], timeouts=0)
+        self.assertEqual(result["returncode"], 0)
+        self.assertTrue(result["budget_exceeded"])
+        self.assertEqual(result["error"], "budget_exceeded")
+        self.assertFalse(signals)
+        result, _, _ = self.budget_job([100, 90], timeouts=0)
+        self.assertEqual(result["error"], "tx_counter_regressed")
+
+    def test_tx_budget_retains_hard_deadline_and_unconfirmed_cleanup(self):
+        result, waits, signals = self.budget_job([100], timeouts=100)
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(waits[:-1], [1] * 50)
+        self.assertEqual(signals, [(424242, signal.SIGTERM)])
+        result, _, signals = self.budget_job([100, 1100], timeouts=100, unreapable=True)
+        self.assertFalse(result["cleanup_confirmed"])
+        self.assertTrue(result["budget_exceeded"])
+        self.assertEqual(signals, [(424242, signal.SIGTERM), (424242, signal.SIGKILL)])
+
+    def test_unconfirmed_startup_cleanup_retains_worker_and_local_ownership(self):
+        snapshot = {"interface": "test0", "network": {"tx_bytes": 100},
+                    "cpu_jiffies": None, "cgroup_cpu_stat": None}
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            for owner in ("worker", "local"):
+                for error_type in (RuntimeError, KeyboardInterrupt):
+                    root = Path(temporary) / f"{owner}-{error_type.__name__}"
+                    child = mock.Mock(pid=424242, stdout=io.BytesIO(), stderr=io.BytesIO(), returncode=None)
+                    child.poll.return_value = None
+                    child.wait.side_effect = subprocess.TimeoutExpired("synthetic child", 3)
+                    controller = mock.Mock()
+                    controller.done.is_set.return_value = True
+                    controller.report.return_value = {"status": "partial", "heights": [], "rate_duration_seconds": 3}
+                    with mock.patch("subprocess.Popen", return_value=child) as popen, \
+                            mock.patch("threading.Thread.start", side_effect=error_type("synthetic thread start failure")), \
+                            mock.patch("os.killpg") as kill, \
+                            mock.patch(__name__ + ".system_snapshot", return_value=snapshot), \
+                            mock.patch(__name__ + ".sha256", return_value="a" * 64), \
+                            mock.patch(__name__ + ".machine_metadata", return_value={"binary_sha256": "a" * 64}), \
+                            mock.patch(__name__ + ".Coordinator", return_value=controller):
+                        if owner == "worker":
+                            worker = Worker(Path(sys.executable), root, "test0")
+                            with self.assertRaises(KeyboardInterrupt if error_type is KeyboardInterrupt else ValueError):
+                                worker.start(fixture_config())
+                            self.assertEqual(len(worker.jobs), 1)
+                            retained = next(iter(worker.jobs.values()))
+                            self.assertIs(retained.child, child)
+                            self.assertFalse(retained.cleanup_confirmed())
+                            with self.assertRaisesRegex(ValueError, "unconfirmed child"):
+                                worker.start(fixture_config(run_id="different-0123456789"))
+                            worker.stop_all()
+                        else:
+                            args = build_parser().parse_args(["campaign", "--binary", sys.executable,
+                                "--roster", "unused", "--token-file", "unused", "--out", "unused",
+                                "--heights", "1", "--warmup", "0"])
+                            roster = {"peers": ["[::1]:20000"], "workers": [None],
+                                      "coordinator": "[::1]:21000", "interface": "test0"}
+                            result = run_trial(args, roster, "not-sent", Path(sys.executable),
+                                {"binary_sha256": "a" * 64}, root,
+                                {"headers": 32, "profile": "baseline", "repetition": 1}, time.monotonic() + 60)
+                            self.assertEqual(result["cleanup_unconfirmed_nodes"], [0])
+                            self.assertEqual(result["status"], "partial")
+                            self.assertEqual(result["interrupted"], error_type is KeyboardInterrupt)
+                            self.assertEqual(result["controller"]["rate_duration_seconds"], 3)
+                        popen.assert_called_once()
+                        self.assertTrue(all(call.args[0] == 424242 for call in kill.call_args_list))
+                        self.assertFalse(child.stdout.closed or child.stderr.closed)
+                        child.stdout.close()  # Fixture-only BytesIO objects; no reader owns them.
+                        child.stderr.close()
+
+    def test_unconfirmed_startup_does_not_close_live_buffered_reader(self):
+        entered, release = threading.Event(), threading.Event()
+
+        class BlockingRaw(io.RawIOBase):
+            def readable(self):
+                return True
+
+            def readinto(self, _buffer):
+                entered.set()
+                release.wait(2)  # Bounded even if this regression fails; no pipe/child/socket.
+                return 0
+
+        source = io.BufferedReader(BlockingRaw())
+        child = mock.Mock(stdout=source, stderr=io.BytesIO(), returncode=None)
+        child.poll.return_value = None
+        original_start, original_join = threading.Thread.start, threading.Thread.join
+        readers = []
+
+        def start(thread):
+            if readers:
+                raise RuntimeError("synthetic second-reader start failure")
+            readers.append(thread)
+            original_start(thread)
+            self.assertTrue(entered.wait(1))  # First capture holds BufferedReader's lock.
+
+        try:
+            with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary, \
+                    mock.patch("subprocess.Popen", return_value=child), \
+                    mock.patch(__name__ + ".machine_metadata", return_value={"binary_sha256": sha256(Path(sys.executable))}), \
+                    mock.patch("threading.Thread.start", new=start), \
+                    mock.patch("threading.Thread.join", new=lambda thread, timeout: original_join(thread, 0.01)), \
+                    mock.patch(__name__ + ".stop_child", side_effect=subprocess.TimeoutExpired("synthetic child", 3)):
+                job = NodeJob(Path(sys.executable), sha256(Path(sys.executable)),
+                              Path(temporary) / "job", fixture_config(), "lo")
+                self.assertTrue(job.done.is_set())
+                self.assertFalse(job.result["cleanup_confirmed"])
+                self.assertIs(job.child, child)
+                self.assertTrue(readers[0].is_alive())
+                self.assertFalse(source.closed)
+                release.set()
+                original_join(readers[0], 1)
+                self.assertFalse(readers[0].is_alive())
+                self.assertTrue(source.closed)  # Capture, not constructor cleanup, closed it.
+        finally:
+            release.set()
+            for thread in readers:
+                original_join(thread, 3)
+            source.close()
+            child.stderr.close()
 
     def test_post_popen_start_failure_stops_owned_child(self):
         binary = Path(__file__).resolve()
@@ -1939,7 +2513,7 @@ finally:
                               "Path(sys.argv[4]).write_text(json.dumps({'status':'complete'}))\n"
                               "print('x' * 300000)\n")
             binary.chmod(0o700)
-            worker = Worker(binary, root / "worker", "lo", 2)
+            worker = Worker(binary, root / "worker", "lo", 2, max_trial_tx_bytes=MAX_TX_BUDGET)
             with WorkerServer(("::1", 0), WorkerHandler) as server:
                 address = f"[::1]:{server.server_address[1]}"
                 server.worker, server.token = worker, token
@@ -1948,7 +2522,10 @@ finally:
                 try:
                     with self.assertRaises(ValueError):
                         worker_request(address, "0" * 64, "info")
-                    self.assertEqual(worker_request(address, token, "info")["binary_sha256"], sha256(binary))
+                    info = worker_request(address, token, "info")
+                    self.assertEqual(info["binary_sha256"], sha256(binary))
+                    self.assertEqual(info["max_trial_tx_bytes"], MAX_TX_BUDGET)
+                    self.assertEqual(info["interface"], "lo")
                     with self.assertRaises(ValueError):
                         worker_request(address, token, "start", fixture_config(binary="/bin/sh"))
                     config = fixture_config()
@@ -2134,7 +2711,7 @@ finally:
             def request(_address, _token, operation, value, **_kwargs):
                 self.assertEqual(value, {"run_id": identifier})
                 if operation == "status":
-                    return {"run_id": identifier, "done": True}
+                    return {"run_id": identifier, "done": True, "result": {"cleanup_confirmed": True}}
                 self.assertEqual(operation, "result")
                 return {"run_id": identifier, "files": {"report.json": raw}}
             with mock.patch(__name__ + ".worker_request", side_effect=request):
@@ -2359,6 +2936,11 @@ def build_parser():
     command.add_argument("--ready-timeout-secs", type=bounded_arg(1, 120), default=30)
     command.add_argument("--chatter-secs", type=bounded_arg(0, 30), default=0)
     command.add_argument("--lifetime-secs", type=bounded_arg(1, 7000), default=6600)
+    for subcommand in (worker, command):
+        subcommand.add_argument("--max-trial-tx-bytes", type=bounded_arg(0, MAX_TX_BUDGET), default=0,
+                                help="per-node whole-child VM TX threshold, bytes; 0 disables; sampled every second, can overshoot")
+    command.add_argument("--max-campaign-tx-bytes", type=bounded_arg(0, MAX_TX_BUDGET), default=0,
+                         help="summed whole-child VM TX threshold, bytes; 0 disables; checked after each trial, one-batch overshoot")
     return parser
 
 
