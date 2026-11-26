@@ -4608,10 +4608,10 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     if let _ = elem().decl(Decl {
                         colour: card_col,
                         radius: ui.scale(16.0).dup4(),
-                        padding: ui.scale(8.0).dup4(),
+                        padding: ui.scale(10.0).dup4(),
                         direction: TopToBottom,
                         align: TopLeft,
-                        child_gap: ui.scale(6.0),
+                        child_gap: ui.scale(2.0),
                         width: fixed!(if net_open { card_w } else { ui.scale(240.0) }),
                         height: fit!(),
                         ..Decl
@@ -4622,19 +4622,11 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                         *wallet::GUI_ENABLE_MINE.lock().unwrap() = actively_mining;
 
                         if let _ = elem().decl(Decl {
-                            colour: BUTTON_GREY.mul(0.70),
-                            width: grow!(),
-                            height: fixed!(ui.scale(1.0)),
-                            ..Decl
-                        }) {}
-
-                        if let _ = elem().decl(Decl {
-                            padding: (0.0, 0.0, ui.scale(2.0), ui.scale(2.0)),
                             child_gap: ui.scale(8.0),
                             direction: LeftToRight,
                             align: Left,
                             width: grow!(),
-                            height: fit!(),
+                            height: fixed!(ui.scale(36.0)),
                             ..Decl
                         }) {
                             ui.nav_skip = true; // @Hack.
@@ -4672,13 +4664,6 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                         }
 
                         if let _ = elem().decl(Decl {
-                            colour: BUTTON_GREY.mul(0.70),
-                            width: grow!(),
-                            height: fixed!(ui.scale(1.0)),
-                            ..Decl
-                        }) {}
-
-                        if let _ = elem().decl(Decl {
                             id: combo_id,
                             colour,
                             radius: ui.scale(18.0).dup4(),
@@ -4687,7 +4672,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             direction: LeftToRight,
                             align: Left,
                             width: grow!(),
-                            height: fit!(),
+                            height: fixed!(ui.scale(36.0)),
                             ..Decl
                         }) {
                             ui.text("Network Info", TextDecl { h: ui.scale(TEXT_BODY), colour: WHITE.mul(0.75), align: AlignX::Left, ..TextDecl });
