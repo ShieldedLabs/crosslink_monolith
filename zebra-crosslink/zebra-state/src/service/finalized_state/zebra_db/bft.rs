@@ -39,6 +39,24 @@ pub const TENDERLINK_WAL_HEIGHTS_KEPT: u32 = 64;
 /// The type for reading this node's tenderlink WAL records.
 pub type TenderlinkWalByHeightCf<'cf> = TypedColumnFamily<'cf, BftHeight, TenderlinkWalRecord>;
 
+/// One local signer image, outside the entire four-byte BFT-height key space.
+/// This is private finalizer state, not a change to any ledger or decided-block encoding.
+/// All legacy-height scans must remain bounded by `BftHeight(u32::MAX)`.
+#[derive(Debug)]
+struct D28BlockKey;
+
+impl crate::service::finalized_state::disk_format::IntoDisk for D28BlockKey {
+    type Bytes = [u8; 8];
+    fn as_bytes(&self) -> Self::Bytes { [0xff; 8] }
+}
+
+impl crate::service::finalized_state::disk_format::FromDisk for D28BlockKey {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        assert_eq!(bytes.as_ref(), &[0xff; 8], "D28 block key is eight FF bytes");
+        Self
+    }
+}
+
 pub type BftConflictingCertificatesCf<'cf> = TypedColumnFamily<'cf, BftConflictKey, StoredFatPointer>;
 
 /// The type for reading decided BFT blocks from the database.
@@ -112,13 +130,40 @@ impl ZebraDb {
             .collect()
     }
 
-    /// This node's tenderlink WAL records from BFT height `from` up, ascending.
+    /// This node's legacy tenderlink WAL records from BFT height `from` up, ascending.
+    /// The explicit upper bound excludes D28's separate local signer-image key.
     pub fn tenderlink_wal(&self, from: u32) -> Vec<(u32, Vec<u8>)> {
-        self.tenderlink_wal_by_height_cf()
-            .zs_items_in_range_ordered(BftHeight(from)..)
+        let cf = self.tenderlink_wal_by_height_cf();
+        // Read the last key separately: an inclusive all-FF upper bound would wrap
+        // in the generic fixed-width range iterator's upper-bound conversion.
+        let mut records: Vec<_> = cf
+            .zs_items_in_range_ordered(BftHeight(from)..BftHeight(u32::MAX))
             .into_iter()
             .map(|(height, record)| (height.0, record.0))
-            .collect()
+            .collect();
+        if let Some(record) = cf.zs_get(&BftHeight(u32::MAX)) {
+            records.push((u32::MAX, record.0));
+        }
+        records
+    }
+
+    /// Read D28's opaque local signer image. The adapter validates its fixed length and identity.
+    pub fn d28_atomic_block(&self) -> Option<Vec<u8>> {
+        TypedColumnFamily::<D28BlockKey, TenderlinkWalRecord>::new(&self.db, TENDERLINK_WAL_BY_HEIGHT)
+            .expect("column family was created when database was created")
+            .zs_get(&D28BlockKey)
+            .map(|record| record.0)
+    }
+
+    /// Atomically replace D28's local signer image and sync it before acknowledging success.
+    /// Unlike the legacy height WAL writer, this never prunes height records.
+    pub fn write_d28_atomic_block(&self, image: Vec<u8>) -> Result<(), rocksdb::Error> {
+        let mut batch = DiskWriteBatch::new();
+        let _ = TypedColumnFamily::<D28BlockKey, TenderlinkWalRecord>::new(&self.db, TENDERLINK_WAL_BY_HEIGHT)
+            .expect("column family was created when database was created")
+            .with_batch_for_writing(&mut batch)
+            .zs_insert(&D28BlockKey, &TenderlinkWalRecord(image));
+        self.db.write_synced(batch)
     }
 
     /// Store this node's tenderlink WAL record for `height`, replacing the one stored before, and
@@ -127,9 +172,8 @@ impl ZebraDb {
     pub fn write_tenderlink_wal(&self, height: u32, record: Vec<u8>) -> Result<(), rocksdb::Error> {
         let keep_from = BftHeight(height.saturating_sub(TENDERLINK_WAL_HEIGHTS_KEPT));
         let cf = self.tenderlink_wal_by_height_cf();
-        // Only when there is a row to drop: a range delete leaves a tombstone, and one per vote
-        // would pile up faster than compaction clears them.
-        let has_old_rows = cf.zs_first_key_value().is_some_and(|(first, _)| first < keep_from);
+        // Bound this scan too: when the D28 image is the only row, it is not a BftHeight.
+        let has_old_rows = cf.zs_forward_range_iter(BftHeight(0)..keep_from).next().is_some();
         let mut batch = DiskWriteBatch::new();
         // zs_insert and zs_delete_range write into the batch and return it; it is committed below.
         let writer = cf.with_batch_for_writing(&mut batch).zs_insert(&BftHeight(height), &TenderlinkWalRecord(record));
@@ -268,6 +312,33 @@ mod tests {
 
     use super::TENDERLINK_WAL_HEIGHTS_KEPT;
     use crate::{service::finalized_state::FinalizedState, Config};
+
+    #[test]
+    fn d28_atomic_block_is_separate_from_all_legacy_wal_heights() {
+        let _init_guard = zebra_test::init();
+        let state = FinalizedState::new(
+            &Config::ephemeral(),
+            &Network::Mainnet,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        ).expect("an ephemeral database opens");
+        let db = &state.db;
+        assert_eq!(db.d28_atomic_block(), None);
+        let first = vec![0xa5; 4096];
+        db.write_d28_atomic_block(first.clone()).unwrap();
+        assert!(db.tenderlink_wal(0).is_empty());
+        // A D28-only database must also be safe to inspect/write through the legacy API.
+        db.write_tenderlink_wal(0, vec![1]).unwrap();
+        assert_eq!(db.tenderlink_wal(0), vec![(0, vec![1])]);
+        assert_eq!(db.d28_atomic_block(), Some(first.clone()));
+        db.write_tenderlink_wal(u32::MAX, vec![2]).unwrap();
+        assert_eq!(db.tenderlink_wal(u32::MAX), vec![(u32::MAX, vec![2])]);
+        assert_eq!(db.d28_atomic_block(), Some(first));
+        let second = vec![0x5a; 4096];
+        db.write_d28_atomic_block(second.clone()).unwrap();
+        assert_eq!(db.clone().d28_atomic_block(), Some(second));
+        assert_eq!(db.tenderlink_wal(0), vec![(u32::MAX, vec![2])]);
+    }
 
     /// Tenderlink's WAL records read back as last written, from any height up, and a record is
     /// dropped only once one is written more than `TENDERLINK_WAL_HEIGHTS_KEPT` heights above it.
