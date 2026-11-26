@@ -5,7 +5,9 @@ impl<S: Storage> Engine<S> {
     /// record is irrelevant; a malformed *published* record fails closed.
     pub(super) fn validate_descriptor(&self) -> Result<()> {
         let d = self.d();
-        if d.locked_round.is_some() != d.locked_id.is_some()
+        if self.c().check_round(d.round).is_err()
+            || d.locked_id.is_some_and(|id| !self.c().valid_id(id))
+            || d.locked_round.is_some() != d.locked_id.is_some()
             || d.locked_round.is_some_and(|r| r > d.round)
             || d.valid_round.is_some_and(|r| r > d.round)
             || d.locked_round
@@ -34,6 +36,7 @@ impl<S: Storage> Engine<S> {
                     || v.round != d.round
                     || v.kind.index() != index
                     || (index == 0 && v.id.is_some())
+                    || v.id.is_some_and(|id| !self.c().valid_id(id))
                 {
                     return Err(Error::Corrupt);
                 }
@@ -68,12 +71,13 @@ impl<S: Storage> Engine<S> {
                 || p.signer as usize != self.me
                 || self.me != self.c().proposer(d.height, d.round)
                 || p.valid_round.is_some_and(|r| r >= p.round)
+                || !self.c().valid_id(p.id)
             {
                 return Err(Error::Corrupt);
             }
             if !d.proposal_published
                 && (self.store.body(i.slot).len() > self.c().max_body
-                    || body_id(self.store.body(i.slot)) != p.id)
+                    || self.c().body_id(self.store.body(i.slot)) != p.id)
             {
                 return Err(Error::Corrupt);
             }

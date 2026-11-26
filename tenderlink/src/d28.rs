@@ -76,6 +76,7 @@ pub struct Config {
     rho: u64,
     timeouts: Timeouts,
     hash: Id,
+    crosslink: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -95,6 +96,30 @@ impl Config {
         max_body: usize,
         rho: u64,
         timeouts: Timeouts,
+    ) -> Result<Self> {
+        Self::build(domain, members, max_body, rho, timeouts, false)
+    }
+    /// Use the existing chain's keyed block IDs and PV/PC signing contract.
+    ///
+    /// The host must derive the roster in active-chain order, weights and namespace
+    /// from its agreed chain state at this height. Votes cannot bind the full config;
+    /// ENTER and proposal headers still do. Proposers use D28 rotation.
+    pub fn crosslink(
+        namespace: Id,
+        members: Vec<Member>,
+        max_body: usize,
+        rho: u64,
+        timeouts: Timeouts,
+    ) -> Result<Self> {
+        Self::build(namespace, members, max_body, rho, timeouts, true)
+    }
+    fn build(
+        domain: Id,
+        members: Vec<Member>,
+        max_body: usize,
+        rho: u64,
+        timeouts: Timeouts,
+        crosslink: bool,
     ) -> Result<Self> {
         if members.is_empty()
             || members.len() > u32::MAX as usize
@@ -118,7 +143,11 @@ impl Config {
         }
         total.checked_mul(3).ok_or(Error::Config)?;
         let mut h = blake3::Hasher::new();
-        h.update(b"tenderlink/D28/config/v1");
+        h.update(if crosslink {
+            b"tenderlink/D28/crosslink/config/v1"
+        } else {
+            b"tenderlink/D28/config/v1"
+        });
         h.update(&domain);
         for m in &members {
             h.update(&m.public_key);
@@ -144,10 +173,34 @@ impl Config {
             rho,
             timeouts,
             hash: *h.finalize().as_bytes(),
+            crosslink,
         })
     }
     pub fn domain(&self) -> Id {
         self.domain
+    }
+    pub fn is_crosslink(&self) -> bool {
+        self.crosslink
+    }
+    /// Hash canonical block bytes in chain mode, or opaque native D28 bytes.
+    pub fn body_id(&self, body: &[u8]) -> Id {
+        if self.crosslink {
+            zcash_primitives::bft::HashKeys::default()
+                .value_id
+                .hash(body)
+        } else {
+            body_id(body)
+        }
+    }
+    fn check_round(&self, round: Round) -> Result<()> {
+        if self.crosslink && round > chain::MAX_ROUND {
+            Err(Error::Exhausted)
+        } else {
+            Ok(())
+        }
+    }
+    fn valid_id(&self, id: Id) -> bool {
+        !self.crosslink || id != [0; 32]
     }
     pub fn max_body(&self) -> usize {
         self.max_body
@@ -221,16 +274,56 @@ fn vote_bytes(c: &Config, v: VoteContent) -> [u8; 133] {
     b
 }
 impl Vote {
+    /// Convenience for trusted callers; use `try_sign` for fallible input.
     pub fn sign(config: &Config, key: &SigningKey, content: VoteContent) -> Self {
-        Self {
+        Self::try_sign(config, key, content).expect("valid D28 vote signing input")
+    }
+    pub fn try_sign(config: &Config, key: &SigningKey, content: VoteContent) -> Result<Self> {
+        if config.crosslink {
+            config.check_round(content.round)?;
+            if content.id.is_some_and(|id| !config.valid_id(id))
+                || (content.kind == VoteKind::Enter && content.id.is_some())
+                || config.members.get(content.signer as usize).is_none_or(|m| {
+                    m.public_key != <[u8; 32]>::from(VerificationKeyBytes::from(key))
+                })
+            {
+                return Err(Error::Invalid);
+            }
+            if content.kind != VoteKind::Enter {
+                return Ok(Self {
+                    content,
+                    signature: crate::sign_with_namespace(
+                        key,
+                        &chain::vote_bytes(config, content)?,
+                        &config.domain,
+                    ),
+                });
+            }
+        }
+        Ok(Self {
             content,
             signature: key.sign(&vote_bytes(config, content)).into(),
-        }
+        })
     }
     pub fn verify(&self, c: &Config) -> bool {
         let v = self.content;
-        if v.kind == VoteKind::Enter && v.id.is_some() {
+        if (v.kind == VoteKind::Enter && v.id.is_some())
+            || c.check_round(v.round).is_err()
+            || v.id.is_some_and(|id| !c.valid_id(id))
+        {
             return false;
+        }
+        if c.crosslink && v.kind != VoteKind::Enter {
+            let Ok(bytes) = chain::vote_bytes(c, v) else {
+                return false;
+            };
+            return zcash_primitives::bft::TMSig(self.signature)
+                .verify_with_namespace(
+                    zcash_primitives::bft::PubKeyID(c.members[v.signer as usize].public_key),
+                    &bytes,
+                    &c.domain,
+                )
+                .is_ok();
         }
         c.members
             .get(v.signer as usize)
@@ -275,15 +368,28 @@ impl Header {
         h.update(&p.signer.to_le_bytes());
         *h.finalize().as_bytes()
     }
+    /// Convenience for trusted callers; use `try_sign` for fallible input.
     pub fn sign(c: &Config, k: &SigningKey, content: ProposalContent) -> Self {
-        Self {
+        Self::try_sign(c, k, content).expect("valid D28 header signing input")
+    }
+    pub fn try_sign(c: &Config, k: &SigningKey, content: ProposalContent) -> Result<Self> {
+        c.check_round(content.round)?;
+        if let Some(round) = content.valid_round {
+            c.check_round(round)?;
+        }
+        if !c.valid_id(content.id) {
+            return Err(Error::Invalid);
+        }
+        Ok(Self {
             content,
             signature: k.sign(&Self::message(c, content)).into(),
-        }
+        })
     }
     pub fn verify(&self, c: &Config) -> bool {
         let p = self.content;
-        (p.valid_round.is_none_or(|r| r < p.round))
+        c.check_round(p.round).is_ok()
+            && c.valid_id(p.id)
+            && p.valid_round.is_none_or(|r| r < p.round)
             && p.signer as usize == c.proposer(p.height, p.round)
             && c.members
                 .get(p.signer as usize)
@@ -474,6 +580,7 @@ pub struct RegionHeader {
 #[derive(Clone, Copy, Debug)]
 pub struct ConfigMeta {
     pub domain: Id,
+    pub crosslink: bool,
     pub total: u64,
     pub count: usize,
     pub max_body: usize,
@@ -510,6 +617,7 @@ pub trait Storage {
             bank,
             ConfigMeta {
                 domain: c.domain,
+                crosslink: c.crosslink,
                 total: c.total,
                 count: c.members.len(),
                 max_body: c.max_body,
@@ -599,6 +707,7 @@ impl Storage for MemoryStore {
         self.sealed[i] = false;
         self.configs[i] = Some(Config {
             domain: m.domain,
+            crosslink: m.crosslink,
             members: vec![
                 Member {
                     public_key: [0; 32],
@@ -622,7 +731,14 @@ impl Storage for MemoryStore {
     fn seal_config_bank(&mut self, i: usize, h: Id) -> Result<()> {
         self.write()?;
         let c = self.configs[i].as_mut().ok_or(Error::Corrupt)?;
-        let rebuilt = Config::new(c.domain, c.members.clone(), c.max_body, c.rho, c.timeouts)?;
+        let rebuilt = Config::build(
+            c.domain,
+            c.members.clone(),
+            c.max_body,
+            c.rho,
+            c.timeouts,
+            c.crosslink,
+        )?;
         if rebuilt.hash != h || rebuilt.total != c.total {
             return Err(Error::Corrupt);
         }
@@ -1029,7 +1145,7 @@ impl<S: Storage> Engine<S> {
             Some(v) if v.content == intent => *v,
             Some(_) => return Err(Error::Corrupt),
             None => {
-                let v = Vote::sign(self.c(), &self.key, intent);
+                let v = Vote::try_sign(self.c(), &self.key, intent)?;
                 self.store.write_own(k, v)?;
                 v
             }
@@ -1233,6 +1349,7 @@ impl<S: Storage> Engine<S> {
         height_start: bool,
         sink: &mut impl Sink,
     ) -> Result<()> {
+        self.c().check_round(round)?;
         let mut d = self.d().clone();
         d.round = round;
         d.step = Step::Propose;
@@ -1338,7 +1455,7 @@ impl<S: Storage> Engine<S> {
             )
         } else {
             self.store.write_body(slot, body)?;
-            (body_id(body), None)
+            (self.c().body_id(body), None)
         };
         let content = ProposalContent {
             height: tag.height,
@@ -1372,7 +1489,7 @@ impl<S: Storage> Engine<S> {
         }) {
             return Ok(());
         }
-        if body_id(self.store.body(intent.slot)) != content.id {
+        if self.c().body_id(self.store.body(intent.slot)) != content.id {
             return Err(Error::Corrupt);
         }
         let header = match self.store.own_header() {
@@ -1381,7 +1498,7 @@ impl<S: Storage> Engine<S> {
                 return Err(Error::Corrupt);
             }
             _ => {
-                let h = Header::sign(self.c(), &self.key, content);
+                let h = Header::try_sign(self.c(), &self.key, content)?;
                 self.store.write_own_header(h)?;
                 h
             }
@@ -1464,6 +1581,7 @@ fn hash_vote(h: &mut blake3::Hasher, v: &Vote) {
 }
 
 pub mod atomic;
+pub mod chain;
 pub mod gossip;
 pub use atomic::AtomicBlockStore;
 mod core;
