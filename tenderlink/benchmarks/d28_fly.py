@@ -59,7 +59,8 @@ MAX_LOG = 256 * 1024
 MAX_LINE = 4096
 PROFILES = {"baseline": {"poll_ms": 25, "status_ms": 100, "receive_budget": 32, "max_requests": 2},
             "fast": {"poll_ms": 5, "status_ms": 25, "receive_budget": 128, "max_requests": 2},
-            "fast_k1": {"poll_ms": 5, "status_ms": 25, "receive_budget": 128, "max_requests": 1}}
+            "fast_k1": {"poll_ms": 5, "status_ms": 25, "receive_budget": 128, "max_requests": 1},
+            "economy": {"poll_ms": 100, "status_ms": 100, "receive_budget": 32, "max_requests": 2}}
 RUN_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{15,95}\Z")
 NOTES = [
     "One chain: body/payload bytes are counted once per all-online ACKed height, not once per validator.",
@@ -156,7 +157,7 @@ def validate_config(config):
               "headers": (0, 2048), "solution_bytes": (0, 1344), "heights": (1, 200),
               "warmup": (0, 20), "timeout_secs": (1, 1800), "workers": (1, 1),
               "max_body": (MAX_BODY, MAX_BODY), "chatter_secs": (0, 30),
-              "poll_ms": (5, 25), "status_ms": (25, 100), "receive_budget": (32, 128),
+              "poll_ms": (5, 100), "status_ms": (25, 100), "receive_budget": (32, 128),
               "max_requests": (1, 2), "max_outgoing": (2, 2)}
     required = set(bounds) - {"solution_bytes"}
     if set(config) - (set(bounds) | {"peers", "coordinator", "run_id"}) or not required <= set(config):
@@ -168,7 +169,7 @@ def validate_config(config):
     if 3 * (config["nodes"] - config["offline"]) <= 2 * config["nodes"]:
         raise ValueError("online nodes must retain >2/3 quorum")
     if {key: config[key] for key in PROFILES["baseline"]} not in PROFILES.values():
-        raise ValueError("only baseline, fast or fast_k1 host-service profile allowed")
+        raise ValueError("host-service profile must be one of: " + ", ".join(PROFILES))
     peers = config.get("peers")
     if not isinstance(peers, list) or len(peers) != config["nodes"]:
         raise ValueError("peers must be the full ordered roster")
@@ -1886,7 +1887,7 @@ class RealTests(unittest.TestCase):
                 args = build_parser().parse_args(["campaign", "--binary", str(self.binary),
                     "--roster", str(root / "roster.json"), "--token-file", str(token_file),
                     "--out", str(root / "smoke"), "--headers", "32", "--repetitions", "1",
-                    "--profiles", "baseline,fast_k1",
+                    "--profiles", "baseline,fast_k1,economy",
                     "--heights", "3", "--warmup", "1", "--timeout-secs", "30"])
                 result = campaign(args)
                 details = {str(path.relative_to(root)): optional_text(path) for pattern in
@@ -1894,7 +1895,7 @@ class RealTests(unittest.TestCase):
                            for path in (root / "smoke").glob(pattern)}
                 self.assertEqual(result, 0, details)
                 summaries = read_json(root / "smoke" / "summary.json")["cases"]
-                self.assertEqual([row["profile"] for row in summaries], ["baseline", "fast_k1"])
+                self.assertEqual([row["profile"] for row in summaries], ["baseline", "economy", "fast_k1"])
                 for summary in summaries:
                     with self.subTest(profile=summary["profile"]):
                         self.assertEqual(summary["completed_heights"], 3)
@@ -1940,7 +1941,7 @@ def comma_arg(parse):
 
 def profile_arg(text):
     if text not in PROFILES:
-        raise ValueError("profile must be baseline, fast or fast_k1")
+        raise ValueError("profile must be one of: " + ", ".join(PROFILES))
     return text
 
 
@@ -1970,7 +1971,7 @@ def build_parser():
     command.add_argument("--solution-bytes", type=bounded_arg(0, 1344), default=0,
                          help="applies to all sizes; near-cap arm: --headers 2048 --solution-bytes 320")
     command.add_argument("--profiles", type=comma_arg(profile_arg), default=["baseline"],
-                         help="comma-separated baseline,fast,fast_k1; K1 limits requests to 1; never changes protocol timers")
+                         help="comma-separated baseline,fast,fast_k1,economy; economy polls at 100ms; never changes protocol timers")
     command.add_argument("--repetitions", type=bounded_arg(1, 32), default=3)
     command.add_argument("--seed", type=bounded_arg(0, 2**32 - 1), default=428)
     command.add_argument("--heights", type=bounded_arg(1, 200), default=12)
