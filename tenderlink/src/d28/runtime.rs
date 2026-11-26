@@ -37,7 +37,10 @@ use std::{
     future::{Future, poll_fn},
     io,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -65,6 +68,182 @@ fn canonical_body(bytes: &[u8], height: u64, max_body: usize) -> bool {
 
 type Work<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
+/// Cumulative application messages and their encoded bytes, not UDP datagrams.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MessageCounts {
+    pub messages: u64,
+    pub bytes: u64,
+}
+impl MessageCounts {
+    fn record(&mut self, bytes: usize) {
+        self.messages = self.messages.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+    }
+}
+
+/// Messages offered to the transport, counted once per logical recipient.
+/// These are application bytes before transport admission, framing, encryption,
+/// fragmentation or retransmission. They do not measure delivery or UDP traffic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OfferedMetrics {
+    pub hello: MessageCounts,
+    pub status: MessageCounts,
+    /// An ordinary frame containing only an outer vote, with no proposal/groups.
+    pub bare_votes: MessageCounts,
+    /// Every other frame, including proposals, certificate groups and decisions.
+    pub evidence: MessageCounts,
+    /// Subset of `status.messages` whose status contains a request token.
+    pub status_request_messages: u64,
+}
+
+/// A cheap, nontransactional view of optional runtime counters.
+///
+/// All counters saturate at `u64::MAX`, never wrap or reset. Each field is read
+/// independently with relaxed ordering, so cross-field equalities need not hold
+/// while a runtime is updating them. Sharing one metrics object aggregates all
+/// runtimes using it; use a fresh object for a new measurement interval.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub offered: OfferedMetrics,
+    /// Raw BFT application inbox returned by transport service, before runtime
+    /// admission. Transport-internal drops and UDP overhead are not included.
+    pub received: MessageCounts,
+    /// Messages whose hello/status/frame handler completed normally. Includes
+    /// duplicate/no-op frames and votes the core ignores; NOT a count of useful
+    /// messages, valid individual signatures, decisions or accepted proposals.
+    pub processed: MessageCounts,
+    /// Runtime-filtered messages (including unknown peers, inactive host scope,
+    /// malformed input and stale status) or frames returning a core error.
+    pub rejected: MessageCounts,
+    /// Known-peer messages left after the per-tick scheduler processing budget.
+    /// These are dropped without decoding, separately from transport drops.
+    pub scheduler_budget_discarded: MessageCounts,
+}
+
+/// Opt-in observational counters. No timers, signatures or codec work are added.
+///
+/// Outgoing counts are recorded immediately before `ConsumerHandle::service`,
+/// even if that call fails. Incoming counts are recorded when service returns;
+/// outcomes are recorded when the runtime consumes that inbox. Thus a snapshot
+/// (including after cancellation/fatal failure) can contain received messages
+/// still awaiting an outcome. On successful receive completion, each consumed
+/// message has exactly one outcome, until counter saturation.
+#[derive(Debug, Default)]
+pub struct RuntimeMetrics {
+    hello: AtomicMessageCounts,
+    status: AtomicMessageCounts,
+    bare_votes: AtomicMessageCounts,
+    evidence: AtomicMessageCounts,
+    status_request_messages: AtomicU64,
+    received: AtomicMessageCounts,
+    processed: AtomicMessageCounts,
+    rejected: AtomicMessageCounts,
+    scheduler_budget_discarded: AtomicMessageCounts,
+}
+impl RuntimeMetrics {
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            offered: OfferedMetrics {
+                hello: self.hello.snapshot(),
+                status: self.status.snapshot(),
+                bare_votes: self.bare_votes.snapshot(),
+                evidence: self.evidence.snapshot(),
+                status_request_messages: self.status_request_messages.load(Ordering::Relaxed),
+            },
+            received: self.received.snapshot(),
+            processed: self.processed.snapshot(),
+            rejected: self.rejected.snapshot(),
+            scheduler_budget_discarded: self.scheduler_budget_discarded.snapshot(),
+        }
+    }
+    fn offer(&self, counts: OfferedMetrics) {
+        self.hello.add(counts.hello);
+        self.status.add(counts.status);
+        self.bare_votes.add(counts.bare_votes);
+        self.evidence.add(counts.evidence);
+        saturating_add(
+            &self.status_request_messages,
+            counts.status_request_messages,
+        );
+    }
+}
+
+#[derive(Debug, Default)]
+struct AtomicMessageCounts {
+    messages: AtomicU64,
+    bytes: AtomicU64,
+}
+impl AtomicMessageCounts {
+    fn add(&self, counts: MessageCounts) {
+        saturating_add(&self.messages, counts.messages);
+        saturating_add(&self.bytes, counts.bytes);
+    }
+    fn record(&self, bytes: usize) {
+        self.add(MessageCounts {
+            messages: 1,
+            bytes: bytes as u64,
+        });
+    }
+    fn snapshot(&self) -> MessageCounts {
+        MessageCounts {
+            messages: self.messages.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+fn saturating_add(counter: &AtomicU64, amount: u64) {
+    if amount != 0 {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            Some(old.saturating_add(amount))
+        });
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameClass {
+    BareVote,
+    Evidence,
+}
+impl FrameClass {
+    fn of(frame: Frame<'_>) -> Self {
+        if frame.message == Message::Ordinary
+            && frame.outer.is_some()
+            && frame.proposal.is_none()
+            && frame.groups.is_empty()
+        {
+            Self::BareVote
+        } else {
+            Self::Evidence
+        }
+    }
+    fn record(self, counts: &mut OfferedMetrics, bytes: usize) {
+        match self {
+            Self::BareVote => counts.bare_votes.record(bytes),
+            Self::Evidence => counts.evidence.record(bytes),
+        }
+    }
+}
+
+// A selected message has one outcome even on an early continue/error. This
+// observes the existing handler result without repeating admission or decoding.
+struct ReceiveOutcome<'a> {
+    metrics: Option<&'a RuntimeMetrics>,
+    bytes: usize,
+    processed: bool,
+}
+impl Drop for ReceiveOutcome<'_> {
+    fn drop(&mut self) {
+        if let Some(metrics) = self.metrics {
+            if self.processed {
+                &metrics.processed
+            } else {
+                &metrics.rejected
+            }
+            .record(self.bytes);
+        }
+    }
+}
+
 /// All time values used by D28 and its request scheduler are milliseconds.
 /// Consensus rho/timeouts must be identical on every node in the configuration.
 pub struct RuntimeConfig {
@@ -91,6 +270,8 @@ pub struct RuntimeConfig {
     /// Upper bound on authenticated message processing (including signature
     /// checks) per tick. Sources and control/body classes get round-robin turns.
     pub max_receive_per_tick: usize,
+    /// Optional shared cumulative application counters; disabled by default.
+    pub metrics: Option<Arc<RuntimeMetrics>>,
 }
 impl RuntimeConfig {
     pub fn new(
@@ -128,6 +309,7 @@ impl RuntimeConfig {
             max_outgoing: 2,
             max_incoming: 1,
             max_receive_per_tick: 32,
+            metrics: None,
         }
     }
     fn limits(&self) -> wire::Limits {
@@ -524,6 +706,7 @@ struct Outgoing {
     key: RequestKey,
     bytes: Vec<u8>,
     permit: Permit,
+    class: FrameClass,
 }
 struct Replies<'a> {
     peers: &'a [Peer],
@@ -553,7 +736,12 @@ impl ReplySink for Replies<'_> {
         }
         match wire::encode_frame(frame, Some(key.sequence), self.limits) {
             Ok(bytes) => {
-                self.outgoing.push(Outgoing { key, bytes, permit });
+                self.outgoing.push(Outgoing {
+                    key,
+                    bytes,
+                    permit,
+                    class: FrameClass::of(frame),
+                });
                 Ok(())
             }
             Err(error) => {
@@ -710,6 +898,14 @@ impl Network {
         }
         Ok(())
     }
+    fn discard_inactive_inbox(&mut self, config: &RuntimeConfig) {
+        if let Some(metrics) = &config.metrics {
+            for (_, bytes) in &self.pull.received_unreliable_messages {
+                metrics.rejected.record(bytes.len());
+            }
+        }
+        self.pull.received_unreliable_messages.clear();
+    }
     fn receive<S: Storage>(
         &mut self,
         engine: &mut Engine<S>,
@@ -736,6 +932,9 @@ impl Network {
                 .iter()
                 .position(|p| p.address.connection_key() == connection)
             else {
+                if let Some(metrics) = &config.metrics {
+                    metrics.rejected.record(bytes.len());
+                }
                 continue;
             };
             let bulk = bytes.first() == Some(&wire::FRAME_TAG) && bytes.len() > 160;
@@ -758,6 +957,11 @@ impl Network {
             };
             self.peers[index].next_control = class != 0;
             let bytes = inbox[index][class].pop_front().expect("nonempty source");
+            let mut outcome = ReceiveOutcome {
+                metrics: config.metrics.as_deref(),
+                bytes: bytes.len(),
+                processed: false,
+            };
             if bytes.first() == Some(&wire::HELLO_TAG) {
                 if let Some(public) = verify_hello(&bytes, &self.peers[index].handshake, local) {
                     if let Some(member) = engine
@@ -782,6 +986,7 @@ impl Network {
                         }
                         peer.public = Some(public);
                         peer.member = Some(member as u32);
+                        outcome.processed = true;
                     }
                 }
                 continue;
@@ -821,6 +1026,7 @@ impl Network {
                         },
                         now,
                     );
+                    outcome.processed = true;
                 }
                 Some(tag) if *tag == wire::FRAME_TAG => {
                     let Some(_permit) = self.incoming.try_acquire() else {
@@ -840,7 +1046,9 @@ impl Network {
                             return Ok(());
                         }
                         record_conflicts(engine, frame, &mut self.conflicts, config.max_members);
-                        tolerate_stale(engine.receive(frame, Status::Indeterminate, events))
+                        let result = engine.receive(frame, Status::Indeterminate, events);
+                        outcome.processed = result.is_ok();
+                        tolerate_stale(result)
                     })?;
                 }
                 _ => {}
@@ -850,6 +1058,11 @@ impl Network {
         // second unbounded backlog; guided requests/status and hello retry them.
         // The source/class cursor survives this drop so saturation cannot keep
         // choosing the first peer or control class forever.
+        if let Some(metrics) = &config.metrics {
+            for bytes in inbox.iter().flat_map(|queues| queues.iter().flatten()) {
+                metrics.scheduler_budget_discarded.record(bytes.len());
+            }
+        }
         Ok(())
     }
     fn exchange<S: Storage>(
@@ -860,6 +1073,8 @@ impl Network {
         events: &mut Events,
         now: u64,
     ) -> io::Result<()> {
+        // Accumulate locally so a pre-handoff error never records an offer.
+        let mut offered = config.metrics.as_ref().map(|_| OfferedMetrics::default());
         let mut push = NetworkThreadPush {
             // Never omit a base-protocol connection merely because the bounded
             // BFT peer table did not admit it: omission is a shared-session kill.
@@ -888,10 +1103,12 @@ impl Network {
                 .last_hello
                 .is_none_or(|old| now.saturating_sub(old) >= 1_000)
             {
-                push.send_unreliable.push((
-                    peer.address.connection_key(),
-                    hello_packet(key, &peer.handshake),
-                ));
+                let bytes = hello_packet(key, &peer.handshake);
+                if let Some(counts) = &mut offered {
+                    counts.hello.record(bytes.len());
+                }
+                push.send_unreliable
+                    .push((peer.address.connection_key(), bytes));
                 peer.last_hello = Some(now);
             }
         }
@@ -905,12 +1122,19 @@ impl Network {
                         .map_err(core_error)?;
                     for peer in &self.peers {
                         if let Some(member) = peer.member {
+                            let request = self.receiver.request_for(member);
                             let bytes = wire::encode_status(wire::WireStatus {
                                 sequence: self.sequence,
-                                request: self.receiver.request_for(member),
+                                request,
                                 snapshot,
                             })
                             .map_err(core_error)?;
+                            if let Some(counts) = &mut offered {
+                                counts.status.record(bytes.len());
+                                counts.status_request_messages = counts
+                                    .status_request_messages
+                                    .saturating_add(u64::from(request.is_some()));
+                            }
                             push.send_unreliable
                                 .push((peer.address.connection_key(), bytes));
                         }
@@ -939,6 +1163,9 @@ impl Network {
                 )
                 .map_err(core_error)?;
                 for peer in self.peers.iter().filter(|p| p.member.is_some()) {
+                    if let Some(counts) = &mut offered {
+                        counts.bare_votes.record(bytes.len());
+                    }
                     push.send_unreliable
                         .push((peer.address.connection_key(), bytes.clone()));
                 }
@@ -958,15 +1185,27 @@ impl Network {
             }
         }
         let mut handoff_permits = Vec::with_capacity(self.outgoing.len());
-        for Outgoing { key, bytes, permit } in self.outgoing.drain(..) {
+        for Outgoing {
+            key,
+            bytes,
+            permit,
+            class,
+        } in self.outgoing.drain(..)
+        {
             if let Some(peer) = self
                 .peers
                 .iter()
                 .find(|p| p.member == Some(key.peer) && p.generation == key.generation)
             {
+                if let Some(counts) = &mut offered {
+                    class.record(counts, bytes.len());
+                }
                 push.send_bulk.push((peer.address.connection_key(), bytes));
                 handoff_permits.push(permit);
             }
+        }
+        if let (Some(metrics), Some(counts)) = (&config.metrics, offered) {
+            metrics.offer(counts);
         }
         self.pull = self
             .handle
@@ -975,6 +1214,11 @@ impl Network {
         // App buffers were MOVED, not cloned, into the separately bounded
         // transport owner. Keep permits through the handoff, not a fake ACK.
         drop(handoff_permits);
+        if let Some(metrics) = &config.metrics {
+            for (_, bytes) in &self.pull.received_unreliable_messages {
+                metrics.received.record(bytes.len());
+            }
+        }
         self.sessions(config, now)?;
         self.addresses = BftAddressMap::new();
         for peer in &self.peers {
@@ -1218,7 +1462,7 @@ pub async fn run<B: AtomicBlockStore + Send + 'static>(
                         &network.addresses,
                     );
                 }
-                network.pull.received_unreliable_messages.clear();
+                network.discard_inactive_inbox(&config);
                 network.exchange::<durable::DurableStore<B>>(
                     None,
                     &config,
@@ -1237,7 +1481,7 @@ pub async fn run<B: AtomicBlockStore + Send + 'static>(
                 // A chain with no active members cannot authorize new signing.
                 // Keep the old descriptor intact until an authorized roster exists.
                 work.retire();
-                network.pull.received_unreliable_messages.clear();
+                network.discard_inactive_inbox(&config);
                 network.exchange::<durable::DurableStore<B>>(
                     None,
                     &config,
@@ -1720,6 +1964,422 @@ mod tests {
         assert_ne!(
             view.conflicts[0].first.content.id,
             view.conflicts[0].second.content.id
+        );
+    }
+
+    #[test]
+    fn metrics_default_zero_length_and_saturation() {
+        let (config, _) = fixture();
+        assert!(config.metrics.is_none());
+        let metrics = RuntimeMetrics::default();
+        assert_eq!(metrics.snapshot(), MetricsSnapshot::default());
+        metrics.received.record(0);
+        assert_eq!(
+            metrics.snapshot().received,
+            MessageCounts {
+                messages: 1,
+                bytes: 0
+            }
+        );
+        metrics.received.add(MessageCounts {
+            messages: u64::MAX,
+            bytes: u64::MAX,
+        });
+        metrics.received.record(1);
+        assert_eq!(
+            metrics.snapshot().received,
+            MessageCounts {
+                messages: u64::MAX,
+                bytes: u64::MAX
+            }
+        );
+        let mut counts = OfferedMetrics::default();
+        counts.hello.record(0);
+        counts.status_request_messages = u64::MAX;
+        metrics.offer(counts);
+        metrics.offer(counts);
+        assert_eq!(
+            metrics.snapshot().offered.hello,
+            MessageCounts {
+                messages: 2,
+                bytes: 0
+            }
+        );
+        assert_eq!(metrics.snapshot().offered.status_request_messages, u64::MAX);
+    }
+
+    #[test]
+    fn metrics_frame_classifier_uses_structure_not_size_or_request_token() {
+        use super::super::{CertKind, Header, ProposalContent, VoteContent, Votes};
+        let (config, key) = fixture();
+        let c = config
+            .chain_config(&config.initial_roster, config.vote_namespace)
+            .unwrap()
+            .unwrap();
+        let id = c.body_id(&[]);
+        let vote = Vote::sign(
+            &c,
+            &key,
+            VoteContent {
+                height: 1,
+                round: 0,
+                kind: VoteKind::Prevote,
+                id: Some(id),
+                signer: 0,
+            },
+        );
+        let bare = Frame {
+            message: Message::Ordinary,
+            outer: Some(&vote),
+            proposal: None,
+            groups: &[],
+        };
+        for request in [None, Some(0), Some(1)] {
+            assert_eq!(
+                wire::encode_frame(bare, request, config.limits())
+                    .unwrap()
+                    .len(),
+                140
+            );
+            assert_eq!(FrameClass::of(bare), FrameClass::BareVote);
+        }
+        let header = Header::sign(
+            &c,
+            &key,
+            ProposalContent {
+                height: 1,
+                round: 0,
+                valid_round: None,
+                id,
+                signer: 0,
+            },
+        );
+        let groups = [Group {
+            kind: CertKind::Decision { round: 0, id },
+            votes: Votes::Dense(&[]),
+        }];
+        for evidence in [
+            Frame {
+                outer: None,
+                ..bare
+            },
+            Frame {
+                message: Message::Dec,
+                ..bare
+            },
+            Frame {
+                groups: &groups,
+                ..bare
+            },
+            Frame {
+                outer: None,
+                groups: &groups,
+                ..bare
+            },
+            Frame {
+                outer: None,
+                proposal: Some(Proposal {
+                    header: &header,
+                    body: &[],
+                }),
+                ..bare
+            },
+        ] {
+            assert_eq!(FrameClass::of(evidence), FrameClass::Evidence);
+            wire::encode_frame(evidence, None, config.limits()).unwrap();
+        }
+        assert_eq!(hello_packet(&key, &[0; 64]).len(), 98);
+        assert_eq!(wire::STATUS_BYTES, 144);
+    }
+
+    fn metrics_fixture() -> (
+        RuntimeConfig,
+        SigningKey,
+        Engine<super::super::MemoryStore>,
+        Events,
+        Network,
+    ) {
+        let (mut config, key) = fixture();
+        config.metrics = Some(Arc::new(RuntimeMetrics::default()));
+        let c = config
+            .chain_config(&config.initial_roster, config.vote_namespace)
+            .unwrap()
+            .unwrap();
+        let mut engine =
+            Engine::boot(super::super::MemoryStore::default(), key.clone(), c.clone()).unwrap();
+        let mut events = Events::default();
+        engine.init(&c, 1, 0, &mut events).unwrap();
+        let mut network = Network::new(&config).unwrap();
+        network.pull.current_connections = (1..=2)
+            .map(|i| (address(40_000 + i), [i as u8; 64]))
+            .collect();
+        network.sessions(&config, 0).unwrap();
+        (config, key, engine, events, network)
+    }
+
+    #[test]
+    fn metrics_receive_outcomes_include_zero_length_rejection_and_budget_surplus() {
+        let (mut config, _, mut engine, mut events, mut network) = metrics_fixture();
+        config.max_receive_per_tick = 1;
+        network.peers[0].member = Some(1);
+        let connection = network.peers[0].address.connection_key();
+        let status = wire::encode_status(wire::WireStatus {
+            sequence: 1,
+            request: None,
+            snapshot: engine.status().unwrap(),
+        })
+        .unwrap();
+        let mut bulk = vec![0; 200];
+        bulk[0] = wire::FRAME_TAG;
+        network.pull.received_unreliable_messages.extend([
+            (connection, status),
+            (connection, bulk),
+            (connection, vec![]),
+            (address(40_003).connection_key(), vec![]),
+        ]);
+        network
+            .receive(
+                &mut engine,
+                &config,
+                &mut events,
+                config.initial_roster[0].pub_key,
+                0,
+            )
+            .unwrap();
+        let snapshot = config.metrics.as_ref().unwrap().snapshot();
+        assert_eq!(
+            snapshot.processed,
+            MessageCounts {
+                messages: 1,
+                bytes: 144
+            }
+        );
+        assert_eq!(
+            snapshot.rejected,
+            MessageCounts {
+                messages: 1,
+                bytes: 0
+            }
+        );
+        assert_eq!(
+            snapshot.scheduler_budget_discarded,
+            MessageCounts {
+                messages: 2,
+                bytes: 200
+            }
+        );
+        assert!(network.pull.received_unreliable_messages.is_empty());
+        assert_eq!(network.incoming.in_use(), 0);
+        network
+            .pull
+            .received_unreliable_messages
+            .push_back((connection, vec![]));
+        network
+            .receive(
+                &mut engine,
+                &config,
+                &mut events,
+                config.initial_roster[0].pub_key,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            config.metrics.as_ref().unwrap().snapshot().rejected,
+            MessageCounts {
+                messages: 2,
+                bytes: 0
+            }
+        );
+        network
+            .pull
+            .received_unreliable_messages
+            .extend([(connection, vec![]), (connection, vec![1, 2, 3])]);
+        network.discard_inactive_inbox(&config);
+        assert_eq!(
+            config.metrics.as_ref().unwrap().snapshot().rejected,
+            MessageCounts {
+                messages: 4,
+                bytes: 3
+            }
+        );
+        // These fixtures bypass service; raw arrival counts are tested over STP.
+        assert_eq!(
+            config.metrics.as_ref().unwrap().snapshot().received,
+            MessageCounts::default()
+        );
+    }
+
+    #[test]
+    fn metrics_receive_rejections_follow_existing_admission_results() {
+        let (config, _, mut engine, mut events, mut network) = metrics_fixture();
+        let connection = network.peers[0].address.connection_key();
+        let unauthenticated = network.peers[1].address.connection_key();
+        let status = wire::encode_status(wire::WireStatus {
+            sequence: 1,
+            request: None,
+            snapshot: engine.status().unwrap(),
+        })
+        .unwrap();
+        let empty_decision = wire::encode_frame(
+            Frame {
+                message: Message::Dec,
+                outer: None,
+                proposal: None,
+                groups: &[],
+            },
+            None,
+            config.limits(),
+        )
+        .unwrap();
+        let invalid_body = decision_packet(engine.c(), &body(2), config.limits());
+        let valid_body = decision_packet(engine.c(), &body(1), config.limits());
+        let mut expected_processed = MessageCounts::default();
+        let mut expected_rejected = MessageCounts::default();
+        for (source, bytes, processed) in [
+            (
+                connection,
+                hello_packet(&SigningKey::from([2; 32]), &network.peers[0].handshake),
+                true,
+            ),
+            (connection, vec![wire::HELLO_TAG], false),
+            (connection, status.clone(), true),
+            (connection, status.clone(), false), // stale sequence
+            (connection, vec![wire::STATUS_TAG], false),
+            (connection, vec![wire::FRAME_TAG], false),
+            (connection, empty_decision, false), // decoded, rejected by core
+            (connection, invalid_body, false),   // decoded, canonical height mismatch
+            (connection, valid_body, true),
+            (unauthenticated, status, false),
+            (connection, vec![], false),
+        ] {
+            if processed {
+                &mut expected_processed
+            } else {
+                &mut expected_rejected
+            }
+            .record(bytes.len());
+            network
+                .pull
+                .received_unreliable_messages
+                .push_back((source, bytes));
+            network
+                .receive(
+                    &mut engine,
+                    &config,
+                    &mut events,
+                    config.initial_roster[0].pub_key,
+                    0,
+                )
+                .unwrap();
+            assert_eq!(network.incoming.in_use(), 0);
+        }
+        let snapshot = config.metrics.as_ref().unwrap().snapshot();
+        assert_eq!(snapshot.processed, expected_processed);
+        assert_eq!(snapshot.rejected, expected_rejected);
+        assert_eq!(
+            snapshot.scheduler_budget_discarded,
+            MessageCounts::default()
+        );
+        assert!(engine.view().unwrap().pending.is_some());
+    }
+
+    #[test]
+    fn metrics_offers_count_recipients_only_at_handoff_and_keep_permits() {
+        use super::super::VoteContent;
+        let (config, key, engine, mut events, mut network) = metrics_fixture();
+        for (i, peer) in network.peers.iter_mut().enumerate() {
+            peer.member = Some(i as u32);
+        }
+        events.votes[VoteKind::Prevote.index()] = Some(Vote::sign(
+            engine.c(),
+            &key,
+            VoteContent {
+                height: 1,
+                round: 0,
+                kind: VoteKind::Prevote,
+                id: None,
+                signer: 0,
+            },
+        ));
+        let bytes = decision_packet(engine.c(), &body(1), config.limits());
+        let evidence_bytes = bytes.len() as u64;
+        let budget = AdmissionBudget::new(2);
+        for generation in [network.peers[0].generation, u64::MAX] {
+            network.outgoing.push(Outgoing {
+                key: RequestKey {
+                    peer: 0,
+                    generation,
+                    sequence: 1,
+                },
+                bytes: bytes.clone(),
+                permit: budget.try_acquire().unwrap(),
+                class: FrameClass::Evidence,
+            });
+        }
+        assert_eq!(budget.in_use(), 2);
+        network
+            .exchange(Some(&engine), &config, &key, &mut events, 0)
+            .unwrap();
+        assert_eq!(budget.in_use(), 0);
+        let offered = config.metrics.as_ref().unwrap().snapshot().offered;
+        assert_eq!(
+            offered.hello,
+            MessageCounts {
+                messages: 2,
+                bytes: 196
+            }
+        );
+        assert_eq!(
+            offered.status,
+            MessageCounts {
+                messages: 2,
+                bytes: 288
+            }
+        );
+        // INIT's ENTER and the explicit PREVOTE each have two recipients.
+        assert_eq!(
+            offered.bare_votes,
+            MessageCounts {
+                messages: 4,
+                bytes: 560
+            }
+        );
+        assert_eq!(
+            offered.evidence,
+            MessageCounts {
+                messages: 1,
+                bytes: evidence_bytes
+            }
+        );
+        assert_eq!(offered.status_request_messages, 0);
+    }
+
+    #[test]
+    fn metrics_offers_exclude_pre_handoff_failure_but_include_failed_service() {
+        let (config, key, engine, mut events, mut network) = metrics_fixture();
+        network.sequence = u64::MAX;
+        assert!(
+            network
+                .exchange(Some(&engine), &config, &key, &mut events, 0)
+                .is_err()
+        );
+        assert_eq!(
+            config.metrics.as_ref().unwrap().snapshot(),
+            MetricsSnapshot::default()
+        );
+        // Replacing this BFT handle causes service to fail after the offer boundary.
+        let _replacement = config.transport.attach(Consumer::Bft);
+        assert!(
+            network
+                .exchange::<super::super::MemoryStore>(None, &config, &key, &mut events, 1_000)
+                .is_err()
+        );
+        assert_eq!(
+            config.metrics.as_ref().unwrap().snapshot().offered.hello,
+            MessageCounts {
+                messages: 2,
+                bytes: 196
+            }
         );
     }
 
