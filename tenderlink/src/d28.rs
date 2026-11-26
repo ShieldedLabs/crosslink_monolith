@@ -1581,6 +1581,8 @@ fn hash_vote(h: &mut blake3::Hasher, v: &Vote) {
 }
 
 pub mod atomic;
+#[cfg(feature = "bench")]
+pub mod bench;
 pub mod chain;
 pub mod durable;
 pub mod gossip;

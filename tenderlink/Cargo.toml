@@ -3,6 +3,14 @@ name = "tenderlink"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+bench = ["dep:serde", "dep:serde_json"]
+
+[[bin]]
+name = "d28_bench"
+path = "src/bin/d28_bench.rs"
+required-features = ["bench"]
+
 [profile.dev]
 opt-level = 0            # no optimizations
 debug = 2   # full debug info (0 = none, 1 = line tables only, 2 = full)
@@ -14,6 +22,8 @@ split-debuginfo = "unpacked"  # produce separate .pdb files
 lto = false
 
 [dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 shielded_transport_pigeon = "4.0"
 blake3 = "1.8.2"
 byteorder = "1.5.0"
