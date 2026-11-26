@@ -687,6 +687,22 @@ enum Control {
     #[serde(rename = "ack")]
     Ack { height: u64 },
 }
+/// The benchmark backend can hit its deadline and return Storage before the
+/// outer timeout wins. Add observed deadline context, never replace the cause
+/// or infer that a pre-deadline storage error was caused by the deadline.
+fn runtime_failure(
+    outcome: &Result<io::Result<()>, tokio::task::JoinError>,
+    now: Instant,
+    deadline: Instant,
+) -> String {
+    let cause = format!("D28 runtime exited: {outcome:?}");
+    if now >= deadline {
+        format!("whole-process benchmark deadline reached; {cause}")
+    } else {
+        cause
+    }
+}
+
 async fn bounded<T>(
     deadline: Instant,
     future: impl std::future::Future<Output = io::Result<T>>,
@@ -824,7 +840,7 @@ pub async fn run(config: DistributedConfig) -> io::Result<DistributedReport> {
                     if c.pending.is_some() { break c.reports.last().expect("pending report").clone(); }
                 }
                 if let Some(outcome) = runtimes.try_join_next() {
-                    return Err(invalid(format!("D28 runtime exited: {outcome:?}")));
+                    return Err(invalid(runtime_failure(&outcome, Instant::now(), deadline)));
                 }
                 tokio::time::sleep(Duration::from_millis(2)).await;
             };
@@ -879,7 +895,7 @@ pub async fn run(config: DistributedConfig) -> io::Result<DistributedReport> {
     runtimes.abort_all();
     while let Some(outcome) = runtimes.join_next().await {
         if !matches!(outcome, Err(ref e) if e.is_cancelled()) {
-            failure.get_or_insert(format!("D28 runtime exited: {outcome:?}"));
+            failure.get_or_insert_with(|| runtime_failure(&outcome, Instant::now(), deadline));
         }
     }
     drop(sampler); // Drop final transport observer: close this process's STP endpoint.
@@ -1129,6 +1145,35 @@ mod tests {
         assert_eq!((request, ttl), (10000, 15000));
         c.timing_profile = "other".into();
         assert!(c.validate().is_err());
+    }
+    #[test]
+    fn runtime_exit_reports_deadline_context_only_at_or_after_deadline() {
+        let deadline = Instant::now();
+        let outcome = Ok::<io::Result<()>, tokio::task::JoinError>(Err(io::Error::other("D28: Storage")));
+        let original = format!("D28 runtime exited: {outcome:?}");
+        assert_eq!(
+            runtime_failure(&outcome, deadline - Duration::from_nanos(1), deadline),
+            original,
+        );
+        for now in [deadline, deadline + Duration::from_nanos(1)] {
+            assert_eq!(
+                runtime_failure(&outcome, now, deadline),
+                format!("whole-process benchmark deadline reached; {original}"),
+            );
+        }
+        // The cleanup path also handles unexpected successful runtime exits;
+        // retain their original cause rather than manufacturing a storage error.
+        let completed = Ok::<io::Result<()>, tokio::task::JoinError>(Ok(()));
+        assert_eq!(
+            runtime_failure(&completed, deadline - Duration::from_nanos(1), deadline),
+            "D28 runtime exited: Ok(Ok(()))",
+        );
+    }
+    #[tokio::test]
+    async fn bounded_deadline_error_retains_its_existing_classification() {
+        let error = bounded::<()>(Instant::now(), std::future::pending()).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "whole-process benchmark deadline reached");
     }
     #[test]
     fn control_is_only_start_or_exact_ack() {
