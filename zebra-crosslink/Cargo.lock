@@ -5881,8 +5881,9 @@ dependencies = [
 
 [[package]]
 name = "softer_gui"
-version = "5.0.1"
-source = "git+https://github.com/ShieldedLabs/softer_gui?rev=de63f083ea670b4e453710863c83e3d9a03d9906#de63f083ea670b4e453710863c83e3d9a03d9906"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebeb588468d3b1f0c8aebbb7bfd26108ddb1453beb4386ead70db56245e9225b"
 
 [[package]]
 name = "soketto"

@@ -4,9 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Pinned to a commit: the clipboard, the Windows request_frame fix and the macOS close fix (EVENT_CLOSE only from the
-# red button or Quit, never from a minimized or hidden window) are in no crates.io release yet.
-softer_gui = { git = "https://github.com/ShieldedLabs/softer_gui", rev = "de63f083ea670b4e453710863c83e3d9a03d9906" }
+softer_gui = "7.0.0"
 num_cpus = "1.17.0"
 ahash = "0.8.12"
 rustybuzz = "0.20.1"
@@ -76,3 +74,23 @@ overflow-checks = true
 incremental = false      # incremental confuses symbol mapping
 codegen-units = 1        # easier to debug single unit
 split-debuginfo = "unpacked"  # produce separate .pdb files
+
+# What `phuild.bat zebra-gui Release` builds, and what gui.sh builds and tests with: release
+# speed with fast rebuilds. An edit to this crate rebuilds only the codegen units it touched.
+[profile.release-iter]
+inherits = "release"
+lto = "off"
+incremental = true
+codegen-units = 256
+opt-level = 2
+debug = "line-tables-only"
+
+[profile.release-iter.package."*"]
+opt-level = 3
+debug = false
+
+[profile.release-iter.package.clay-layout]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false

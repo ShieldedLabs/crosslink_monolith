@@ -1,3 +1,5 @@
 /subtree text eol=lf
 /sync-crosslink-book.sh text eol=lf
 /sync-crosslink-book.bat text eol=crlf
+/zebra-gui/gui.sh text eol=lf
+/zebra-gui/scripts/*.gui text eol=lf

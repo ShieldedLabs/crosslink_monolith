@@ -1,0 +1,45 @@
+# The main screen on the displays people run it at.
+settle 300
+
+# The smallest window it has to stay whole in, and the one it is designed for: both at
+# scale 1.
+size minspec
+shot minspec
+size mainline
+shot mainline
+
+# Sharper displays, which draw everything larger. The window is as large as the display.
+size 1920 1080
+scale 1.25
+shot 1920x1080_125
+size 2560 1440
+scale 1.5
+shot 2560x1440_150
+size 3840 2160
+scale 2
+shot 3840x2160_200
+
+# Windows under the smallest size draw nothing useful; they only have to not crash.
+scale 1
+size 800 600
+frame 2
+size 300 200
+frame 2
+size 40 900
+frame 2
+size 1 1
+frame 2
+
+# A drag that starts on the height strip beside the block map, in a window too short for the strip.
+scale 1.25
+size 1013 156
+move 33 112
+frame
+move 301 78
+frame
+down mouse
+frame
+move 675 71
+frame
+up mouse
+frame

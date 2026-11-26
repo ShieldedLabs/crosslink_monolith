@@ -87,3 +87,79 @@ featurenet's state.
 
 cTAZ means Crosslink TAZ, the featurenet's coin: 1 cTAZ is 100,000,000 zats.
 The "c" is never centi-, so 10 cTAZ is 1,000,000,000 zats.
+
+## GUI work
+
+Any change to the GUI (`zebra-gui/`: its screens, layout, drawing, input or
+speed) is built, run and checked through `zebra-gui/gui.sh`. It builds the GUI
+alone in about 20 seconds, runs it on mock data with no window, and answers in
+text and small images. Never build zebrad to look at a GUI change, and never
+write a new script to drive or screenshot the GUI. `zebra-gui/GUI_DEV.md` is
+the manual: read it before the first GUI change of a session.
+
+Whoever adds a GUI feature is its designer, even when the request says only to
+implement it. Read `zebra-gui/GUI_DESIGN.md` first and decide what the person
+sees first, what their hand does, and what form each control's job calls for.
+The screens as they stand are not the standard to copy. A new button in a new
+row is the first idea and seldom the best: ask whether something already on
+screen can do the job, and what the change pushes out of place. Add a
+typeface, an icon, an image, an animation or a new kind of control when the
+design calls for one, and write it into that file's vocabulary.
+
+The report of a GUI change has a part headed `Design`: for each new thing on
+screen, the form and place you chose, one you turned down, and why; then the
+one image a person should look at.
+
+```text
+bash zebra-gui/gui.sh run 'shot before'  Before the first edit: look at the screen as it is.
+                                         With no uncommitted GUI change, any gui.sh command
+                                         also records every screen, to compare with later.
+bash zebra-gui/gui.sh check              After each edit: build, run every script and random
+                                         input, say what changed on screen.
+bash zebra-gui/gui.sh run '<commands>'   Try one thing, e.g. 'click "Send"; shot send; lint send'
+```
+
+- A GUI change is done only when `check` ends in `check: ok` and you have read
+  every image it names and every line of it that says `new`. It names one
+  image for each way the screens changed, not one for each screenshot. Say in
+  your report which changes you meant to cause.
+- Look at the result yourself: read the PNG that `shot`, `lint` or `diff`
+  names. Do not report a visual change you have not seen.
+- Judge a design with `squint` (what the eye lands on first), `targets` (what
+  can be pressed, how big, how it answers the pointer) and `style` (the sizes
+  and colours in use).
+- Check what moves (an animation, a scroll, a delay) with `settle`, `film` and
+  `track`; speed with `gui.sh bench`; a real window's frame timing with
+  `gui.sh pace`.
+- Design the GUI for a 1920x1080 display at scale 1 and 60 Hz, and keep it whole on a
+  1280x720 display at scale 1. The windows those leave room for are what the tools call
+  `mainline` (1920x1000, where every scripted run starts) and `minspec` (1280x640). `check`
+  runs every screen at both. Choose text sizes at scale 1.
+- Check how a screen takes a change of size with `resize` (the window) and
+  `drag` (a pane's divider). Each moves a step at a time, as a hand does, and
+  says from what size text is cut off or overlaps, what jumps, and what
+  follows a frame late. `check` does this for the main screen; run both on a
+  screen or a pane you add or change.
+- A screen at rest is not the whole of it. Much of this GUI opens, expands or
+  switches when pressed ("Finalizer Filters", "Network Info", a row of the
+  history, each dialog), and what opens pushes the rest of the page about.
+  `explore` presses everything on a screen and whatever each press brings up,
+  and says for each what it opened, what that moved, which faults it brought
+  and what undoes it. `check` does this for the main screen at both sizes:
+  read the image of each state your change touches, and the one with all of
+  them open at once. Run `explore` yourself inside a dialog or a pane you add
+  or change.
+- A new screen or behaviour gets lines in a script under `zebra-gui/scripts/`,
+  so `check` covers it from then on.
+- A crash or a hang prints the script line it happened on. A random-input
+  crash leaves `target/gui/now/monkey/monkey.gui`, which replays it.
+- The mock data is in `zebra-gui/src/main.rs`. If the screen you need cannot
+  be reached from it, add to the mock data; do not start a node.
+- Use no worktree for GUI work. `check` compares with the last commit's screens,
+  which `gui.sh` records by itself under `base`: never record `base` yourself
+  after editing. `gui.sh snap <label>` keeps any other state to compare with.
+- `gui.sh` takes 5 to 30 seconds. Start it in the background when you have
+  reading to do meanwhile.
+- The scripted run has no real window. What only a real window shows (the
+  pointer's shape on screen, the title bar, the clipboard, how it feels) is
+  unchecked unless a person looked: say so.

@@ -1,0 +1,46 @@
+# Every screen the mock scene can reach, one screenshot each.
+# Each screenshot is also checked for visual faults (GUI_DEV.md, "lint").
+
+# The blocks fly in at the start; the screenshots are of the screen at rest.
+settle 300
+shot main
+expect "Your Wallet"
+expect "126.956 cTAZ"
+
+click "Send"
+shot modal_send
+key esc
+click "Receive"
+shot modal_receive
+key esc
+click "Stake"
+expect "Paste Identity"
+shot modal_stake
+key esc
+click "Edit Stake"
+shot modal_edit_stake
+key esc
+click "User"
+shot modal_user
+key esc
+expect_not "Paste Identity"
+
+click "Faucet Wallet"
+shot faucet_wallet
+click "Your Wallet"
+
+click "BC Tip"
+shot right_bc_tip
+click "Finalizers"
+
+down ctrl
+key j
+up ctrl
+shot modal_jump
+key esc
+
+key f3
+expect "Rate:"
+# The top two lines are live frame timings, which differ every run.
+shot debug_overlay 0 32 8192 8192
+key f3

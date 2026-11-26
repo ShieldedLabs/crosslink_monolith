@@ -36,9 +36,10 @@ pub struct SlashForkConfig {
     /// The BFT certificate height at which this slashfork activates, or
     /// [`SlashForkConfig::NEVER`] for a PoW-only slashfork.
     pub bft_certificate_height: u64,
-    /// Finalizers terminated by this slashfork; must list at least one. Committed
-    /// to by hash later, so this list is sorted into a canonical order when the
-    /// schedule is built.
+    /// Finalizers terminated by this slashfork; must list at least one. Config
+    /// accepts legacy 64-character hex keys or verified 134-character `zfinv1`
+    /// addresses. Only the public keys are retained and serialized, and the
+    /// schedule sorts them into canonical order.
     #[serde(deserialize_with = "deserialize_unique_finalizers")]
     pub terminated_finalizers: Vec<PubKeyID>,
 }
@@ -64,15 +65,31 @@ fn deserialize_staking_aligned<'de, D>(d: D) -> Result<u64, D::Error> where D: s
 }
 
 fn deserialize_unique_finalizers<'de, D>(d: D) -> Result<Vec<PubKeyID>, D::Error> where D: serde::Deserializer<'de> {
-    let finalizers = Vec::<PubKeyID>::deserialize(d)?;
-    if finalizers.is_empty() {
+    let entries = Vec::<std::string::String>::deserialize(d)?;
+    if entries.is_empty() {
         return Err(serde::de::Error::custom("`terminated_finalizers` must list at least one finalizer"));
     }
-    let mut seen = std::collections::HashSet::with_capacity(finalizers.len());
-    for finalizer in &finalizers {
+    let mut finalizers = Vec::with_capacity(entries.len());
+    let mut seen = std::collections::HashSet::with_capacity(entries.len());
+    for entry in entries {
+        let finalizer = match entry.len() {
+            // Preserve the existing hex parsing and byte order exactly.
+            64 => PubKeyID::deserialize(
+                serde::de::value::StrDeserializer::<D::Error>::new(&entry),
+            )?,
+            134 => FinalizerAddress::decode_and_verify(&entry)
+                .ok_or_else(|| serde::de::Error::custom(
+                    "invalid finalizer address: expected a zfinv1 address with a valid signature",
+                ))?,
+            len => return Err(serde::de::Error::invalid_length(
+                len,
+                &"64 hex characters (legacy public key) or a 134-character zfinv1 finalizer address",
+            )),
+        };
         if !seen.insert(finalizer) {
             return Err(serde::de::Error::custom(format!("`terminated_finalizers` contains duplicate finalizer \"{finalizer}\", which was already specified")));
         }
+        finalizers.push(finalizer);
     }
     Ok(finalizers)
 }
@@ -1203,27 +1220,14 @@ impl FatPointerToBftBlock {
         buf
     }
 
-    #[allow(clippy::reversed_empty_ranges)]
-    pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 76 - 32 + 2 {
+    /// Decodes exactly one fat pointer, returning `None` for truncated input, trailing
+    /// bytes, or a signature count exceeding [`FAT_POINTER_SIGNATURES_MAX`].
+    pub fn try_from_bytes(mut bytes: &[u8]) -> Option<Self> {
+        let pointer = Self::zcash_deserialize(&mut bytes).ok()?;
+        if !bytes.is_empty() {
             return None;
         }
-        let vote_for_block_without_finalizer_public_key = bytes[0..76 - 32].try_into().unwrap();
-        let len = u16::from_le_bytes(bytes[76 - 32..2].try_into().unwrap()) as usize;
-
-        if 76 - 32 + 2 + len * (32 + 64) > bytes.len() {
-            return None;
-        }
-        let rem = &bytes[76 - 32 + 2..];
-        let signatures = rem
-            .chunks_exact(32 + 64)
-            .map(|chunk| FatPointerSignature::from_bytes(chunk.try_into().unwrap()))
-            .collect();
-
-        Some(Self {
-            vote_for_block_without_finalizer_public_key,
-            signatures,
-        })
+        Some(pointer)
     }
 
     pub fn from_parts(bft_block_hash: Blake3Hash, height: u64, round: u32, signatures: &[FatPointerSignature]) -> Self {
@@ -1540,6 +1544,69 @@ pub struct ScanInfo {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fat_pointer_try_from_bytes_roundtrips() {
+        let template = signed_fat_pointer(true);
+        for count in [0, 1, template.signatures.len(), FAT_POINTER_SIGNATURES_MAX] {
+            let mut pointer = template.clone();
+            pointer
+                .signatures
+                .resize(count, template.signatures[0].clone());
+            let bytes = pointer.to_bytes();
+            let mut canonical = Vec::new();
+            pointer.zcash_serialize(&mut canonical).unwrap();
+            assert_eq!(bytes, canonical);
+            assert_eq!(FatPointerToBftBlock::try_from_bytes(&bytes), Some(pointer));
+        }
+        let null = FatPointerToBftBlock::null();
+        assert_eq!(
+            FatPointerToBftBlock::try_from_bytes(&null.to_bytes()),
+            Some(null)
+        );
+    }
+
+    #[test]
+    fn fat_pointer_try_from_bytes_rejects_truncated_input() {
+        let bytes = signed_fat_pointer(true).to_bytes();
+        for end in 0..bytes.len() {
+            assert_eq!(FatPointerToBftBlock::try_from_bytes(&bytes[..end]), None);
+        }
+    }
+
+    #[test]
+    fn fat_pointer_try_from_bytes_rejects_trailing_bytes() {
+        let pointer = signed_fat_pointer(true);
+        let signature_bytes = pointer.signatures[0].to_bytes();
+        for tail_len in 1..=signature_bytes.len() {
+            let mut bytes = pointer.to_bytes();
+            bytes.extend_from_slice(&signature_bytes[..tail_len]);
+            assert_eq!(FatPointerToBftBlock::try_from_bytes(&bytes), None);
+
+            // Stream decoding remains compositional: only the byte-slice helper
+            // requires the input to contain exactly one object.
+            let mut remaining = bytes.as_slice();
+            assert_eq!(
+                FatPointerToBftBlock::zcash_deserialize(&mut remaining).unwrap(),
+                pointer
+            );
+            assert_eq!(remaining, &signature_bytes[..tail_len]);
+        }
+    }
+
+    #[test]
+    fn fat_pointer_try_from_bytes_rejects_excess_signatures() {
+        let mut pointer = signed_fat_pointer(true);
+        pointer.signatures.resize(
+            FAT_POINTER_SIGNATURES_MAX + 1,
+            pointer.signatures[0].clone(),
+        );
+        // Supply the complete payload so rejection tests the count bound, not truncation.
+        assert_eq!(
+            FatPointerToBftBlock::try_from_bytes(&pointer.to_bytes()),
+            None
+        );
+    }
+
     /// Each withdrawal finality rule's threshold for an unbonding at the start and at the end of
     /// a staking day. Only the selected rule runs end to end, so this keeps the others checked.
     #[test]
@@ -1625,5 +1692,3 @@ mod tests {
         assert!(!prevotes.validate_signatures(&[0; 32]));
     }
 }
-
-

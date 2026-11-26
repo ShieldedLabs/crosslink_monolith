@@ -18,6 +18,8 @@ pub use viz_gui::*;
 
 pub mod audio;
 
+pub mod script;
+
 const TURN_OFF_HASH_BASED_LAZY_RENDER: usize = 0;
 
 #[derive(Clone, Copy, PartialOrd, PartialEq, Ord, Eq, Debug, Default)]
@@ -173,6 +175,9 @@ impl Drop for RenderWorkers {
     fn drop(&mut self) {
         unsafe {
             let context = &*(self.context as *const ThreadContext);
+            // A worker still waking up for the last frame would see the stop flag and return
+            // without coming back to the barrier, and the wait below would never end.
+            while context.workers_that_have_passed_the_wake_up_gate.load(Ordering::Relaxed) != context.thread_count - 1 { spin_loop(); }
             context.stop.store(true, Ordering::Release);
             context.wake_up_barrier.wait();
         }
@@ -559,6 +564,11 @@ impl DrawCtx {
             }
             let text_shape_cache = self.text_shape_cache.borrow();
             let glyph_run = text_shape_cache.get(&shape_key).unwrap();
+
+            if let Some(log) = self.text_log.borrow_mut().as_mut() {
+                let w: usize = glyph_run.iter().map(|(_, px_advance)| *px_advance as usize).sum();
+                log.push(script::LoggedText { x: text_x as i32, y: text_y as i32, w: w as u32, h: text_height as u32, color, at: *self.draw_command_count, text: script::loggable(text_line) });
+            }
 
             let glyph_bitmap_run_start = self.glyph_bitmap_run_allocator.add(*self.glyph_bitmap_run_allocator_position);
             let mut glyph_bitmap_run_count = 0usize;
@@ -959,6 +969,8 @@ struct DrawCtx {
     debug_pixel_inspector_last_color: *mut u32,
     measure_cache: HashMap<MeasureKey, f32>,
     text_shape_cache: RefCell<HashMap<TextShapeKey, Vec<(u16, u16)>>>,
+    /// What `text_line` was asked to draw this frame; Some only under a script.
+    text_log: RefCell<Option<Vec<script::LoggedText>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1140,8 +1152,25 @@ pub static DEV_WIN32_WINDOW_RIGHT: AtomicBool = AtomicBool::new(false);
 /// Overrides the window title when set before the window is created (e.g. "TEST: <name>").
 pub static WINDOW_TITLE: Mutex<String> = Mutex::new(String::new());
 
-/// The visualizer's window, open but not yet drawn into.
-pub type Window = softer_gui::Gui;
+/// The visualizer's window, open but not yet drawn into: a real one, or one a script drives
+/// with no display at all (see script.rs).
+pub enum Window {
+    Os(softer_gui::Gui),
+    Script(script::ScriptWindow),
+}
+
+impl Window {
+    fn wait_ms(&mut self, ms: u64) { if let Window::Os(g) = self { g.wait_ms(ms) } }
+    fn request_frame(&mut self) { if let Window::Os(g) = self { g.request_frame() } }
+    fn submit(&mut self) { if let Window::Os(g) = self { g.submit() } }
+    fn set_icon(&mut self, images: &[softer_gui::icon::IconImage]) { if let Window::Os(g) = self { g.set_icon(images) } }
+    fn set_cursor(&mut self, shape: softer_gui::CursorShape) { if let Window::Os(g) = self { g.set_cursor(shape) } }
+    // A script's frames are all drawn, so its run is the same every time.
+    fn take_full_redraw(&mut self) -> bool { match self { Window::Os(g) => g.take_full_redraw(), Window::Script(_) => true } }
+    fn clipboard(&self) -> softer_gui::Clipboard { match self { Window::Os(g) => g.clipboard(), Window::Script(_) => softer_gui::Clipboard::default() } }
+    fn next_event(&mut self, ev: &mut Event) -> bool { match self { Window::Os(g) => g.next_event(ev), Window::Script(s) => s.next_event(ev) } }
+    fn get_framebuffer(&mut self) -> softer_gui::Framebuffer { match self { Window::Os(g) => g.get_framebuffer(), Window::Script(s) => s.get_framebuffer() } }
+}
 
 /// Open the visualizer's window, or None when this machine has no display to put one on (no
 /// Wayland or X server, a Windows service session, a macOS host without AppKit). Call it on the
@@ -1149,23 +1178,29 @@ pub type Window = softer_gui::Gui;
 /// Nothing else about the program has started yet when this is asked, so a None can still
 /// become an ordinary headless run.
 pub fn open_window() -> Option<Window> {
+    if let Ok(script) = std::env::var("ZEBRA_GUI_SCRIPT") {
+        return script::ScriptWindow::open(&script, &std::env::var("ZEBRA_GUI_OUT").unwrap_or_default()).map(Window::Script);
+    }
     let title = {
         let t = WINDOW_TITLE.lock().unwrap();
         if t.is_empty() { "Zcash Crosslink Visualizer".to_string() } else { t.clone() }
     };
-    softer_gui::open(&title, "org.zfnd.crosslink_visualizer", 1600, 900)
+    // The smallest window the screens hold whole in, which fits on a 1280x720 display with a
+    // title bar and a task bar; a 1600x900 window would run off one. softer_gui cannot yet
+    // ask the display's size or open maximized, so a larger display starts small too.
+    softer_gui::open(&title, "org.zfnd.crosslink_visualizer", 1280, 640).map(Window::Os)
 }
 
 pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::WalletState>>, fake_data: bool, should_stop: impl Fn() -> bool) {
 
-    let mut viz_state = viz_gui_init(fake_data);
+    let mut viz_state = viz_gui_init(fake_data, matches!(gui, Window::Script(_)));
 
     // Create window + event loop.
 
     let mut frame_stats = [FrameStat::_0; 512];
     let mut frame_stat_o = 0;
-    let mut frame_interval_milli_hertz = 60000;
-    let mut next_frame_deadline = Instant::now() + Duration::from_secs(1000) / frame_interval_milli_hertz;
+    // Replaced by each RENDER's own period, which softer_gui reads off the display.
+    let mut frame_period_fs: u64 = 1_000_000_000_000_000 / 60;
     let mut prev_frame_time_single_threaded_us = 0usize;
     let mut prev_frame_time_us = 0usize;
     let mut prev_frame_time_total_us = 0usize;
@@ -1201,13 +1236,14 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
         }));
     }
 
-    // No render target of our own any more: the tiles are rasterised straight into
-    // softer_gui's back buffer. One tile-hash set per buffer, plus the generation
-    // they belong to, so a realloc drops both.
-    let mut tile_cache_generation = u64::MAX;
-    // One damage cache per back buffer: softer_gui rotates two.
-    let mut tile_hashes: [Vec<u64>; 2] = [Vec::new(), Vec::new()];
-    let mut whole_screen_hash = [0u64; 2];
+    // The tiles are rasterised straight into softer_gui's back buffer, which holds
+    // whatever was last drawn into that buffer, not the last frame: softer_gui rotates
+    // up to three. So each buffer has its own tile hashes, kept while its key holds.
+    let mut tile_cache_key = [u64::MAX; 3];
+    let mut tile_hashes: [Vec<u64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    // The hash of the frame on screen: a frame equal to it needs no submit, whichever
+    // buffer it was drawn into.
+    let mut shown_frame_hash = 0u64;
     let mut did_window_resize = true;
 
     // staking day cosmetics
@@ -1262,6 +1298,7 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
         debug_pixel_inspector_last_color: (&mut _debug_pixel_inspector_last_color) as *mut u32,
         measure_cache: HashMap::new(),
         text_shape_cache: RefCell::new(HashMap::new()),
+        text_log: RefCell::new(if matches!(gui, Window::Script(_)) { Some(Vec::new()) } else { None }),
     }};
 
     draw_ctx._init_font_tracker(FONT_PIXEL_3X3_MONO, 2, FontKind::Mono,  4);
@@ -1287,6 +1324,7 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
     
     let mut gui_clay = clay_layout::Clay::new((1280., 720.).into());
     let mut ui   = ui::Context::new();
+    if matches!(gui, Window::Script(_)) { ui.targets = Some(Vec::new()); }
     let mut data = ui::UiData::default();
 
     ui.clay = &mut gui_clay;
@@ -1427,6 +1465,7 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                 EVENT_RENDER => {
                     last_render = Instant::now();
                     if ev.scale_fx != 0 { dpi_scale = ev.scale_fx as f64 / 65536.0; }
+                    if ev.dt_fs != 0 { frame_period_fs = ev.dt_fs; }
                     if ev.width as usize != last_window_size.0 || ev.height as usize != last_window_size.1 {
                         last_window_size = (ev.width as usize, ev.height as usize);
                         did_window_resize = true;
@@ -1486,7 +1525,7 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                         //     (*p_thread_context).wake_up_gate.store(1, Ordering::Release);
                         // }
 
-                        let target_frame_time_us = (1000000000.0 / (frame_interval_milli_hertz as f64)) as usize;
+                        let target_frame_time_us = (frame_period_fs / 1_000_000_000) as usize;
                         let begin_frame_instant = Instant::now();
 
                         // softer_gui's back buffer is the layout this renderer already wanted: square,
@@ -1503,23 +1542,20 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                         let (window_width, window_height) = (fb.width, fb.height);
                         if window_width == 0 || window_height == 0 { continue; }
 
-                        // Back buffers rotate, so "this tile is unchanged" has to mean unchanged
-                        // relative to what THIS buffer already holds, not to the last frame drawn.
-                        // `fb.key` is (generation << 1 | index) and is stable per buffer until a
-                        // realloc, which is exactly the identity the tile cache needs.
-                        let fb_index = (fb.key & 1) as usize;
-                        let fb_generation = fb.key >> 1;
-                        if tile_cache_generation != fb_generation || tile_hashes[fb_index].len() != tiles_wide*tiles_wide {
-                            tile_cache_generation = fb_generation;
-                            tile_hashes = [vec![0u64; tiles_wide*tiles_wide], vec![0u64; tiles_wide*tiles_wide]];
-                            whole_screen_hash = [0; 2];
+                        // `fb.key` is (generation << 2 | index), and stays put until that one
+                        // buffer is reallocated; the buffers can be reallocated at different times.
+                        let fb_index = (fb.key & 3) as usize;
+                        if tile_cache_key[fb_index] != fb.key || tile_hashes[fb_index].len() != tiles_wide*tiles_wide {
+                            tile_cache_key[fb_index] = fb.key;
+                            tile_hashes[fb_index] = vec![0u64; tiles_wide*tiles_wide];
+                            shown_frame_hash = 0;
                         }
                         let saved_tile_hashes = &mut tile_hashes[fb_index];
 
-                        let mut dt = 1000.0 / (frame_interval_milli_hertz as f64);
+                        let mut dt = frame_period_fs as f64 / 1e15;
                         {
                             let cpu_dt = prev_frame_time_total_us as f64 / 1000000.0;
-                            if cpu_dt > dt*2.0 { dt = cpu_dt; }
+                            if cpu_dt > dt*2.0 && matches!(gui, Window::Os(_)) { dt = cpu_dt; }
                         }
 
                         draw_ctx.window_width = window_width as isize;
@@ -1562,7 +1598,9 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                         ui.draw  = &draw_ctx;
                         ui.dpi_scale = dpi_scale as f32;
                         ui.delta = dt as f32;
-                        
+                        ui.scale = ui.zoom * ui.dpi_scale;
+                        ui::resolve_pane_widths(&mut ui);
+
                         // NOTE(Giovanni): Timer thingy //
                         //{
                         //    let timer = Timer::scope_("viz_gui_draw_the_stuff_for_the_things", true);
@@ -1791,10 +1829,15 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                             }
                         }
 
-                        // @todo(sam): softer_gui has no cursor-shape call yet, so the widgets'
-                        // choice is tracked but not applied. Add `set_cursor` to the crate.
                         if ui.prev_cursor != ui.cursor {
                             ui.prev_cursor = ui.cursor;
+                            gui.set_cursor(match ui.cursor {
+                                CursorIcon::Default    => softer_gui::CursorShape::Arrow,
+                                CursorIcon::Pointer    => softer_gui::CursorShape::Hand,
+                                CursorIcon::Text       => softer_gui::CursorShape::Text,
+                                CursorIcon::EwResize   => softer_gui::CursorShape::ResizeEw,
+                                CursorIcon::NwseResize => softer_gui::CursorShape::ResizeNwse,
+                            });
                         }
 
                         input_ctx.mouse_moved = false;
@@ -2217,16 +2260,14 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                                 }
                             });
 
-                        let need_buffer_flip;
-                        {
+                        let frame_hash = {
                             let mut hasher = ahash::AHasher::default();
                             hasher.write_usize(window_width);
                             hasher.write_usize(window_height);
                             for th in saved_tile_hashes.iter() { hasher.write_u64(*th); }
-                            let new_hash = hasher.finish();
-                            need_buffer_flip = whole_screen_hash[fb_index] != new_hash;
-                            whole_screen_hash[fb_index] = new_hash;
-                        }
+                            hasher.finish()
+                        };
+                        let need_buffer_flip = shown_frame_hash != frame_hash;
 
                         prev_frame_time_us = begin_frame_instant.elapsed().as_micros() as usize;
 
@@ -2239,17 +2280,32 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                         prev_frame_time_single_thread_us_max_5_seconds = prev_frame_time_single_thread_us_max_5_seconds.max(prev_frame_time_single_threaded_us);
                         prev_frame_time_total_us_max_5_seconds = prev_frame_time_total_us_max_5_seconds.max(prev_frame_time_total_us);
 
-                        if let Some((x, y)) = *draw_ctx.debug_pixel_inspector {
+                        if let Window::Script(s) = &mut gui {
+                            let commands = std::slice::from_raw_parts(draw_ctx.draw_command_buffer, *draw_ctx.draw_command_count);
+                            s.frame_done(draw_ctx.text_log.borrow_mut().as_mut().unwrap(), commands, ui.targets.as_deref().unwrap_or(&[]), script::FrameReport {
+                                single_us: prev_frame_time_single_threaded_us,
+                                total_us: prev_frame_time_total_us,
+                                draw_commands: *draw_ctx.draw_command_count,
+                                cursor: ui.cursor,
+                            });
+                        }
+
+                        // The inspected pixel was picked at an earlier window size and can lie outside this one.
+                        if let Some((x, y)) = (*draw_ctx.debug_pixel_inspector).filter(|(x, y)| *x < draw_area_pixel_wide && *y < draw_area_pixel_wide) {
                             let pixel_src = render_target_0.byte_add((x+y*draw_area_pixel_wide)*4);
                             *draw_ctx.debug_pixel_inspector_last_color = *(pixel_src as *mut u32);
                         }
 
                         if ui.debug {
+                            // The overlay bypasses the tiles, so the tiles under it are marked
+                            // stale in this buffer afterwards; else they keep its pixels for good.
+                            let mut overlay_x2 = 0usize;
+                            let mut overlay_y2 = 0usize;
                             *draw_ctx.draw_command_count = 0;
                             draw_ctx.text_line(FontKind::Mono, 8.0, 8.0, 13.0,
                                 &format!(
                                     "Rate: {} hz | (us) deadline: {} internal:{:>5} total:{:>5} max(5s):{:>5}",
-                                    frame_interval_milli_hertz as f32 / 1000.0,
+                                    (1e15 / frame_period_fs as f64) as f32,
                                     target_frame_time_us,
                                     prev_frame_time_us,
                                     prev_frame_time_total_us,
@@ -2289,6 +2345,8 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                                                 x1 = 0;
                                             }
                                             if x1 >= x2 { continue; }
+                                            overlay_x2 = overlay_x2.max(x2 as usize);
+                                            overlay_y2 = overlay_y2.max(y as usize + 1);
                                             let len = x2 - x1;
                                             debug_assert!(len != 0);
                                             for _ in 0..len {
@@ -2320,6 +2378,8 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                                 let full_color = if stat.full_time_us < target_frame_time_us { 0x1133ff } else { 0x991111 };
                                 for t in 0..thick {
                                     if y+t >= window_height { continue; }
+                                    overlay_x2 = overlay_x2.max(single_w + work_w + full_w);
+                                    overlay_y2 = overlay_y2.max(y + t + 1);
                                     let mut put_ptr = final_output_blit_buffer.byte_add((y+t)*fb_side*4) as *mut u32;
                                     for x in 0..single_w {
                                         *put_ptr = blend_u32(*put_ptr, single_color, 128);
@@ -2335,6 +2395,12 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                                     }
                                 }
                             }
+
+                            let tx2 = overlay_x2.div_ceil(RENDER_TILE_SIZE).min(tiles_wide);
+                            let ty2 = overlay_y2.div_ceil(RENDER_TILE_SIZE).min(tiles_wide);
+                            for ty in 0..ty2 {
+                                for tx in 0..tx2 { saved_tile_hashes[ty*tiles_wide + tx] = 0; }
+                            }
                         }
 
                         if prev_frame_time_total_us_max_5_seconds_last_reset.elapsed().as_secs() >= 5 {
@@ -2347,8 +2413,11 @@ pub fn main_thread_run_program(mut gui: Window, wallet_state: Arc<Mutex<wallet::
                         let frame_pace_us = last_call_to_present_instant.elapsed().as_micros() as u64;
                         last_call_to_present_instant = Instant::now();
 
-                        let need_buffer_flip = need_buffer_flip || ui.debug;
+                        let need_buffer_flip = script::pace_frame(frame_pace_us) || need_buffer_flip || ui.debug;
                         if need_buffer_flip {
+                            // A frame with the overlay on it matches no frame without, so turning
+                            // the overlay off still submits.
+                            shown_frame_hash = if ui.debug { 0 } else { frame_hash };
                             gui.submit();   // one present per vblank; this is what paces the next RENDER
                         }
 

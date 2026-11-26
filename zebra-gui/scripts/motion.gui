@@ -1,0 +1,36 @@
+# How the screen moves. `settle` draws frames until three in a row change nothing and fails if
+# the screen is still changing at its frame limit, so an animation that got much slower, or
+# never stops, fails here. Each `film` is one image of twelve frames in a row.
+
+# Start-up: the blocks fly in.
+film start 12
+settle 300
+
+# Scrolling the wallet history.
+move 200 500
+wheel -3
+film scroll_history 12 0 290 530 710
+settle 120
+wheel 3
+settle 120
+
+# A dialog opening and closing. `click` and `key` draw frames of their own, so a response is
+# timed from a bare press instead.
+hover "Send"
+down mouse
+up mouse
+settle 60
+expect "Send"
+down esc
+up esc
+settle 60
+
+# Panning and zooming the block view.
+move 960 500
+wheel -5
+film pan_blocks 12 530 0 934 1000
+settle 240
+down ctrl
+wheel 2
+up ctrl
+settle 240
