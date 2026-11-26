@@ -2,28 +2,28 @@
 //! authority/restart, and real localhost shared STP with receiver-selected frames.
 use ed25519_zebra::{SigningKey, VerificationKeyBytes};
 use std::{
+    collections::VecDeque,
     future::pending,
     net::{Ipv6Addr, UdpSocket},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tenderlink::{
-    d28::{
-        self,
-        durable::{DurableStore, Limits},
-        runtime::{self, AccessD28, HostCallbacks, RuntimeConfig},
-        AtomicBlockStore, Config, Emission, Engine, Frame, Group, Member, Proposal, Sink, Step,
-        Target, Timeouts,
-    },
-    stp::new_keypair_from_connect_magic1,
-    transport::SharedTransport,
     BlockValue, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b, ClosureToProposeNewBlock,
     ClosureToPushDecidedBlock, ClosureToReadDecidedTip, ClosureToUpdatePeers,
     ClosureToValidateProposedBlock, HostTip, STPAddress, SortedRosterMember, TMStatus,
     TMStatusReason, ValueId,
+    d28::{
+        self, AtomicBlockStore, Config, Emission, Engine, Frame, Group, Member, Proposal, Sink,
+        Step, Target, Timeouts,
+        durable::{DurableStore, Limits},
+        runtime::{self, AccessD28, HostCallbacks, RuntimeConfig},
+    },
+    stp::new_keypair_from_connect_magic1,
+    transport::{Consumer, NetworkThreadPush, SharedTransport, TransportStats},
 };
 use zcash_primitives::bft::{BftBlock, FatPointerToBftBlock, PubKeyID};
 
@@ -32,6 +32,7 @@ struct Disk {
     size: usize,
     image: Arc<Mutex<Option<Vec<u8>>>>,
     writes: Arc<AtomicUsize>,
+    deadline: Option<Instant>,
 }
 impl Disk {
     fn new(config: &RuntimeConfig) -> Self {
@@ -43,6 +44,7 @@ impl Disk {
             .unwrap(),
             image: Arc::new(Mutex::new(None)),
             writes: Arc::new(AtomicUsize::new(0)),
+            deadline: None,
         }
     }
 }
@@ -62,6 +64,14 @@ impl AtomicBlockStore for Disk {
         }
     }
     fn replace(&mut self, bytes: &[u8]) -> d28::Result<()> {
+        // Tokio cancellation cannot interrupt a synchronous catch-up loop.
+        // Only bounded liveness fixtures set this; expiry must fail the test.
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(d28::Error::Storage);
+        }
         if bytes.len() != self.size {
             return Err(d28::Error::Storage);
         }
@@ -392,6 +402,439 @@ fn four_real_localhost_finalizers_decide_while_host_pushes_are_pending() {
     });
 }
 
+#[derive(Default)]
+struct QuorumProgress {
+    snapshots: VecDeque<(u128, String)>,
+    decision: Option<(u64, d28::Id)>,
+    absent_voted: bool,
+}
+
+#[derive(Debug, Default)]
+struct BaseProgress {
+    services: usize,
+    control_received: usize,
+    bulk_received: usize,
+    transport: TransportStats,
+}
+
+async fn three_of_four_localhost_case(absent: usize, host_defaults: bool, with_base: bool) {
+    let started = Instant::now();
+    let deadline = Duration::from_secs(90);
+    let mut nodes: Vec<_> = (0..4).map(|_| Some(node())).collect();
+    let seeds: Vec<_> = nodes
+        .iter()
+        .map(|node| node.as_ref().unwrap().1.clone())
+        .collect();
+    // The fourth identity remains in the stake roster and seed list, but has
+    // neither a finalizer nor a listening STP endpoint for the entire case.
+    drop(nodes[absent].take().unwrap());
+    let pushes: Vec<_> = (0..4).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+    let progress: Vec<_> = (0..4)
+        .map(|_| Arc::new(Mutex::new(QuorumProgress::default())))
+        .collect();
+    let base_progress: Vec<_> = (0..4)
+        .map(|_| Arc::new(Mutex::new(BaseProgress::default())))
+        .collect();
+    let mut tasks = Vec::new();
+    let mut base_tasks = Vec::new();
+    let mut writes = Vec::new();
+    for (i, node) in nodes.into_iter().enumerate() {
+        let Some((transport, _)) = node else { continue };
+        // No discovered address can cause a dial outside this ephemeral loopback set.
+        transport.dial_only(seeds.iter().map(STPAddress::connection_key).collect());
+        let peers = seeds
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, address)| address.clone())
+            .collect();
+        let config = if host_defaults {
+            let config = RuntimeConfig::new(1, roster(4), [11; 32], 4, transport.clone(), peers);
+            assert_eq!(config.max_body, 1 << 20);
+            config
+        } else {
+            config(transport.clone(), roster(4), peers)
+        };
+        let c = core_config(&config);
+        assert!(c.quorum(3) && !c.quorum(2));
+        assert_eq!(
+            c.proposer(1, 0),
+            1,
+            "identity 1 is the absent-initial-proposer case"
+        );
+        let mut disk = Disk::new(&config);
+        disk.deadline = Some(started + deadline);
+        writes.push((i, disk.writes.clone()));
+        if with_base {
+            let mut base = transport.attach(Consumer::Base);
+            let observed = base_progress[i].clone();
+            base_tasks.push((
+                i,
+                tokio::spawn(async move {
+                    let mut push = NetworkThreadPush::default();
+                    loop {
+                        let pull = base.service(push).expect("Base shared transport stopped");
+                        {
+                            let mut observed = observed.lock().unwrap();
+                            observed.services += 1;
+                            for (_, message) in pull.received_unreliable_messages {
+                                assert_eq!(
+                                    message.len(),
+                                    2,
+                                    "unexpected Base test message: {message:?}"
+                                );
+                                assert!(usize::from(message[1]) < 4);
+                                assert_ne!(usize::from(message[1]), absent);
+                                assert_ne!(usize::from(message[1]), i);
+                                match message[0] {
+                                    1 => observed.control_received += 1,
+                                    2 => observed.bulk_received += 1,
+                                    _ => {
+                                        panic!("non-Base test traffic routed to Base: {message:?}")
+                                    }
+                                }
+                            }
+                            observed.transport = base.stats();
+                        }
+                        // Preserve every offered session: omitting one means killing it
+                        // for BOTH consumers. Exercise both actual Base send channels.
+                        push = NetworkThreadPush {
+                            send_unreliable: pull
+                                .current_connections
+                                .iter()
+                                .map(|(address, _)| (address.connection_key(), vec![1, i as u8]))
+                                .collect(),
+                            send_bulk: pull
+                                .current_connections
+                                .iter()
+                                .map(|(address, _)| (address.connection_key(), vec![2, i as u8]))
+                                .collect(),
+                            wanted_connections: pull.current_connections,
+                            ..Default::default()
+                        };
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                }),
+            ));
+        }
+        let mut callbacks = host(roster(4), pushes[i].clone());
+        callbacks.validate = ClosureToValidateProposedBlock(Arc::new(|_| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(45)).await;
+                (TMStatus::Pass, TMStatusReason::None)
+            })
+        }));
+        let observed = progress[i].clone();
+        callbacks.access = AccessD28(Arc::new(move |view, addresses| {
+            let votes = |rows: &[Option<d28::Vote>]| {
+                rows.iter()
+                    .flatten()
+                    .map(|v| {
+                        (
+                            v.content.signer,
+                            v.content.round,
+                            v.content.id.map(|id| hex::encode(&id[..4])),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let peers: Vec<_> = view
+                .roster
+                .iter()
+                .enumerate()
+                .filter(|(_, member)| addresses.contains_key(&member.pub_key))
+                .map(|(i, _)| i)
+                .collect();
+            let state = format!(
+                "h={} r={} step={:?} lock={:?} valid={:?} catching_up={} peers={peers:?} pv={:?} pc={:?} pending={:?} conflicts={}",
+                view.height,
+                view.round,
+                view.step,
+                view.locked_round,
+                view.valid_round,
+                view.catching_up,
+                votes(view.prevotes),
+                votes(view.precommits),
+                view.pending
+                    .as_ref()
+                    .map(|p| (p.round, hex::encode(&p.id[..4]))),
+                view.conflicts.len(),
+            );
+            let mut observed = observed.lock().unwrap();
+            observed.absent_voted |=
+                view.prevotes[absent].is_some() || view.precommits[absent].is_some();
+            if view.step == Step::Decided {
+                if let Some(pending) = &view.pending {
+                    observed.decision = Some((pending.round, pending.id));
+                }
+            }
+            if observed
+                .snapshots
+                .back()
+                .is_none_or(|(_, previous)| previous != &state)
+            {
+                if observed.snapshots.len() == 12 {
+                    observed.snapshots.pop_front();
+                }
+                observed
+                    .snapshots
+                    .push_back((started.elapsed().as_millis(), state));
+            }
+        }));
+        tasks.push((
+            i,
+            tokio::spawn(runtime::run(key(i), disk, config, callbacks)),
+        ));
+    }
+    let online: Vec<_> = (0..4).filter(|&i| i != absent).collect();
+    let reached = tokio::time::timeout(deadline, async {
+        loop {
+            if tasks.iter().any(|(_, task)| task.is_finished())
+                || base_tasks.iter().any(|(_, task)| task.is_finished())
+            {
+                return false;
+            }
+            if online.iter().all(|&i| {
+                pushes[i].load(Ordering::SeqCst) == 1
+                    && progress[i].lock().unwrap().decision.is_some()
+                    && (!with_base || {
+                        let base = base_progress[i].lock().unwrap();
+                        base.control_received > 0 && base.bulk_received > 0
+                    })
+            }) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    // Always tear down our tasks before asserting, including the timeout path.
+    let mut exits = Vec::new();
+    for (i, task) in tasks {
+        if task.is_finished() {
+            exits.push(format!("runtime {i}: {:?}", task.await));
+        } else {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+    for (i, task) in base_tasks {
+        if task.is_finished() {
+            exits.push(format!("Base {i}: {:?}", task.await));
+        } else {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+    let mut diagnostics = format!(
+        "absent={absent} initial_proposer_absent={} host_defaults={host_defaults} with_base={with_base} elapsed={:?} outcome={reached:?} exits={exits:?}",
+        absent == 1,
+        started.elapsed(),
+    );
+    for (i, writes) in writes {
+        diagnostics.push_str(&format!(
+            "\nnode {i}: pushes={} durable_writes={} Base={:?}",
+            pushes[i].load(Ordering::SeqCst),
+            writes.load(Ordering::SeqCst),
+            base_progress[i].lock().unwrap(),
+        ));
+        for (ms, snapshot) in &progress[i].lock().unwrap().snapshots {
+            diagnostics.push_str(&format!("\n  +{ms}ms {snapshot}"));
+        }
+    }
+    eprintln!("three-of-four STP: {diagnostics}");
+    assert!(
+        matches!(reached, Ok(true)) && exits.is_empty(),
+        "{diagnostics}"
+    );
+    let decision = progress[online[0]].lock().unwrap().decision.unwrap().1;
+    for i in online {
+        let observed = progress[i].lock().unwrap();
+        let (round, id) = observed.decision.unwrap();
+        assert_eq!(
+            id, decision,
+            "online nodes decided different values: {diagnostics}"
+        );
+        assert!(
+            !observed.absent_voted,
+            "absent identity contributed a vote: {diagnostics}"
+        );
+        if absent == 1 {
+            assert!(
+                round > 0,
+                "absent initial proposer must be skipped: {diagnostics}"
+            );
+        }
+    }
+}
+
+#[test]
+fn three_of_four_real_localhost_finalizers_each_absent_identity() {
+    executor().block_on(async {
+        for absent in [1, 0, 2, 3] {
+            three_of_four_localhost_case(absent, false, false).await;
+        }
+    });
+}
+
+// Full-sized durable images need an optimized build to exercise the production
+// timer budget, rather than the throughput of debug serialization and hashing.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "production-sized runtime timing: run with --release"
+)]
+fn three_of_four_real_localhost_finalizers_default_host_constants() {
+    executor().block_on(async {
+        for absent in [1, 0, 2, 3] {
+            three_of_four_localhost_case(absent, true, false).await;
+        }
+    });
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "production-sized runtime timing: run with --release"
+)]
+fn three_of_four_real_localhost_finalizers_default_host_constants_with_base() {
+    executor().block_on(async {
+        for absent in [1, 0, 2, 3] {
+            three_of_four_localhost_case(absent, true, true).await;
+        }
+    });
+}
+
+#[derive(Debug, Default)]
+struct SlowDiskTrace {
+    armed: bool,
+    guard_hit: bool,
+    writes_since_access: usize,
+    snapshots: Vec<(u128, u64, Step, usize, usize)>,
+}
+
+struct SlowDisk {
+    disk: Disk,
+    trace: Arc<Mutex<SlowDiskTrace>>,
+}
+impl SlowDisk {
+    const WRITE_DELAY: Duration = Duration::from_millis(30);
+}
+impl AtomicBlockStore for SlowDisk {
+    fn block_size(&self) -> usize {
+        self.disk.block_size()
+    }
+    fn load(&mut self, bytes: &mut [u8]) -> d28::Result<bool> {
+        self.disk.load(bytes)
+    }
+    fn replace(&mut self, bytes: &[u8]) -> d28::Result<()> {
+        let armed = {
+            let mut trace = self.trace.lock().unwrap();
+            if trace.armed {
+                trace.writes_since_access += 1;
+                // A synchronous elapse can prevent Tokio's timeout/cancellation
+                // from running. Stop runaway fixture work deterministically;
+                // hitting this guard is a test FAILURE, never a passing timeout.
+                if trace.writes_since_access > 64 {
+                    trace.guard_hit = true;
+                    return Err(d28::Error::Storage);
+                }
+            }
+            trace.armed
+        };
+        if armed {
+            std::thread::sleep(Self::WRITE_DELAY);
+        }
+        self.disk.replace(bytes)
+    }
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "production-sized runtime timing: run with --release"
+)]
+fn slow_durable_writes_yield_to_runtime_and_shared_transport_between_elapsed_slices() {
+    executor().block_on(async {
+        let (transport, _) = node();
+        // Keep production consensus deadlines and growth: only rho is shortened
+        // below the injected replacement delay. Sub-second synthetic consensus
+        // timers would instead measure full-image debug serialization throughput.
+        let mut config = RuntimeConfig::new(1, roster(1), [11; 32], 4, transport.clone(), vec![]);
+        assert_eq!(config.max_body, 1 << 20);
+        config.rho = 20;
+        assert!(Duration::from_millis(config.rho) < SlowDisk::WRITE_DELAY);
+        let disk = Disk::new(&config);
+        let writes = disk.writes.clone();
+        let trace = Arc::new(Mutex::new(SlowDiskTrace::default()));
+        let backend = SlowDisk { disk, trace: trace.clone() };
+        let mut base = transport.attach(Consumer::Base);
+        let base_services = Arc::new(AtomicUsize::new(0));
+        let services = base_services.clone();
+        let base_task = tokio::spawn(async move {
+            let mut push = NetworkThreadPush::default();
+            loop {
+                let pull = base.service(push).expect("Base transport stopped during slow storage");
+                assert!(pull.received_unreliable_messages.is_empty());
+                push = NetworkThreadPush {
+                    wanted_connections: pull.current_connections,
+                    ..Default::default()
+                };
+                services.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let mut callbacks = host(roster(1), Arc::new(AtomicUsize::new(0)));
+        callbacks.propose = ClosureToProposeNewBlock(Arc::new(|| Box::pin(pending())));
+        let started = Instant::now();
+        let observed = trace.clone();
+        let services = base_services.clone();
+        callbacks.access = AccessD28(Arc::new(move |view, _| {
+            let mut trace = observed.lock().unwrap();
+            let writes = trace.writes_since_access;
+            trace.snapshots.push((started.elapsed().as_millis(), view.round, view.step,
+                writes, services.load(Ordering::SeqCst)));
+            trace.writes_since_access = 0;
+            // Delay only after initialization, isolating online catch-up from boot.
+            trace.armed = true;
+        }));
+        let task = tokio::spawn(runtime::run(key(0), backend, config, callbacks));
+        let reached = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if task.is_finished() || base_task.is_finished() {
+                    return false;
+                }
+                if {
+                    let trace = trace.lock().unwrap();
+                    trace.snapshots.len() >= 40
+                        && trace.snapshots.last().is_some_and(|snapshot| snapshot.1 >= 1)
+                } {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await;
+        let exit = if task.is_finished() {
+            Some(format!("{:?}", task.await))
+        } else {
+            task.abort();
+            let _ = task.await;
+            None
+        };
+        let base_finished = base_task.is_finished();
+        base_task.abort();
+        let base_exit = base_task.await;
+        let trace = trace.lock().unwrap();
+        eprintln!("slow durable runtime: outcome={reached:?} exit={exit:?} writes={} Base_services={} Base_exit={base_exit:?} trace={trace:?}",
+            writes.load(Ordering::SeqCst), base_services.load(Ordering::SeqCst));
+        assert!(matches!(reached, Ok(true)), "slow durable storage starved runtime access: {trace:?}; {exit:?}");
+        assert!(exit.is_none() && !base_finished, "runtime or Base exited: {exit:?}; {base_exit:?}");
+        assert!(!trace.guard_hit, "elapsed catch-up exceeded the per-service write guard: {trace:?}");
+        assert!(trace.snapshots.last().unwrap().1 >= 1, "consensus timers stopped: {trace:?}");
+        assert!(base_services.load(Ordering::SeqCst) >= 10, "Base service starved: {trace:?}");
+    });
+}
+
 #[test]
 fn unrepresentable_chain_height_is_refused_without_signing() {
     executor().block_on(async {
@@ -564,9 +1007,11 @@ fn completed_decision_is_published_before_host_acknowledgment_retires_height() {
         .await;
         let log = snapshots.lock().unwrap();
         let new_height = log.iter().position(|(height, _)| *height == 2).unwrap();
-        assert!(log[..new_height]
-            .iter()
-            .any(|&(height, pending)| height == 1 && pending));
+        assert!(
+            log[..new_height]
+                .iter()
+                .any(|&(height, pending)| height == 1 && pending)
+        );
         drop(log);
         task.abort();
         let _ = task.await;
