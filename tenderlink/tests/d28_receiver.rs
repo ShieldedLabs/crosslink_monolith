@@ -771,6 +771,12 @@ fn latest_request_snapshot_serves_current_polka_without_asserting_body_validity(
     );
     drop(permit);
     assert_eq!((rx.in_use(), rx.high_water()), (0, 1));
+    replies.owned.clear();
+    assert_eq!(
+        sender.outstanding(),
+        0,
+        "TX capacity must not mask token replay"
+    );
     assert!(sender.poll(&source, 2, &mut replies).unwrap().is_empty());
     assert_eq!(
         replies.calls.len(),
