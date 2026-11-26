@@ -658,8 +658,8 @@ fn fat_pointer_digest_at_switches_on_at_featurenet_upgrade_2() {
     assert_eq!(fat_pointer_digest_at(&scheduled, Height(11), &pointer), fat_pointer_digest(&pointer));
 }
 
-/// BftFirst from FeaturenetUpgrade5: `bft_info` and `rest` reproduce the commitment. Earlier
-/// heights and null pointers keep the old one.
+/// Tests that BftFirst blocks use the `bft_info` layout, and that earlier heights and null
+/// pointers keep ZIP 244.
 #[test]
 fn block_commitments_use_the_bft_info_layout_from_featurenet_upgrade_5() {
     use crate::{

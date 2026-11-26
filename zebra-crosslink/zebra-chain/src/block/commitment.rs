@@ -386,8 +386,8 @@ pub fn uses_bft_info_commitment(
     ) && *fat_pointer != FatPointerToBftBlock::null()
 }
 
-/// The `hashBlockCommitments` a block must carry: BftFirst where it applies, else ZIP 244 with
-/// [`fat_pointer_digest_at`].
+/// Returns a block's `hashBlockCommitments`: BftFirst from FeaturenetUpgrade5 if the fat pointer
+/// is non-null, else ZIP 244.
 pub fn block_commitments_at(
     network: &Network,
     height: block::Height,

@@ -511,30 +511,20 @@ impl Parameters for MainNetwork {
     }
 }
 
-/// The Crosslink testnet activation height of [`NetworkUpgrade::FeaturenetUpgrade1`]. The node's
-/// Testnet and Regtest schedules take it from here, so the node and the wallet, which builds
-/// against [`TestNetwork`], cannot disagree on which branch ID a height uses.
+/// The Crosslink testnet activation height of [`NetworkUpgrade::FeaturenetUpgrade1`].
 pub const TESTNET_FEATURENET_UPGRADE_1_HEIGHT: u32 = 55_296;
 
-/// The Crosslink testnet activation height of [`NetworkUpgrade::FeaturenetUpgrade2`], or `None`
-/// while it is unscheduled. This is the one place to schedule it: the node's Testnet schedule, the
-/// Regtest default and the wallet's [`TestNetwork`] all take it from here, so they cannot disagree
-/// on which branch ID a height uses.
+/// The Crosslink testnet activation height of [`NetworkUpgrade::FeaturenetUpgrade2`].
 pub const TESTNET_FEATURENET_UPGRADE_2_HEIGHT: Option<u32> = Some(165_000);
 
-/// The Crosslink testnet activation height of [`NetworkUpgrade::FeaturenetUpgrade3`], or `None`
-/// while it is unscheduled. This is the one place to schedule it: the node's Testnet schedule, the
-/// Regtest default and the wallet's [`TestNetwork`] all take it from here, so they cannot disagree
-/// on which branch ID a height uses.
+/// The Crosslink testnet activation height of [`NetworkUpgrade::FeaturenetUpgrade3`].
 pub const TESTNET_FEATURENET_UPGRADE_3_HEIGHT: Option<u32> = Some(189_000);
 
-/// The Crosslink testnet activation height of [`NetworkUpgrade::FeaturenetUpgrade4`], or `None`
-/// while it is unscheduled. This is the one place to schedule it: the node's Testnet schedule, the
-/// Regtest default and the wallet's [`TestNetwork`] all take it from here, so they cannot disagree
-/// on which branch ID a height uses.
+/// The Crosslink testnet activation height of [`NetworkUpgrade::FeaturenetUpgrade4`].
 pub const TESTNET_FEATURENET_UPGRADE_4_HEIGHT: Option<u32> = Some(213_000);
 
-/// Testnet activation height of [`NetworkUpgrade::FeaturenetUpgrade5`]; `None` while unscheduled.
+/// Testnet activation height of [`NetworkUpgrade::FeaturenetUpgrade5`], or `None` while
+/// unscheduled.
 pub const TESTNET_FEATURENET_UPGRADE_5_HEIGHT: Option<u32> = None;
 
 /// Marker struct for the test network.
