@@ -39,6 +39,35 @@ pub mod distributed;
 
 const NAMESPACE: [u8; 32] = [0x28; 32];
 
+/// Opt-in benchmark geometry only; production `PROPOSAL_MAX_SIZE` stays 1 MiB.
+pub const BENCH_MAX_BODY: usize = 10 * 1024 * 1024;
+
+/// Admit a bounded complete evidence frame, not just its body. Keep the wrapper's
+/// existing defaults for legacy 1 MiB runs; no production transport limit changes.
+fn bench_transport_limits(nodes: usize, max_body: usize) -> io::Result<crate::transport::TransportLimits> {
+    if !(1..=128).contains(&nodes) || !(1..=BENCH_MAX_BODY).contains(&max_body) {
+        return Err(invalid("invalid benchmark transport geometry"));
+    }
+    let frame = super::wire::Limits { max_members: nodes, max_body }
+        .max_frame_bytes()
+        .map_err(|_| invalid("invalid benchmark frame bound"))?;
+    let mut limits = crate::transport::TransportLimits::default();
+    if max_body > crate::PROPOSAL_MAX_SIZE {
+        // Completed-message slots are count-bounded, not byte-bounded. Avoid
+        // allowing 4096 large frames in the native ring on a 2 GiB test VM.
+        limits.rings.receive = 32;
+    }
+    limits.max_message_size = limits.max_message_size.max(frame);
+    // Leave control-message slack beyond a full frame (16 MiB for 10 MiB bodies).
+    let queue = frame.next_power_of_two();
+    limits.peer_outbox_bytes = limits.peer_outbox_bytes.max(queue);
+    limits.consumer_inbox_peer_bytes = limits.consumer_inbox_peer_bytes.max(queue);
+    limits.consumer_inbox_bytes = limits.consumer_inbox_bytes.max(queue);
+    // STP permits one oversized-to-target message in an empty send queue. Keep
+    // its 8 MiB backlog target and 512 KiB high-water gating unchanged.
+    Ok(limits)
+}
+
 /// Finite work and allocation limits; `heights` excludes `warmup` heights.
 #[derive(Clone, Debug, Serialize)]
 pub struct BenchConfig {
@@ -92,11 +121,11 @@ impl BenchConfig {
             || self.host_delay_ms > 60_000
             || self.store_delay_ms > 60_000
             || self.chatter_secs > 3_600
-            || !(1..=16 * 1024 * 1024).contains(&self.max_body)
+            || !(1..=BENCH_MAX_BODY).contains(&self.max_body)
             || self.headers > 2_048
         {
             return Err(invalid(
-                "invalid benchmark bounds: total heights 1..10000, timeout 1..86400s, workers 1..128, delays <=60000ms, chatter <=3600s, max-body 1..16MiB, headers <=2048",
+                "invalid benchmark bounds: total heights 1..10000, timeout 1..86400s, workers 1..128, delays <=60000ms, chatter <=3600s, max-body 1..10MiB, headers <=2048",
             ));
         }
         // Reserve a full-N parent certificate, not just the likely minimum quorum.
@@ -1113,6 +1142,7 @@ async fn run_inner(
         .map(|s| s.local_addr().map(|a| a.port()))
         .collect::<io::Result<_>>()?;
     drop(reservations);
+    let transport_limits = bench_transport_limits(config.nodes, config.max_body)?;
     let transports: Vec<_> = identities
         .into_iter()
         .zip(ports.iter().copied())
@@ -1122,7 +1152,7 @@ async fn run_inner(
                 port,
                 None,
                 (1_000_000, 512 * 1024, 8 << 20),
-                crate::transport::TransportLimits::default(),
+                transport_limits.clone(),
                 std::net::IpAddr::V6(Ipv6Addr::LOCALHOST),
             )
         })
@@ -1386,7 +1416,7 @@ async fn run_inner(
         runtime_settings,
         transport_settings: format!(
             "send_buffer_params=(1000000,524288,8388608); max_pps=None; limits={:?}; peer_high_water_bytes clamped to min buffer=524288",
-            crate::transport::TransportLimits::default()
+            transport_limits
         ),
         nodes: (0..config.nodes)
             .map(|i| {
@@ -1430,7 +1460,7 @@ async fn run_inner(
 mod tests {
     use super::*;
     use zcash_primitives::bft::{Blake3Hash, FatPointerSignature, Vote};
-    fn pointer(n: usize, signers: &[usize], height: u64, id: ValueId) -> FatPointerToBftBlock {
+    pub(super) fn pointer(n: usize, signers: &[usize], height: u64, id: ValueId) -> FatPointerToBftBlock {
         let signatures: Vec<_> = signers
             .iter()
             .map(|&i| {
@@ -1452,6 +1482,29 @@ mod tests {
             })
             .collect();
         FatPointerToBftBlock::from_parts(Blake3Hash(id.0), height, 0, &signatures)
+    }
+    #[test]
+    fn benchmark_body_and_transport_caps_leave_production_defaults_unchanged() {
+        assert_eq!(BenchConfig::default().max_body, crate::PROPOSAL_MAX_SIZE);
+        assert_eq!(crate::PROPOSAL_MAX_SIZE, 1024 * 1024);
+        let defaults = crate::transport::TransportLimits::default();
+        let legacy = bench_transport_limits(7, crate::PROPOSAL_MAX_SIZE).unwrap();
+        assert_eq!(format!("{legacy:?}"), format!("{defaults:?}"));
+        let limits = bench_transport_limits(7, BENCH_MAX_BODY).unwrap();
+        let frame = super::super::wire::Limits { max_members: 7, max_body: BENCH_MAX_BODY }
+            .max_frame_bytes().unwrap();
+        assert_eq!(frame, BENCH_MAX_BODY + 1499);
+        assert_eq!(limits.max_message_size, frame);
+        assert_eq!(limits.peer_outbox_bytes, 16 << 20);
+        assert_eq!(limits.consumer_inbox_peer_bytes, 16 << 20);
+        assert_eq!(limits.consumer_inbox_bytes, 64 << 20);
+        assert_eq!(limits.peer_high_water_bytes, 512 * 1024);
+        assert_eq!((limits.rings.send, limits.rings.control, limits.rings.receive), (1024, 256, 32));
+        let mut config = BenchConfig { max_body: BENCH_MAX_BODY, ..Default::default() };
+        assert!(config.validate().is_ok());
+        config.max_body += 1;
+        assert!(config.validate().is_err());
+        assert!(bench_transport_limits(7, config.max_body).is_err());
     }
     #[test]
     fn bounds_preserve_strict_full_roster_quorum_and_body_limit() {

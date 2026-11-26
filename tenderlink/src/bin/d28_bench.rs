@@ -11,8 +11,14 @@ Real D28/STP/crypto/durable-image mock-chain benchmark.
 Default: all validators on localhost. --distributed: one validator per process,
 exact private IPv6 peer roster and strict JSONL all-online ACK controller;
 configuration comes only from CONFIG.json, not mixed component CLI flags.
-Distributed-only solution_bytes pads existing synthetic headers (0..1344);
-headers <=2048 and actual full-roster-parent body <=max_body are always checked.
+Distributed body_bytes defaults to 0 (legacy headers + solution_bytes 0..1344).
+Positive body_bytes targets the EXACT serialized body including its parent certificate:
+use headers=32, solution_bytes=0, max_body=10485760 for a size sweep through 10 MiB.
+Distributed nodes <=32, byte-mode headers 1..2048; full-roster parent must fit.
+Mock solution padding uses unchanged parsing/serialization, NOT valid Equihash work.
+Distributed timing_profile defaults to production; explicit wan changes benchmark
+base timers to 10000/5000/7000ms, request timeout10000ms and status expiry15000ms.
+Rho, round increments, production limits and defaults remain unchanged.
 No PoW, ledger, physical persistence, transactions, or TPS claims.
 Component defaults: 4 nodes, 0 offline, 30 measured heights + 3 warmup, 32 headers,
 180 second whole-run deadline, 4 executor workers, zero artificial delays,
@@ -93,14 +99,32 @@ fn write_report(path: Option<&PathBuf>, report: &impl serde::Serialize) -> Resul
         return Ok(());
     };
     let write = || -> Result<(), Box<dyn std::error::Error>> {
-        // Refuse to overwrite an earlier result, especially a matrix trial.
+        // A killed writer must not leave a truncated final report. Publish a
+        // complete sibling with an atomic no-replace hard link; plain rename
+        // could clobber an earlier trial's report after a check/create race.
+        let mut name = path.file_name().ok_or("report path has no filename")?.to_os_string();
+        name.push(format!(".partial-{}", std::process::id()));
+        let temporary = path.with_file_name(name);
         let mut output = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(path)?;
-        serde_json::to_writer_pretty(&mut output, report)?;
-        output.write_all(b"\n")?;
-        output.flush()?;
+            .open(&temporary)?;
+        let written = (|| -> Result<(), Box<dyn std::error::Error>> {
+            serde_json::to_writer_pretty(&mut output, report)?;
+            output.write_all(b"\n")?;
+            output.flush()?;
+            Ok(())
+        })();
+        drop(output);
+        let published = written.and_then(|()| {
+            std::fs::hard_link(&temporary, path)?;
+            Ok(())
+        });
+        // Only our create_new-owned temporary is eligible for cleanup. An
+        // interrupted process may leave a .partial file, never a partial report.
+        let cleanup = std::fs::remove_file(&temporary);
+        published?;
+        cleanup?;
         Ok(())
     };
     write().map_err(|e| format!("JSON {}: {e}", path.display()))
@@ -237,6 +261,37 @@ mod tests {
     use super::*;
     fn args(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_owned).collect()
+    }
+    #[test]
+    fn report_publication_is_complete_and_never_clobbers() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")
+            .join(format!("atomic-report-test-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("report.json");
+        let expected = serde_json::json!({"status":"complete", "heights":[1, 2, 3]});
+        write_report(Some(&path), &expected).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&original).unwrap(), expected);
+        assert!(write_report(Some(&path), &serde_json::json!({"replaced":true})).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        struct Fails;
+        impl serde::Serialize for Fails {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("injected serialization failure"))
+            }
+        }
+        let failed = dir.join("failed.json");
+        assert!(write_report(Some(&failed), &Fails).is_err());
+        assert!(!failed.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let stale = dir.join(format!("failed.json.partial-{}", std::process::id()));
+        std::fs::write(&stale, b"preexisting temporary").unwrap();
+        assert!(write_report(Some(&failed), &expected).is_err());
+        assert!(!failed.exists());
+        assert_eq!(std::fs::read(&stale).unwrap(), b"preexisting temporary");
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn parser_and_safety_bounds() {
