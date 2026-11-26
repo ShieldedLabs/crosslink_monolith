@@ -21,6 +21,8 @@
 use super::*;
 use std::collections::HashMap;
 
+pub mod receiver;
+
 /// The state-changing gap a frame was chosen to close, strongest first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gap {
