@@ -701,7 +701,7 @@ impl Context {
             child_gap: self.scale(8.0),
             padding: self.scale(10.0).dup4(),
             radius: radius.dup4(),
-            align: Center,
+            align: Left,
             direction: LeftToRight,
             width,
             height: fit!(radius * 2.0),
@@ -999,9 +999,9 @@ impl Context {
         text
     }
 
-    pub fn slider(&mut self, id: Id, value: f32, horizontal: bool) -> f32 {
+    pub fn slider(&mut self, id: Id, value: f32, horizontal: bool, length: Sizing) -> f32 {
         let track_thickness = self.scale(10.0);
-        let track_length = self.scale(96.0);
+        let grab_thickness = self.scale(24.0);
         let mut new_value = value;
         let mouse_hover = self.hovered_raw(id);
         self.log_target(id, true, true, "");
@@ -1027,22 +1027,29 @@ impl Context {
         let fill_colour = if active { (0x55, 0x95, 0xdf, 0xff) } else { (0x3a, 0x7a, 0xc7, 0xff) };
         if let _ = elem().decl(Decl {
             id,
-            colour: track_colour,
-            radius: (track_thickness / 2.0).dup4(),
-            width: if horizontal { fixed!(track_length) } else { fixed!(track_thickness) },
-            height: if horizontal { fixed!(track_thickness) } else { fixed!(track_length) },
-            direction: if horizontal { LeftToRight } else { TopToBottom },
-            align: if horizontal { Left } else { Bottom },
-            clip: if horizontal { ClipX } else { ClipY },
+            width: if horizontal { length } else { fixed!(grab_thickness) },
+            height: if horizontal { fixed!(grab_thickness) } else { length },
+            align: Center,
             ..Decl
         }) {
             if let _ = elem().decl(Decl {
-                colour: fill_colour,
+                colour: track_colour,
                 radius: (track_thickness / 2.0).dup4(),
-                width: if horizontal { Sizing::Percent(new_value) } else { grow!() },
-                height: if horizontal { grow!() } else { Sizing::Percent(new_value) },
+                width: if horizontal { grow!() } else { fixed!(track_thickness) },
+                height: if horizontal { fixed!(track_thickness) } else { grow!() },
+                direction: if horizontal { LeftToRight } else { TopToBottom },
+                align: if horizontal { Left } else { Bottom },
+                clip: if horizontal { ClipX } else { ClipY },
                 ..Decl
-            }) {}
+            }) {
+                if let _ = elem().decl(Decl {
+                    colour: fill_colour,
+                    radius: (track_thickness / 2.0).dup4(),
+                    width: if horizontal { Sizing::Percent(new_value) } else { grow!() },
+                    height: if horizontal { grow!() } else { Sizing::Percent(new_value) },
+                    ..Decl
+                }) {}
+            }
         }
         new_value
     }
@@ -4588,9 +4595,9 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
 
                     let combo_id = id("Network Health Combo");
-                    // Closed, the card is as wide as its controls. Open, it widens to the details it
-                    // drops down, and both keep that width while the window resizes until the room
-                    // between the height strips is narrower.
+                    // Closed, the card is as wide as its controls need. Open, it widens to the details
+                    // it drops down, and both keep that width while the window resizes until the room
+                    // between the height strips is narrower. Each row fills the width from one left edge.
                     let base = BUTTON_GREY.mul(0.85);
                     let (net_activated, colour, _) = ui.button_ex(true, base, combo_id, true, CursorIcon::Pointer);
                     let net_open = ui.openable(data, combo_id, net_activated, false);
@@ -4601,11 +4608,11 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     if let _ = elem().decl(Decl {
                         colour: card_col,
                         radius: ui.scale(16.0).dup4(),
-                        padding: (ui.scale(8.0), ui.scale(12.0), ui.scale(8.0), ui.scale(12.0)),
+                        padding: ui.scale(8.0).dup4(),
                         direction: TopToBottom,
                         align: TopLeft,
                         child_gap: ui.scale(6.0),
-                        width: if net_open { fixed!(card_w) } else { fit!() },
+                        width: fixed!(if net_open { card_w } else { ui.scale(240.0) }),
                         height: fit!(),
                         ..Decl
                     }) {
@@ -4616,16 +4623,17 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             child_gap: ui.scale(8.0),
                             padding: ui.scale(10.0).dup4(),
                             direction: LeftToRight,
-                            align: Center,
-                            width: fit!(),
+                            align: Left,
+                            width: grow!(),
                             height: fit!(),
                             ..Decl
                         }) {
-                            ui.text("Network Info", TextDecl { h: ui.scale(TEXT_BODY), colour: WHITE.mul(0.75), align: AlignX::Center, ..TextDecl });
-                            ui.text(ICON_DOWN_OPEN, TextDecl { font: Icons, h: ui.scale(TEXT_SMALL), colour: WHITE.mul(0.6), align: AlignX::Center, ..TextDecl });
+                            ui.text("Network Info", TextDecl { h: ui.scale(TEXT_BODY), colour: WHITE.mul(0.75), align: AlignX::Left, ..TextDecl });
+                            let _ = elem().decl(Decl { width: grow!(), ..Decl });
+                            ui.text(if net_open { ICON_UP_OPEN_1 } else { ICON_DOWN_OPEN }, TextDecl { font: Icons, h: ui.scale(TEXT_SMALL), colour: WHITE.mul(0.6), align: AlignX::Center, ..TextDecl });
                         }
                         if ui.hovered(combo_id) {
-                            set_tooltip_text!(data, "Click to expand.");
+                            if net_open { set_tooltip_text!(data, "Click to collapse"); } else { set_tooltip_text!(data, "Click to expand"); }
                         }
 
                         if let _ = elem().decl(Decl {
@@ -4648,10 +4656,10 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                         }) {}
 
                         if let _ = elem().decl(Decl {
-                            padding: (ui.scale(7.0), ui.scale(8.0), ui.scale(7.0), ui.scale(8.0)),
+                            padding: (0.0, 0.0, ui.scale(2.0), ui.scale(2.0)),
                             child_gap: ui.scale(8.0),
                             direction: LeftToRight,
-                            align: Center,
+                            align: Left,
                             width: grow!(),
                             height: fit!(),
                             ..Decl
@@ -4666,26 +4674,27 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                 radius: ui.scale(16.0).dup4(),
                                 padding: (ui.scale(8.0), ui.scale(10.0), ui.scale(8.0), ui.scale(10.0)),
                                 child_gap,
-                                align: Center,
+                                align: Left,
                                 direction: TopToBottom,
-                                width: fixed!(ui.scale(48.0)),
+                                width: fit!(),
                                 height: fit!(),
                                 ..Decl
                             }) {
-                                ui.text(icon, TextDecl { font: Icons, colour: WHITE.mul(0.95), h: ui.scale(TEXT_HEADING), align: AlignX::Center, ..TextDecl });
+                                ui.text(icon, TextDecl { font: Icons, colour: WHITE.mul(0.95), h: ui.scale(TEXT_BODY), align: AlignX::Left, ..TextDecl });
                             }
                             if clicked {
                                 if ui.global_audio_volume > 0.01 { ui.global_audio_volume = 0.0 } else { ui.global_audio_volume = 1.0 };
                             }
                             ui.nav_skip = false; // @Hack.
-                            ui.global_audio_volume = ui.slider(id("Volume Slider"), ui.global_audio_volume, true);
+                            ui.global_audio_volume = ui.slider(id("Volume Slider"), ui.global_audio_volume, true, grow!());
                             let volume_pct = (ui.global_audio_volume * 100.0).round() as u32;
                             if let _ = elem().decl(Decl {
                                 width: fixed!(ui.scale(42.0)),
                                 height: fit!(),
+                                padding: (0.0, ui.scale(10.0), 0.0, 0.0),
                                 ..Decl
                             }) {
-                                ui.text(frame_strf!(data, "{}%", volume_pct), TextDecl { font: Mono, h: ui.scale(TEXT_BODY), align: AlignX::Center, colour: WHITE.mul(0.8), ..TextDecl });
+                                ui.text(frame_strf!(data, "{}%", volume_pct), TextDecl { font: Mono, h: ui.scale(TEXT_BODY), align: AlignX::Right, colour: WHITE.mul(0.8), ..TextDecl });
                             }
                         }
 
