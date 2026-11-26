@@ -197,6 +197,14 @@ def render(template, root, index, args, peers, discovery=False):
     return text
 
 
+def pow_hash_display(raw):
+    # GetBlockHeightAndHashResponse embeds block::Hash's raw serde byte array;
+    # getblockhash wraps the same Hash in hex's reversed display-byte encoding.
+    require(isinstance(raw, list) and len(raw) == 32
+            and all(type(b) is int and 0 <= b <= 255 for b in raw), "malformed finalized PoW hash")
+    return bytes(raw)[::-1].hex()
+
+
 def certificate(pointer):
     if pointer is None:
         return {"height": 0, "hash": None, "round": 0, "signers": 0}
@@ -392,7 +400,9 @@ class Network:
             if final:
                 require(final["height"] <= height, "finalized height exceeds PoW tip")
                 expected = self.source.rpc("getblockhash", [final["height"]])
-                require(final["hash"] == expected, f"node{node.index} finalized a different PoW chain")
+                actual = pow_hash_display(final["hash"])
+                require(actual == expected,
+                        f"node{node.index} finalized a different PoW chain at {final['height']}: {actual} != {expected}")
             rows.append({"node": node.index, "pow_height": height, "final": final,
                          "certificate": cert, "pointer": pointer})
         if rows:
@@ -662,6 +672,14 @@ def selftest():
                     pin_binary(source, out)
                 self.assertEqual(pinned.read_bytes(), b"first executable")
 
+        def test_final_hash_uses_existing_rpc_byte_order(self):
+            raw = list(range(32))
+            self.assertEqual(pow_hash_display(raw), bytes(raw)[::-1].hex())
+            self.assertNotEqual(pow_hash_display(raw), bytes(raw).hex())
+            for invalid in (raw[:-1], raw + [0], [True] * 32, [256] * 32, "not a byte array"):
+                with self.assertRaises(Failure):
+                    pow_hash_display(invalid)
+
         def test_output_refusal(self):
             with tempfile.TemporaryDirectory(prefix="d28-selftest-") as temp:
                 root = Path(temp)
@@ -785,11 +803,11 @@ def selftest():
                         return None
                     if method == "get_tfl_final_block_height_and_hash":
                         seen_finality.append(True)
-                        return {"height": 20, "hash": "same-chain"}
+                        return {"height": 20, "hash": list(range(32))}
                     if method == "getblockcount":
                         return 30 if seen_finality else 10
                     if method == "getblockhash":
-                        return "same-chain"
+                        return bytes(range(32))[::-1].hex()
                     self.fail(f"unexpected RPC {method}")
                 fake = mock.Mock(index=0, proc=object())
                 fake.rpc.side_effect = rpc
