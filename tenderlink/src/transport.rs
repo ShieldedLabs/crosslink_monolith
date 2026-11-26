@@ -458,8 +458,36 @@ impl SharedTransport {
         send_buffer_params: (u32, u32, u32),
         limits: TransportLimits,
     ) -> Self {
+        Self::bind(keypairs, port, max_pps, send_buffer_params, limits, None)
+    }
+
+    /// Bind only this local IP, rather than all interfaces. Useful for isolated
+    /// component hosts; this does not change the permitted outgoing peer set.
+    pub fn with_bind_ip(
+        keypairs: Vec<IdentityKeyPair>,
+        port: u16,
+        max_pps: Option<u64>,
+        send_buffer_params: (u32, u32, u32),
+        limits: TransportLimits,
+        bind_ip: std::net::IpAddr,
+    ) -> Self {
+        Self::bind(keypairs, port, max_pps, send_buffer_params, limits, Some(bind_ip))
+    }
+
+    fn bind(
+        keypairs: Vec<IdentityKeyPair>,
+        port: u16,
+        max_pps: Option<u64>,
+        send_buffer_params: (u32, u32, u32),
+        limits: TransportLimits,
+        bind_ip: Option<std::net::IpAddr>,
+    ) -> Self {
+        let (mut handle, pump) = NetworkThreadHandle::new_unstarted_on(
+            keypairs, port, max_pps, send_buffer_params, limits, bind_ip,
+        );
+        handle.pump = PumpThread::start(pump, port);
         let hub = Arc::new(Mutex::new(Hub {
-            handle: NetworkThreadHandle::new(keypairs, port, max_pps, send_buffer_params, limits),
+            handle,
             consumers: Default::default(),
             redial: HashMap::new(),
             lock_times: Default::default(),
@@ -720,7 +748,18 @@ impl NetworkThreadHandle {
         port: u16,
         max_pps: Option<u64>,
         send_buffer_params: (u32, u32, u32),
+        limits: TransportLimits,
+    ) -> (Self, Pump) {
+        Self::new_unstarted_on(keypairs, port, max_pps, send_buffer_params, limits, None)
+    }
+
+    fn new_unstarted_on(
+        keypairs: Vec<IdentityKeyPair>,
+        port: u16,
+        max_pps: Option<u64>,
+        send_buffer_params: (u32, u32, u32),
         mut limits: TransportLimits,
+        bind_ip: Option<std::net::IpAddr>,
     ) -> (Self, Pump) {
         // The core's per-peer queue capacity never drops below min(min, max) of these bounds.
         let core_floor = send_buffer_params.1.min(send_buffer_params.2) as u64;
@@ -735,6 +774,7 @@ impl NetworkThreadHandle {
             NetworkThreadOptions {
                 rings: limits.rings.clone(),
                 send_queue_count: Channel::ALL.len(),
+                bind_ip,
                 ..Default::default()
             },
         );
@@ -1148,6 +1188,26 @@ mod tests {
     fn free_port() -> u16 {
         let probe = std::net::UdpSocket::bind("[::1]:0").unwrap();
         probe.local_addr().unwrap().port()
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn explicit_loopback_bind_is_not_a_wildcard_listener() {
+        let key = new_keypair_from_connect_magic1(
+            CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b,
+        ).unwrap();
+        let port = free_port();
+        let transport = SharedTransport::with_bind_ip(
+            vec![key], port, None, (1_000_000, 512 * 1024, 32 << 20),
+            TransportLimits::default(), std::net::IpAddr::V6(Ipv6Addr::LOCALHOST),
+        );
+        // The default dual-stack wildcard listener would claim this port too.
+        let ipv4 = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        let sockets = std::fs::read_to_string("/proc/net/udp6").unwrap();
+        let local = format!("00000000000000000000000001000000:{port:04X}");
+        assert!(sockets.lines().any(|line| line.split_whitespace().nth(1) == Some(&local)));
+        drop(ipv4);
+        drop(transport);
     }
 
     fn node(limits: TransportLimits) -> (NetworkThreadHandle, STPAddress) {
