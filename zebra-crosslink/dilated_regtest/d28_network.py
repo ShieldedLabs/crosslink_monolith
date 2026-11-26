@@ -16,7 +16,8 @@ chain, config, process, or output directory is removed. Each node has fresh stat
 identity, ports and boot logs. Only node 0 mines (generate RPC); its wallet funds
 four equal finalizers using the existing faucet/staking RPCs. Peers form a static
 full mesh. The short calendar and 90x clock come from node0.toml.in. Existing
-FeaturenetUpgrade2 rules activate at height 1 to exercise the certificate gate.
+FeaturenetUpgrade2 rules activate at the roster snapshot (300), after wallet
+funding/bonding, so the first D28 height already uses the strict certificate gate.
 
 Default: all nodes make progress, then one finalizer restarts on the same state.
 --late-finalizer withholds the last node until the other three decide; its only
@@ -165,7 +166,9 @@ def render(template, root, index, args, peers, discovery=False):
             "initial_mainnet_peers": [], "initial_testnet_peers": [],
             "listen_addr": f"127.0.0.1:{p['p2p']}",
         },
-        "network.testnet_parameters.activation_heights": {"FeaturenetUpgrade2": 1},
+        # Keep wallet funding on its default transaction branch, then activate
+        # strict certificates at the first roster snapshot, before BFT starts.
+        "network.testnet_parameters.activation_heights": {"FeaturenetUpgrade2": ROSTER},
         "rpc": {"listen_addr": f"127.0.0.1:{p['rpc']}", "enable_cookie_auth": False,
                 "cookie_dir": str(node / "state")},
         "state": {"cache_dir": str(node / "state"), "ephemeral": False,
@@ -426,13 +429,23 @@ class Network:
 
     def fund_and_bond(self):
         wallet = self.wait("wallet's first sync", lambda: self.source.rpc("wallet_spendable_funds"))
-        self.mine_to(4)
+        # The faucet spends shielded notes, not freshly mined coinbase. Follow
+        # wallet_notes.py: mature one automatic 10 cTAZ shield before queuing a
+        # donation, since an unfunded request can otherwise be consumed once.
+        self.mine_to(40)
+        self.wait("miner shield in mempool", lambda: self.source.rpc("getrawmempool"))
+        self.mine_to(self.source.rpc("getblockcount") + 3)
+        self.wait("wallet scans mature miner shield", lambda:
+                  self.source.rpc("wallet_spendable_funds")["tip_height"] >= self.source.rpc("getblockcount"))
+        time.sleep(2)
         # One faucet payment is 0.5 cTAZ; support 4..8 nodes without changing bond sizes.
         for _ in range((self.args.nodes + 3) // 4):
             before = self.source.rpc("wallet_spendable_funds")["spendable_zats"]
             self.source.rpc("requestfaucetdonation", [{"address": wallet["address"]}],
                             timeout=self.args.phase_timeout)
-            self.wait("faucet transaction in mempool", lambda: self.source.rpc("getrawmempool"))
+            self.wait("faucet transaction in mempool", lambda:
+                      self.source.rpc("wallet_spendable_funds")["pending_zats"] >= 50_000_000
+                      and self.source.rpc("getrawmempool"))
             self.wait("faucet funds mature", lambda: self.source.rpc("wallet_spendable_funds")["spendable_zats"] > before,
                       mine=True, max_height=STAKING - 1)
         self.wait("funds for all bonds and fees", lambda: self.source.rpc("wallet_spendable_funds")["spendable_zats"] >= self.args.nodes * BOND + 1_000_000)
@@ -473,7 +486,7 @@ class Network:
                     f"node{node.index} did not start the required D28 runtime")
             info = node.rpc("getblockchaininfo")
             gate = info.get("upgrades", {}).get("46545532", {})
-            require(gate.get("status") == "active" and gate.get("activationheight") == 1,
+            require(gate.get("status") == "active" and gate.get("activationheight") == ROSTER,
                     f"node{node.index} has no active FeaturenetUpgrade2 certificate gate")
             dump(node.path / "blockchain-info.json", info)
             roster = node.rpc("get_tfl_roster_with_addresses")
@@ -621,7 +634,8 @@ def selftest():
                 self.assertTrue(cfg["state"]["network_connect_only"])
                 self.assertFalse(cfg["mining"]["internal_miner"])
                 self.assertEqual(cfg["crosslink"]["disable_the_headless_wallet"], i != 0)
-                self.assertEqual(cfg["network"]["testnet_parameters"]["activation_heights"]["FeaturenetUpgrade2"], 1)
+                self.assertEqual(cfg["network"]["testnet_parameters"]["activation_heights"]["FeaturenetUpgrade2"], ROSTER)
+                self.assertGreater(ROSTER, STAKING + 65)
             with self.assertRaises(Failure):
                 render(template, Path("/NEW"), 0, args, ["[2001:db8::1]:1:magic:key"])
 
