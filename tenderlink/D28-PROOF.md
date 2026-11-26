@@ -4,9 +4,11 @@
 
 The executable reference is `src/d28.rs` and `src/d28/`. It follows D28's
 one-height rules, with an explicit extension for trusted configuration changes
-at higher heights. It is not yet connected to Zebra's runtime or the shared STP
-bridge. The tests exercise the Rust engine; they are not a formal refinement
-proof, a transport memory audit, or a termination proof for arbitrary STP loss.
+at higher heights. `src/d28/runtime.rs` connects the guided receiver-selected
+engine to Zebra's existing host callbacks and shared STP bridge; `chain.rs`
+preserves the chain's BFT block and fat-pointer contracts. The finite core,
+codec, durability and runtime tests are not a formal refinement proof, a
+whole-node memory audit, or a termination proof for arbitrary STP loss.
 
 The reference specification is
 `/home/sam/dev/tendermint_reduced_proof/designs/D28-weightedpacketjump/design.md`
@@ -22,8 +24,14 @@ At a fixed height, the source agreement argument uses strict weighted quorum
 intersection, non-equivocation, and locking; it does not require timely delivery
 (`proof.md:32–176`). Dropping a message must not authorize a vote or decision.
 The implementation verifies signatures and complete groups before their use,
-binds signatures to the configuration hash/domain and height, and retains only
-bounded current signing contents rather than a history of votes.
+and retains only bounded current signing contents rather than a history of votes.
+Reference-mode signatures bind the configuration hash/domain and height. In the
+chain-compatible mode, prevote/precommit signing bytes instead preserve the existing
+public-key/value/height/round and namespace contract; they do NOT additionally bind
+D28's configuration hash or signer index. Enter and proposal headers remain
+configuration-bound. Thus the chain mode relies on the host's unique immutable
+height/namespace-authorized roster below, not a cryptographic distinction between
+two different rosters carrying the same keys and namespace.
 
 A composition argument across changing rosters requires the following host
 contract, not merely a successful call to `Engine::init`:
@@ -1199,15 +1207,23 @@ and Reference/CompactLive results remain separate and unchanged.
 
 ## Persistence and memory are separate contracts
 
-`AtomicBlockStore` is the agreed fixed-size atomic replacement API. Its bounded
-image codec, adapter and physical durable backend are deliberately deferred.
-`MemoryStore` supports deterministic logical publication/crash tests and is not
-durable storage. No production signing should use it as such.
+`AtomicBlockStore` is the fixed-size atomic replacement API. `durable.rs` now
+implements its bounded image codec and storage adapter: two configuration banks,
+three bodies, four certificate regions and fixed signing/publication records.
+The image size is `4096 + 3*Bmax + 556*Nmax` bytes. Every acknowledged mutation
+replaces the image before returning; a failed replacement poisons the adapter.
+Zebra's backend adds a 40-byte signer-identity envelope and commits through a
+synced RocksDB write, separate from decided-chain rows. Recovery checks exact
+limits, identity, checksum and semantic publication invariants before signing.
+`MemoryStore` remains a logical test fixture, not durable storage. Physical
+power-loss guarantees still depend on RocksDB and the underlying filesystem/device.
 
-Core roles are bounded independently of the number of elapsed rounds. Actual
-transport queues, receive/reassembly buffers, serialization copies and host
-workspaces still require accounting in the shared bridge integration. Memory
-saturation can cause drops without compromising agreement, but termination
-requires service of useful correct traffic; bounded capacity alone does not
-prove freedom from starvation. Aggregate replay work is also not bounded by
-the source's memory bound (`proof.md:994–1014`).
+Core roles are bounded independently of the number of elapsed rounds. The runtime
+separates bounded application frame permits, per-tick receive work, queued host
+requests and STP's message/reassembly/inbox/outbox limits. Moving a buffer into
+STP transfers ownership; it is not an end-to-end delivery acknowledgement. These
+component bounds are not a whole-node RSS bound or a bound on historical chain
+storage. Memory saturation can cause drops without compromising agreement, but
+termination still requires service of useful correct traffic; bounded capacity
+alone does not prove freedom from starvation. Aggregate replay work is also not
+bounded by the source's memory bound (`proof.md:994–1014`).

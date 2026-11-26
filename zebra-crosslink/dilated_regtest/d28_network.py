@@ -96,6 +96,17 @@ def new_output(path):
     return path.resolve()
 
 
+def pin_binary(source, root):
+    """Run every boot from one owned copy, even if a build replaces the source."""
+    pinned = root / "zebrad"
+    with source.open("rb") as src, pinned.open("xb") as dst:
+        shutil.copyfileobj(src, dst)
+    pinned.chmod(0o500)
+    with pinned.open("rb") as executable:
+        digest = hashlib.file_digest(executable, "sha256").hexdigest()
+    return pinned, digest
+
+
 def clean_env(home):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("ZEBRA_", "NEXTEST_", "CROSSLINK_"))
@@ -403,6 +414,16 @@ class Network:
         self.wait(phase, reached, mine=True)
         return max(r["certificate"]["height"] for r in self.last)
 
+    def progress_with_one_offline(self):
+        survivors = self.active()
+        require(len(survivors) == self.args.nodes - 1, "offline phase needs exactly one stopped finalizer")
+        # Snapshot AFTER stop, not an earlier phase's height. Every survivor must
+        # observe new decisions made while the finalizer is actually absent.
+        baseline = max(certificate(node.rpc("get_tfl_fat_pointer_to_bft_chain_tip"))["height"]
+                       for node in survivors)
+        return self.progress("quorum progresses with one offline",
+                             self.source.rpc("getblockcount") + 20, baseline + 2)
+
     def fund_and_bond(self):
         wallet = self.wait("wallet's first sync", lambda: self.source.rpc("wallet_spendable_funds"))
         self.mine_to(4)
@@ -472,7 +493,7 @@ class Network:
         before = certificate(victim.rpc("get_tfl_fat_pointer_to_bft_chain_tip"))["height"]
         victim.stop(crash=self.args.crash_restart)
         if self.args.offline_finalizer:
-            first = self.progress("quorum progresses with one offline", self.source.rpc("getblockcount") + 20, first + 2)
+            first = self.progress_with_one_offline()
         victim.start(self.config(victim))
         victim.ready()
         require("crosslink bootstrap: PoW reached height" not in victim.text(),
@@ -498,8 +519,8 @@ class Network:
                     f"node{node.index} differs on the accepted PoW prefix")
         dump(self.root / "pow-prefix.json", reference)
         for node in self.nodes:
-            require(re.search(self.args.require_log, node.text(all_boots=True)),
-                    f"node{node.index} never logged runtime marker {self.args.require_log!r}")
+            require(re.search(self.args.require_log, node.text()),
+                    f"node{node.index} current boot never logged runtime marker {self.args.require_log!r}")
         for node in self.nodes:
             node.stop()
             text = node.text(all_boots=True)
@@ -611,6 +632,22 @@ def selftest():
             with self.assertRaises(Failure):
                 set_key('[a]\nx=1\nx=2\n', "a", "x", 3)
 
+        def test_binary_is_pinned_across_source_replacement(self):
+            with tempfile.TemporaryDirectory(prefix="d28-selftest-") as temp:
+                root = Path(temp)
+                source = root / "build-output"
+                source.write_bytes(b"first executable")
+                out = new_output(root / "run")
+                pinned, digest = pin_binary(source, out)
+                source.write_bytes(b"next build")
+                self.assertEqual(pinned.read_bytes(), b"first executable")
+                self.assertEqual(digest, hashlib.sha256(b"first executable").hexdigest())
+                self.assertTrue(os.access(pinned, os.X_OK))
+                self.assertEqual(pinned.stat().st_mode & 0o222, 0)
+                with self.assertRaises(FileExistsError):
+                    pin_binary(source, out)
+                self.assertEqual(pinned.read_bytes(), b"first executable")
+
         def test_output_refusal(self):
             with tempfile.TemporaryDirectory(prefix="d28-selftest-") as temp:
                 root = Path(temp)
@@ -707,6 +744,23 @@ def selftest():
                 self.assertTrue((node.path / "boot1.log").exists())
                 self.assertTrue((node.path / "boot2.log").exists())
 
+        def test_offline_progress_uses_current_survivor_maximum(self):
+            with tempfile.TemporaryDirectory(prefix="d28-selftest-") as temp:
+                net = Network(parse_args(["run"]), Path(temp), "unused")
+                survivors = [mock.Mock(index=i, proc=object()) for i in range(3)]
+                survivors[0].rpc.side_effect = [{"height": 30}, 500]
+                survivors[1].rpc.return_value = {"height": 31}
+                survivors[2].rpc.return_value = {"height": 29}
+                stopped = mock.Mock(index=3, proc=None)
+                net.nodes, net.source = survivors + [stopped], survivors[0]
+                with mock.patch(__name__ + ".certificate", side_effect=lambda value: value), \
+                        mock.patch.object(net, "progress", return_value=33) as progress:
+                    self.assertEqual(net.progress_with_one_offline(), 33)
+                progress.assert_called_once_with("quorum progresses with one offline", 520, 33)
+                stopped.rpc.assert_not_called()
+                for node in survivors[1:]:
+                    node.rpc.assert_called_once_with("get_tfl_fat_pointer_to_bft_chain_tip")
+
         def test_sample_late_catchup_orders_finality_before_tip(self):
             with tempfile.TemporaryDirectory(prefix="d28-selftest-") as temp:
                 args = parse_args(["run"])
@@ -747,10 +801,10 @@ def main():
     enter_namespace(args)
     root = new_output(args.out)
     say(f"evidence directory: {root} (always preserved)")
-    with args.binary.open("rb") as binary:
-        binary_hash = hashlib.file_digest(binary, "sha256").hexdigest()
+    source_binary = args.binary
+    args.binary, binary_hash = pin_binary(source_binary, root)
     manifest = {"arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-                "binary_sha256": binary_hash,
+                "source_binary": str(source_binary), "binary_sha256": binary_hash,
                 "network_namespace": netns_id(), "template_sha256": hashlib.sha256(template.encode()).hexdigest(),
                 "started": time.time()}
     dump(root / "manifest.json", manifest)

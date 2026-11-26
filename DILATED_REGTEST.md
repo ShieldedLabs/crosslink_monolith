@@ -59,7 +59,12 @@ clock stops its nodes and fails.
 
 ## Timing
 
-The dilation applies to the consensus clock and the miner's pacing, and within tenderlink to
+The measurements and Tenderlink timer behavior in this section describe the legacy engine.
+D28 keeps its gossip, request and round timers on monotonic wall-clock time; PoW calendar
+and miner pacing still use the configured dilation. The D28 harness below mines continuously
+but does not assert these legacy throughput numbers.
+
+The dilation applies to the consensus clock and the miner's pacing, and within legacy Tenderlink to
 the send tick and to the Prevote and Precommit timeouts, all through
 `zebra_debug_time::real_duration`. A step's timeout dilates exactly when the thing it waits for
 dilates: Prevote and Precommit wait on vote gossip, which leaves on the dilated tick, while
