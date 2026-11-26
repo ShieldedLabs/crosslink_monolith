@@ -3473,6 +3473,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn d28_export_passes_unchanged_host_certificate_rules() {
+        use ed25519_zebra::{SigningKey, VerificationKeyBytes};
+        use tenderlink::d28::{self, CertKind, Group, Header, Member, Proposal, ProposalContent,
+            Timeouts, Vote, VoteContent, VoteKind, Votes};
+        let keys = [SigningKey::from([1; 32]), SigningKey::from([2; 32])];
+        let members: Vec<_> = keys.iter().zip([7, 5]).map(|(key, weight)| Member {
+            public_key: VerificationKeyBytes::from(key).into(), weight,
+        }).collect();
+        let roster: Vec<_> = members.iter().scan(0, |cumulative, member| {
+            *cumulative += member.weight;
+            Some(SortedRosterMember { pub_key: PubKeyID(member.public_key), stake: member.weight,
+                cumulative_stake: *cumulative })
+        }).collect();
+        let block = test_block(2);
+        let body = block.zcash_serialize_to_vec().unwrap();
+        let height = u64::from(block.height);
+        for namespace in [[0; 32], [31; 32]] {
+            let config = d28::Config::crosslink(namespace, members.clone(), tenderlink::PROPOSAL_MAX_SIZE,
+                500, Timeouts { propose: 30, prevote: 10, precommit: 20,
+                    inc_propose: 3, inc_prevote: 1, inc_precommit: 2 }).unwrap();
+            let id = config.body_id(&body);
+            assert_eq!(id, block.blake3_hash().0);
+            let proposer = config.proposer(height, 0);
+            let header = Header::try_sign(&config, &keys[proposer], ProposalContent {
+                height, round: 0, valid_round: None, id, signer: proposer as u32,
+            }).unwrap();
+            let votes: Vec<_> = keys.iter().enumerate().map(|(i, key)| Vote::try_sign(&config, key,
+                VoteContent { height, round: 0, kind: VoteKind::Precommit, id: Some(id), signer: i as u32 })
+                .unwrap()).collect();
+            let proposal = Proposal { header: &header, body: &body };
+            let certificate = Group { kind: CertKind::Decision { round: 0, id }, votes: Votes::Dense(&votes) };
+            let pointer = d28::chain::decision_fat_pointer(&config, height, proposal, certificate).unwrap();
+            let mut voting = VotingRoster { roster: roster.clone(), vote_namespace: namespace, strict_quorum: true };
+            assert!(certificate_is_valid(&pointer, height, &voting));
+            voting.strict_quorum = false;
+            assert!(certificate_is_valid(&pointer, height, &voting));
+            assert_eq!(pointer.signatures[0].vote_signature, votes[0].signature);
+            assert_eq!(pointer.signatures[1].vote_signature, votes[1].signature);
+            let mut unordered = pointer.clone();
+            unordered.signatures.reverse();
+            assert!(!certificate_is_valid(&unordered, height, &voting));
+            // The old chain rule accepts 7/12; D28 deliberately insists on >2/3.
+            // This does not change either chain rule or the supplied namespace.
+            let mut legacy = pointer.clone();
+            legacy.signatures.truncate(1);
+            assert!(certificate_is_valid(&legacy, height, &voting));
+            voting.strict_quorum = true;
+            assert!(!certificate_is_valid(&legacy, height, &voting));
+            let weak = Group { kind: certificate.kind, votes: Votes::Dense(&votes[..1]) };
+            assert!(d28::chain::decision_fat_pointer(&config, height, proposal, weak).is_err());
+            voting.vote_namespace[0] ^= 1;
+            assert!(!certificate_is_valid(&pointer, height, &voting));
+        }
+    }
+
+    #[test]
     fn d28_host_requests_keep_capacity_after_response_cancellation() {
         let budget = Arc::new(tokio::sync::Semaphore::new(D28_HOST_REQUEST_LIMIT));
         let (tx, rx) = std::sync::mpsc::channel();
