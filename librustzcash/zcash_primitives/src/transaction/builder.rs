@@ -917,7 +917,8 @@ impl<P, U> Builder<P, U> {
                 | BranchId::FeaturenetUpgrade1
                 | BranchId::FeaturenetUpgrade2
                 | BranchId::FeaturenetUpgrade3
-                | BranchId::FeaturenetUpgrade4 => true,
+                | BranchId::FeaturenetUpgrade4
+                | BranchId::FeaturenetUpgrade5 => true,
                 #[cfg(zcash_unstable = "nu7")]
                 BranchId::Nu7 => true,
                 _ => false,

@@ -53,14 +53,18 @@ pub struct DefaultRoots {
     #[getter(copy)]
     pub(crate) block_commitments_hash: ChainHistoryBlockTxAuthCommitmentHash,
 
-    /// The digest of the template's fat pointer that `block_commitments_hash` covers in place of
-    /// ZIP 244's zero terminator: all zeroes before `FeaturenetUpgrade2` or for a null pointer.
-    /// In display order, like the other roots. A pool that recomputes `block_commitments_hash`
-    /// after changing the transactions needs it to build a valid block.
+    /// The value in ZIP 244's terminator slot, in display order: zero before `FeaturenetUpgrade2`
+    /// or for a null pointer, `S` under BftFirst. Pools recomputing the commitment need it.
     #[serde(rename = "fatpointerdigest")]
     #[serde(with = "hex")]
     #[getter(copy)]
     pub(crate) fat_pointer_digest: [u8; 32],
+
+    /// `bft_info` as hex, under BftFirst only. The commitment is then
+    /// `H(bftinfo ‖ H(chainhistoryroot ‖ authdataroot ‖ fatpointerdigest))`.
+    #[serde(rename = "bftinfo", default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub(crate) bft_info: Option<String>,
 }
 
 impl DefaultRoots {
@@ -93,7 +97,12 @@ impl DefaultRoots {
             }))
             .collect();
 
-        let fat_pointer_digest = block::fat_pointer_digest_at(net, height, fat_pointer);
+        let uses_bft_info = block::uses_bft_info_commitment(net, height, fat_pointer);
+        let fat_pointer_digest = if uses_bft_info {
+            block::fat_pointer_signatures_digest(fat_pointer)
+        } else {
+            block::fat_pointer_digest_at(net, height, fat_pointer)
+        };
 
         Self {
             merkle_root: iter::once(coinbase.hash)
@@ -115,10 +124,12 @@ impl DefaultRoots {
             {
                 block::CHAIN_HISTORY_ACTIVATION_RESERVED.into()
             } else {
-                ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                block::block_commitments_at(
+                    net,
+                    height,
                     &chain_history_root,
                     &auth_data_root,
-                    &fat_pointer_digest,
+                    fat_pointer,
                 )
             },
             fat_pointer_digest: {
@@ -126,6 +137,8 @@ impl DefaultRoots {
                 display_order.reverse();
                 display_order
             },
+            bft_info: uses_bft_info
+                .then(|| hex::encode(fat_pointer.vote_for_block_without_finalizer_public_key)),
         }
     }
 }

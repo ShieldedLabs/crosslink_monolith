@@ -101,6 +101,7 @@ fn stale_branch_id_at_max_nu6_3_height_has_no_mempool_score() {
             featurenet_upgrade_2: None,
             featurenet_upgrade_3: None,
             featurenet_upgrade_4: None,
+            featurenet_upgrade_5: None,
             nu7: None,
         })
         .expect("activation heights at Height::MAX are valid")
@@ -740,6 +741,7 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
             featurenet_upgrade_2: None,
             featurenet_upgrade_3: None,
             featurenet_upgrade_4: None,
+            featurenet_upgrade_5: None,
             nu7: Some(12),
         })
         .expect("activation heights are valid")
@@ -866,6 +868,7 @@ async fn mempool_reset_keeps_active_state_when_sync_status_falls_behind() -> Res
             featurenet_upgrade_2: None,
             featurenet_upgrade_3: None,
             featurenet_upgrade_4: None,
+            featurenet_upgrade_5: None,
             nu7: Some(12),
         })
         .expect("activation heights are valid")
@@ -2789,6 +2792,7 @@ async fn transaction_verified_again_after_a_reset_keeps_out_conflicts() -> Resul
             featurenet_upgrade_2: None,
             featurenet_upgrade_3: None,
             featurenet_upgrade_4: None,
+            featurenet_upgrade_5: None,
             nu7: Some(12),
         })
         .expect("activation heights are valid")

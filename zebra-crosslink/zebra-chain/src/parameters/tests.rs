@@ -284,6 +284,8 @@ const NETWORK_UPGRADES_IN_ORDER: &[NetworkUpgrade] = &[
     #[cfg(any(test, feature = "zebra-test"))]
     FeaturenetUpgrade4,
     #[cfg(any(test, feature = "zebra-test"))]
+    FeaturenetUpgrade5,
+    #[cfg(any(test, feature = "zebra-test"))]
     Nu7,
 ];
 
@@ -303,7 +305,7 @@ fn full_activation_list_contains_all_upgrades() {
     // The featurenet upgrades and NU7 are unscheduled on Mainnet (no activation height committed),
     // so they are absent from the full activation list even though they are always present in the
     // iter.
-    assert_eq!(full_list.len(), NetworkUpgrade::iter().count() - 5);
+    assert_eq!(full_list.len(), NetworkUpgrade::iter().count() - 6);
 }
 
 /// FeaturenetUpgrade4's branch ID is the bytes `FNU4`, and Zebra and zcash_protocol both map it
@@ -334,6 +336,41 @@ fn featurenet_upgrade_4_branch_id_round_trips() {
         .network_upgrade()
         .expect("a featurenet branch ID has a network upgrade");
     assert_eq!(NetworkUpgrade::from(lrz_upgrade), FeaturenetUpgrade4);
+    assert_eq!(lrz_upgrade.branch_id(), lrz_branch_id);
+
+    let hex_branch_id: String = branch_id.encode_hex();
+    assert_eq!(
+        ConsensusBranchId::from_hex(hex_branch_id).expect("hex branch ID parses"),
+        branch_id
+    );
+}
+
+/// FeaturenetUpgrade5's branch ID is `FNU5` and round-trips through Zebra and zcash_protocol.
+#[test]
+fn featurenet_upgrade_5_branch_id_round_trips() {
+    let _init_guard = zebra_test::init();
+
+    let branch_id = FeaturenetUpgrade5
+        .branch_id()
+        .expect("FeaturenetUpgrade5 has a consensus branch ID");
+    assert_eq!(u32::from(branch_id).to_be_bytes(), *b"FNU5");
+    assert_ne!(Some(branch_id), FeaturenetUpgrade4.branch_id());
+
+    let upgrade = NetworkUpgrade::try_from(u32::from(branch_id))
+        .expect("Zebra knows the FeaturenetUpgrade5 branch ID");
+    assert_eq!(upgrade, FeaturenetUpgrade5);
+
+    let lrz_branch_id = zcash_protocol::consensus::BranchId::try_from(branch_id)
+        .expect("zcash_protocol knows the FeaturenetUpgrade5 branch ID");
+    assert_eq!(
+        lrz_branch_id,
+        zcash_protocol::consensus::BranchId::FeaturenetUpgrade5
+    );
+    assert_eq!(u32::from(lrz_branch_id), u32::from(branch_id));
+    let lrz_upgrade = lrz_branch_id
+        .network_upgrade()
+        .expect("a featurenet branch ID has a network upgrade");
+    assert_eq!(NetworkUpgrade::from(lrz_upgrade), FeaturenetUpgrade5);
     assert_eq!(lrz_upgrade.branch_id(), lrz_branch_id);
 
     let hex_branch_id: String = branch_id.encode_hex();
@@ -447,7 +484,7 @@ fn minimum_difficulty_exemption_follows_start_height_and_featurenet_upgrade_2() 
     }
 
     // Stock Testnet parameters with FeaturenetUpgrade2 moved above every other upgrade and above
-    // the start height, and FeaturenetUpgrade3 and FeaturenetUpgrade4, which must follow it,
+    // the start height, and FeaturenetUpgrade3 to FeaturenetUpgrade5, which must follow it,
     // unscheduled, so the exemption holds from the start height up to the upgrade.
     let mut heights = testnet::ConfiguredActivationHeights::from(stock_params.activation_heights());
     let last_scheduled = stock_params.activation_heights().keys().last().expect("Testnet has upgrades").0;
@@ -455,6 +492,7 @@ fn minimum_difficulty_exemption_follows_start_height_and_featurenet_upgrade_2() 
     heights.featurenet_upgrade_2 = Some(activation.0);
     heights.featurenet_upgrade_3 = None;
     heights.featurenet_upgrade_4 = None;
+    heights.featurenet_upgrade_5 = None;
     let upgraded = testnet::Parameters::build()
         .with_activation_heights(heights)
         .expect("valid activation heights")

@@ -35,7 +35,8 @@ pub mod tests;
 
 pub use commitment::{
     ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Commitment, CommitmentError,
-    fat_pointer_digest, fat_pointer_digest_at, CHAIN_HISTORY_ACTIVATION_RESERVED,
+    block_commitments_at, fat_pointer_digest, fat_pointer_digest_at, fat_pointer_signatures_digest,
+    uses_bft_info_commitment, BFT_INFO_SIZE, CHAIN_HISTORY_ACTIVATION_RESERVED,
 };
 pub use hash::Hash;
 pub use header::{

@@ -76,6 +76,7 @@ impl Parameters for LocalNetwork {
             NetworkUpgrade::FeaturenetUpgrade2 => None,
             NetworkUpgrade::FeaturenetUpgrade3 => None,
             NetworkUpgrade::FeaturenetUpgrade4 => None,
+            NetworkUpgrade::FeaturenetUpgrade5 => None,
         }
     }
 }
