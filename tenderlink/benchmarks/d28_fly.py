@@ -57,8 +57,9 @@ MAX_BODY = 1048576
 MAX_JSON = 8 * 1024 * 1024
 MAX_LOG = 256 * 1024
 MAX_LINE = 4096
-PROFILES = {"baseline": {"poll_ms": 25, "status_ms": 100, "receive_budget": 32},
-            "fast": {"poll_ms": 5, "status_ms": 25, "receive_budget": 128}}
+PROFILES = {"baseline": {"poll_ms": 25, "status_ms": 100, "receive_budget": 32, "max_requests": 2},
+            "fast": {"poll_ms": 5, "status_ms": 25, "receive_budget": 128, "max_requests": 2},
+            "fast_k1": {"poll_ms": 5, "status_ms": 25, "receive_budget": 128, "max_requests": 1}}
 RUN_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{15,95}\Z")
 NOTES = [
     "One chain: body/payload bytes are counted once per all-online ACKed height, not once per validator.",
@@ -156,7 +157,7 @@ def validate_config(config):
               "warmup": (0, 20), "timeout_secs": (1, 1800), "workers": (1, 1),
               "max_body": (MAX_BODY, MAX_BODY), "chatter_secs": (0, 30),
               "poll_ms": (5, 25), "status_ms": (25, 100), "receive_budget": (32, 128),
-              "max_requests": (2, 2), "max_outgoing": (2, 2)}
+              "max_requests": (1, 2), "max_outgoing": (2, 2)}
     required = set(bounds) - {"solution_bytes"}
     if set(config) - (set(bounds) | {"peers", "coordinator", "run_id"}) or not required <= set(config):
         raise ValueError("unknown or missing config fields")
@@ -167,7 +168,7 @@ def validate_config(config):
     if 3 * (config["nodes"] - config["offline"]) <= 2 * config["nodes"]:
         raise ValueError("online nodes must retain >2/3 quorum")
     if {key: config[key] for key in PROFILES["baseline"]} not in PROFILES.values():
-        raise ValueError("only baseline or fast host-service profile allowed")
+        raise ValueError("only baseline, fast or fast_k1 host-service profile allowed")
     peers = config.get("peers")
     if not isinstance(peers, list) or len(peers) != config["nodes"]:
         raise ValueError("peers must be the full ordered roster")
@@ -401,7 +402,192 @@ class Coordinator:
         return report
 
 
+# Read-only postprocessing of retained Rust reports. Never substitute worker.json's
+# whole-process counters for an absent measured/chatter boundary.
+WINDOW_COUNTERS = {
+    "application": ("offered.evidence.bytes", "offered.status.bytes", "offered.hello.bytes",
+                    "offered.bare_votes.bytes", "scheduler_budget_discarded.messages",
+                    "received.messages", "rejected.messages"),
+    "transport": ("outbox_dropped_messages", "outbox_dropped_bytes", "inbox_dropped_messages",
+                  "inbox_dropped_bytes", "ring_sent", "ring_received", "ring_receive_dropped_full",
+                  "ring_inbound_refused_full", "ring_send_head_blocked", "ring_send_dropped_unknown",
+                  "ring_send_dropped_oversized", "send_to_unknown_peer_dropped", "oversized_dropped"),
+    "system": ("network.eth0.tx_bytes", "process.user_ticks", "process.system_ticks",
+               "cpu.steal_ticks", "cpu.total_ticks"),
+}
+AGGREGATION_NOTES = [
+    "Postprocessing retained schema-1 Rust reports; this aggregator need not be the deployed runner version.",
+    "Each counter total/rate/ratio uses only trials with that counter valid on ALL online nodes; coverage and matched denominators are per metric, not interchangeable.",
+    "Measured rates sum node deltas / sum matched controller durations; body ratios use unique ACKed controller body bytes once. Missing counters are null, not zero.",
+    "Node snapshot boundaries are serial and not atomic across machines; partial trials may end at different failure boundaries. Matched partial trials are explicitly counted.",
+    "VM eth0 TX includes TCP/control and other VM activity, not pure BFT bytes or retransmissions. RX is never added; offered application bytes and transport ring messages are not wire bytes/packets.",
+    "Chatter is a separate final-height hold, not quiescent idle traffic: rates sum each node's bytes / its actual pooled local window duration, not requested hold seconds or controller duration.",
+    "Process CPU seconds use each window's reported ticks_per_second. Steal is sum steal / sum total guest CPU ticks, not a diagnosis of shared-host contention.",
+    "Peak RSS is the maximum observed end-window process.max_rss_bytes gauge, a process-lifetime high-water mark (possibly reached in warmup), never a counter delta.",
+]
+
+
+def _window_duration(window, system=False):
+    start, end = window["start"], window["end"]
+    if system:
+        start, end = start["system"], end["system"]
+    times = [number(snapshot["at_ms"], 0, float("inf"), "snapshot at_ms") for snapshot in (start, end)]
+    duration = (times[1] - times[0]) / 1000
+    if duration <= 0:
+        raise ValueError("nonpositive window duration")
+    return duration
+
+
+def _window_counter(window, area, key):
+    boundaries = [window[side][area] if area else window[side] for side in ("start", "end")]
+    if area == "system":
+        boundaries = [snapshot["counters"] for snapshot in boundaries]
+    start, end = [integer(snapshot[key], 0, 2**64 - 1, key) for snapshot in boundaries]
+    delta = integer(window[area + "_delta"][key] if area else window[key], 0, 2**64 - 1, key)
+    # Rust application/transport deltas saturate on reset and accept missing start
+    # keys. Require both original counters here rather than interpreting that as 0.
+    if end < start or delta != end - start:
+        raise ValueError("counter reset or inconsistent delta: " + key)
+    return delta
+
+
+def _process_cpu_seconds(window, fields):
+    ticks = [integer(window[side]["system"]["counters"]["process.ticks_per_second"],
+                     1, 2**64 - 1, "process.ticks_per_second") for side in ("start", "end")]
+    if ticks[0] != ticks[1]:
+        raise ValueError("process.ticks_per_second changed")
+    return sum(_window_counter(window, "system", "process." + key + "_ticks") for key in fields) / ticks[0]
+
+
+def _cpu_ticks(window, key):
+    steal = _window_counter(window, "system", "cpu.steal_ticks")
+    total = _window_counter(window, "system", "cpu.total_ticks")
+    if not 0 <= steal <= total or total == 0:
+        raise ValueError("invalid CPU steal/total interval")
+    return steal if key == "steal" else total
+
+
+def _aggregate_window_metric(samples, getter, *, system=False, chatter=False, body_ratio=False, gauge=False):
+    values, missing = {}, []
+    by_trial = {}
+    for index, sample in enumerate(samples):
+        by_trial.setdefault(sample["index"], []).append(index)
+        try:
+            if sample["error"]:
+                raise ValueError(sample["error"])
+            duration = None if gauge else _window_duration(sample["window"], system)
+            values[index] = (getter(sample["window"]), duration)
+        except (KeyError, TypeError, ValueError) as exc:
+            missing.append({"trial": sample["trial"], "node": sample["node"], "reason": str(exc)})
+    out = {"expected_node_windows": len(samples), "available_node_windows": len(values), "missing": missing}
+    if gauge:
+        return {**out, "max": max((value for value, _ in values.values()), default=None)}
+    matched = [indices for indices in by_trial.values() if all(index in values for index in indices)]
+    indices = [index for cohort in matched for index in cohort]
+    trials = [samples[cohort[0]]["source"] for cohort in matched]
+    total = sum(values[index][0] for index in indices) if indices else None
+    out.update(total=total, matched_trials=len(trials),
+               matched_complete_trials=sum(trial["status"] == "complete" for trial in trials),
+               matched_partial_trials=sum(trial["status"] != "complete" for trial in trials),
+               excluded_trials=[samples[cohort[0]]["trial"] for cohort in by_trial.values()
+                                if not all(index in values for index in cohort)])
+    if chatter:
+        node_rates = {}
+        for index in indices:
+            node = samples[index]["node"]
+            row = node_rates.setdefault(node, {"node": node, "n": 0, "total": 0, "duration_seconds": 0})
+            row["n"] += 1
+            row["total"] += values[index][0]
+            row["duration_seconds"] += values[index][1]
+        for row in node_rates.values():
+            row["per_second"] = row["total"] / row["duration_seconds"]
+        out["node_rates"] = [node_rates[node] for node in sorted(node_rates)]
+        out["per_second"] = sum(row["per_second"] for row in node_rates.values()) if node_rates else None
+    else:
+        duration = sum(trial["controller"]["rate_duration_seconds"] for trial in trials)
+        body = sum(row["body_bytes"] for trial in trials for row in trial["controller"]["heights"]
+                   if row["measured"] and row["acknowledged"])
+        out.update(controller_duration_seconds=duration if trials else None, body_bytes=body if trials else None,
+                   per_second=total / duration if total is not None and duration > 0 else None)
+        if body_ratio:
+            out["per_body_byte"] = total / body if total is not None and body > 0 else None
+    return out
+
+
+def aggregate_node_windows(trials, window_name="measured_window"):
+    """Return JSON-ready per-metric matched cohorts; no files, clocks or network.
+
+    trials have the same config/status/controller/profile fields as aggregate(),
+    plus node_reports={node_index: original Rust report}. Missing reports/counters
+    exclude that trial from that metric's numerator AND denominator, not from the
+    independent chain throughput. Chatter cohorts include only requested holds.
+    """
+    if window_name not in ("measured_window", "chatter_window"):
+        raise ValueError("unknown Rust counter window")
+    chatter = window_name == "chatter_window"
+    samples, observations = [], []
+    requested = [trial for trial in trials if not chatter or trial["config"].get("chatter_secs", 0) > 0]
+    for index, trial in enumerate(requested):
+        for node in range(trial["config"]["nodes"] - trial["config"]["offline"]):
+            sample = {"index": index, "trial": trial.get("trial", f"trial-{index + 1:03d}"),
+                      "node": node, "source": trial, "window": None, "error": None}
+            observation = {"trial": sample["trial"], "node": node}
+            try:
+                report = trial.get("node_reports", {}).get(node)
+                if not isinstance(report, dict):
+                    raise ValueError(trial.get("node_report_errors", {}).get(node, "missing node report"))
+                if (report.get("schema_version") != 1 or report.get("mode") != "distributed"
+                        or report.get("status") not in ("complete", "partial")
+                        or report.get("config") != dict(trial["config"], node=node)):
+                    raise ValueError("node report schema/identity/config mismatch")
+                window = report[window_name]
+                observation.update(report_status=report["status"], duration_seconds=_window_duration(window))
+                sample["window"] = window
+                try:
+                    observation["system_duration_seconds"] = _window_duration(window, system=True)
+                except (KeyError, TypeError, ValueError):
+                    observation["system_duration_seconds"] = None
+                observation["system_errors"] = {
+                    side: (window[side]["system"].get("errors", []) if isinstance(window[side].get("system"), dict)
+                           else ["missing system snapshot"]) for side in ("start", "end")}
+            except (KeyError, TypeError, ValueError) as exc:
+                sample["error"] = str(exc)
+                observation["error"] = str(exc)
+            samples.append(sample)
+            observations.append(observation)
+    out = {"requested_trials": len(requested), "expected_node_windows": len(samples),
+           "valid_node_windows": sum(sample["error"] is None for sample in samples), "node_windows": observations}
+    for area, required in WINDOW_COUNTERS.items():
+        keys = set(required)
+        if area != "system":
+            for sample in samples:
+                if sample["window"] and isinstance(sample["window"].get(area + "_delta"), dict):
+                    keys.update(sample["window"][area + "_delta"])
+        out[area + "_delta"] = {
+            key: _aggregate_window_metric(samples, lambda window: _window_counter(window, area, key),
+                                          system=area == "system", chatter=chatter,
+                                          body_ratio=key.endswith(".bytes") or key == "network.eth0.tx_bytes")
+            for key in sorted(keys)}
+    for key in ("store_replacements", "store_replacement_bytes"):
+        out[key] = _aggregate_window_metric(samples, lambda window: _window_counter(window, None, key),
+                                            chatter=chatter, body_ratio=key.endswith("_bytes"))
+    out["process_cpu_seconds"] = {
+        name: _aggregate_window_metric(samples, lambda window: _process_cpu_seconds(window, fields),
+                                       system=True, chatter=chatter)
+        for name, fields in (("user", ("user",)), ("system", ("system",)), ("total", ("user", "system")))}
+    steal = _aggregate_window_metric(samples, lambda window: _cpu_ticks(window, "steal"), system=True, chatter=chatter)
+    total = _aggregate_window_metric(samples, lambda window: _cpu_ticks(window, "total"), system=True, chatter=chatter)
+    out["cpu_steal"] = {**steal, "total_ticks": total["total"],
+                        "percent": 100 * steal["total"] / total["total"] if total["total"] else None}
+    out["cpu_steal"]["steal_ticks"] = out["cpu_steal"].pop("total")
+    out["peak_rss_bytes"] = _aggregate_window_metric(samples,
+        lambda window: integer(window["end"]["system"]["counters"]["process.max_rss_bytes"],
+                               0, 2**64 - 1, "process.max_rss_bytes"), system=True, gauge=True)
+    return out
+
+
 def aggregate(trials):
+    """Pool controller observations and optional per-node reports without mutation."""
     groups = {}
     for trial in trials:
         config = trial["config"]
@@ -411,7 +597,8 @@ def aggregate(trials):
                                        "complete_trials": 0, "duration_seconds": 0, "completed_heights": 0,
                                        "body_bytes": 0, "payload_bytes": 0, "body_sizes": set(),
                                        "receipt_ms": {c: [] for c in ("first", "quorum", "all")},
-                                       "node_local_ms": [], "cycle_ms": [], "ack_send_ms": []})
+                                       "node_local_ms": [], "cycle_ms": [], "ack_send_ms": [], "_trials": []})
+        group["_trials"].append(trial)
         group["trials"] += 1
         group["complete_trials"] += trial["status"] == "complete"
         controller = trial["controller"]
@@ -434,6 +621,8 @@ def aggregate(trials):
     result = []
     for key in sorted(groups):
         group = groups[key]
+        grouped_trials = group.pop("_trials")
+        group["failed_trials"] = group["trials"] - group["complete_trials"]
         group["body_sizes"] = sorted(group["body_sizes"])
         for field in ("completed_heights", "body_bytes", "payload_bytes"):
             group[field + "_per_second"] = (group[field] / group["duration_seconds"]
@@ -443,6 +632,8 @@ def aggregate(trials):
             group[field] = {"n": len(values), "percentiles": percentile(values)}
         group["receipt_ms"] = {cohort: {"n": len(values), "percentiles": percentile(values)}
                                 for cohort, values in group["receipt_ms"].items()}
+        for name in ("measured_window", "chatter_window"):
+            group[name] = aggregate_node_windows(grouped_trials, name)
         result.append(group)
     return result
 
@@ -1003,6 +1194,8 @@ def run_trial(args, roster, token, binary, metadata, directory, case, campaign_d
 
 
 def summarize(directory, quiet=False):
+    """Read original artifacts; return JSON-ready analysis without writing summary.json."""
+    directory = Path(directory)
     manifest = read_json(directory / "manifest.json")
     if manifest.get("mode") != "d28_fly_campaign":
         raise ValueError("not a D28 Fly campaign")
@@ -1011,20 +1204,54 @@ def summarize(directory, quiet=False):
         case = read_json(path)
         result = read_json(path.parent / "result.json")
         controller = read_json(path.parent / "controller.json")
-        trials.append({**case, **result, "controller": controller})
+        reports, errors = {}, {}
+        for node in range(case["config"]["nodes"] - case["config"]["offline"]):
+            try:
+                reports[node] = read_json(path.parent / f"node-{node:03d}" / "report.json")
+            except (OSError, ValueError) as exc:
+                errors[node] = f"{type(exc).__name__}: {exc}"
+        trials.append({**case, **result, "trial": path.parent.name, "controller": controller,
+                       "node_reports": reports, "node_report_errors": errors})
     rows = aggregate(trials)
     if not quiet:
-        print("nodes offline headers solution profile complete/trials heights body_B/s receipt_all_p50_ms")
+        def fmt(value, factor=1):
+            return "-" if value is None else f"{value * factor:.3f}"
+
+        print("nodes/offline headers+solution profile complete/failed local_n local_p50/p95_ms body_KiB/s VM_TX_Mbit/s TX/body evidence/body budget_discards steal_% peak_RSS_MiB")
         for row in rows:
-            percentiles = row["receipt_ms"]["all"]["percentiles"]
-            latency = "-" if percentiles is None else f"{percentiles['p50']:.3f}"
-            rate = row["body_bytes_per_second"]
-            print(row["nodes"], row["offline"], row["headers"], row["solution_bytes"], row["profile"],
-                  f"{row['complete_trials']}/{row['trials']}", row["completed_heights"],
-                  "-" if rate is None else f"{rate:.3f}", latency)
-        for note in NOTES:
+            measured = row["measured_window"]
+            tx = measured["system_delta"]["network.eth0.tx_bytes"]
+            evidence = measured["application_delta"]["offered.evidence.bytes"]
+            discards = measured["application_delta"]["scheduler_budget_discarded.messages"]
+            local = row["node_local_ms"]
+            latency = local["percentiles"] or {}
+            print(f"{row['nodes']}/{row['offline']}", f"{row['headers']}+{row['solution_bytes']}", row["profile"],
+                  f"{row['complete_trials']}/{row['failed_trials']}", local["n"],
+                  f"{fmt(latency.get('p50'))}/{fmt(latency.get('p95'))}",
+                  fmt(row["body_bytes_per_second"], 1 / 1024), fmt(tx["per_second"], 8 / 1e6),
+                  fmt(tx["per_body_byte"]), fmt(evidence["per_body_byte"]), fmt(discards["total"]),
+                  fmt(measured["cpu_steal"]["percent"]), fmt(measured["peak_rss_bytes"]["max"], 1 / 2**20))
+            receipts = []
+            for name, cohort in row["receipt_ms"].items():
+                latency = cohort["percentiles"] or {}
+                receipts.append(f"{name}={fmt(latency.get('p50'))}/{fmt(latency.get('p95'))}(n={cohort['n']})")
+            print("  controller_receipt_p50/p95_ms:", " ".join(receipts))
+            print(f"  matched/all trials: TX={tx['matched_trials']}/{row['trials']} "
+                  f"evidence={evidence['matched_trials']}/{row['trials']} budget={discards['matched_trials']}/{row['trials']} "
+                  f"steal={measured['cpu_steal']['matched_trials']}/{row['trials']}; "
+                  f"RSS nodes={measured['peak_rss_bytes']['available_node_windows']}/{measured['expected_node_windows']}; "
+                  f"TX matched-partial={tx['matched_partial_trials']}")
+            chatter = row["chatter_window"]
+            if chatter["requested_trials"]:
+                tx = chatter["system_delta"]["network.eth0.tx_bytes"]
+                evidence = chatter["application_delta"]["offered.evidence.bytes"]
+                print(f"  chatter: VM_TX_Mbit/s={fmt(tx['per_second'], 8 / 1e6)} "
+                      f"evidence_KiB/s={fmt(evidence['per_second'], 1 / 1024)} "
+                      f"matched/requested TX={tx['matched_trials']}/{chatter['requested_trials']} "
+                      f"evidence={evidence['matched_trials']}/{chatter['requested_trials']} (actual per-node durations)")
+        for note in NOTES + AGGREGATION_NOTES:
             print(note)
-    return {"schema_version": 1, "cases": rows, "notes": NOTES}
+    return {"schema_version": 1, "aggregation_version": 2, "cases": rows, "notes": NOTES + AGGREGATION_NOTES}
 
 
 def campaign(args):
@@ -1261,6 +1488,198 @@ finally:
         failed_ready = Barrier(config, 10)
         failed_ready.finish(12, "ready timeout")
         self.assertEqual(failed_ready.report(12)["rate_duration_seconds"], 2)
+
+    def counter_trial(self, name="trial-001", duration=2, body=100, scale=1, status="complete", hold_scale=1):
+        config = fixture_config(heights=1, warmup=1, chatter_secs=1)
+        row = {"measured": True, "acknowledged": True, "body_bytes": body, "payload_bytes": body // 2,
+               "cycle_ms": 1000, "ack_send_ms": 1,
+               "decisions": [{"node": n, "node_latency_ms": n + 1, "receipt_ms": 100 * (n + 1)} for n in range(4)]}
+        trial = {"trial": name, "config": config, "profile": "baseline", "status": status,
+                 "controller": {"rate_duration_seconds": duration,
+                                "heights": [dict(row, measured=False, body_bytes=999999)] + ([row] if body else [])},
+                 "node_reports": {}}
+        for node in range(4):
+            ticks = 100 if node % 2 == 0 else 250
+
+            def window(seconds, tx):
+                at = 10000 * (node + 1)  # Unrelated per-node clock origins.
+                application = {key: scale * (node + 1) for key in WINDOW_COUNTERS["application"]}
+                application["offered.evidence.bytes"] *= 100
+                transport = {key: 0 for key in WINDOW_COUNTERS["transport"]}
+                system = {"network.eth0.tx_bytes": tx, "network.eth0.rx_bytes": 10**9,
+                          "process.user_ticks": ticks * scale, "process.system_ticks": ticks * scale // 2,
+                          "cpu.total_ticks": 100 * (node + 1), "cpu.steal_ticks": 10 * (node + 1)}
+                result = {"application_delta": application, "transport_delta": transport, "system_delta": system,
+                          "store_replacements": scale * (node + 1),
+                          "store_replacement_bytes": scale * (node + 1) * 3152048}
+                for side, factor in (("start", 0), ("end", 1)):
+                    snapshot = {"at_ms": at + factor * seconds * 1000,
+                                "application": {k: 100000 + factor * v for k, v in application.items()},
+                                "transport": {k: 100000 + factor * v for k, v in transport.items()},
+                                "system": {"at_ms": at + 5 + factor * seconds * 1000, "errors": [],
+                                           "counters": {k: 100000 + factor * v for k, v in system.items()}}}
+                    snapshot["system"]["counters"].update({"process.ticks_per_second": ticks,
+                        "process.max_rss_bytes": 1000 + factor * (1000 + node), "process.rss_bytes": 50})
+                    for key in ("store_replacements", "store_replacement_bytes"):
+                        snapshot[key] = 10**9 + factor * result[key]
+                    result[side] = snapshot
+                return result
+
+            trial["node_reports"][node] = {"schema_version": 1, "mode": "distributed", "status": status,
+                "config": dict(config, node=node),
+                "measured_window": window(duration + node, 200 * (node + 1) * scale),
+                "chatter_window": window(hold_scale * (node + 1), 1000 * (node + 1) * scale),
+                "process_start": {"network.eth0.tx_bytes": 0},
+                "process_end": {"network.eth0.tx_bytes": 10**12}}
+        return trial
+
+    def test_counter_rates_exclude_warmup_hold_and_process(self):
+        row = aggregate([self.counter_trial(), self.counter_trial("trial-002", duration=8, body=300, scale=3)])[0]
+        self.assertEqual((row["trials"], row["complete_trials"], row["failed_trials"]), (2, 2, 0))
+        self.assertEqual((row["body_bytes"], row["duration_seconds"], row["body_bytes_per_second"]), (400, 10, 40))
+        self.assertEqual(row["node_local_ms"], {"n": 8, "percentiles": {"p50": 2, "p95": 4, "p99": 4}})
+        self.assertEqual(row["receipt_ms"]["first"]["percentiles"]["p50"], 100)
+        measured = row["measured_window"]
+        tx = measured["system_delta"]["network.eth0.tx_bytes"]
+        self.assertEqual((tx["total"], tx["per_second"], tx["per_body_byte"]), (8000, 800, 20))
+        self.assertEqual((tx["body_bytes"], tx["controller_duration_seconds"]), (400, 10))
+        self.assertEqual(measured["application_delta"]["offered.evidence.bytes"]["per_body_byte"], 10)
+        self.assertEqual(measured["application_delta"]["received.messages"]["total"], 40)
+        self.assertEqual(measured["transport_delta"]["ring_receive_dropped_full"]["total"], 0)
+        self.assertNotIn("network.eth0.rx_bytes", measured["system_delta"])
+        self.assertEqual(measured["store_replacements"]["total"], 40)
+        self.assertEqual(measured["store_replacement_bytes"]["total"], 40 * 3152048)
+        self.assertEqual(measured["store_replacement_bytes"]["per_second"], 4 * 3152048)
+
+    def test_counter_missing_coverage_and_partial_denominators(self):
+        good, missing = self.counter_trial(), self.counter_trial("trial-002", duration=8, body=300, scale=3)
+        del missing["node_reports"][1]["measured_window"]["system_delta"]["network.eth0.tx_bytes"]
+        row = aggregate([good, missing])[0]
+        tx = row["measured_window"]["system_delta"]["network.eth0.tx_bytes"]
+        self.assertEqual(row["body_bytes_per_second"], 40)
+        self.assertEqual((tx["total"], tx["body_bytes"], tx["controller_duration_seconds"]), (2000, 100, 2))
+        self.assertEqual((tx["matched_trials"], tx["available_node_windows"], tx["expected_node_windows"]), (1, 7, 8))
+        self.assertEqual(tx["excluded_trials"], ["trial-002"])
+        self.assertEqual(tx["missing"][0]["node"], 1)
+        self.assertEqual(row["measured_window"]["application_delta"]["offered.evidence.bytes"]["matched_trials"], 2)
+        partial = self.counter_trial("trial-003", duration=5, body=0, status="partial")
+        row = aggregate([good, partial])[0]
+        tx = row["measured_window"]["system_delta"]["network.eth0.tx_bytes"]
+        self.assertEqual(row["failed_trials"], 1)
+        self.assertEqual(row["body_bytes_per_second"], 100 / 7)
+        self.assertEqual((tx["total"], tx["per_second"], tx["matched_partial_trials"]), (4000, 4000 / 7, 1))
+        self.assertIsNone(aggregate_node_windows([partial])["system_delta"]["network.eth0.tx_bytes"]["per_body_byte"])
+        partial["node_reports"] = {}
+        row = aggregate([good, partial])[0]
+        tx = row["measured_window"]["system_delta"]["network.eth0.tx_bytes"]
+        self.assertEqual(row["body_bytes_per_second"], 100 / 7)
+        self.assertEqual((tx["matched_trials"], len(tx["missing"]), tx["controller_duration_seconds"]), (1, 4, 2))
+        self.assertIsNone(aggregate_node_windows([partial])["system_delta"]["network.eth0.tx_bytes"]["total"])
+
+    def test_cpu_units_steal_and_peak_gauge(self):
+        trial = self.counter_trial()
+        measured = aggregate_node_windows([trial])
+        self.assertEqual({k: v["total"] for k, v in measured["process_cpu_seconds"].items()},
+                         {"user": 4, "system": 2, "total": 6})
+        self.assertEqual(measured["process_cpu_seconds"]["total"]["per_second"], 3)
+        self.assertEqual((measured["cpu_steal"]["steal_ticks"], measured["cpu_steal"]["total_ticks"],
+                          measured["cpu_steal"]["percent"]), (100, 1000, 10))
+        self.assertEqual(measured["peak_rss_bytes"]["max"], 2003)  # Not delta=1003 or sum=8006.
+        end = trial["node_reports"][0]["measured_window"]["end"]["system"]["counters"]
+        del end["process.ticks_per_second"]
+        measured = aggregate_node_windows([trial])
+        self.assertIsNone(measured["process_cpu_seconds"]["total"]["total"])
+        self.assertEqual(measured["process_cpu_seconds"]["total"]["available_node_windows"], 3)
+        self.assertEqual(measured["system_delta"]["network.eth0.tx_bytes"]["total"], 2000)
+        trial["node_reports"][0]["measured_window"]["start"]["system"] = None
+        measured = aggregate_node_windows([trial])
+        self.assertIsNone(measured["system_delta"]["network.eth0.tx_bytes"]["total"])
+        self.assertEqual(measured["application_delta"]["offered.evidence.bytes"]["total"], 1000)
+        self.assertEqual(measured["peak_rss_bytes"]["available_node_windows"], 4)  # End gauge needs no start counter.
+        self.assertEqual(measured["node_windows"][0]["system_errors"]["start"], ["missing system snapshot"])
+
+    def test_invalid_window_counters_are_not_zero(self):
+        for fault in ("reset", "missing_start", "bad_delta", "bad_clock", "wrong_node", "changed_ticks"):
+            with self.subTest(fault=fault):
+                trial = self.counter_trial()
+                report = trial["node_reports"][0]
+                window = report["measured_window"]
+                key = "offered.evidence.bytes"
+                if fault == "reset":
+                    window["start"]["application"][key] = 10**9
+                    window["application_delta"][key] = 0
+                elif fault == "missing_start":
+                    del window["start"]["application"][key]
+                elif fault == "bad_delta":
+                    window["application_delta"][key] = True
+                elif fault == "bad_clock":
+                    window["end"]["at_ms"] = window["start"]["at_ms"]
+                elif fault == "wrong_node":
+                    report["config"]["node"] = 1
+                else:
+                    window["end"]["system"]["counters"]["process.ticks_per_second"] = 99
+                measured = aggregate_node_windows([trial])
+                metric = (measured["process_cpu_seconds"]["total"] if fault == "changed_ticks"
+                          else measured["application_delta"][key])
+                self.assertIsNone(metric["total"])
+                self.assertEqual((metric["matched_trials"], metric["available_node_windows"]), (0, 3))
+                self.assertEqual(len(metric["missing"]), 1)
+
+    def test_chatter_rates_use_actual_per_node_durations(self):
+        trials = [self.counter_trial(), self.counter_trial("trial-002", scale=3, hold_scale=2)]
+        chatter = aggregate_node_windows(trials, "chatter_window")
+        tx = chatter["system_delta"]["network.eth0.tx_bytes"]
+        self.assertEqual(tx["total"], 40000)
+        self.assertAlmostEqual(tx["per_second"], 4 * 4000 / 3)
+        self.assertEqual([node["duration_seconds"] for node in tx["node_rates"]], [3, 6, 9, 12])
+        self.assertNotIn("per_body_byte", tx)
+        self.assertNotIn("controller_duration_seconds", tx)
+        trials[0]["config"]["chatter_secs"] = 0
+        self.assertEqual(aggregate_node_windows(trials, "chatter_window")["requested_trials"], 1)
+
+    def test_summary_is_read_only_and_reports_missing_artifacts(self):
+        trial = self.counter_trial()
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary)
+            write_json(root / "manifest.json", {"mode": "d28_fly_campaign", "script_sha256": "old-deployed-script"})
+            write_json(root / "summary.json", {"old": "preserve byte for byte"})
+            path = root / trial["trial"]
+            path.mkdir()
+            write_json(path / "trial.json", {"config": trial["config"], "profile": trial["profile"]})
+            write_json(path / "result.json", {"status": trial["status"]})
+            write_json(path / "controller.json", trial["controller"])
+            for node in range(4):
+                directory = path / f"node-{node:03d}"
+                directory.mkdir()
+                if node < 2:
+                    write_json(directory / "report.json", trial["node_reports"][node])
+                elif node == 2:
+                    (directory / "report.json").write_text("incomplete JSON", encoding="utf-8")
+                (directory / "worker.json").write_text("not read: whole-process counters", encoding="utf-8")
+            before = {p: p.read_bytes() for p in root.glob("**/*") if p.is_file()}
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                summary = summarize(root)
+            self.assertIn("VM_TX_Mbit/s", stdout.getvalue())
+            self.assertIn("TX=0/1", stdout.getvalue())
+            self.assertEqual(summary["aggregation_version"], 2)
+            tx = summary["cases"][0]["measured_window"]["system_delta"]["network.eth0.tx_bytes"]
+            self.assertIsNone(tx["total"])
+            self.assertEqual((tx["available_node_windows"], len(tx["missing"])), (2, 2))
+            self.assertEqual(before, {p: p.read_bytes() for p in root.glob("**/*") if p.is_file()})
+            encode(summary)  # Entire exported analysis is strict, finite JSON.
+
+    def test_fast_k1_exact_profile_and_default(self):
+        for profile, knobs in PROFILES.items():
+            self.assertEqual(validate_config(fixture_config(**knobs))["max_requests"], knobs["max_requests"])
+            self.assertEqual(profile_arg(profile), profile)
+        for changes in ({"max_requests": 1}, {"max_requests": 0}, {"max_requests": 3},
+                        {"max_outgoing": 1}, {"max_outgoing": 3}, dict(PROFILES["fast_k1"], status_ms=100),
+                        dict(PROFILES["fast_k1"], receive_budget=32)):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                validate_config(fixture_config(**changes))
+        argv = ["campaign", "--roster", "unused", "--binary", "unused", "--token-file", "unused", "--out", "unused"]
+        self.assertEqual(build_parser().parse_args(argv).profiles, ["baseline"])
+        self.assertEqual(build_parser().parse_args(argv + ["--profiles", "fast,fast_k1"]).profiles, ["fast", "fast_k1"])
 
     def test_post_ack_collection_failure_confirms_exact_run_cleanup(self):
         roster = {"peers": fixture_config()["peers"], "coordinator": "[::1]:21000", "interface": "lo",
@@ -1509,7 +1928,7 @@ def comma_arg(parse):
 
 def profile_arg(text):
     if text not in PROFILES:
-        raise ValueError("profile must be baseline or fast")
+        raise ValueError("profile must be baseline, fast or fast_k1")
     return text
 
 
@@ -1539,7 +1958,7 @@ def build_parser():
     command.add_argument("--solution-bytes", type=bounded_arg(0, 1344), default=0,
                          help="applies to all sizes; near-cap arm: --headers 2048 --solution-bytes 320")
     command.add_argument("--profiles", type=comma_arg(profile_arg), default=["baseline"],
-                         help="baseline or baseline,fast; host polling only, never protocol timers")
+                         help="comma-separated baseline,fast,fast_k1; K1 limits requests to 1; never changes protocol timers")
     command.add_argument("--repetitions", type=bounded_arg(1, 32), default=3)
     command.add_argument("--seed", type=bounded_arg(0, 2**32 - 1), default=428)
     command.add_argument("--heights", type=bounded_arg(1, 200), default=12)
