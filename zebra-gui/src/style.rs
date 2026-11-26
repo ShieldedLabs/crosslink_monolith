@@ -56,7 +56,7 @@ pub const RIGHT_PANE_MIN: f32 = 320.0;
 /// The widest a divider can make a side pane.
 pub const PANE_MAX: f32 = 720.0;
 /// The least the block map keeps between the panes: its two height strips and the network box.
-pub const CENTRE_MIN_W: f32 = 340.0;
+pub const CENTRE_MIN_W: f32 = 420.0;
 
 pub trait VizColor {
     fn as_viz_color(self) -> u32;

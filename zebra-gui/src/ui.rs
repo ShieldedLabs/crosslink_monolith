@@ -4588,23 +4588,27 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
 
                     let combo_id = id("Network Health Combo");
-                    let mut net_activated = false;
+                    // Closed, the card is as wide as its controls. Open, it widens to the details it
+                    // drops down, and both keep that width while the window resizes until the room
+                    // between the height strips is narrower.
+                    let base = BUTTON_GREY.mul(0.85);
+                    let (net_activated, colour, _) = ui.button_ex(true, base, combo_id, true, CursorIcon::Pointer);
+                    let net_open = ui.openable(data, combo_id, net_activated, false);
+                    let card_w = ui.scale(296.0).min(window_w - ui.left_pane_px - ui.right_pane_px - ui.scale(172.0)).max(ui.scale(260.0));
+                    // Opaque: `mul` also scales alpha, and the block map's text showed through.
+                    let card_col = { let c = BUTTON_GREY.mul(0.90); (c.0, c.1, c.2, 0xff) };
 
                     if let _ = elem().decl(Decl {
-                        colour: BUTTON_GREY.mul(0.90),
+                        colour: card_col,
                         radius: ui.scale(16.0).dup4(),
                         padding: (ui.scale(8.0), ui.scale(12.0), ui.scale(8.0), ui.scale(12.0)),
                         direction: TopToBottom,
                         align: TopLeft,
                         child_gap: ui.scale(6.0),
-                        width: fit!(),
+                        width: if net_open { fixed!(card_w) } else { fit!() },
                         height: fit!(),
                         ..Decl
                     }) {
-
-                        let base = BUTTON_GREY.mul(0.85);
-                        let (activated, colour, text_colour) = ui.button_ex(true, base, combo_id, true, CursorIcon::Pointer);
-                        net_activated = activated;
                         if let _ = elem().decl(Decl {
                             id: combo_id,
                             colour,
@@ -4685,15 +4689,14 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             }
                         }
 
-                        if ui.openable(data, combo_id, net_activated, false) {
+                        if net_open {
                             if let _ = elem().decl(Decl {
-                                colour: BUTTON_GREY.mul(0.90),
+                                colour: card_col,
                                 radius: ui.scale(16.0).dup4(),
                                 padding: (ui.scale(12.0), ui.scale(16.0), ui.scale(12.0), ui.scale(16.0)),
                                 child_gap: ui.scale(10.0),
                                 direction: TopToBottom,
-                                // No wider than the room between the PoW and PoS height strips.
-                                width: fixed!(ui.scale(400.0).min(window_w - ui.left_pane_px - ui.right_pane_px - ui.scale(172.0))),
+                                width: fixed!(card_w),
                                 height: fit!(),
                                 align: TopRight,
                                 floating: Floating::Below(ui.scale(6.0)),
