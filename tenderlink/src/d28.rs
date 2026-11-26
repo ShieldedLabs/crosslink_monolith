@@ -1584,6 +1584,7 @@ pub mod atomic;
 pub mod chain;
 pub mod durable;
 pub mod gossip;
+pub mod runtime;
 pub mod wire;
 pub use atomic::AtomicBlockStore;
 mod core;

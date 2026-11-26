@@ -17,7 +17,7 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use chrono::{DateTime, Utc};
 use tenderlink::{
-    addr_string_to_stuff, BftAddressMap, BlockValue, ConsensusCounts, FinalizerPeerAddress,
+    BftAddressMap, BlockValue, ConsensusCounts,
     RoundData, SortedRosterMember, TMState, TMStatus, TMStatusReason, TMStep, ValueId,
 };
 use zcash_primitives::bft::{
@@ -547,6 +547,12 @@ fn publish_parked_decision_height(height: Option<u64>) {
 
 /// What tenderlink (and the test harness) ask the sync thread.
 pub enum BftRequest {
+    /// D28 host work owns capacity through the sync queue and its handler. A
+    /// cancelled response future must not release capacity still held here.
+    Bounded {
+        request: Box<BftRequest>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    },
     Propose {
         reply: tokio::sync::oneshot::Sender<Option<BftBlock>>,
     },
@@ -577,6 +583,16 @@ pub enum BftRequest {
         require_certificate: bool,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+}
+
+/// One budget across proposal, validation and decision requests, including work
+/// whose originating runtime future was cancelled while the sync thread was busy.
+const D28_HOST_REQUEST_LIMIT: usize = 4;
+static D28_HOST_REQUESTS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(D28_HOST_REQUEST_LIMIT)));
+
+fn bounded_d28_request(request: BftRequest, permit: tokio::sync::OwnedSemaphorePermit) -> BftRequest {
+    BftRequest::Bounded { request: Box::new(request), permit }
 }
 
 fn send_request(request: BftRequest) -> bool {
@@ -1849,20 +1865,43 @@ fn stored_tenderlink_wal(from: u64) -> Vec<(u64, Vec<u8>)> {
     db.tenderlink_wal(from).into_iter().map(|(height, record)| (u64::from(height), record)).collect()
 }
 
-/// Stores tenderlink's WAL record for `height`, synced to disk. `false` when it is not stored,
-/// which keeps tenderlink from sending what the record holds.
-fn write_tenderlink_wal(height: u64, record: Vec<u8>) -> bool {
-    let db = BFT_DB.read().unwrap();
-    let (Some(db), Ok(height)) = (db.as_ref(), u32::try_from(height)) else {
-        tracing::error!("there is no database to store tenderlink's WAL record for BFT height {height} in");
-        return false;
-    };
-    match db.write_tenderlink_wal(height, record) {
-        Ok(()) => true,
-        Err(err) => {
-            tracing::error!("could not store tenderlink's WAL record for BFT height {height}: {err}");
-            false
+/// Single-writer D28 storage. The node's one BFT task owns this (it is not Clone).
+/// RocksDB's synced atomic replacement is wrapped in an identity-bound envelope:
+/// changing the finalizer key must not reinterpret an old signing authority.
+struct D28BlockStore {
+    db: ZebraDb,
+    size: usize,
+    public_key: [u8; 32],
+}
+
+impl tenderlink::d28::AtomicBlockStore for D28BlockStore {
+    fn block_size(&self) -> usize { self.size }
+
+    fn load(&mut self, block: &mut [u8]) -> tenderlink::d28::Result<bool> {
+        use tenderlink::d28::Error;
+        if block.len() != self.size { return Err(Error::Storage); }
+        let Some(image) = self.db.d28_atomic_block() else { return Ok(false); };
+        if image.len() != self.size.checked_add(40).ok_or(Error::Storage)?
+            || &image[..8] != b"D28KEY01"
+            || image[8..40] != self.public_key
+        {
+            return Err(Error::Corrupt);
         }
+        block.copy_from_slice(&image[40..]);
+        Ok(true)
+    }
+
+    fn replace(&mut self, next: &[u8]) -> tenderlink::d28::Result<()> {
+        use tenderlink::d28::Error;
+        if next.len() != self.size { return Err(Error::Storage); }
+        let mut image = Vec::with_capacity(self.size.checked_add(40).ok_or(Error::Storage)?);
+        image.extend_from_slice(b"D28KEY01");
+        image.extend_from_slice(&self.public_key);
+        image.extend_from_slice(next);
+        self.db.write_d28_atomic_block(image).map_err(|err| {
+            tracing::error!("D28 durable signing image replacement failed; signing stops: {err}");
+            Error::Storage
+        })
     }
 }
 
@@ -1909,9 +1948,10 @@ impl BftRunner {
         metrics::gauge!("state.crosslink.bft_dropped").set(0.0);
         *BFT_DB.write().unwrap() = Some(block_writer.finalized_state.db.clone());
         crate::new_network::fin::load(&block_writer.finalized_state.db);
-        // The WAL keeps its newest record whatever it prunes, so a node that has signed in this
-        // state holds at least one.
-        runner.has_wal = !block_writer.finalized_state.db.tenderlink_wal(0).is_empty();
+        // Both engines retain their newest signing authority. D28's fixed image
+        // must count as signed state even though it is not a legacy height WAL row.
+        runner.has_wal = block_writer.finalized_state.db.d28_atomic_block().is_some()
+            || !block_writer.finalized_state.db.tenderlink_wal(0).is_empty();
         if runner.launch.is_some() {
             // A chain-bootstrapped node restarting with a stored chain and no WAL holds tenderlink
             // back until the sync loop has heard from peers whether it is behind
@@ -2104,8 +2144,14 @@ impl BftRunner {
     /// Serves one of tenderlink's requests, on the sync thread (see `SyncWakes`).
     pub(super) fn handle(&mut self, request: BftRequest, read_state: &ReadState, block_writer: &mut WriteBlockWorkerTask) {
         match request {
+            BftRequest::Bounded { request, permit } => {
+                self.handle(*request, read_state, block_writer);
+                drop(permit); // queued capacity is released only after handling
+            }
             BftRequest::Propose { reply } => {
-                let _ = reply.send(if bft_is_dropped() { None } else { self.propose(read_state) });
+                if !reply.is_closed() {
+                    let _ = reply.send(if bft_is_dropped() { None } else { self.propose(read_state) });
+                }
             }
             BftRequest::Validate { block, reply } => {
                 if bft_is_dropped() {
@@ -3149,7 +3195,7 @@ impl BftRunner {
     /// an empty roster: BFT height 1's roster is fixed by the stakes at h1, so nothing would ever
     /// change. Dropping the launch on that path is what stops the caller retrying: genesis is
     /// already decided and stored, and `store_decision` refuses to store it twice.
-    fn spawn_tenderlink(&mut self, roster: Vec<SortedRosterMember>, ingest: Vec<RoundData>, vote_namespace: [u8; 32], strict_quorum: bool) {
+    fn spawn_tenderlink(&mut self, roster: Vec<SortedRosterMember>, ingest: Vec<RoundData>, vote_namespace: [u8; 32], _strict_quorum: bool) {
         if roster.is_empty() {
             tracing::error!(
                 "BFT height {} has an empty roster: no stake was bonded by the bootstrap roster height ({:?}). BFT will not run on this chain.",
@@ -3174,79 +3220,83 @@ impl BftRunner {
             return;
         }
         let Some(launch) = self.launch.take() else { return; };
-        publish_tenderlink_held(false);
-        tracing::info!("starting tenderlink at BFT height {} with {} finalizer(s)", height_after(&ingest), roster.len());
-        BFT_CHAIN.write().unwrap().is_activated = true;
-
-        // The seeds are only addresses to start connections from. A finalizer's BFT key is
-        // learned on connect (tenderlink verifies it and rewrites its address map), so the hint
-        // here is deliberately nil: the roster comes from the chain, never from this list.
-        let (shared_transport, static_keypair, endpoint, seeds) = match launch.network {
-            Some(network) => {
-                // One key and port per node: tenderlink speaks as the node, at its public IP.
-                let ip = addr_string_to_stuff(&launch.public_address).1.ip;
-                if !launch.peer_addresses.is_empty() {
-                    tracing::warn!("bft_peers is ignored: BFT runs over the node's own connections, seeded from network_initial_peers");
-                }
-                let endpoint = tenderlink::stp::STPAddress::from(ip, network.port, &network.keypair);
-                (Some(network.transport), network.keypair, endpoint, network.seeds)
-            }
-            None => {
-                let (static_keypair, endpoint) = addr_string_to_stuff(&launch.public_address);
-                let seeds = launch.peer_addresses.iter().map(|peer| addr_string_to_stuff(peer).1).collect();
-                (None, static_keypair, endpoint, seeds)
+        let initial_height = height_after(&ingest);
+        let Some(network) = launch.network else {
+            tracing::error!("D28 requires the node's shared STP transport; BFT was not started");
+            return;
+        };
+        if !launch.peer_addresses.is_empty() {
+            tracing::warn!("bft_peers is ignored: D28 uses shared STP, seeded from network_initial_peers");
+        }
+        let Some(db) = BFT_DB.read().unwrap().clone() else {
+            tracing::error!("D28 requires durable signing storage; no database is available");
+            return;
+        };
+        // A legacy lock/intent cannot safely be interpreted as fresh D28 authority.
+        // Old decisions remain readable, but switching an active signer needs a new
+        // testnet or an externally coordinated height beyond every old signing intent.
+        if !stored_tenderlink_wal(initial_height).is_empty() {
+            tracing::error!("D28 refuses legacy signing records at or above BFT height {initial_height}; do not delete signer state to bypass this check");
+            return;
+        }
+        let config = tenderlink::d28::runtime::RuntimeConfig::new(
+            initial_height, roster, vote_namespace, self.params.active_roster_max_n,
+            network.transport, network.seeds,
+        );
+        let size = match tenderlink::d28::durable::image_size(tenderlink::d28::durable::Limits {
+            max_members: config.max_members, max_body: config.max_body,
+        }) {
+            Ok(size) => size,
+            Err(error) => {
+                tracing::error!("D28 signing image limits are invalid: {error:?}");
+                return;
             }
         };
-        let finalizer_peer_addresses: Vec<FinalizerPeerAddress> =
-            seeds.into_iter().map(|address| FinalizerPeerAddress { bft_pk: PubKeyID::NIL, address }).collect();
-        let wal_records = stored_tenderlink_wal(height_after(&ingest));
-        let task = self.rt.spawn(tenderlink::entry_point(
-            launch.signing_key,
-            shared_transport,
-            Some(static_keypair),
-            Some(endpoint),
-            roster,
-            self.params.active_roster_max_n,
-            finalizer_peer_addresses,
-            None,
-            tenderlink::ClosureToProposeNewBlock(Arc::new(move || {
+        let backend = D28BlockStore {
+            db, size,
+            public_key: ed25519_zebra::VerificationKeyBytes::from(&launch.signing_key).into(),
+        };
+        publish_tenderlink_held(false);
+        tracing::info!("starting D28 bounded engine at BFT height {initial_height} (durable image {size} bytes)");
+        BFT_CHAIN.write().unwrap().is_activated = true;
+        let host = tenderlink::d28::runtime::HostCallbacks {
+            propose: tenderlink::ClosureToProposeNewBlock(Arc::new(move || {
                 Box::pin(async move {
+                    let permit = Arc::clone(&D28_HOST_REQUESTS).acquire_owned().await.expect("D28 host budget is never closed");
                     let (reply, rx) = tokio::sync::oneshot::channel();
-                    if !send_request(BftRequest::Propose { reply }) {
+                    if !send_request(bounded_d28_request(BftRequest::Propose { reply }, permit)) {
                         return None;
                     }
                     rx.await.ok().flatten().map(|block| BlockValue(block.zcash_serialize_to_vec().unwrap()))
                 })
             })),
-            tenderlink::ClosureToValidateProposedBlock(Arc::new(move |block| {
-                let parsed = bft_block_from_canonical_bytes(&block.0);
+            validate: tenderlink::ClosureToValidateProposedBlock(Arc::new(move |block| {
                 Box::pin(async move {
-                    let Some(block) = parsed else {
-                        tracing::error!("Tenderlink payload is not a canonically encoded BFT block.");
+                    // The parsing allocation is also behind admission; cancelled
+                    // futures cannot leave unlimited parsed blocks in the sync queue.
+                    let permit = Arc::clone(&D28_HOST_REQUESTS).acquire_owned().await.expect("D28 host budget is never closed");
+                    let Some(block) = bft_block_from_canonical_bytes(&block.0) else {
+                        tracing::error!("D28 payload is not a canonically encoded BFT block.");
                         return (TMStatus::Fail, TMStatusReason::None);
                     };
                     let (reply, rx) = tokio::sync::oneshot::channel();
-                    if !send_request(BftRequest::Validate { block, reply }) {
+                    if !send_request(bounded_d28_request(BftRequest::Validate { block, reply }, permit)) {
                         return (TMStatus::Indeterminate, TMStatusReason::None);
                     }
                     rx.await.unwrap_or((TMStatus::Indeterminate, TMStatusReason::None))
                 })
             })),
-            tenderlink::ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer, proposal_sigs| {
+            push_decided: tenderlink::ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer, proposal_sigs| {
                 Box::pin(async move {
+                    let permit = Arc::clone(&D28_HOST_REQUESTS).acquire_owned().await.expect("D28 host budget is never closed");
                     let block = BftBlock::zcash_deserialize(&block.0[..]).unwrap();
                     let height = u64::from(block.height);
-                    // Subscribed before the hand-off, so the tip it leads to is not missed.
+                    // Subscribe before the hand-off. The existing host admission and
+                    // ledger transition remain the sole path for all decisions.
                     let mut tips = DECIDED_TIP.subscribe();
-                    // Failing to send means the sync thread is gone, so no tip will pass this
-                    // height; waiting forever lets the runtime's shutdown end the task instead of
-                    // the process. A refused or parked decision likewise waits, for the height to
-                    // be decided from peers or the snapshot to return.
-                    if !send_request(BftRequest::Decided { block, fat_pointer, proposal_sigs }) {
+                    if !send_request(bounded_d28_request(BftRequest::Decided { block, fat_pointer, proposal_sigs }, permit)) {
                         return std::future::pending().await;
                     }
-                    // The decision's own height when it was stored, or a later tip when the node
-                    // had decided past it: either way the published tip passing it is the answer.
                     loop {
                         let reached = tips.borrow_and_update().as_deref().filter(|tip| tip.height >= height).map(host_tip_of);
                         if let Some(tip) = reached {
@@ -3258,7 +3308,7 @@ impl BftRunner {
                     }
                 })
             })),
-            tenderlink::ClosureToUpdatePeers(Arc::new(move |all_peers| {
+            update_peers: tenderlink::ClosureToUpdatePeers(Arc::new(move |all_peers| {
                 let mut peer_strings = Vec::with_capacity(all_peers.len());
                 for peer in &all_peers {
                     peer_strings.push(format!(
@@ -3271,28 +3321,92 @@ impl BftRunner {
                 BFT_CHAIN.write().unwrap().peer_strings = peer_strings;
                 Box::pin(async {})
             })),
-            tenderlink::ClosureToAccessBft(Arc::new(move |bft_state: &TMState, bft_key_address_map: &BftAddressMap| {
-                RECENCY_STATUS.send_replace(recency_status_from(bft_state, bft_key_address_map));
-                note_decided_missing_pow_blocks(bft_state);
-                note_conflicting_quorum(bft_state);
-                Box::pin(async {})
-            })),
-            tenderlink::ClosureToFetchDecidedRound(Arc::new({
-                let active_roster_max_n = self.params.active_roster_max_n;
-                move |height| fetch_decided_round(height, active_roster_max_n)
-            })),
-            tenderlink::ClosureToWriteWal(Arc::new(move |height, record| {
-                let stored = write_tenderlink_wal(height, record);
-                Box::pin(async move { stored })
-            })),
-            tenderlink::ClosureToReadDecidedTip(Arc::new(host_tip)),
-            ingest,
-            wal_records,
-            vote_namespace,
-            strict_quorum,
-        ));
+            access: tenderlink::d28::runtime::AccessD28(Arc::new(publish_d28_status)),
+            read_tip: tenderlink::ClosureToReadDecidedTip(Arc::new(host_tip)),
+        };
+        let task = self.rt.spawn(async move {
+            if let Err(error) = tenderlink::d28::runtime::run(launch.signing_key, backend, config, host).await {
+                publish_tenderlink_held(true);
+                tracing::error!("D28 stopped without further signing: {error}; preserve the signing database before restarting");
+            }
+        });
         *TENDERLINK_TASK.lock().unwrap() = Some(task.abort_handle());
     }
+}
+
+/// Publish the bounded D28 live view through the existing monitoring structure.
+/// No historical round bank or new chain-facing structure is introduced.
+fn publish_d28_status(snapshot: &tenderlink::d28::runtime::Snapshot<'_>, addresses: &BftAddressMap) {
+    use tenderlink::d28::{Status, Step};
+    let now_utc = chrono::Utc::now().timestamp();
+    let active = &snapshot.roster[..snapshot.roster.len().min(snapshot.active_roster_max_n)];
+    let finalizer_statuses = active.iter().enumerate().map(|(index, member)| {
+        let mut status = FinalizerRecencyStatus::default();
+        for (kind, row) in [snapshot.prevotes, snapshot.precommits].iter().enumerate() {
+            if let Some(Some(vote)) = row.get(index) {
+                status.no_yes_votes_in_my_height[kind][usize::from(vote.content.id.is_some())] = 1;
+                status.highest_round_vote = u32::try_from(vote.content.round).unwrap_or(u32::MAX);
+            }
+        }
+        status.last_direct_connection_utc = if member.pub_key == snapshot.public_key {
+            Some(now_utc)
+        } else {
+            addresses.last_packet_utcs.get(&member.pub_key).copied()
+        };
+        (member.pub_key, status)
+    }).collect();
+    if let Some(pending) = &snapshot.pending {
+        // This is retained, fully verified decision evidence, not an untrusted
+        // status or an incomplete certificate. Reuse the existing missing-block path.
+        if let (Status::Indeterminate, TMStatusReason::NeedsBlock { hash }) = (pending.validity, &pending.reason) {
+            if !bft_is_dropped() && MISSING_POW_BLOCKS.lock().unwrap().contains_key(&Hash(*hash)) {
+                DECIDED_MISSING_POW_BLOCKS.lock().unwrap().insert(Hash(*hash));
+            }
+        }
+        let stored = {
+            let chain = BFT_CHAIN.read().unwrap();
+            usize::try_from(pending.height).ok().and_then(|height| decided_block(&chain, height))
+                .map(|block| block.blake3_hash())
+        };
+        if let Some(stored) = stored.filter(|stored| stored.0 != pending.id) {
+            if let Ok(round) = u32::try_from(pending.round) {
+                let signatures: Option<Vec<_>> = pending.certificate.votes.iter().map(|vote| {
+                    let member = active.get(vote.content.signer as usize)?;
+                    Some(zcash_primitives::bft::FatPointerSignature {
+                        pub_key: member.pub_key, vote_signature: vote.signature,
+                    })
+                }).collect();
+                if let Some(signatures) = signatures {
+                    let certificate = FatPointerToBftBlock::from_parts(
+                        Blake3Hash(pending.id), pending.height, round, &signatures,
+                    );
+                    let voting = VotingRoster {
+                        roster: active.to_vec(), vote_namespace: snapshot.namespace, strict_quorum: true,
+                    };
+                    if certificate_is_valid(&certificate, pending.height, &voting) {
+                        report_conflicting_quorum(pending.height, stored, &certificate, "D28 retains a decision quorum for");
+                    }
+                }
+            }
+        }
+    }
+    RECENCY_STATUS.send_replace(TFLRecencyStatus {
+        now_utc, my_height: snapshot.height,
+        my_round: u32::try_from(snapshot.round).unwrap_or(u32::MAX),
+        my_step: match snapshot.step {
+            Step::PreRound | Step::Propose => 0,
+            Step::Prevote => 1,
+            Step::Precommit | Step::Decided => 2,
+        },
+        my_locked_round: snapshot.locked_round.and_then(|r| i64::try_from(r).ok()).unwrap_or(-1),
+        my_valid_round: snapshot.valid_round.and_then(|r| i64::try_from(r).ok()).unwrap_or(-1),
+        finalizer_statuses,
+        parked_decision_height: *PARKED_DECISION_HEIGHT.lock().unwrap(),
+        bft_restores: BFT_RESTORES.load(std::sync::atomic::Ordering::Relaxed),
+        tenderlink_held: snapshot.catching_up,
+        conflicting_quorums: CONFLICTING_QUORUMS_SEEN.load(std::sync::atomic::Ordering::Relaxed),
+        conflicts: CONFLICTING_QUORUMS_REPORTED.lock().unwrap().iter().map(|(conflict, _)| conflict.clone()).collect(),
+    });
 }
 
 fn recency_status_from(bft_state: &TMState, bft_key_address_map: &BftAddressMap) -> TFLRecencyStatus {
@@ -3357,6 +3471,80 @@ fn recency_status_from(bft_state: &TMState, bft_key_address_map: &BftAddressMap)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn d28_host_requests_keep_capacity_after_response_cancellation() {
+        let budget = Arc::new(tokio::sync::Semaphore::new(D28_HOST_REQUEST_LIMIT));
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Cancellation before enqueue releases the owned request and permit.
+        let permit = budget.clone().try_acquire_owned().unwrap();
+        let (reply, response) = tokio::sync::oneshot::channel();
+        drop(bounded_d28_request(BftRequest::Propose { reply }, permit));
+        drop(response);
+        assert_eq!(budget.available_permits(), D28_HOST_REQUEST_LIMIT);
+        // A busy sync thread retains bodies even after every runtime waiter is
+        // cancelled. Their four permits must remain charged to the queued work.
+        for _ in 0..D28_HOST_REQUEST_LIMIT {
+            let permit = budget.clone().try_acquire_owned().unwrap();
+            let (reply, response) = tokio::sync::oneshot::channel();
+            let request = bounded_d28_request(BftRequest::Validate { block: test_block(2), reply }, permit);
+            assert!(tx.send(request).is_ok());
+            drop(response);
+        }
+        for _ in 0..1000 { assert!(budget.clone().try_acquire_owned().is_err()); }
+        let BftRequest::Bounded { request, permit } = rx.recv().unwrap() else { panic!("bounded request"); };
+        assert_eq!(budget.available_permits(), 0);
+        drop(request); // the handler consumes the body before releasing its permit
+        assert_eq!(budget.available_permits(), 0);
+        drop(permit);
+        assert_eq!(budget.available_permits(), 1);
+        let remaining: Vec<_> = rx.try_iter().collect();
+        assert_eq!(remaining.len(), D28_HOST_REQUEST_LIMIT - 1);
+        drop(remaining);
+        assert_eq!(budget.available_permits(), D28_HOST_REQUEST_LIMIT);
+        // Failed enqueue owns the request until the error itself is dropped.
+        drop(rx);
+        let permit = budget.clone().try_acquire_owned().unwrap();
+        let (reply, _response) = tokio::sync::oneshot::channel();
+        let failed = tx.send(bounded_d28_request(BftRequest::Propose { reply }, permit));
+        assert!(failed.is_err());
+        assert_eq!(budget.available_permits(), D28_HOST_REQUEST_LIMIT - 1);
+        drop(failed);
+        assert_eq!(budget.available_permits(), D28_HOST_REQUEST_LIMIT);
+    }
+
+    #[test]
+    fn d28_block_store_checks_size_identity_and_corruption() {
+        use tenderlink::d28::{AtomicBlockStore, Error};
+        let _init_guard = zebra_test::init();
+        let state = crate::service::finalized_state::FinalizedState::new(
+            &crate::Config::ephemeral(),
+            &Network::Mainnet,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        ).expect("an ephemeral database opens");
+        let mut backend = D28BlockStore { db: state.db.clone(), size: 64, public_key: [1; 32] };
+        let mut loaded = [0; 64];
+        assert_eq!(backend.load(&mut loaded), Ok(false));
+        assert_eq!(backend.load(&mut [0; 63]), Err(Error::Storage));
+        assert_eq!(backend.replace(&[3; 65]), Err(Error::Storage));
+        assert!(state.db.d28_atomic_block().is_none());
+        backend.replace(&[7; 64]).unwrap();
+        assert_eq!(backend.load(&mut loaded), Ok(true));
+        assert_eq!(loaded, [7; 64]);
+        drop(backend);
+        let mut reopened = D28BlockStore { db: state.db.clone(), size: 64, public_key: [1; 32] };
+        assert_eq!(reopened.load(&mut loaded), Ok(true));
+        assert_eq!(reopened.replace(&[3; 63]), Err(Error::Storage));
+        assert_eq!(reopened.load(&mut loaded), Ok(true));
+        assert_eq!(loaded, [7; 64]);
+        let mut wrong_key = D28BlockStore { db: state.db.clone(), size: 64, public_key: [2; 32] };
+        assert_eq!(wrong_key.load(&mut loaded), Err(Error::Corrupt));
+        let mut wrong_size = D28BlockStore { db: state.db.clone(), size: 65, public_key: [1; 32] };
+        assert_eq!(wrong_size.load(&mut [0; 65]), Err(Error::Corrupt));
+        state.db.write_d28_atomic_block(vec![0; 4]).unwrap();
+        assert_eq!(reopened.load(&mut loaded), Err(Error::Corrupt));
+    }
 
     fn test_block(version: u32) -> BftBlock {
         let header = BcBlockHeader {
