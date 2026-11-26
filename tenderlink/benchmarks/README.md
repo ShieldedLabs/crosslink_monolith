@@ -104,3 +104,69 @@ Rust stdout/stderr, **unchanged** Rust `report.json`, setup output, timed raw
 watchdog/classification `result.json`. The build recipe is provenance guidance,
 not proof of the command that produced an externally supplied binary. Trials are
 sequential within one invocation; unrelated CPU/disk activity is not excluded.
+
+## Recorded baseline — 2026-11-26
+
+Measured release commit `32e3e94f1efd4921c195236f7cdbd7037c7ca9f8`, built with
+Rust 1.94.0. Binary SHA-256:
+`ecdb54ee18ac8c0313614565bd447d4644c1b68cc2947fbbfade38be544b655d`.
+The shared host was an AMD Ryzen 5 5500U, 12 logical CPUs. All validators shared
+one process with **4 Tokio workers**; each STP endpoint also owns its transport
+threads. Production timers, receive budget 32, and the 1 MiB body bound were
+unchanged. Storage was the in-memory atomic-image backend; these are not fsync
+or distributed-machine capacity measurements.
+
+Each row combines three sequential trials, each with 2 warmup and 12 measured
+heights, plus a separate 1-second final-height hold. All **21 repeated trials
+completed**. Percentiles below pool 36 raw height observations using nearest rank;
+rates use total bytes divided by total measured duration, not averaged medians.
+
+Four validators, 512 synthetic headers, **96,103 serialized bytes/body**:
+
+| Network condition | First decision p50 / p95 (ms) | All-online p50 (ms) | Committed body KiB/s | Network / chain bytes |
+|---|---:|---:|---:|---:|
+| Clean | 470.48 / 521.91 | 501.02 | 186.81 | 25.32× |
+| 25 ms one-way delay | 659.10 / 857.50 | 700.20 | 130.24 | 27.75× |
+| 25 ± 5 ms, 1% loss | 689.29 / 961.37 | 726.22 | 110.64 | 26.61× |
+| Shared aggregate 10 Mbit/s | 2058.03 / 5622.86 | 2257.77 | 31.25 | 33.75× |
+| One validator offline | 523.95 / 4008.00 | 552.81 | 67.02 | 21.02× |
+
+Network/chain uses pre-netem accounted bytes, including the synthetic 14-byte
+loopback link header. It includes necessary replication, complete evidence,
+framing, redundancy and probes: **it is not a pure wasted-chatter ratio**.
+Complete evidence alone was 12.42–16.89 times unique chain-body bytes and
+95.2–99.1% of application-offered traffic. Application control traffic was
+22.50–28.26 KiB/s with four online validators, and 12.78 KiB/s with one offline.
+One lossy height took 4.33 seconds to its first decision; with only 36 samples,
+p99 is the maximum, not a stable tail estimate.
+
+Clean-link scaling with 32 headers (same 5,984-byte synthetic payload):
+
+| Online validators | Mean body bytes | First decision p50 / p95 (ms) | All-online p50 / p95 (ms) | Body KiB/s | Network / chain bytes | Receive-budget discards |
+|---|---:|---:|---:|---:|---:|---:|
+| 4 | 6,343 | 498.24 / 548.34 | 532.89 / 616.96 | 11.54 | 80.84× | 0 |
+| 16 | 7,111 | 1354.74 / 6029.82 | 1976.44 / 6551.54 | 2.93 | 2193.52× | 19,699 |
+
+The 16-validator run exposes local receive-budget losses on a lossless simulated
+link, despite zero recorded wrapper inbox/outbox/ring drops. It is a **contended
+single-host, four-worker result**, not a prediction for sixteen separate hosts.
+Larger bodies amortize substantial per-height traffic; the defaults are not a
+performance-tuned configuration. The separate final-height hold is not idle:
+for the four-validator large-body clean case it still emitted 803.9 KiB/s,
+including unfinished transfer traffic, control and transport overhead.
+
+A separate 100%-loss trial correctly returned `partial` with no decisions,
+retained its stalled duration of at least 3 seconds, and recorded positive
+whole-process pre-loss traffic despite zero post-loss loopback TX. Missing
+end-of-deadline `tc` samples remained unavailable, not fabricated zero costs.
+
+Raw local evidence (each includes manifests, original reports and counters):
+
+- `/var/tmp/d28-component-matrix-20261126-1538`
+- `/var/tmp/d28-component-small-20261126-1542`
+- `/var/tmp/d28-component-scale16-20261126-1542`
+- `/var/tmp/d28-component-allloss-20261126-1546`
+
+The corresponding code passed 275 release tests (five existing ignored tests;
+unbounded legacy `single_rt` excluded), 14 runner selftests including real netns
+checks, and the optimized CLI build. No PoW/ledger formats or rules were changed.
