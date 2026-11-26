@@ -218,9 +218,10 @@ of 32; `fast` uses 5/25 ms and 128. Both allow two concurrent source requests.
 an end-to-end RX/memory cap, and an unhelpful source can occupy that sole lease
 until the unchanged two-second expiry. `economy` changes only baseline's polling
 interval, from 25 to 100 ms, to test lower state-replacement frequency. All profiles
-keep outgoing handoffs at two. Consensus timers, quorum, signatures and the 1 MiB
-body cap are unchanged. These are benchmark overrides, **not changed node
-defaults**. Sizes and paired profiles are randomized within each repetition.
+keep outgoing handoffs at two. By default, consensus timers, quorum, signatures
+and the 1 MiB body cap are unchanged; explicit large-body and WAN overrides are
+explained below. These are benchmark overrides, **not changed node defaults**.
+Sizes and paired profiles are randomized within each repetition.
 `--offline 1` keeps four identities in the roster but launches only three nodes.
 
 Reprocess a downloaded campaign without changing its original `summary.json`:
@@ -267,6 +268,56 @@ Raw reports, exact configurations, executable/script hashes, worker metadata and
 controller traces are retained per trial. Workers run one fixed executable with
 bounded input and owned-child lifetimes; uncertain cleanup stops the campaign.
 Stop and delete only the temporary app you created after retrieving its results.
+
+### Exact large bodies and worldwide timing
+
+`--body-bytes` selects exact **serialized block** sizes, including the previous
+fat pointer, through 10 MiB. It uses 32 existing mock headers and deterministic
+padding in their solution fields; it is incompatible with explicit `--headers`
+or `--solution-bytes`. These are not valid Equihash solutions or real transaction
+payloads. The canonical block parser, hash, vote signatures and fat-pointer
+format are unchanged. Synthetic-payload counters count the serialized headers,
+not the full block or its parent certificate.
+
+Set `--max-body 10485760` explicitly and keep it fixed across a size sweep.
+Changing the cap also changes the fixed durable-image work and transport
+geometry, so doing it per size would confound the comparison. For seven members
+this cap gives a 31,465,268-byte durable image, serialized/hashed/copied on each
+replacement. The store is still in memory, not a disk-backed production store.
+Large-cap benchmark transport settings admit the bounded frame and use 16-MiB
+per-peer byte queues and 32 native receive-ring slots; default-cap settings are
+unchanged. This is not a proof that every allocation fits a particular VM size.
+
+`--timing-profile wan` uses propose/prevote/precommit timeouts of 10/5/7 seconds,
+a 10-second source-request lifetime and 15-second status TTL. Timeout increments
+remain 900/300/600 ms and rho remains 500 ms. These timers do not impose waits on
+the successful quorum path, but do change failure recovery; these results must
+not be labeled production-default performance. The default timing profile is
+`production`. Host-service profiles such as `baseline` remain a separate choice.
+
+Each completed seven-height trial covers a full round-zero proposer rotation.
+Partial trials need not cover all seven, and fallback rounds can use other
+proposers. For example:
+
+```sh
+python3 /app/d28_fly.py campaign --roster /data/roster.json \
+  --binary /app/d28_bench --token-file /run/d28-token --out /data/global-grid-001 \
+  --body-bytes 131072,524288,1048576,2097152,4194304,8388608,10485760 \
+  --max-body 10485760 --timing-profile wan --profiles baseline \
+  --repetitions 3 --heights 7 --warmup 1 --seed 431 \
+  --timeout-secs 180 --chatter-secs 2 --lifetime-secs 5400 \
+  --max-trial-tx-bytes 1073741824 --max-campaign-tx-bytes 25000000000
+```
+
+Set the same `--max-trial-tx-bytes` on each worker. The per-node watchdog counts
+whole-child VM-interface TX, including warmup, hold and control traffic; the
+campaign budget sums those counters, not RX or just measured-chain traffic.
+Missing or regressing counters fail closed when limits are enabled. These are
+software stop thresholds, **not exact billing ceilings**: sampling, termination
+and an in-flight trial can overshoot. Keep a separate machine lifetime limit,
+collect results, and delete the temporary app. A budget stop is not a successful
+completion of the planned campaign. Do not discard partial trials or manufacture
+zero counters for missing node reports.
 
 ### Recorded Fly results — 2026-11-26
 
