@@ -1886,16 +1886,28 @@ class RealTests(unittest.TestCase):
                 args = build_parser().parse_args(["campaign", "--binary", str(self.binary),
                     "--roster", str(root / "roster.json"), "--token-file", str(token_file),
                     "--out", str(root / "smoke"), "--headers", "32", "--repetitions", "1",
+                    "--profiles", "baseline,fast_k1",
                     "--heights", "3", "--warmup", "1", "--timeout-secs", "30"])
                 result = campaign(args)
                 details = {str(path.relative_to(root)): optional_text(path) for pattern in
                            ("trial-*/result.json", "trial-*/controller.json", "trial-*/node-*/stderr.txt")
                            for path in (root / "smoke").glob(pattern)}
                 self.assertEqual(result, 0, details)
-                summary = read_json(root / "smoke" / "summary.json")["cases"][0]
-                self.assertEqual(summary["completed_heights"], 3)
-                self.assertGreater(summary["body_bytes"], 18000)
-                self.assertEqual(summary["receipt_ms"]["all"]["n"], 3)
+                summaries = read_json(root / "smoke" / "summary.json")["cases"]
+                self.assertEqual([row["profile"] for row in summaries], ["baseline", "fast_k1"])
+                for summary in summaries:
+                    with self.subTest(profile=summary["profile"]):
+                        self.assertEqual(summary["completed_heights"], 3)
+                        self.assertGreater(summary["body_bytes"], 18000)
+                        self.assertEqual(summary["receipt_ms"]["all"]["n"], 3)
+                for trial in (root / "smoke").glob("trial-*"):
+                    profile = read_json(trial / "trial.json")["profile"]
+                    reports = list(trial.glob("node-*/report.json"))
+                    self.assertEqual(len(reports), 4)
+                    for path in reports:
+                        config = read_json(path)["config"]
+                        self.assertEqual(config["max_requests"], PROFILES[profile]["max_requests"])
+                        self.assertEqual(config["max_outgoing"], 2)
             finally:
                 for server in servers:
                     server.shutdown(); server.server_close()
