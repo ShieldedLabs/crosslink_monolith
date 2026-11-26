@@ -28,9 +28,16 @@ pub struct DistributedConfig {
     pub peers: Vec<SocketAddrV6>,
     pub coordinator: SocketAddrV6,
     pub run_id: String,
-    /// Existing Zcash solution field, not an added ledger/wire format.
+    /// Legacy per-header padding in the existing Zcash solution field.
     #[serde(default)]
     pub solution_bytes: usize,
+    /// Exact serialized BftBlock target, including the actual parent certificate.
+    /// Zero retains legacy header/solution sizing. Mock padding is NOT valid PoW.
+    #[serde(default)]
+    pub body_bytes: usize,
+    /// Explicit benchmark-only fallback timers; omitted means unchanged production.
+    #[serde(default = "default_timing_profile")]
+    pub timing_profile: String,
     #[serde(default = "default_poll")]
     pub poll_ms: u64,
     #[serde(default = "default_status")]
@@ -55,7 +62,38 @@ fn default_requests() -> usize {
     2
 }
 
+fn default_timing_profile() -> String {
+    "production".into()
+}
+
 impl DistributedConfig {
+    fn validate_body_shape(&self) -> io::Result<()> {
+        if !(1..=32).contains(&self.nodes)
+            || !(1..=BENCH_MAX_BODY).contains(&self.max_body)
+            || self.body_bytes > self.max_body
+            || self.body_bytes > BENCH_MAX_BODY
+            || self.headers > 2048
+            || self.solution_bytes > 1344
+            || (self.body_bytes > 0 && (self.headers == 0 || self.solution_bytes != 0))
+        {
+            return Err(invalid("bounds: nodes 1..32, max_body 1..10MiB, body_bytes <=max_body, headers <=2048; byte mode requires headers 1..2048 and solution_bytes=0; legacy solution_bytes <=1344"));
+        }
+        Ok(())
+    }
+    fn apply_timing(
+        &self,
+        timeouts: &mut super::super::Timeouts,
+        request_timeout: &mut u64,
+        status_ttl: &mut u64,
+    ) {
+        if self.timing_profile == "wan" {
+            timeouts.propose = 10_000;
+            timeouts.prevote = 5_000;
+            timeouts.precommit = 7_000;
+            *request_timeout = 10_000;
+            *status_ttl = 15_000;
+        }
+    }
     fn base(&self) -> BenchConfig {
         BenchConfig {
             nodes: self.nodes,
@@ -71,6 +109,10 @@ impl DistributedConfig {
         }
     }
     pub fn validate(&self) -> io::Result<()> {
+        self.validate_body_shape()?;
+        if !matches!(self.timing_profile.as_str(), "production" | "wan") {
+            return Err(invalid("timing_profile must be production or wan"));
+        }
         self.base().validate()?;
         if self.node >= self.nodes - self.offline || self.peers.len() != self.nodes {
             return Err(invalid(
@@ -113,7 +155,7 @@ impl DistributedConfig {
         if unique.len() != self.peers.len() {
             return Err(invalid("duplicate peer endpoint"));
         }
-        let parent = FatPointerToBftBlock::from_parts(
+        let mut parent = FatPointerToBftBlock::from_parts(
             zcash_primitives::bft::Blake3Hash([1; 32]),
             1,
             0,
@@ -125,10 +167,16 @@ impl DistributedConfig {
                 self.nodes
             ],
         );
-        if body(2, parent, self)?.0.len() > self.max_body {
-            return Err(invalid(
-                "padded headers plus full-roster parent certificate exceed max_body",
-            ));
+        // Check size arithmetic before allocating any solution padding. A full-N
+        // parent must fit even if the actual chain exports only a quorum.
+        solution_lengths(&parent, self)?;
+        if self.body_bytes > 0 {
+            let quorum = crate::decision_threshold(self.nodes as u64, true) as usize;
+            while parent.signatures.len() > quorum {
+                parent.signatures.pop();
+                solution_lengths(&parent, self)?;
+            }
+            solution_lengths(&FatPointerToBftBlock::null(), self)?;
         }
         Ok(())
     }
@@ -157,30 +205,102 @@ fn padded_header(height: u32, index: usize, bytes: usize) -> BlockHeaderData {
     h.solution = vec![0x28; bytes];
     h
 }
+
+/// Largest solution whose encoded growth over an empty solution fits `budget`.
+/// The unchanged Vector codec uses CompactSize (1/3/5 bytes here), bounded by
+/// 32 MiB per vector. Our entire body is <=10 MiB, including all these vectors.
+fn padding_at_most(budget: usize) -> (usize, usize) {
+    match budget {
+        0..=252 => (budget, budget),
+        253..=254 => (252, 252),
+        255..=65537 => (budget - 2, budget),
+        65538..=65539 => (65535, 65537),
+        _ => (budget - 4, budget),
+    }
+}
+
+/// Bounded arithmetic/metadata only: no solution Vec is allocated until the
+/// whole target (including the actual parent certificate) has been checked.
+fn solution_lengths(parent: &FatPointerToBftBlock, c: &DistributedConfig) -> io::Result<Vec<usize>> {
+    c.validate_body_shape()?;
+    if parent.signatures.len() > c.nodes {
+        return Err(invalid("parent exceeds full roster"));
+    }
+    // Derive fixed overhead from the existing serializers, not a second format.
+    let base = mock_body(2, parent.clone(), 0)?.0.len() + payload_size(c.headers)? as usize;
+    if c.body_bytes == 0 {
+        let prefix_growth = if c.solution_bytes < 253 { 0 } else { 2 };
+        if base + c.headers * (c.solution_bytes + prefix_growth) > c.max_body {
+            return Err(invalid("padded headers plus full-roster parent certificate exceed max_body"));
+        }
+        return Ok(vec![c.solution_bytes; c.headers]);
+    }
+    let extra = c.body_bytes.checked_sub(base)
+        .ok_or_else(|| invalid("body_bytes is smaller than headers plus parent certificate"))?;
+    if c.headers == 1 {
+        let (length, used) = padding_at_most(extra);
+        return if used == extra { Ok(vec![length]) } else {
+            Err(invalid("body_bytes falls in a CompactSize gap; use at least two headers"))
+        };
+    }
+    // Balance the first N-2 headers, then solve the last pair. Two headers can
+    // bridge either two-byte CompactSize gap without changing the target size.
+    let (each, used) = padding_at_most(extra / c.headers);
+    let mut lengths = vec![each; c.headers];
+    let remaining = extra - used * (c.headers - 2);
+    for adjustment in 0..=4 {
+        let (a, a_used) = padding_at_most((remaining / 2).saturating_sub(adjustment));
+        let (b, b_used) = padding_at_most(remaining - a_used);
+        if a_used + b_used == remaining {
+            lengths[c.headers - 2] = a;
+            lengths[c.headers - 1] = b;
+            return Ok(lengths);
+        }
+    }
+    Err(invalid("cannot represent exact padding target"))
+}
+
 fn body(
     height: u32,
     parent: FatPointerToBftBlock,
     c: &DistributedConfig,
 ) -> io::Result<BlockValue> {
-    Ok(BlockValue(
+    let lengths = solution_lengths(&parent, c)?;
+    let value = BlockValue(
         BftBlock {
             version: 2,
             height,
             previous_block_fat_ptr: parent,
-            headers: (0..c.headers)
-                .map(|i| padded_header(height, i, c.solution_bytes))
+            headers: lengths.into_iter().enumerate()
+                .map(|(i, bytes)| padded_header(height, i, bytes))
                 .collect(),
             slashforks: vec![],
             do_not_include_until_bc_height: 0,
         }
         .zcash_serialize_to_vec()?,
-    ))
+    );
+    if value.0.len() > c.max_body || (c.body_bytes > 0 && value.0.len() != c.body_bytes) {
+        return Err(invalid("serialized mock body does not match its validated target"));
+    }
+    Ok(value)
 }
-fn payload_bytes(c: &DistributedConfig) -> io::Result<u64> {
-    let mut bytes = vec![];
-    BlockHeader::write_data(&padded_header(1, 0, c.solution_bytes), &mut bytes)?;
-    Ok((bytes.len() * c.headers) as u64)
+
+fn payload_bytes(block: &BftBlock) -> io::Result<u64> {
+    struct Counter(u64);
+    impl io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 += bytes.len() as u64;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    let mut counter = Counter(0);
+    for h in &block.headers {
+        BlockHeader::write_data(h, &mut counter)?;
+    }
+    Ok(counter.0)
 }
+
 fn valid_body(
     value: &BlockValue,
     height: u64,
@@ -188,33 +308,43 @@ fn valid_body(
     c: &DistributedConfig,
     members: &[SortedRosterMember],
 ) -> bool {
-    if value.0.len() > c.max_body {
-        return false;
+    checked_body_payload(value, height, parent, c, members).is_some()
+}
+
+/// Validate once and return actual serialized header bytes, not the target body
+/// size. In byte mode this payload varies with the parent certificate's length.
+fn checked_body_payload(
+    value: &BlockValue,
+    height: u64,
+    parent: ValueId,
+    c: &DistributedConfig,
+    members: &[SortedRosterMember],
+) -> Option<u64> {
+    c.validate_body_shape().ok()?;
+    if value.0.len() > c.max_body || (c.body_bytes > 0 && value.0.len() != c.body_bytes) {
+        return None;
     }
     let mut bytes = &value.0[..];
-    let Ok(block) = BftBlock::zcash_deserialize(&mut bytes) else {
-        return false;
-    };
+    let block = BftBlock::zcash_deserialize(&mut bytes).ok()?;
+    let lengths = solution_lengths(&block.previous_block_fat_ptr, c).ok()?;
     if !bytes.is_empty()
         || block.version != 2
         || u64::from(block.height) != height
         || !block.slashforks.is_empty()
         || block.do_not_include_until_bc_height != 0
         || block.headers.len() != c.headers
-        || !block
-            .headers
-            .iter()
-            .enumerate()
-            .all(|(i, h)| *h == padded_header(block.height, i, c.solution_bytes))
+        || !block.headers.iter().zip(lengths).enumerate()
+            .all(|(i, (h, length))| *h == padded_header(block.height, i, length))
         || block.zcash_serialize_to_vec().ok().as_deref() != Some(value.0.as_slice())
     {
-        return false;
+        return None;
     }
-    if height == 1 {
+    let valid_parent = if height == 1 {
         block.previous_block_fat_ptr == FatPointerToBftBlock::null()
     } else {
         verify_pointer(&block.previous_block_fat_ptr, members, height - 1, parent)
-    }
+    };
+    valid_parent.then(|| payload_bytes(&block).ok()).flatten()
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -501,9 +631,10 @@ fn host(state: Arc<Mutex<LocalState>>) -> HostCallbacks {
             let mut c = pushed.lock().unwrap();
             let height = c.committed + 1;
             let id = ValueId(HashKeys::default().value_id.hash(&body.0));
+            let payload = checked_body_payload(&body, height, c.id, &c.config, &c.members);
             if c.pending.is_some()
                 || !chunks.is_empty()
-                || !valid_body(&body, height, c.id, &c.config, &c.members)
+                || payload.is_none()
                 || !verify_pointer(&pointer, &c.members, height, id)
             {
                 c.failure = Some(format!(
@@ -515,7 +646,7 @@ fn host(state: Arc<Mutex<LocalState>>) -> HostCallbacks {
                     measured: height > u64::from(c.config.warmup),
                     id: hex::encode(id.0),
                     body_bytes: body.0.len() as u64,
-                    payload_bytes: payload_bytes(&c.config).expect("validated shape"),
+                    payload_bytes: payload.expect("validated shape"),
                     latency_ms: milliseconds(entered.duration_since(c.height_start)),
                     round: pointer.get_vote_template().round as u64,
                     at_ms: milliseconds(entered.duration_since(c.origin)),
@@ -632,7 +763,7 @@ pub async fn run(config: DistributedConfig) -> io::Result<DistributedReport> {
     let mut measured_end = None;
     let mut chatter_end = None;
     let mut runtime_settings = BTreeMap::new();
-    let limits = crate::transport::TransportLimits::default();
+    let limits = bench_transport_limits(config.nodes, config.max_body)?;
     let transport_settings = format!("{limits:?}; send_buffer_params=(1000000,524288,8388608)");
     let result = bounded(deadline, async {
         let identities: Vec<_> = (0..config.nodes).map(|i| {
@@ -657,6 +788,7 @@ pub async fn run(config: DistributedConfig) -> io::Result<DistributedReport> {
         let mut rt = RuntimeConfig::new(1, roster(config.nodes), NAMESPACE, config.nodes, transport,
             addresses.into_iter().enumerate().filter_map(|(i, a)| (i != config.node).then_some(a)).collect());
         rt.max_body = config.max_body;
+        config.apply_timing(&mut rt.timeouts, &mut rt.request_timeout, &mut rt.status_ttl);
         rt.poll_interval = Duration::from_millis(config.poll_ms);
         rt.status_interval = Duration::from_millis(config.status_ms);
         rt.max_receive_per_tick = config.receive_budget;
@@ -809,7 +941,8 @@ pub async fn run(config: DistributedConfig) -> io::Result<DistributedReport> {
             "Optional chatter retains final-height evidence after final ACK without next-height publication; not idle traffic of a quiescent chain. Shutdown/in-flight tail excluded from measured counters.",
             "Application offered bytes are not wire bytes; transport ring messages are not UDP packets. /proc/net/dev includes TX/RX of every non-lo interface and all VM traffic, including controller/management; not isolated D28 amplification. Serial snapshots have sampling skew.",
             "Host CPU/steal/cgroup counters include other VM processes. Process CPU is in reported clock ticks; RSS/maxRSS are gauges (not deltas). Missing system metrics carry errors, never fabricated zeros. In-memory atomic image is not fsync/crash-durable storage.",
-            "Production rho/consensus timeouts and core formats unchanged. Only explicit poll/status/receive/request/outgoing scheduling knobs vary; transport defaults and maximum body bound are recorded.",
+            "Synthetic solution padding uses unchanged BftBlock/header Vector serialization; it is NOT valid Equihash work or a production-valid ledger body. body_bytes targets the exact whole serialized body; payload_bytes counts only actual serialized headers and can vary with parent certificate length.",
+            "Production defaults and core formats unchanged. Explicit benchmark timing_profile=wan changes only base consensus/request/status-expiry timers; rho and round increments stay unchanged. Scheduling knobs, body cap and benchmark transport/ring overrides are recorded. Memory bounds here are not a whole-process RSS guarantee.",
         ],
     })
 }
@@ -843,7 +976,7 @@ mod tests {
         let b = body(1, FatPointerToBftBlock::null(), &c).unwrap();
         assert!(b.0.len() > 1_000_000 && b.0.len() < 1_048_576);
         assert!(valid_body(&b, 1, ValueId::NIL, &c, &roster(4)));
-        assert_eq!(payload_bytes(&c).unwrap(), 509 * 2048);
+        assert_eq!(checked_body_payload(&b, 1, ValueId::NIL, &c, &roster(4)), Some(509 * 2048));
         c.solution_bytes = 321;
         assert!(!valid_body(&b, 1, ValueId::NIL, &c, &roster(4)));
         c.headers = 2049;
@@ -860,6 +993,141 @@ mod tests {
         assert!(c.validate().is_err());
         c = config();
         c.receive_budget = 0;
+        assert!(c.validate().is_err());
+    }
+    fn byte_config(target: usize) -> DistributedConfig {
+        let mut c = config();
+        c.nodes = 7;
+        c.peers = (0..7).map(|i| format!("[::1]:{}", 9000 + i).parse().unwrap()).collect();
+        c.body_bytes = target;
+        c.max_body = BENCH_MAX_BODY;
+        c
+    }
+    #[test]
+    fn exact_bodies_roundtrip_with_null_quorum_and_full_roster_parents() {
+        use super::super::tests::pointer;
+        let members = roster(7);
+        for target in [6727, 8192, 65536, 1024 * 1024, BENCH_MAX_BODY] {
+            let c = byte_config(target);
+            c.validate().unwrap();
+            let first = body(1, FatPointerToBftBlock::null(), &c).unwrap();
+            let id = ValueId(HashKeys::default().value_id.hash(&first.0));
+            for (height, parent) in [
+                (1, FatPointerToBftBlock::null()),
+                (2, pointer(7, &[0, 1, 2, 3, 4], 1, id)),
+                (2, pointer(7, &[0, 1, 2, 3, 4, 5], 1, id)),
+                (2, pointer(7, &[0, 1, 2, 3, 4, 5, 6], 1, id)),
+            ] {
+                let signatures = parent.signatures.len();
+                let value = body(height, parent, &c).unwrap();
+                assert_eq!(value.0.len(), target);
+                let mut bytes = value.0.as_slice();
+                let decoded = BftBlock::zcash_deserialize(&mut bytes).unwrap();
+                assert!(bytes.is_empty());
+                assert_eq!(decoded.zcash_serialize_to_vec().unwrap(), value.0);
+                assert!(valid_body(&value, height.into(), id, &c, &members));
+                assert_eq!(payload_bytes(&decoded).unwrap() as usize, target - 71 - 96 * signatures);
+                assert_eq!(checked_body_payload(&value, height.into(), id, &c, &members),
+                    Some((target - 71 - 96 * signatures) as u64));
+                if target == BENCH_MAX_BODY {
+                    assert!(decoded.headers.iter().all(|h| h.solution.len() > 1344));
+                }
+            }
+        }
+        for headers in [1, 2, 2048] {
+            let mut c = byte_config(BENCH_MAX_BODY);
+            c.headers = headers;
+            c.validate().unwrap();
+            let value = body(1, FatPointerToBftBlock::null(), &c).unwrap();
+            assert_eq!(value.0.len(), BENCH_MAX_BODY);
+            assert!(valid_body(&value, 1, ValueId::NIL, &c, &members));
+        }
+    }
+    #[test]
+    fn exact_padding_bridges_compact_size_gaps_without_format_changes() {
+        for headers in [1, 2, 32] {
+            let mut c = byte_config(8192);
+            c.headers = headers;
+            let base = mock_body(1, FatPointerToBftBlock::null(), headers).unwrap().0.len();
+            for extra in (0..=520).chain(65500..=65600).chain(32 * 252..=32 * 256) {
+                c.body_bytes = base + extra;
+                let value = body(1, FatPointerToBftBlock::null(), &c);
+                if headers == 1 && matches!(extra, 253 | 254 | 65538 | 65539) {
+                    assert!(value.is_err());
+                } else {
+                    let value = value.unwrap();
+                    assert_eq!(value.0.len(), c.body_bytes);
+                    assert!(valid_body(&value, 1, ValueId::NIL, &c, &roster(7)));
+                }
+            }
+        }
+    }
+    #[test]
+    fn byte_mode_rejects_bad_bounds_padding_and_parent_signatures() {
+        use super::super::tests::pointer;
+        for (field, value) in [
+            ("body_bytes", BENCH_MAX_BODY + 1), ("body_bytes", usize::MAX),
+            ("max_body", BENCH_MAX_BODY + 1), ("max_body", 0),
+            ("max_body", 8191), ("headers", 0), ("headers", 2049),
+            ("nodes", 0), ("nodes", 33), ("solution_bytes", 1),
+            ("body_bytes", 6726),
+        ] {
+            let mut json = serde_json::to_value(byte_config(8192)).unwrap();
+            json[field] = serde_json::json!(value);
+            let c: DistributedConfig = serde_json::from_value(json).unwrap();
+            assert!(c.validate().is_err(), "{field}={value}");
+        }
+        let c = byte_config(8192);
+        let members = roster(7);
+        let first = body(1, FatPointerToBftBlock::null(), &c).unwrap();
+        let id = ValueId(HashKeys::default().value_id.hash(&first.0));
+        let parent = pointer(7, &[0, 1, 2, 3, 4], 1, id);
+        let value = body(2, parent.clone(), &c).unwrap();
+        let mut decoded = BftBlock::zcash_deserialize(value.0.as_slice()).unwrap();
+        decoded.headers[0].solution[0] ^= 1;
+        let bad = BlockValue(decoded.zcash_serialize_to_vec().unwrap());
+        assert_eq!(bad.0.len(), c.body_bytes);
+        assert!(!valid_body(&bad, 2, id, &c, &members));
+        decoded.headers[0].solution[0] ^= 1;
+        decoded.headers[0].solution.pop();
+        assert!(!valid_body(&BlockValue(decoded.zcash_serialize_to_vec().unwrap()), 2, id, &c, &members));
+        let mut bad_parent = parent;
+        bad_parent.signatures[0].vote_signature[0] ^= 1;
+        assert!(!valid_body(&body(2, bad_parent, &c).unwrap(), 2, id, &c, &members));
+        let short = pointer(7, &[0, 1, 2, 3], 1, id);
+        assert!(!valid_body(&body(2, short, &c).unwrap(), 2, id, &c, &members));
+        assert!(!valid_body(&value, 2, ValueId::NIL, &c, &members));
+        assert!(!valid_body(&value, 3, id, &c, &members));
+        let mut trailing = value;
+        trailing.0.push(0);
+        assert!(!valid_body(&trailing, 2, id, &c, &members));
+        // Valid at full-roster height2 but not representable at height1: reject
+        // before launch rather than returning no proposal later.
+        let mut gap = byte_config(71 + 187 + 65538);
+        gap.headers = 1;
+        assert!(gap.validate().is_err());
+    }
+    #[test]
+    fn timing_profiles_are_explicit_and_preserve_production_defaults() {
+        let mut c = config();
+        assert_eq!(c.body_bytes, 0);
+        assert_eq!(c.timing_profile, "production");
+        let original = super::super::super::Timeouts {
+            propose: 2000, prevote: 1000, precommit: 1500,
+            inc_propose: 900, inc_prevote: 300, inc_precommit: 600,
+        };
+        let mut timeouts = original;
+        let (mut request, mut ttl) = (2000, 5000);
+        c.apply_timing(&mut timeouts, &mut request, &mut ttl);
+        assert_eq!((timeouts, request, ttl), (original, 2000, 5000));
+        c.timing_profile = "wan".into();
+        c.validate().unwrap();
+        c.apply_timing(&mut timeouts, &mut request, &mut ttl);
+        assert_eq!(timeouts, super::super::super::Timeouts {
+            propose: 10000, prevote: 5000, precommit: 7000, ..original
+        });
+        assert_eq!((request, ttl), (10000, 15000));
+        c.timing_profile = "other".into();
         assert!(c.validate().is_err());
     }
     #[test]

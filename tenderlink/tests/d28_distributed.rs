@@ -19,6 +19,7 @@ struct Trial {
     ports: Vec<String>,
     reservations: Vec<UdpSocket>,
     listener: TcpListener,
+    retain: bool,
 }
 impl Trial {
     fn new(nodes: usize) -> Self {
@@ -45,6 +46,7 @@ impl Trial {
             ports,
             reservations,
             listener,
+            retain: false,
         }
     }
     fn config(&self, node: usize, timeout: u64) -> Value {
@@ -132,11 +134,21 @@ impl Trial {
 }
 impl Drop for Trial {
     fn drop(&mut self) {
+        if thread::panicking() {
+            // One EOF at the deadline must not immediately kill peers still
+            // publishing their partial reports. Give only these owned children
+            // a bounded flush grace, then retain the existing kill/reap fallback.
+            let until = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < until && self.children.iter_mut()
+                .any(|c| matches!(c.try_wait(), Ok(None))) {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
         for c in &mut self.children {
             let _ = c.kill();
             let _ = c.wait();
         }
-        if !thread::panicking() {
+        if !thread::panicking() && !self.retain {
             let _ = fs::remove_dir_all(&self.dir);
         }
     }
@@ -150,20 +162,31 @@ fn send(s: &mut BufReader<TcpStream>, text: &[u8]) {
     s.get_mut().write_all(text).unwrap();
 }
 
-fn cohort(headers: usize, solution: usize, offline: usize, chatter: u64) {
-    let mut trial = Trial::new(4);
-    let online = 4 - offline;
+fn cohort(nodes: usize, headers: usize, solution: usize, body_bytes: usize,
+    offline: usize, chatter: u64, timing_profile: &str) {
+    let mut trial = Trial::new(nodes);
+    let online = nodes - offline;
+    // Seven large-body processes contend on one host: this is a functional
+    // smoke, not a throughput gate. Consensus/host-service settings stay fixed.
+    let timeout = if body_bytes > 0 { 240 } else { 90 };
+    // Retain the large real-process smoke's configs/stdout/reports for inspection.
+    trial.retain = body_bytes > 0;
     for node in 0..online {
-        let mut c = trial.config(node, 90);
+        let mut c = trial.config(node, timeout);
         c["headers"] = json!(headers);
         c["solution_bytes"] = json!(solution);
         c["offline"] = json!(offline);
         c["chatter_secs"] = json!(chatter);
+        if body_bytes > 0 {
+            c["body_bytes"] = json!(body_bytes);
+            c["max_body"] = json!(10 * 1024 * 1024);
+            c["timing_profile"] = json!(timing_profile);
+        }
         trial.launch(c);
     }
     let mut peers = BTreeMap::new();
     for _ in 0..online {
-        let mut s = trial.accept(90);
+        let mut s = trial.accept(timeout);
         let r = read(&mut s);
         assert_eq!(r["type"], "ready");
         assert_eq!(r["run_id"], "rust-local-processes");
@@ -193,6 +216,17 @@ fn cohort(headers: usize, solution: usize, offline: usize, chatter: u64) {
         if solution > 0 {
             assert!(d["body_bytes"].as_u64().unwrap() > 1_000_000);
         }
+        if body_bytes > 0 {
+            assert_eq!(d["body_bytes"], body_bytes);
+            let overhead = body_bytes as u64 - d["payload_bytes"].as_u64().unwrap();
+            if height == 1 {
+                assert_eq!(overhead, 71);
+            } else {
+                let quorum = tenderlink::decision_threshold(nodes as u64, true);
+                assert!((71 + 96 * quorum..=71 + 96 * nodes as u64).contains(&overhead));
+                assert_eq!((overhead - 71) % 96, 0);
+            }
+        }
         ids.push(d["id"].clone());
         // Even after everyone decided, no node may independently advance its tip.
         thread::sleep(Duration::from_millis(150));
@@ -211,7 +245,7 @@ fn cohort(headers: usize, solution: usize, offline: usize, chatter: u64) {
             );
         }
     }
-    let statuses = trial.finish(95);
+    let statuses = trial.finish(timeout + 5);
     for (node, status) in statuses.iter().enumerate() {
         let r = trial.report(node);
         assert!(status.success(), "node{node}: {r:#}");
@@ -219,6 +253,38 @@ fn cohort(headers: usize, solution: usize, offline: usize, chatter: u64) {
         assert_eq!(r["summary"]["measured_heights"], 2);
         assert_eq!(r["summary"]["latency_samples"], 2);
         assert_eq!(r["heights"].as_array().unwrap().len(), 3);
+        assert_eq!(r["config"]["node"], node);
+        assert_eq!(r["config"]["nodes"], nodes);
+        assert_eq!(r["config"]["body_bytes"], body_bytes);
+        assert_eq!(r["config"]["timing_profile"], timing_profile);
+        let settings = &r["runtime_settings"];
+        assert_eq!(settings["rho"], 500);
+        for (name, value) in [("inc_propose", 900), ("inc_prevote", 300), ("inc_precommit", 600)] {
+            assert_eq!(settings[format!("timeouts.{name}_ms")], value);
+        }
+        let (propose, prevote, precommit, request, ttl) = if timing_profile == "wan" {
+            (10000, 5000, 7000, 10000, 15000)
+        } else { (2000, 1000, 1500, 2000, 5000) };
+        for (key, value) in [("timeouts.propose_ms", propose), ("timeouts.prevote_ms", prevote),
+            ("timeouts.precommit_ms", precommit), ("request_timeout", request), ("status_ttl", ttl)] {
+            assert_eq!(settings[key], value);
+        }
+        if body_bytes > 0 {
+            assert_eq!(r["config"]["max_body"], 10 * 1024 * 1024);
+            assert_eq!(settings["max_body"], 10 * 1024 * 1024);
+            assert_eq!(r["summary"]["body_bytes"], 2 * body_bytes);
+            let transport = r["transport_settings"].as_str().unwrap();
+            for setting in ["max_message_size: 10487259", "receive: 32",
+                "peer_outbox_bytes: 16777216", "consumer_inbox_peer_bytes: 16777216",
+                "consumer_inbox_bytes: 67108864", "peer_high_water_bytes: 524288"] {
+                assert!(transport.contains(setting), "{transport}");
+            }
+            println!("10MiB node{node}: complete, RSS peak {} bytes, report {}",
+                r["process_end"]["counters"]["process.max_rss_bytes"],
+                trial.dir.join(format!("report{node}.json")).display());
+        } else {
+            assert_eq!(r["config"]["max_body"], 1024 * 1024);
+        }
         for (i, h) in r["heights"].as_array().unwrap().iter().enumerate() {
             assert_eq!(h["id"], ids[i]);
             assert_eq!(h["acknowledged"], true);
@@ -263,15 +329,19 @@ fn cohort(headers: usize, solution: usize, offline: usize, chatter: u64) {
 }
 #[test]
 fn four_process_localhost_chain_and_ack_barrier() {
-    cohort(32, 0, 0, 1);
+    cohort(4, 32, 0, 0, 0, 1, "production");
 }
 #[test]
 fn four_process_near_one_mib_unchanged_block_parser() {
-    cohort(2048, 320, 0, 0);
+    cohort(4, 2048, 320, 0, 0, 0, "production");
 }
 #[test]
 fn full_roster_with_one_offline_validator() {
-    cohort(32, 0, 1, 0);
+    cohort(4, 32, 0, 0, 1, 0, "production");
+}
+#[test]
+fn seven_process_ten_mib_chain_and_wan_profile() {
+    cohort(7, 32, 0, 10 * 1024 * 1024, 0, 0, "wan");
 }
 
 #[test]
