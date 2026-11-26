@@ -242,7 +242,8 @@ fn ensure_anchor_update_supported(global: &Global) -> Result<(), AnchorUpdateErr
             | BranchId::FeaturenetUpgrade1
             | BranchId::FeaturenetUpgrade2
             | BranchId::FeaturenetUpgrade3
-            | BranchId::FeaturenetUpgrade4,
+            | BranchId::FeaturenetUpgrade4
+            | BranchId::FeaturenetUpgrade5,
         ) => Ok(()),
         #[cfg(zcash_unstable = "nu7")]
         Ok(BranchId::Nu7) => Ok(()),

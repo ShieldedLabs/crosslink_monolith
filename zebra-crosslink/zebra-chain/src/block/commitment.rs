@@ -137,7 +137,7 @@ impl Commitment {
             // block. Match every post-Heartwood upgrade *at the Heartwood activation height* instead.
             //
             // See <https://zips.z.cash/zip-0221> and the [protocol specification §7.6](https://zips.z.cash/protocol/protocol.pdf).
-            (Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3 | FeaturenetUpgrade4 | Nu7, activation_height)
+            (Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3 | FeaturenetUpgrade4 | FeaturenetUpgrade5 | Nu7, activation_height)
                 if height == activation_height
                     && Some(height) == Heartwood.activation_height(network) =>
             {
@@ -148,7 +148,7 @@ impl Commitment {
                 }
             }
             (Heartwood | Canopy, _) => Ok(ChainHistoryRoot(ChainHistoryMmrRootHash(bytes))),
-            (Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3 | FeaturenetUpgrade4 | Nu7, _) => Ok(ChainHistoryBlockTxAuthCommitment(
+            (Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1 | FeaturenetUpgrade2 | FeaturenetUpgrade3 | FeaturenetUpgrade4 | FeaturenetUpgrade5 | Nu7, _) => Ok(ChainHistoryBlockTxAuthCommitment(
                 ChainHistoryBlockTxAuthCommitmentHash(bytes),
             )),
 
@@ -336,6 +336,81 @@ impl ChainHistoryBlockTxAuthCommitmentHash {
             .try_into()
             .expect("32 byte array");
         Self(hash_block_commitments)
+    }
+
+    /// BftFirst `hashBlockCommitments`: `H(bft_info ‖ rest)`.
+    pub fn from_bft_info_and_rest(bft_info: &[u8; BFT_INFO_SIZE], rest: &Self) -> Self {
+        let hash: [u8; 32] = blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(b"ZcashCLBftCommit")
+            .to_state()
+            .update(bft_info)
+            .update(&rest.0)
+            .finalize()
+            .as_bytes()
+            .try_into()
+            .expect("32 byte array");
+        Self(hash)
+    }
+}
+
+/// Size of `bft_info`: BFT block hash, height and round.
+pub const BFT_INFO_SIZE: usize = 76 - 32;
+
+/// BftFirst `S`: BLAKE2b-256 of the serialized signature count and signatures.
+pub fn fat_pointer_signatures_digest(fat_pointer: &FatPointerToBftBlock) -> [u8; 32] {
+    let mut bytes = Vec::new();
+    fat_pointer
+        .zcash_serialize(&mut bytes)
+        .expect("serialization into a vec can't fail");
+    blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"ZcashCLFatPtrSig")
+        .hash(&bytes[BFT_INFO_SIZE..])
+        .as_bytes()
+        .try_into()
+        .expect("32 byte array")
+}
+
+/// Whether a block uses BftFirst: from `FeaturenetUpgrade5`, non-null pointers only.
+pub fn uses_bft_info_commitment(
+    network: &Network,
+    height: block::Height,
+    fat_pointer: &FatPointerToBftBlock,
+) -> bool {
+    use zcash_protocol::consensus::Parameters;
+
+    network.is_nu_active(
+        zcash_protocol::consensus::NetworkUpgrade::FeaturenetUpgrade5,
+        height.0.into(),
+    ) && *fat_pointer != FatPointerToBftBlock::null()
+}
+
+/// Returns a block's `hashBlockCommitments`: BftFirst from FeaturenetUpgrade5 if the fat pointer
+/// is non-null, else ZIP 244.
+pub fn block_commitments_at(
+    network: &Network,
+    height: block::Height,
+    history_tree_root: &ChainHistoryMmrRootHash,
+    auth_data_root: &AuthDataRoot,
+    fat_pointer: &FatPointerToBftBlock,
+) -> ChainHistoryBlockTxAuthCommitmentHash {
+    if uses_bft_info_commitment(network, height, fat_pointer) {
+        let rest = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+            history_tree_root,
+            auth_data_root,
+            &fat_pointer_signatures_digest(fat_pointer),
+        );
+        ChainHistoryBlockTxAuthCommitmentHash::from_bft_info_and_rest(
+            &fat_pointer.vote_for_block_without_finalizer_public_key,
+            &rest,
+        )
+    } else {
+        ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+            history_tree_root,
+            auth_data_root,
+            &fat_pointer_digest_at(network, height, fat_pointer),
+        )
     }
 }
 

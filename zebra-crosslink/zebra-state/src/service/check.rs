@@ -5,7 +5,7 @@ use std::{borrow::Borrow, sync::Arc};
 use chrono::Duration;
 
 use zebra_chain::{
-    block::{self, Block, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError},
+    block::{self, Block, CommitmentError},
     history_tree::HistoryTree,
     parameters::{Network, NetworkUpgrade},
     work::difficulty::CompactDifficulty,
@@ -223,14 +223,12 @@ pub(crate) fn block_commitment_is_valid_for_chain_history(
                 .coinbase_height()
                 .expect("Block::commitment above refuses a block without a height");
 
-            let hash_block_commitments = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+            let hash_block_commitments = block::block_commitments_at(
+                network,
+                height,
                 &history_tree_root,
                 &auth_data_root,
-                &block::fat_pointer_digest_at(
-                    network,
-                    height,
-                    &block.header.fat_pointer_to_bft_block,
-                ),
+                &block.header.fat_pointer_to_bft_block,
             );
 
             if actual_hash_block_commitments == hash_block_commitments {

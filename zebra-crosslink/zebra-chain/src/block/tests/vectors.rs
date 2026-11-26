@@ -657,3 +657,96 @@ fn fat_pointer_digest_at_switches_on_at_featurenet_upgrade_2() {
     assert_eq!(fat_pointer_digest_at(&scheduled, Height(10), &pointer), fat_pointer_digest(&pointer));
     assert_eq!(fat_pointer_digest_at(&scheduled, Height(11), &pointer), fat_pointer_digest(&pointer));
 }
+
+/// Tests that BftFirst blocks use the `bft_info` layout, and that earlier heights and null
+/// pointers keep ZIP 244.
+#[test]
+fn block_commitments_use_the_bft_info_layout_from_featurenet_upgrade_5() {
+    use crate::{
+        block::{
+            block_commitments_at, fat_pointer_digest, fat_pointer_signatures_digest,
+            merkle::AuthDataRoot, ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash,
+            FatPointerToBftBlock, BFT_INFO_SIZE,
+        },
+        parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
+    };
+
+    let _init_guard = zebra_test::init();
+
+    let blake2b = |personal: &[u8; 16], input: &[u8]| -> [u8; 32] {
+        blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(personal)
+            .hash(input)
+            .as_bytes()
+            .try_into()
+            .expect("32 byte array")
+    };
+
+    let network = Network::new_regtest(RegtestParameters::from(ConfiguredActivationHeights {
+        nu5: Some(1),
+        featurenet_upgrade_2: Some(5),
+        featurenet_upgrade_5: Some(10),
+        ..Default::default()
+    }));
+    let history_root = ChainHistoryMmrRootHash::from([0x11; 32]);
+    let auth_data_root = AuthDataRoot::from([0x22; 32]);
+    let pointer = sample_fat_pointer();
+    let bft_info = pointer.vote_for_block_without_finalizer_public_key;
+
+    // `S`: the serialized count and signatures, after `bft_info`.
+    let serialized = pointer.to_bytes();
+    let s = blake2b(b"ZcashCLFatPtrSig", &serialized[BFT_INFO_SIZE..]);
+    assert_eq!(fat_pointer_signatures_digest(&pointer), s);
+
+    let rest = blake2b(b"ZcashBlockCommit", &[[0x11; 32], [0x22; 32], s].concat());
+    let expected = blake2b(b"ZcashCLBftCommit", &[&bft_info[..], &rest[..]].concat());
+    assert_eq!(
+        block_commitments_at(&network, Height(10), &history_root, &auth_data_root, &pointer),
+        ChainHistoryBlockTxAuthCommitmentHash::from(expected),
+    );
+    assert_eq!(
+        ChainHistoryBlockTxAuthCommitmentHash::from_bft_info_and_rest(
+            &bft_info,
+            &ChainHistoryBlockTxAuthCommitmentHash::from(rest),
+        ),
+        ChainHistoryBlockTxAuthCommitmentHash::from(expected),
+    );
+
+    // Below the upgrade: the FeaturenetUpgrade2 commitment.
+    assert_eq!(
+        block_commitments_at(&network, Height(9), &history_root, &auth_data_root, &pointer),
+        ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+            &history_root,
+            &auth_data_root,
+            &fat_pointer_digest(&pointer),
+        ),
+    );
+
+    // Null pointer: ZIP 244.
+    let zip_244 = blake2b(b"ZcashBlockCommit", &[[0x11; 32], [0x22; 32], [0; 32]].concat());
+    for height in [Height(10), Height(11)] {
+        assert_eq!(
+            block_commitments_at(
+                &network,
+                height,
+                &history_root,
+                &auth_data_root,
+                &FatPointerToBftBlock::null(),
+            ),
+            ChainHistoryBlockTxAuthCommitmentHash::from(zip_244),
+        );
+    }
+
+    // Changing `bft_info` or the signatures changes the commitment.
+    let mut bft_info_changed = pointer.clone();
+    bft_info_changed.vote_for_block_without_finalizer_public_key[32] ^= 1;
+    let mut signatures_changed = pointer.clone();
+    signatures_changed.signatures.clear();
+    for changed in [bft_info_changed, signatures_changed] {
+        assert_ne!(
+            block_commitments_at(&network, Height(10), &history_root, &auth_data_root, &changed),
+            ChainHistoryBlockTxAuthCommitmentHash::from(expected),
+        );
+    }
+}

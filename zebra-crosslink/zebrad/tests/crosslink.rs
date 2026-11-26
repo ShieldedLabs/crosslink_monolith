@@ -8,7 +8,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use zcash_keys::address::Address;
 use zebra_chain::{
     block::{
-        merkle, Block, BftBlock, BftBlockAndFatPointerToIt, ChainHistoryBlockTxAuthCommitmentHash,
+        merkle, Block, BftBlock, BftBlockAndFatPointerToIt,
         FatPointerSignature, FatPointerToBftBlock, PROTOTYPE_PARAMETERS, PubKeyID,
         Hash as BlockHash, Header as BlockHeader, Height as BlockHeight,
     },
@@ -2448,7 +2448,8 @@ impl BlockGen {
     /// (state service check::block_commitment_is_valid_for_chain_history): the Heartwood
     /// activation block carries the reserved all-zero commitment, Heartwood/Canopy carry the raw
     /// history MMR root, and NU5 onward carries the ZIP-244 hashBlockCommitments, which also
-    /// commits to the auth data of every transaction and, from FeaturenetUpgrade2, to the pointer.
+    /// commits to the auth data of every transaction and, from FeaturenetUpgrade2, to the pointer
+    /// (from FeaturenetUpgrade5, as BftFirst).
     fn commitment_bytes(
         network: &Network,
         height: BlockHeight,
@@ -2465,12 +2466,14 @@ impl BlockGen {
             }
             _ => {
                 let auth_data_root: merkle::AuthDataRoot = transactions.iter().collect();
-                ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                zebra_chain::block::block_commitments_at(
+                    network,
+                    height,
                     &history_tree
                         .hash()
                         .expect("history tree is non-empty after the Heartwood activation block"),
                     &auth_data_root,
-                    &zebra_chain::block::fat_pointer_digest_at(network, height, fat_pointer),
+                    fat_pointer,
                 )
                 .bytes_in_serialized_order()
             }

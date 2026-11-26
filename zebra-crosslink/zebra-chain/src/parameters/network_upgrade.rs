@@ -84,6 +84,10 @@ pub enum NetworkUpgrade {
     /// height, so a network that schedules this upgrade should schedule FeaturenetUpgrade3 at or
     /// below it.
     FeaturenetUpgrade4,
+    /// The Zcash protocol after the fifth Crosslink featurenet upgrade.
+    ///
+    /// Switches `hashBlockCommitments` to BftFirst. Schedule FeaturenetUpgrade4 at or below it.
+    FeaturenetUpgrade5,
     /// The Zcash protocol after the NU7 upgrade.
     #[serde(rename = "NU7")]
     Nu7,
@@ -162,10 +166,11 @@ pub(super) const TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] 
     use zcash_protocol::consensus::{
         TESTNET_FEATURENET_UPGRADE_1_HEIGHT, TESTNET_FEATURENET_UPGRADE_2_HEIGHT,
         TESTNET_FEATURENET_UPGRADE_3_HEIGHT, TESTNET_FEATURENET_UPGRADE_4_HEIGHT,
+        TESTNET_FEATURENET_UPGRADE_5_HEIGHT,
     };
     // The scheduled upgrades, packed at the front of the array; `len` counts them.
-    const SCHEDULE: ([(block::Height, NetworkUpgrade); 6], usize) = {
-        let mut entries = [(block::Height(0), Genesis); 6];
+    const SCHEDULE: ([(block::Height, NetworkUpgrade); 7], usize) = {
+        let mut entries = [(block::Height(0), Genesis); 7];
         entries[1] = (block::Height(1), Nu6_3);
         entries[2] = (block::Height(TESTNET_FEATURENET_UPGRADE_1_HEIGHT), FeaturenetUpgrade1);
         let mut len = 3;
@@ -179,6 +184,10 @@ pub(super) const TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] 
         }
         if let Some(height) = TESTNET_FEATURENET_UPGRADE_4_HEIGHT {
             entries[len] = (block::Height(height), FeaturenetUpgrade4);
+            len += 1;
+        }
+        if let Some(height) = TESTNET_FEATURENET_UPGRADE_5_HEIGHT {
+            entries[len] = (block::Height(height), FeaturenetUpgrade5);
             len += 1;
         }
         (entries, len)
@@ -287,6 +296,8 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (FeaturenetUpgrade3, ConsensusBranchId(0x464e5533)),
     // Matches zcash_protocol's `BranchId::FeaturenetUpgrade4`.
     (FeaturenetUpgrade4, ConsensusBranchId(0x464e5534)),
+    // Matches zcash_protocol's `BranchId::FeaturenetUpgrade5`.
+    (FeaturenetUpgrade5, ConsensusBranchId(0x464e5535)),
     // TODO: set below to (Nu7, ConsensusBranchId(0x77190ad8)), once the same value is set in librustzcash
     #[cfg(any(test, feature = "zebra-test"))]
     (Nu7, ConsensusBranchId(0xfffffffe)),
@@ -461,7 +472,8 @@ impl NetworkUpgrade {
         let spacing_seconds = match self {
             Genesis | BeforeOverwinter | Overwinter | Sapling => PRE_BLOSSOM_POW_TARGET_SPACING,
             Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | FeaturenetUpgrade1
-            | FeaturenetUpgrade2 | FeaturenetUpgrade3 | FeaturenetUpgrade4 | Nu7 => {
+            | FeaturenetUpgrade2 | FeaturenetUpgrade3 | FeaturenetUpgrade4 | FeaturenetUpgrade5
+            | Nu7 => {
                 POST_BLOSSOM_POW_TARGET_SPACING.into()
             }
 
@@ -602,6 +614,9 @@ impl From<zcash_protocol::consensus::NetworkUpgrade> for NetworkUpgrade {
             }
             zcash_protocol::consensus::NetworkUpgrade::FeaturenetUpgrade4 => {
                 Self::FeaturenetUpgrade4
+            }
+            zcash_protocol::consensus::NetworkUpgrade::FeaturenetUpgrade5 => {
+                Self::FeaturenetUpgrade5
             }
             #[cfg(zcash_unstable = "nu7")]
             zcash_protocol::consensus::NetworkUpgrade::Nu7 => Self::Nu7,

@@ -122,7 +122,8 @@ impl Creator {
             | BranchId::FeaturenetUpgrade1
             | BranchId::FeaturenetUpgrade2
             | BranchId::FeaturenetUpgrade3
-            | BranchId::FeaturenetUpgrade4 => (V6_TX_VERSION, V6_VERSION_GROUP_ID),
+            | BranchId::FeaturenetUpgrade4
+            | BranchId::FeaturenetUpgrade5 => (V6_TX_VERSION, V6_VERSION_GROUP_ID),
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => (V6_TX_VERSION, V6_VERSION_GROUP_ID),
         };
