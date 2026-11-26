@@ -326,3 +326,60 @@ the first campaign runner's SHA-256 was
 `1769242a6ee78bf626e3a5494c85dd75a382fe60fe5acf1acf2cd19e31fe51e1`.
 Original report hashes, controller/node height agreement and snapshot deltas were
 independently checked, with no missing/invalid reports or excluded trials.
+
+#### Cross-region run and shared-CPU limitation
+
+The subsequent `wan-grid-001` campaign used two IAD and two FRA machines, the
+same executable/first runner, seed 429, and the same 20 measured / three warmup
+heights per trial. It took about 17 minutes. This was **not** a matched experiment
+isolating network distance: IAD machines had already served the earlier campaign,
+and shared CPU credit/host scheduling conditions changed during the run.
+
+| Serialized body | Profile | Complete / trials | ACKed / planned measured heights | Chain KiB/s | First receipt p50 / p95 ms | All receipt p50 / p95 ms |
+|---:|---|---:|---:|---:|---:|---:|
+| 6.19 KiB | baseline | 3 / 3 | 60 / 60 | 3.96 | 925 / 4305 | 1280 / 4800 |
+| 6.19 KiB | fast | 3 / 3 | 60 / 60 | 5.43 | 465 / 4492 | 561 / 4670 |
+| 93.85 KiB | baseline | 3 / 3 | 60 / 60 | 48.23 | 783 / 6090 | 865 / 6402 |
+| 93.85 KiB | fast | 3 / 3 | 60 / 60 | 36.43 | 543 / 7280 | 598 / 7521 |
+| 374.35 KiB | baseline | 2 / 3 | 48 / 60 | 94.11 | 823 / 11680 | 898 / 12642 |
+| 374.35 KiB | fast | 2 / 3 | 42 / 60 | 172.87 | 530 / 717 | 591 / 806 |
+
+Percentiles describe observed receipts only: a stalled height with **no** decision
+cannot appear in them. The largest fast arm's low p95 is not a successful or
+robust tail-latency result. Throughput includes each partial trial's measured
+stall duration (156.214 s baseline; 66.961 s fast), not just successful heights.
+Their whole-process lifetimes were 180 s, with the remainder mostly warmup;
+failed warmup time is not part of these measured-window rates.
+
+Both failures occurred in repetition three. Retained Rust reports say
+`whole-process benchmark deadline reached`; the controller then reports
+`node disconnected before final ACK`. Three other child processes were cancelled
+with SIGTERM during cleanup and produced no report. Local decision callbacks
+already took seconds to tens of seconds before these failures; this is not
+merely delayed controller reporting. Available records show no conflicting block
+IDs or panic, but do not establish a single root cause for the slowdown.
+
+All three trials' CPU windows exist for each 6-/94-KiB arm: pooled guest steal was
+34.0% / 34.3% for baseline/fast at 6 KiB, and 35.4% / 48.4% at 94 KiB. This is
+substantially worse than the earlier IAD campaign. Steal alone does not distinguish
+shared-credit throttling from host contention. Largest-block CPU/TX/evidence
+ratios have only **two-of-three matched-trial coverage**, because the failed trial
+is missing some node reports; their low complete-subset steal cannot describe
+the failed cohort. No failed controller duration was removed from chain rates.
+
+Raw reports: `/var/tmp/d28-fly-20261126-1600/wan-grid-001{,.tar.gz}`. Read-only
+postprocessing for both campaigns is retained as `*-analysis-v2.json` alongside
+those directories, preserving original `summary.json` and runner provenance.
+
+#### What the hold traffic does, and does not, show
+
+In the fast 6-/374-KiB hold windows there were **zero new evidence or bare-vote
+offers**, yet about 400 status and 12 hello messages/s across the four nodes
+(roughly 59 KB/s of offered application bytes). Consequently, the 1.50/2.68 MB/s
+VM TX cannot all be explained as new repeated evidence packages. STP 4.0 pads
+ordinary datagrams to its current transfer unit and also sends ACKs/probes,
+conditional copies and proactive parity. Previously queued work can cross the
+measurement boundary. The retained counters do not identify these contributions
+separately: neither TX/body nor TX minus offered bytes measures retransmissions
+or packet loss. A final-height hold still sends statuses/hellos; it is not silent
+protocol-only idle traffic.
