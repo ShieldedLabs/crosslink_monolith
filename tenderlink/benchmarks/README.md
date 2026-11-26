@@ -249,3 +249,63 @@ Raw reports, exact configurations, executable/script hashes, worker metadata and
 controller traces are retained per trial. Workers run one fixed executable with
 bounded input and owned-child lifetimes; uncertain cleanup stops the campaign.
 Stop and delete only the temporary app you created after retrieving its results.
+
+### Recorded Fly results — 2026-11-26
+
+Four separate `shared-cpu-1x`, 512-MiB machines, one validator/executor worker per
+machine, over private Fly IPv6. The same-region campaign used four IAD machines.
+The mock host used an in-memory atomic store, not RocksDB/fsync. Production
+consensus timers, signatures, block parser and 1-MiB body admission cap were
+unchanged. `baseline` and `fast` are the host-service profiles above: fast changes
+polling, status cadence **and** receive budget together, not one isolated knob.
+
+Each row below pools three trials and 60 measured heights, excluding three warmup
+heights per trial. Throughput counts a single chain, including slow decisions.
+Latencies are first/all decision **receipts at the controller**, p50/p95, in ms;
+node-local callback latency is retained separately. All-online ACK pacing remains
+part of this experiment. These are short shared-CPU observations, not sustained
+capacity guarantees or distributed-machine synchronized decision timestamps.
+
+| Serialized body | Profile | Chain KiB/s | First receipt p50 / p95 ms | All receipt p50 / p95 ms | VM TX / body | Offered evidence / body |
+|---:|---|---:|---:|---:|---:|---:|
+| 6.19 KiB | baseline | 13.2 | 448 / 475 | 468 / 497 | 92.64× | 20.64× |
+| 6.19 KiB | fast | 37.9 | 154 / 162 | 163 / 171 | 85.96× | 21.43× |
+| 23.73 KiB | baseline | 50.4 | 452 / 479 | 476 / 504 | 41.95× | 19.12× |
+| 23.73 KiB | fast | 140.6 | 158 / 170 | 167 / 184 | 43.69× | 20.41× |
+| 93.85 KiB | baseline | 195.1 | 455 / 473 | 484 / 510 | 28.34× | 18.56× |
+| 93.85 KiB | fast | 522.8 | 166 / 181 | 178 / 192 | 30.76× | 20.44× |
+| 374.35 KiB | baseline | 728.9 | 486 / 517 | 518 / 546 | 22.93× | 19.59× |
+| 374.35 KiB | fast | 1040.4 | 220 / 250 | 244 / 274 | 21.26× | 17.91× |
+
+All 24 trials and 480 measured heights completed. Two of the 60 largest-block
+fast heights required round 1: their all-receipt latencies were 3,772 and 3,719 ms.
+Those two cycles consumed 34.7% of that arm's measured time; its 244-ms median
+therefore does **not** imply a sustained 1.57 MB/s chain. They are included in the
+reported 1,065,334 B/s. Per-trial CPU/store counters cannot establish their cause.
+
+VM TX is summed once across validators in each node's measured window; RX is not
+added. It includes STP, TCP control and other VM activity, not just BFT packets or
+wasted/retransmitted bytes. Application offers are a different counter layer.
+All online nodes supplied valid windows. Measured receive-budget and reported
+transport wrapper/ring drops were zero; this does not prove zero UDP loss.
+
+The separate one-second final-height hold produced aggregate VM TX rates of
+0.51–1.35 MB/s for baseline and 1.50–2.68 MB/s for fast, using actual node window
+durations. This holds final-height evidence without advancing the tip: it is
+**not** the idle traffic of a quiescent chain. Fast improves latency but increases
+this hold traffic.
+
+Measured guest steal was 0.46–0.85% across these arms. Shared CPU credit balances
+were not available, so neither low steal nor zero reported cgroup throttling
+establishes steady-state headroom. All body sizes retain the same 3,152,048-byte
+store image; replacement byte counts are in-memory serialization/hash/copy work,
+not disk I/O. Observed end-boundary process-lifetime RSS high-water marks were
+15.2–22.0 MiB, not a whole-node memory bound.
+
+Raw same-region reports and archive:
+`/var/tmp/d28-fly-20261126-1600/iad-grid-001{,.tar.gz}`. The deployed executable's
+SHA-256 was `ea688cd47c257c53d2465a78dd3765f0d56b81e6a93d6fb62c897ce2a2efa738`;
+the first campaign runner's SHA-256 was
+`1769242a6ee78bf626e3a5494c85dd75a382fe60fe5acf1acf2cd19e31fe51e1`.
+Original report hashes, controller/node height agreement and snapshot deltas were
+independently checked, with no missing/invalid reports or excluded trials.
