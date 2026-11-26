@@ -113,14 +113,14 @@ binary and legacy algorithm tests are not the node runtime.
 Build and run the real four-node acceptance network from the repository root:
 
 ```sh
-cargo build --manifest-path zebra-crosslink/Cargo.toml --locked -p zebrad --bin zebrad
+cargo build --manifest-path zebra-crosslink/Cargo.toml --locked -p zebrad --bin zebrad --profile release-iter
 python3 zebra-crosslink/dilated_regtest/d28_network.py selftest
 python3 zebra-crosslink/dilated_regtest/d28_network.py run \
-  --binary "$PWD/zebra-crosslink/target/debug/zebrad" \
+  --binary "$PWD/zebra-crosslink/target/release-iter/zebrad" \
   --crash-restart
 # A separate fresh network also exercises late admission and a withholding/offline finalizer:
 python3 zebra-crosslink/dilated_regtest/d28_network.py run \
-  --binary "$PWD/zebra-crosslink/target/debug/zebrad" \
+  --binary "$PWD/zebra-crosslink/target/release-iter/zebrad" \
   --late-finalizer --offline-finalizer --crash-restart
 ```
 
@@ -133,8 +133,8 @@ finalizers, activates the existing strict chain-certificate gate, and checks pos
 `accepted-carrier.json` records an actual common PoW header carrying a retained post-restart BFT
 decision in the unchanged fat-pointer encoding. These are a shared BFT checkpoint and evidence of
 resumed signing, not an exhaustive BFT-prefix comparison or an independent power-loss proof.
-The default deadline is one hour; debug proving and mining can be slow. `--profile release-iter`
-builds an optimized binary at `zebra-crosslink/target/release-iter/zebrad` instead.
+The default deadline is one hour. Use the optimized build above for production-sized timing
+checks: unoptimized full-image validation and signing can exceed the protocol's service budgets.
 
 For a remotely deployed testnet, use the existing node configuration, initial-peer discovery,
 wallet/staking and bootstrap procedures with fresh chain state and fresh identities. The harness's
