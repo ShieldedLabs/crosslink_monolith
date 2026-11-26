@@ -26,11 +26,13 @@ progress while that node is stopped. Three of four equal stakes exceed two third
 No simulated votes, mocked ledger, modified consensus rules, or external peers.
 
 Samples compare certified BFT hashes at equal heights (not signature subsets),
-finalized PoW hashes, and accepted common PoW prefixes. They retain full certificate
-RPC replies, but do not independently verify Ed25519 in Python: acceptance is by the
-real nodes. Template certificate + accepted post-activation blocks exercise the
-chain gate. Startup logs must contain --require-log (default D28); a legacy runtime
-must not accidentally pass. This finite run is not a liveness or memory proof.
+finalized PoW hashes, and the full accepted common PoW prefix. An actual accepted
+header must carry a retained post-restart decision, giving a shared BFT checkpoint
+(not an exhaustive BFT-prefix comparison). A survivor must also observe a NEW
+certificate signed by the restarted finalizer. Full pointers/headers are retained;
+Ed25519 verification is by the real nodes, not independently repeated in Python.
+Startup logs must contain --require-log (default D28), and the restarted boot must
+restore its decided chain. This finite run is not a liveness or memory proof.
 
 A native debug build can need tens of minutes, including cold shielded-key/prover
 initialization. Default wall budget is one hour; release-iter is faster. Native
@@ -228,6 +230,44 @@ def certificate(pointer):
                 and all(type(b) is int and 0 <= b <= 255 for b in value), "malformed signature")
     return {"height": height, "hash": raw[:32].hex(),
             "round": round_bits & 0x7fffffff, "signers": len(signers)}
+
+
+def header_pointer(header_hex):
+    """Decode the existing chain header, not a proposed D28-only wire format."""
+    require(isinstance(header_hex, str), "raw header is not hex text")
+    try:
+        raw = bytes.fromhex(header_hex)
+    except ValueError as error:
+        raise Failure("malformed raw header hex") from error
+    require(len(raw) >= 141, "truncated fixed header or Equihash length")
+    version = int.from_bytes(raw[:4], "little")
+    logical_version = int(f"{version:032b}"[::-1], 2) if version & 0xffff0000 else version
+    marker = raw[140]
+    width = {253: 2, 254: 4, 255: 8}.get(marker, 0)
+    solution_at = 141 + width
+    require(len(raw) >= solution_at, "truncated Equihash CompactSize")
+    length = int.from_bytes(raw[141:solution_at], "little") if width else marker
+    require(not width or length >= {2: 253, 4: 65536, 8: 4294967296}[width],
+            "noncanonical Equihash CompactSize")
+    require(length in (36, 1344), "unexpected Equihash solution size")
+    pointer_at = solution_at + length
+    require(len(raw) >= pointer_at, "truncated Equihash solution")
+    if logical_version < 5:
+        require(len(raw) == pointer_at, "legacy header has trailing bytes")
+        return None
+    require(len(raw) >= pointer_at + 46, "truncated chain fat pointer")
+    count = int.from_bytes(raw[pointer_at + 44:pointer_at + 46], "little")
+    require(count <= 256, "chain fat pointer exceeds signature limit")
+    require(len(raw) == pointer_at + 46 + 96 * count,
+            "truncated chain signatures or trailing header bytes")
+    signatures = []
+    for offset in range(pointer_at + 46, len(raw), 96):
+        signatures.append({"pub_key": raw[offset:offset + 32][::-1].hex(),
+                           "vote_signature": list(raw[offset + 32:offset + 96])})
+    pointer = {"vote_for_block_without_finalizer_public_key": list(raw[pointer_at:pointer_at + 44]),
+               "signatures": signatures}
+    certificate(pointer)
+    return pointer
 
 
 def remember_decision(seen, cert):
@@ -442,6 +482,51 @@ class Network:
         return self.progress("quorum progresses with one offline",
                              self.source.rpc("getblockcount") + 20, baseline + 2)
 
+    def restarted_signer_witness(self, victim, before_signing):
+        roster = self.source.rpc("get_tfl_roster_with_addresses")
+        members = [m for m in roster if m["finalizer_address"] == victim.finalizer]
+        require(len(members) == 1, "restarted finalizer is not uniquely present in roster")
+        key = bytes.fromhex(members[0]["pub_key"])
+        require(len(key) == 32, "malformed restarted finalizer key")
+        # Roster keys use raw hex; PubKeyID's pointer serde uses reversed hex.
+        signer = key[::-1].hex()
+        floor = max([before_signing] + [certificate(n.rpc("get_tfl_fat_pointer_to_bft_chain_tip"))["height"]
+                                       for n in self.active()])
+        def signed():
+            rows = self.sample("restarted finalizer signs a new height")
+            row = next(r for r in rows if r["node"] == self.source.index)
+            pointer, cert = row["pointer"], row["certificate"]
+            if cert["height"] > floor and any(s["pub_key"] == signer for s in pointer["signatures"]):
+                return {"node": victim.index, "observed_by": self.source.index,
+                        "before_signing_height": before_signing, "post_restart_floor": floor,
+                        "signer": signer, "certificate": cert, "pointer": pointer}
+            return None
+        witness = self.wait("restarted finalizer contributes a new certificate", signed, mine=True)
+        dump(self.root / "restart-signer.json", witness)
+        return witness
+
+    def accepted_checkpoint(self, height, min_bft):
+        # A template alone is not evidence of what was mined. Inspect a recent
+        # accepted header and require a decision independently retained from RPC.
+        for h in range(height, max(ACTIVATION - 1, height - 100), -1):
+            block_hash = self.source.rpc("getblockhash", [h])
+            raw = self.source.rpc("getblockheader", [block_hash, False])
+            pointer = header_pointer(raw)
+            cert = certificate(pointer)
+            if cert["height"] < min_bft or cert["height"] not in self.seen:
+                continue
+            require(self.seen[cert["height"]] == cert["hash"],
+                    "accepted PoW carrier conflicts with an observed BFT decision")
+            for node in self.active():
+                require(node.rpc("getblockhash", [h]) == block_hash
+                        and node.rpc("getblockheader", [block_hash, False]) == raw,
+                        f"node{node.index} does not share the accepted certified header")
+            checkpoint = {"pow_height": h, "pow_hash": block_hash, "header": raw,
+                          "certificate": cert, "pointer": pointer}
+            dump(self.root / "accepted-carrier.json", checkpoint)
+            return checkpoint
+        raise Failure("no recent accepted PoW carrier matches a retained post-restart BFT decision")
+
     def fund_and_bond(self):
         wallet = self.wait("wallet's first sync", lambda: self.source.rpc("wallet_spendable_funds"))
         # The faucet spends shielded notes, not freshly mined coinbase. Follow
@@ -519,27 +604,28 @@ class Network:
             first = self.progress("late finalizer catches up", self.source.rpc("getblockcount") + 20, first + 2)
         victim = self.nodes[-1]
         before = certificate(victim.rpc("get_tfl_fat_pointer_to_bft_chain_tip"))["height"]
+        before_signing = max(before, victim.rpc("get_tfl_recency_status")["my_height"])
         victim.stop(crash=self.args.crash_restart)
         if self.args.offline_finalizer:
             first = self.progress_with_one_offline()
         victim.start(self.config(victim))
+        restart_log = victim.logs[-1]
         victim.ready()
-        require("crosslink bootstrap: PoW reached height" not in victim.text(),
-                "restarted finalizer bootstrapped again instead of restoring")
         self.progress("restarted finalizer recovers", self.source.rpc("getblockcount") + 20,
                       max(before, first) + 2)
+        restart_witness = self.restarted_signer_witness(victim, before_signing)
         self.progress("final progress", max(self.args.target, self.source.rpc("getblockcount") + 10),
                       max(r["certificate"]["height"] for r in self.last) + 2)
-        # Capture a non-genesis certificate selected by the real mining template. Then require
-        # further PoW accepted by every node, with FeaturenetUpgrade2's certificate gate active.
         template = self.source.rpc("getblocktemplate", [{}], timeout=self.args.phase_timeout)
         self.certified_template = certificate(template["fat_pointer_to_bft_block"])
         require(self.certified_template["height"] > 0, "mining template has no BFT certificate")
+        remember_decision(self.seen, self.certified_template)
         dump(self.root / "certified-template.json", template)
         height = self.source.rpc("getblockcount") + 2
         self.mine_to(height)
         self.wait("all peers accept certified PoW", lambda: all(n.rpc("getblockcount") >= height for n in self.active()))
         self.sample("accepted certified PoW")
+        checkpoint = self.accepted_checkpoint(height, restart_witness["certificate"]["height"])
         # Compare EVERY accepted PoW hash, not just reported tip heights.
         reference = [self.source.rpc("getblockhash", [h]) for h in range(height + 1)]
         for node in self.nodes[1:]:
@@ -555,9 +641,16 @@ class Network:
             require("panicked" not in text and "empty roster" not in text,
                     f"node{node.index} panic or empty roster")
             require(not re.search(r"\bERROR\b", text), f"node{node.index} logged ERROR; inspect preserved logs")
+        # ready() can precede BFT initialization, so inspect the complete restarted boot.
+        restarted = restart_log.read_text(errors="replace")
+        require("crosslink bootstrap: PoW reached height" not in restarted,
+                "restarted finalizer bootstrapped again instead of restoring")
+        require(re.search(r"crosslink restore: resuming BFT at height [1-9][0-9]*", restarted),
+                "restarted finalizer did not restore its decided chain")
         require(not any(self.root.rglob("pos.chain")), "obsolete pos.chain store appeared")
         return {"status": "PASS", "samples": self.samples, "pow_height": height,
-                "certified_template": self.certified_template,
+                "certified_template": self.certified_template, "accepted_carrier": checkpoint,
+                "restart_signer": restart_witness,
                 "observed_bft_heights": len(self.seen), "final": self.last}
 
 
@@ -717,6 +810,36 @@ def selftest():
             with self.assertRaises(Failure):
                 certificate(dict(pointer, vote_for_block_without_finalizer_public_key=raw[:43]))
 
+        def test_accepted_header_pointer_uses_unchanged_chain_encoding(self):
+            key = bytes(range(32))
+            vote = bytes([7]) * 32 + (9).to_bytes(8, "little") + (0x80000003).to_bytes(4, "little")
+            pointer = vote + (1).to_bytes(2, "little") + key + bytes([2]) * 64
+            for version in (5, 0xa0000000):  # direct and bit-reversed version encodings
+                prefix = version.to_bytes(4, "little") + bytes(136)
+                for size in (36, 1344):
+                    length = bytes([size]) if size < 253 else b"\xfd" + size.to_bytes(2, "little")
+                    raw = prefix + length + bytes(size) + pointer
+                    decoded = header_pointer(raw.hex())
+                    self.assertEqual(decoded["vote_for_block_without_finalizer_public_key"], list(vote))
+                    self.assertEqual(decoded["signatures"][0]["pub_key"], key[::-1].hex())
+                    self.assertEqual(certificate(decoded), {"height": 9, "hash": "07" * 32,
+                                     "round": 3, "signers": 1})
+                    for damaged in (raw[:-1], raw + b"\x00", raw[:140], raw[:141]):
+                        with self.assertRaises(Failure):
+                            header_pointer(damaged.hex())
+            prefix = (5).to_bytes(4, "little") + bytes(136)
+            for damaged in (prefix + b"\xfd\x24\x00" + bytes(36) + pointer,
+                            prefix + b"\x24" + bytes(36) + vote + (257).to_bytes(2, "little"),
+                            prefix + b"\x24" + bytes(35), prefix + b"\xff"):
+                with self.assertRaises(Failure):
+                    header_pointer(damaged.hex())
+            legacy = (4).to_bytes(4, "little") + bytes(136) + b"\x24" + bytes(36)
+            self.assertIsNone(header_pointer(legacy.hex()))
+            with self.assertRaises(Failure):
+                header_pointer((legacy + pointer).hex())
+            with self.assertRaises(Failure):
+                header_pointer("not hex")
+
         def test_environment(self):
             with mock.patch.dict(os.environ, {"ZEBRA_STATE__CACHE_DIR": "/existing", "NEXTEST_TEST_GLOBAL_SLOT": "2",
                                              "SENTRY_DSN": "secret", "DISPLAY": ":0"}):
@@ -797,6 +920,66 @@ def selftest():
                 stopped.rpc.assert_not_called()
                 for node in survivors[1:]:
                     node.rpc.assert_called_once_with("get_tfl_fat_pointer_to_bft_chain_tip")
+
+        def test_restart_witness_requires_new_height_and_correct_signer(self):
+            for before, peer_height in ((20, 12), (12, 20)):
+                with tempfile.TemporaryDirectory(prefix="d28-selftest-") as temp:
+                    net = Network(parse_args(["run"]), Path(temp), "unused")
+                    key = bytes(range(32))
+                    source = mock.Mock(index=0, proc=object())
+                    victim = mock.Mock(index=3, proc=object(), finalizer="fixture-finalizer")
+                    def rpc(method, params=None):
+                        if method == "get_tfl_roster_with_addresses":
+                            return [{"finalizer_address": victim.finalizer, "pub_key": key.hex()}]
+                        return {"height": peer_height}
+                    source.rpc.side_effect = rpc
+                    victim.rpc.return_value = {"height": peer_height - 1}
+                    net.nodes, net.source = [source, victim], source
+                    floor = max(before, peer_height)
+                    def sample(height, signer):
+                        return [{"node": 0, "certificate": {"height": height},
+                                 "pointer": {"signatures": [{"pub_key": signer}]}}]
+                    attempts = [sample(floor, key[::-1].hex()),
+                                sample(floor + 1, key.hex()),  # wrong serde byte order
+                                sample(floor + 2, key[::-1].hex())]
+                    def wait(what, predicate, mine=False):
+                        self.assertTrue(mine)
+                        self.assertIsNone(predicate())
+                        self.assertIsNone(predicate())
+                        return predicate()
+                    with mock.patch(__name__ + ".certificate", side_effect=lambda value: value), \
+                            mock.patch.object(net, "sample", side_effect=attempts), \
+                            mock.patch.object(net, "wait", side_effect=wait):
+                        witness = net.restarted_signer_witness(victim, before)
+                    self.assertEqual(witness["post_restart_floor"], floor)
+                    self.assertEqual(witness["certificate"]["height"], floor + 2)
+                    self.assertEqual(witness["observed_by"], 0)
+                    self.assertTrue((Path(temp) / "restart-signer.json").is_file())
+
+        def test_checkpoint_requires_actual_shared_nonnull_accepted_pointer(self):
+            with tempfile.TemporaryDirectory(prefix="d28-selftest-") as temp:
+                net = Network(parse_args(["run"]), Path(temp), "unused")
+                prefix = (5).to_bytes(4, "little") + bytes(136) + b"\x24" + bytes(36)
+                vote = bytes([7]) * 32 + (9).to_bytes(8, "little") + (0x80000003).to_bytes(4, "little")
+                raw = (prefix + vote + b"\x01\x00" + bytes([1]) * 32 + bytes([2]) * 64).hex()
+                source = mock.Mock(index=0, proc=object())
+                peer = mock.Mock(index=1, proc=object())
+                source.rpc.side_effect = lambda method, params: "accepted-hash" if method == "getblockhash" else raw
+                peer.rpc.side_effect = source.rpc.side_effect
+                net.nodes, net.source, net.seen = [source, peer], source, {9: "07" * 32}
+                checkpoint = net.accepted_checkpoint(ACTIVATION, 9)
+                self.assertEqual(checkpoint["certificate"]["height"], 9)
+                self.assertTrue((Path(temp) / "accepted-carrier.json").is_file())
+                net.seen[9] = "08" * 32
+                with self.assertRaises(Failure):
+                    net.accepted_checkpoint(ACTIVATION, 9)
+                net.seen[9] = "07" * 32
+                peer.rpc.side_effect = lambda method, params: "accepted-hash" if method == "getblockhash" else raw + "00"
+                with self.assertRaises(Failure):
+                    net.accepted_checkpoint(ACTIVATION, 9)
+                raw = (prefix + bytes(46)).hex()
+                with self.assertRaises(Failure):
+                    net.accepted_checkpoint(ACTIVATION, 9)
 
         def test_sample_late_catchup_orders_finality_before_tip(self):
             with tempfile.TemporaryDirectory(prefix="d28-selftest-") as temp:

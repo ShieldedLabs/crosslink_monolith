@@ -631,6 +631,17 @@ it emits at most one complete, already-retained frame, to that peer only.
 selecting a volatile policy after a reference-mode recovery is too late.
 Reference and CompactLive retain their separate earlier contracts.
 
+The Guided runtime uses `elapse_coalesced`: between consensus/height-delay
+expiries it persists the full timer decrement and exact normalized rho phase
+once, rather than rewriting its image at every missed rho tick. It retains an
+old-state replay when an earlier tick was crossed, and a post-drive replay when
+the endpoint coincides with a tick; both may occur. Every consensus transition
+and signing/body/header/certificate publication remains synchronous. Successful
+final descriptors, signed records, rows and the runtime's reduced events match
+reference elapsed processing; intermediate per-tick callback/write/crash-cut
+traces intentionally differ. Public `Engine::elapse` is unchanged. This runtime
+coalescing is not a wall-clock refinement of the source theorem above.
+
 The host advertises `Engine::status()` periodically, also after useful state
 changes, including throughout round changes and after decision. A snapshot
 contains configuration, height, round, step, current proposal id, its

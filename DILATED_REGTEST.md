@@ -129,6 +129,10 @@ fresh rootless network namespace to the host network. It creates a new private o
 prints its path, and preserves configs, boot logs, certificates, PoW-prefix checks and results.
 `--out` can name a **new** directory. It starts only local owned children, funds and bonds four
 finalizers, activates the existing strict chain-certificate gate, and checks post-restart progress.
+`restart-signer.json` proves a survivor received a new certificate signed by the restarted member;
+`accepted-carrier.json` records an actual common PoW header carrying a retained post-restart BFT
+decision in the unchanged fat-pointer encoding. These are a shared BFT checkpoint and evidence of
+resumed signing, not an exhaustive BFT-prefix comparison or an independent power-loss proof.
 The default deadline is one hour; debug proving and mining can be slow. `--profile release-iter`
 builds an optimized binary at `zebra-crosslink/target/release-iter/zebrad` instead.
 
