@@ -30,16 +30,17 @@ Ideally, the steps in this checklist require little subjective judgement. This w
 
 A checklist for our releases:
 
-1. Ensure all issues in the relevant issue tracking milestone for the release are closed, except a final "do the release" issue.
-2. Set `ESTIMATED_RELEASE_HEIGHT` in `zebra-crosslink/zebrad/src/components/sync/end_of_support.rs` to the tip height expected at release: the current tip plus 144 blocks per hour until then.
-3. Ensure github CI is green for the target commit.
-4. Ensure there are no changes on `main` that are not on `dev`, such that a fastforward merge of `main` to `dev` will succeed.
-5. If it is the first release that codifies a Network Upgrade, ensure all versioning constants are already correctly upgraded such as `magic2`, [FIXME: list all relevant ones]
-6. Announce in the SL CL team channel that we're now releasing `v<N>`
-7. Tag the target commit with the new version number `v<N>`
-8. Update the Shielded Labs servers deploylink on the release
-9. Fast-forward `main` to the tip of `dev`; this assumes there are no unmerged changes on `main`
-10. Use Github to create a new release from `main` based on the tag `v<N>`
-11. Build the new release binaries
-12. Mark the release as public
-13. Announce the release in the Crosslink Updates Signal group
+1. If any software node configuration is configured for Nightly, then "De-Nightly" those configurations to point to the featurenet parameters.
+2. Ensure all issues in the relevant issue tracking milestone for the release are closed, except a final "do the release" issue.
+3. Set `ESTIMATED_RELEASE_HEIGHT` in `zebra-crosslink/zebrad/src/components/sync/end_of_support.rs` to the tip height expected at release: the current tip plus 144 blocks per hour until then.
+4. Ensure github CI is green for the target commit.
+5. Ensure there are no changes on `main` that are not on `dev`, such that a fastforward merge of `main` to `dev` will succeed.
+6. If it is the first release that codifies a Network Upgrade, ensure all versioning constants are already correctly upgraded such as `magic2`, [FIXME: list all relevant ones]
+7. Announce in the SL CL team channel that we're now releasing `v<N>`
+8. Tag the target commit with the new version number `v<N>`
+9. Update the Shielded Labs servers deploylink on the release
+10. Fast-forward `main` to the tip of `dev`; this assumes there are no unmerged changes on `main`
+11. Use Github to create a new release from `main` based on the tag `v<N>`
+12. Build the new release binaries
+13. Mark the release as public
+14. Announce the release in the Crosslink Updates Signal group
