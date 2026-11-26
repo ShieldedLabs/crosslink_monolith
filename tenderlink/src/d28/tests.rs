@@ -1297,3 +1297,571 @@ fn verified_outer_reuse_requires_exact_bytes_and_all_group_guards() {
         }
     }
 }
+
+mod coalesced {
+    use super::*;
+
+    // The runtime's bounded Events reduction, including retry insertion order.
+    // Consensus callbacks are not coalesced and must match exactly.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Events {
+        votes: [Option<Vote>; 3],
+        retries: [Option<BodyTag>; 2],
+        decisions: Vec<Header>,
+        acquisitions: Vec<ProposalTag>,
+    }
+    impl Sink for Events {
+        fn send(&mut self, target: Target, frame: Frame<'_>) {
+            assert_eq!(target, Target::All);
+            assert!(frame.proposal.is_none() && frame.groups.is_empty());
+            if let Some(vote) = frame.outer {
+                self.votes[vote.content.kind.index()] = Some(*vote);
+            }
+        }
+        fn decided(&mut self, _: u64, proposal: Proposal<'_>, _: Group<'_>) {
+            self.decisions.push(*proposal.header);
+        }
+        fn acquire(&mut self, tag: ProposalTag) {
+            self.acquisitions.push(tag);
+        }
+        fn retry(&mut self, tag: BodyTag, _: Proposal<'_>) {
+            if !self.retries.contains(&Some(tag)) {
+                if let Some(slot) = self.retries.iter_mut().find(|slot| slot.is_none()) {
+                    *slot = Some(tag);
+                }
+            }
+        }
+    }
+
+    fn clone_engine(e: &Engine<MemoryStore>) -> Engine<MemoryStore> {
+        Engine {
+            emission: Emission::Guided,
+            store: e.store.clone(),
+            key: e.key.clone(),
+            me: e.me,
+            active: e.active,
+            pv: e.pv.clone(),
+            pc: e.pc.clone(),
+            replied: e.replied.clone(),
+            selected: e.selected.clone(),
+            group_ok: e.group_ok.clone(),
+            outer_ok: e.outer_ok,
+            rx_positions: e.rx_positions.clone(),
+            rx_weights: e.rx_weights.clone(),
+            acquiring: e.acquiring,
+        }
+    }
+    fn assert_same(a: &Engine<MemoryStore>, b: &Engine<MemoryStore>) {
+        assert_eq!(a.d(), b.d(), "descriptor");
+        assert_eq!(a.store.own, b.store.own, "signed OWN rows");
+        assert_eq!(a.store.own_header, b.store.own_header);
+        assert_eq!(a.store.headers, b.store.headers);
+        assert_eq!(a.store.bodies, b.store.bodies);
+        assert_eq!(a.store.region_headers, b.store.region_headers);
+        assert_eq!(a.store.regions, b.store.regions);
+        assert_eq!(a.store.configs, b.store.configs);
+        assert_eq!(a.store.sealed, b.store.sealed);
+        assert_eq!(a.pv, b.pv);
+        assert_eq!(a.pc, b.pc);
+        assert_eq!(a.replied, b.replied);
+        assert_eq!(a.acquiring, b.acquiring);
+        assert_eq!(a.active, b.active);
+    }
+    fn compare_elapsed(base: &Engine<MemoryStore>, online: u64) {
+        let mut reference = clone_engine(base);
+        let mut coalesced = clone_engine(base);
+        let mut expected = Events::default();
+        let mut actual = Events::default();
+        reference.elapse(online, &mut expected).unwrap();
+        coalesced.elapse_coalesced(online, &mut actual).unwrap();
+        assert_same(&reference, &coalesced);
+        assert_eq!(expected, actual, "effective guided events");
+        let mut expected = Events::default();
+        let mut actual = Events::default();
+        let reference = Engine::recover_with_emission(
+            reference.store,
+            base.key.clone(),
+            Emission::Guided,
+            &mut expected,
+        )
+        .unwrap();
+        let coalesced = Engine::recover_with_emission(
+            coalesced.store,
+            base.key.clone(),
+            Emission::Guided,
+            &mut actual,
+        )
+        .unwrap();
+        assert_same(&reference, &coalesced);
+        assert_eq!(expected, actual, "recovery events");
+    }
+    fn rows(e: &mut Engine<MemoryStore>, kind: VoteKind, id: Option<Id>) {
+        let votes = (0..3)
+            .map(|s| vote(e.c(), s, 0, kind, id))
+            .collect::<Vec<_>>();
+        let groups = [Group {
+            kind: CertKind::Row { round: 0, kind },
+            votes: Votes::Dense(&votes),
+        }];
+        e.receive(
+            ordinary(None, None, &groups),
+            Status::Indeterminate,
+            &mut Out::default(),
+        )
+        .unwrap();
+    }
+    fn snapshots(c: &Config) -> Vec<Engine<MemoryStore>> {
+        let (pre, _) = engine(c, 1, 4, 37);
+        let (propose, _) = engine(c, 3, 4, 0);
+        let mut prevote = clone_engine(&propose);
+        prevote.elapse(30, &mut Events::default()).unwrap();
+        assert_eq!(prevote.d().step, Step::Prevote);
+        let mut fallback = clone_engine(&propose);
+        rows(&mut fallback, VoteKind::Prevote, Some([7; 32]));
+        rows(&mut fallback, VoteKind::Precommit, None);
+        assert!(fallback.d().timers[1].active && fallback.d().timers[3].active);
+        let mut precommit = clone_engine(&propose);
+        rows(&mut precommit, VoteKind::Prevote, None);
+        precommit.elapse(5, &mut Events::default()).unwrap();
+        assert_eq!(precommit.d().step, Step::Precommit);
+
+        let mut retry = clone_engine(&propose);
+        let h = header(c, 0, None, b"retry-slot");
+        retry
+            .receive(
+                ordinary(
+                    None,
+                    Some(Proposal {
+                        header: &h,
+                        body: b"retry-slot",
+                    }),
+                    &[],
+                ),
+                Status::Indeterminate,
+                &mut Events::default(),
+            )
+            .unwrap();
+        let h = header(c, 7, None, b"retry-pending");
+        let votes = (0..3)
+            .map(|s| vote(c, s, 7, VoteKind::Precommit, Some(h.content.id)))
+            .collect::<Vec<_>>();
+        let groups = [Group {
+            kind: CertKind::Decision {
+                round: 7,
+                id: h.content.id,
+            },
+            votes: Votes::Dense(&votes),
+        }];
+        let pending = Frame {
+            message: Message::Dec,
+            outer: None,
+            proposal: Some(Proposal {
+                header: &h,
+                body: b"retry-pending",
+            }),
+            groups: &groups,
+        };
+        retry
+            .receive(pending, Status::Indeterminate, &mut Events::default())
+            .unwrap();
+        let mut pre_retry = clone_engine(&pre);
+        pre_retry
+            .receive(pending, Status::Indeterminate, &mut Events::default())
+            .unwrap();
+
+        // Carry a locked body into the next round, where this node is proposer:
+        // timeout-driven start must retain every intent/header/body/cert write.
+        let (mut locked, _) = engine(c, 1, 4, 0);
+        locked.set_emission(Emission::Guided);
+        let h = header(c, 0, None, b"locked");
+        locked
+            .receive(
+                ordinary(
+                    None,
+                    Some(Proposal {
+                        header: &h,
+                        body: b"locked",
+                    }),
+                    &[],
+                ),
+                Status::Valid,
+                &mut Events::default(),
+            )
+            .unwrap();
+        rows(&mut locked, VoteKind::Prevote, Some(h.content.id));
+        rows(&mut locked, VoteKind::Precommit, None);
+        assert_eq!(locked.d().step, Step::Precommit);
+        assert!(locked.d().vc.is_some() && locked.d().timers[3].active);
+        let mut decided = clone_engine(&locked);
+        rows(&mut decided, VoteKind::Precommit, Some(h.content.id));
+        assert_eq!(decided.d().step, Step::Decided);
+        vec![
+            pre, propose, prevote, fallback, precommit, retry, pre_retry, locked, decided,
+        ]
+    }
+
+    #[test]
+    fn differential_all_steps_grid_phases_expiries_and_recovery() {
+        for rho in [3, 10, 17] {
+            let c = config([1; 4]);
+            let c = Config::new(
+                c.domain(),
+                c.members().to_vec(),
+                c.max_body(),
+                rho,
+                c.timeouts(),
+            )
+            .unwrap();
+            for (scenario, base) in snapshots(&c).iter().enumerate() {
+                for grid in [0, 1, rho - 1, rho] {
+                    let mut base = clone_engine(base);
+                    base.store.descriptor.as_mut().unwrap().grid_remaining = grid;
+                    // Zero is the legitimate crash cut between a reference tick's
+                    // decrement publication and its grid-reset publication.
+                    if grid == 0 {
+                        base = Engine::recover_with_emission(
+                            base.store,
+                            base.key,
+                            Emission::Guided,
+                            &mut Events::default(),
+                        )
+                        .unwrap();
+                    }
+                    for online in [0, 1, 5, 9, 10, 11, 29, 30, 31, 37, 101] {
+                        let result = std::panic::catch_unwind(|| compare_elapsed(&base, online));
+                        assert!(
+                            result.is_ok(),
+                            "rho={rho} scenario={scenario} grid={grid} online={online}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn differential_multiple_rounds_heights_and_configurations() {
+        let c = config([1, 7, 1, 1]);
+        let (base, _) = engine(&c, 1, 4, 7);
+        compare_elapsed(&base, 1_001); // Heavy own nil quorums advance many rounds.
+        let mut base = clone_engine(&base);
+        base.elapse_coalesced(3, &mut Events::default()).unwrap();
+        let next = Config::new([99; 32], c.members()[2..].to_vec(), 512, 7, c.timeouts()).unwrap();
+        base.init(&next, 5, 11, &mut Events::default()).unwrap();
+        assert_eq!(base.local_index(), None);
+        assert_eq!(base.d().grid_remaining, 7);
+        compare_elapsed(&base, 113);
+        let next =
+            Config::crosslink([100; 32], c.members().to_vec(), 1024, 13, c.timeouts()).unwrap();
+        base.init(&next, 8, 0, &mut Events::default()).unwrap();
+        assert_eq!(base.local_index(), Some(1));
+        compare_elapsed(&base, 1_003);
+    }
+
+    #[test]
+    fn full_elapsed_and_write_bound_independent_of_missed_grid_ticks() {
+        let c = config([1; 4]);
+        let c = Config::new(
+            c.domain(),
+            c.members().to_vec(),
+            c.max_body(),
+            1,
+            c.timeouts(),
+        )
+        .unwrap();
+        let states = snapshots(&c);
+        for index in [2, 8] {
+            // Stable Prevote and Decided have no future deadline.
+            for online in [1, 10_003, u64::MAX] {
+                let mut e = clone_engine(&states[index]);
+                let before = e.store.writes;
+                e.elapse_coalesced(online, &mut Events::default()).unwrap();
+                assert_eq!(e.store.writes - before, 1);
+                assert_eq!(e.d(), states[index].d());
+            }
+        }
+        let mut costs = Vec::new();
+        for online in [31, 10_003, u64::MAX] {
+            let mut e = clone_engine(&states[1]);
+            let before = e.store.writes;
+            e.elapse_coalesced(online, &mut Events::default()).unwrap();
+            assert_eq!(e.d().step, Step::Prevote);
+            assert_eq!(e.d().timers[0].remaining, 0);
+            assert_eq!(e.d().grid_remaining, 1);
+            costs.push(e.store.writes - before);
+        }
+        assert!(costs[0] <= 6);
+        assert_eq!(costs, vec![costs[0]; 3]);
+        let (mut pre, _) = engine(&c, 0, 4, u64::MAX);
+        pre.set_emission(Emission::Guided);
+        let before = pre.store.writes;
+        pre.elapse_coalesced(u64::MAX - 1, &mut Events::default())
+            .unwrap();
+        assert_eq!(pre.store.writes - before, 1);
+        assert_eq!(pre.d().height_remaining, 1);
+        pre.elapse_coalesced(1, &mut Events::default()).unwrap();
+        assert_eq!(pre.d().step, Step::Propose);
+        assert_eq!(pre.d().timers[0].remaining, 30);
+    }
+
+    #[test]
+    fn guarded_policy_and_extreme_grid_arithmetic() {
+        let c = config([1; 4]);
+        let (mut e, _) = engine(&c, 0, 4, 0);
+        let before = e.store.writes;
+        for emission in [Emission::Reference, Emission::CompactLive] {
+            e.set_emission(emission);
+            let mut out = Out::default();
+            assert_eq!(e.elapse_coalesced(100, &mut out), Err(Error::Invalid));
+            assert_eq!(e.store.writes, before);
+            assert!(e.is_active() && out.sent.is_empty() && out.acquire == 0);
+        }
+        let c = Config::new(
+            c.domain(),
+            c.members().to_vec(),
+            c.max_body(),
+            u64::MAX,
+            c.timeouts(),
+        )
+        .unwrap();
+        let (base, _) = engine(&c, 0, 4, 37);
+        compare_elapsed(&base, u64::MAX);
+    }
+
+    use super::super::durable::{DurableStore, Limits, image_size};
+    use std::{cell::RefCell, rc::Rc};
+    const LIMITS: Limits = Limits {
+        max_members: 4,
+        max_body: 1024,
+    };
+
+    // Atomic old-or-new fault model; not a claim of physical fsync durability.
+    #[derive(Clone, Default)]
+    struct Disk(Rc<RefCell<DiskState>>);
+    #[derive(Default)]
+    struct DiskState {
+        block: Option<Vec<u8>>,
+        writes: usize,
+        fail: Option<(usize, bool)>,
+        failed: bool,
+    }
+    impl AtomicBlockStore for Disk {
+        fn block_size(&self) -> usize {
+            image_size(LIMITS).unwrap()
+        }
+        fn load(&mut self, block: &mut [u8]) -> Result<bool> {
+            assert_eq!(block.len(), self.block_size());
+            let state = self.0.borrow();
+            if let Some(saved) = &state.block {
+                block.copy_from_slice(saved);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        fn replace(&mut self, block: &[u8]) -> Result<()> {
+            assert_eq!(block.len(), self.block_size());
+            let mut state = self.0.borrow_mut();
+            let fail = state.fail.filter(|(at, _)| *at == state.writes);
+            state.writes += 1;
+            if fail.is_none_or(|(_, commit_new)| commit_new) {
+                state.block = Some(block.to_vec());
+            }
+            state.failed = fail.is_some();
+            if fail.is_some() {
+                Err(Error::Storage)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    struct Published {
+        disk: Disk,
+        calls: usize,
+        votes: Vec<Vote>,
+    }
+    impl Published {
+        fn load(&mut self) -> DurableStore<Disk> {
+            assert!(
+                !self.disk.0.borrow().failed,
+                "callback after failed replacement"
+            );
+            self.calls += 1;
+            DurableStore::open(self.disk.clone(), LIMITS).unwrap()
+        }
+    }
+    impl Sink for Published {
+        fn send(&mut self, _: Target, frame: Frame<'_>) {
+            assert!(frame.proposal.is_none() && frame.groups.is_empty());
+            let store = self.load();
+            let d = store.descriptor().unwrap();
+            assert!(
+                d.grid_remaining > 0,
+                "replay before normalized grid publication"
+            );
+            let vote = frame.outer.unwrap();
+            assert_eq!(d.intents[vote.content.kind.index()], Some(vote.content));
+            assert_eq!(store.own(vote.content.kind), Some(vote));
+            if d.proposal_published {
+                let intent = d.proposal_intent.unwrap();
+                let header = store.own_header().unwrap();
+                assert_eq!(header.content, intent.content);
+                assert_eq!(store.header(intent.slot), Some(header));
+                assert_eq!(
+                    store.config().unwrap().body_id(store.body(intent.slot)),
+                    header.content.id
+                );
+            }
+            for region in [d.entry, d.vc.map(|p| p.certificate)].into_iter().flatten() {
+                let header = store.region_header(region.index).unwrap();
+                assert_eq!(header.digest, region.digest);
+                assert_eq!(
+                    store.region_rows(region.index).iter().flatten().count(),
+                    header.count
+                );
+            }
+            self.votes.push(*vote);
+        }
+        fn decided(&mut self, _: u64, proposal: Proposal<'_>, _: Group<'_>) {
+            let store = self.load();
+            let d = store.descriptor().unwrap();
+            assert_eq!(d.step, Step::Decided);
+            let slot = d.pending.unwrap().proposal.index;
+            assert_eq!(store.header(slot), Some(proposal.header));
+            assert_eq!(store.body(slot), proposal.body);
+        }
+        fn acquire(&mut self, tag: ProposalTag) {
+            let store = self.load();
+            let d = store.descriptor().unwrap();
+            assert_eq!((d.height, d.round), (tag.height, tag.round));
+        }
+        fn retry(&mut self, tag: BodyTag, _: Proposal<'_>) {
+            let store = self.load();
+            let d = store.descriptor().unwrap();
+            assert!(
+                [d.slot, d.pending.map(|p| p.proposal)]
+                    .into_iter()
+                    .flatten()
+                    .any(
+                        |s| s.header == tag.header && d.body_generations[s.index] == tag.generation
+                    )
+            );
+        }
+    }
+    fn durable_locked() -> (Engine<DurableStore<Disk>>, Published) {
+        let c = config([1; 4]);
+        let c = Config::new(
+            c.domain(),
+            c.members().to_vec(),
+            c.max_body(),
+            3,
+            c.timeouts(),
+        )
+        .unwrap();
+        let disk = Disk::default();
+        let store = DurableStore::open(disk.clone(), LIMITS).unwrap();
+        let mut e = Engine::boot(store, keys()[1].clone(), c.clone()).unwrap();
+        e.set_emission(Emission::Guided);
+        let mut out = Published {
+            disk,
+            calls: 0,
+            votes: Vec::new(),
+        };
+        e.init(&c, 4, 0, &mut out).unwrap();
+        let h = header(&c, 0, None, b"durable-lock");
+        e.receive(
+            ordinary(
+                None,
+                Some(Proposal {
+                    header: &h,
+                    body: b"durable-lock",
+                }),
+                &[],
+            ),
+            Status::Valid,
+            &mut out,
+        )
+        .unwrap();
+        for (kind, id) in [
+            (VoteKind::Prevote, Some(h.content.id)),
+            (VoteKind::Precommit, None),
+        ] {
+            let votes = (0..3).map(|s| vote(&c, s, 0, kind, id)).collect::<Vec<_>>();
+            let groups = [Group {
+                kind: CertKind::Row { round: 0, kind },
+                votes: Votes::Dense(&votes),
+            }];
+            e.receive(
+                ordinary(None, None, &groups),
+                Status::Indeterminate,
+                &mut out,
+            )
+            .unwrap();
+        }
+        assert_eq!(e.d().step, Step::Precommit);
+        assert!(e.d().vc.is_some() && e.d().timers[3].active);
+        out.calls = 0;
+        out.votes.clear();
+        (e, out)
+    }
+
+    #[test]
+    fn durable_every_elapsed_cut_keeps_publication_and_fails_closed() {
+        let (mut baseline, mut out) = durable_locked();
+        let before = out.disk.0.borrow().writes;
+        baseline.elapse_coalesced(37, &mut out).unwrap();
+        let writes = out.disk.0.borrow().writes - before;
+        assert!(writes > 10); // Timeout certificate, new ENTER, copied proposal/PV.
+        assert_eq!(baseline.d().round, 1);
+        assert!(baseline.d().proposal_published);
+        for commit_new in [false, true] {
+            for cut in 0..writes {
+                let (mut e, mut out) = durable_locked();
+                let before = out.disk.0.borrow().writes;
+                out.disk.0.borrow_mut().fail = Some((before + cut, commit_new));
+                assert_eq!(
+                    e.elapse_coalesced(37, &mut out),
+                    Err(Error::Storage),
+                    "cut={cut}"
+                );
+                assert!(!e.is_active() && e.storage().is_poisoned());
+                if cut == 0 {
+                    assert_eq!(out.calls, 0);
+                }
+                let calls = out.calls;
+                assert_eq!(e.elapse_coalesced(1, &mut out), Err(Error::Inactive));
+                assert_eq!(out.calls, calls);
+                out.disk.0.borrow_mut().fail = None;
+                out.disk.0.borrow_mut().failed = false;
+                let store = DurableStore::open(e.into_storage().into_backend(), LIMITS).unwrap();
+                let mut e = Engine::recover_with_emission(
+                    store,
+                    keys()[1].clone(),
+                    Emission::Guided,
+                    &mut out,
+                )
+                .unwrap();
+                e.elapse_coalesced(37, &mut out).unwrap();
+                for v in &out.votes {
+                    for after in &out.votes {
+                        if (v.content.height, v.content.round, v.content.kind)
+                            == (
+                                after.content.height,
+                                after.content.round,
+                                after.content.kind,
+                            )
+                        {
+                            assert_eq!(v, after, "double sign at cut={cut} new={commit_new}");
+                        }
+                    }
+                }
+            }
+        }
+        baseline.elapse_coalesced(6, &mut out).unwrap(); // Last positive timer.
+        for online in [1, 10_003, u64::MAX] {
+            let before = out.disk.0.borrow().writes;
+            baseline.elapse_coalesced(online, &mut out).unwrap();
+            assert_eq!(out.disk.0.borrow().writes - before, 1);
+        }
+    }
+}
