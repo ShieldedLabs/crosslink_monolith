@@ -1256,16 +1256,18 @@ pub async fn run<B: AtomicBlockStore + Send + 'static>(
                 .map_err(core_error)?;
             last_tick = now;
         }
+        // Consume the elapsed interval before this tick's inputs can arm new
+        // timers. Keep the tick-start timestamp so processing time is not lost.
+        engine
+            .elapse_coalesced(now.saturating_sub(last_tick), &mut events)
+            .map_err(core_error)?;
+        last_tick = now;
         network.receive(engine, &config, &mut events, public_key, now)?;
         work.schedule(engine, &host, &mut events, now, config.max_body)?;
         acknowledged = work.poll(engine, &mut events, now, &config, &host).await?;
         if acknowledged.is_some() {
             continue;
         }
-        engine
-            .elapse_coalesced(now.saturating_sub(last_tick), &mut events)
-            .map_err(core_error)?;
-        last_tick = now;
         work.schedule(engine, &host, &mut events, now, config.max_body)?;
         (host.access.0)(
             &snapshot(
