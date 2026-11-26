@@ -53,7 +53,9 @@ import unittest
 from unittest import mock
 
 
-MAX_BODY = 1048576
+MAX_BODY = 1048576  # Legacy default; never silently raised for a byte-target sweep.
+MAX_BENCH_BODY = 10 * MAX_BODY
+REPORT_GRACE_SECONDS = 8  # Shared post-failure cleanup budget, never measured time.
 MAX_JSON = 8 * 1024 * 1024
 MAX_LOG = 256 * 1024
 MAX_LINE = 4096
@@ -98,8 +100,27 @@ def decode(raw):
                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
 
 
+@contextlib.contextmanager
+def atomic_text_file(path):
+    """Publish a complete new artifact without overwriting an existing path."""
+    path = Path(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix="." + path.name + "-", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            yield stream
+            stream.flush()
+            os.fsync(stream.fileno())
+        # link, unlike replace/rename, preserves the original create-only contract.
+        os.link(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink()
+
+
 def write_json(path, value):
-    with Path(path).open("x", encoding="utf-8") as stream:
+    with atomic_text_file(path) as stream:
         json.dump(value, stream, indent=2, sort_keys=True, allow_nan=False)
         stream.write("\n")
 
@@ -156,14 +177,23 @@ def validate_config(config):
     bounds = {"node": (0, 31), "nodes": (1, 32), "offline": (0, 31),
               "headers": (0, 2048), "solution_bytes": (0, 1344), "heights": (1, 200),
               "warmup": (0, 20), "timeout_secs": (1, 1800), "workers": (1, 1),
-              "max_body": (MAX_BODY, MAX_BODY), "chatter_secs": (0, 30),
+              "body_bytes": (0, MAX_BENCH_BODY), "max_body": (1, MAX_BENCH_BODY), "chatter_secs": (0, 30),
               "poll_ms": (5, 100), "status_ms": (25, 100), "receive_budget": (32, 128),
               "max_requests": (1, 2), "max_outgoing": (2, 2)}
-    required = set(bounds) - {"solution_bytes"}
-    if set(config) - (set(bounds) | {"peers", "coordinator", "run_id"}) or not required <= set(config):
+    required = set(bounds) - {"solution_bytes", "body_bytes"}
+    if set(config) - (set(bounds) | {"peers", "coordinator", "run_id", "timing_profile"}) or not required <= set(config):
         raise ValueError("unknown or missing config fields")
     for key, (low, high) in bounds.items():
         integer(config.get(key, 0), low, high, key)
+    if config.get("timing_profile", "production") not in ("production", "wan"):
+        raise ValueError("timing_profile must be production or wan")
+    if config.get("body_bytes", 0):
+        if config["headers"] != 32 or config.get("solution_bytes", 0) != 0:
+            raise ValueError("body_bytes requires headers=32 and solution_bytes=0")
+        # Serialized v2 fixed bytes + 32 existing mock headers + full-roster certificate.
+        minimum = 71 + 187 * config["headers"] + 96 * config["nodes"]
+        if not minimum <= config["body_bytes"] <= config["max_body"]:
+            raise ValueError(f"body_bytes must be >= {minimum} and <= max_body; no implicit cap increase")
     if config["node"] >= config["nodes"] - config["offline"]:
         raise ValueError("node must be online")
     if 3 * (config["nodes"] - config["offline"]) <= 2 * config["nodes"]:
@@ -180,6 +210,18 @@ def validate_config(config):
         raise ValueError("coordinator must have a distinct endpoint")
     run_id(config.get("run_id"))
     return dict(config)
+
+
+def configs_match(actual, expected):
+    """Only the two new serde defaults may differ; never rewrite raw provenance."""
+    if not isinstance(actual, dict) or not isinstance(expected, dict):
+        return False
+    if any(type(config.get("body_bytes", 0)) is not int for config in (actual, expected)):
+        return False
+    def normalized(config):
+        return dict(config, body_bytes=config.get("body_bytes", 0),
+                    timing_profile=config.get("timing_profile", "production"))
+    return normalized(actual) == normalized(expected)
 
 
 def percentile(values):
@@ -240,7 +282,9 @@ class Barrier:
             raise ProtocolError("out-of-order height")
         if not isinstance(message["id"], str) or re.fullmatch(r"[0-9a-f]{64}", message["id"]) is None:
             raise ProtocolError("invalid body ID")
-        integer(message["body_bytes"], 1, MAX_BODY, "body_bytes")
+        integer(message["body_bytes"], 1, self.config["max_body"], "body_bytes")
+        if self.config.get("body_bytes", 0) and message["body_bytes"] != self.config["body_bytes"]:
+            raise ProtocolError("body byte count differs from exact target")
         integer(message["payload_bytes"], 0, message["body_bytes"], "payload_bytes")
         integer(message["round"], 0, 2**31 - 1, "round")
         number(message["latency_ms"], 0, self.config["timeout_secs"] * 1000 + 1000, "latency_ms")
@@ -539,7 +583,7 @@ def aggregate_node_windows(trials, window_name="measured_window"):
                     raise ValueError(trial.get("node_report_errors", {}).get(node, "missing node report"))
                 if (report.get("schema_version") != 1 or report.get("mode") != "distributed"
                         or report.get("status") not in ("complete", "partial")
-                        or report.get("config") != dict(trial["config"], node=node)):
+                        or not configs_match(report.get("config"), dict(trial["config"], node=node))):
                     raise ValueError("node report schema/identity/config mismatch")
                 window = report[window_name]
                 observation.update(report_status=report["status"], duration_seconds=_window_duration(window))
@@ -592,9 +636,11 @@ def aggregate(trials):
     groups = {}
     for trial in trials:
         config = trial["config"]
-        key = (config["nodes"], config["offline"], config["headers"], config.get("solution_bytes", 0), trial["profile"])
+        key = (config["nodes"], config["offline"], config["headers"], config.get("solution_bytes", 0), trial["profile"],
+               config.get("body_bytes", 0), config["max_body"], config.get("timing_profile", "production"))
         group = groups.setdefault(key, {"nodes": key[0], "offline": key[1], "headers": key[2],
                                        "solution_bytes": key[3], "profile": key[4], "trials": 0,
+                                       "target_body_bytes": key[5], "max_body": key[6], "timing_profile": key[7],
                                        "complete_trials": 0, "duration_seconds": 0, "completed_heights": 0,
                                        "body_bytes": 0, "payload_bytes": 0, "body_sizes": set(),
                                        "receipt_ms": {c: [] for c in ("first", "quorum", "all")},
@@ -625,6 +671,26 @@ def aggregate(trials):
         grouped_trials = group.pop("_trials")
         group["failed_trials"] = group["trials"] - group["complete_trials"]
         group["body_sizes"] = sorted(group["body_sizes"])
+        group["trial_chronology"] = [
+            {"trial": trial.get("trial"), "trial_index": trial.get("trial_index"),
+             "repetition": trial.get("repetition"), "status": trial["status"],
+             "started_at": trial.get("started_at"), "finished_at": trial.get("finished_at"),
+             "elapsed_seconds": trial.get("elapsed_seconds"),
+             "rate_duration_seconds": trial["controller"]["rate_duration_seconds"],
+             "planned_measured_heights": trial["config"]["heights"],
+             "observed_measured_heights": sum(row["measured"] for row in trial["controller"]["heights"]),
+             "completed_measured_heights": sum(row["measured"] and row["acknowledged"]
+                                               for row in trial["controller"]["heights"])}
+            for trial in grouped_trials]
+        chronology = group["trial_chronology"]
+        for key, select in (("started_at", min), ("finished_at", max)):
+            group[key] = select((trial[key] for trial in chronology if trial[key] is not None), default=None)
+        elapsed = [trial["elapsed_seconds"] for trial in chronology if trial["elapsed_seconds"] is not None]
+        group["elapsed_seconds"] = sum(elapsed) if elapsed else None
+        group["elapsed_trial_count"] = len(elapsed)
+        for key in ("planned_measured_heights", "observed_measured_heights"):
+            group[key] = sum(trial[key] for trial in chronology)
+        group["uncompleted_measured_heights"] = group["planned_measured_heights"] - group["completed_heights"]
         for field in ("completed_heights", "body_bytes", "payload_bytes"):
             group[field + "_per_second"] = (group[field] / group["duration_seconds"]
                                               if group["duration_seconds"] > 0 else None)
@@ -1022,18 +1088,66 @@ def validate_roster(roster):
     return dict(roster, interface=interface)
 
 
-def schedule(headers, profiles, repetitions, seed):
+def schedule(headers, profiles, repetitions, seed, *, body_bytes=None, max_body=MAX_BODY,
+             timing_profile="production"):
+    targets = headers if body_bytes is None else body_bytes
+    if len(targets) * len(profiles) * repetitions > 128:
+        raise ValueError("campaign limited to 128 sequential trials")
     rng = random.Random(seed)
     trials = []
     for repetition in range(1, repetitions + 1):
-        sizes = list(headers)
+        sizes = list(targets)
         rng.shuffle(sizes)
         for size in sizes:
             paired = list(profiles)
             rng.shuffle(paired)
             for profile in paired:
-                trials.append({"repetition": repetition, "headers": size, "profile": profile})
+                trials.append({"repetition": repetition, "headers": size if body_bytes is None else 32,
+                               "body_bytes": 0 if body_bytes is None else size, "max_body": max_body,
+                               "timing_profile": timing_profile, "profile": profile})
     return trials
+
+
+def trial_name(index, case):
+    # Preserve legacy directory names at the old defaults; new dimensions are explicit.
+    target = case.get("body_bytes", 0)
+    size = f"b{target}" if target else f"h{case['headers']}"
+    cap = case.get("max_body", MAX_BODY)
+    if target or cap != MAX_BODY:
+        size += f"-cap{cap}"
+    timing = case.get("timing_profile", "production")
+    suffix = "" if timing == "production" else "-" + timing
+    return f"trial-{index:03d}-r{case['repetition']:02d}-{size}-{case['profile']}{suffix}"
+
+
+def campaign_cases(args):
+    if args.body_bytes is not None and (args.headers_explicit or args.solution_bytes_explicit):
+        raise ValueError("--body-bytes excludes explicit --headers and --solution-bytes")
+    if args.body_bytes is not None and any(value > args.max_body for value in args.body_bytes):
+        raise ValueError("--body-bytes targets must fit --max-body; no implicit cap increase")
+    return schedule(args.headers, args.profiles, args.repetitions, args.seed,
+                    body_bytes=args.body_bytes, max_body=args.max_body, timing_profile=args.timing_profile)
+
+
+def trial_config(args, roster, case, identifier):
+    config = {"node": 0, "nodes": len(roster["peers"]), "offline": args.offline,
+              "headers": case["headers"], "solution_bytes": 0 if case.get("body_bytes", 0) else args.solution_bytes,
+              "heights": args.heights, "warmup": args.warmup, "timeout_secs": args.timeout_secs,
+              "workers": 1, "max_body": case.get("max_body", args.max_body), "chatter_secs": args.chatter_secs,
+              "peers": roster["peers"], "coordinator": roster["coordinator"],
+              "run_id": identifier, "max_requests": 2, "max_outgoing": 2, **PROFILES[case["profile"]]}
+    # Old executables/config artifacts remain usable when neither new mode is requested.
+    if case.get("body_bytes", 0):
+        config["body_bytes"] = case["body_bytes"]
+    if case.get("timing_profile", args.timing_profile) != "production":
+        config["timing_profile"] = case.get("timing_profile", args.timing_profile)
+    return validate_config(config)
+
+
+def failure_report_grace(began, timeout, now, started):
+    """Only a started trial near its process deadline gets a bounded report flush."""
+    near_deadline = abs(now - (began + timeout)) <= min(REPORT_GRACE_SECONDS, timeout / 10)
+    return REPORT_GRACE_SECONDS if started and near_deadline else 0
 
 
 def collect_remote(address, token, identifier, directory, grace):
@@ -1041,12 +1155,16 @@ def collect_remote(address, token, identifier, directory, grace):
     request = {"run_id": identifier}
     while True:
         status = worker_request(address, token, "status", request, timeout=5)
-        if status.get("done"):
+        if not isinstance(status, dict) or status.get("run_id") != identifier:
+            raise ValueError("invalid worker status identity")
+        if status.get("done") is True:
             break
         if time.monotonic() >= deadline:
-            worker_request(address, token, "stop", request, timeout=10)
+            status = worker_request(address, token, "stop", request, timeout=10)
+            if not isinstance(status, dict) or status.get("run_id") != identifier or status.get("done") is not True:
+                raise ValueError("worker stop did not confirm terminal child")
             break
-        time.sleep(0.2)  # Only AFTER final ACK/failure, never during measured heights.
+        time.sleep(min(0.2, max(0, deadline - time.monotonic())))  # Post-ACK/failure only.
     artifacts = worker_request(address, token, "result", request, timeout=10)
     if artifacts.get("run_id") != identifier or not isinstance(artifacts.get("files"), dict):
         raise ValueError("invalid worker result identity")
@@ -1056,7 +1174,7 @@ def collect_remote(address, token, identifier, directory, grace):
     for name, raw in artifacts["files"].items():
         if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_JSON:
             raise ValueError("invalid worker artifact text")
-        with (directory / name).open("x", encoding="utf-8") as stream:
+        with atomic_text_file(directory / name) as stream:
             stream.write(raw)
 
 
@@ -1073,23 +1191,16 @@ def validate_node_artifacts(directory, config, expected_sha):
         raise ValueError("node process did not exit successfully")
     if report.get("schema_version") != 1 or report.get("mode") != "distributed" or report.get("status") != "complete":
         raise ValueError("node report missing, partial or unsupported")
-    if report.get("config", {}).get("run_id") != config["run_id"] or report.get("config", {}).get("node") != config["node"]:
-        raise ValueError("node report identity mismatch")
+    if not configs_match(report.get("config"), config):
+        raise ValueError("node report identity/config mismatch")
     return worker, report
 
 
 def run_trial(args, roster, token, binary, metadata, directory, case, campaign_deadline):
+    config = trial_config(args, roster, case, secrets.token_hex(24))
     directory.mkdir(mode=0o700)
-    began = time.monotonic()
-    config = {"node": 0, "nodes": len(roster["peers"]), "offline": args.offline,
-              "headers": case["headers"], "solution_bytes": args.solution_bytes,
-              "heights": args.heights, "warmup": args.warmup, "timeout_secs": args.timeout_secs,
-              "workers": 1, "max_body": MAX_BODY, "chatter_secs": args.chatter_secs,
-              "peers": roster["peers"], "coordinator": roster["coordinator"],
-              "run_id": secrets.token_hex(24), "max_requests": 2, "max_outgoing": 2,
-              **PROFILES[case["profile"]]}
-    validate_config(config)
-    write_json(directory / "trial.json", {"config": config, **case})
+    began, started_at = time.monotonic(), utc_now()
+    write_json(directory / "trial.json", {"config": config, "started_at": started_at, **case})
     local = controller = None
     attempted = []
     errors = []
@@ -1123,19 +1234,24 @@ def run_trial(args, roster, token, binary, metadata, directory, case, campaign_d
         if controller is not None and not controller.done.is_set():
             controller.abort(errors[-1] if errors else "controller stop")
             controller.thread.join(5)
-        good_controller = controller is not None and controller.done.is_set() and controller.state.complete
-        if not good_controller or errors:
-            if local is not None:
-                local.cancel()
-            for node in attempted:
-                try:
-                    worker_request(roster["workers"][node], token, "stop", {"run_id": config["run_id"]})
-                except (OSError, ValueError, http.client.HTTPException) as exc:
-                    errors.append(f"node {node} stop: {type(exc).__name__}")
-        # Collection begins only after the coordinator's final ACK or failure.
+        # Freeze the controller/rate boundary BEFORE waiting for any report flush.
+        cleanup_began = time.monotonic()
+        if controller is not None and controller.done.is_set():
+            control_report = controller.report()
+        else:
+            failed = Barrier(config, began)
+            failed.finish(cleanup_began, errors[-1] if errors else "no controller report")
+            control_report = failed.report(cleanup_began)
+        good_controller = control_report["status"] == "complete" and not errors
+        grace = args.chatter_secs + REPORT_GRACE_SECONDS if good_controller else 0
+        if not good_controller and not errors and not interrupted and controller is not None and local is not None:
+            grace = failure_report_grace(local.began, config["timeout_secs"], cleanup_began,
+                                         controller.state.started is not None)
+        # One shared report-wait deadline, not N*grace. Bounded HTTP/kill operations
+        # can take additional time; terminal-state confirmation is still required.
+        cleanup_deadline = cleanup_began + grace
         cleanup_unconfirmed = []
-        grace = args.chatter_secs + 8
-        if local is not None and not local.done.wait(grace):
+        if local is not None and not local.done.wait(max(0, cleanup_deadline - time.monotonic())):
             local.cancel()
             errors.append("node 0 exit timeout")
         if local is not None and not local.done.is_set():
@@ -1143,7 +1259,7 @@ def run_trial(args, roster, token, binary, metadata, directory, case, campaign_d
         for node in attempted:
             try:
                 collect_remote(roster["workers"][node], token, config["run_id"],
-                               directory / f"node-{node:03d}", grace)
+                               directory / f"node-{node:03d}", max(0, cleanup_deadline - time.monotonic()))
             except (OSError, ValueError, http.client.HTTPException) as exc:
                 errors.append(f"node {node} collection: {type(exc).__name__}: {exc}")
                 # Even a successful final ACK does not prove the remote process
@@ -1162,12 +1278,6 @@ def run_trial(args, roster, token, binary, metadata, directory, case, campaign_d
                 if not confirmed:
                     cleanup_unconfirmed.append(node)
                     errors.append(f"node {node} cleanup unconfirmed; campaign must halt")
-    if controller is not None and controller.done.is_set():
-        control_report = controller.report()
-    else:
-        failed = Barrier(config, began)
-        failed.finish(time.monotonic(), errors[-1] if errors else "no controller report")
-        control_report = failed.report(time.monotonic())
     write_json(directory / "controller.json", control_report)
     node_results = []
     for node in range(config["nodes"] - config["offline"]):
@@ -1188,8 +1298,13 @@ def run_trial(args, roster, token, binary, metadata, directory, case, campaign_d
             node_results.append({"node": node, "status": "failed"})
     status = "complete" if control_report["status"] == "complete" and not errors else "partial"
     result = {"schema_version": 1, "status": status, "errors": errors, "interrupted": interrupted,
-              "cleanup_unconfirmed_nodes": cleanup_unconfirmed,
-              "elapsed_seconds": time.monotonic() - began, "finished_at": utc_now(), "nodes": node_results}
+              "cleanup_unconfirmed_nodes": cleanup_unconfirmed, "report_grace_seconds": grace,
+              "started_at": started_at, "elapsed_seconds": time.monotonic() - began,
+              "finished_at": utc_now(), "nodes": node_results,
+              "planned_measured_heights": config["heights"],
+              "observed_measured_heights": sum(row["measured"] for row in control_report["heights"]),
+              "completed_measured_heights": sum(row["measured"] and row["acknowledged"]
+                                                for row in control_report["heights"])}
     write_json(directory / "result.json", result)
     return {"trial": directory.name, "config": config, **case, **result, "controller": control_report}
 
@@ -1218,7 +1333,7 @@ def summarize(directory, quiet=False):
         def fmt(value, factor=1):
             return "-" if value is None else f"{value * factor:.3f}"
 
-        print("nodes/offline headers+solution profile complete/failed local_n local_p50/p95_ms body_KiB/s VM_TX_Mbit/s TX/body evidence/body budget_discards steal_% peak_RSS_MiB")
+        print("nodes/offline headers+solution target_body_B max_body_B timing profile complete/failed local_n local_p50/p95_ms body_KiB/s VM_TX_Mbit/s TX/body evidence/body budget_discards steal_% peak_RSS_MiB")
         for row in rows:
             measured = row["measured_window"]
             tx = measured["system_delta"]["network.eth0.tx_bytes"]
@@ -1226,12 +1341,18 @@ def summarize(directory, quiet=False):
             discards = measured["application_delta"]["scheduler_budget_discarded.messages"]
             local = row["node_local_ms"]
             latency = local["percentiles"] or {}
-            print(f"{row['nodes']}/{row['offline']}", f"{row['headers']}+{row['solution_bytes']}", row["profile"],
+            print(f"{row['nodes']}/{row['offline']}", f"{row['headers']}+{row['solution_bytes']}",
+                  row["target_body_bytes"], row["max_body"], row["timing_profile"], row["profile"],
                   f"{row['complete_trials']}/{row['failed_trials']}", local["n"],
                   f"{fmt(latency.get('p50'))}/{fmt(latency.get('p95'))}",
                   fmt(row["body_bytes_per_second"], 1 / 1024), fmt(tx["per_second"], 8 / 1e6),
                   fmt(tx["per_body_byte"]), fmt(evidence["per_body_byte"]), fmt(discards["total"]),
                   fmt(measured["cpu_steal"]["percent"]), fmt(measured["peak_rss_bytes"]["max"], 1 / 2**20))
+            print(f"  chronology: first_start={row['started_at'] or '-'} last_finish={row['finished_at'] or '-'} "
+                  f"elapsed_s={fmt(row['elapsed_seconds'])}(n={row['elapsed_trial_count']}) "
+                  f"rate_duration_s={fmt(row['duration_seconds'])} "
+                  f"measured_heights completed/observed/planned={row['completed_heights']}/"
+                  f"{row['observed_measured_heights']}/{row['planned_measured_heights']}")
             receipts = []
             for name, cohort in row["receipt_ms"].items():
                 latency = cohort["percentiles"] or {}
@@ -1256,23 +1377,25 @@ def summarize(directory, quiet=False):
 
 
 def campaign(args):
+    cases = [dict(case, trial_index=index) for index, case in enumerate(campaign_cases(args), 1)]
     roster = validate_roster(read_json(args.roster))
+    # Check every target/full-roster minimum before output creation or any child launch.
+    for case in cases:
+        trial_config(args, roster, case, "preflight-0123456789")
     token = read_token(args.token_file)
     binary = args.binary.resolve(strict=True)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise ValueError("binary must be an executable file")
-    if 3 * (len(roster["peers"]) - args.offline) <= 2 * len(roster["peers"]):
-        raise ValueError("online nodes must retain >2/3 quorum")
-    cases = schedule(args.headers, args.profiles, args.repetitions, args.seed)
-    if len(cases) > 128:
-        raise ValueError("campaign limited to 128 sequential trials")
     output = args.out.resolve()
     output.mkdir(mode=0o700, parents=True)
+    began, started_at = time.monotonic(), utc_now()
     metadata = machine_metadata(binary)
     write_json(output / "manifest.json", {
         "schema_version": 1, "mode": "d28_fly_campaign", "host": metadata, "roster": roster,
-        "cases_in_order": cases, "seed": args.seed, "heights": args.heights, "warmup": args.warmup,
-        "solution_bytes": args.solution_bytes, "offline": args.offline, "max_body": MAX_BODY,
+        "started_at": started_at, "cases_in_order": cases, "seed": args.seed,
+        "heights": args.heights, "warmup": args.warmup, "body_bytes": args.body_bytes,
+        "solution_bytes": args.solution_bytes, "offline": args.offline, "max_body": args.max_body,
+        "timing_profile": args.timing_profile,
         "timeout_secs": args.timeout_secs, "lifetime_secs": args.lifetime_secs,
         "profiles": PROFILES, "notes": NOTES,
         "node_latency_scope": "node-local ACK/tip publication to push_decided callback, not exact INIT timing",
@@ -1288,15 +1411,19 @@ def campaign(args):
     for index, case in enumerate(cases, 1):
         if time.monotonic() >= deadline:
             break
-        name = f"trial-{index:03d}-r{case['repetition']:02d}-h{case['headers']}-{case['profile']}"
+        name = trial_name(index, case)
         result = run_trial(args, roster, token, binary, metadata, output / name, case, deadline)
-        results.append({"trial": name, "status": result["status"]})
+        results.append({"trial": name, "status": result["status"], **case,
+                        **{key: result.get(key) for key in ("started_at", "finished_at", "elapsed_seconds")}})
         print(f"{name}: {result['status']}", flush=True)
         if result["interrupted"] or result["cleanup_unconfirmed_nodes"]:
             break
     complete = len(results) == len(cases) and all(row["status"] == "complete" for row in results)
-    write_json(output / "run.json", {"status": "complete" if complete else "partial",
-                                     "finished_at": utc_now(), "planned_trials": len(cases), "trials": results})
+    write_json(output / "run.json", {"status": "complete" if complete else "partial", "started_at": started_at,
+                                     "finished_at": utc_now(), "elapsed_seconds": time.monotonic() - began,
+                                     "planned_trials": len(cases), "started_trials": len(results),
+                                     "complete_trials": sum(row["status"] == "complete" for row in results),
+                                     "trials": results})
     write_json(output / "summary.json", summarize(output))
     return 0 if complete else 1
 
@@ -1329,7 +1456,7 @@ class SelfTests(unittest.TestCase):
         fixture = '''import json,socket,sys,time
 from pathlib import Path
 config=json.loads(Path(sys.argv[2]).read_text())
-node=config['node']; rows=[]; status='partial'
+node=config['node']; rows=[]; status='partial'; body=config.get('body_bytes',0) or 100
 host,port=config['coordinator'][1:].split(']:')
 sock=socket.socket(socket.AF_INET6,socket.SOCK_STREAM); sock.settimeout(10)
 sock.connect((host,int(port))); stream=sock.makefile('rb')
@@ -1342,15 +1469,16 @@ try:
     for height in range(1,config['heights']+config['warmup']+1):
         identifier=('b' if config['headers']==128 and node==1 else 'a')*64
         decision={'type':'decision','run_id':config['run_id'],'node':node,'height':height,
-                  'id':identifier,'body_bytes':100,'payload_bytes':80,'latency_ms':1.25,'round':0}
+                  'id':identifier,'body_bytes':body,'payload_bytes':80,'latency_ms':1.25,'round':0}
         send(decision)
         ack=receive(); assert ack=={'type':'ack','height':height}
-        rows.append({'height':height,'id':identifier,'body_bytes':100,'payload_bytes':80,
+        rows.append({'height':height,'id':identifier,'body_bytes':body,'payload_bytes':80,
                      'acknowledged':True})
     status='complete'
 except (OSError,ValueError,AssertionError): pass
 finally:
     sock.close()
+    config.setdefault('body_bytes',0); config.setdefault('timing_profile','production')
     Path(sys.argv[4]).write_text(json.dumps({'schema_version':1,'mode':'distributed',
         'config':config,'status':status,'heights':rows}))
 '''
@@ -1377,23 +1505,28 @@ finally:
                 roster = {"peers": fixture_config()["peers"], "coordinator": control, "interface": "lo",
                           "workers": [None] + [f"[::1]:{server.server_address[1]}" for server in servers]}
                 write_json(root / "roster.json", roster)
-                # Success, zero-decision timeout and a disagreement all retained.
-                for name, sizes, expected in (("success", "32", 0), ("failures", "0,128", 1)):
+                # Legacy success, exact-byte sweep, zero-decision timeout and disagreement.
+                for name, options, expected in (("success", ["--headers", "32"], 0),
+                        ("bytes", ["--body-bytes", "131072,10485760", "--max-body", "10485760", "--timing-profile", "wan"], 0),
+                        ("failures", ["--headers", "0,128"], 1)):
                     args = build_parser().parse_args(["campaign", "--binary", str(binary),
                         "--token-file", str(token_file), "--roster", str(root / "roster.json"),
-                        "--out", str(root / name), "--headers", sizes, "--repetitions", "1",
-                        "--heights", "3", "--warmup", "1" if name == "success" else "0",
-                        "--timeout-secs", "1", "--ready-timeout-secs", "5"])
+                        "--out", str(root / name), "--repetitions", "1",
+                        "--heights", "3", "--warmup", "1" if expected == 0 else "0",
+                        "--timeout-secs", "1", "--ready-timeout-secs", "5"] + options)
                     with contextlib.redirect_stdout(io.StringIO()):
                         self.assertEqual(campaign(args), expected)
                     manifest = read_json(root / name / "manifest.json")
                     self.assertEqual(manifest["host"]["binary_sha256"], sha256(binary))
                     summary = read_json(root / name / "summary.json")
-                    if name == "success":
-                        row = summary["cases"][0]
-                        self.assertEqual(row["completed_heights"], 3)
-                        self.assertEqual(row["body_bytes"], 300)
-                        self.assertEqual(row["node_local_ms"]["n"], 12)
+                    if expected == 0:
+                        for row in summary["cases"]:
+                            self.assertEqual(row["completed_heights"], 3)
+                            self.assertEqual(row["body_bytes"], 3 * (row["target_body_bytes"] or 100))
+                            self.assertEqual(row["node_local_ms"]["n"], 12)
+                            self.assertIsNotNone(row["started_at"])
+                            self.assertEqual(row["elapsed_trial_count"], 1)
+                            self.assertEqual(row["trial_chronology"][0]["planned_measured_heights"], 3)
                     else:
                         self.assertEqual(sum(row["completed_heights"] for row in summary["cases"]), 0)
                         zero = next(row for row in summary["cases"] if row["headers"] == 0)
@@ -1401,8 +1534,16 @@ finally:
                         self.assertEqual(zero["body_bytes_per_second"], 0)
                         failures = [read_json(path)["failure"] for path in (root / name).glob("trial-*/controller.json")]
                         self.assertTrue(any("conflicting" in value for value in failures), failures)
+                    if name == "bytes":
+                        self.assertEqual(manifest["body_bytes"], [131072, 10485760])
+                        self.assertEqual((manifest["max_body"], manifest["timing_profile"]), (10485760, "wan"))
+                        self.assertEqual({row["target_body_bytes"] for row in summary["cases"]}, {131072, 10485760})
+                        self.assertTrue(all("-cap10485760-" in path.name for path in (root / name).glob("trial-*")))
                     for path in (root / name).glob("trial-*/node-*/worker.json"):
-                        self.assertIsInstance(read_json(path)["process_window"]["start"], dict)
+                        worker_result = read_json(path)
+                        self.assertIsInstance(worker_result["process_window"]["start"], dict)
+                        if expected == 0:
+                            self.assertFalse(worker_result["cancelled"])
             finally:
                 for server in servers:
                     server.shutdown(); server.server_close()
@@ -1842,7 +1983,7 @@ finally:
         for value in ("[::]:9000", "[2001:4860::1]:9000", "127.0.0.1:9000", "[::1]:80"):
             with self.assertRaises(ValueError):
                 endpoint(value)
-        for change in ({"headers": 5500}, {"workers": 2}, {"max_body": MAX_BODY + 1},
+        for change in ({"headers": 5500}, {"workers": 2}, {"max_body": MAX_BENCH_BODY + 1},
                        {"node": True}, {"offline": 2}, {"run_id": "../../escape"},
                        {"binary": "/bin/sh"}, {"poll_ms": 6}):
             with self.assertRaises(ValueError):
@@ -1852,11 +1993,221 @@ finally:
         with self.assertRaises(ValueError):
             decode('{"a":NaN}')
 
+    def test_exact_byte_config_and_metadata_bounds(self):
+        config = fixture_config(nodes=7, peers=[f"[::1]:{20000 + i}" for i in range(7)],
+                                body_bytes=6727, max_body=MAX_BENCH_BODY, timing_profile="wan")
+        self.assertEqual(validate_config(config), config)
+        self.assertEqual(validate_config(dict(config, offline=2))["body_bytes"], 6727)
+        for changes in ({"body_bytes": 6726}, {"body_bytes": True}, {"body_bytes": -1},
+                        {"body_bytes": MAX_BENCH_BODY + 1}, {"max_body": 0}, {"max_body": 6726},
+                        {"max_body": MAX_BENCH_BODY + 1}, {"headers": 31}, {"solution_bytes": 1},
+                        {"timing_profile": "adaptive"}, {"body_bytes_extra": 1}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                validate_config(dict(config, **changes))
+        legacy = fixture_config(solution_bytes=320, headers=2048)
+        self.assertEqual(validate_config(legacy), legacy)
+        self.assertNotIn("body_bytes", legacy)
+        self.assertEqual((MAX_JSON, MAX_LINE), (8 * 1024 * 1024, 4096))
+        state = Barrier(dict(config, body_bytes=MAX_BENCH_BODY), 0)
+        self.ready(state)
+        state.decision(self.decision(state, body_bytes=MAX_BENCH_BODY), 3)
+        with self.assertRaises(ProtocolError):
+            state.decision(self.decision(state, 1, body_bytes=MAX_BENCH_BODY - 1), 3)
+        with self.assertRaises(ValueError):
+            state.decision(self.decision(state, 1, body_bytes=MAX_BENCH_BODY + 1), 3)
+        self.assertLess(len(encode(self.decision(state, body_bytes=MAX_BENCH_BODY))), MAX_LINE)
+
+    def test_body_cli_schedule_and_artifact_names(self):
+        argv = ["campaign", "--roster", "unused", "--binary", "unused", "--token-file", "unused", "--out", "unused"]
+        parser = build_parser()
+        legacy = parser.parse_args(argv)
+        self.assertEqual((legacy.headers, legacy.solution_bytes, legacy.max_body, legacy.timing_profile),
+                         ([32, 128, 512, 2048], 0, MAX_BODY, "production"))
+        self.assertEqual(trial_name(1, {"repetition": 1, "headers": 32, "profile": "baseline"}),
+                         "trial-001-r01-h32-baseline")
+        targets = [131072, 524288, 1048576, 2097152, 4194304, 8388608, 10485760]
+        options = ["--body-bytes", ",".join(map(str, targets)), "--max-body", str(MAX_BENCH_BODY),
+                   "--timing-profile", "wan", "--profiles", "baseline,fast"]
+        args = parser.parse_args(argv + options)
+        cases = campaign_cases(args)
+        self.assertEqual(len(cases), 42)
+        self.assertEqual(cases, campaign_cases(parser.parse_args(argv + options)))
+        self.assertNotEqual(cases, campaign_cases(parser.parse_args(argv + options + ["--seed", "429"])))
+        for repetition in range(1, 4):
+            paired = [case for case in cases if case["repetition"] == repetition]
+            self.assertEqual({case["body_bytes"] for case in paired}, set(targets))
+            for index in range(0, len(paired), 2):
+                self.assertEqual(paired[index]["body_bytes"], paired[index + 1]["body_bytes"])
+                self.assertEqual({paired[index]["profile"], paired[index + 1]["profile"]}, {"baseline", "fast"})
+        for case in cases:
+            config = trial_config(args, fixture_config(), case, "fixture-0123456789")
+            self.assertEqual((config["headers"], config["solution_bytes"], config["max_body"], config["timing_profile"]),
+                             (32, 0, MAX_BENCH_BODY, "wan"))
+            self.assertEqual(config["body_bytes"], case["body_bytes"])
+            self.assertIn(f"b{case['body_bytes']}-cap{MAX_BENCH_BODY}", trial_name(1, case))
+        first = cases[0]
+        self.assertNotEqual(trial_name(1, first), trial_name(1, dict(first, max_body=MAX_BODY)))
+        self.assertNotEqual(trial_name(1, first), trial_name(1, dict(first, timing_profile="production")))
+        for conflict in (["--headers", "32"], ["--solution-bytes", "0"]):
+            with self.assertRaises(ValueError):
+                campaign_cases(parser.parse_args(argv + options + conflict))
+        with self.assertRaises(ValueError):
+            campaign_cases(parser.parse_args(argv + ["--body-bytes", "10485760"]))
+        for value in ("0", "1.0", "-1", "+1", "1_024", "10MiB", " 10000", "10000,", "10000,10000", "10485761"):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parser.parse_args(argv + ["--body-bytes", value])
+
+    def test_caps_targets_timing_and_chronology_do_not_pool(self):
+        trials = []
+        for index, (target, cap, timing) in enumerate(((0, MAX_BODY, "production"),
+                (131072, MAX_BODY, "production"), (131072, MAX_BENCH_BODY, "production"),
+                (131072, MAX_BENCH_BODY, "wan"), (524288, MAX_BENCH_BODY, "wan")), 1):
+            trial = self.counter_trial(f"trial-{index:03d}", body=target or 100)
+            trial["config"].update(body_bytes=target, max_body=cap, timing_profile=timing)
+            for node, report in trial["node_reports"].items():
+                report["config"] = dict(trial["config"], node=node)
+            trial.update(trial_index=index, repetition=1, started_at=f"2026-11-26T18:0{index}:00+00:00",
+                         finished_at=f"2026-11-26T18:0{index}:09+00:00", elapsed_seconds=9)
+            trials.append(trial)
+        rows = aggregate(trials)
+        self.assertEqual(len(rows), 5)
+        for row in rows:
+            self.assertEqual(row["trials"], 1)
+            self.assertEqual((row["elapsed_seconds"], row["duration_seconds"], row["elapsed_trial_count"]), (9, 2, 1))
+            self.assertEqual((row["planned_measured_heights"], row["observed_measured_heights"], row["uncompleted_measured_heights"]),
+                             (1, 1, 0))
+            chronology = row["trial_chronology"][0]
+            self.assertEqual((chronology["completed_measured_heights"], chronology["rate_duration_seconds"]), (1, 2))
+            self.assertEqual(row["started_at"], chronology["started_at"])
+            self.assertEqual(row["body_bytes"], row["target_body_bytes"] or 100)
+            self.assertEqual(row["measured_window"]["system_delta"]["network.eth0.tx_bytes"]["matched_trials"], 1)
+        old = aggregate([self.counter_trial()])[0]
+        self.assertIsNone(old["elapsed_seconds"])
+        self.assertIsNone(old["started_at"])
+        self.assertEqual(old["elapsed_trial_count"], 0)
+
+    def test_new_serde_defaults_only_normalize_for_comparison(self):
+        trial = self.counter_trial()
+        old = dict(trial["node_reports"][0]["config"])
+        new = dict(old, body_bytes=0, timing_profile="production")
+        self.assertTrue(configs_match(old, new))
+        self.assertTrue(configs_match(new, old))
+        trial["node_reports"][0]["config"] = new
+        self.assertEqual(aggregate_node_windows([trial])["valid_node_windows"], 4)
+        self.assertEqual(trial["config"], old)  # Comparison never fills defaults into original config.
+        for change in ({"body_bytes": 10000}, {"body_bytes": False}, {"timing_profile": "wan"},
+                       {"max_body": MAX_BENCH_BODY}, {"extra": 0}):
+            self.assertFalse(configs_match(dict(new, **change), old))
+        missing_old_field = dict(new)
+        del missing_old_field["solution_bytes"]
+        self.assertFalse(configs_match(missing_old_field, old))
+        trial["node_reports"][0]["config"]["max_body"] = MAX_BENCH_BODY
+        metric = aggregate_node_windows([trial])["system_delta"]["network.eth0.tx_bytes"]
+        self.assertIsNone(metric["total"])
+        self.assertEqual(metric["available_node_windows"], 3)
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary)
+            write_json(root / "config.json", old)
+            write_json(root / "manifest.json", {"binary_sha256": "fixture"})
+            write_json(root / "worker.json", {"run_id": old["run_id"], "node": 0, "binary_sha256": "fixture", "returncode": 0})
+            report = dict(trial["node_reports"][0], config=dict(old, body_bytes=0, timing_profile="production"))
+            write_json(root / "report.json", report)
+            before = (root / "report.json").read_bytes()
+            self.assertEqual(validate_node_artifacts(root, old, "fixture")[1], report)
+            self.assertEqual((root / "report.json").read_bytes(), before)
+
+    def test_atomic_artifacts_preserve_create_only_and_raw_text(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary)
+            path = root / "artifact.json"
+            with self.assertRaises(ValueError):
+                write_json(path, {"bad": float("nan")})
+            self.assertEqual(list(root.iterdir()), [])
+            write_json(path, {"keep": "original"})
+            original = path.read_bytes()
+            with self.assertRaises(FileExistsError):
+                write_json(path, {"replacement": "forbidden"})
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(root.iterdir()), [path])
+            raw = '{"partial_raw_report":\n'
+            identifier = "fixture-0123456789"
+            def request(_address, _token, operation, value, **_kwargs):
+                self.assertEqual(value, {"run_id": identifier})
+                if operation == "status":
+                    return {"run_id": identifier, "done": True}
+                self.assertEqual(operation, "result")
+                return {"run_id": identifier, "files": {"report.json": raw}}
+            with mock.patch(__name__ + ".worker_request", side_effect=request):
+                collect_remote("[::1]:21000", "not-sent", identifier, root, 0)
+            self.assertEqual((root / "report.json").read_text(), raw)
+
+    def test_failure_report_grace_is_shared_and_excluded_from_measurement(self):
+        for now, started, expected in ((189, True, 8), (197, True, 8), (180, True, 0),
+                                       (199, True, 0), (190, False, 0)):
+            self.assertEqual(failure_report_grace(100, 90, now, started), expected)
+        roster = {"peers": fixture_config()["peers"], "coordinator": "[::1]:21000", "interface": "lo",
+                  "workers": [None, "[::1]:22001", "[::1]:22002", "[::1]:22003"]}
+        clock = [100.0]
+        def controller(config, _ready_timeout):
+            state = Barrier(config, 100)
+            for node in range(4):
+                state.ready({"type": "ready", "node": node, "run_id": config["run_id"]}, 101)
+            state.start(102)
+            state.finish(190, "node disconnected before final ACK")
+            result = mock.Mock(state=state)
+            result.done.is_set.return_value = True
+            def wait(_seconds):
+                clock[0] = 190
+                return True
+            result.done.wait.side_effect = wait
+            result.report.side_effect = lambda: state.report(clock[0])
+            return result
+        local = mock.Mock(began=100)
+        local.done.is_set.return_value = True
+        def local_wait(seconds):
+            self.assertEqual(seconds, 8)
+            clock[0] += 3
+            return True
+        local.done.wait.side_effect = local_wait
+        waits = []
+        def collect(_address, _token, _identifier, _directory, grace):
+            waits.append(grace)
+            clock[0] += 1
+        def request(_address, _token, operation, value):
+            self.assertEqual(operation, "start")
+            return {"accepted": True, "node": value["node"], "run_id": value["run_id"]}
+        args = build_parser().parse_args(["campaign", "--binary", sys.executable, "--roster", "unused",
+            "--token-file", "unused", "--out", "unused", "--timeout-secs", "90", "--warmup", "0"])
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary, \
+                mock.patch(__name__ + ".time.monotonic", side_effect=lambda: clock[0]), \
+                mock.patch(__name__ + ".Coordinator", side_effect=controller), \
+                mock.patch(__name__ + ".NodeJob", return_value=local), \
+                mock.patch(__name__ + ".worker_request", side_effect=request), \
+                mock.patch(__name__ + ".collect_remote", side_effect=collect), \
+                mock.patch(__name__ + ".validate_node_artifacts", side_effect=ValueError("partial fixture")):
+            result = run_trial(args, roster, "not-sent", Path(sys.executable), {"binary_sha256": "fixture"},
+                               Path(temporary) / "trial", {"headers": 32, "profile": "baseline", "repetition": 1}, 300)
+        self.assertEqual(waits, [5, 4, 3])
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["controller"]["rate_duration_seconds"], 88)
+        self.assertEqual(result["elapsed_seconds"], 96)
+        self.assertEqual(result["report_grace_seconds"], 8)
+        self.assertEqual(result["cleanup_unconfirmed_nodes"], [])
+        local.cancel.assert_not_called()
+
 
 class RealTests(unittest.TestCase):
     binary = None
 
     def test_four_real_nodes(self):
+        self.run_local_nodes(4, ["--headers", "32", "--profiles", "baseline,fast_k1,economy",
+                                 "--heights", "3", "--timeout-secs", "30"])
+
+    def test_seven_real_nodes_exact_10mib_wan(self):
+        self.run_local_nodes(7, ["--body-bytes", "10485760", "--max-body", "10485760",
+                                 "--timing-profile", "wan", "--heights", "2", "--timeout-secs", "240"])
+
+    def run_local_nodes(self, nodes, options):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
             root = Path(temporary)
             token_file = root / "token"
@@ -1864,7 +2215,7 @@ class RealTests(unittest.TestCase):
             token = read_token(token_file)
             servers, threads, workers = [], [], []
             try:
-                for node in range(1, 4):
+                for node in range(1, nodes):
                     worker = Worker(self.binary, root / f"worker-{node}", "lo")
                     server = WorkerServer(("::1", 0), WorkerHandler)
                     server.worker, server.token = worker, token
@@ -1874,7 +2225,7 @@ class RealTests(unittest.TestCase):
                 # Hold distinct UDP ports while allocating; Rust owns them after release.
                 with contextlib.ExitStack() as stack:
                     ports = []
-                    for _ in range(4):
+                    for _ in range(nodes):
                         reserved = stack.enter_context(socket.socket(socket.AF_INET6, socket.SOCK_DGRAM))
                         reserved.bind(("::1", 0))
                         ports.append(reserved.getsockname()[1])
@@ -1886,29 +2237,36 @@ class RealTests(unittest.TestCase):
                 write_json(root / "roster.json", roster)
                 args = build_parser().parse_args(["campaign", "--binary", str(self.binary),
                     "--roster", str(root / "roster.json"), "--token-file", str(token_file),
-                    "--out", str(root / "smoke"), "--headers", "32", "--repetitions", "1",
-                    "--profiles", "baseline,fast_k1,economy",
-                    "--heights", "3", "--warmup", "1", "--timeout-secs", "30"])
+                    "--out", str(root / "smoke"), "--repetitions", "1", "--warmup", "1"] + options)
                 result = campaign(args)
                 details = {str(path.relative_to(root)): optional_text(path) for pattern in
                            ("trial-*/result.json", "trial-*/controller.json", "trial-*/node-*/stderr.txt")
                            for path in (root / "smoke").glob(pattern)}
                 self.assertEqual(result, 0, details)
                 summaries = read_json(root / "smoke" / "summary.json")["cases"]
-                self.assertEqual([row["profile"] for row in summaries], ["baseline", "economy", "fast_k1"])
+                self.assertEqual([row["profile"] for row in summaries], sorted(args.profiles))
                 for summary in summaries:
                     with self.subTest(profile=summary["profile"]):
-                        self.assertEqual(summary["completed_heights"], 3)
+                        self.assertEqual(summary["completed_heights"], args.heights)
                         self.assertGreater(summary["body_bytes"], 18000)
-                        self.assertEqual(summary["receipt_ms"]["all"]["n"], 3)
+                        self.assertEqual(summary["receipt_ms"]["all"]["n"], args.heights)
+                        if args.body_bytes:
+                            self.assertEqual(summary["body_sizes"], args.body_bytes)
+                            self.assertEqual(summary["body_bytes"], args.heights * args.body_bytes[0])
+                            self.assertEqual(summary["timing_profile"], "wan")
+                            self.assertEqual(summary["measured_window"]["valid_node_windows"], nodes)
                 for trial in (root / "smoke").glob("trial-*"):
                     profile = read_json(trial / "trial.json")["profile"]
                     reports = list(trial.glob("node-*/report.json"))
-                    self.assertEqual(len(reports), 4)
+                    self.assertEqual(len(reports), nodes)
                     for path in reports:
-                        config = read_json(path)["config"]
+                        report = read_json(path)
+                        config = report["config"]
                         self.assertEqual(config["max_requests"], PROFILES[profile]["max_requests"])
                         self.assertEqual(config["max_outgoing"], 2)
+                        if args.body_bytes:
+                            self.assertEqual(config["body_bytes"], args.body_bytes[0])
+                            self.assertEqual({row["body_bytes"] for row in report["heights"]}, set(args.body_bytes))
             finally:
                 for server in servers:
                     server.shutdown(); server.server_close()
@@ -1945,6 +2303,18 @@ def profile_arg(text):
     return text
 
 
+class ExplicitStore(argparse.Action):
+    def __call__(self, parser, namespace, value, option_string=None):
+        setattr(namespace, self.dest, value)
+        setattr(namespace, self.dest + "_explicit", True)
+
+
+def body_bytes_arg(text):
+    if re.fullmatch(r"[0-9]+", text) is None:
+        raise argparse.ArgumentTypeError("body bytes must be positive decimal integers (no unit suffixes)")
+    return bounded_arg(1, MAX_BENCH_BODY)(text)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="mode", required=True)
@@ -1967,9 +2337,17 @@ def build_parser():
     command.add_argument("--binary", required=True, type=Path)
     command.add_argument("--token-file", required=True, type=Path)
     command.add_argument("--out", required=True, type=Path, help="NEW artifact directory")
-    command.add_argument("--headers", type=comma_arg(bounded_arg(0, 2048)), default=[32, 128, 512, 2048])
-    command.add_argument("--solution-bytes", type=bounded_arg(0, 1344), default=0,
+    command.set_defaults(headers_explicit=False, solution_bytes_explicit=False)
+    command.add_argument("--headers", type=comma_arg(bounded_arg(0, 2048)), default=[32, 128, 512, 2048],
+                         action=ExplicitStore)
+    command.add_argument("--solution-bytes", type=bounded_arg(0, 1344), default=0, action=ExplicitStore,
                          help="applies to all sizes; near-cap arm: --headers 2048 --solution-bytes 320")
+    command.add_argument("--body-bytes", type=comma_arg(body_bytes_arg),
+                         help="exact serialized body targets, comma-separated decimal bytes; excludes --headers/--solution-bytes")
+    command.add_argument("--max-body", type=bounded_arg(1, MAX_BENCH_BODY), default=MAX_BODY,
+                         help="fixed body cap across the sweep, bytes (default 1048576; maximum 10485760)")
+    command.add_argument("--timing-profile", choices=("production", "wan"), default="production",
+                         help="benchmark-only protocol timing profile; fixed across the sweep")
     command.add_argument("--profiles", type=comma_arg(profile_arg), default=["baseline"],
                          help="comma-separated baseline,fast,fast_k1,economy; economy polls at 100ms; never changes protocol timers")
     command.add_argument("--repetitions", type=bounded_arg(1, 32), default=3)
