@@ -1251,6 +1251,31 @@ already handed to STP retain STP's independent ownership bounds and cannot be
 recalled merely by dropping an application lease. The complete-frame theorem
 therefore does not, by itself, prove either outlined or chunked acquisition live.
 
+The unordered Merkle transport owns **additional** K=`max_requests` body slots,
+shared by partial assemblies and completed caches. These are not the core's
+three body slots. Each owns at most Bmax bytes plus bounded tree/retry metadata;
+per-peer inventories and send histories contain bitmaps, not body copies.
+Current-height content can survive metadata expiry and round/header changes,
+but a finite cache cannot retain every distinct body ever observed. Eviction,
+source availability and scheduler service still belong in the acquisition
+assumptions, not in a claim that randomness guarantees delivery.
+
+Every shard carries its indexed Merkle proof and the original proposer's
+BFT-only signature over the exact-header/context-bound root and geometry. The
+index is authenticated by the leaf hash, not by arrival order. Proposer-only
+initial push and randomized missing-leaf repair use no shard ACK or batch
+completion barrier. Neither these signatures nor possession advertisements
+replace the complete-body and host-validity checks above.
+
+The Merkle sender admits new encoded work against a geometry-independent byte
+ceiling after charging observed active-channel backlog and already-staged
+frames, and also limits per-call messages and local outbox slots. If preexisting
+work exceeds that ceiling, it adds nothing. Other runtime control producers
+retain their existing policies; this is not a hard whole-runtime memory bound.
+Transport snapshots are observations, not reservations against concurrent Base
+traffic. Native STP queue, FEC/rescue and receive ownership remain separate;
+planned-send backlog retirement is not proof of delivery or memory reclamation.
+
 ## Persistence and memory are separate contracts
 
 `AtomicBlockStore` is the fixed-size atomic replacement API. `durable.rs` now
