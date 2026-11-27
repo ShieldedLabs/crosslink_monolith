@@ -69,8 +69,10 @@ impl Limits {
     }
 
     pub fn max_outlined_bytes(self) -> Result<usize> {
-        self.max_frame_bytes()?.checked_sub(self.max_body)
-            .and_then(|n| n.checked_add(32)).ok_or(Error::Exhausted)
+        self.max_frame_bytes()?
+            .checked_sub(self.max_body)
+            .and_then(|n| n.checked_add(32))
+            .ok_or(Error::Exhausted)
     }
 
     fn max_positions(self) -> Result<usize> {
@@ -187,11 +189,23 @@ impl DecodedOutlined {
     pub fn header(&self) -> Option<&Header> {
         self.metadata.proposal.as_ref().map(|(h, _)| h)
     }
+    pub(crate) fn priority(&self) -> (bool, u64, usize) {
+        (
+            self.metadata.message == Message::Dec,
+            self.header().map_or(0, |h| h.content.round),
+            self.metadata.votes.len(),
+        )
+    }
     pub fn with_body<R>(&self, body: &[u8], f: impl FnOnce(Frame<'_>) -> R) -> R {
-        self.metadata.with_frame(|frame| f(Frame {
-            proposal: frame.proposal.map(|p| Proposal { header: p.header, body }),
-            ..frame
-        }))
+        self.metadata.with_frame(|frame| {
+            f(Frame {
+                proposal: frame.proposal.map(|p| Proposal {
+                    header: p.header,
+                    body,
+                }),
+                ..frame
+            })
+        })
     }
 }
 
@@ -229,7 +243,9 @@ pub struct BodyRequest {
     pub key: BodyKey,
 }
 fn put_body_control(out: &mut Vec<u8>, tag: u8, request: BodyRequest) -> Result<()> {
-    if request.token == 0 || request.generation == 0 { return Err(Error::Invalid); }
+    if request.token == 0 || request.generation == 0 {
+        return Err(Error::Invalid);
+    }
     out.extend_from_slice(&[tag, VERSION]);
     put_u64(out, request.token);
     put_u64(out, request.generation);
@@ -241,10 +257,17 @@ fn put_body_control(out: &mut Vec<u8>, tag: u8, request: BodyRequest) -> Result<
 fn read_body_control(r: &mut Reader<'_>, tag: u8) -> Result<BodyRequest> {
     r.prefix(tag)?;
     let request = BodyRequest {
-        token: r.u64()?, generation: r.u64()?,
-        key: BodyKey { config: r.array()?, height: r.u64()?, id: r.array()? },
+        token: r.u64()?,
+        generation: r.u64()?,
+        key: BodyKey {
+            config: r.array()?,
+            height: r.u64()?,
+            id: r.array()?,
+        },
     };
-    if request.token == 0 || request.generation == 0 { return Err(Error::Invalid); }
+    if request.token == 0 || request.generation == 0 {
+        return Err(Error::Invalid);
+    }
     Ok(request)
 }
 pub fn encode_body_request(request: BodyRequest) -> Result<Vec<u8>> {
@@ -258,7 +281,9 @@ pub fn encode_body_ack(request: BodyRequest) -> Result<Vec<u8>> {
     Ok(out)
 }
 fn decode_body_control(bytes: &[u8], tag: u8) -> Result<BodyRequest> {
-    if bytes.len() != BODY_CONTROL_BYTES { return Err(Error::Invalid); }
+    if bytes.len() != BODY_CONTROL_BYTES {
+        return Err(Error::Invalid);
+    }
     let mut r = Reader::new(bytes);
     let request = read_body_control(&mut r, tag)?;
     r.finish()?;
@@ -271,8 +296,12 @@ pub fn decode_body_ack(bytes: &[u8]) -> Result<BodyRequest> {
     decode_body_control(bytes, BODY_ACK_TAG)
 }
 pub fn encode_body_response(request: BodyRequest, body: &[u8], limits: Limits) -> Result<Vec<u8>> {
-    if body.len() > limits.max_body { return Err(Error::Invalid); }
-    let size = BODY_RESPONSE_OVERHEAD.checked_add(body.len()).ok_or(Error::Exhausted)?;
+    if body.len() > limits.max_body {
+        return Err(Error::Invalid);
+    }
+    let size = BODY_RESPONSE_OVERHEAD
+        .checked_add(body.len())
+        .ok_or(Error::Exhausted)?;
     check_capacity::<u8>(size)?;
     let mut out = reserved(size)?;
     put_body_control(&mut out, BODY_RESPONSE_TAG, request)?;
@@ -282,8 +311,12 @@ pub fn encode_body_response(request: BodyRequest, body: &[u8], limits: Limits) -
 }
 /// No allocation: validate all length arithmetic and reject trailing data first.
 pub fn decode_body_response(bytes: &[u8], limits: Limits) -> Result<(BodyRequest, &[u8])> {
-    let max = BODY_RESPONSE_OVERHEAD.checked_add(limits.max_body).ok_or(Error::Exhausted)?;
-    if bytes.len() > max { return Err(Error::Invalid); }
+    let max = BODY_RESPONSE_OVERHEAD
+        .checked_add(limits.max_body)
+        .ok_or(Error::Exhausted)?;
+    if bytes.len() > max {
+        return Err(Error::Invalid);
+    }
     let mut r = Reader::new(bytes);
     let request = read_body_control(&mut r, BODY_RESPONSE_TAG)?;
     let len = r.count(limits.max_body)?;
@@ -325,13 +358,19 @@ pub fn encode_frame(frame: Frame<'_>, request: Option<u64>, limits: Limits) -> R
 /// Same exact signed header and evidence, with only the body bytes omitted.
 /// The declared length is an untrusted bounded hint, never a signed commitment.
 pub fn encode_outlined(
-    frame: Frame<'_>, request: Option<u64>, config: Id, limits: Limits,
+    frame: Frame<'_>,
+    request: Option<u64>,
+    config: Id,
+    limits: Limits,
 ) -> Result<Vec<u8>> {
     encode_evidence(frame, request, limits, Some(config))
 }
 
 fn encode_evidence(
-    frame: Frame<'_>, request: Option<u64>, limits: Limits, config: Option<Id>,
+    frame: Frame<'_>,
+    request: Option<u64>,
+    limits: Limits,
+    config: Option<Id>,
 ) -> Result<Vec<u8>> {
     let mut size = encoded_size(frame, limits)?;
     if config.is_some() {
@@ -339,8 +378,17 @@ fn encode_evidence(
         add_size(&mut size, 32)?;
     }
     let mut out = reserved(size)?;
-    out.extend_from_slice(&[if config.is_some() { OUTLINED_TAG } else { FRAME_TAG }, VERSION]);
-    if let Some(config) = config { out.extend_from_slice(&config); }
+    out.extend_from_slice(&[
+        if config.is_some() {
+            OUTLINED_TAG
+        } else {
+            FRAME_TAG
+        },
+        VERSION,
+    ]);
+    if let Some(config) = config {
+        out.extend_from_slice(&config);
+    }
     put_option_u64(&mut out, request);
     out.push(match frame.message {
         Message::Ordinary => 0,
@@ -354,7 +402,9 @@ fn encode_evidence(
     if let Some(p) = frame.proposal {
         put_header(&mut out, p.header);
         put_u64(&mut out, p.body.len() as u64);
-        if config.is_none() { out.extend_from_slice(p.body); }
+        if config.is_none() {
+            out.extend_from_slice(p.body);
+        }
     }
     put_u64(&mut out, frame.groups.len() as u64);
     for group in frame.groups {
@@ -455,8 +505,14 @@ struct Parsed<'a> {
 }
 
 fn preflight(bytes: &[u8], limits: Limits, outlined: bool) -> Result<Parsed<'_>> {
-    let max = if outlined { limits.max_outlined_bytes()? } else { limits.max_frame_bytes()? };
-    if bytes.len() > max { return Err(Error::Invalid); }
+    let max = if outlined {
+        limits.max_outlined_bytes()?
+    } else {
+        limits.max_frame_bytes()?
+    };
+    if bytes.len() > max {
+        return Err(Error::Invalid);
+    }
     let max_positions = limits.max_positions()?;
     let mut r = Reader::new(bytes);
     r.prefix(if outlined { OUTLINED_TAG } else { FRAME_TAG })?;
@@ -703,29 +759,57 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod payload_tests {
     use super::*;
-    const LIMITS: Limits = Limits { max_members: 2, max_body: 4096 };
+    const LIMITS: Limits = Limits {
+        max_members: 2,
+        max_body: 4096,
+    };
     fn request() -> BodyRequest {
-        BodyRequest { token: 7, generation: 9, key: BodyKey {
-            config: [1; 32], height: 3, id: [2; 32],
-        }}
+        BodyRequest {
+            token: 7,
+            generation: 9,
+            key: BodyKey {
+                config: [1; 32],
+                height: 3,
+                id: [2; 32],
+            },
+        }
     }
     #[test]
     fn outlined_preserves_exact_header_and_metadata_without_body() {
         let body = vec![77; 4096];
-        let header = Header { content: ProposalContent {
-            height: 3, round: 5, valid_round: Some(2), id: [3; 32], signer: 1,
-        }, signature: [4; 64] };
-        let frame = Frame { message: Message::Dec, outer: None,
-            proposal: Some(Proposal { header: &header, body: &body }), groups: &[] };
+        let header = Header {
+            content: ProposalContent {
+                height: 3,
+                round: 5,
+                valid_round: Some(2),
+                id: [3; 32],
+                signer: 1,
+            },
+            signature: [4; 64],
+        };
+        let frame = Frame {
+            message: Message::Dec,
+            outer: None,
+            proposal: Some(Proposal {
+                header: &header,
+                body: &body,
+            }),
+            groups: &[],
+        };
         let inline = encode_frame(frame, Some(4), LIMITS).unwrap();
         let bytes = encode_outlined(frame, Some(4), [1; 32], LIMITS).unwrap();
         assert_eq!(bytes.len() + body.len(), inline.len() + 32);
         let decoded = decode_outlined(&bytes, LIMITS).unwrap();
         assert_eq!(decoded.header(), Some(&header));
         assert_eq!(decoded.body_len, Some(body.len()));
-        decoded.with_body(&body, |f| assert_eq!(encode_frame(f, Some(4), LIMITS).unwrap(), inline));
-        for end in 0..bytes.len() { assert!(decode_outlined(&bytes[..end], LIMITS).is_err()); }
-        let mut extra = bytes.clone(); extra.push(0);
+        decoded.with_body(&body, |f| {
+            assert_eq!(encode_frame(f, Some(4), LIMITS).unwrap(), inline)
+        });
+        for end in 0..bytes.len() {
+            assert!(decode_outlined(&bytes[..end], LIMITS).is_err());
+        }
+        let mut extra = bytes.clone();
+        extra.push(0);
         assert!(decode_outlined(&extra, LIMITS).is_err());
         let mut oversized = bytes;
         // No outer vote: header starts at 46, then its body-length hint.
@@ -738,14 +822,21 @@ mod payload_tests {
         let bytes = encode_body_request(req).unwrap();
         assert_eq!(bytes.len(), BODY_CONTROL_BYTES);
         assert_eq!(decode_body_request(&bytes).unwrap(), req);
-        assert_eq!(decode_body_ack(&encode_body_ack(req).unwrap()).unwrap(), req);
+        assert_eq!(
+            decode_body_ack(&encode_body_ack(req).unwrap()).unwrap(),
+            req
+        );
         let body = vec![8; LIMITS.max_body];
         let bytes = encode_body_response(req, &body, LIMITS).unwrap();
         let (parsed, borrowed) = decode_body_response(&bytes, LIMITS).unwrap();
-        assert_eq!(parsed, req); assert_eq!(borrowed, body);
+        assert_eq!(parsed, req);
+        assert_eq!(borrowed, body);
         assert_eq!(borrowed.as_ptr(), bytes[BODY_RESPONSE_OVERHEAD..].as_ptr());
-        for end in 0..bytes.len() { assert!(decode_body_response(&bytes[..end], LIMITS).is_err()); }
-        let mut extra = bytes; extra.push(0);
+        for end in 0..bytes.len() {
+            assert!(decode_body_response(&bytes[..end], LIMITS).is_err());
+        }
+        let mut extra = bytes;
+        extra.push(0);
         assert!(decode_body_response(&extra, LIMITS).is_err());
         assert!(encode_body_response(req, &vec![8; LIMITS.max_body + 1], LIMITS).is_err());
         assert!(encode_body_request(BodyRequest { token: 0, ..req }).is_err());
