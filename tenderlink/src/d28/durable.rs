@@ -1,11 +1,12 @@
 //! Bounded durable D28 workspace over one [`AtomicBlockStore`] image.
 //!
-//! Each successful `Storage` mutation commits the entire image before returning.
-//! This deliberately favors the existing publication contract over write efficiency:
-//! even an unreferenced certificate row is durable, not an acknowledged RAM write.
-//! An unsuccessful replacement poisons this adapter. Drop the engine, recover its
-//! backend with `into_backend`, reopen, and use `Engine::recover_with_emission`.
-//! Never continue from the possibly newer working copy after a replacement error.
+//! `open` preserves eager durability: every successful mutation commits the image.
+//! `open_buffered` explicitly stages mutations in the same bounded working copy;
+//! only `flush` / `flush_publication` commit it. The engine fences signing and
+//! publication, while elapsed countdown/grid progress can wait for a checkpoint.
+//! No I/O happens on drop. A mutation, encoding or replacement failure poisons
+//! the adapter. Drop the engine, recover its backend with `into_backend`, reopen,
+//! and use `Engine::recover_with_emission`. Never resume the newer working copy.
 //!
 //! The codec is independent of Rust layout. There are two configuration banks,
 //! three bodies, four certificate regions, and constant-sized signing/publication
@@ -61,6 +62,9 @@ pub struct DurableStore<B: AtomicBlockStore> {
     limits: Limits,
     memory: MemoryStore,
     image: Vec<u8>,
+    buffered: bool,
+    dirty: bool,
+    publication_dirty: bool,
     poisoned: bool,
 }
 
@@ -68,7 +72,21 @@ impl<B: AtomicBlockStore> DurableStore<B> {
     /// Load a complete committed image, or attach genuinely uninitialized storage.
     /// Bad size, version, padding, lengths, checksum or records fail closed. A
     /// corrupt image is never interpreted as permission to bootstrap fresh keys.
-    pub fn open(mut backend: B, limits: Limits) -> Result<Self> {
+    /// Every successful mutation is durable before returning (the eager API).
+    pub fn open(backend: B, limits: Limits) -> Result<Self> {
+        Self::open_mode(backend, limits, false)
+    }
+
+    /// Explicit staged-write API, using the same image and bounded workspace as
+    /// `open`. Successful mutations change the working copy; only barriers make
+    /// them durable. Use with `Engine`, which fences signing/publication, and
+    /// periodically call `Engine::checkpoint` to bound lost countdown progress.
+    /// Dropping the store or taking its backend discards unflushed changes.
+    pub fn open_buffered(backend: B, limits: Limits) -> Result<Self> {
+        Self::open_mode(backend, limits, true)
+    }
+
+    fn open_mode(mut backend: B, limits: Limits, buffered: bool) -> Result<Self> {
         let size = image_size(limits)?;
         if backend.block_size() != size {
             return Err(Error::Config);
@@ -85,6 +103,9 @@ impl<B: AtomicBlockStore> DurableStore<B> {
             limits,
             memory,
             image,
+            buffered,
+            dirty: false,
+            publication_dirty: false,
             poisoned: false,
         })
     }
@@ -97,7 +118,8 @@ impl<B: AtomicBlockStore> DurableStore<B> {
         self.poisoned
     }
 
-    /// Discard every cached byte and return the backend for a fresh load.
+    /// Discard every cached byte, including unflushed writes, and return the
+    /// backend for a fresh load. This never performs I/O.
     pub fn into_backend(self) -> B {
         self.backend
     }
@@ -110,21 +132,34 @@ impl<B: AtomicBlockStore> DurableStore<B> {
         }
     }
 
-    fn update(&mut self, mutate: impl FnOnce(&mut MemoryStore) -> Result<()>) -> Result<()> {
-        self.ready()?;
-        // MemoryStore's counter/fault injector belongs to the reference tests,
-        // not to durable state, and must not grow over this store's lifetime.
-        self.memory.writes = 0;
-        let result = mutate(&mut self.memory)
-            .and_then(|()| encode(&self.memory, self.limits, &mut self.image))
-            .and_then(|()| self.backend.replace(&self.image));
-        self.memory.writes = 0;
+    fn mutation_result(&mut self, result: Result<()>) -> Result<()> {
         if result.is_err() {
             self.poisoned = true;
-            // A backend may report any Error variant. Normalize it so the core
-            // always deactivates before another callback or signing operation.
-            return Err(Error::Storage);
+            // Even an applied-then-error replacement, or a non-Storage backend
+            // error, must deactivate the core before any further sign/callback.
+            Err(Error::Storage)
+        } else {
+            Ok(())
         }
+    }
+
+    fn update(&mut self, mutate: impl FnOnce(&mut MemoryStore) -> Result<()>) -> Result<()> {
+        self.stage(mutate)?;
+        self.publication_dirty = true;
+        if !self.buffered {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn stage(&mut self, mutate: impl FnOnce(&mut MemoryStore) -> Result<()>) -> Result<()> {
+        self.ready()?;
+        // The reference fault counter is not durable state and must not grow.
+        self.memory.writes = 0;
+        let result = mutate(&mut self.memory);
+        self.memory.writes = 0;
+        self.mutation_result(result)?;
+        self.dirty = true;
         Ok(())
     }
 
@@ -139,6 +174,53 @@ impl<B: AtomicBlockStore> DurableStore<B> {
 }
 
 impl<B: AtomicBlockStore> Storage for DurableStore<B> {
+    fn flush(&mut self) -> Result<()> {
+        self.ready()?;
+        if self.dirty {
+            let result = encode(&self.memory, self.limits, &mut self.image)
+                .and_then(|()| self.backend.replace(&self.image));
+            self.mutation_result(result)?;
+            self.dirty = false;
+            self.publication_dirty = false;
+        }
+        Ok(())
+    }
+    fn flush_publication(&mut self) -> Result<()> {
+        self.ready()?;
+        if self.publication_dirty {
+            self.flush()?;
+        }
+        Ok(())
+    }
+    fn write_progress_descriptor(&mut self, d: &Descriptor) -> Result<()> {
+        if !self.buffered {
+            return self.write_descriptor(d);
+        }
+        self.ready()?;
+        // Normalize only explicitly permitted fields, then compare the complete
+        // descriptor. New safety/authority fields are therefore denied by default.
+        let valid = self.memory.descriptor().is_some_and(|old| {
+            let mut normalized = d.clone();
+            let countdowns = d.height_remaining <= old.height_remaining
+                && d.timers.iter().zip(old.timers).all(|(new, old)| {
+                    new.remaining <= old.remaining && (old.active || new.remaining == old.remaining)
+                });
+            normalized.height_remaining = old.height_remaining;
+            for (new, old) in normalized.timers.iter_mut().zip(old.timers) {
+                new.remaining = old.remaining;
+            }
+            normalized.grid_remaining = old.grid_remaining;
+            countdowns
+                && self.config().is_some_and(|c| d.grid_remaining <= c.rho)
+                && normalized == *old
+        });
+        if !valid {
+            return self.mutation_result(Err(Error::Corrupt));
+        }
+        // Do not clear publication_dirty: earlier staged safety changes still
+        // require a publication fence even if followed by countdown progress.
+        self.stage(|m| m.write_descriptor(d))
+    }
     fn config(&self) -> Option<&Config> {
         self.memory.config()
     }
@@ -218,6 +300,11 @@ impl<B: AtomicBlockStore> Storage for DurableStore<B> {
         self.ready()?;
         if !(0..2).any(|bank| self.config_bank_hash(bank) == Some(d.config)) {
             return Err(Error::Corrupt);
+        }
+        // A repeated validity callback must not turn countdown-only dirt into
+        // publication dirt. Preserve every earlier dirty bit on this no-op.
+        if self.buffered && self.memory.descriptor() == Some(d) {
+            return Ok(());
         }
         self.update(|m| m.write_descriptor(d))
     }
@@ -1165,5 +1252,192 @@ mod tests {
             assert_original_image(&populated(limits), limits, &mut image),
             full_end
         );
+    }
+
+    struct Block {
+        image: Vec<u8>,
+        replacements: usize,
+        fail: Option<bool>,
+    }
+    impl AtomicBlockStore for Block {
+        fn block_size(&self) -> usize {
+            self.image.len()
+        }
+        fn load(&mut self, block: &mut [u8]) -> Result<bool> {
+            block.copy_from_slice(&self.image);
+            Ok(true)
+        }
+        fn replace(&mut self, next: &[u8]) -> Result<()> {
+            self.replacements += 1;
+            if self.fail != Some(false) {
+                self.image.copy_from_slice(next);
+            }
+            if self.fail.is_some() {
+                Err(Error::Invalid)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    fn buffered() -> DurableStore<Block> {
+        let limits = Limits {
+            max_members: 4,
+            max_body: 128,
+        };
+        let mut m = populated(limits);
+        m.descriptor.as_mut().unwrap().grid_remaining = 10;
+        let mut image = vec![0; image_size(limits).unwrap()];
+        encode(&m, limits, &mut image).unwrap();
+        DurableStore::open_buffered(
+            Block {
+                image,
+                replacements: 0,
+                fail: None,
+            },
+            limits,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn buffered_batches_mutations_and_drops_without_io() {
+        let mut store = buffered();
+        let old = store.backend.image.clone();
+        store.write_body(0, b"new body").unwrap();
+        store.write_body(1, b"another body").unwrap();
+        assert_eq!(store.backend.replacements, 0);
+        assert_eq!(store.body(0), b"new body");
+        assert_eq!(store.backend.image, old);
+        store.flush_publication().unwrap();
+        assert_eq!(store.backend.replacements, 1);
+        assert_eq!(
+            decode(&store.backend.image, store.limits).unwrap().body(0),
+            b"new body"
+        );
+        store.flush().unwrap();
+        store.flush_publication().unwrap();
+        assert_eq!(store.backend.replacements, 1);
+        let committed = store.backend.image.clone();
+        store.write_body(0, b"discard me").unwrap();
+        let block = store.into_backend();
+        assert_eq!(block.replacements, 1);
+        assert_eq!(block.image, committed);
+    }
+
+    #[test]
+    fn buffered_progress_needs_full_checkpoint_and_never_clears_publication_dirty() {
+        let mut store = buffered();
+        let old = store.backend.image.clone();
+        let mut d = store.descriptor().unwrap().clone();
+        store.write_descriptor(&d).unwrap();
+        store.flush().unwrap();
+        assert_eq!(store.backend.replacements, 0);
+        d.height_remaining -= 1;
+        d.timers[0].remaining -= 1;
+        d.grid_remaining = 0;
+        store.write_progress_descriptor(&d).unwrap();
+        d.grid_remaining = 10;
+        store.write_progress_descriptor(&d).unwrap();
+        store.write_descriptor(&d).unwrap();
+        store.flush_publication().unwrap();
+        assert_eq!(store.backend.image, old);
+        assert_eq!(store.backend.replacements, 0);
+        store.flush().unwrap();
+        assert_eq!(store.backend.replacements, 1);
+        assert_eq!(
+            decode(&store.backend.image, store.limits)
+                .unwrap()
+                .descriptor(),
+            Some(&d)
+        );
+        store.write_body(0, b"publication").unwrap();
+        d.timers[0].remaining -= 1;
+        store.write_progress_descriptor(&d).unwrap();
+        store.write_descriptor(&d).unwrap();
+        store.flush_publication().unwrap();
+        assert_eq!(store.backend.replacements, 2);
+        assert!(!store.dirty);
+        assert!(!store.publication_dirty);
+    }
+
+    #[test]
+    fn buffered_progress_rejects_authority_and_countdown_changes() {
+        let changes: &[fn(&mut Descriptor)] = &[
+            |d| d.config[0] ^= 1,
+            |d| d.height += 1,
+            |d| d.round += 1,
+            |d| d.step = Step::Decided,
+            |d| d.locked_id = Some([88; 32]),
+            |d| d.locked_round = None,
+            |d| d.valid_round = None,
+            |d| d.slot = None,
+            |d| d.justified = false,
+            |d| d.vc = None,
+            |d| d.entry = None,
+            |d| d.pending = None,
+            |d| d.statuses[0] = Status::Valid,
+            |d| d.body_generations[0] += 1,
+            |d| d.next_generation += 1,
+            |d| d.timers[0].active = false,
+            |d| d.timers[0].height += 1,
+            |d| d.timers[0].round += 1,
+            |d| d.timers[0].remaining += 1,
+            |d| d.timers[1].remaining -= 1,
+            |d| d.height_remaining += 1,
+            |d| d.grid_remaining = 11,
+            |d| d.intents[0] = None,
+            |d| d.proposal_intent = None,
+            |d| d.proposal_published = false,
+        ];
+        for change in changes {
+            let mut store = buffered();
+            let mut d = store.descriptor().unwrap().clone();
+            change(&mut d);
+            assert_eq!(store.write_progress_descriptor(&d), Err(Error::Storage));
+            assert!(store.is_poisoned());
+            assert_eq!(store.flush(), Err(Error::Storage));
+            assert_eq!(store.flush_publication(), Err(Error::Storage));
+            assert_eq!(store.backend.replacements, 0);
+        }
+    }
+
+    #[test]
+    fn buffered_mutation_encode_and_ambiguous_replace_errors_poison() {
+        let mut store = buffered();
+        assert_eq!(store.update(|_| Err(Error::Invalid)), Err(Error::Storage));
+        assert!(store.is_poisoned());
+        assert_eq!(store.flush_publication(), Err(Error::Storage));
+
+        let mut store = buffered();
+        store
+            .update(|m| {
+                m.bodies[0].resize(129, 0);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.flush(), Err(Error::Storage));
+        assert!(store.is_poisoned());
+        assert_eq!(store.backend.replacements, 0);
+
+        for applied in [false, true] {
+            let mut store = buffered();
+            let old = store.backend.image.clone();
+            store.write_body(0, b"ambiguous").unwrap();
+            store.backend.fail = Some(applied);
+            assert_eq!(store.flush_publication(), Err(Error::Storage));
+            assert!(store.is_poisoned());
+            assert_eq!(store.write_body(0, b"retry"), Err(Error::Storage));
+            assert_eq!(store.flush(), Err(Error::Storage));
+            assert_eq!(store.backend.replacements, 1);
+            assert_eq!(store.backend.image != old, applied);
+            let limits = store.limits;
+            let reopened = DurableStore::open_buffered(store.into_backend(), limits).unwrap();
+            assert!(!reopened.is_poisoned());
+            if applied {
+                assert_eq!(reopened.body(0), b"ambiguous");
+            } else {
+                assert_eq!(reopened.image, old);
+            }
+        }
     }
 }

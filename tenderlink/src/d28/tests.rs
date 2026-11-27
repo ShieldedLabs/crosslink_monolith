@@ -98,6 +98,120 @@ fn ordinary<'a>(
     }
 }
 #[test]
+fn checked_receive_uses_only_token_bytes_and_preserves_indeterminate_validity() {
+    let c = config([1; 4]);
+    let bytes = b"checked immutable body";
+    let h = header(&c, 0, None, bytes);
+    let checked = checked_body::CheckedBody::new(&c, 4, h.content.id, bytes.to_vec()).unwrap();
+    let (mut cached, mut out) = engine(&c, 1, 4, 0);
+    let (mut ordinary_engine, mut ordinary_out) = engine(&c, 1, 4, 0);
+    let incoming = ordinary(
+        None,
+        Some(Proposal {
+            header: &h,
+            body: b"unrelated slice",
+        }),
+        &[],
+    );
+    cached
+        .receive_checked_body(incoming, &checked, &mut out)
+        .unwrap();
+    ordinary_engine
+        .receive(
+            ordinary(
+                None,
+                Some(Proposal {
+                    header: &h,
+                    body: bytes,
+                }),
+                &[],
+            ),
+            Status::Indeterminate,
+            &mut ordinary_out,
+        )
+        .unwrap();
+    assert_eq!(cached.view(), ordinary_engine.view());
+    let slot = cached.view().unwrap().slot.unwrap();
+    assert_eq!(cached.storage().body(slot.index), bytes);
+    assert_eq!(
+        cached.view().unwrap().statuses[slot.index],
+        Status::Indeterminate
+    );
+    assert!(cached.storage().own(VoteKind::Prevote).is_none());
+    // Public receive still hashes the actual borrowed bytes, not a prior token.
+    assert_eq!(
+        cached.receive(incoming, Status::Valid, &mut out),
+        Err(Error::Invalid)
+    );
+}
+
+#[test]
+fn checked_receive_rechecks_scope_header_and_required_proposal() {
+    let c = config([1; 4]);
+    let bytes = b"checked immutable body";
+    let h = header(&c, 0, None, bytes);
+    let other = Config::new([43; 32], c.members().to_vec(), 1024, 10, c.timeouts()).unwrap();
+    let wrong = [
+        checked_body::CheckedBody::new(&c, 5, h.content.id, bytes.to_vec()).unwrap(),
+        checked_body::CheckedBody::new(&other, 4, h.content.id, bytes.to_vec()).unwrap(),
+        checked_body::CheckedBody::new(&c, 4, body_id(b"other"), b"other".to_vec()).unwrap(),
+    ];
+    let (mut e, mut out) = engine(&c, 1, 4, 0);
+    let before = e.view().unwrap().clone();
+    for checked in wrong {
+        assert_eq!(
+            e.receive_checked_body(
+                ordinary(
+                    None,
+                    Some(Proposal {
+                        header: &h,
+                        body: bytes
+                    }),
+                    &[]
+                ),
+                &checked,
+                &mut out
+            ),
+            Err(Error::Invalid)
+        );
+        assert_eq!(e.view(), Some(&before));
+        assert!(e.rx_positions.is_empty());
+    }
+    let checked = checked_body::CheckedBody::new(&c, 4, h.content.id, bytes.to_vec()).unwrap();
+    let mut bad_header = h;
+    bad_header.signature[0] ^= 1;
+    assert_eq!(
+        e.receive_checked_body(
+            ordinary(
+                None,
+                Some(Proposal {
+                    header: &bad_header,
+                    body: bytes
+                }),
+                &[]
+            ),
+            &checked,
+            &mut out
+        ),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        e.receive_checked_body(ordinary(None, None, &[]), &checked, &mut out),
+        Err(Error::Invalid)
+    );
+    assert_eq!(e.view(), Some(&before));
+    e.active = false;
+    assert_eq!(e.status(), None);
+    assert_eq!(e.view(), Some(&before));
+    assert_eq!(e.checkpoint(), Err(Error::Inactive));
+    assert_eq!(e.publication_checkpoint(), Err(Error::Inactive));
+    assert_eq!(
+        e.receive_checked_body(ordinary(None, None, &[]), &checked, &mut out),
+        Err(Error::Inactive)
+    );
+}
+
+#[test]
 fn strict_weight_boundaries() {
     let c = config([1, 1, 1, 3]);
     assert!(!c.quorum(4));

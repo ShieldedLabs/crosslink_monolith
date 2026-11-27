@@ -618,7 +618,7 @@ impl RequesterModel {
 
 #[test]
 fn seeded_responder_model_retains_terminal_tokens_and_physical_ownership() {
-    let engine = proposal_source();
+    let mut engine = proposal_source();
     let caught_up = engine.status().unwrap();
     let lag = StatusSnapshot {
         proposal: None,
@@ -752,7 +752,7 @@ fn seeded_responder_model_retains_terminal_tokens_and_physical_ownership() {
             for p in model.values_mut() {
                 p.expire(now);
             }
-            let sent = responder.poll(&engine, now, &mut sink).unwrap();
+            let sent = responder.poll(&mut engine, now, &mut sink).unwrap();
             assert!(sink.called.len() <= cfg.max_outgoing);
             let mut offered_this_poll = BTreeSet::new();
             for &key in &sink.called {

@@ -105,9 +105,11 @@ enum Plan {
     Prevote,
 }
 impl<S: Storage> Engine<S> {
-    /// The status to advertise to peers (None before init / after sealing).
+    /// The status to advertise to peers (None before init or after failure).
+    /// Buffered hosts must fence publication before advertising this snapshot;
+    /// `view` remains available for inspecting an inactive engine's working copy.
     pub fn status(&self) -> Option<StatusSnapshot> {
-        let d = self.view()?;
+        let d = self.view().filter(|_| self.active)?;
         let polka = match (d.valid_round, d.vc) {
             (Some(r), Some(vc)) => Some((r, self.proposal(vc.proposal).header.content.id)),
             _ => None,
@@ -281,7 +283,16 @@ impl<S: Storage> Engine<S> {
     /// peer's reported status. The status is only a hint; nothing is marked
     /// delivered or convincing.
     pub fn serve(
-        &self,
+        &mut self,
+        peer: u32,
+        status: &StatusSnapshot,
+        sink: &mut impl Sink,
+    ) -> Result<Served> {
+        let r = self.serve_inner(peer, status, sink);
+        self.finish(r)
+    }
+    fn serve_inner(
+        &mut self,
         peer: u32,
         status: &StatusSnapshot,
         sink: &mut impl Sink,
@@ -291,6 +302,7 @@ impl<S: Storage> Engine<S> {
             Ok(x) => x,
             Err(s) => return Ok(Served::Skipped(s)),
         };
+        self.publication_checkpoint()?;
         let t = Target::Peer(peer);
         match plan {
             Plan::Dec => {
@@ -306,9 +318,9 @@ impl<S: Storage> Engine<S> {
                     },
                 );
             }
-            Plan::Enter => self.emit_vote_complete(VoteKind::Enter, t, sink),
-            Plan::Precommit => self.emit_vote_complete(VoteKind::Precommit, t, sink),
-            Plan::Prevote => self.emit_vote_complete(VoteKind::Prevote, t, sink),
+            Plan::Enter => self.emit_vote_complete(VoteKind::Enter, t, sink)?,
+            Plan::Precommit => self.emit_vote_complete(VoteKind::Precommit, t, sink)?,
+            Plan::Prevote => self.emit_vote_complete(VoteKind::Prevote, t, sink)?,
             Plan::Polka => {
                 let vc = self.d().vc.ok_or(Error::Corrupt)?;
                 let mut p = self.proposal(vc.proposal);
@@ -487,7 +499,7 @@ impl Director {
     /// (at most K).
     pub fn poll<S: Storage>(
         &mut self,
-        engine: &Engine<S>,
+        engine: &mut Engine<S>,
         now: u64,
         sink: &mut impl Sink,
     ) -> Result<Vec<(u32, Gap)>> {

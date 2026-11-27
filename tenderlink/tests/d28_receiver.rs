@@ -179,7 +179,7 @@ fn update(peer: u32, generation: u64, sequence: u64, status: StatusSnapshot) -> 
 #[test]
 fn complete_evidence_still_needs_core_validation_and_external_validity() {
     let c = config();
-    let (source, mut sent) = decided(&c, 0);
+    let (mut source, mut sent) = decided(&c, 0);
     let (receiver, _) = engine(&c, 3);
     assert_eq!(
         source
@@ -319,7 +319,7 @@ impl ReplySink for Replies {
 #[test]
 fn older_closed_origin_cannot_reopen_a_newer_already_offered_request() {
     let c = config();
-    let (source, _) = decided(&c, 0);
+    let (mut source, _) = decided(&c, 0);
     let (receiver, _) = engine(&c, 3);
     let status = receiver.status().unwrap();
     let mut responder = Responder::try_new(sender_config(2, 1)).unwrap();
@@ -332,7 +332,7 @@ fn older_closed_origin_cannot_reopen_a_newer_already_offered_request() {
 
     put(&mut responder, 10, None, 0);
     put(&mut responder, 20, Some(20), 0);
-    let offered = responder.poll(&source, 0, &mut replies).unwrap();
+    let offered = responder.poll(&mut source, 0, &mut replies).unwrap();
     assert_eq!(offered.len(), 1);
     assert_eq!(offered[0].0.sequence, 20);
     assert_eq!(replies.calls.len(), 1);
@@ -348,17 +348,27 @@ fn older_closed_origin_cannot_reopen_a_newer_already_offered_request() {
         "cancellation is not TX retirement"
     );
     put(&mut responder, 22, Some(20), 2);
-    assert!(responder.poll(&source, 2, &mut replies).unwrap().is_empty());
+    assert!(
+        responder
+            .poll(&mut source, 2, &mut replies)
+            .unwrap()
+            .is_empty()
+    );
     replies.owned.clear();
     assert_eq!(responder.outstanding(), 0);
     // Remove the capacity obstruction: a duplicate must still not be offered.
     put(&mut responder, 23, Some(20), 3);
-    assert!(responder.poll(&source, 3, &mut replies).unwrap().is_empty());
+    assert!(
+        responder
+            .poll(&mut source, 3, &mut replies)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(replies.calls.len(), 1, "token 20 was offered twice");
     assert_eq!(responder.active_requests(), 0);
 
     put(&mut responder, 24, Some(24), 4);
-    let fresh = responder.poll(&source, 4, &mut replies).unwrap();
+    let fresh = responder.poll(&mut source, 4, &mut replies).unwrap();
     assert_eq!(fresh.len(), 1);
     assert_eq!(fresh[0].0.sequence, 24);
     assert_eq!(replies.calls.len(), 2);
@@ -367,7 +377,7 @@ fn older_closed_origin_cannot_reopen_a_newer_already_offered_request() {
 #[test]
 fn many_holders_send_only_to_fixed_receiver_nominations() {
     let c = config();
-    let (source, _) = decided(&c, 0);
+    let (mut source, _) = decided(&c, 0);
     let (receiver, _) = engine(&c, 3);
     let local = receiver.status().unwrap();
     for k in [1, 2] {
@@ -392,7 +402,7 @@ fn many_holders_send_only_to_fixed_receiver_nominations() {
             sender
                 .update(request_status(peer(3), 1, 1, request, local), 0)
                 .unwrap();
-            let sent = sender.poll(&source, 0, &mut replies).unwrap();
+            let sent = sender.poll(&mut source, 0, &mut replies).unwrap();
             assert_eq!(sent.len(), usize::from(request.is_some()));
             assert_eq!(sender.outstanding(), usize::from(request.is_some()));
         }
@@ -464,7 +474,7 @@ fn receiver_heartbeats_keep_origin_and_deadline_with_backwards_clock() {
 #[test]
 fn responder_heartbeats_use_latest_status_without_reset_or_duplicate_offer() {
     let c = config();
-    let (source, _) = decided(&c, 0);
+    let (mut source, _) = decided(&c, 0);
     let (receiver, _) = engine(&c, 3);
     let local = receiver.status().unwrap();
     let mut sender = Responder::try_new(sender_config(1, 1)).unwrap();
@@ -476,26 +486,41 @@ fn responder_heartbeats_use_latest_status_without_reset_or_duplicate_offer() {
             0,
         )
         .unwrap();
-    assert!(sender.poll(&source, 0, &mut replies).unwrap().is_empty());
+    assert!(
+        sender
+            .poll(&mut source, 0, &mut replies)
+            .unwrap()
+            .is_empty()
+    );
     // Same origin, but a newer semantic snapshot exposes the real gap.
     sender
         .update(request_status(peer(3), 1, 11, Some(10), local), 1)
         .unwrap();
-    assert_eq!(sender.poll(&source, 1, &mut replies).unwrap().len(), 1);
+    assert_eq!(sender.poll(&mut source, 1, &mut replies).unwrap().len(), 1);
     assert_eq!(replies.owned[0].key.sequence, 10);
     replies.owned.clear();
     for sequence in 12..20 {
         sender
             .update(request_status(peer(3), 1, sequence, Some(10), local), 9)
             .unwrap();
-        assert!(sender.poll(&source, 9, &mut replies).unwrap().is_empty());
+        assert!(
+            sender
+                .poll(&mut source, 9, &mut replies)
+                .unwrap()
+                .is_empty()
+        );
     }
     assert_eq!(
         replies.calls.len(),
         1,
         "same-token heartbeat is not another offer"
     );
-    assert!(sender.poll(&source, 10, &mut replies).unwrap().is_empty());
+    assert!(
+        sender
+            .poll(&mut source, 10, &mut replies)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         sender.active_requests(),
         0,
@@ -504,11 +529,16 @@ fn responder_heartbeats_use_latest_status_without_reset_or_duplicate_offer() {
     sender
         .update(request_status(peer(3), 1, 20, Some(10), local), 10)
         .unwrap();
-    assert!(sender.poll(&source, 10, &mut replies).unwrap().is_empty());
+    assert!(
+        sender
+            .poll(&mut source, 10, &mut replies)
+            .unwrap()
+            .is_empty()
+    );
     sender
         .update(request_status(peer(3), 1, 21, Some(21), local), 10)
         .unwrap();
-    assert_eq!(sender.poll(&source, 10, &mut replies).unwrap().len(), 1);
+    assert_eq!(sender.poll(&mut source, 10, &mut replies).unwrap().len(), 1);
     assert_eq!(
         replies.owned[0].key.sequence, 21,
         "loss requires a fresh attempt"
@@ -612,7 +642,7 @@ fn cancelled_receive_ownership_survives_reconnect_and_late_evidence_is_admissibl
 #[test]
 fn cancelled_transmit_ownership_blocks_refill_across_fresh_generation() {
     let c = config();
-    let (source, _) = decided(&c, 0);
+    let (mut source, _) = decided(&c, 0);
     let (receiver, _) = engine(&c, 3);
     let local = receiver.status().unwrap();
     let mut sender = Responder::try_new(sender_config(1, 1)).unwrap();
@@ -620,7 +650,7 @@ fn cancelled_transmit_ownership_blocks_refill_across_fresh_generation() {
     sender
         .update(request_status(peer(3), 1, 1, Some(1), local), 0)
         .unwrap();
-    assert_eq!(sender.poll(&source, 0, &mut replies).unwrap().len(), 1);
+    assert_eq!(sender.poll(&mut source, 0, &mut replies).unwrap().len(), 1);
     let old_key = replies.owned[0].key;
     sender
         .update(request_status(peer(3), 1, 2, None, local), 1)
@@ -634,7 +664,12 @@ fn cancelled_transmit_ownership_blocks_refill_across_fresh_generation() {
     sender
         .update(request_status(peer(3), 1, 3, Some(3), local), 1)
         .unwrap();
-    assert!(sender.poll(&source, 1, &mut replies).unwrap().is_empty());
+    assert!(
+        sender
+            .poll(&mut source, 1, &mut replies)
+            .unwrap()
+            .is_empty()
+    );
     sender.remove(peer(3));
     assert_eq!(sender.peers(), 0);
     assert_eq!(sender.outstanding(), 1);
@@ -646,11 +681,16 @@ fn cancelled_transmit_ownership_blocks_refill_across_fresh_generation() {
         sender.update(request_status(peer(3), 1, 99, None, local), 1),
         Err(RequestUpdateError::Stale)
     );
-    assert!(sender.poll(&source, 1, &mut replies).unwrap().is_empty());
+    assert!(
+        sender
+            .poll(&mut source, 1, &mut replies)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(replies.calls, [old_key]);
     replies.owned.clear();
     assert_eq!(sender.outstanding(), 0);
-    assert_eq!(sender.poll(&source, 1, &mut replies).unwrap().len(), 1);
+    assert_eq!(sender.poll(&mut source, 1, &mut replies).unwrap().len(), 1);
     assert_eq!(sender.outstanding(), 1);
     let new_key = replies.owned[0].key;
     assert_eq!(
@@ -719,14 +759,19 @@ fn latest_request_snapshot_serves_current_polka_without_asserting_body_validity(
             0,
         )
         .unwrap();
-    assert!(sender.poll(&source, 0, &mut replies).unwrap().is_empty());
+    assert!(
+        sender
+            .poll(&mut source, 0, &mut replies)
+            .unwrap()
+            .is_empty()
+    );
     sender
         .update(
             request_status(peer(2), 1, 11, Some(10), receiver.status().unwrap()),
             1,
         )
         .unwrap();
-    let sent = sender.poll(&source, 1, &mut replies).unwrap();
+    let sent = sender.poll(&mut source, 1, &mut replies).unwrap();
     assert_eq!(sent.len(), 1);
     assert_eq!((sent[0].0.sequence, sent[0].1), (10, Gap::Polka));
     assert_eq!(replies.owned.len(), 1);
@@ -777,7 +822,12 @@ fn latest_request_snapshot_serves_current_polka_without_asserting_body_validity(
         0,
         "TX capacity must not mask token replay"
     );
-    assert!(sender.poll(&source, 2, &mut replies).unwrap().is_empty());
+    assert!(
+        sender
+            .poll(&mut source, 2, &mut replies)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         replies.calls.len(),
         1,

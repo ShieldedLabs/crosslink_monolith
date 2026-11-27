@@ -168,11 +168,56 @@ impl<S: Storage> Engine<S> {
         status: Status,
         sink: &mut impl Sink,
     ) -> Result<()> {
-        let r = self.receive_inner(frame, status, sink);
+        self.receive_body(frame, status, None, sink)
+    }
+    /// Runtime-only ingress for immutable bytes whose configured hash was
+    /// checked at assembly. The token is not header/certificate or validity
+    /// authority: all other receive checks run, with Indeterminate validity.
+    pub(super) fn receive_checked_body(
+        &mut self,
+        frame: Frame<'_>,
+        body: &checked_body::CheckedBody,
+        sink: &mut impl Sink,
+    ) -> Result<()> {
+        // Never trust the frame's separate body slice, even if the token matches
+        // its header. Only the exact immutable allocation checked by the token
+        // may take this path; no token is persisted or reused across recovery.
+        let frame = Frame {
+            proposal: frame.proposal.map(|p| Proposal {
+                header: p.header,
+                body: body.bytes(),
+            }),
+            ..frame
+        };
+        self.receive_body(frame, Status::Indeterminate, Some(body), sink)
+    }
+    fn receive_body(
+        &mut self,
+        frame: Frame<'_>,
+        status: Status,
+        checked: Option<&checked_body::CheckedBody>,
+        sink: &mut impl Sink,
+    ) -> Result<()> {
+        let r = self
+            .receive_inner(frame, status, checked, sink)
+            .and_then(|()| {
+                // A completed retained body must survive even when its validity is
+                // pending and Guided mode emits no proposal or signer output.
+                if frame.proposal.is_some() {
+                    self.store.flush_publication()?;
+                }
+                Ok(())
+            });
         self.clear_rx();
         self.finish(r)
     }
-    fn receive_inner(&mut self, f: Frame<'_>, status: Status, sink: &mut impl Sink) -> Result<()> {
+    fn receive_inner(
+        &mut self,
+        f: Frame<'_>,
+        status: Status,
+        checked: Option<&checked_body::CheckedBody>,
+        sink: &mut impl Sink,
+    ) -> Result<()> {
         self.check()?;
         let n = self.c().members.len();
         if f.groups.len() > n + 1
@@ -183,12 +228,22 @@ impl<S: Storage> Engine<S> {
             return Err(Error::Invalid);
         }
         if let Some(p) = f.proposal {
-            if p.header.content.height != self.d().height
-                || !p.header.verify(self.c())
-                || self.c().body_id(p.body) != p.header.content.id
-            {
+            if p.header.content.height != self.d().height || !p.header.verify(self.c()) {
                 return Err(Error::Invalid);
             }
+            if let Some(body) = checked {
+                if !body.matches(self.c(), self.d().height, p.header.content.id) {
+                    return Err(Error::Invalid);
+                }
+            } else {
+                #[cfg(test)]
+                checked_body::record_hash(p.body.len());
+                if self.c().body_id(p.body) != p.header.content.id {
+                    return Err(Error::Invalid);
+                }
+            }
+        } else if checked.is_some() {
+            return Err(Error::Invalid);
         }
         self.index_frame(f);
         if f.message == Message::Dec {
@@ -340,7 +395,7 @@ impl<S: Storage> Engine<S> {
                     && self.d().slot.is_some()
                     && self.c().proposer(self.d().height, self.d().round) == self.me
                 {
-                    self.emit_proposal(Target::Peer(v.content.signer), sink);
+                    self.emit_proposal(Target::Peer(v.content.signer), sink)?;
                     self.replied[v.content.signer as usize] = true;
                 }
             }
@@ -512,13 +567,15 @@ impl<S: Storage> Engine<S> {
     fn expired(&self, index: usize) -> bool {
         self.d().timers[index].active && self.d().timers[index].remaining == 0
     }
-    fn decide_output(&self, sink: &mut impl Sink) {
+    fn decide_output(&mut self, sink: &mut impl Sink) -> Result<()> {
+        self.publication_checkpoint()?;
         let p = self.d().pending.expect("decided package");
         sink.decided(
             self.d().height,
             self.proposal(p.proposal),
             self.group(p.certificate),
         );
+        Ok(())
     }
     pub(super) fn drive(&mut self, sink: &mut impl Sink) -> Result<()> {
         loop {
@@ -531,7 +588,7 @@ impl<S: Storage> Engine<S> {
                     d.step = Step::Decided;
                     self.commit(d)?;
                     self.acquiring = false;
-                    self.decide_output(sink);
+                    self.decide_output(sink)?;
                     return Ok(());
                 }
             }
@@ -565,7 +622,7 @@ impl<S: Storage> Engine<S> {
                 }
                 return Ok(());
             }
-            self.request_proposal(sink);
+            self.request_proposal(sink)?;
             if self.d().step == Step::Propose
                 && self.d().vc.is_some()
                 && self.c().proposer(self.d().height, self.d().round) == self.me
@@ -651,7 +708,7 @@ impl<S: Storage> Engine<S> {
                         self.commit(d)?;
                         if step == Step::Prevote {
                             self.materialize(VoteKind::Precommit)?;
-                            self.emit_vote(VoteKind::Precommit, Target::All, sink);
+                            self.emit_vote(VoteKind::Precommit, Target::All, sink)?;
                         }
                         continue;
                     }
@@ -659,7 +716,7 @@ impl<S: Storage> Engine<S> {
             }
             if step == Step::Prevote {
                 if self.c().quorum(self.row_weight(VoteKind::Prevote, None)) && self.arm(2)? {
-                    self.emit_vote(VoteKind::Prevote, Target::All, sink);
+                    self.emit_vote(VoteKind::Prevote, Target::All, sink)?;
                 }
                 if self
                     .c()
@@ -688,10 +745,11 @@ impl<S: Storage> Engine<S> {
             return Ok(());
         }
     }
-    fn periodic(&self, sink: &mut impl Sink) {
+    fn periodic(&mut self, sink: &mut impl Sink) -> Result<()> {
+        self.publication_checkpoint()?;
         if self.d().step == Step::Decided {
             if self.emission == Emission::Guided {
-                return;
+                return Ok(());
             }
             let p = self.d().pending.unwrap();
             let groups = [self.group(p.certificate)];
@@ -704,13 +762,13 @@ impl<S: Storage> Engine<S> {
                     groups: &groups,
                 },
             );
-            return;
+            return Ok(());
         }
         if self.d().step != Step::PreRound {
-            self.emit_replay(VoteKind::Enter, sink);
-            self.emit_proposal(Target::All, sink);
-            self.emit_replay(VoteKind::Prevote, sink);
-            self.emit_replay(VoteKind::Precommit, sink);
+            self.emit_replay(VoteKind::Enter, sink)?;
+            self.emit_proposal(Target::All, sink)?;
+            self.emit_replay(VoteKind::Prevote, sink)?;
+            self.emit_replay(VoteKind::Precommit, sink)?;
         }
         for (i, s) in [self.d().slot, self.d().pending.map(|p| p.proposal)]
             .into_iter()
@@ -724,6 +782,7 @@ impl<S: Storage> Engine<S> {
                 }
             }
         }
+        Ok(())
     }
     pub fn elapse(&mut self, online: u64, sink: &mut impl Sink) -> Result<()> {
         let r = self.elapse_inner(online, sink);
@@ -782,13 +841,13 @@ impl<S: Storage> Engine<S> {
                     }
                 }
             }
-            self.commit(d)?;
+            self.commit_progress(d)?;
             online -= delta;
             // A strictly earlier grid tick belongs to the pre-deadline state.
             // Keep it even when another tick coincides with the deadline: a round
             // transition may retire a vote or retry without overwriting its event.
             if delta > grid {
-                self.periodic(sink);
+                self.periodic(sink)?;
             }
             if self.d().step == Step::PreRound && self.d().height_remaining == 0 {
                 self.start(0, None, true, sink)?;
@@ -796,7 +855,7 @@ impl<S: Storage> Engine<S> {
             self.drive(sink)?;
             // The reference drives consensus before a coincident rho replay.
             if crossed && remainder == 0 {
-                self.periodic(sink);
+                self.periodic(sink)?;
             }
         }
         Ok(())
@@ -826,7 +885,7 @@ impl<S: Storage> Engine<S> {
                     }
                 }
             }
-            self.commit(d)?;
+            self.commit_progress(d)?;
             online -= delta;
             if self.d().step == Step::PreRound && self.d().height_remaining == 0 {
                 self.start(0, None, true, sink)?;
@@ -835,8 +894,8 @@ impl<S: Storage> Engine<S> {
             if self.d().grid_remaining == 0 {
                 let mut d = self.d().clone();
                 d.grid_remaining = self.c().rho;
-                self.commit(d)?;
-                self.periodic(sink);
+                self.commit_progress(d)?;
+                self.periodic(sink)?;
             }
         }
         Ok(())
@@ -959,7 +1018,7 @@ impl<S: Storage> Engine<S> {
             if self.d().pending.is_none() {
                 return Err(Error::Corrupt);
             }
-            self.decide_output(sink);
+            self.decide_output(sink)?;
             return Ok(());
         }
         if self.d().step != Step::PreRound {
@@ -997,11 +1056,11 @@ impl<S: Storage> Engine<S> {
                 };
             }
             self.commit(d)?;
-            self.request_proposal(sink);
+            self.request_proposal(sink)?;
             for k in [VoteKind::Enter, VoteKind::Prevote, VoteKind::Precommit] {
-                self.emit_replay(k, sink);
+                self.emit_replay(k, sink)?;
             }
-            self.emit_proposal(Target::All, sink);
+            self.emit_proposal(Target::All, sink)?;
         }
         self.drive(sink)
     }

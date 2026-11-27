@@ -587,17 +587,35 @@ pub struct ConfigMeta {
     pub rho: u64,
     pub timeouts: Timeouts,
 }
-/// Logical bounded-workspace/publication interface used by the reference core.
-/// Applications are not required to implement physical row writes or a WAL;
-/// see `AtomicBlockStore` for the agreed physical API (adapter deferred).
-/// For publication/crash tests each `write_*` except `write_body` is one
-/// atomic, durable small-record replacement. A successful call must survive a
-/// crash. `write_body` may tear on failure, but is only used on unreferenced
-/// slots; bodies precede header/intent/descriptor publication. `copy_body`
-/// copies a still-retained valid body to an unreferenced slot without a core
-/// scratch body. Reads expose only bounded physical records. No implementation
-/// may silently acknowledge an undurable write. On errors no more output occurs.
+/// Logical bounded-workspace/publication interface used by the core.
+/// Applications need not implement physical row writes or a WAL; see
+/// `AtomicBlockStore` for the physical API. Eager stores make each successful
+/// mutation durable. An explicitly buffered store may acknowledge staged writes:
+/// reads then expose the working copy, not necessarily the committed image.
+/// `flush` must durably commit every prior write before signing or a checkpoint;
+/// `flush_publication` commits all publication/authority changes before output.
+/// Only validated countdown/grid progress may be omitted by the latter.
+/// `write_body` may tear on failure, but is only used on unreferenced slots;
+/// bodies precede header/intent/descriptor publication. `copy_body` copies a
+/// retained body to an unreferenced slot without a core scratch body. A failed
+/// mutation or barrier forbids further signing/output until recovery.
 pub trait Storage {
+    /// Make every prior staged mutation durable. Eager stores need no work.
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+    /// Commit publication changes. Already-durable output may be replayed while
+    /// countdown/grid progress alone is dirty. Other stores use a full flush.
+    fn flush_publication(&mut self) -> Result<()> {
+        self.flush()
+    }
+    /// Stage only elapsed-time bookkeeping. The default retains eager semantics;
+    /// buffered overrides must reject every other descriptor change, including
+    /// timer activation/identity changes and increases in countdowns (except the
+    /// bounded periodic grid reset).
+    fn write_progress_descriptor(&mut self, d: &Descriptor) -> Result<()> {
+        self.write_descriptor(d)
+    }
     fn config(&self) -> Option<&Config>;
     fn config_bank_hash(&self, bank: usize) -> Option<Id>;
     /// Clear only the unreferenced configuration bank and allocate its bounded
@@ -927,6 +945,9 @@ impl<S: Storage> Engine<S> {
     pub fn storage(&self) -> &S {
         &self.store
     }
+    /// Take the working store without flushing. For durable recovery, discard
+    /// this working copy via `DurableStore::into_backend` and reopen the backend
+    /// first; a buffered or poisoned working image is not a committed snapshot.
     pub fn into_storage(self) -> S {
         self.store
     }
@@ -960,8 +981,29 @@ impl<S: Storage> Engine<S> {
             Ok(())
         }
     }
+    /// Persist every staged write, including elapsed-time bookkeeping. This
+    /// performs no work after a failure; reopen the backend before recovery.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        if !self.active {
+            return Err(Error::Inactive);
+        }
+        let r = self.store.flush();
+        self.finish(r)
+    }
+    /// Fence host/network publication from borrowed views. Unlike `checkpoint`,
+    /// this may leave countdown/grid-only progress staged for a periodic flush.
+    pub fn publication_checkpoint(&mut self) -> Result<()> {
+        if !self.active {
+            return Err(Error::Inactive);
+        }
+        let r = self.store.flush_publication();
+        self.finish(r)
+    }
     fn commit(&mut self, d: Descriptor) -> Result<()> {
         self.store.write_descriptor(&d)
+    }
+    fn commit_progress(&mut self, d: Descriptor) -> Result<()> {
+        self.store.write_progress_descriptor(&d)
     }
     fn finish<T>(&mut self, r: Result<T>) -> Result<T> {
         if matches!(r, Err(Error::Storage | Error::Corrupt | Error::Exhausted)) {
@@ -1052,6 +1094,8 @@ impl<S: Storage> Engine<S> {
             self.start(0, None, true, sink)?;
         }
         self.drive(sink)?;
+        // INIT retires old signing authority even with tau > 0 or no local key.
+        self.store.flush()?;
         Ok(true)
     }
     fn clear_volatile(&mut self) {
@@ -1128,7 +1172,8 @@ impl<S: Storage> Engine<S> {
     }
     fn materialize(&mut self, k: VoteKind) -> Result<()> {
         if self.me == usize::MAX {
-            return Ok(());
+            // Observers also retain entry/lock transitions without signer output.
+            return self.store.flush_publication();
         }
         let Some(intent) = self.d().intents[k.index()] else {
             return Ok(());
@@ -1145,6 +1190,9 @@ impl<S: Storage> Engine<S> {
             Some(v) if v.content == intent => *v,
             Some(_) => return Err(Error::Corrupt),
             None => {
+                // The complete intent/lock/evidence image must precede signing,
+                // not merely precede emission of the resulting OWN record.
+                self.store.flush()?;
                 let v = Vote::try_sign(self.c(), &self.key, intent)?;
                 self.store.write_own(k, v)?;
                 v
@@ -1190,13 +1238,16 @@ impl<S: Storage> Engine<S> {
             _ => {}
         }
         self.commit(d)?;
-        self.emit_vote(k, Target::All, sink);
+        self.emit_vote(k, Target::All, sink)?;
         Ok(())
     }
     /// Live state-transition emission, subject to the volatile policy.
-    fn emit_vote(&self, k: VoteKind, target: Target, sink: &mut impl Sink) {
+    fn emit_vote(&mut self, k: VoteKind, target: Target, sink: &mut impl Sink) -> Result<()> {
+        self.publication_checkpoint()?;
         if self.emission != Emission::Reference {
-            let Some(v) = self.own_current(k) else { return };
+            let Some(v) = self.own_current(k) else {
+                return Ok(());
+            };
             sink.send(
                 target,
                 Frame {
@@ -1206,23 +1257,31 @@ impl<S: Storage> Engine<S> {
                     groups: &[],
                 },
             );
-            return;
+            return Ok(());
         }
-        self.emit_vote_complete(k, target, sink);
+        self.emit_vote_complete(k, target, sink)
     }
     /// Periodic rho and recovery replay: the complete reference frame, except
     /// that Guided replays the bare current own vote.
-    fn emit_replay(&self, k: VoteKind, sink: &mut impl Sink) {
+    fn emit_replay(&mut self, k: VoteKind, sink: &mut impl Sink) -> Result<()> {
         if self.emission == Emission::Guided {
-            self.emit_vote(k, Target::All, sink);
+            self.emit_vote(k, Target::All, sink)
         } else {
-            self.emit_vote_complete(k, Target::All, sink);
+            self.emit_vote_complete(k, Target::All, sink)
         }
     }
     /// Complete evidence frame (reference replay and targeted service); not
     /// affected by the CompactLive policy.
-    fn emit_vote_complete(&self, k: VoteKind, target: Target, sink: &mut impl Sink) {
-        let Some(v) = self.own_current(k) else { return };
+    fn emit_vote_complete(
+        &mut self,
+        k: VoteKind,
+        target: Target,
+        sink: &mut impl Sink,
+    ) -> Result<()> {
+        self.publication_checkpoint()?;
+        let Some(v) = self.own_current(k) else {
+            return Ok(());
+        };
         let mut proposal = None;
         let group = match k {
             VoteKind::Enter => self.d().entry.map(|r| self.group(r)),
@@ -1275,18 +1334,22 @@ impl<S: Storage> Engine<S> {
                 groups: groups.as_slice(),
             },
         );
+        Ok(())
     }
-    fn emit_proposal(&self, target: Target, sink: &mut impl Sink) {
+    fn emit_proposal(&mut self, target: Target, sink: &mut impl Sink) -> Result<()> {
         if self.emission == Emission::Guided {
-            return;
+            return Ok(());
         }
         if self.c().proposer(self.d().height, self.d().round) != self.me {
-            return;
+            return Ok(());
         }
-        let Some(s) = self.d().slot else { return };
+        let Some(s) = self.d().slot else {
+            return Ok(());
+        };
+        self.publication_checkpoint()?;
         let p = self.proposal(s);
         if p.header.content.signer as usize != self.me {
-            return;
+            return Ok(());
         }
         let group = self
             .d()
@@ -1303,6 +1366,7 @@ impl<S: Storage> Engine<S> {
                 groups: groups.as_slice(),
             },
         );
+        Ok(())
     }
     fn stage_selected(&mut self, kind: CertKind, source: Selection<'_>) -> Result<RegionRef> {
         let index = self.region_free()?;
@@ -1386,11 +1450,11 @@ impl<S: Storage> Engine<S> {
             self.acquiring = false;
         }
         self.materialize(VoteKind::Enter)?;
-        self.emit_vote(VoteKind::Enter, Target::All, sink);
-        self.request_proposal(sink);
+        self.emit_vote(VoteKind::Enter, Target::All, sink)?;
+        self.request_proposal(sink)?;
         Ok(())
     }
-    fn request_proposal(&mut self, sink: &mut impl Sink) {
+    fn request_proposal(&mut self, sink: &mut impl Sink) -> Result<()> {
         if self.d().step == Step::Propose
             && self.c().proposer(self.d().height, self.d().round) == self.me
             && self.d().proposal_intent.is_none()
@@ -1398,12 +1462,14 @@ impl<S: Storage> Engine<S> {
             && self.own_current(VoteKind::Prevote).is_none()
             && !self.acquiring
         {
+            self.publication_checkpoint()?;
             self.acquiring = true;
             sink.acquire(ProposalTag {
                 height: self.d().height,
                 round: self.d().round,
             });
         }
+        Ok(())
     }
     pub fn proposal_tag(&self) -> Option<ProposalTag> {
         self.store
@@ -1468,7 +1534,7 @@ impl<S: Storage> Engine<S> {
         d.proposal_intent = Some(ProposalIntent { content, slot });
         self.commit(d)?;
         self.complete_proposal()?;
-        self.emit_proposal(Target::All, sink);
+        self.emit_proposal(Target::All, sink)?;
         self.drive(sink)
     }
     fn complete_proposal(&mut self) -> Result<()> {
@@ -1498,6 +1564,8 @@ impl<S: Storage> Engine<S> {
                 return Err(Error::Corrupt);
             }
             _ => {
+                // The body and proposal intent must be durable before signing.
+                self.store.flush()?;
                 let h = Header::try_sign(self.c(), &self.key, content)?;
                 self.store.write_own_header(h)?;
                 h
@@ -1528,6 +1596,9 @@ impl<S: Storage> Engine<S> {
         d.justified = content.valid_round.is_some();
         d.proposal_published = true;
         self.commit(d)?;
+        // Guided emission is a no-op, but retained headers can be attested by
+        // the transport and body tags can escape through host validation.
+        self.store.flush_publication()?;
         self.acquiring = false;
         Ok(())
     }
@@ -1590,6 +1661,7 @@ pub mod merkle;
 pub mod runtime;
 pub mod wire;
 pub use atomic::AtomicBlockStore;
+mod checked_body;
 mod core;
 mod recovery;
 #[cfg(test)]

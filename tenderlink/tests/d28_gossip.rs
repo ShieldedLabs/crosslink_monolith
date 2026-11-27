@@ -181,7 +181,7 @@ fn upd(peer: u32, generation: u64, sequence: u64, status: StatusSnapshot) -> Sta
 #[test]
 fn lagging_peer_is_served_one_proposal_and_uptodate_peer_is_not() {
     let c = config(&[0, 1, 2, 3], &[1; 4]);
-    let (e, mut s, h) = with_proposal(&c, 3, b"body");
+    let (mut e, mut s, h) = with_proposal(&c, 3, b"body");
     let (mut r, mut rs) = engine(&c, 2, 0);
     let mine = st(&e);
     assert_eq!(mine.proposal, Some(h.content.id));
@@ -356,7 +356,7 @@ fn polka_package_repairs_polluted_rows_and_moves_lock() {
 fn configuration_and_height_are_separated_and_fail_closed() {
     let c = config(&[0, 1, 2, 3], &[1; 4]);
     let other = config(&[0, 1, 2], &[1; 3]);
-    let (e, mut s, _) = with_proposal(&c, 3, b"x");
+    let (mut e, mut s, _) = with_proposal(&c, 3, b"x");
     let mut lag = StatusSnapshot {
         proposal: None,
         ..st(&e)
@@ -385,7 +385,7 @@ fn configuration_and_height_are_separated_and_fail_closed() {
 #[test]
 fn latest_status_wins_and_old_or_duplicate_are_rejected() {
     let c = config(&[0, 1, 2, 3], &[1; 4]);
-    let (e, _, _) = with_proposal(&c, 3, b"x");
+    let (mut e, _, _) = with_proposal(&c, 3, b"x");
     let a = st(&e);
     let mut d = Director::new(dcfg(4, 2));
     d.update(upd(1, 5, 10, a), 0).unwrap();
@@ -404,16 +404,16 @@ fn latest_status_wins_and_old_or_duplicate_are_rejected() {
     let mut s = Recorder::default();
     d.update(upd(1, 1, 1, lag), 0).unwrap();
     d.update(upd(1, 1, 2, a), 1).unwrap();
-    assert!(d.poll(&e, 1, &mut s).unwrap().is_empty());
+    assert!(d.poll(&mut e, 1, &mut s).unwrap().is_empty());
     assert!(s.packets.is_empty());
     assert_eq!(d.update(upd(1, 1, 1, lag), 1), Err(UpdateError::Stale));
-    assert!(d.poll(&e, 2, &mut s).unwrap().is_empty());
+    assert!(d.poll(&mut e, 2, &mut s).unwrap().is_empty());
 }
 
 #[test]
 fn bounded_grants_timeout_and_fair_ties() {
     let c = config(&[0, 1, 2, 3], &[1; 4]);
-    let (e, mut s, _) = with_proposal(&c, 3, b"x");
+    let (mut e, mut s, _) = with_proposal(&c, 3, b"x");
     let lag = StatusSnapshot {
         proposal: None,
         ..st(&e)
@@ -423,15 +423,15 @@ fn bounded_grants_timeout_and_fair_ties() {
         d.update(upd(p, 1, 1, lag), 0).unwrap();
     }
     assert_eq!(d.update(upd(50, 1, 1, lag), 0), Err(UpdateError::Full));
-    let first = d.poll(&e, 0, &mut s).unwrap();
+    let first = d.poll(&mut e, 0, &mut s).unwrap();
     assert_eq!(first.len(), 3);
     assert_eq!(s.packets.len(), 3);
     assert_eq!(d.active_grants(), 3);
     // Outstanding grants block more sends; no growth with N.
-    assert!(d.poll(&e, 5, &mut s).unwrap().is_empty());
+    assert!(d.poll(&mut e, 5, &mut s).unwrap().is_empty());
     assert_eq!(s.packets.len(), 3);
     // After the timeout the unresponsive peers are not retried ahead of fresh ones.
-    let second = d.poll(&e, 10, &mut s).unwrap();
+    let second = d.poll(&mut e, 10, &mut s).unwrap();
     assert_eq!(second.len(), 3);
     for (p, _) in &second {
         assert!(!first.iter().any(|(q, _)| q == p), "pinned to {p}");
@@ -441,7 +441,7 @@ fn bounded_grants_timeout_and_fair_ties() {
     let mut now = 10;
     while seen.len() < 50 {
         now += 10;
-        for (p, _) in d.poll(&e, now, &mut s).unwrap() {
+        for (p, _) in d.poll(&mut e, now, &mut s).unwrap() {
             assert!(seen.insert(p) || seen.len() == 50);
         }
         assert!(now < 1000);
@@ -458,7 +458,7 @@ impl HashSetFrom {
 #[test]
 fn state_changing_gap_has_priority_and_progress_releases_grant() {
     let c = config(&[0, 1, 2, 3], &[1; 4]);
-    let (e, mut s, _) = with_proposal(&c, 3, b"x");
+    let (mut e, mut s, _) = with_proposal(&c, 3, b"x");
     let (r, _) = engine(&c, 2, 0);
     let a = st(&e);
     let no_prop = StatusSnapshot {
@@ -474,13 +474,13 @@ fn state_changing_gap_has_priority_and_progress_releases_grant() {
     d.update(upd(2, 1, 1, no_prop), 0).unwrap();
     d.update(upd(3, 1, 1, a), 0).unwrap();
     let _ = r;
-    let got = d.poll(&e, 0, &mut s).unwrap();
+    let got = d.poll(&mut e, 0, &mut s).unwrap();
     assert_eq!(got, [(2, Gap::Proposal)]);
     // Sending alone does not convince: still granted, nothing else sent.
-    assert!(d.poll(&e, 1, &mut s).unwrap().is_empty());
+    assert!(d.poll(&mut e, 1, &mut s).unwrap().is_empty());
     // A newer status showing the gap closed releases the grant.
     d.update(upd(2, 1, 2, a), 2).unwrap();
-    let got = d.poll(&e, 2, &mut s).unwrap();
+    let got = d.poll(&mut e, 2, &mut s).unwrap();
     assert!(got.iter().all(|(p, _)| *p != 2));
 }
 
@@ -748,7 +748,7 @@ fn high_priority_churn_cannot_starve_lower_gap() {
         seq += 1;
         let flip = if seq % 2 == 0 { hi_prop } else { hi_round };
         d.update(upd(2, 1, seq, flip), now).unwrap();
-        for (p, _) in d.poll(&e, now, &mut s).unwrap() {
+        for (p, _) in d.poll(&mut e, now, &mut s).unwrap() {
             if p == 1 {
                 served_low = true;
             }
@@ -763,9 +763,9 @@ fn high_priority_churn_cannot_starve_lower_gap() {
 #[test]
 fn poll_on_healthy_engine_with_no_peers_is_empty() {
     let c = config(&[0, 1, 2, 3], &[1; 4]);
-    let (e, mut s, _) = with_proposal(&c, 3, b"x");
+    let (mut e, mut s, _) = with_proposal(&c, 3, b"x");
     let mut d = Director::new(dcfg(2, 1));
-    assert!(d.poll(&e, 0, &mut s).unwrap().is_empty());
+    assert!(d.poll(&mut e, 0, &mut s).unwrap().is_empty());
 }
 
 fn assert_bare(packets: &[Packet]) {
@@ -1001,7 +1001,7 @@ fn recovered_late_polka_bridges_lower_round_despite_nil_own_precommit() {
     e.receive(ordinary(None, None, &polka), Status::Valid, &mut s)
         .unwrap();
     assert_eq!(st(&e).polka, Some((1, id)));
-    let e =
+    let mut e =
         Engine::recover_with_emission(e.into_storage(), key(3), Emission::Guided, &mut s).unwrap();
     assert!(!st(&e).prevote_quorum, "volatile quorum row was cleared");
     assert_eq!(e.precommits()[3].unwrap().content.id, None);
@@ -1054,7 +1054,7 @@ fn equal_information_gaps_do_not_make_every_holder_aim_at_one_peer() {
     let c = config(&[0, 1, 2, 3], &[1; 4]);
     let mut targets = std::collections::HashSet::new();
     for source in 0..4 {
-        let (e, mut s, _) = with_proposal(&c, source, b"shared proposal");
+        let (mut e, mut s, _) = with_proposal(&c, source, b"shared proposal");
         let lag = StatusSnapshot {
             proposal: None,
             ..st(&e)
@@ -1063,7 +1063,7 @@ fn equal_information_gaps_do_not_make_every_holder_aim_at_one_peer() {
         for peer in 1000..1064 {
             d.update(upd(peer, 1, 1, lag), 0).unwrap();
         }
-        let sent = d.poll(&e, 0, &mut s).unwrap();
+        let sent = d.poll(&mut e, 0, &mut s).unwrap();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].1, Gap::Proposal);
         targets.insert(sent[0].0);

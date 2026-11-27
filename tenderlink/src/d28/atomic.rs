@@ -23,10 +23,11 @@ use super::Result;
 /// write must never be treated as permission to send.
 ///
 /// This is the public physical persistence contract, **not** a WAL request.
-/// [`super::durable::DurableStore`] implements `Storage` by atomically replacing
-/// its bounded image on every mutation. The application must supply a backend
-/// meeting this contract, including exclusive writer ownership. `MemoryStore`
-/// alone remains only a logical publication/crash model, not durable storage.
+/// [`super::durable::DurableStore`] atomically replaces its bounded image on
+/// every mutation in eager mode, or at explicit signing/publication/checkpoint
+/// barriers in buffered mode. The backend contract is identical in both modes,
+/// including exclusive writer ownership. `MemoryStore` alone remains only a
+/// logical publication/crash model, not durable storage.
 pub trait AtomicBlockStore {
     fn block_size(&self) -> usize;
     fn load(&mut self, block: &mut [u8]) -> Result<bool>;

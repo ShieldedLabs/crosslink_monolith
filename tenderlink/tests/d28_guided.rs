@@ -354,7 +354,7 @@ impl Net {
             }
             let n = self.nodes[i].as_mut().unwrap();
             n.r.guided_by = true;
-            let grants = n.d.poll(&n.e, self.now, &mut n.r).unwrap();
+            let grants = n.d.poll(&mut n.e, self.now, &mut n.r).unwrap();
             n.r.guided_by = false;
             assert!(grants.len() <= K);
             assert!(n.d.active_grants() <= K);
@@ -738,7 +738,7 @@ fn future_bare_votes_are_not_banked_and_laggard_needs_complete_entry() {
             1,
         )
         .unwrap();
-    let grants = sender.d.poll(&sender.e, 1, &mut sender.r).unwrap();
+    let grants = sender.d.poll(&mut sender.e, 1, &mut sender.r).unwrap();
     sender.r.guided_by = false;
     assert_eq!(grants, vec![(peer(3), Gap::Round)]);
     let package = sender.r.packets.pop().unwrap();
@@ -806,7 +806,7 @@ fn beam(net: &mut Net, from: usize, to: usize, now: u64, sequence: u64) -> Vec<P
         now,
     )
     .unwrap();
-    n.d.poll(&n.e, now, &mut n.r).unwrap();
+    n.d.poll(&mut n.e, now, &mut n.r).unwrap();
     n.r.guided_by = false;
     assert!(n.d.active_grants() <= K);
     std::mem::take(&mut n.r.packets)

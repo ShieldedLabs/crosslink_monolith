@@ -515,7 +515,7 @@ impl Responder {
     }
     pub fn poll<S: Storage>(
         &mut self,
-        engine: &Engine<S>,
+        engine: &mut Engine<S>,
         now: u64,
         sink: &mut impl ReplySink,
     ) -> Result<Vec<(RequestKey, Gap)>> {

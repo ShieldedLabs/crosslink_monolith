@@ -778,7 +778,7 @@ impl Net {
                     // With K=1, gate busy TX just as Responder does, rather than
                     // unfairly manufacturing a failed grant/backoff in this arm.
                     if tx.in_use() < tx.capacity() {
-                        director.poll(&n.engine, self.now, &mut sink).unwrap();
+                        director.poll(&mut n.engine, self.now, &mut sink).unwrap();
                     }
                     assert_eq!(sink.dropped, 0);
                     self.counts.tx_cap_drops += sink.dropped;
@@ -793,7 +793,7 @@ impl Net {
                         .unwrap();
                     self.counts.requests_started += started.len() as u64;
                     let mut sink = Replies { frames: vec![] };
-                    responder.poll(&n.engine, self.now, &mut sink).unwrap();
+                    responder.poll(&mut n.engine, self.now, &mut sink).unwrap();
                     sink.frames
                 }
             };
