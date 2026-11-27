@@ -639,3 +639,104 @@ seed `2960165695641715445` generated three missing-leading-signature cases versu
 its required four, after functional assertions passed (`src/lib.rs:6646`). Both
 failure logs are retained; no unrelated legacy code was changed. No additional
 performance experiments were started after the shutdown request.
+
+## Outlined-payload component profile — 2026-11-27
+
+The first payload experiment separates the existing signed proposal header and
+certificate metadata from the serialized body. A missing body is fetched
+separately; later evidence reuses descriptor-retained body bytes. Existing keyed
+block IDs, proposal/vote signatures, canonical block parsing and the Host validity
+boundary are unchanged. Inline transport remains the production default.
+
+This is **seven separate localhost validator processes**, not a new Fly campaign
+or a WAN-capacity result. All six planned trials completed: seven measured heights
+and one excluded warmup per trial, **42 measured chain heights** total. The body
+sizes were 128 KiB, 1 MiB and 10 MiB, with the **same 10-MiB capacity in every arm**.
+Each process used one executor worker; all arms used the economy host profile,
+100-ms polling/status, 32-message receive budget, two source requests/two outgoing
+leases, and WAN benchmark timers. There were no overlapping builds or benchmark
+jobs during this primary profile. Earlier functional gates are excluded.
+
+### Stage-one results
+
+Receipt latency uses the controller's single monotonic clock. Each cell is the
+**median / observed maximum** over seven heights, not a stable tail estimate.
+Throughput counts one chain and includes the all-online ACK barrier.
+
+| Body | Mode | First receipt, seconds | Chain KiB/s | Raw payload/body | Total offered application/body |
+|---|---|---:|---:|---:|---:|
+| 128 KiB | inline | 22.185 / 30.566 | 5.426 | 44.000x | 56.026x |
+| 128 KiB | outlined | 23.395 / 47.721 | 4.264 | 13.714x | 28.802x |
+| 1 MiB | inline | 30.722 / 30.987 | 37.459 | 48.143x | 49.892x |
+| 1 MiB | outlined | 24.430 / 48.000 | 30.850 | 14.571x | 16.756x |
+| 10 MiB | inline | 24.903 / 45.642 | 353.720 | 48.000x | 48.169x |
+| 10 MiB | outlined | 26.388 / 47.443 | 312.749 | 13.714x | 13.917x |
+
+Outlining reduced raw payload offers by **68.8–71.4%**. Total application offers
+fell by **48.6%, 66.4% and 71.1%**, respectively. It did **not** improve sustained
+chain throughput in this sample: rates fell **21.4%, 17.6% and 11.6%**. The 1-MiB
+median improved, but its maximum worsened; the other medians were slower too.
+All seven nodes agreed on each final round: **34 round-one and eight round-two
+measured decisions, with none in round zero**. These reports do not establish why
+round zero failed. The 10/5/7-second WAN timeout settings are fallback timers,
+not an unconditional minimum decision time.
+
+The outlined ratios are still above the six-copy ideal for one successful
+proposal delivered once to every other validator. They can include different
+proposals across fallback rounds and repeated transfers. The bounded
+`duplicate_payload_bytes` counter remembers only the most recent body offered to
+a peer in a height/session; it is **not** global duplicate detection or total waste.
+The 31,465,268-byte atomic state image also remains unchanged in every arm.
+
+### Accounting and reproduction
+
+`d28_fly.py local` retains the same distributed controller/worker reports while
+running every validator as its own local process. It checks child ownership and
+cleanup, removes only its own token, and suppresses invalid independent-VM
+aggregation of shared-host interface, guest-CPU and cgroup counters. No Fly
+resources were provisioned for this experiment.
+
+```sh
+cargo build --offline --locked --release --features bench \
+  --manifest-path tenderlink/Cargo.toml --bin d28_bench
+python3 -B tenderlink/benchmarks/d28_fly.py local \
+  --binary "$PWD/tenderlink/target/release/d28_bench" \
+  --out /var/tmp/d28-outline-new --nodes 7 \
+  --body-bytes 131072,1048576,10485760 --max-body 10485760 \
+  --payload-modes inline,outlined --profiles economy --timing-profile wan \
+  --repetitions 1 --heights 7 --warmup 1 --timeout-secs 600 \
+  --chatter-secs 2 --lifetime-secs 4800 --seed 428
+```
+
+Raw payload bytes are a **subset**, not an additional traffic category. Total
+offered application bytes sum exactly six disjoint categories:
+`offered.{hello,status,bare_votes,evidence}.bytes` and
+`payload.{offered_control,offered_data}.bytes`. Outlined metadata is already in
+evidence; body bytes are already in inline evidence or separate data. Use only
+the common trial cohort with all six counters present on every online node.
+Divide by controller-ACKed measured body bytes, once per chain, and retain failed
+or partial durations. These are offers, **not delivery or STP/UDP wire bytes**.
+
+Campaign completeness comes from `campaign/run.json` and `local-result.json`,
+not merely summary rows for surviving trial directories. This run's independent
+audit checked 42 original reports, six controllers, all 252 category/node deltas,
+matching IDs/sizes/rounds/ACKs, 54 input hashes and worker cleanup. All workers
+exited zero; threads stopped and the run token was removed. The separate
+final-height chatter windows are not quiescent-idle measurements.
+
+Root: `/var/tmp/d28-payload-20261127/`.
+
+- Primary reports: `outline-primary/campaign/` and retained worker originals.
+- Frozen plan/preflight: `outline-primary-plan.json`, `outline-preflight.json`.
+- Audited result: `outline-primary-independent-audit.json`, SHA-256
+  `ae6dc89d402facee47a987394bbadeb005365cc50445f03aab6190715b116bca`.
+- Pinned executable: `d28_bench-outlined-2a01a05e`, built from integrated source
+  `35b5d2bc6623c77bda6baf469766e7067adbffe0`, SHA-256
+  `2e9d5239c823b09f38809f8f1f1408618fe463e781ce30a4f4d529101f28f74c`.
+- Historical runner SHA-256:
+  `43af8ea239f57702ede5eaf88e3da66ee09c7c4d4b7c5fd7189f11265e03227b`.
+
+The later certificate-admission hardening in `b3023b31` is not retroactively
+included in these measurements. A Merkle comparison must use a fresh outlined
+control on the **same final executable** as its leaf-size arms; comparing only
+against this earlier stage would also confound code version and time order.

@@ -1232,6 +1232,15 @@ ID; even a signed root claim requires final reconstruction and verification of
 the existing body ID and canonical bytes before normal core/host processing.
 No transport acknowledgement grants `Status::Valid`.
 
+A valid proposal-header signature alone does not authenticate a claimed DEC or
+its priority. Before outlined metadata can replace a pending record or select a
+cached-body completion, the runtime checks vote signatures, certificate kinds,
+signer distinctness, weights and admission cardinality using the core's existing
+certificate predicate. A DEC must contain a decision certificate matching that
+exact header's round and body ID. These checks prevent malformed replacement
+metadata from displacing retained valid evidence; they neither validate the
+missing body nor bypass complete-frame and host validation after reconstruction.
+
 Reference metadata needs its own global fixed-slot bound; retaining a dense
 certificate per peer would reintroduce O(N^2) backing storage. Payload attempts
 and outgoing ownership are separate from the one-off evidence request tokens.
