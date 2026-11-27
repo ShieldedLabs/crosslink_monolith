@@ -662,7 +662,6 @@ fn encode(m: &MemoryStore, limits: Limits, image: &mut [u8]) -> Result<()> {
     if image.len() != image_size(limits)? {
         return Err(Error::Corrupt);
     }
-    image.fill(0);
     let checksum_at = image.len() - CHECKSUM;
     let mut w = Writer {
         bytes: &mut image[..checksum_at],
@@ -717,6 +716,8 @@ fn encode(m: &MemoryStore, limits: Limits, image: &mut [u8]) -> Result<()> {
         w.optional(own, write_vote)?;
     }
     w.optional(&m.own_header, write_header)?;
+    // The writer overwrote the occupied prefix; clear only the unused tail.
+    w.bytes[w.at..].fill(0);
     let payload = u64::try_from(w.at - PREFIX).map_err(|_| Error::Corrupt)?;
     image[PREFIX - 8..PREFIX].copy_from_slice(&payload.to_le_bytes());
     let checksum = blake3::hash(&image[..checksum_at]);
@@ -832,4 +833,337 @@ fn decode(image: &[u8], limits: Limits) -> Result<MemoryStore> {
         return Err(Error::Corrupt);
     }
     Ok(m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The original encoder: clear the entire image before writing its payload.
+    // Keep this test-only copy independent of encode's tail-zeroing optimization.
+    fn encode_original(m: &MemoryStore, limits: Limits, image: &mut [u8]) -> Result<()> {
+        if image.len() != image_size(limits)? {
+            return Err(Error::Corrupt);
+        }
+        image.fill(0);
+        let checksum_at = image.len() - CHECKSUM;
+        let mut w = Writer {
+            bytes: &mut image[..checksum_at],
+            at: 0,
+        };
+        w.put(MAGIC)?;
+        w.put(&VERSION.to_le_bytes())?;
+        w.usize(limits.max_members)?;
+        w.usize(limits.max_body)?;
+        w.u64(0)?;
+        for bank in 0..2 {
+            w.flag(m.sealed[bank])?;
+            w.optional(&m.configs[bank], |w, c| {
+                if c.members.len() > limits.max_members || c.max_body > limits.max_body {
+                    return Err(Error::Corrupt);
+                }
+                w.put(&c.domain)?;
+                w.u64(c.total)?;
+                w.usize(c.max_body)?;
+                w.u64(c.rho)?;
+                write_timeouts(w, c.timeouts)?;
+                w.flag(c.crosslink)?;
+                w.put(&c.hash)?;
+                w.usize(c.members.len())?;
+                for member in &c.members {
+                    w.put(&member.public_key)?;
+                    w.u64(member.weight)?;
+                }
+                Ok(())
+            })?;
+        }
+        w.optional(&m.descriptor, write_descriptor)?;
+        for slot in 0..3 {
+            if m.bodies[slot].len() > limits.max_body {
+                return Err(Error::Corrupt);
+            }
+            w.usize(m.bodies[slot].len())?;
+            w.put(&m.bodies[slot])?;
+            w.optional(&m.headers[slot], write_header)?;
+        }
+        for region in 0..4 {
+            if m.regions[region].len() > limits.max_members {
+                return Err(Error::Corrupt);
+            }
+            w.usize(m.regions[region].len())?;
+            for vote in &m.regions[region] {
+                w.optional(vote, write_vote)?;
+            }
+            w.optional(&m.region_headers[region], write_region_header)?;
+        }
+        for own in &m.own {
+            w.optional(own, write_vote)?;
+        }
+        w.optional(&m.own_header, write_header)?;
+        let payload = u64::try_from(w.at - PREFIX).map_err(|_| Error::Corrupt)?;
+        image[PREFIX - 8..PREFIX].copy_from_slice(&payload.to_le_bytes());
+        let checksum = blake3::hash(&image[..checksum_at]);
+        image[checksum_at..].copy_from_slice(checksum.as_bytes());
+        Ok(())
+    }
+
+    fn config(count: usize, max_body: usize, crosslink: bool) -> Config {
+        let members = (0..count)
+            .map(|i| Member {
+                public_key: VerificationKeyBytes::from(&SigningKey::from([i as u8 + 1; 32])).into(),
+                weight: i as u64 + 1,
+            })
+            .collect();
+        Config::build(
+            [42; 32],
+            members,
+            max_body,
+            10,
+            Timeouts {
+                propose: 30,
+                prevote: 5,
+                precommit: 10,
+                inc_propose: 3,
+                inc_prevote: 1,
+                inc_precommit: 2,
+            },
+            crosslink,
+        )
+        .unwrap()
+    }
+
+    // Exercise every physical role, independently of protocol reachability.
+    // Signatures and reference digests are opaque bytes to this codec.
+    fn populated(limits: Limits) -> MemoryStore {
+        let c = config(limits.max_members, limits.max_body, false);
+        let mut m = MemoryStore {
+            configs: [
+                Some(c.clone()),
+                Some(config(limits.max_members, limits.max_body, true)),
+            ],
+            sealed: [true; 2],
+            ..MemoryStore::default()
+        };
+        for slot in 0..3 {
+            m.bodies[slot] = vec![slot as u8 + 1; limits.max_body];
+            m.headers[slot] = Some(Header {
+                content: ProposalContent {
+                    height: 9,
+                    round: 7,
+                    valid_round: Some(6),
+                    id: [slot as u8 + 11; 32],
+                    signer: 0,
+                },
+                signature: [slot as u8 + 21; 64],
+            });
+        }
+        m.own = [VoteKind::Enter, VoteKind::Prevote, VoteKind::Precommit].map(|kind| {
+            Some(Vote {
+                content: VoteContent {
+                    height: 9,
+                    round: 7,
+                    kind,
+                    id: (kind != VoteKind::Enter).then_some([11; 32]),
+                    signer: 0,
+                },
+                signature: [kind as u8 + 31; 64],
+            })
+        });
+        m.own_header = m.headers[0];
+        let kinds = [
+            CertKind::Polka {
+                round: 7,
+                id: [11; 32],
+            },
+            CertKind::Decision {
+                round: 7,
+                id: [12; 32],
+            },
+            CertKind::Timeout { round: 7 },
+            CertKind::Jump { round: 8 },
+        ];
+        for (region, kind) in kinds.into_iter().enumerate() {
+            m.regions[region] = vec![m.own[region % 3]; limits.max_members];
+            m.region_headers[region] = Some(RegionHeader {
+                kind,
+                count: limits.max_members,
+                digest: [region as u8 + 41; 32],
+            });
+        }
+        let slot = SlotRef {
+            index: 2,
+            header: [51; 32],
+        };
+        let region = RegionRef {
+            index: 3,
+            digest: [52; 32],
+        };
+        let certified = Certified {
+            proposal: slot,
+            certificate: region,
+        };
+        m.descriptor = Some(Descriptor {
+            height: 9,
+            config: c.hash,
+            round: 7,
+            step: Step::Precommit,
+            locked_round: Some(6),
+            locked_id: Some([11; 32]),
+            valid_round: Some(6),
+            slot: Some(slot),
+            justified: true,
+            vc: Some(certified),
+            entry: Some(region),
+            pending: Some(certified),
+            statuses: [Status::Indeterminate, Status::Valid, Status::Invalid],
+            body_generations: [1, 2, 3],
+            next_generation: 4,
+            timers: std::array::from_fn(|i| Timer {
+                active: i % 2 == 0,
+                remaining: 100 + i as u64,
+                height: 9,
+                round: 7,
+            }),
+            height_remaining: 101,
+            grid_remaining: 102,
+            intents: m.own.map(|vote| vote.map(|v| v.content)),
+            proposal_intent: Some(ProposalIntent {
+                content: m.own_header.unwrap().content,
+                slot: 0,
+            }),
+            proposal_published: true,
+        });
+        m
+    }
+
+    fn assert_original_image(m: &MemoryStore, limits: Limits, image: &mut [u8]) -> usize {
+        let mut original = vec![0xa5; image_size(limits).unwrap()];
+        encode_original(m, limits, &mut original).unwrap();
+        encode(m, limits, image).unwrap();
+        assert!(
+            image == original,
+            "image differs from the original full-clear encoder"
+        );
+        let end = PREFIX
+            + usize::try_from(u64::from_le_bytes(
+                image[PREFIX - 8..PREFIX].try_into().unwrap(),
+            ))
+            .unwrap();
+        let checksum_at = image.len() - CHECKSUM;
+        assert!(image[end..checksum_at].iter().all(|byte| *byte == 0));
+        assert_eq!(
+            &image[checksum_at..],
+            blake3::hash(&image[..checksum_at]).as_bytes()
+        );
+        // The independently decoded image must also re-encode identically.
+        let reopened = decode(image, limits).unwrap();
+        encode(&reopened, limits, &mut original).unwrap();
+        assert!(image == original, "reopened image changed");
+        end
+    }
+
+    #[test]
+    fn encode_matches_original_for_empty_and_three_bodies_in_dirty_images() {
+        for max_body in [1, 100 * 1024, 10 * 1024 * 1024] {
+            let limits = Limits {
+                max_members: 4,
+                max_body,
+            };
+            for m in [MemoryStore::default(), populated(limits)] {
+                let mut image = vec![0; image_size(limits).unwrap()];
+                assert_original_image(&m, limits, &mut image);
+                // Every byte (including padding and checksum) starts nonzero.
+                for (i, byte) in image.iter_mut().enumerate() {
+                    *byte = (i % 255 + 1) as u8;
+                }
+                assert_original_image(&m, limits, &mut image);
+            }
+        }
+    }
+
+    #[test]
+    fn encode_matches_original_through_shrinking_banks_bodies_and_optional_records() {
+        let limits = Limits {
+            max_members: 4,
+            max_body: 100 * 1024,
+        };
+        let mut image = vec![0xff; image_size(limits).unwrap()];
+        let mut m = populated(limits);
+        let full_end = assert_original_image(&m, limits, &mut image);
+
+        // Replace a full sealed bank with a smaller, unfinished staging bank.
+        let small = config(1, 8, true);
+        m.begin_config(
+            1,
+            ConfigMeta {
+                domain: small.domain,
+                total: small.total,
+                count: small.members.len(),
+                max_body: small.max_body,
+                rho: small.rho,
+                timeouts: small.timeouts,
+                crosslink: small.crosslink,
+            },
+        )
+        .unwrap();
+        let staged_end = assert_original_image(&m, limits, &mut image);
+        assert!(staged_end < full_end);
+        m.write_config_member(1, 0, small.members[0].clone())
+            .unwrap();
+        assert_original_image(&m, limits, &mut image);
+        m.seal_config_bank(1, small.hash).unwrap();
+        assert_original_image(&m, limits, &mut image);
+
+        m.configs[0] = None;
+        m.sealed[0] = false;
+        m.bodies[0].truncate(3);
+        m.bodies[1].truncate(1);
+        m.bodies[2].clear();
+        m.headers[0].as_mut().unwrap().content.valid_round = None;
+        m.headers[1..].fill(None);
+        m.own[0] = None;
+        m.own[1].as_mut().unwrap().content.id = None;
+        m.own[2] = None;
+        m.own_header = None;
+        m.regions = [vec![m.own[1]], vec![None], Vec::new(), Vec::new()];
+        m.region_headers = [
+            Some(RegionHeader {
+                kind: CertKind::Row {
+                    round: 7,
+                    kind: VoteKind::Prevote,
+                },
+                count: 1,
+                digest: [61; 32],
+            }),
+            None,
+            None,
+            None,
+        ];
+        let d = m.descriptor.as_mut().unwrap();
+        d.config = small.hash;
+        d.locked_round = None;
+        d.locked_id = None;
+        d.valid_round = None;
+        d.slot = None;
+        d.justified = false;
+        d.vc = None;
+        d.entry = None;
+        d.pending = None;
+        d.intents = m.own.map(|vote| vote.map(|v| v.content));
+        d.proposal_intent = None;
+        d.proposal_published = false;
+        let sparse_end = assert_original_image(&m, limits, &mut image);
+        assert!(sparse_end < staged_end);
+        assert!(image[sparse_end..full_end].iter().all(|byte| *byte == 0));
+
+        // Remove the descriptor, remaining body/header/vote and both banks.
+        // Then grow again without ever reinitializing the reused image buffer.
+        let empty_end = assert_original_image(&MemoryStore::default(), limits, &mut image);
+        assert_eq!(empty_end, PREFIX + 72);
+        assert!(image[empty_end..sparse_end].iter().all(|byte| *byte == 0));
+        assert_eq!(
+            assert_original_image(&populated(limits), limits, &mut image),
+            full_end
+        );
+    }
 }
