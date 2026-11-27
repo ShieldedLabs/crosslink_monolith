@@ -27,7 +27,13 @@ pub const BFT_FAMILY: u8 = 0x80;
 pub const HELLO_TAG: u8 = 0xB0;
 pub const STATUS_TAG: u8 = 0xB1;
 pub const FRAME_TAG: u8 = 0xB2;
+pub const OUTLINED_TAG: u8 = 0xB3;
+pub const BODY_REQUEST_TAG: u8 = 0xB4;
+pub const BODY_RESPONSE_TAG: u8 = 0xB5;
+pub const BODY_ACK_TAG: u8 = 0xB6;
 pub const VERSION: u8 = 1;
+pub const BODY_CONTROL_BYTES: usize = 90;
+pub const BODY_RESPONSE_OVERHEAD: usize = BODY_CONTROL_BYTES + 8;
 /// Status has a fixed size, including zero-filled absent optional payloads.
 pub const STATUS_BYTES: usize = 144;
 
@@ -60,6 +66,11 @@ impl Limits {
             return Err(Error::Exhausted);
         }
         Ok(bytes)
+    }
+
+    pub fn max_outlined_bytes(self) -> Result<usize> {
+        self.max_frame_bytes()?.checked_sub(self.max_body)
+            .and_then(|n| n.checked_add(32)).ok_or(Error::Exhausted)
     }
 
     fn max_positions(self) -> Result<usize> {
@@ -165,6 +176,122 @@ pub struct DecodedFrame<'a> {
     groups: Vec<DecodedGroup>,
     votes: Vec<Vote>,
 }
+/// Owned O(N) evidence only. A complete, independently validated body must be
+/// supplied before this can be materialized for the core.
+pub struct DecodedOutlined {
+    pub config: Id,
+    pub body_len: Option<usize>,
+    metadata: DecodedFrame<'static>,
+}
+impl DecodedOutlined {
+    pub fn header(&self) -> Option<&Header> {
+        self.metadata.proposal.as_ref().map(|(h, _)| h)
+    }
+    pub fn with_body<R>(&self, body: &[u8], f: impl FnOnce(Frame<'_>) -> R) -> R {
+        self.metadata.with_frame(|frame| f(Frame {
+            proposal: frame.proposal.map(|p| Proposal { header: p.header, body }),
+            ..frame
+        }))
+    }
+}
+
+pub fn decode_outlined(bytes: &[u8], limits: Limits) -> Result<DecodedOutlined> {
+    let parsed = preflight(bytes, limits, true)?;
+    let config = parsed.config.ok_or(Error::Invalid)?;
+    let body_len = parsed.body_len;
+    let decoded = decode_parsed(parsed, limits)?;
+    Ok(DecodedOutlined {
+        config,
+        body_len,
+        metadata: DecodedFrame {
+            request: decoded.request,
+            message: decoded.message,
+            outer: decoded.outer,
+            proposal: decoded.proposal.map(|(header, _)| (header, &[][..])),
+            groups: decoded.groups,
+            votes: decoded.votes,
+        },
+    })
+}
+
+/// Complete transfer fences. Generation is chosen by the requester for this
+/// authenticated session and echoed verbatim; it is not the sender's counter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyKey {
+    pub config: Id,
+    pub height: u64,
+    pub id: Id,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyRequest {
+    pub token: u64,
+    pub generation: u64,
+    pub key: BodyKey,
+}
+fn put_body_control(out: &mut Vec<u8>, tag: u8, request: BodyRequest) -> Result<()> {
+    if request.token == 0 || request.generation == 0 { return Err(Error::Invalid); }
+    out.extend_from_slice(&[tag, VERSION]);
+    put_u64(out, request.token);
+    put_u64(out, request.generation);
+    out.extend_from_slice(&request.key.config);
+    put_u64(out, request.key.height);
+    out.extend_from_slice(&request.key.id);
+    Ok(())
+}
+fn read_body_control(r: &mut Reader<'_>, tag: u8) -> Result<BodyRequest> {
+    r.prefix(tag)?;
+    let request = BodyRequest {
+        token: r.u64()?, generation: r.u64()?,
+        key: BodyKey { config: r.array()?, height: r.u64()?, id: r.array()? },
+    };
+    if request.token == 0 || request.generation == 0 { return Err(Error::Invalid); }
+    Ok(request)
+}
+pub fn encode_body_request(request: BodyRequest) -> Result<Vec<u8>> {
+    let mut out = reserved(BODY_CONTROL_BYTES)?;
+    put_body_control(&mut out, BODY_REQUEST_TAG, request)?;
+    Ok(out)
+}
+pub fn encode_body_ack(request: BodyRequest) -> Result<Vec<u8>> {
+    let mut out = reserved(BODY_CONTROL_BYTES)?;
+    put_body_control(&mut out, BODY_ACK_TAG, request)?;
+    Ok(out)
+}
+fn decode_body_control(bytes: &[u8], tag: u8) -> Result<BodyRequest> {
+    if bytes.len() != BODY_CONTROL_BYTES { return Err(Error::Invalid); }
+    let mut r = Reader::new(bytes);
+    let request = read_body_control(&mut r, tag)?;
+    r.finish()?;
+    Ok(request)
+}
+pub fn decode_body_request(bytes: &[u8]) -> Result<BodyRequest> {
+    decode_body_control(bytes, BODY_REQUEST_TAG)
+}
+pub fn decode_body_ack(bytes: &[u8]) -> Result<BodyRequest> {
+    decode_body_control(bytes, BODY_ACK_TAG)
+}
+pub fn encode_body_response(request: BodyRequest, body: &[u8], limits: Limits) -> Result<Vec<u8>> {
+    if body.len() > limits.max_body { return Err(Error::Invalid); }
+    let size = BODY_RESPONSE_OVERHEAD.checked_add(body.len()).ok_or(Error::Exhausted)?;
+    check_capacity::<u8>(size)?;
+    let mut out = reserved(size)?;
+    put_body_control(&mut out, BODY_RESPONSE_TAG, request)?;
+    put_u64(&mut out, body.len() as u64);
+    out.extend_from_slice(body);
+    Ok(out)
+}
+/// No allocation: validate all length arithmetic and reject trailing data first.
+pub fn decode_body_response(bytes: &[u8], limits: Limits) -> Result<(BodyRequest, &[u8])> {
+    let max = BODY_RESPONSE_OVERHEAD.checked_add(limits.max_body).ok_or(Error::Exhausted)?;
+    if bytes.len() > max { return Err(Error::Invalid); }
+    let mut r = Reader::new(bytes);
+    let request = read_body_control(&mut r, BODY_RESPONSE_TAG)?;
+    let len = r.count(limits.max_body)?;
+    let body = r.take(len)?;
+    r.finish()?;
+    Ok((request, body))
+}
+
 impl DecodedFrame<'_> {
     /// Creates O(N) temporary group references, not another copy of the votes
     /// or body. Neither group references nor a `Frame` can escape the closure.
@@ -192,9 +319,28 @@ impl DecodedFrame<'_> {
 /// Checks all bounds before the output Vec is allocated. Sparse local rows are
 /// admitted only up to N storage slots, then encoded as their occupied votes.
 pub fn encode_frame(frame: Frame<'_>, request: Option<u64>, limits: Limits) -> Result<Vec<u8>> {
-    let size = encoded_size(frame, limits)?;
+    encode_evidence(frame, request, limits, None)
+}
+
+/// Same exact signed header and evidence, with only the body bytes omitted.
+/// The declared length is an untrusted bounded hint, never a signed commitment.
+pub fn encode_outlined(
+    frame: Frame<'_>, request: Option<u64>, config: Id, limits: Limits,
+) -> Result<Vec<u8>> {
+    encode_evidence(frame, request, limits, Some(config))
+}
+
+fn encode_evidence(
+    frame: Frame<'_>, request: Option<u64>, limits: Limits, config: Option<Id>,
+) -> Result<Vec<u8>> {
+    let mut size = encoded_size(frame, limits)?;
+    if config.is_some() {
+        size -= frame.proposal.map_or(0, |p| p.body.len());
+        add_size(&mut size, 32)?;
+    }
     let mut out = reserved(size)?;
-    out.extend_from_slice(&[FRAME_TAG, VERSION]);
+    out.extend_from_slice(&[if config.is_some() { OUTLINED_TAG } else { FRAME_TAG }, VERSION]);
+    if let Some(config) = config { out.extend_from_slice(&config); }
     put_option_u64(&mut out, request);
     out.push(match frame.message {
         Message::Ordinary => 0,
@@ -208,7 +354,7 @@ pub fn encode_frame(frame: Frame<'_>, request: Option<u64>, limits: Limits) -> R
     if let Some(p) = frame.proposal {
         put_header(&mut out, p.header);
         put_u64(&mut out, p.body.len() as u64);
-        out.extend_from_slice(p.body);
+        if config.is_none() { out.extend_from_slice(p.body); }
     }
     put_u64(&mut out, frame.groups.len() as u64);
     for group in frame.groups {
@@ -225,7 +371,10 @@ pub fn encode_frame(frame: Frame<'_>, request: Option<u64>, limits: Limits) -> R
 /// The first pass validates the entire byte record without allocating; only
 /// then does the second pass reserve bounded dense group/vote metadata.
 pub fn decode_frame(bytes: &[u8], limits: Limits) -> Result<DecodedFrame<'_>> {
-    let parsed = preflight(bytes, limits)?;
+    decode_parsed(preflight(bytes, limits, false)?, limits)
+}
+
+fn decode_parsed<'a>(parsed: Parsed<'a>, limits: Limits) -> Result<DecodedFrame<'a>> {
     // Check every backing allocation's byte arithmetic before making any one
     // allocation; native metadata sizes need not equal the encoded sizes.
     check_capacity::<DecodedGroup>(parsed.group_count)?;
@@ -294,6 +443,8 @@ fn encoded_size(frame: Frame<'_>, limits: Limits) -> Result<usize> {
 }
 
 struct Parsed<'a> {
+    config: Option<Id>,
+    body_len: Option<usize>,
     request: Option<u64>,
     message: Message,
     outer: Option<Vote>,
@@ -303,13 +454,14 @@ struct Parsed<'a> {
     vote_count: usize,
 }
 
-fn preflight(bytes: &[u8], limits: Limits) -> Result<Parsed<'_>> {
-    if bytes.len() > limits.max_frame_bytes()? {
-        return Err(Error::Invalid);
-    }
+fn preflight(bytes: &[u8], limits: Limits, outlined: bool) -> Result<Parsed<'_>> {
+    let max = if outlined { limits.max_outlined_bytes()? } else { limits.max_frame_bytes()? };
+    if bytes.len() > max { return Err(Error::Invalid); }
     let max_positions = limits.max_positions()?;
     let mut r = Reader::new(bytes);
-    r.prefix(FRAME_TAG)?;
+    r.prefix(if outlined { OUTLINED_TAG } else { FRAME_TAG })?;
+    let config = if outlined { Some(r.array()?) } else { None };
+    let mut body_len = None;
     let request = r.option_u64()?;
     let message = match r.byte()? {
         0 => Message::Ordinary,
@@ -320,7 +472,8 @@ fn preflight(bytes: &[u8], limits: Limits) -> Result<Parsed<'_>> {
     let proposal = if r.boolean()? {
         let header = r.header()?;
         let length = r.count(limits.max_body)?;
-        Some((header, r.take(length)?))
+        body_len = Some(length);
+        Some((header, if outlined { &[] } else { r.take(length)? }))
     } else {
         None
     };
@@ -339,6 +492,8 @@ fn preflight(bytes: &[u8], limits: Limits) -> Result<Parsed<'_>> {
     }
     r.finish()?;
     Ok(Parsed {
+        config,
+        body_len,
         request,
         message,
         outer,
@@ -542,5 +697,57 @@ impl<'a> Reader<'a> {
         let count = self.count(max_members.min(remaining))?;
         let size = count.checked_mul(VOTE_BYTES).ok_or(Error::Invalid)?;
         Ok((kind, count, self.take(size)?))
+    }
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+    const LIMITS: Limits = Limits { max_members: 2, max_body: 4096 };
+    fn request() -> BodyRequest {
+        BodyRequest { token: 7, generation: 9, key: BodyKey {
+            config: [1; 32], height: 3, id: [2; 32],
+        }}
+    }
+    #[test]
+    fn outlined_preserves_exact_header_and_metadata_without_body() {
+        let body = vec![77; 4096];
+        let header = Header { content: ProposalContent {
+            height: 3, round: 5, valid_round: Some(2), id: [3; 32], signer: 1,
+        }, signature: [4; 64] };
+        let frame = Frame { message: Message::Dec, outer: None,
+            proposal: Some(Proposal { header: &header, body: &body }), groups: &[] };
+        let inline = encode_frame(frame, Some(4), LIMITS).unwrap();
+        let bytes = encode_outlined(frame, Some(4), [1; 32], LIMITS).unwrap();
+        assert_eq!(bytes.len() + body.len(), inline.len() + 32);
+        let decoded = decode_outlined(&bytes, LIMITS).unwrap();
+        assert_eq!(decoded.header(), Some(&header));
+        assert_eq!(decoded.body_len, Some(body.len()));
+        decoded.with_body(&body, |f| assert_eq!(encode_frame(f, Some(4), LIMITS).unwrap(), inline));
+        for end in 0..bytes.len() { assert!(decode_outlined(&bytes[..end], LIMITS).is_err()); }
+        let mut extra = bytes.clone(); extra.push(0);
+        assert!(decode_outlined(&extra, LIMITS).is_err());
+        let mut oversized = bytes;
+        // No outer vote: header starts at 46, then its body-length hint.
+        oversized[171..179].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(decode_outlined(&oversized, LIMITS).is_err());
+    }
+    #[test]
+    fn body_records_are_borrowed_exact_and_bounded() {
+        let req = request();
+        let bytes = encode_body_request(req).unwrap();
+        assert_eq!(bytes.len(), BODY_CONTROL_BYTES);
+        assert_eq!(decode_body_request(&bytes).unwrap(), req);
+        assert_eq!(decode_body_ack(&encode_body_ack(req).unwrap()).unwrap(), req);
+        let body = vec![8; LIMITS.max_body];
+        let bytes = encode_body_response(req, &body, LIMITS).unwrap();
+        let (parsed, borrowed) = decode_body_response(&bytes, LIMITS).unwrap();
+        assert_eq!(parsed, req); assert_eq!(borrowed, body);
+        assert_eq!(borrowed.as_ptr(), bytes[BODY_RESPONSE_OVERHEAD..].as_ptr());
+        for end in 0..bytes.len() { assert!(decode_body_response(&bytes[..end], LIMITS).is_err()); }
+        let mut extra = bytes; extra.push(0);
+        assert!(decode_body_response(&extra, LIMITS).is_err());
+        assert!(encode_body_response(req, &vec![8; LIMITS.max_body + 1], LIMITS).is_err());
+        assert!(encode_body_request(BodyRequest { token: 0, ..req }).is_err());
     }
 }

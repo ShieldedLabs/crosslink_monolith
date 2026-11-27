@@ -46,6 +46,9 @@ use std::{
 };
 use zcash_primitives::bft::{BftBlock, PubKeyID};
 
+mod payload;
+pub use payload::{PayloadMetricsSnapshot, PayloadMode};
+
 // The unchanged chain body encodes height as u32, unlike D28's wider counters.
 fn chain_height(height: u64) -> io::Result<u64> {
     u32::try_from(height).map_err(|_| invalid("D28 height exceeds chain u32 domain"))?;
@@ -105,6 +108,7 @@ pub struct OfferedMetrics {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub offered: OfferedMetrics,
+    pub payload: PayloadMetricsSnapshot,
     /// Raw BFT application inbox returned by transport service, before runtime
     /// admission. Transport-internal drops and UDP overhead are not included.
     pub received: MessageCounts,
@@ -130,6 +134,7 @@ pub struct MetricsSnapshot {
 /// message has exactly one outcome, until counter saturation.
 #[derive(Debug, Default)]
 pub struct RuntimeMetrics {
+    payload: payload::AtomicPayloadMetrics,
     hello: AtomicMessageCounts,
     status: AtomicMessageCounts,
     bare_votes: AtomicMessageCounts,
@@ -143,6 +148,7 @@ pub struct RuntimeMetrics {
 impl RuntimeMetrics {
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
+            payload: self.payload.snapshot(),
             offered: OfferedMetrics {
                 hello: self.hello.snapshot(),
                 status: self.status.snapshot(),
@@ -253,6 +259,8 @@ pub struct RuntimeConfig {
     pub active_roster_max_n: usize,
     pub max_members: usize,
     pub max_body: usize,
+    /// Inline remains the production default until outlined profiling is accepted.
+    pub payload_mode: PayloadMode,
     pub rho: u64,
     pub timeouts: Timeouts,
     pub transport: SharedTransport,
@@ -289,6 +297,7 @@ impl RuntimeConfig {
             active_roster_max_n,
             max_members: active_roster_max_n.max(1),
             max_body: crate::PROPOSAL_MAX_SIZE,
+            payload_mode: PayloadMode::Inline,
             rho: 500,
             timeouts: Timeouts {
                 propose: 2_000,
@@ -773,6 +782,9 @@ struct Network {
 }
 impl Network {
     fn new(config: &RuntimeConfig) -> io::Result<Self> {
+        if config.payload_mode != PayloadMode::Inline {
+            return Err(invalid("requested payload transport is not installed"));
+        }
         let handle = config.transport.attach(Consumer::Bft);
         let transport = handle.limits();
         let max_frame = config.limits().max_frame_bytes().map_err(core_error)?;
