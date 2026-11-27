@@ -455,7 +455,7 @@ fn nonresponsive_advertiser_does_not_pin_body_and_late_shards_remain_useful() {
             assert!(n.inject(peer, packet(&tree, &b, auth, i), 703));
         }
     }
-    assert!(n.network.payload.merkle.owned[0].complete);
+    assert!(n.network.payload.merkle.owned[0].complete());
     // Unsolicited old replies need no request token/ACK fence and are idempotent.
     assert!(n.inject(0, packet(&tree, &b, auth, 0), 704));
     n.finish();
@@ -622,7 +622,12 @@ fn global_encoded_budget_is_fixed_across_geometries_counts_pending_and_non_bft_b
 fn full_size_leaf_outgoing_one_and_nonzero_backlog_still_admits() {
     let mut n = Node::proposer(1048576);
     n.config.max_outgoing = 1;
-    let b = vec![19; 1 << 20]; // synthetic sender fixture for the exact size boundary
+    let initial = body(1);
+    let mut block = zcash_primitives::bft::BftBlock::zcash_deserialize(initial.as_slice()).unwrap();
+    // The solution's CompactSize length grows from one to five bytes.
+    block.headers[0].solution = vec![19; (1 << 20) - initial.len() - 4];
+    let b = block.zcash_serialize_to_vec().unwrap();
+    assert_eq!(b.len(), 1 << 20);
     let (tree, auth, _) = n.source(&b, n.header(&b, 0), None);
     let ai = n
         .network
@@ -635,8 +640,7 @@ fn full_size_leaf_outgoing_one_and_nonzero_backlog_still_admits() {
     bitmap.set(0).unwrap();
     let a = &mut n.network.payload.merkle.owned[ai];
     a.inventory = Inventory::Full(tree, bitmap);
-    a.complete = true;
-    a.body = b;
+    a.verified = Some(VerifiedBody::new(n.engine.c(), auth.reference.key(), b, n.config.max_body).unwrap());
     a.local_proposer = true;
     let capacity = n.capacity(u64::MAX, usize::MAX, 100);
     let (push, _) = n.poll_with(0, &capacity, NetworkThreadPush::default());
@@ -747,10 +751,13 @@ fn matching_partial_is_upgraded_in_place_when_core_has_local_body() {
     let h = n.header(&b, 0);
     let (tree, auth, _) = n.source(&b, h, None);
     assert!(n.inject(0, packet(&tree, &b, auth, 0), 0));
+    let allocation = n.network.payload.merkle.owned[0].body.as_ptr();
     n.retain_proposal(&b, h);
     n.poll(1);
     assert_eq!(n.network.payload.merkle.owned.len(), 1);
-    assert!(n.network.payload.merkle.owned[0].complete);
+    assert!(n.network.payload.merkle.owned[0].complete());
+    assert_eq!(n.network.payload.merkle.owned[0].bytes().as_ptr(), allocation);
+    assert_eq!(n.network.payload.merkle.owned[0].body.capacity(), 0);
 }
 #[test]
 fn completed_cache_eviction_and_scope_retirement_are_bounded() {
@@ -931,7 +938,7 @@ fn newer_local_source_replaces_expired_partial_but_same_round_refresh_does_not_c
             .merkle
             .owned
             .iter()
-            .any(|a| a.auth.header == header && a.complete)
+            .any(|a| a.auth.header == header && a.complete())
     );
     let before = n
         .network
@@ -954,4 +961,131 @@ fn newer_local_source_replaces_expired_partial_but_same_round_refresh_does_not_c
             .collect::<Vec<_>>(),
         before
     );
+}
+
+#[test]
+fn completed_owner_moves_allocation_and_repeated_certificates_do_no_body_work() {
+    use crate::d28::checked_body::hash_work;
+    let mut n = Node::new(32768);
+    let b = body(1500);
+    let (tree, auth, _) = n.source(&b, n.header(&b, 0), None);
+    let leaves: Vec<_> = (0..tree.leaf_count())
+        .map(|i| packet(&tree, &b, auth, i as u32))
+        .collect();
+    let outlines: Vec<_> = (1..5).map(|round| n.outline(&b, round).1).collect();
+    assert!(leaves.len() > 1);
+    let hash_before = hash_work();
+    let canonical_before = super::super::CANONICAL_BYTES.with(std::cell::Cell::get);
+    assert!(n.inject(0, leaves[0].clone(), 0));
+    let allocation = n.network.payload.merkle.owned[0].body.as_ptr();
+    for (i, leaf) in leaves.into_iter().enumerate().skip(1) {
+        assert!(n.inject(0, leaf, i as u64));
+    }
+    let owner = &n.network.payload.merkle.owned[0];
+    assert_eq!(owner.bytes().as_ptr(), allocation, "freeze moves rather than copies assembly");
+    assert_eq!(owner.body.capacity(), 0, "no second full-body allocation survives freeze");
+    let hashes = hash_work();
+    assert_eq!(hashes, (hash_before.0 + 1, hash_before.1 + b.len()));
+    let canonical = super::super::CANONICAL_BYTES.with(std::cell::Cell::get);
+    assert_eq!(canonical, canonical_before + b.len());
+    let cached = n.network.payload.cached_body(&n.engine, auth.reference.key()).unwrap();
+    let super::super::CachedBody::Verified(body) = cached else {
+        panic!("the Merkle owner must win over the retained-core copy");
+    };
+    assert_eq!(body.bytes().as_ptr(), allocation);
+    drop(body);
+    for (i, outline) in outlines.iter().enumerate() {
+        for repeat in 0..3 {
+            assert!(n.inject(1, outline.clone(), 100 + (i * 3 + repeat) as u64));
+        }
+    }
+    assert_eq!(hash_work(), hashes, "12 certificate hits must not rehash a body");
+    assert_eq!(super::super::CANONICAL_BYTES.with(std::cell::Cell::get), canonical,
+        "12 certificate hits must not parse or re-encode a canonical body");
+    assert_eq!(n.network.payload.merkle.owned.len(), 1);
+    assert_eq!(n.network.payload.merkle.owned[0].bytes().as_ptr(), allocation);
+    let d = n.engine.view().unwrap();
+    assert_eq!(d.statuses[d.pending.unwrap().proposal.index], Status::Indeterminate);
+    assert_ne!(d.step, Step::Decided, "hash/canonical proofs never supply Host validity");
+    n.finish();
+
+    // Run the same metadata stream through the unoptimized retained-core
+    // fallback. This measures the saved body passes, not network throughput.
+    let mut fallback = Node::new(32768);
+    let inline = wire::encode_frame(Frame {
+        message: Message::Ordinary, outer: None,
+        proposal: Some(Proposal { header: &auth.header, body: &b }), groups: &[],
+    }, None, fallback.config.limits()).unwrap();
+    assert!(fallback.inject(0, inline, 0));
+    let before_hashes = hash_work();
+    let before_canonical = super::super::CANONICAL_BYTES.with(std::cell::Cell::get);
+    for (i, outline) in outlines.iter().enumerate() {
+        for repeat in 0..3 {
+            assert!(fallback.inject(1, outline.clone(), 100 + (i * 3 + repeat) as u64));
+        }
+    }
+    let after_hashes = hash_work();
+    assert_eq!(after_hashes, (before_hashes.0 + 12, before_hashes.1 + 12 * b.len()));
+    assert_eq!(super::super::CANONICAL_BYTES.with(std::cell::Cell::get),
+        before_canonical + 12 * b.len());
+    assert!(fallback.network.payload.merkle.owned.is_empty());
+    eprintln!("checked-body repeat work: body_bytes={}, repeats=12, fallback_hash_bytes={}, cached_hash_bytes=0, fallback_canonical_bytes={}, cached_canonical_bytes=0",
+        b.len(), 12 * b.len(), 12 * b.len());
+}
+
+#[test]
+fn deferred_completed_owner_uses_checked_delivery_and_keeps_rx_budget() {
+    use crate::d28::checked_body::hash_work;
+    let mut n = Node::new(32768);
+    n.config.max_receive_per_tick = 1;
+    let b = body(400);
+    let (tree, auth, _) = n.source(&b, n.header(&b, 0), None);
+    for i in 0..tree.leaf_count() {
+        assert!(n.inject(0, packet(&tree, &b, auth, i as u32), i as u64));
+    }
+    let (_, outline) = n.outline(&b, 1);
+    let evidence = wire::decode_outlined(&outline, n.config.limits()).unwrap();
+    n.network.payload.defer(auth.reference.key(), evidence, 0,
+        n.network.peers[0].generation, &n.config, 20);
+    let hashes = hash_work();
+    let canonical = super::super::CANONICAL_BYTES.with(std::cell::Cell::get);
+    assert_eq!(n.network.complete_cached_payloads(&mut n.engine, &n.config, &mut n.events).unwrap(), 1);
+    assert_eq!(n.network.incoming.in_use(), 0);
+    assert!(n.network.payload.pending.is_empty());
+    assert_eq!(hash_work(), hashes);
+    assert_eq!(super::super::CANONICAL_BYTES.with(std::cell::Cell::get), canonical);
+    let d = n.engine.view().unwrap();
+    assert_eq!(d.statuses[d.pending.unwrap().proposal.index], Status::Indeterminate);
+}
+
+#[test]
+fn checked_cache_hits_still_reject_fresh_bad_headers_certificates_and_scope() {
+    let mut n = Node::new(32768);
+    let b = body(400);
+    let (tree, auth, _) = n.source(&b, n.header(&b, 0), None);
+    for i in 0..tree.leaf_count() {
+        assert!(n.inject(0, packet(&tree, &b, auth, i as u32), i as u64));
+    }
+    let (_, valid) = n.outline(&b, 1);
+    let mut bad_header = valid.clone();
+    bad_header[107] ^= 1;
+    let mut foreign = valid.clone();
+    foreign[2] ^= 1;
+    let bad_certificate = wire::decode_outlined(&valid, n.config.limits()).unwrap()
+        .with_body(&b, |frame| {
+            let mut votes: Vec<_> = frame.groups[0].votes.iter().copied().collect();
+            votes[0].signature[0] ^= 1;
+            let groups = [Group { kind: frame.groups[0].kind, votes: Votes::Dense(&votes) }];
+            wire::encode_outlined(Frame { groups: &groups, ..frame }, None,
+                n.engine.c().hash(), n.config.limits()).unwrap()
+        });
+    let writes = n.engine.storage().writes;
+    for bad in [bad_header, foreign, bad_certificate] {
+        assert!(!n.inject(1, bad, 50));
+        assert_eq!(n.engine.storage().writes, writes);
+        assert!(n.engine.view().unwrap().pending.is_none());
+    }
+    assert!(n.inject(1, valid, 51));
+    assert!(n.engine.view().unwrap().pending.is_some());
+    assert_eq!(n.network.payload.merkle.owned.len(), 1);
 }

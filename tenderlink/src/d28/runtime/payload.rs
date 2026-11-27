@@ -4,12 +4,67 @@ use super::{
     Peer, RuntimeConfig, RuntimeMetrics, Status, Storage, canonical_body, core_error,
     record_conflicts, saturating_add, tolerate_stale, wire,
 };
+use crate::d28::{Config, checked_body::CheckedBody};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use wire::{BodyKey, BodyRequest, DecodedOutlined};
 
 mod merkle;
 pub(super) mod merkle_wire;
+
+/// Canonical chain encoding plus the configured content hash, never Host Valid.
+/// Only existing K Merkle owners retain these handles. Clones used while
+/// delivering metadata share their immutable allocation and expire at turn end.
+#[derive(Clone)]
+struct VerifiedBody(CheckedBody);
+impl VerifiedBody {
+    fn new(c: &Config, key: BodyKey, body: Vec<u8>, max_body: usize) -> Option<Self> {
+        if key.config != c.hash() || !checked_canonical_body(&body, key.height, max_body) {
+            return None;
+        }
+        CheckedBody::new(c, key.height, key.id, body).ok().map(Self)
+    }
+    fn bytes(&self) -> &[u8] {
+        self.0.bytes()
+    }
+}
+
+// Keep the work counter test-local: concurrent tests run on separate threads.
+#[cfg(test)]
+std::thread_local! {
+    static CANONICAL_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+fn checked_canonical_body(body: &[u8], height: u64, max_body: usize) -> bool {
+    #[cfg(test)]
+    CANONICAL_BYTES.with(|count| count.set(count.get() + body.len()));
+    canonical_body(body, height, max_body)
+}
+
+/// One RX permit covers this temporary source. Only a Merkle owner carries a
+/// content proof; the retained-core fallback still copies and fully verifies.
+enum CachedBody {
+    Verified(VerifiedBody),
+    Retained(Vec<u8>),
+}
+impl CachedBody {
+    fn deliver<S: Storage>(
+        &self,
+        evidence: &DecodedOutlined,
+        engine: &mut Engine<S>,
+        events: &mut Events,
+        conflicts: &mut Vec<super::VoteConflict>,
+        config: &RuntimeConfig,
+    ) -> io::Result<bool> {
+        match self {
+            Self::Verified(body) => evidence.with_body(body.bytes(), |frame| {
+                complete_verified(engine, frame, body, events, conflicts, config)
+            }),
+            Self::Retained(body) => evidence.with_body(body, |frame| {
+                complete(engine, frame, events, conflicts, config)
+            }),
+        }
+    }
+}
 
 /// Payload transport is opt-in; ledger bytes, body IDs and signatures do not change.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -173,6 +228,12 @@ pub(super) struct PayloadState {
     serve_cursor: usize,
 }
 impl PayloadState {
+    fn cached_body<S: Storage>(&self, engine: &Engine<S>, key: BodyKey) -> Option<CachedBody> {
+        // Prefer the existing immutable owner even when the same content also
+        // has a core role. No new long-lived body slot/cache is introduced.
+        self.merkle.verified(key).cloned().map(CachedBody::Verified)
+            .or_else(|| retained_body(engine, key).map(|body| CachedBody::Retained(body.to_vec())))
+    }
     pub(super) fn clear(&mut self) {
         self.scope = None;
         self.peers.clear();
@@ -534,12 +595,32 @@ pub(super) fn complete<S: Storage>(
 ) -> io::Result<bool> {
     if frame
         .proposal
-        .is_some_and(|p| !canonical_body(p.body, p.header.content.height, config.max_body))
+        .is_some_and(|p| !checked_canonical_body(p.body, p.header.content.height, config.max_body))
     {
         return Ok(false);
     }
     record_conflicts(engine, frame, conflicts, config.max_members);
     let result = engine.receive(frame, Status::Indeterminate, events);
+    let processed = result.is_ok();
+    tolerate_stale(result)?;
+    Ok(processed)
+}
+
+fn complete_verified<S: Storage>(
+    engine: &mut Engine<S>,
+    frame: Frame<'_>,
+    body: &VerifiedBody,
+    events: &mut Events,
+    conflicts: &mut Vec<super::VoteConflict>,
+    config: &RuntimeConfig,
+) -> io::Result<bool> {
+    if body.bytes().len() > config.max_body {
+        return Ok(false);
+    }
+    record_conflicts(engine, frame, conflicts, config.max_members);
+    // Only immutable content work is reused. The core replaces the frame's
+    // body with this proof's bytes and checks the fresh header and certificates.
+    let result = engine.receive_checked_body(frame, &body.0, events);
     let processed = result.is_ok();
     tolerate_stale(result)?;
     Ok(processed)
@@ -556,27 +637,22 @@ impl Network {
     ) -> io::Result<usize> {
         let mut completed = 0;
         while completed < config.max_receive_per_tick {
-            let Some((index, body)) = self
-                .payload
-                .pending
-                .iter()
-                .enumerate()
-                .find_map(|(i, pending)| retained_body(engine, pending.key)
-                    .or_else(|| self.payload.merkle.body(pending.key)).map(|body| (i, body)))
-            else {
+            let Some(index) = self.payload.pending.iter().position(|pending| {
+                self.payload.merkle.verified(pending.key).is_some()
+                    || retained_body(engine, pending.key).is_some()
+            }) else {
                 break;
             };
             let Some(_permit) = self.incoming.try_acquire() else {
                 break;
             };
-            let body = body.to_vec();
+            // Acquire before a possible retained-core fallback body copy.
             let pending = self.payload.pending.remove(index);
+            let body = self.payload.cached_body(engine, pending.key).expect("located body");
             if let Some(metrics) = &config.metrics {
                 metrics.payload.cache(true);
             }
-            pending.evidence.with_body(&body, |frame| {
-                complete(engine, frame, events, &mut self.conflicts, config)
-            })?;
+            body.deliver(&pending.evidence, engine, events, &mut self.conflicts, config)?;
             completed += 1;
         }
         Ok(completed)
@@ -629,13 +705,10 @@ impl Network {
                     height: d.height,
                     id: header.content.id,
                 };
-                if let Some(body) = retained_body(engine, key).or_else(|| self.payload.merkle.body(key)) {
+                if let Some(body) = self.payload.cached_body(engine, key) {
                     if let Some(metrics) = &config.metrics {
                         metrics.payload.cache(true);
                     }
-                    // One temporary RX body copy, under the existing incoming
-                    // permit; the core still verifies the hash/header/certificates.
-                    let body = body.to_vec();
                     let evidence = if let Some(index) =
                         self.payload.pending.iter().position(|p| p.key == key)
                     {
@@ -648,9 +721,7 @@ impl Network {
                     } else {
                         evidence
                     };
-                    return evidence.with_body(&body, |f| {
-                        complete(engine, f, events, &mut self.conflicts, config)
-                    });
+                    return body.deliver(&evidence, engine, events, &mut self.conflicts, config);
                 }
                 if let Some(metrics) = &config.metrics {
                     metrics.payload.cache(false);
