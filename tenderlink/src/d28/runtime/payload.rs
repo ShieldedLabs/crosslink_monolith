@@ -2,7 +2,7 @@
 use super::{
     AtomicMessageCounts, Engine, Error, Events, Frame, MessageCounts, Network, NetworkThreadPush,
     Peer, RuntimeConfig, RuntimeMetrics, Status, Storage, canonical_body, core_error,
-    record_conflicts, saturating_add, tolerate_stale, wire,
+    record_conflicts, saturating_add, tolerate_stale, measure, wire,
 };
 use crate::d28::{Config, checked_body::CheckedBody};
 use std::io;
@@ -595,12 +595,16 @@ pub(super) fn complete<S: Storage>(
 ) -> io::Result<bool> {
     if frame
         .proposal
-        .is_some_and(|p| !checked_canonical_body(p.body, p.header.content.height, config.max_body))
+        .is_some_and(|p| !measure(config.metrics.as_ref().map(|m| &m.body_check), || {
+            checked_canonical_body(p.body, p.header.content.height, config.max_body)
+        }))
     {
         return Ok(false);
     }
     record_conflicts(engine, frame, conflicts, config.max_members);
-    let result = engine.receive(frame, Status::Indeterminate, events);
+    let result = measure(config.metrics.as_ref().map(|m| &m.core_receive), || {
+        engine.receive(frame, Status::Indeterminate, events)
+    });
     let processed = result.is_ok();
     tolerate_stale(result)?;
     Ok(processed)
@@ -620,7 +624,9 @@ fn complete_verified<S: Storage>(
     record_conflicts(engine, frame, conflicts, config.max_members);
     // Only immutable content work is reused. The core replaces the frame's
     // body with this proof's bytes and checks the fresh header and certificates.
-    let result = engine.receive_checked_body(frame, &body.0, events);
+    let result = measure(config.metrics.as_ref().map(|m| &m.core_receive), || {
+        engine.receive_checked_body(frame, &body.0, events)
+    });
     let processed = result.is_ok();
     tolerate_stale(result)?;
     Ok(processed)
@@ -668,6 +674,7 @@ impl Network {
         bytes: &[u8],
         now: u64,
     ) -> io::Result<bool> {
+        let _timer = config.metrics.as_ref().map(|m| m.payload_receive.start());
         if config.payload_mode == PayloadMode::Inline {
             return Ok(false);
         }

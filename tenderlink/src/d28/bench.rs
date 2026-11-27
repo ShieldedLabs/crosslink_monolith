@@ -363,6 +363,10 @@ pub struct CounterSnapshot {
     pub transport: BTreeMap<String, u64>,
     pub store_replacements: u64,
     pub store_replacement_bytes: u64,
+    /// Linux network-namespace-wide UDP6, VM-global on the distributed runner.
+    /// Includes unrelated sockets; NOT STP-only. Missing fields stay absent.
+    pub kernel_udp6: Option<BTreeMap<String, u64>>,
+    pub kernel_udp6_error: Option<String>,
     pub loopback: Option<LoopbackCounters>,
     pub tc: Option<TcCounters>,
     pub tc_error: Option<String>,
@@ -374,6 +378,9 @@ pub struct CounterWindow {
     pub end: CounterSnapshot,
     pub application_delta: BTreeMap<String, u64>,
     pub transport_delta: BTreeMap<String, u64>,
+    /// Only fields observed at both ends with nondecreasing values; unavailable
+    /// or reset counters are absent, never inferred to be zero.
+    pub kernel_udp6_delta: Option<BTreeMap<String, u64>>,
     pub store_replacements: u64,
     pub store_replacement_bytes: u64,
 }
@@ -576,6 +583,33 @@ impl AtomicBlockStore for MemoryBackend {
     }
 }
 
+fn parse_kernel_udp6(text: &str) -> io::Result<BTreeMap<String, u64>> {
+    const FIELDS: [&str; 6] = [
+        "Udp6InDatagrams", "Udp6OutDatagrams", "Udp6RcvbufErrors",
+        "Udp6SndbufErrors", "Udp6InErrors", "Udp6NoPorts",
+    ];
+    let mut counters = BTreeMap::new();
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        let Some(name) = words.next() else { continue };
+        if !FIELDS.contains(&name) { continue; }
+        let value = words.next().and_then(|n| n.parse::<u64>().ok())
+            .ok_or_else(|| invalid(format!("invalid /proc/net/snmp6 {name}")))?;
+        if words.next().is_some() || counters.insert(name.to_owned(), value).is_some() {
+            return Err(invalid(format!("duplicate or extra /proc/net/snmp6 {name}")));
+        }
+    }
+    if counters.is_empty() { return Err(invalid("/proc/net/snmp6 has no UDP6 counters")); }
+    Ok(counters)
+}
+fn kernel_udp6_delta(
+    end: Option<&BTreeMap<String, u64>>, start: Option<&BTreeMap<String, u64>>,
+) -> Option<BTreeMap<String, u64>> {
+    let (end, start) = (end?, start?);
+    Some(end.iter().filter_map(|(name, value)| {
+        Some((name.clone(), value.checked_sub(*start.get(name)?)?))
+    }).collect())
+}
 fn parse_loopback(text: &str) -> io::Result<LoopbackCounters> {
     let line = text
         .lines()
@@ -723,45 +757,7 @@ impl Sampler {
         let mut out = BTreeMap::new();
         for metrics in &self.metrics {
             let snapshot = metrics.snapshot();
-            for (name, count) in [
-                ("offered.hello", snapshot.offered.hello),
-                ("offered.status", snapshot.offered.status),
-                ("offered.bare_votes", snapshot.offered.bare_votes),
-                ("offered.evidence", snapshot.offered.evidence),
-                ("payload.offered_control", snapshot.payload.offered_control),
-                ("payload.offered_data", snapshot.payload.offered_data),
-                ("received", snapshot.received),
-                ("processed", snapshot.processed),
-                ("rejected", snapshot.rejected),
-                (
-                    "scheduler_budget_discarded",
-                    snapshot.scheduler_budget_discarded,
-                ),
-            ] {
-                *out.entry(format!("{name}.messages")).or_default() += count.messages;
-                *out.entry(format!("{name}.bytes")).or_default() += count.bytes;
-            }
-            *out.entry("offered.status_request_messages".into())
-                .or_default() += snapshot.offered.status_request_messages;
-            // Subset metrics, not additional traffic: raw bodies are already in
-            // inline evidence or outlined data; outlined metadata is in evidence.
-            for (name, value) in [
-                ("body_cache_hits", snapshot.payload.body_cache_hits),
-                ("body_cache_misses", snapshot.payload.body_cache_misses),
-                ("body_requests", snapshot.payload.body_requests),
-                ("body_responses", snapshot.payload.body_responses),
-                ("payload_bytes", snapshot.payload.payload_bytes),
-                ("duplicate_payload_bytes", snapshot.payload.duplicate_payload_bytes),
-                ("outlined_evidence_bytes", snapshot.payload.outlined_evidence_bytes),
-                ("leaf_requests", snapshot.payload.leaf_requests),
-                ("leaf_responses", snapshot.payload.leaf_responses),
-                ("leaf_proof_bytes", snapshot.payload.leaf_proof_bytes),
-                ("availability_bytes", snapshot.payload.availability_bytes),
-                ("verified_leaf_bytes", snapshot.payload.verified_leaf_bytes),
-                ("assembly_completions", snapshot.payload.assembly_completions),
-            ] {
-                *out.entry(format!("payload.{name}")).or_default() += value;
-            }
+            add_application_snapshot(&mut out, snapshot);
         }
         out
     }
@@ -786,11 +782,18 @@ impl Sampler {
                 .iter()
                 .map(|s| s.bytes.load(Ordering::Relaxed))
                 .sum(),
+            kernel_udp6: None,
+            kernel_udp6_error: None,
             loopback: None,
             tc: None,
             tc_error: None,
             tc_timed_out: false,
         };
+        match std::fs::read_to_string("/proc/net/snmp6")
+            .and_then(|text| parse_kernel_udp6(&text)) {
+            Ok(counters) => result.kernel_udp6 = Some(counters),
+            Err(error) => result.kernel_udp6_error = Some(error.to_string()),
+        }
         if self.scope.is_some() {
             result.loopback = Some(parse_loopback(&std::fs::read_to_string("/proc/net/dev")?)?);
             match bounded_output(
@@ -811,6 +814,75 @@ impl Sampler {
         }
         result.sampling_duration_ms = milliseconds(at.elapsed());
         Ok(result)
+    }
+}
+// Aggregate with saturation too: sharing a handle or summing runtimes must not
+// wrap even when an individual cumulative counter has already saturated.
+fn add_counter(out: &mut BTreeMap<String, u64>, name: String, value: u64) {
+    let total = out.entry(name).or_default();
+    *total = total.saturating_add(value);
+}
+fn add_application_snapshot(out: &mut BTreeMap<String, u64>, snapshot: runtime::MetricsSnapshot) {
+    for (name, count) in [
+        ("offered.hello", snapshot.offered.hello),
+        ("offered.status", snapshot.offered.status),
+        ("offered.bare_votes", snapshot.offered.bare_votes),
+        ("offered.evidence", snapshot.offered.evidence),
+        ("payload.offered_control", snapshot.payload.offered_control),
+        ("payload.offered_data", snapshot.payload.offered_data),
+        ("received", snapshot.received),
+        ("processed", snapshot.processed),
+        ("rejected", snapshot.rejected),
+        (
+            "scheduler_budget_discarded",
+            snapshot.scheduler_budget_discarded,
+        ),
+    ] {
+        add_counter(out, format!("{name}.messages"), count.messages);
+        add_counter(out, format!("{name}.bytes"), count.bytes);
+    }
+    add_counter(out, "offered.status_request_messages".into(), snapshot.offered.status_request_messages);
+    // Subset metrics, not additional traffic: raw bodies are already in
+    // inline evidence or outlined data; outlined metadata is in evidence.
+    for (name, value) in [
+        ("body_cache_hits", snapshot.payload.body_cache_hits),
+        ("body_cache_misses", snapshot.payload.body_cache_misses),
+        ("body_requests", snapshot.payload.body_requests),
+        ("body_responses", snapshot.payload.body_responses),
+        ("payload_bytes", snapshot.payload.payload_bytes),
+        ("duplicate_payload_bytes", snapshot.payload.duplicate_payload_bytes),
+        ("outlined_evidence_bytes", snapshot.payload.outlined_evidence_bytes),
+        ("leaf_requests", snapshot.payload.leaf_requests),
+        ("leaf_responses", snapshot.payload.leaf_responses),
+        ("leaf_proof_bytes", snapshot.payload.leaf_proof_bytes),
+        ("availability_bytes", snapshot.payload.availability_bytes),
+        ("verified_leaf_bytes", snapshot.payload.verified_leaf_bytes),
+        ("assembly_completions", snapshot.payload.assembly_completions),
+    ] {
+        add_counter(out, format!("payload.{name}"), value);
+    }
+    // Inclusive monotonic wall samples, not CPU and not additive phase costs.
+    for (name, phase) in [
+        ("runtime.network_receive", snapshot.phases.network_receive),
+        ("runtime.network_exchange", snapshot.phases.network_exchange),
+        ("runtime.transport_service", snapshot.phases.transport_service),
+        ("runtime.payload_receive", snapshot.phases.payload_receive),
+        ("runtime.payload_offer", snapshot.phases.payload_offer),
+        ("runtime.body_check", snapshot.phases.body_check),
+        ("runtime.host_schedule", snapshot.phases.host_schedule),
+        ("runtime.host_poll", snapshot.phases.host_poll),
+        ("runtime.host_propose_completed", snapshot.phases.host_propose_completed),
+        ("runtime.host_validate_completed", snapshot.phases.host_validate_completed),
+        ("runtime.core_receive", snapshot.phases.core_receive),
+        ("runtime.core_timer", snapshot.phases.core_timer),
+        ("runtime.core_host_completion", snapshot.phases.core_host_completion),
+        ("runtime.core_checkpoint", snapshot.phases.core_checkpoint),
+        ("durable.image_encode", snapshot.durable.image_encode),
+        ("durable.image_checksum", snapshot.durable.image_checksum),
+        ("durable.backend_replace", snapshot.durable.backend_replace),
+    ] {
+        add_counter(out, format!("{name}.calls"), phase.calls);
+        add_counter(out, format!("{name}.wall_ns"), phase.wall_ns);
     }
 }
 fn add_transport(out: &mut BTreeMap<String, u64>, value: TransportStats) {
@@ -850,6 +922,7 @@ fn counter_window(start: &CounterSnapshot, end: &CounterSnapshot) -> CounterWind
         end: end.clone(),
         application_delta: map_delta(&end.application, &start.application),
         transport_delta: map_delta(&end.transport, &start.transport),
+        kernel_udp6_delta: kernel_udp6_delta(end.kernel_udp6.as_ref(), start.kernel_udp6.as_ref()),
         store_replacements: end
             .store_replacements
             .saturating_sub(start.store_replacements),
@@ -1585,6 +1658,59 @@ mod tests {
                                   ..Default::default() }.validate().is_err());
         }
     }
+    #[test]
+    fn phase_snapshot_flattens_zero_saturates_and_differences() {
+        let mut before = BTreeMap::new();
+        add_application_snapshot(&mut before, runtime::MetricsSnapshot::default());
+        for name in ["runtime.network_receive", "runtime.network_exchange", "runtime.transport_service", "runtime.payload_receive", "runtime.payload_offer", "runtime.body_check", "runtime.host_schedule", "runtime.host_poll", "runtime.host_propose_completed", "runtime.host_validate_completed", "runtime.core_receive", "runtime.core_timer", "runtime.core_host_completion", "runtime.core_checkpoint", "durable.image_encode", "durable.image_checksum", "durable.backend_replace"] {
+            assert_eq!(before.get(&format!("{name}.calls")), Some(&0));
+            assert_eq!(before.get(&format!("{name}.wall_ns")), Some(&0));
+        }
+        let mut sample = runtime::MetricsSnapshot::default();
+        sample.phases.network_receive = runtime::WallTimeSnapshot { calls: 2, wall_ns: 31 };
+        sample.phases.core_receive = runtime::WallTimeSnapshot { calls: 1, wall_ns: 17 };
+        sample.durable.image_encode = runtime::WallTimeSnapshot { calls: 1, wall_ns: 11 };
+        sample.durable.image_checksum = runtime::WallTimeSnapshot { calls: 1, wall_ns: 7 };
+        sample.durable.backend_replace = runtime::WallTimeSnapshot { calls: 1, wall_ns: 3 };
+        let mut after = before.clone();
+        add_application_snapshot(&mut after, sample);
+        let delta = map_delta(&after, &before);
+        assert_eq!(delta["runtime.network_receive.calls"], 2);
+        assert_eq!(delta["runtime.network_receive.wall_ns"], 31);
+        assert_eq!(delta["runtime.core_receive.wall_ns"], 17);
+        assert_eq!(delta["durable.image_encode.wall_ns"], 11);
+        assert_eq!(delta["durable.image_checksum.wall_ns"], 7);
+        assert_eq!(delta["durable.backend_replace.wall_ns"], 3);
+        add_application_snapshot(&mut after, sample);
+        assert_eq!(map_delta(&after, &before)["durable.backend_replace.calls"], 2);
+        sample.phases.network_receive = runtime::WallTimeSnapshot { calls: u64::MAX, wall_ns: u64::MAX };
+        sample.received = runtime::MessageCounts { messages: u64::MAX, bytes: u64::MAX };
+        add_application_snapshot(&mut after, sample);
+        add_application_snapshot(&mut after, sample);
+        for name in ["runtime.network_receive.calls", "runtime.network_receive.wall_ns", "received.messages", "received.bytes"] {
+            assert_eq!(after[name], u64::MAX);
+        }
+    }
+
+    #[test]
+    fn kernel_udp6_keeps_missing_invalid_and_reset_counters_distinct_from_zero() {
+        let before = parse_kernel_udp6("Ip6InReceives 12\nUdp6InDatagrams 8\nUdp6OutDatagrams 9\nUdp6RcvbufErrors 2\n").unwrap();
+        assert_eq!(before.len(), 3);
+        assert!(!before.contains_key("Udp6SndbufErrors"));
+        let after = parse_kernel_udp6("Udp6InDatagrams 11\nUdp6OutDatagrams 1\nUdp6RcvbufErrors 2\nUdp6NoPorts 4\n").unwrap();
+        let delta = kernel_udp6_delta(Some(&after), Some(&before)).unwrap();
+        assert_eq!(delta.len(), 2);
+        assert_eq!(delta["Udp6InDatagrams"], 3);
+        assert_eq!(delta["Udp6RcvbufErrors"], 0);
+        assert!(!delta.contains_key("Udp6OutDatagrams"));
+        assert!(!delta.contains_key("Udp6NoPorts"));
+        assert_eq!(kernel_udp6_delta(None, Some(&before)), None);
+        assert_eq!(kernel_udp6_delta(Some(&after), None), None);
+        for invalid in ["", "Ip6InReceives 1", "Udp6InErrors nope", "Udp6InErrors 1 2", "Udp6InErrors 1\nUdp6InErrors 2"] {
+            assert!(parse_kernel_udp6(invalid).is_err());
+        }
+    }
+
     #[test]
     fn payload_snapshot_retains_all_counters_without_combining_subsets() {
         let sampler = Sampler { observers: vec![], stores: vec![], scope: None,
