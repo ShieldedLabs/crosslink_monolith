@@ -944,3 +944,226 @@ Root: `/var/tmp/d28-payload-20261127/`.
 The local cleanup receipt confirms all owned children/worker threads stopped and
 the temporary token removed. No benchmark processes remain and no Fly resources
 were created for either payload comparison.
+
+## Unordered authenticated shards — 2026-11-27
+
+This implementation replaces the historical ACK-gated experiment above, rather
+than tuning its batch window. Only the proposer proactively pushes: independent
+shuffled passes cover each connected peer without replacement. Receivers advertise
+verified possession and randomly request missing indices from advertising peers.
+Retries have independent 250–500 ms clocks; when alternatives exist, a retry avoids
+its previous source. A 200 ms initial-progress grace avoids immediately racing
+healthy initial delivery. No remote shard ACK releases application credit, and no
+batch-completion or transport-empty barrier gates unrelated shards.
+
+Every shard includes the original proposer's BFT-only commitment to the exact
+header, consensus context, Merkle root and geometry, plus its proof path. Its
+32-bit index is the first shard field after the two-byte tag/version and is bound
+by the leaf hash. Partial receivers can relay verified leaves with the original
+proposer proof. The reconstructed body must still pass the existing canonical
+encoding, chain body-ID, certificate and Host checks. These transport signatures
+are not a replacement for chain-facing signatures or validity.
+
+For an exact 10-MiB body, the **new** wire geometry is:
+
+| Shard size | Leaves | Availability bitmap | Proof per shard | Shard envelope plus proof | Full HAVE record |
+|---|---:|---:|---:|---:|---:|
+| 32 KiB | 320 | 40 B | 288 B | 663 B | 411 B |
+| 100 KiB | 103 | 13 B | 224 B | 599 B | 384 B |
+| 256 KiB | 40 | 5 B | 192 B | 567 B | 376 B |
+| 1 MiB | 10 | 2 B | 128 B | 503 B | 373 B |
+
+Envelope sizes exclude shard data and STP/UDP/IP overhead. These are not the
+historical holder-only HAVE sizes in the preceding experiment.
+
+### Bounds and 100-KiB-only tuning
+
+Partial assemblies and completed caches share two additional body owners, separate
+from the consensus core's three physical body slots. Per-peer inventories and
+send histories contain bitmaps, not body copies. Useful content can survive round
+changes, but finite cache ownership cannot retain every proposal ever observed.
+Random selection does not guarantee recovery without an honest available source
+and eventual useful delivery.
+
+All shard-size arms use the same 10-MiB body cap, `max_requests=max_outgoing=2`,
+**21,397,220-byte** encoded Merkle admission ceiling, 256 staged-message ceiling,
+and 24 shard offers per service call. Admission charges observed transport backlog
+and already staged frames, then observes native STP byte/slot headroom. These are
+local admission/service bounds, not remote-ACK windows, equal byte-rate shaping,
+or a whole-runtime/STP memory proof. In particular, a fixed messages-per-call cap
+still allows different potential bytes per call at different shard sizes.
+
+Optimization used only 100-KiB shards and seven separate localhost processes.
+The initial `economy`, `baseline` and `fast` gates all completed in round zero.
+A subsequent isolated receive-budget comparison held polling at 25 ms and status
+at 100 ms: raising the receive budget from 32 to 128 (`balanced`) removed **1,312
+receive-budget discards** across six measured heights, versus zero with balanced.
+Observed throughput was 1.311 versus 1.302 MiB/s; this is not a demonstrated speed
+improvement. Balanced was selected to avoid clean-link discards, without a material
+observed throughput regression. All other production defaults remain unchanged.
+
+A 49-Hz userspace CPU profile, including startup/warmup, found 37.56% self samples
+in BLAKE3's AVX2 hash routine. Incomplete stack unwinding prevents assigning all
+those samples to durable storage. The old image encoder nevertheless demonstrably
+zeroed bytes immediately before overwriting them. The narrow optimization clears
+only the unused tail; full-image hashing and atomic replacement remain unchanged.
+Two differential tests compare complete output with the original encoder, including
+dirty/reused buffers, shrink/clear transitions and three 10-MiB bodies. This is not
+a storage-format redesign, removal of durability, or a benchmark-only bypass.
+
+The 100-KiB A/B/B/A encoder comparison completed all 12 measured heights in round
+zero without receive-budget discards. It **did not demonstrate a latency or
+throughput improvement**: original versus tail-zero pooled throughput was 1.366
+versus 1.278 MiB/s; first-receipt p50 was 6.394 versus 6.915 seconds. Aggregate
+process CPU was 52.027 versus 51.885 seconds per height. Only six measured heights
+per encoder were collected on a shared host. The tiny byte-identical change is
+retained for eliminating provably redundant zero writes, not as an established
+speedup. Both executables and every exploratory result are retained.
+
+### Frozen comparison methodology and reproduction
+
+The primary comparison uses seven separate localhost processes, exact 10-MiB
+bodies, a fixed 10-MiB capacity, one executor worker per validator, `balanced`
+host service and unchanged benchmark `wan` timers. The same executable runs all
+five arms. Three repetitions interleave outlined whole-body transfer with the
+four shard sizes, using seed 428 for trial ordering only; protocol randomness is
+OS-seeded. Each trial has one warmup and seven measured heights, a 300-second
+deadline and a separate two-second final-height hold. The plan has 15 trials and
+105 measured heights; failures are retained, not retried or excluded.
+
+Latency to the first certificate-backed decision report at the controller and
+node-local callback latency are separate quantities. Chain throughput counts
+one body per all-online-ACKed height, including stalled measured time. A small
+sample does not establish stable p95/p99 tails. Total application bytes sum six
+disjoint categories: hello, status, bare votes, evidence, payload control and
+payload data. Raw body bytes, proof bytes and HAVE bytes are subsets, never added
+again. Local shared-loopback counters cannot be attributed to separate machines:
+**there is no aggregate STP/UDP/IP wire-byte measurement or WAN capacity claim**.
+
+```sh
+cargo build --offline --locked --release --features bench \
+  --manifest-path tenderlink/Cargo.toml --bin d28_bench
+unset D28_LEAF_TRACE
+python3 -B tenderlink/benchmarks/d28_fly.py local \
+  --binary "$PWD/tenderlink/target/release/d28_bench" \
+  --out /var/tmp/d28-unordered-new --nodes 7 \
+  --body-bytes 10485760 --max-body 10485760 \
+  --payload-modes outlined,merkle \
+  --payload-leaf-bytes 32768,102400,262144,1048576 \
+  --interleave-payload-modes --profiles balanced --timing-profile wan \
+  --repetitions 3 --heights 7 --warmup 1 --timeout-secs 300 \
+  --chatter-secs 2 --lifetime-secs 6000 --seed 428
+```
+
+The selected code is `a0351df70f6e7ccba610e05526cd0cff4bc79c79`. Before measurement,
+**359 optimized Rust tests** passed with seed 428 (five existing ignored tests,
+unbounded legacy `single_rt` excluded), plus the non-benchmark release library
+check, optimized benchmark build, and **46 Python checks including real-process
+integration tests**. Production defaults still use inline transfer; PoW/ledger
+formats and chain-facing signatures are unchanged.
+
+Artifacts are under `/var/tmp/d28-shards-20261127/`:
+
+- Plans, source/binary pins and verification: `plan.json`, `primary-design.json`,
+  `primary-preflight.json`, `final-verification.log`.
+- Optimization: `100k-gate-001/`, `100k-host-profiles/`, `100k-perf-001/`,
+  `100k-balanced/`, `100k-encoder-{original-a1,tail-zero-b1,tail-zero-b2,original-a2}/`.
+- Primary: `frozen-primary/campaign/`; separate availability gate: `100k-offline/`.
+- Exact executable: `d28_bench-a0351df70`, SHA-256
+  `921a5068a2013c711eaa8f5ca84ad4bf627b6ea4d4fb1461eebe3e13461032b0`.
+- Runner SHA-256:
+  `e7ca55ab9b99a97200b7a28d49f800a1c8723de6ee3047d52bb4ae6305593305`.
+
+### Frozen primary results
+
+All **12 Merkle trials completed**, covering 84/84 measured heights, every one in
+round zero. The outlined control completed one trial and timed out in two, for
+17/21 measured heights. Overall, 13/15 trials completed and 101/105 measured
+heights were ACKed. Both partials remain in the table and throughput denominator;
+no arm was retried. The campaign correctly exited nonzero for those partials.
+
+| Transfer | Complete / trials | Measured heights | First receipt p50 / p95 s | Chain MiB/s | Raw payload / chain bytes | All application / chain bytes |
+|---|---:|---:|---:|---:|---:|---:|
+| 32-KiB shards | 3/3 | 21/21 | 10.83 / 11.66 | 0.895 | 6.001× | 6.253× |
+| **100-KiB shards** | **3/3** | **21/21** | **7.02 / 8.41** | **1.270** | **6.000×** | **6.103×** |
+| 256-KiB shards | 3/3 | 21/21 | 8.04 / 8.43 | 1.165 | 6.402× | 6.498× |
+| 1-MiB shards | 3/3 | 21/21 | 5.99 / 6.90 | 1.510 | 11.652× | 11.711× |
+| Outlined whole body | 1/3 | 17/21 | 46.25 / 72.31 | 0.217 | 16.706× | 16.974× |
+
+Outlined receipt percentiles include only its 17 completed measured heights, not
+the four censored heights. Its two partial trials each ACKed five of seven
+measured heights after warmup. Measured controller durations were 268.295 and
+270.694 seconds, ending at the whole-process 300-second deadline; warmup is not
+silently added to measured time. Every completed outlined height used a later
+round: eight in round 1, eight in round 2 and one in round 3. This is the current
+whole-body implementation's result, not a lower bound for an ideal outlined
+protocol.
+
+The **100-KiB arm is the best observed bandwidth tradeoff**, not a universal
+optimal leaf size. Its raw payload offers were exactly the six copies needed for
+six other validators. Signatures, proofs and all control traffic took the total
+to 6.103×, about 1.7% above that raw replication minimum. It made zero leaf repair
+requests in the measured windows. This application accounting does not include
+STP FEC, retransmissions, framing, UDP/IP or padding.
+
+One-MiB shards bought **19.0% more throughput** than 100-KiB shards, at **91.9% more
+application bytes**. They recorded 1,906 requested indices and 2,447 leaf offers,
+versus 1,260 offers for one six-recipient pass across 21 bodies. Known repeated
+same-peer offers were 430 MiB, but that counter is not a complete cross-peer or
+cross-proposal duplicate detector. The fixed 100-KiB-tuned repair policy was not
+retuned for larger shards. Counters show redundancy; they do not trace every
+request to a particular delayed or lost STP message.
+
+All primary arms reported zero runtime receive-budget discards and zero exposed
+wrapper/native-ring drop/refusal counters. Normal receive rejections still
+occurred; these counters do not mean zero stale or invalid messages. Process and
+storage work remain substantial:
+
+| Transfer | Aggregate process CPU s / height | Image replacement GiB / height | Peak process RSS MiB |
+|---|---:|---:|---:|
+| 32-KiB shards | 76.28 | 26.92 | 141.97 |
+| 100-KiB shards | 53.44 | 16.10 | 144.47 |
+| 256-KiB shards | 61.71 | 19.42 | 149.59 |
+| 1-MiB shards | 48.52 | 14.76 | 169.22 |
+| Outlined whole body | 304.23 | 113.03 | 167.41 |
+
+CPU is summed across seven processes; image work is serialization/hash/copy work,
+not disk traffic. RSS is a process-lifetime high-water mark, not seven-process
+aggregate or a measured-window allocation delta. The fixed per-call message cap,
+CPU contention and repeated durable-image work remain part of this implementation
+comparison; the table does not isolate pure Merkle geometry or remote capacity.
+
+Separate final-height holds had no Merkle payload-data offers but continued
+application control traffic: **139–152 KiB/s aggregate** across the four shard
+arms. These use actual per-node hold durations, not requested seconds. They are
+unfinished-height holds, not quiescent idle-wire measurements. Outlined hold
+coverage is only 1/3 trials and is not silently pooled as three zero-traffic holds.
+
+### Two-offline availability gate and cleanup
+
+A separate 100-KiB, seven-identity run with two validators offline completed all
+seven measured heights, with five online validators agreeing on every decision.
+Raw payload offers were 4.015× chain bytes and all application offers were 4.093×,
+against a four-other-online-validator replication minimum. It issued 12 requested
+leaf indices and recorded zero receive-budget discards. First-receipt p50 was
+5.981 seconds; throughput was 0.750 MiB/s. Heights 5 and 6 required rounds 2 and 1,
+with first receipts at 41.587 and 22.264 seconds; other measured heights used
+round zero. This tests unavailable proposers and fallback, **not random packet
+loss or a malicious-validator testnet**. Deterministic unit tests separately cover
+dropped/reordered/duplicate leaves, nonresponsive advertisers, partial relaying,
+independent retries, authenticated indices and bounded ownership.
+
+All primary and offline-gate local cleanup receipts confirm owned child and
+worker-thread termination and temporary-token removal. No `d28_bench` processes
+remained after the sweep. No Fly resources were created. Exact originals and
+partial trials are retained, with the concise derived table in
+`primary-analysis.json`; no benchmark inputs were replaced by summaries.
+
+An independent audit recomputed endpoint deltas, controller/node decisions,
+percentiles, matched coverage, timeout denominators and cleanup from originals,
+without importing the runner: **41,374 checks, zero errors**, with **1,522 input
+SHA-256s unchanged**. It verified all 105 node reports and 90 worker-original
+copies, including the two partial trials. This is an artifact/accounting audit,
+not a fresh cryptographic or production-security audit. Receipt:
+`primary-independent-audit.json`, SHA-256
+`0d2494a6d93e08467541a28487464cb9241c6c9e007a9593852b4954d153f221`.
