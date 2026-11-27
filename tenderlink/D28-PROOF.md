@@ -1216,6 +1216,32 @@ STP-bridge scheduler/admission guarantee, a deployment memory bound, a physical
 WAL/backend, or a stronger wall-clock theorem. The old sender-selected Guided
 and Reference/CompactLive results remain separate and unchanged.
 
+### Outlined payloads and the complete-processing boundary
+
+A body reference is not complete evidence. Splitting an `Engine::serve` frame
+into signed-header/certificate metadata and a separately fetched body does not
+change the PULL(C) boundary above: the receiver must reconstruct, verify and
+process the complete logical frame. Discovery, retries, source retirement,
+assembly and body validation all count toward that service obligation. A
+reference, possession bitmap, Merkle proof or payload acknowledgement alone
+cannot establish it.
+
+The existing proposal header, keyed chain body ID, certificates and host-validity
+checks remain authoritative. A transport-only Merkle root is not the chain body
+ID; even a signed root claim requires final reconstruction and verification of
+the existing body ID and canonical bytes before normal core/host processing.
+No transport acknowledgement grants `Status::Valid`.
+
+Reference metadata needs its own global fixed-slot bound; retaining a dense
+certificate per peer would reintroduce O(N^2) backing storage. Payload attempts
+and outgoing ownership are separate from the one-off evidence request tokens.
+Retired height/configuration/session state must not be revived by late bytes.
+Useful current-scope late data may satisfy an already bounded interest; a token
+is a scheduling correlation, not a substitute for content verification. Bytes
+already handed to STP retain STP's independent ownership bounds and cannot be
+recalled merely by dropping an application lease. The complete-frame theorem
+therefore does not, by itself, prove either outlined or chunked acquisition live.
+
 ## Persistence and memory are separate contracts
 
 `AtomicBlockStore` is the fixed-size atomic replacement API. `durable.rs` now
