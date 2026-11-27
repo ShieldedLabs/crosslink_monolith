@@ -57,6 +57,9 @@ use shielded_transport_pigeon::stp::{
     new_pump_with_options,
 };
 
+#[cfg(feature = "bench")]
+pub(crate) mod protocol;
+
 /// Advisory send capacity for one connected peer and channel.
 ///
 /// `backlog_bytes` includes local outbox bytes and STP's remaining planned-send
@@ -318,6 +321,8 @@ pub struct NetworkThreadHandle {
     pending_connects: VecDeque<STPAddress>,
     stats: TransportStats,
     flush_cursor: usize,
+    #[cfg(feature = "bench")]
+    protocol_request: Option<protocol::Request>,
 }
 
 impl Drop for NetworkThreadHandle {
@@ -833,6 +838,8 @@ impl NetworkThreadHandle {
             pending_connects: VecDeque::new(),
             stats: TransportStats::default(),
             flush_cursor: 0,
+            #[cfg(feature = "bench")]
+            protocol_request: None,
         };
         (handle, pump)
     }

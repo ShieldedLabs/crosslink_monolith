@@ -594,6 +594,8 @@ pub struct DistributedReport {
     pub process_end: SystemSnapshot,
     pub runtime_settings: BTreeMap<String, u64>,
     pub transport_settings: String,
+    /// One bounded final tail, not duplicated in boundary windows.
+    pub protocol: Vec<ProtocolHistory>,
     pub methodology: Vec<&'static str>,
 }
 
@@ -823,7 +825,7 @@ pub async fn run(config: DistributedConfig) -> io::Result<DistributedReport> {
         transport.dial_only(addresses.iter().map(STPAddress::connection_key).collect());
         let counts = Arc::new(StoreCounts::default());
         let metrics = Arc::new(runtime::RuntimeMetrics::default());
-        sampler.observers.push(transport.attach(Consumer::Base));
+        sampler.observers.push(ProtocolObserver::new(transport.attach(Consumer::Base), origin, deadline, 1));
         sampler.stores.push(counts.clone());
         sampler.metrics.push(metrics.clone());
         let mut rt = RuntimeConfig::new(1, roster(config.nodes), config.namespace(), config.nodes, transport,
@@ -925,6 +927,7 @@ pub async fn run(config: DistributedConfig) -> io::Result<DistributedReport> {
             failure.get_or_insert_with(|| runtime_failure(&outcome, Instant::now(), deadline));
         }
     }
+    let protocol = sampler.protocol_snapshot();
     drop(sampler); // Drop final transport observer: close this process's STP endpoint.
     let process_end = system_snapshot(origin);
     let heights = state.lock().unwrap().reports.clone();
@@ -966,6 +969,7 @@ pub async fn run(config: DistributedConfig) -> io::Result<DistributedReport> {
         durable_image_bytes: image_size,
         heights,
         summary,
+        protocol,
         chatter_window: measured_end
             .as_ref()
             .zip(chatter_end.as_ref())
@@ -985,6 +989,7 @@ pub async fn run(config: DistributedConfig) -> io::Result<DistributedReport> {
             "Node latency uses one local monotonic clock: START to push_decided entry at height1, prior ACK/tip-publication to push_decided entry thereafter. Includes INIT, storage and host polling; excludes local export checks and ACK wait. Never subtract clocks across machines; controller receipt/cycle metrics are separate.",
             "Measured counter window starts before first measured height publication and ends after final ACK: includes global barrier overhead, excludes warmup and optional separate chatter. Partial zero-decision duration is retained. ACK wait is callback entry to ACK receipt, including host validation/control overhead.",
             "Optional chatter retains final-height evidence after final ACK without next-height publication; not idle traffic of a quiescent chain. Shutdown/in-flight tail excluded from measured counters.",
+            crate::transport::protocol::SEMANTICS,
             "Application offered bytes are not wire bytes; transport ring messages are not UDP packets. /proc/net/dev includes TX/RX of every non-lo interface and all VM traffic, including controller/management; not isolated D28 amplification. Serial snapshots have sampling skew.",
             "Host CPU/steal/cgroup counters include other VM processes. Process CPU is in reported clock ticks; RSS/maxRSS are gauges (not deltas). Missing system metrics carry errors, never fabricated zeros. In-memory atomic image is not fsync/crash-durable storage.",
             "Synthetic solution padding uses unchanged BftBlock/header Vector serialization; it is NOT valid Equihash work or a production-valid ledger body. body_bytes targets the exact whole serialized body; payload_bytes counts only actual serialized headers and can vary with parent certificate length.",
