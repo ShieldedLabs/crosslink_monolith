@@ -716,11 +716,15 @@ struct Outgoing {
     bytes: Vec<u8>,
     permit: Permit,
     class: FrameClass,
+    payload: Option<(wire::BodyKey, usize)>,
+    live: bool,
 }
 struct Replies<'a> {
     peers: &'a [Peer],
     handle: &'a ConsumerHandle,
     limits: wire::Limits,
+    mode: PayloadMode,
+    config: Id,
     outgoing: &'a mut Vec<Outgoing>,
     error: Option<Error>,
 }
@@ -733,23 +737,35 @@ impl ReplySink for Replies<'_> {
         else {
             return Err(permit);
         };
-        // A single complete frame may exceed the high-water mark. It can enter
-        // an empty bounded outbox, but never build a queue behind stalled bulk.
+        // Metadata has its own live queue; a stalled Bulk transfer cannot
+        // prevent header/certificate repair or hold its metadata permit hostage.
+        let live = self.mode != PayloadMode::Inline;
+        let channel = if live { Channel::BftLive } else { Channel::Bulk };
         if self
             .handle
-            .send_backlog_bytes(peer.address.connection_key(), Channel::Bulk)
+            .send_backlog_bytes(peer.address.connection_key(), channel)
             .unwrap_or(1)
             != 0
         {
             return Err(permit);
         }
-        match wire::encode_frame(frame, Some(key.sequence), self.limits) {
+        let outlined = live && frame.proposal.is_some();
+        let encoded = if outlined {
+            wire::encode_outlined(frame, Some(key.sequence), self.config, self.limits)
+        } else {
+            wire::encode_frame(frame, Some(key.sequence), self.limits)
+        };
+        match encoded {
             Ok(bytes) => {
                 self.outgoing.push(Outgoing {
                     key,
                     bytes,
                     permit,
                     class: FrameClass::of(frame),
+                    payload: if outlined { None } else { frame.proposal.map(|p| (wire::BodyKey {
+                        config: self.config, height: p.header.content.height, id: p.header.content.id,
+                    }, p.body.len())) },
+                    live,
                 });
                 Ok(())
             }
@@ -770,6 +786,7 @@ struct Network {
     rx_cursor: usize,
     receiver: Receiver,
     responder: Responder,
+    payload: payload::PayloadState,
     incoming: AdmissionBudget,
     outgoing: Vec<Outgoing>,
     sequence: u64,
@@ -782,12 +799,13 @@ struct Network {
 }
 impl Network {
     fn new(config: &RuntimeConfig) -> io::Result<Self> {
-        if config.payload_mode != PayloadMode::Inline {
-            return Err(invalid("requested payload transport is not installed"));
+        if matches!(config.payload_mode, PayloadMode::Merkle { .. }) {
+            return Err(invalid("Merkle payload transport is not installed"));
         }
         let handle = config.transport.attach(Consumer::Bft);
         let transport = handle.limits();
-        let max_frame = config.limits().max_frame_bytes().map_err(core_error)?;
+        let max_frame = config.limits().max_frame_bytes().map_err(core_error)?
+            .max(config.limits().max_outlined_bytes().map_err(core_error)?);
         if config.max_connections == 0
             || config.max_connections > u32::MAX as usize
             || config.max_connections < config.max_members
@@ -831,6 +849,7 @@ impl Network {
             rx_cursor: 0,
             receiver,
             responder,
+            payload: payload::PayloadState::default(),
             incoming: AdmissionBudget::new(config.max_incoming),
             outgoing: Vec::new(),
             sequence: 0,
@@ -843,6 +862,7 @@ impl Network {
         })
     }
     fn reset_scope(&mut self) {
+        self.payload.clear();
         // Keep schedulers and their budgets; remove only retired roster metadata.
         for peer in &mut self.peers {
             if let Some(member) = peer.member.take() {
@@ -926,6 +946,7 @@ impl Network {
         local: PubKeyID,
         now: u64,
     ) -> io::Result<()> {
+        self.payload.sync(engine, &self.peers, now);
         let scope = engine.view().map(|d| (d.height, d.round));
         if self.conflict_scope != scope {
             self.conflicts.clear();
@@ -949,7 +970,8 @@ impl Network {
                 }
                 continue;
             };
-            let bulk = bytes.first() == Some(&wire::FRAME_TAG) && bytes.len() > 160;
+            let bulk = bytes.first() == Some(&wire::BODY_RESPONSE_TAG)
+                || (bytes.first() == Some(&wire::FRAME_TAG) && bytes.len() > 160);
             inbox[index][usize::from(bulk)].push_back(bytes);
         }
         for _ in 0..config.max_receive_per_tick {
@@ -1030,6 +1052,7 @@ impl Network {
                         sequence: status.sequence,
                         status: status.snapshot,
                     };
+                    self.payload.status_hint(member, peer.generation, status.snapshot);
                     let _ = self.receiver.update(update, now);
                     let _ = self.responder.update(
                         RequestStatus {
@@ -1049,19 +1072,14 @@ impl Network {
                     };
                     // Request tokens classify replies, never gate a late or
                     // unsolicited authenticated complete frame's validity.
-                    decoded.with_frame(|frame| {
-                        // The host validates chain state, but must never see a
-                        // body whose canonical height disagrees with its header.
-                        if frame.proposal.is_some_and(|p| {
-                            !canonical_body(p.body, p.header.content.height, config.max_body)
-                        }) {
-                            return Ok(());
-                        }
-                        record_conflicts(engine, frame, &mut self.conflicts, config.max_members);
-                        let result = engine.receive(frame, Status::Indeterminate, events);
-                        outcome.processed = result.is_ok();
-                        tolerate_stale(result)
+                    outcome.processed = decoded.with_frame(|frame| {
+                        payload::complete(engine, frame, events, &mut self.conflicts, config)
                     })?;
+                }
+                Some(&wire::OUTLINED_TAG | &wire::BODY_REQUEST_TAG | &wire::BODY_RESPONSE_TAG | &wire::BODY_ACK_TAG) => {
+                    let generation = peer.generation;
+                    let Some(_permit) = self.incoming.try_acquire() else { continue };
+                    outcome.processed = self.receive_payload(engine, config, events, member, generation, &bytes, now)?;
                 }
                 _ => {}
             }
@@ -1087,6 +1105,7 @@ impl Network {
     ) -> io::Result<()> {
         // Accumulate locally so a pre-handoff error never records an offer.
         let mut offered = config.metrics.as_ref().map(|_| OfferedMetrics::default());
+        let mut payload_offered = PayloadMetricsSnapshot::default();
         let mut push = NetworkThreadPush {
             // Never omit a base-protocol connection merely because the bounded
             // BFT peer table did not admit it: omission is a shared-session kill.
@@ -1125,6 +1144,10 @@ impl Network {
             }
         }
         if let Some(engine) = engine {
+            self.payload.sync(engine, &self.peers, now);
+            if config.payload_mode != PayloadMode::Inline {
+                self.payload.offer(engine, &self.peers, |connection| self.handle.send_backlog_bytes(connection, Channel::Bulk) == Some(0), config, now, &mut push, &mut payload_offered)?;
+            }
             let status = engine.status();
             if status != self.last_status || now >= self.status_at {
                 if let Some(snapshot) = status {
@@ -1186,6 +1209,8 @@ impl Network {
                 peers: &self.peers,
                 handle: &self.handle,
                 limits: config.limits(),
+                mode: config.payload_mode,
+                config: engine.c().hash(),
                 outgoing: &mut self.outgoing,
                 error: None,
             };
@@ -1202,6 +1227,8 @@ impl Network {
             bytes,
             permit,
             class,
+            payload,
+            live,
         } in self.outgoing.drain(..)
         {
             if let Some(peer) = self
@@ -1212,12 +1239,20 @@ impl Network {
                 if let Some(counts) = &mut offered {
                     class.record(counts, bytes.len());
                 }
-                push.send_bulk.push((peer.address.connection_key(), bytes));
+                if bytes.first() == Some(&wire::OUTLINED_TAG) && class == FrameClass::Evidence {
+                    payload_offered.outlined_evidence_bytes = payload_offered.outlined_evidence_bytes.saturating_add(bytes.len() as u64);
+                }
+                if let Some((body_key, len)) = payload {
+                    self.payload.body_offer(key.peer, key.generation, body_key, len, &mut payload_offered);
+                }
+                if live { push.send_unreliable.push((peer.address.connection_key(), bytes)); }
+                else { push.send_bulk.push((peer.address.connection_key(), bytes)); }
                 handoff_permits.push(permit);
             }
         }
         if let (Some(metrics), Some(counts)) = (&config.metrics, offered) {
             metrics.offer(counts);
+            metrics.payload.offer(payload_offered);
         }
         self.pull = self
             .handle
@@ -1553,7 +1588,7 @@ mod tests {
     use super::*;
     use std::net::{Ipv6Addr, UdpSocket};
 
-    fn fixture() -> (RuntimeConfig, SigningKey) {
+    pub(super) fn fixture() -> (RuntimeConfig, SigningKey) {
         let identity = crate::stp::new_keypair_from_connect_magic1(
             crate::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b,
         )
@@ -1575,7 +1610,7 @@ mod tests {
         config.max_connections = 2;
         (config, SigningKey::from([1; 32]))
     }
-    fn address(port: u16) -> STPAddress {
+    pub(super) fn address(port: u16) -> STPAddress {
         let identity = crate::new_keypair_from_connect_magic1_with_seed(
             crate::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b,
             [3; 32],
@@ -1729,7 +1764,7 @@ mod tests {
         );
     }
 
-    fn body(height: u32) -> Vec<u8> {
+    pub(super) fn body(height: u32) -> Vec<u8> {
         use zcash_primitives::bft::FatPointerToBftBlock;
         BftBlock {
             version: 1,
@@ -1743,7 +1778,7 @@ mod tests {
         .unwrap()
     }
 
-    fn decision_packet(c: &Config, bytes: &[u8], limits: wire::Limits) -> Vec<u8> {
+    pub(super) fn decision_packet(c: &Config, bytes: &[u8], limits: wire::Limits) -> Vec<u8> {
         use super::super::{CertKind, Header, ProposalContent, VoteContent, Votes};
         let id = c.body_id(bytes);
         let header = Header::sign(
@@ -2104,7 +2139,7 @@ mod tests {
         assert_eq!(wire::STATUS_BYTES, 144);
     }
 
-    fn metrics_fixture() -> (
+    pub(super) fn metrics_fixture() -> (
         RuntimeConfig,
         SigningKey,
         Engine<super::super::MemoryStore>,
@@ -2326,6 +2361,8 @@ mod tests {
                 bytes: bytes.clone(),
                 permit: budget.try_acquire().unwrap(),
                 class: FrameClass::Evidence,
+                payload: Some((wire::BodyKey { config: engine.c().hash(), height: 1, id: engine.c().body_id(&body(1)) }, body(1).len())),
+                live: false,
             });
         }
         assert_eq!(budget.in_use(), 2);
@@ -2364,6 +2401,10 @@ mod tests {
             }
         );
         assert_eq!(offered.status_request_messages, 0);
+        let payload = config.metrics.as_ref().unwrap().snapshot().payload;
+        assert_eq!(payload.payload_bytes, body(1).len() as u64);
+        assert_eq!(payload.offered_data, MessageCounts::default());
+        assert_eq!(payload.duplicate_payload_bytes, 0);
     }
 
     #[test]
