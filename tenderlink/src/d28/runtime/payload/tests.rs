@@ -562,6 +562,79 @@ fn cached_weaker_outline_cannot_discard_pending_decision() {
 }
 
 #[test]
+fn invalid_outline_metadata_cannot_replace_a_pending_decision() {
+    for fault in 0..4 {
+        let mut node = Node::new();
+        let payload = body(1);
+        let valid = node.inline(&payload);
+        assert!(node.inject(1, node.outline(&payload), 0));
+        let original = *node.network.payload.pending[0].evidence.header().unwrap();
+        let bad = wire::decode_frame(&valid, node.config.limits())
+            .unwrap()
+            .with_frame(|frame| {
+                let mut votes: Vec<_> = frame.groups[0].votes.iter().copied().collect();
+                let mut outer = None;
+                let mut header = *frame.proposal.unwrap().header;
+                match fault {
+                    0 => votes[0].signature[0] ^= 1,
+                    1 => votes[1] = votes[0],
+                    2 => {
+                        // Both signatures and the certificate are valid, but the
+                        // decision certificate does not match this newer header.
+                        header =
+                            at_round(node.engine.c(), &payload, 1, false, node.config.limits()).0;
+                    }
+                    3 => {
+                        let mut vote = votes[0];
+                        vote.signature[0] ^= 1;
+                        outer = Some(vote);
+                    }
+                    _ => unreachable!(),
+                }
+                let groups = [Group {
+                    kind: frame.groups[0].kind,
+                    votes: Votes::Dense(&votes),
+                }];
+                wire::encode_outlined(
+                    Frame {
+                        message: Message::Dec,
+                        outer: outer.as_ref(),
+                        proposal: Some(Proposal {
+                            header: &header,
+                            body: &payload,
+                        }),
+                        groups: &groups,
+                    },
+                    Some(71),
+                    node.engine.c().hash(),
+                    node.config.limits(),
+                )
+                .unwrap()
+            });
+        let writes = node.engine.storage().writes;
+        assert!(
+            !node.inject(1, bad, 1),
+            "fault {fault} must be rejected before replacement"
+        );
+        assert_eq!(node.engine.storage().writes, writes);
+        assert_eq!(node.network.payload.pending.len(), 1);
+        assert_eq!(
+            node.network.payload.pending[0].evidence.header(),
+            Some(&original)
+        );
+        node.poll(2, true);
+        let request = node.request(1);
+        assert!(node.inject(
+            1,
+            wire::encode_body_response(request, &payload, node.config.limits()).unwrap(),
+            3,
+        ));
+        assert!(node.engine.view().unwrap().pending.is_some());
+        node.finish_validation();
+    }
+}
+
+#[test]
 fn four_nodes_route_outline_requests_bodies_and_acks_with_bounded_leases() {
     use crate::{PubKeyID, SortedRosterMember};
     use ed25519_zebra::VerificationKeyBytes;

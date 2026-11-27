@@ -1,6 +1,6 @@
 use super::*;
 impl<S: Storage> Engine<S> {
-    fn group_valid(&self, g: Group<'_>) -> bool {
+    pub(super) fn group_valid(&self, g: Group<'_>) -> bool {
         self.group_valid_with_outer(g, None)
     }
     // Only a fully verified, current-frame outer vote may supply this shortcut.

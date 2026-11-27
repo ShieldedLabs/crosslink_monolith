@@ -454,6 +454,41 @@ fn retained_body<S: Storage>(engine: &Engine<S>, key: BodyKey) -> Option<&[u8]> 
     None
 }
 
+/// Authenticate scheduling priority before metadata can replace a bounded
+/// interest. This deliberately does not validate an absent body or host state;
+/// reconstruction still goes through the unchanged complete-frame/core path.
+fn authenticated_outline_metadata<S: Storage>(
+    engine: &Engine<S>,
+    evidence: &DecodedOutlined,
+) -> bool {
+    evidence.with_body(&[], |frame| {
+        let n = engine.c().members().len();
+        let positions = usize::from(frame.outer.is_some())
+            + frame.groups.iter().map(|g| g.votes.len()).sum::<usize>();
+        if frame.groups.len() > n + 1
+            || positions > n + 1
+            || frame.groups.iter().any(|g| g.votes.storage_len() > n)
+            || frame.outer.is_some_and(|vote| {
+                engine.view().map(|d| d.height) != Some(vote.content.height)
+                    || !vote.verify(engine.c())
+            })
+            || frame.groups.iter().any(|group| !engine.group_valid(*group))
+        {
+            return false;
+        }
+        frame.message != crate::d28::Message::Dec
+            || frame.proposal.is_some_and(|proposal| {
+                frame.groups.iter().any(|group| {
+                    group.kind
+                        == (crate::d28::CertKind::Decision {
+                            round: proposal.header.content.round,
+                            id: proposal.header.content.id,
+                        })
+                })
+            })
+    })
+}
+
 pub(super) fn complete<S: Storage>(
     engine: &mut Engine<S>,
     frame: Frame<'_>,
@@ -539,7 +574,10 @@ impl Network {
                         complete(engine, f, events, &mut self.conflicts, config)
                     });
                 };
-                if header.content.height != d.height || !header.verify(engine.c()) {
+                if header.content.height != d.height
+                    || !header.verify(engine.c())
+                    || !authenticated_outline_metadata(engine, &evidence)
+                {
                     return Ok(false);
                 }
                 let key = BodyKey {
