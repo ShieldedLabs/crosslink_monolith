@@ -204,7 +204,7 @@ impl<S: Storage> Engine<S> {
                 // A completed retained body must survive even when its validity is
                 // pending and Guided mode emits no proposal or signer output.
                 if frame.proposal.is_some() {
-                    self.store.flush_publication()?;
+                    self.publication_checkpoint()?;
                 }
                 Ok(())
             });

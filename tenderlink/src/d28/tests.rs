@@ -97,6 +97,261 @@ fn ordinary<'a>(
         groups,
     }
 }
+mod barrier_errors {
+    use super::*;
+
+    // A public Storage implementation, deliberately without DurableStore's
+    // normalization/poisoning. A failed barrier is one-shot: retrying the same
+    // speculative image would succeed if Engine did not deactivate itself.
+    #[derive(Default)]
+    struct BarrierStore {
+        inner: MemoryStore,
+        failure: Option<(bool, Error)>,
+        barriers: [usize; 2],
+    }
+    impl BarrierStore {
+        fn barrier(&mut self, publication: bool) -> Result<()> {
+            self.barriers[usize::from(publication)] += 1;
+            if self.failure.is_some_and(|(kind, _)| kind == publication) {
+                return Err(self.failure.take().unwrap().1);
+            }
+            Ok(())
+        }
+    }
+    impl Storage for BarrierStore {
+        fn flush(&mut self) -> Result<()> {
+            self.barrier(false)
+        }
+        fn flush_publication(&mut self) -> Result<()> {
+            self.barrier(true)
+        }
+        fn config(&self) -> Option<&Config> {
+            self.inner.config()
+        }
+        fn config_bank_hash(&self, bank: usize) -> Option<Id> {
+            self.inner.config_bank_hash(bank)
+        }
+        fn begin_config(&mut self, bank: usize, meta: ConfigMeta) -> Result<()> {
+            self.inner.begin_config(bank, meta)
+        }
+        fn write_config_member(&mut self, bank: usize, row: usize, member: Member) -> Result<()> {
+            self.inner.write_config_member(bank, row, member)
+        }
+        fn seal_config_bank(&mut self, bank: usize, hash: Id) -> Result<()> {
+            self.inner.seal_config_bank(bank, hash)
+        }
+        fn descriptor(&self) -> Option<&Descriptor> {
+            self.inner.descriptor()
+        }
+        fn write_descriptor(&mut self, d: &Descriptor) -> Result<()> {
+            self.inner.write_descriptor(d)
+        }
+        fn body(&self, slot: usize) -> &[u8] {
+            self.inner.body(slot)
+        }
+        fn header(&self, slot: usize) -> Option<&Header> {
+            self.inner.header(slot)
+        }
+        fn write_body(&mut self, slot: usize, body: &[u8]) -> Result<()> {
+            self.inner.write_body(slot, body)
+        }
+        fn copy_body(&mut self, from: usize, to: usize) -> Result<()> {
+            self.inner.copy_body(from, to)
+        }
+        fn write_header(&mut self, slot: usize, header: Header) -> Result<()> {
+            self.inner.write_header(slot, header)
+        }
+        fn region_header(&self, region: usize) -> Option<RegionHeader> {
+            self.inner.region_header(region)
+        }
+        fn region_rows(&self, region: usize) -> &[Option<Vote>] {
+            self.inner.region_rows(region)
+        }
+        fn write_region_row(
+            &mut self,
+            region: usize,
+            row: usize,
+            vote: Option<Vote>,
+        ) -> Result<()> {
+            self.inner.write_region_row(region, row, vote)
+        }
+        fn write_region_header(&mut self, region: usize, header: RegionHeader) -> Result<()> {
+            self.inner.write_region_header(region, header)
+        }
+        fn own(&self, kind: VoteKind) -> Option<&Vote> {
+            self.inner.own(kind)
+        }
+        fn write_own(&mut self, kind: VoteKind, vote: Vote) -> Result<()> {
+            self.inner.write_own(kind, vote)
+        }
+        fn own_header(&self) -> Option<&Header> {
+            self.inner.own_header()
+        }
+        fn write_own_header(&mut self, header: Header) -> Result<()> {
+            self.inner.write_own_header(header)
+        }
+    }
+    fn boot(c: &Config, me: Option<usize>) -> Engine<BarrierStore> {
+        let key = me.map_or_else(|| SigningKey::from([99; 32]), |i| keys()[i].clone());
+        let mut e = Engine::boot(BarrierStore::default(), key, c.clone()).unwrap();
+        e.set_emission(Emission::Guided);
+        e
+    }
+    fn no_callbacks(out: &Out) {
+        assert!(out.sent.is_empty() && out.decisions.is_empty());
+        assert_eq!((out.acquire, out.retries), (0, 0));
+    }
+    fn stays_inactive(e: &mut Engine<BarrierStore>, c: &Config) {
+        assert!(!e.is_active());
+        assert!(e.status().is_none() && e.proposal_tag().is_none());
+        assert!(
+            e.store.failure.is_none(),
+            "one-shot fault was not exercised"
+        );
+        let writes = e.store.inner.writes;
+        let barriers = e.store.barriers;
+        let mut out = Out::default();
+        assert_eq!(e.checkpoint(), Err(Error::Inactive));
+        assert_eq!(e.publication_checkpoint(), Err(Error::Inactive));
+        assert_eq!(e.init(c, 5, 0, &mut out), Err(Error::Inactive));
+        assert_eq!(e.elapse(100, &mut out), Err(Error::Inactive));
+        assert_eq!(e.elapse_coalesced(100, &mut out), Err(Error::Inactive));
+        assert_eq!(
+            e.supply_proposal(
+                ProposalTag {
+                    height: 4,
+                    round: 0
+                },
+                b"retry",
+                Status::Valid,
+                &mut out,
+            ),
+            Err(Error::Inactive)
+        );
+        assert_eq!(
+            e.receive(ordinary(None, None, &[]), Status::Valid, &mut out),
+            Err(Error::Inactive)
+        );
+        assert_eq!(e.store.inner.writes, writes);
+        assert_eq!(e.store.barriers, barriers, "retried speculative memory");
+        no_callbacks(&out);
+    }
+
+    #[test]
+    fn checkpoints_normalize_every_error_and_never_retry() {
+        let c = config([1; 4]);
+        for error in [
+            Error::Config,
+            Error::Inactive,
+            Error::Storage,
+            Error::Corrupt,
+            Error::Invalid,
+            Error::Stale,
+            Error::Exhausted,
+        ] {
+            for publication in [false, true] {
+                let mut e = boot(&c, Some(0));
+                e.init(&c, 4, 0, &mut Out::default()).unwrap();
+                e.store.failure = Some((publication, error));
+                let result = if publication {
+                    e.publication_checkpoint()
+                } else {
+                    e.checkpoint()
+                };
+                assert_eq!(result, Err(Error::Storage), "{publication} {error:?}");
+                stays_inactive(&mut e, &c);
+            }
+        }
+    }
+
+    #[test]
+    fn init_and_materialize_barriers_stop_signers_and_observers() {
+        let c = config([1; 4]);
+        // Signer ENTER's pre-sign flush, observer ENTER's publication flush,
+        // and delayed INIT's final full flush (with and without a local key).
+        for (me, tau, publication) in [
+            (Some(0), 0, false),
+            (None, 0, true),
+            (Some(0), 1, false),
+            (None, 1, false),
+        ] {
+            for error in [Error::Invalid, Error::Config] {
+                let mut e = boot(&c, me);
+                let mut out = Out::default();
+                e.store.failure = Some((publication, error));
+                assert_eq!(e.init(&c, 4, tau, &mut out), Err(Error::Storage));
+                assert!(e.store.inner.own.iter().all(Option::is_none));
+                assert!(e.store.own_header().is_none());
+                no_callbacks(&out);
+                stays_inactive(&mut e, &c);
+            }
+        }
+    }
+
+    #[test]
+    fn proposal_barriers_stop_before_signing_or_publication() {
+        let c = config([1; 4]);
+        for publication in [false, true] {
+            for error in [Error::Invalid, Error::Config] {
+                let mut e = boot(&c, Some(c.proposer(4, 0)));
+                e.init(&c, 4, 0, &mut Out::default()).unwrap();
+                let tag = e.proposal_tag().unwrap();
+                let mut out = Out::default();
+                e.store.failure = Some((publication, error));
+                assert_eq!(
+                    e.supply_proposal(tag, b"proposal", Status::Valid, &mut out),
+                    Err(Error::Storage)
+                );
+                // The full barrier precedes the header signature. Publication
+                // failure may retain it, but must not sign the following PV.
+                assert_eq!(e.store.own_header().is_some(), publication);
+                assert!(e.store.own(VoteKind::Prevote).is_none());
+                no_callbacks(&out);
+                stays_inactive(&mut e, &c);
+            }
+        }
+    }
+
+    #[test]
+    fn received_body_barrier_stops_public_and_checked_ingress() {
+        let c = config([1; 4]);
+        let bytes = b"retained body";
+        let h = header(&c, 0, None, bytes);
+        let checked = checked_body::CheckedBody::new(&c, 4, h.content.id, bytes.to_vec()).unwrap();
+        for use_checked in [false, true] {
+            for error in [Error::Invalid, Error::Config] {
+                let mut e = boot(&c, Some(1));
+                e.init(&c, 4, 0, &mut Out::default()).unwrap();
+                let frame = ordinary(
+                    None,
+                    Some(Proposal {
+                        header: &h,
+                        body: bytes,
+                    }),
+                    &[],
+                );
+                let mut out = Out::default();
+                e.store.failure = Some((true, error));
+                let result = if use_checked {
+                    e.receive_checked_body(frame, &checked, &mut out)
+                } else {
+                    e.receive(frame, Status::Indeterminate, &mut out)
+                };
+                assert_eq!(result, Err(Error::Storage));
+                let slot = e.view().unwrap().slot.unwrap();
+                assert_eq!(e.storage().body(slot.index), bytes);
+                assert_eq!(
+                    e.view().unwrap().statuses[slot.index],
+                    Status::Indeterminate
+                );
+                assert!(e.store.own(VoteKind::Prevote).is_none());
+                no_callbacks(&out);
+                stays_inactive(&mut e, &c);
+            }
+        }
+    }
+}
+
 #[test]
 fn checked_receive_uses_only_token_bytes_and_preserves_indeterminate_validity() {
     let c = config([1; 4]);
