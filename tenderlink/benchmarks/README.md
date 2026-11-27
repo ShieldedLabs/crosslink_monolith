@@ -1167,3 +1167,149 @@ copies, including the two partial trials. This is an artifact/accounting audit,
 not a fresh cryptographic or production-security audit. Receipt:
 `primary-independent-audit.json`, SHA-256
 `0d2494a6d93e08467541a28487464cb9241c6c9e007a9593852b4954d153f221`.
+
+## Sparse durability and immutable bodies — 2026-11-27
+
+The runtime now opens `DurableStore::open_buffered`. Logical mutations stage in
+its existing bounded working state rather than encoding, hashing and replacing
+an entire image for every mutation. This is not a non-durable benchmark bypass:
+
+- Partial shard assemblies stay volatile. A completed body is committed before
+  dependent externally visible work; there is no per-shard persistence protocol.
+- Signing intents and their supporting state are committed before signing.
+  Publication state is committed before dependent callbacks, evidence service,
+  Host scheduling, status publication and Merkle attestations.
+- Countdown/rho-only progress uses a fixed-age one-second checkpoint, not a
+  sliding debounce that busy traffic can defer forever. Scheduler/storage stalls
+  can extend that interval. Already-durable output can replay without forcing
+  unchanged authority plus a new countdown to disk on every poll.
+- Any mutation, encoding or barrier error fails closed. This includes a backend
+  reporting an error after actually replacing the block. Recovery reloads and
+  validates the old-or-new durable state, never trusting the discarded RAM copy.
+
+The fixed image format and `AtomicBlockStore` API are unchanged. The measured
+image is still **31,465,268 bytes**. Zebra still uses its identity-bound, synced
+RocksDB replacement; no PoW/ledger formats or chain-facing signatures changed.
+The eager `DurableStore::open` path remains available with its reference crash
+cuts. Buffered countdown recovery can repeat elapsed/replay work; it does not
+promise identical intermediate crash traces or charge time spent offline.
+
+A completed Merkle owner also retains an immutable, configured-hash-checked body
+with a canonical-encoding wrapper. Subsequent evidence can share that allocation
+without copying, parsing, re-encoding or hashing its entire payload again. This
+uses the existing two additional body owners, not an unbounded proposal cache.
+New header/context/certificate checks and Host validity remain necessary; recovery
+rechecks actual bytes. Retained-core-only fallback remains unoptimized.
+
+A focused work-counter test delivers 12 certificates for a 280,571-byte body.
+Fallback processes **3,366,852 bytes** in each of the body-hash and canonical-check
+paths; the completed-owner path adds **zero** such bytes after the single assembly
+check. Pointer tests confirm allocation reuse on freeze and partial-owner refresh.
+These counters do not cover every hash, Host parse, Merkle operation or allocation.
+
+### Frozen measurement and results
+
+All arms keep **100-KiB shards, exact 10-MiB bodies, seven identities, one executor
+worker per validator and benchmark `wan` timers**. The same-profile comparison
+uses `balanced` service: 25-ms polling, 100-ms status and a 128-message receive
+budget. Two old-code trials preceded the candidate; two candidate trials were
+followed by two more old-code trials. Each trial has one warmup and seven measured
+heights, a 300-second timeout and a separate two-second final-height hold. A
+prespecified two-trial `fast` sensitivity and one two-offline gate follow. No
+builds/tests ran concurrently with measurements, and no code was retuned between
+arms. This sequential shared-host comparison is not a randomized machine trial
+or an ablation separating the two optimizations.
+
+All **nine trials completed**, covering **63/63 measured heights**. The 56 heights
+in all-online trials all decided in round zero. No failed or partial runs were
+excluded. Here, latency is first certificate-backed receipt at the controller;
+throughput counts one chain and waits for every online validator's ACK.
+
+| Code / service | Measured heights | First receipt p50 / p95 s | Chain MiB/s | Application bytes / chain bytes | Receive-budget discards |
+|---|---:|---:|---:|---:|---:|
+| Old, balanced, before | 14 | 7.44 / 8.17 | 1.221 | 6.104× | 0 |
+| **New, balanced** | **14** | **2.71 / 2.81** | **3.460** | **6.101×** | **0** |
+| Old, balanced, after | 14 | 7.30 / 10.78 | 1.145 | 6.119× | 23 |
+| New, fast | 14 | 2.85 / 3.15 | 3.168 | 6.213× | 435 |
+| New, balanced, two offline | 7 | 2.48 / 38.74 | 0.980 | 4.073× | 0 |
+
+The unchanged-settings candidate is **2.83× faster than the before control and
+3.02× faster than the after control**. Relative to before, its median first
+receipt is 63.5% lower. Quorum/all-receipt medians are 2.790/2.856 seconds, versus
+7.740/7.959 before. Small samples do not establish stable tail percentiles.
+Application traffic sums six disjoint offered-byte categories, not wire bytes.
+The new balanced raw payload ratio is 6.027×, with 39 requested shard indices;
+its 6.101× total remains close to the six-copy minimum. It is not a zero-repair run.
+
+| Code / service | Aggregate CPU s / height | Replacements / height | Replaced-image GiB / height | Peak process RSS MiB |
+|---|---:|---:|---:|---:|
+| Old, balanced, before | 56.97 | 546.00 | 16.000 | 142.80 |
+| **New, balanced** | **14.06** | **75.36** | **2.208** | **147.80** |
+| Old, balanced, after | 58.42 | 572.21 | 16.768 | 145.09 |
+| New, fast | 16.17 | 76.43 | 2.240 | 158.26 |
+| New, balanced, two offline | 19.34 | 107.43 | 3.148 | 143.16 |
+
+CPU is summed across the online processes, not wall-clock latency. Replaced-image
+bytes are image size times replacement count, not physical disk traffic or a count
+of every memory pass. RSS is the largest process-lifetime high-water mark. The
+balanced candidate reduces CPU by **75.3%** and replacement volume by **86.2%**
+relative to before. It still performs 2.21 GiB of full-image replacement work per
+10-MiB block: this change reduces frequency, not the size of each required commit.
+
+The `fast` profile changes both polling (25→5 ms) and status (100→25 ms), not just
+one variable. It is slower here and discards 435 messages at the receive budget;
+**balanced remains selected**. Separate final-height holds offer 208.4 KiB/s of
+aggregate application control traffic with new balanced, versus 141.5 before and
+136.3 in the repeated old control. Fast offers 821.7 KiB/s. All have zero payload
+data offers during those holds. These are unfinished-height holds, not quiescent
+idle or wire-traffic measurements; the increased control rate remains a cost.
+
+With two identities offline, all five online validators agree on seven measured
+heights. Heights 5 and 6 require rounds 2 and 1, with first receipts at 38.743 and
+19.799 seconds; the other five use round zero. This is unavailable-proposer
+fallback, not a Byzantine-node or packet-loss deployment. Raw payload is 4.003×
+and total application offers 4.073×, against the four-copy online minimum.
+
+### Verification, reproduction and retained artifacts
+
+Candidate source is `b1792811cc7bce9340e43e2459ab7f392b22e30b`. The integrated
+optimized suite passes **390 Tenderlink Rust tests**, with five existing ignored
+tests and unbounded legacy `single_rt` excluded. The non-benchmark release library
+check, benchmark build, **46 Python checks** including real subprocess integration,
+and **four Zebra adapter tests** pass. New crash tests cover required output/signing
+barriers, complete-body retention, recovered locks, discarded staged rows, progress
+checkpoints, and old/new outcomes at replacement failures. Four generic-Storage
+regressions also check non-Storage error normalization and refusal to retry/output.
+These are fault-model tests, not physical power-loss/fsync certification.
+
+Artifacts are under `/var/tmp/d28-sparse-20261127/`:
+
+- Frozen inputs: `plan.json`, `candidate-plan.json`, `candidate-preflight.json`.
+- Suites: `verification-receipt.json`, `final-verification.log`,
+  `zebra-adapter-tests.log`, `sparse-crash-tests.log`.
+- Measurements: `baseline-before/`, `candidate-balanced/`, `baseline-after/`,
+  `candidate-fast/`, `candidate-offline/`; each retains raw reports and cleanup.
+- Derived comparison with input hashes: `performance-analysis.json`.
+- Candidate executable: `d28_bench-b1792811c`, SHA-256
+  `62f766c07683bc1587873835577cf825cac25208762e7349c35fec85e82147a3`.
+- Old executable and unchanged runner hashes are the same as the unordered-shard
+  experiment above; the old `b8718d92a` result commit adds documentation beyond
+  executable source `a0351df70`, not a different runtime implementation.
+
+```sh
+python3 -B tenderlink/benchmarks/d28_fly.py local \
+  --binary /var/tmp/d28-sparse-20261127/d28_bench-b1792811c \
+  --out /var/tmp/d28-sparse-new --nodes 7 \
+  --body-bytes 10485760 --max-body 10485760 \
+  --payload-modes merkle --payload-leaf-bytes 102400 \
+  --profiles balanced --timing-profile wan --repetitions 2 \
+  --heights 7 --warmup 1 --seed 428 --timeout-secs 300 \
+  --chatter-secs 2 --lifetime-secs 1200
+```
+
+All cleanup receipts confirm owned children and worker threads stopped and tokens
+removed; no benchmark processes remained after the sweep. No Fly resources were
+created. These are separate localhost processes with a memory backend that still
+executes real encoding/hashing and required atomic replacement barriers. They do
+**not** establish physical disk throughput, worldwide performance, STP/UDP/IP byte
+amplification or operation at the nodes' network-bandwidth limit.
