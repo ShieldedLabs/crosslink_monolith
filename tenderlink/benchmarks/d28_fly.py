@@ -25,6 +25,7 @@ public listeners, shell commands, remote executable paths, installs or deploymen
 
 import argparse
 import contextlib
+import copy
 import datetime
 import hashlib
 import hmac
@@ -55,6 +56,13 @@ from unittest import mock
 
 MAX_BODY = 1048576  # Legacy default; never silently raised for a byte-target sweep.
 MAX_BENCH_BODY = 10 * MAX_BODY
+PAYLOAD_MODES = ("inline", "outlined", "merkle")
+MIN_PAYLOAD_LEAF = 32 * 1024
+MAX_PAYLOAD_LEAF = 1024 * 1024
+LOCAL_NOTE = ("Local shared-host process comparison, not WAN performance. Each validator is a separate "
+              "process; all traffic is ::1. Shared host interface/CPU/cgroup counters must not be summed "
+              "as independent machines. VM network rates/ratios are unavailable; application offers, "
+              "per-process CPU, RSS and store work remain usable.")
 REPORT_GRACE_SECONDS = 8  # Shared post-failure cleanup budget, never measured time.
 MAX_TX_BUDGET = 2**40  # Bounded CLI bytes; zero disables the corresponding guard.
 TX_SAMPLE_SECONDS = 1
@@ -177,6 +185,16 @@ def run_id(value):
     return value
 
 
+def payload_settings(config):
+    mode = config.get("payload_mode", "inline")
+    leaf = integer(config.get("payload_leaf_bytes", 0), 0, MAX_PAYLOAD_LEAF, "payload_leaf_bytes")
+    if mode not in PAYLOAD_MODES:
+        raise ValueError("payload_mode must be inline, outlined or merkle")
+    if (mode == "merkle" and leaf < MIN_PAYLOAD_LEAF) or (mode != "merkle" and leaf != 0):
+        raise ValueError("merkle requires payload_leaf_bytes 32768..1048576; other modes require 0")
+    return mode, leaf
+
+
 def validate_config(config):
     if not isinstance(config, dict):
         raise ValueError("config must be an object")
@@ -187,10 +205,11 @@ def validate_config(config):
               "poll_ms": (5, 100), "status_ms": (25, 100), "receive_budget": (32, 128),
               "max_requests": (1, 2), "max_outgoing": (2, 2)}
     required = set(bounds) - {"solution_bytes", "body_bytes"}
-    if set(config) - (set(bounds) | {"peers", "coordinator", "run_id", "timing_profile"}) or not required <= set(config):
+    if set(config) - (set(bounds) | {"peers", "coordinator", "run_id", "timing_profile", "payload_mode", "payload_leaf_bytes"}) or not required <= set(config):
         raise ValueError("unknown or missing config fields")
     for key, (low, high) in bounds.items():
         integer(config.get(key, 0), low, high, key)
+    payload_settings(config)
     if config.get("timing_profile", "production") not in ("production", "wan"):
         raise ValueError("timing_profile must be production or wan")
     if config.get("body_bytes", 0):
@@ -219,14 +238,21 @@ def validate_config(config):
 
 
 def configs_match(actual, expected):
-    """Only the two new serde defaults may differ; never rewrite raw provenance."""
+    """Normalize only explicit serde defaults; never rewrite raw provenance."""
     if not isinstance(actual, dict) or not isinstance(expected, dict):
         return False
     if any(type(config.get("body_bytes", 0)) is not int for config in (actual, expected)):
         return False
+    try:
+        for config in (actual, expected):
+            payload_settings(config)
+    except ValueError:
+        return False
     def normalized(config):
         return dict(config, body_bytes=config.get("body_bytes", 0),
-                    timing_profile=config.get("timing_profile", "production"))
+                    timing_profile=config.get("timing_profile", "production"),
+                    payload_mode=config.get("payload_mode", "inline"),
+                    payload_leaf_bytes=config.get("payload_leaf_bytes", 0))
     return normalized(actual) == normalized(expected)
 
 
@@ -254,9 +280,13 @@ class Barrier:
         self.complete = False
 
     def ready(self, message, now):
-        if set(message) != {"type", "run_id", "node"} or message.get("type") != "ready":
+        required = {"type", "run_id", "node"}
+        if (not required <= set(message) or set(message) - required - {"payload_mode", "payload_leaf_bytes"}
+                or message.get("type") != "ready"):
             raise ProtocolError("expected ready")
         self.identity(message)
+        if payload_settings(message) != payload_settings(self.config):
+            raise ProtocolError("ready payload mode/leaf size mismatch")
         node = message["node"]
         if self.started is not None or node in self.ready_nodes:
             raise ProtocolError("duplicate or late ready")
@@ -592,6 +622,11 @@ def aggregate_node_windows(trials, window_name="measured_window"):
                         or not configs_match(report.get("config"), dict(trial["config"], node=node))):
                     raise ValueError("node report schema/identity/config mismatch")
                 window = report[window_name]
+                if trial.get("environment") == "local":
+                    # Rust records host non-loopback interfaces even for a loopback
+                    # trial. Do not multiply unrelated host traffic by node count.
+                    window = dict(window, system_delta={key: value for key, value in
+                        window.get("system_delta", {}).items() if not key.startswith(("network.", "cpu.", "cgroup."))})
                 observation.update(report_status=report["status"], duration_seconds=_window_duration(window))
                 sample["window"] = window
                 try:
@@ -617,7 +652,7 @@ def aggregate_node_windows(trials, window_name="measured_window"):
         out[area + "_delta"] = {
             key: _aggregate_window_metric(samples, lambda window: _window_counter(window, area, key),
                                           system=area == "system", chatter=chatter,
-                                          body_ratio=key.endswith(".bytes") or key == "network.eth0.tx_bytes")
+                                          body_ratio=key.endswith((".bytes", "_bytes")))
             for key in sorted(keys)}
     for key in ("store_replacements", "store_replacement_bytes"):
         out[key] = _aggregate_window_metric(samples, lambda window: _window_counter(window, None, key),
@@ -643,10 +678,12 @@ def aggregate(trials):
     for trial in trials:
         config = trial["config"]
         key = (config["nodes"], config["offline"], config["headers"], config.get("solution_bytes", 0), trial["profile"],
-               config.get("body_bytes", 0), config["max_body"], config.get("timing_profile", "production"))
+               config.get("body_bytes", 0), config["max_body"], config.get("timing_profile", "production"),
+               *payload_settings(config), trial.get("environment", "distributed"))
         group = groups.setdefault(key, {"nodes": key[0], "offline": key[1], "headers": key[2],
                                        "solution_bytes": key[3], "profile": key[4], "trials": 0,
                                        "target_body_bytes": key[5], "max_body": key[6], "timing_profile": key[7],
+                                       "payload_mode": key[8], "payload_leaf_bytes": key[9], "environment": key[10],
                                        "complete_trials": 0, "duration_seconds": 0, "completed_heights": 0,
                                        "body_bytes": 0, "payload_bytes": 0, "body_sizes": set(),
                                        "receipt_ms": {c: [] for c in ("first", "quorum", "all")},
@@ -1194,9 +1231,13 @@ def validate_roster(roster):
 
 
 def schedule(headers, profiles, repetitions, seed, *, body_bytes=None, max_body=MAX_BODY,
-             timing_profile="production"):
+             timing_profile="production", payload_modes=("inline",), payload_leaf_bytes=(102400,)):
     targets = headers if body_bytes is None else body_bytes
-    if len(targets) * len(profiles) * repetitions > 128:
+    arms = [(mode, leaf) for mode in payload_modes
+            for leaf in (payload_leaf_bytes if mode == "merkle" else (0,))]
+    for mode, leaf in arms:
+        payload_settings({"payload_mode": mode, "payload_leaf_bytes": leaf})
+    if len(targets) * len(profiles) * len(arms) * repetitions > 128:
         raise ValueError("campaign limited to 128 sequential trials")
     rng = random.Random(seed)
     trials = []
@@ -1204,13 +1245,16 @@ def schedule(headers, profiles, repetitions, seed, *, body_bytes=None, max_body=
         sizes = list(targets)
         rng.shuffle(sizes)
         for size in sizes:
-            paired = list(profiles)
+            paired = [(profile, mode, leaf) for profile in profiles for mode, leaf in arms]
             rng.shuffle(paired)
-            for profile in paired:
+            for profile, mode, leaf in paired:
                 trials.append({"repetition": repetition, "headers": size if body_bytes is None else 32,
                                "body_bytes": 0 if body_bytes is None else size, "max_body": max_body,
-                               "timing_profile": timing_profile, "profile": profile})
-    return trials
+                               "timing_profile": timing_profile, "profile": profile,
+                               "payload_mode": mode, "payload_leaf_bytes": leaf})
+    # Stable partition: whole-payload comparison completes before leaf exchange.
+    return [case for case in trials if case["payload_mode"] != "merkle"] + [
+        case for case in trials if case["payload_mode"] == "merkle"]
 
 
 def trial_name(index, case):
@@ -1222,6 +1266,9 @@ def trial_name(index, case):
         size += f"-cap{cap}"
     timing = case.get("timing_profile", "production")
     suffix = "" if timing == "production" else "-" + timing
+    mode, leaf = payload_settings(case)
+    if "payload_mode" in case:
+        suffix += f"-{mode}-leaf{leaf}"
     return f"trial-{index:03d}-r{case['repetition']:02d}-{size}-{case['profile']}{suffix}"
 
 
@@ -1231,7 +1278,8 @@ def campaign_cases(args):
     if args.body_bytes is not None and any(value > args.max_body for value in args.body_bytes):
         raise ValueError("--body-bytes targets must fit --max-body; no implicit cap increase")
     return schedule(args.headers, args.profiles, args.repetitions, args.seed,
-                    body_bytes=args.body_bytes, max_body=args.max_body, timing_profile=args.timing_profile)
+                    body_bytes=args.body_bytes, max_body=args.max_body, timing_profile=args.timing_profile,
+                    payload_modes=args.payload_modes, payload_leaf_bytes=args.payload_leaf_bytes)
 
 
 def trial_config(args, roster, case, identifier):
@@ -1246,6 +1294,7 @@ def trial_config(args, roster, case, identifier):
         config["body_bytes"] = case["body_bytes"]
     if case.get("timing_profile", args.timing_profile) != "production":
         config["timing_profile"] = case.get("timing_profile", args.timing_profile)
+    config["payload_mode"], config["payload_leaf_bytes"] = payload_settings(case)
     return validate_config(config)
 
 
@@ -1370,7 +1419,8 @@ def trial_tx_ledger(directory, config, expected_sha, max_trial_tx_bytes, max_cam
 
 
 def run_trial(args, roster, token, binary, metadata, directory, case, campaign_deadline):
-    config = trial_config(args, roster, case, secrets.token_hex(24))
+    mode, leaf = payload_settings(case)
+    config = trial_config(args, roster, case, f"{mode}-leaf{leaf}-{secrets.token_hex(24)}")
     directory.mkdir(mode=0o700)
     began, started_at = time.monotonic(), utc_now()
     write_json(directory / "trial.json", {"config": config, "started_at": started_at, **case})
@@ -1474,6 +1524,12 @@ def run_trial(args, roster, token, binary, metadata, directory, case, campaign_d
             node_results.append({"node": node, "status": "failed"})
     budget = trial_tx_ledger(directory, config, metadata["binary_sha256"],
                              args.max_trial_tx_bytes, args.max_campaign_tx_bytes)
+    if args.mode == "local":
+        budget.update(accounting_complete=False, whole_child_tx_bytes=None, confirmed_tx_bytes=None,
+                      note="Unavailable: shared host lo appears in every process window; never sum it.")
+        for entry in budget["nodes"]:
+            entry["tx_bytes"] = None
+            entry["reason"] = "shared host interface; raw observations retained, not per-node traffic"
     cleanup_unconfirmed = sorted(set(cleanup_unconfirmed + budget["cleanup_unconfirmed_nodes"]))
     if cleanup_unconfirmed:
         errors.append("child cleanup unconfirmed; campaign must halt")
@@ -1498,9 +1554,14 @@ def run_trial(args, roster, token, binary, metadata, directory, case, campaign_d
 def summarize(directory, quiet=False):
     """Read original artifacts; return JSON-ready analysis without writing summary.json."""
     directory = Path(directory)
+    if (directory / "local.json").is_file():
+        if read_json(directory / "local.json").get("mode") != "d28_local":
+            raise ValueError("not a retained local run")
+        directory = directory / "campaign"
     manifest = read_json(directory / "manifest.json")
-    if manifest.get("mode") != "d28_fly_campaign":
-        raise ValueError("not a D28 Fly campaign")
+    if manifest.get("mode") not in ("d28_fly_campaign", "d28_local_campaign"):
+        raise ValueError("not a D28 campaign")
+    environment = "local" if manifest["mode"] == "d28_local_campaign" else "distributed"
     trials = []
     for path in sorted(directory.glob("trial-*/trial.json")):
         case = read_json(path)
@@ -1513,13 +1574,13 @@ def summarize(directory, quiet=False):
             except (OSError, ValueError) as exc:
                 errors[node] = f"{type(exc).__name__}: {exc}"
         trials.append({**case, **result, "trial": path.parent.name, "controller": controller,
-                       "node_reports": reports, "node_report_errors": errors})
+                       "node_reports": reports, "node_report_errors": errors, "environment": environment})
     rows = aggregate(trials)
     if not quiet:
         def fmt(value, factor=1):
             return "-" if value is None else f"{value * factor:.3f}"
 
-        print("nodes/offline headers+solution target_body_B max_body_B timing profile complete/failed local_n local_p50/p95_ms body_KiB/s VM_TX_Mbit/s TX/body evidence/body budget_discards steal_% peak_RSS_MiB")
+        print("nodes/offline headers+solution target_body_B max_body_B timing profile payload_mode leaf_B complete/failed local_n local_p50/p95_ms body_KiB/s VM_TX_Mbit/s TX/body evidence/body budget_discards steal_% peak_RSS_MiB")
         for row in rows:
             measured = row["measured_window"]
             tx = measured["system_delta"]["network.eth0.tx_bytes"]
@@ -1529,6 +1590,7 @@ def summarize(directory, quiet=False):
             latency = local["percentiles"] or {}
             print(f"{row['nodes']}/{row['offline']}", f"{row['headers']}+{row['solution_bytes']}",
                   row["target_body_bytes"], row["max_body"], row["timing_profile"], row["profile"],
+                  row["payload_mode"], row["payload_leaf_bytes"],
                   f"{row['complete_trials']}/{row['failed_trials']}", local["n"],
                   f"{fmt(latency.get('p50'))}/{fmt(latency.get('p95'))}",
                   fmt(row["body_bytes_per_second"], 1 / 1024), fmt(tx["per_second"], 8 / 1e6),
@@ -1557,9 +1619,10 @@ def summarize(directory, quiet=False):
                       f"evidence_KiB/s={fmt(evidence['per_second'], 1 / 1024)} "
                       f"matched/requested TX={tx['matched_trials']}/{chatter['requested_trials']} "
                       f"evidence={evidence['matched_trials']}/{chatter['requested_trials']} (actual per-node durations)")
-        for note in NOTES + AGGREGATION_NOTES:
+        for note in NOTES + AGGREGATION_NOTES + ([LOCAL_NOTE] if environment == "local" else []):
             print(note)
-    return {"schema_version": 1, "aggregation_version": 2, "cases": rows, "notes": NOTES + AGGREGATION_NOTES}
+    return {"schema_version": 1, "aggregation_version": 3, "environment": environment, "cases": rows,
+            "notes": NOTES + AGGREGATION_NOTES + ([LOCAL_NOTE] if environment == "local" else [])}
 
 
 def campaign(args):
@@ -1581,11 +1644,13 @@ def campaign(args):
     metadata = dict(machine_metadata(binary), max_trial_tx_bytes=args.max_trial_tx_bytes,
                     interface=roster["interface"])
     write_json(output / "manifest.json", {
-        "schema_version": 1, "mode": "d28_fly_campaign", "host": metadata, "roster": roster,
+        "schema_version": 1, "mode": "d28_local_campaign" if args.mode == "local" else "d28_fly_campaign",
+        "host": metadata, "roster": roster,
         "started_at": started_at, "cases_in_order": cases, "seed": args.seed,
         "heights": args.heights, "warmup": args.warmup, "body_bytes": args.body_bytes,
         "solution_bytes": args.solution_bytes, "offline": args.offline, "max_body": args.max_body,
         "timing_profile": args.timing_profile, "tx_budget": budget_config,
+        "payload_modes": args.payload_modes, "payload_leaf_bytes": args.payload_leaf_bytes,
         "timeout_secs": args.timeout_secs, "lifetime_secs": args.lifetime_secs,
         "profiles": PROFILES, "notes": NOTES,
         "node_latency_scope": "node-local ACK/tip publication to push_decided callback, not exact INIT timing",
@@ -1608,6 +1673,10 @@ def campaign(args):
     for index, case in enumerate(cases, 1):
         if time.monotonic() >= deadline:
             halt_reason = "campaign_deadline"
+            break
+        if case["payload_mode"] == "merkle" and any(
+                row["payload_mode"] != "merkle" and row["status"] != "complete" for row in results):
+            halt_reason = "whole_payload_phase_incomplete"
             break
         name = trial_name(index, case)
         result = run_trial(args, roster, token, binary, metadata, output / name, case, deadline)
@@ -1648,6 +1717,110 @@ def campaign(args):
     return 0 if complete else 1
 
 
+def local_campaign(args):
+    """Retained loopback harness; workers own only fixed-binary, new-session children."""
+    cases = campaign_cases(args)
+    if args.max_trial_tx_bytes or args.max_campaign_tx_bytes:
+        raise ValueError("local shared-lo TX is not a per-node counter; local TX budgets are unavailable")
+    # Validate every arm before making an output or binding any socket.
+    provisional = {"peers": [f"[::1]:{20000 + node}" for node in range(args.nodes)],
+                   "coordinator": "[::1]:21000"}
+    for case in cases:
+        trial_config(args, provisional, case, "local-preflight-0123456789")
+    binary = args.binary.resolve(strict=True)
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise ValueError("binary must be an executable regular file")
+    root = args.out.resolve()
+    root.mkdir(mode=0o700, parents=True)  # create-only; never reuse a timed-out run
+    token_path = root / "worker.token"
+    workers, servers, threads = [], [], []
+    token_identity = None
+    began, started_at = time.monotonic(), utc_now()
+    result, error = None, None
+    try:
+        create_token(token_path)
+        token_stat = token_path.stat()
+        token_identity = (token_stat.st_dev, token_stat.st_ino)
+        token = read_token(token_path)
+        # In-process HTTP services, but each validator is a separate Rust process.
+        for node in range(1, args.nodes - args.offline):
+            worker = Worker(binary, root / f"worker-{node:03d}", "lo", max_runs=len(cases))
+            workers.append(worker)
+            server = WorkerServer(("::1", 0), WorkerHandler)
+            servers.append(server)
+            server.worker, server.token = worker, token
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05},
+                                      name=f"d28-local-worker-{node}", daemon=True)
+            threads.append(thread)
+            thread.start()
+        # Reserve UDP endpoints and controller TCP port concurrently; no external
+        # port-discovery tool, public bind or DNS. Release immediately before campaign.
+        with contextlib.ExitStack() as reservations:
+            used = {server.server_address[1] for server in servers}
+            def reserve(kind):
+                for _ in range(128):
+                    sock = reservations.enter_context(socket.socket(socket.AF_INET6, kind))
+                    sock.bind(("::1", 0))
+                    port = sock.getsockname()[1]
+                    if port not in used:
+                        used.add(port)
+                        return f"[::1]:{port}"
+                raise ValueError("could not reserve distinct local ports")
+            peers = [reserve(socket.SOCK_DGRAM) for _ in range(args.nodes)]
+            coordinator = reserve(socket.SOCK_STREAM)
+            worker_addresses = [None] + [f"[::1]:{server.server_address[1]}" for server in servers]
+            # Offline identities have endpoints but never spawn a process/server.
+            worker_addresses += [reserve(socket.SOCK_STREAM) for _ in range(args.offline)]
+            roster = validate_roster({"peers": peers, "workers": worker_addresses,
+                                      "coordinator": coordinator, "interface": "lo"})
+            write_json(root / "roster.json", roster)
+            write_json(root / "local.json", {"schema_version": 1, "mode": "d28_local",
+                "started_at": started_at, "nodes": args.nodes, "offline": args.offline,
+                "lifetime_secs": args.lifetime_secs, "campaign": "campaign", "roster": roster,
+                "host": machine_metadata(binary), "script_sha256": sha256(Path(__file__)),
+                "token_policy": "new owned 0600 token; removed after owned workers stop; never logged",
+                "cases_in_order": cases, "notes": [LOCAL_NOTE,
+                    "Original worker artifacts and campaign-collected copies are retained; no failed arm is retried.",
+                    "Port reservations have a close/rebind race; a bind failure is a retained failure, not a retry."]})
+        run_args = argparse.Namespace(**vars(args))
+        run_args.binary, run_args.out = binary, root / "campaign"
+        run_args.roster, run_args.token_file = root / "roster.json", token_path
+        # The shared campaign deadline and each NodeJob watchdog are independent;
+        # cleanup has an additional finite grace and never cancels unrelated jobs.
+        result = campaign(run_args)
+        return result
+    except BaseException as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        for server, thread in zip(servers, threads):
+            if thread.is_alive():
+                server.shutdown()
+        for server in servers:
+            server.server_close()
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(4)
+        for worker in workers:
+            worker.stop_all()
+        cleanup = [{"root": str(worker.root.relative_to(root)), "run_id": identifier,
+                    "node": job.config["node"], "cleanup_confirmed": job.cleanup_confirmed()}
+                   for worker in workers for identifier, job in worker.jobs.items()]
+        token_removed = False
+        if token_identity is not None:
+            with contextlib.suppress(FileNotFoundError):
+                current = token_path.lstat()
+                if (current.st_dev, current.st_ino) == token_identity:
+                    token_path.unlink()
+                    token_removed = True
+        write_json(root / "local-result.json", {"status": "complete" if result == 0 else "partial",
+            "returncode": result, "error": error, "started_at": started_at, "finished_at": utc_now(),
+            "elapsed_seconds": time.monotonic() - began, "workers": cleanup,
+            "cleanup_confirmed": all(row["cleanup_confirmed"] for row in cleanup),
+            "worker_threads_stopped": all(not thread.is_alive() for thread in threads),
+            "token_removed": token_removed})
+
+
 def fixture_config(**changes):
     config = {"node": 0, "nodes": 4, "offline": 0, "headers": 32, "solution_bytes": 0,
               "heights": 2, "warmup": 0, "timeout_secs": 5, "workers": 1, "max_body": MAX_BODY,
@@ -1683,7 +1856,8 @@ sock.connect((host,int(port))); stream=sock.makefile('rb')
 def send(value): sock.sendall(json.dumps(value).encode()+b'\\n')
 def receive(): return json.loads(stream.readline())
 try:
-    send({'type':'ready','run_id':config['run_id'],'node':node})
+    send({'type':'ready','run_id':config['run_id'],'node':node,
+          'payload_mode':config.get('payload_mode','inline'),'payload_leaf_bytes':config.get('payload_leaf_bytes',0)})
     assert receive()=={'type':'start'}
     if config['headers']==0: time.sleep(10)
     for height in range(1,config['heights']+config['warmup']+1):
@@ -1764,6 +1938,31 @@ finally:
                         self.assertIsInstance(worker_result["process_window"]["start"], dict)
                         if expected == 0:
                             self.assertFalse(worker_result["cancelled"])
+                # Exercise the retained CLI with SEVEN synthetic metadata-only
+                # processes, not a performance measurement or D28 simulation.
+                local_args = build_parser().parse_args(["local", "--binary", str(binary),
+                    "--out", str(root / "local"), "--nodes", "7", "--body-bytes", "131072",
+                    "--repetitions", "1", "--heights", "2", "--warmup", "1", "--timeout-secs", "5"])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(local_campaign(local_args), 0)
+                local_root = root / "local"
+                self.assertFalse((local_root / "worker.token").exists())
+                receipt = read_json(local_root / "local-result.json")
+                self.assertTrue(receipt["cleanup_confirmed"] and receipt["worker_threads_stopped"])
+                self.assertTrue(receipt["token_removed"])
+                self.assertEqual(len(receipt["workers"]), 12)
+                local_summary = summarize(local_root, quiet=True)
+                self.assertEqual(local_summary["environment"], "local")
+                self.assertEqual({row["payload_mode"] for row in local_summary["cases"]}, {"inline", "outlined"})
+                for row in local_summary["cases"]:
+                    self.assertEqual(row["completed_heights"], 2)
+                    self.assertIsNone(row["measured_window"]["system_delta"]["network.eth0.tx_bytes"]["total"])
+                for path in (local_root / "campaign").glob("trial-*/result.json"):
+                    self.assertIsNone(read_json(path)["tx_budget"]["whole_child_tx_bytes"])
+                before = (local_root / "local.json").read_bytes()
+                with self.assertRaises(FileExistsError):
+                    local_campaign(local_args)
+                self.assertEqual((local_root / "local.json").read_bytes(), before)
             finally:
                 for server in servers:
                     server.shutdown(); server.server_close()
@@ -1771,6 +1970,71 @@ finally:
                     thread.join(2)
                 for worker in workers:
                     worker.stop_all()
+
+    def test_payload_modes_config_ready_and_legacy_normalization(self):
+        legacy = fixture_config()
+        explicit = dict(legacy, payload_mode="inline", payload_leaf_bytes=0)
+        self.assertTrue(configs_match(legacy, explicit))
+        for mode, leaf in (("inline", 0), ("outlined", 0), ("merkle", 32768),
+                           ("merkle", 102400), ("merkle", 1048576)):
+            config = dict(legacy, payload_mode=mode, payload_leaf_bytes=leaf)
+            self.assertEqual(validate_config(config), config)
+            state = Barrier(config, 0)
+            ready = {"type": "ready", "run_id": config["run_id"], "node": 0,
+                     "payload_mode": mode, "payload_leaf_bytes": leaf}
+            if mode != "inline":
+                with self.assertRaises(ProtocolError):
+                    state.ready({key: ready[key] for key in ("type", "run_id", "node")}, 1)
+            with self.assertRaises(ProtocolError):
+                state.ready(dict(ready, payload_mode="outlined" if mode == "inline" else "inline",
+                                 payload_leaf_bytes=0), 1)
+            state.ready(ready, 1)
+        for mode, leaf in (("unknown", 0), ("inline", 1), ("outlined", 102400), ("merkle", 0),
+                           ("merkle", 32767), ("merkle", 1048577), ("merkle", True), ("merkle", 102400.0)):
+            config = dict(legacy, payload_mode=mode, payload_leaf_bytes=leaf)
+            with self.assertRaises(ValueError):
+                validate_config(config)
+            self.assertFalse(configs_match(config, config))
+
+    def test_payload_schedule_no_nonmerkle_leaf_product_and_modes_do_not_pool(self):
+        cases = schedule([32], ["economy"], 2, 428, payload_modes=PAYLOAD_MODES,
+                         payload_leaf_bytes=[32768, 102400, 262144, 1048576])
+        self.assertEqual(len(cases), 12)
+        self.assertEqual([case["payload_mode"] for case in cases[:4]].count("outlined"), 2)
+        self.assertTrue(all(case["payload_mode"] == "merkle" for case in cases[4:]))
+        self.assertTrue(all(case["payload_leaf_bytes"] == 0 for case in cases[:4]))
+        self.assertEqual(len({trial_name(index, case) for index, case in enumerate(cases)}), 12)
+        trials = []
+        for mode, leaf in (("inline", 0), ("outlined", 0), ("merkle", 102400), ("merkle", 32768)):
+            trial = self.counter_trial()
+            trial["config"].update(payload_mode=mode, payload_leaf_bytes=leaf)
+            for node, report in trial["node_reports"].items():
+                report["config"] = dict(trial["config"], node=node)
+            trials.append(trial)
+        self.assertEqual(len(aggregate(trials)), 4)
+        trial = trials[0]
+        local = dict(trial, environment="local")
+        row = aggregate([local])[0]
+        self.assertIsNone(row["measured_window"]["system_delta"]["network.eth0.tx_bytes"]["total"])
+        self.assertIsNone(row["measured_window"]["cpu_steal"]["percent"])
+        self.assertIsNotNone(row["measured_window"]["process_cpu_seconds"]["total"]["total"])
+        self.assertIsNotNone(aggregate([trial])[0]["measured_window"]["system_delta"]["network.eth0.tx_bytes"]["total"])
+
+    def test_local_start_failure_closes_workers_and_removes_only_owned_token(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary)
+            args = build_parser().parse_args(["local", "--binary", sys.executable,
+                                              "--out", str(root / "run"), "--repetitions", "1"])
+            with mock.patch(__name__ + ".campaign", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    local_campaign(args)
+            receipt = read_json(root / "run" / "local-result.json")
+            self.assertEqual(receipt["status"], "partial")
+            self.assertTrue(receipt["token_removed"] and receipt["worker_threads_stopped"])
+            self.assertFalse((root / "run" / "worker.token").exists())
+            self.assertTrue(all(endpoint(peer)[0] == "::1" for peer in read_json(root / "run" / "roster.json")["peers"]))
+            with self.assertRaises(ValueError):
+                local_campaign(argparse.Namespace(**dict(vars(args), max_trial_tx_bytes=1)))
 
     def test_seeded_matched_schedule(self):
         first = schedule([32, 128, 512, 2048], ["baseline", "fast"], 3, 428)
@@ -2023,7 +2287,7 @@ finally:
                 summary = summarize(root)
             self.assertIn("VM_TX_Mbit/s", stdout.getvalue())
             self.assertIn("TX=0/1", stdout.getvalue())
-            self.assertEqual(summary["aggregation_version"], 2)
+            self.assertEqual(summary["aggregation_version"], 3)
             tx = summary["cases"][0]["measured_window"]["system_delta"]["network.eth0.tx_bytes"]
             self.assertIsNone(tx["total"])
             self.assertEqual((tx["available_node_windows"], len(tx["missing"])), (2, 2))
@@ -2880,6 +3144,12 @@ def profile_arg(text):
     return text
 
 
+def payload_mode_arg(text):
+    if text not in PAYLOAD_MODES:
+        raise ValueError("payload mode must be one of: " + ", ".join(PAYLOAD_MODES))
+    return text
+
+
 class ExplicitStore(argparse.Action):
     def __call__(self, parser, namespace, value, option_string=None):
         setattr(namespace, self.dest, value)
@@ -2909,10 +3179,9 @@ def build_parser():
     worker.add_argument("--interface", default="eth0")
     worker.add_argument("--max-runs", type=bounded_arg(1, 128), default=128)
     worker.add_argument("--lifetime-secs", type=bounded_arg(1, 7200), default=7200)
-    command = commands.add_parser("campaign", help="ON VM0: local node0 + private remote workers, sequential randomized grid")
-    command.add_argument("--roster", required=True, type=Path)
+    common = argparse.ArgumentParser(add_help=False)
+    command = common
     command.add_argument("--binary", required=True, type=Path)
-    command.add_argument("--token-file", required=True, type=Path)
     command.add_argument("--out", required=True, type=Path, help="NEW artifact directory")
     command.set_defaults(headers_explicit=False, solution_bytes_explicit=False)
     command.add_argument("--headers", type=comma_arg(bounded_arg(0, 2048)), default=[32, 128, 512, 2048],
@@ -2927,6 +3196,10 @@ def build_parser():
                          help="benchmark-only protocol timing profile; fixed across the sweep")
     command.add_argument("--profiles", type=comma_arg(profile_arg), default=["baseline"],
                          help="comma-separated baseline,fast,fast_k1,economy; economy polls at 100ms; never changes protocol timers")
+    command.add_argument("--payload-modes", type=comma_arg(payload_mode_arg), default=["inline"],
+                         help="comma-separated inline,outlined,merkle; whole-payload arms run before merkle")
+    command.add_argument("--payload-leaf-bytes", type=comma_arg(bounded_arg(MIN_PAYLOAD_LEAF, MAX_PAYLOAD_LEAF)),
+                         default=[102400], help="Merkle-only leaf sizes; no leaf cartesian product in other modes")
     command.add_argument("--repetitions", type=bounded_arg(1, 32), default=3)
     command.add_argument("--seed", type=bounded_arg(0, 2**32 - 1), default=428)
     command.add_argument("--heights", type=bounded_arg(1, 200), default=12)
@@ -2941,6 +3214,16 @@ def build_parser():
                                 help="per-node whole-child VM TX threshold, bytes; 0 disables; sampled every second, can overshoot")
     command.add_argument("--max-campaign-tx-bytes", type=bounded_arg(0, MAX_TX_BUDGET), default=0,
                          help="summed whole-child VM TX threshold, bytes; 0 disables; checked after each trial, one-batch overshoot")
+    remote = commands.add_parser("campaign", parents=[common],
+                                 help="ON VM0: local node0 + private remote workers")
+    remote.add_argument("--roster", required=True, type=Path)
+    remote.add_argument("--token-file", required=True, type=Path)
+    local = commands.add_parser("local", parents=[copy.deepcopy(common)],
+                                help="retained loopback-only comparison, one validator process per node; no external tools")
+    local.add_argument("--nodes", type=bounded_arg(1, 32), default=7)
+    local.set_defaults(profiles=["economy"], timing_profile="wan", heights=7, warmup=1,
+                       body_bytes=[131072, 1048576, 10485760], max_body=MAX_BENCH_BODY,
+                       payload_modes=["inline", "outlined"])
     return parser
 
 
@@ -2962,6 +3245,8 @@ def main(argv=None):
         if args.mode == "worker":
             endpoint(args.bind)
             return serve_worker(args)
+        if args.mode == "local":
+            return local_campaign(args)
         return campaign(args)
     except (OSError, ValueError, http.client.HTTPException) as exc:
         print(f"d28_fly: {type(exc).__name__}: {exc}", file=sys.stderr)
