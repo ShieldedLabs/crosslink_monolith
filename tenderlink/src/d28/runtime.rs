@@ -1400,6 +1400,17 @@ fn snapshot<'a, S: Storage>(
     }
 }
 
+// A fixed-age checkpoint, not a sliding debounce restarted by input. Scheduler
+// and storage stalls can extend the interval; safety-critical fences never wait.
+fn checkpoint_progress<S: Storage>(engine: &mut Engine<S>, now: u64, due: &mut u64) -> io::Result<()> {
+    if now >= *due {
+        let next = now.checked_add(1_000).ok_or_else(|| core_error(Error::Exhausted))?;
+        engine.checkpoint().map_err(core_error)?;
+        *due = next;
+    }
+    Ok(())
+}
+
 /// Run until transport/storage/finite-domain failure or cancellation. The host
 /// must refuse unimportable active legacy WAL before calling this function and
 /// must bind the durable backend to this signing public key.
@@ -1581,13 +1592,7 @@ pub async fn run<B: AtomicBlockStore + Send + 'static>(
             .elapse_coalesced(now.saturating_sub(last_tick), &mut events)
             .map_err(core_error)?;
         last_tick = now;
-        // Fixed-age checkpoint, never reset by shard arrivals. Only countdown
-        // progress can remain dirty across publication fences; a crash may replay
-        // at most this service interval plus scheduling/storage stalls.
-        if now >= checkpoint_at {
-            engine.checkpoint().map_err(core_error)?;
-            checkpoint_at = now.checked_add(1_000).ok_or_else(|| core_error(Error::Exhausted))?;
-        }
+        checkpoint_progress(engine, now, &mut checkpoint_at)?;
         network.receive(engine, &config, &mut events, public_key, now)?;
         work.schedule(engine, &host, &mut events, now, config.max_body)?;
         acknowledged = work.poll(engine, &mut events, now, &config, &host).await?;
@@ -2468,6 +2473,63 @@ mod tests {
                 bytes: 196
             }
         );
+    }
+
+    #[test]
+    fn progress_checkpoint_is_fixed_age_despite_continuous_service() {
+        use std::sync::Mutex;
+        #[derive(Clone)]
+        struct Disk {
+            image: Arc<Mutex<Option<Vec<u8>>>>,
+            writes: Arc<AtomicU64>,
+            size: usize,
+        }
+        impl AtomicBlockStore for Disk {
+            fn block_size(&self) -> usize { self.size }
+            fn load(&mut self, bytes: &mut [u8]) -> super::super::Result<bool> {
+                let image = self.image.lock().unwrap();
+                if let Some(image) = image.as_ref() {
+                    bytes.copy_from_slice(image);
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            fn replace(&mut self, bytes: &[u8]) -> super::super::Result<()> {
+                assert_eq!(bytes.len(), self.size);
+                *self.image.lock().unwrap() = Some(bytes.to_vec());
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let (config, key) = fixture();
+        let c = config.chain_config(&config.initial_roster, config.vote_namespace).unwrap().unwrap();
+        let limits = durable::Limits { max_members: config.max_members, max_body: config.max_body };
+        let disk = Disk {
+            image: Arc::new(Mutex::new(None)),
+            writes: Arc::new(AtomicU64::new(0)),
+            size: durable::image_size(limits).unwrap(),
+        };
+        let store = durable::DurableStore::open_buffered(disk.clone(), limits).unwrap();
+        let mut engine = Engine::boot(store, key, c.clone()).unwrap();
+        engine.set_emission(Emission::Guided);
+        let mut events = Events::default();
+        engine.init(&c, 1, 10_000, &mut events).unwrap();
+        let initial = disk.writes.load(Ordering::SeqCst);
+        let mut due = 1_000;
+        for now in (25..=2_000).step_by(25) {
+            engine.elapse_coalesced(25, &mut events).unwrap();
+            // A status/old-evidence publication opportunity must not turn every
+            // poll into a full-image replacement or reset the checkpoint age.
+            engine.publication_checkpoint().unwrap();
+            checkpoint_progress(&mut engine, now, &mut due).unwrap();
+            assert_eq!(disk.writes.load(Ordering::SeqCst), initial + now / 1_000);
+            assert_eq!(due, (now / 1_000 + 1) * 1_000);
+        }
+        let cold = durable::DurableStore::open(disk.clone(), limits).unwrap();
+        assert_eq!(cold.descriptor().unwrap().height_remaining, 8_000);
+        checkpoint_progress(&mut engine, 2_999, &mut due).unwrap();
+        assert_eq!(disk.writes.load(Ordering::SeqCst), initial + 2);
     }
 
     #[test]

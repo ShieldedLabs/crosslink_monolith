@@ -632,15 +632,23 @@ selecting a volatile policy after a reference-mode recovery is too late.
 Reference and CompactLive retain their separate earlier contracts.
 
 The Guided runtime uses `elapse_coalesced`: between consensus/height-delay
-expiries it persists the full timer decrement and exact normalized rho phase
-once, rather than rewriting its image at every missed rho tick. It retains an
+expiries it applies the full timer decrement and exact normalized rho phase
+once, rather than processing every missed rho tick separately. It retains an
 old-state replay when an earlier tick was crossed, and a post-drive replay when
-the endpoint coincides with a tick; both may occur. Every consensus transition
-and signing/body/header/certificate publication remains synchronous. Successful
-final descriptors, signed records, rows and the runtime's reduced events match
-reference elapsed processing; intermediate per-tick callback/write/crash-cut
-traces intentionally differ. Public `Engine::elapse` is unchanged. This runtime
-coalescing is not a wall-clock refinement of the source theorem above.
+the endpoint coincides with a tick; both may occur. With eager storage,
+successful final descriptors, signed records, rows and the runtime's reduced
+events match reference elapsed processing; intermediate per-tick
+callback/write/crash-cut traces intentionally differ. Public `Engine::elapse`
+keeps its reference tick processing. This runtime coalescing is not a wall-clock
+refinement of the source theorem above.
+
+The runtime now explicitly opens buffered storage. Signing and publication
+barriers remain synchronous, but countdown/rho-only updates can remain in RAM
+until the next fixed-age one-second checkpoint (plus scheduler/storage stalls),
+not a sliding debounce restarted by traffic. Recovery resumes the last committed
+remaining durations and rho phase, without charging offline time. This can
+repeat elapsed/replay work after a crash; it cannot forget an externally used
+signing choice or lock. See the separate persistence contract below.
 
 The host advertises `Engine::status()` periodically, also after useful state
 changes, including throughout round changes and after decision. A snapshot
@@ -1278,16 +1286,33 @@ planned-send backlog retirement is not proof of delivery or memory reclamation.
 
 ## Persistence and memory are separate contracts
 
-`AtomicBlockStore` is the fixed-size atomic replacement API. `durable.rs` now
-implements its bounded image codec and storage adapter: two configuration banks,
-three bodies, four certificate regions and fixed signing/publication records.
-The image size is `4096 + 3*Bmax + 556*Nmax` bytes. Every acknowledged mutation
-replaces the image before returning; a failed replacement poisons the adapter.
-Zebra's backend adds a 40-byte signer-identity envelope and commits through a
-synced RocksDB write, separate from decided-chain rows. Recovery checks exact
-limits, identity, checksum and semantic publication invariants before signing.
-`MemoryStore` remains a logical test fixture, not durable storage. Physical
-power-loss guarantees still depend on RocksDB and the underlying filesystem/device.
+`AtomicBlockStore` is the unchanged fixed-size atomic replacement API. Its
+bounded codec contains two configuration banks, three bodies, four certificate
+regions and fixed signing/publication records. The image size remains
+`4096 + 3*Bmax + 556*Nmax` bytes; the byte format and old-or-new backend contract
+are unchanged. `DurableStore::open` retains eager per-mutation durability and
+its reference crash cuts. Explicit `open_buffered`, used by the runtime, stages
+logical writes in the same bounded workspace and commits at barriers instead.
+It does not add an append-only WAL, another image, or fragment history.
+
+The engine commits the full body/evidence/intent state before invoking either
+consensus signer, and commits publication state before callbacks, explicit
+service, completed proposals and successful INIT. Runtime host scheduling,
+access snapshots and network/Merkle attestations have corresponding publication
+barriers. Already-published output can replay without flushing countdown-only
+dirt. Only the explicit progress writer may defer countdown/rho changes; it
+compares the entire descriptor after normalizing those fields and rejects any
+authority, reference, activation, context or increasing countdown change.
+Completed-body hash/canonical checks and Host validity remain separate.
+
+A failed mutation, encoding or replacement poisons the adapter; a failed barrier
+halts the engine before further output. Dirty flags clear only on successful
+replacement. Drop does not flush: recovery discards the working copy and reloads
+the backend, checking limits, identity, checksum and semantic publication
+invariants before signing. Zebra's existing backend still adds its 40-byte
+signer-identity envelope and commits via synced RocksDB separately from decided
+chain rows. `MemoryStore` remains a logical test fixture, not durable storage;
+physical power-loss guarantees depend on RocksDB and the filesystem/device.
 
 Core roles are bounded independently of the number of elapsed rounds. The runtime
 separates bounded application frame permits, per-tick receive work, queued host
