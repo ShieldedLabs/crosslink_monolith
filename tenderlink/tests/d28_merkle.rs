@@ -1,7 +1,5 @@
 //! Independent transport primitives; the runtime/consensus boundary is unchanged.
-// The module registration is deliberately left to the integration branch.
-#[path = "../src/d28/merkle.rs"]
-mod merkle;
+use tenderlink::d28::merkle;
 
 use ed25519_zebra::{SigningKey, VerificationKeyBytes};
 use merkle::{

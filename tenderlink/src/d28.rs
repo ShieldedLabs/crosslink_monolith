@@ -1586,6 +1586,7 @@ pub mod bench;
 pub mod chain;
 pub mod durable;
 pub mod gossip;
+pub mod merkle;
 pub mod runtime;
 pub mod wire;
 pub use atomic::AtomicBlockStore;
