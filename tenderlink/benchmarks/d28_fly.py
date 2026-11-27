@@ -281,7 +281,7 @@ class Barrier:
 
     def ready(self, message, now):
         required = {"type", "run_id", "node"}
-        if (not required <= set(message) or set(message) - required - {"payload_mode", "payload_leaf_bytes"}
+        if (set(message) not in (required, required | {"payload_mode", "payload_leaf_bytes"})
                 or message.get("type") != "ready"):
             raise ProtocolError("expected ready")
         self.identity(message)
@@ -488,7 +488,10 @@ class Coordinator:
 WINDOW_COUNTERS = {
     "application": ("offered.evidence.bytes", "offered.status.bytes", "offered.hello.bytes",
                     "offered.bare_votes.bytes", "scheduler_budget_discarded.messages",
-                    "received.messages", "rejected.messages"),
+                    "received.messages", "rejected.messages", "payload.offered_control.bytes",
+                    "payload.offered_data.bytes", "payload.payload_bytes", "payload.outlined_evidence_bytes",
+                    "payload.duplicate_payload_bytes", "payload.body_cache_hits", "payload.body_cache_misses",
+                    "payload.body_requests", "payload.body_responses"),
     "transport": ("outbox_dropped_messages", "outbox_dropped_bytes", "inbox_dropped_messages",
                   "inbox_dropped_bytes", "ring_sent", "ring_received", "ring_receive_dropped_full",
                   "ring_inbound_refused_full", "ring_send_head_blocked", "ring_send_dropped_unknown",
@@ -505,6 +508,8 @@ AGGREGATION_NOTES = [
     "Chatter is a separate final-height hold, not quiescent idle traffic: rates sum each node's bytes / its actual pooled local window duration, not requested hold seconds or controller duration.",
     "Process CPU seconds use each window's reported ticks_per_second. Steal is sum steal / sum total guest CPU ticks, not a diagnosis of shared-host contention.",
     "Peak RSS is the maximum observed end-window process.max_rss_bytes gauge, a process-lifetime high-water mark (possibly reached in warmup), never a counter delta.",
+    "Payload metrics count application offers, not delivery. Raw payload bytes are already in inline evidence or outlined data; outlined metadata is already in evidence. Payload control/data are separate from evidence. Never add subset counters twice.",
+    "duplicate_payload_bytes tracks locally known repeated offers of the most recent body ID to the same peer/height/session, not globally deduplicated reception or total wasted network traffic. Raw-payload/body measures replication, not only waste.",
 ]
 
 
@@ -1596,6 +1601,18 @@ def summarize(directory, quiet=False):
                   fmt(row["body_bytes_per_second"], 1 / 1024), fmt(tx["per_second"], 8 / 1e6),
                   fmt(tx["per_body_byte"]), fmt(evidence["per_body_byte"]), fmt(discards["total"]),
                   fmt(measured["cpu_steal"]["percent"]), fmt(measured["peak_rss_bytes"]["max"], 1 / 2**20))
+            app = measured["application_delta"]
+            def payload_metric(name, field="total", factor=1):
+                metric = app["payload." + name]
+                return f"{fmt(metric[field], factor)}(trials={metric['matched_trials']}/{row['trials']})"
+            print("  payload application offers:",
+                  "raw/body=" + payload_metric("payload_bytes", "per_body_byte"),
+                  "outlined_metadata/body=" + payload_metric("outlined_evidence_bytes", "per_body_byte"),
+                  "control_KiB/s=" + payload_metric("offered_control.bytes", "per_second", 1 / 1024),
+                  "data_KiB/s=" + payload_metric("offered_data.bytes", "per_second", 1 / 1024),
+                  "cache_hits=" + payload_metric("body_cache_hits"),
+                  "cache_misses=" + payload_metric("body_cache_misses"),
+                  "known_duplicate_B=" + payload_metric("duplicate_payload_bytes"))
             print(f"  chronology: first_start={row['started_at'] or '-'} last_finish={row['finished_at'] or '-'} "
                   f"elapsed_s={fmt(row['elapsed_seconds'])}(n={row['elapsed_trial_count']}) "
                   f"rate_duration_s={fmt(row['duration_seconds'])} "
@@ -1696,7 +1713,8 @@ def campaign(args):
             halt_reason = "campaign_tx_budget_exceeded"
         elif result["interrupted"]:
             halt_reason = "interrupted"
-        ledger.update(campaign_confirmed_tx_bytes=confirmed_tx, campaign_halt_reason=halt_reason)
+        ledger.update(campaign_confirmed_tx_bytes=None if args.mode == "local" else confirmed_tx,
+                      campaign_halt_reason=halt_reason)
         results.append({"trial": name, "status": result["status"], **case, "tx_budget": ledger,
                         **{key: result.get(key) for key in ("started_at", "finished_at", "elapsed_seconds")}})
         print(f"{name}: {result['status']}", flush=True)
@@ -1710,7 +1728,7 @@ def campaign(args):
                                      "planned_trials": len(cases), "started_trials": len(results),
                                      "complete_trials": sum(row["status"] == "complete" for row in results),
                                      "halt_reason": halt_reason,
-                                     "tx_budget": dict(budget_config, confirmed_tx_bytes=confirmed_tx,
+                                     "tx_budget": dict(budget_config, confirmed_tx_bytes=None if args.mode == "local" else confirmed_tx,
                                                        accounting_complete=accounting_complete),
                                      "trials": results})
     write_json(output / "summary.json", summarize(output))
@@ -1985,6 +2003,8 @@ finally:
             if mode != "inline":
                 with self.assertRaises(ProtocolError):
                     state.ready({key: ready[key] for key in ("type", "run_id", "node")}, 1)
+            with self.assertRaises(ProtocolError):
+                state.ready({key: value for key, value in ready.items() if key != "payload_leaf_bytes"}, 1)
             with self.assertRaises(ProtocolError):
                 state.ready(dict(ready, payload_mode="outlined" if mode == "inline" else "inline",
                                  payload_leaf_bytes=0), 1)
