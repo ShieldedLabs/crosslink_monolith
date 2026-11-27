@@ -17,7 +17,7 @@ pub enum PayloadMode {
     #[default]
     Inline,
     Outlined,
-    /// Verified, independently relayable Merkle leaves with bounded windows.
+    /// Unordered, proposer-authenticated shards with bounded local ownership.
     Merkle {
         leaf_bytes: usize,
     },
@@ -36,10 +36,10 @@ pub struct PayloadMetricsSnapshot {
     /// Raw body bytes offered per recipient, including bodies in inline frames.
     /// A subset of encoded evidence/data bytes; never add it to total wire bytes.
     pub payload_bytes: u64,
-    /// Locally known repeat raw-byte offers of the most recently offered body to
-    /// that peer in the current height/session. Merkle counts repeats of the SAME
-    /// leaf, not successive different leaves; bounded one-body/geometry bitmap
-    /// history per peer. Not global duplicates, received duplicates, or delivery.
+    /// Locally known repeat raw-byte offers in the current height/session.
+    /// Outlined remembers the last body per peer. Merkle counts repeats of the SAME
+    /// leaf, not successive different leaves; at most K owned-body/geometry
+    /// histories per peer. Not global duplicates, received duplicates, or delivery.
     pub duplicate_payload_bytes: u64,
     /// Subset of `offered.evidence.bytes`, never additional wire bytes.
     pub outlined_evidence_bytes: u64,
@@ -55,7 +55,7 @@ pub struct PayloadMetricsSnapshot {
     pub verified_leaf_bytes: u64,
     /// Assemblies passing canonical-height and keyed-body-ID checks. NOT Host Valid.
     pub assembly_completions: u64,
-    /// Body/leaf request, ACK and HAVE records, separate from evidence and status.
+    /// Body requests/ACKs (Outlined), shard WANT/HAVE (Merkle), separate from evidence/status.
     pub offered_control: MessageCounts,
     /// Encoded body/leaf responses, separate from evidence and status.
     pub offered_data: MessageCounts,
@@ -158,10 +158,10 @@ struct Pending {
     attempt: Option<(u32, u64, u64)>, // source/session/retry deadline, not metadata token
     cursor: u32,
 }
-/// Separate ownership from Receiver/Responder permits: global K pending
-/// evidence records (O(K*N)), O(N) peer scalars, and at most K_tx body leases.
-/// No second long-lived body cache: complete response bytes are borrowed and
-/// retained engine bodies are consulted before making one temporary RX copy.
+/// Separate ownership from Receiver/Responder permits: K pending evidence
+/// records (O(K*N)). Outlined has O(N) peer scalars and K_tx body leases;
+/// Merkle instead shares K owned slots between partials and completed content.
+/// Engine bodies and completed Merkle owners can supply fresh outlined metadata.
 #[derive(Default)]
 pub(super) struct PayloadState {
     scope: Option<(super::Id, u64)>,
@@ -561,7 +561,8 @@ impl Network {
                 .pending
                 .iter()
                 .enumerate()
-                .find_map(|(i, pending)| retained_body(engine, pending.key).map(|body| (i, body)))
+                .find_map(|(i, pending)| retained_body(engine, pending.key)
+                    .or_else(|| self.payload.merkle.body(pending.key)).map(|body| (i, body)))
             else {
                 break;
             };
@@ -594,7 +595,7 @@ impl Network {
         if config.payload_mode == PayloadMode::Inline {
             return Ok(false);
         }
-        if matches!(bytes.first(), Some(&merkle_wire::HAVE | &merkle_wire::WANT | &merkle_wire::LEAF | &merkle_wire::ACK)) {
+        if matches!(bytes.first(), Some(&merkle_wire::HAVE | &merkle_wire::WANT | &merkle_wire::LEAF)) {
             return self.receive_merkle(engine, config, events, member, generation, bytes, now);
         }
         if matches!(config.payload_mode, PayloadMode::Merkle { .. })
@@ -628,7 +629,7 @@ impl Network {
                     height: d.height,
                     id: header.content.id,
                 };
-                if let Some(body) = retained_body(engine, key) {
+                if let Some(body) = retained_body(engine, key).or_else(|| self.payload.merkle.body(key)) {
                     if let Some(metrics) = &config.metrics {
                         metrics.payload.cache(true);
                     }
