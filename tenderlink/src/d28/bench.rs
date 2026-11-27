@@ -753,6 +753,12 @@ impl Sampler {
                 ("payload_bytes", snapshot.payload.payload_bytes),
                 ("duplicate_payload_bytes", snapshot.payload.duplicate_payload_bytes),
                 ("outlined_evidence_bytes", snapshot.payload.outlined_evidence_bytes),
+                ("leaf_requests", snapshot.payload.leaf_requests),
+                ("leaf_responses", snapshot.payload.leaf_responses),
+                ("leaf_proof_bytes", snapshot.payload.leaf_proof_bytes),
+                ("availability_bytes", snapshot.payload.availability_bytes),
+                ("verified_leaf_bytes", snapshot.payload.verified_leaf_bytes),
+                ("assembly_completions", snapshot.payload.assembly_completions),
             ] {
                 *out.entry(format!("payload.{name}")).or_default() += value;
             }
@@ -1586,6 +1592,8 @@ mod tests {
         let snapshot = sampler.application_snapshot();
         for key in ["body_cache_hits", "body_cache_misses", "body_requests", "body_responses",
                     "payload_bytes", "duplicate_payload_bytes", "outlined_evidence_bytes",
+                    "leaf_requests", "leaf_responses", "leaf_proof_bytes", "availability_bytes",
+                    "verified_leaf_bytes", "assembly_completions",
                     "offered_control.messages", "offered_control.bytes", "offered_data.messages",
                     "offered_data.bytes"] {
             assert_eq!(snapshot.get(&format!("payload.{key}")), Some(&0));
