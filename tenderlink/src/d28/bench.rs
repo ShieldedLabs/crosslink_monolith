@@ -40,7 +40,7 @@ pub mod distributed;
 const NAMESPACE: [u8; 32] = [0x28; 32];
 
 /// Opt-in benchmark geometry only; production `PROPOSAL_MAX_SIZE` stays 1 MiB.
-pub const BENCH_MAX_BODY: usize = 10 * 1024 * 1024;
+pub const BENCH_MAX_BODY: usize = 40 * 1024 * 1024;
 pub const MIN_PAYLOAD_LEAF_BYTES: usize = 32 * 1024;
 pub const MAX_PAYLOAD_LEAF_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_PAYLOAD_LEAF_BYTES: usize = 102400;
@@ -90,7 +90,7 @@ fn bench_transport_limits(nodes: usize, max_body: usize) -> io::Result<crate::tr
         limits.rings.receive = 32;
     }
     limits.max_message_size = limits.max_message_size.max(frame);
-    // Leave control-message slack beyond a full frame (16 MiB for 10 MiB bodies).
+    // Leave control-message slack beyond a full frame (16/64 MiB for 10/40 MiB bodies).
     let queue = frame.next_power_of_two();
     limits.peer_outbox_bytes = limits.peer_outbox_bytes.max(queue);
     limits.consumer_inbox_peer_bytes = limits.consumer_inbox_peer_bytes.max(queue);
@@ -166,7 +166,7 @@ impl BenchConfig {
             || self.headers > 2_048
         {
             return Err(invalid(
-                "invalid benchmark bounds: total heights 1..10000, timeout 1..86400s, workers 1..128, delays <=60000ms, chatter <=3600s, max-body 1..10MiB, headers <=2048",
+                "invalid benchmark bounds: total heights 1..10000, timeout 1..86400s, workers 1..128, delays <=60000ms, chatter <=3600s, max-body 1..40MiB, headers <=2048",
             ));
         }
         // Reserve a full-N parent certificate, not just the likely minimum quorum.
@@ -1606,16 +1606,19 @@ mod tests {
         let defaults = crate::transport::TransportLimits::default();
         let legacy = bench_transport_limits(7, crate::PROPOSAL_MAX_SIZE).unwrap();
         assert_eq!(format!("{legacy:?}"), format!("{defaults:?}"));
-        let limits = bench_transport_limits(7, BENCH_MAX_BODY).unwrap();
-        let frame = super::super::wire::Limits { max_members: 7, max_body: BENCH_MAX_BODY }
-            .max_frame_bytes().unwrap();
-        assert_eq!(frame, BENCH_MAX_BODY + 1499);
-        assert_eq!(limits.max_message_size, frame);
-        assert_eq!(limits.peer_outbox_bytes, 16 << 20);
-        assert_eq!(limits.consumer_inbox_peer_bytes, 16 << 20);
-        assert_eq!(limits.consumer_inbox_bytes, 64 << 20);
-        assert_eq!(limits.peer_high_water_bytes, 512 * 1024);
-        assert_eq!((limits.rings.send, limits.rings.control, limits.rings.receive), (1024, 256, 32));
+        assert_eq!(BENCH_MAX_BODY, 40 * 1024 * 1024);
+        for (max_body, queue) in [(10 << 20, 16 << 20), (BENCH_MAX_BODY, 64 << 20)] {
+            let limits = bench_transport_limits(7, max_body).unwrap();
+            let frame = super::super::wire::Limits { max_members: 7, max_body }
+                .max_frame_bytes().unwrap();
+            assert_eq!(frame, max_body + 1499);
+            assert_eq!(limits.max_message_size, frame);
+            assert_eq!(limits.peer_outbox_bytes, queue);
+            assert_eq!(limits.consumer_inbox_peer_bytes, queue);
+            assert_eq!(limits.consumer_inbox_bytes, 64 << 20);
+            assert_eq!(limits.peer_high_water_bytes, 512 * 1024);
+            assert_eq!((limits.rings.send, limits.rings.control, limits.rings.receive), (1024, 256, 32));
+        }
         let mut config = BenchConfig { max_body: BENCH_MAX_BODY, ..Default::default() };
         assert!(config.validate().is_ok());
         config.max_body += 1;

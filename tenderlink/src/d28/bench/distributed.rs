@@ -22,6 +22,7 @@ pub struct DistributedConfig {
     pub heights: u32,
     pub warmup: u32,
     pub timeout_secs: u64,
+    /// Tokio executor threads per validator process, not machine vCPUs or total threads.
     pub workers: usize,
     pub max_body: usize,
     pub chatter_secs: u64,
@@ -83,7 +84,7 @@ impl DistributedConfig {
             || self.solution_bytes > 1344
             || (self.body_bytes > 0 && (self.headers == 0 || self.solution_bytes != 0))
         {
-            return Err(invalid("bounds: nodes 1..32, max_body 1..10MiB, body_bytes <=max_body, headers <=2048; byte mode requires headers 1..2048 and solution_bytes=0; legacy solution_bytes <=1344"));
+            return Err(invalid("bounds: nodes 1..32, max_body 1..40MiB, body_bytes <=max_body, headers <=2048; byte mode requires headers 1..2048 and solution_bytes=0; legacy solution_bytes <=1344"));
         }
         Ok(())
     }
@@ -93,13 +94,14 @@ impl DistributedConfig {
         request_timeout: &mut u64,
         status_ttl: &mut u64,
     ) {
-        if self.timing_profile == "wan" {
-            timeouts.propose = 10_000;
-            timeouts.prevote = 5_000;
-            timeouts.precommit = 7_000;
-            *request_timeout = 10_000;
-            *status_ttl = 15_000;
-        }
+        let bases = match self.timing_profile.as_str() {
+            "wan" => (10_000, 5_000, 7_000),
+            "wan_fast" => (2_500, 1_500, 2_000),
+            _ => return,
+        };
+        (timeouts.propose, timeouts.prevote, timeouts.precommit) = bases;
+        *request_timeout = 10_000;
+        *status_ttl = 15_000;
     }
     fn base(&self) -> BenchConfig {
         BenchConfig {
@@ -119,8 +121,11 @@ impl DistributedConfig {
     }
     pub fn validate(&self) -> io::Result<()> {
         self.validate_body_shape()?;
-        if !matches!(self.timing_profile.as_str(), "production" | "wan") {
-            return Err(invalid("timing_profile must be production or wan"));
+        if !matches!(self.timing_profile.as_str(), "production" | "wan" | "wan_fast") {
+            return Err(invalid("timing_profile must be production, wan or wan_fast"));
+        }
+        if !(1..=4).contains(&self.workers) {
+            return Err(invalid("distributed workers must be 1..4 Tokio executor threads"));
         }
         self.base().validate()?;
         if self.node >= self.nodes - self.offline || self.peers.len() != self.nodes {
@@ -217,7 +222,8 @@ fn padded_header(height: u32, index: usize, bytes: usize) -> BlockHeaderData {
 
 /// Largest solution whose encoded growth over an empty solution fits `budget`.
 /// The unchanged Vector codec uses CompactSize (1/3/5 bytes here), bounded by
-/// 32 MiB per vector. Our entire body is <=10 MiB, including all these vectors.
+/// 32 MiB per vector. A 40 MiB body fits across the runner's 32 headers; the
+/// legacy single-header path must still respect the unchanged vector bound.
 fn padding_at_most(budget: usize) -> (usize, usize) {
     match budget {
         0..=252 => (budget, budget),
@@ -248,6 +254,11 @@ fn solution_lengths(parent: &FatPointerToBftBlock, c: &DistributedConfig) -> io:
         .ok_or_else(|| invalid("body_bytes is smaller than headers plus parent certificate"))?;
     if c.headers == 1 {
         let (length, used) = padding_at_most(extra);
+        // zcash_encoding::MAX_COMPACT_SIZE is an unchanged 32 MiB per Vector.
+        // With >=2 headers, the 40 MiB whole-body bound keeps each below it.
+        if length > 32 * 1024 * 1024 {
+            return Err(invalid("single-header solution exceeds the 32MiB Vector limit"));
+        }
         return if used == extra { Ok(vec![length]) } else {
             Err(invalid("body_bytes falls in a CompactSize gap; use at least two headers"))
         };
@@ -973,7 +984,7 @@ pub async fn run(config: DistributedConfig) -> io::Result<DistributedReport> {
             "Application offered bytes are not wire bytes; transport ring messages are not UDP packets. /proc/net/dev includes TX/RX of every non-lo interface and all VM traffic, including controller/management; not isolated D28 amplification. Serial snapshots have sampling skew.",
             "Host CPU/steal/cgroup counters include other VM processes. Process CPU is in reported clock ticks; RSS/maxRSS are gauges (not deltas). Missing system metrics carry errors, never fabricated zeros. In-memory atomic image is not fsync/crash-durable storage.",
             "Synthetic solution padding uses unchanged BftBlock/header Vector serialization; it is NOT valid Equihash work or a production-valid ledger body. body_bytes targets the exact whole serialized body; payload_bytes counts only actual serialized headers and can vary with parent certificate length.",
-            "Production defaults and core formats unchanged. Explicit benchmark timing_profile=wan changes only base consensus/request/status-expiry timers; rho and round increments stay unchanged. Scheduling knobs, body cap and benchmark transport/ring overrides are recorded. Memory bounds here are not a whole-process RSS guarantee.",
+            "Production defaults and core formats unchanged. Explicit benchmark timing_profile=wan/wan_fast changes only base consensus/request/status-expiry timers (wan_fast uses 2500/1500/2000ms consensus bases with WAN request/status TTL); rho and round increments stay unchanged. Scheduling knobs, body cap and benchmark transport/ring overrides are recorded. Memory bounds here are not a whole-process RSS guarantee.",
         ],
     })
 }
@@ -1029,6 +1040,60 @@ mod tests {
         }
     }
     #[test]
+    fn executor_workers_are_bounded_explicit_and_roundtrip() {
+        for workers in 1..=4 {
+            let mut c = config();
+            c.workers = workers;
+            c.validate().unwrap();
+            assert_eq!(c.base().workers, workers);
+            let json = serde_json::to_value(&c).unwrap();
+            assert_eq!(json["workers"], workers);
+            let decoded: DistributedConfig = serde_json::from_value(json).unwrap();
+            decoded.validate().unwrap();
+            assert_eq!(decoded.workers, workers);
+        }
+        for workers in [0, 5, 128, usize::MAX] {
+            let mut c = config();
+            c.workers = workers;
+            assert!(c.validate().is_err());
+        }
+        for field in ["workers", "max_body"] {
+            let mut json = serde_json::to_value(config()).unwrap();
+            json.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<DistributedConfig>(json).is_err());
+        }
+        for value in [serde_json::json!(true), serde_json::json!(-1),
+                      serde_json::json!(1.5), serde_json::json!("2"), serde_json::Value::Null] {
+            let mut json = serde_json::to_value(config()).unwrap();
+            json["workers"] = value;
+            assert!(serde_json::from_value::<DistributedConfig>(json).is_err());
+        }
+        // Do not narrow the older single-process library/CLI worker range.
+        assert!(BenchConfig { workers: 128, ..Default::default() }.validate().is_ok());
+    }
+    #[test]
+    fn forty_mib_merkle_geometry_is_bounded_for_100k_and_32k_leaves() {
+        assert_eq!(BENCH_MAX_BODY, 41_943_040);
+        for (leaf_bytes, count, bitmap, proof) in [(102400, 410, 52, 288), (32768, 1280, 160, 352)] {
+            let mut c = byte_config(BENCH_MAX_BODY);
+            c.payload_mode = "merkle".into();
+            c.payload_leaf_bytes = leaf_bytes;
+            c.validate().unwrap();
+            let layout = crate::d28::merkle::Manifest {
+                body_id: [0; 32], signed_header_identity: [0; 32], root: [0; 32],
+                body_len: c.body_bytes as u64, leaf_bytes: leaf_bytes as u32,
+            }.validate(c.max_body).unwrap();
+            assert_eq!(layout.leaf_count(), count);
+            assert_eq!(layout.bitmap_bytes(), bitmap);
+            assert_eq!(layout.proof_bytes(), proof);
+            assert!(u32::try_from(layout.leaf_count()).is_ok()); // Runtime wire index bound.
+            let json = serde_json::to_value(&c).unwrap();
+            let decoded: DistributedConfig = serde_json::from_value(json).unwrap();
+            decoded.validate().unwrap();
+            assert_eq!((decoded.body_bytes, decoded.max_body), (BENCH_MAX_BODY, BENCH_MAX_BODY));
+        }
+    }
+    #[test]
     fn shape_and_private_topology_bounds() {
         let mut c = config();
         assert!(c.validate().is_ok());
@@ -1079,7 +1144,7 @@ mod tests {
     fn exact_bodies_roundtrip_with_null_quorum_and_full_roster_parents() {
         use super::super::tests::pointer;
         let members = roster(7);
-        for target in [6727, 8192, 65536, 1024 * 1024, BENCH_MAX_BODY] {
+        for target in [6727, 8192, 65536, 1024 * 1024, 10 * 1024 * 1024, BENCH_MAX_BODY] {
             let c = byte_config(target);
             c.validate().unwrap();
             let first = body(1, FatPointerToBftBlock::null(), &c).unwrap();
@@ -1107,13 +1172,33 @@ mod tests {
             }
         }
         for headers in [1, 2, 2048] {
-            let mut c = byte_config(BENCH_MAX_BODY);
+            let target = if headers == 1 { 10 * 1024 * 1024 } else { BENCH_MAX_BODY };
+            let mut c = byte_config(target);
             c.headers = headers;
             c.validate().unwrap();
             let value = body(1, FatPointerToBftBlock::null(), &c).unwrap();
-            assert_eq!(value.0.len(), BENCH_MAX_BODY);
+            assert_eq!(value.0.len(), target);
             assert!(valid_body(&value, 1, ValueId::NIL, &c, &members));
         }
+    }
+    #[test]
+    fn exact_body_cap_never_autogrows_and_single_vector_limit_is_checked_before_allocation() {
+        let mut c = byte_config(BENCH_MAX_BODY);
+        c.max_body = 10 * 1024 * 1024;
+        assert!(c.validate().is_err());
+        c.max_body = BENCH_MAX_BODY;
+        c.headers = 1;
+        let null = FatPointerToBftBlock::null();
+        assert!(c.validate().is_err());
+        assert!(solution_lengths(&null, &c).is_err());
+        assert!(body(1, null.clone(), &c).is_err());
+        // Exact unchanged Vector limit accepted, next byte rejected arithmetically.
+        c.body_bytes = 71 + 187 + 4 + 32 * 1024 * 1024;
+        c.validate().unwrap();
+        assert_eq!(solution_lengths(&null, &c).unwrap(), vec![32 * 1024 * 1024]);
+        c.body_bytes += 1;
+        assert!(c.validate().is_err());
+        assert!(solution_lengths(&null, &c).is_err());
     }
     #[test]
     fn exact_padding_bridges_compact_size_gaps_without_format_changes() {
@@ -1199,6 +1284,20 @@ mod tests {
             propose: 10000, prevote: 5000, precommit: 7000, ..original
         });
         assert_eq!((request, ttl), (10000, 15000));
+        let namespace = c.namespace();
+        c.timing_profile = "wan_fast".into();
+        c.validate().unwrap();
+        c.apply_timing(&mut timeouts, &mut request, &mut ttl);
+        assert_eq!(timeouts, super::super::super::Timeouts {
+            propose: 2500, prevote: 1500, precommit: 2000, ..original
+        });
+        assert_eq!((request, ttl), (10000, 15000));
+        assert_eq!(c.namespace(), namespace); // Timer choice is not a payload/signature domain.
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(json["timing_profile"], "wan_fast");
+        let decoded: DistributedConfig = serde_json::from_value(json).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded.timing_profile, "wan_fast");
         c.timing_profile = "other".into();
         assert!(c.validate().is_err());
     }

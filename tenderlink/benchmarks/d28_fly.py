@@ -55,8 +55,10 @@ from unittest import mock
 
 
 MAX_BODY = 1048576  # Legacy default; never silently raised for a byte-target sweep.
-MAX_BENCH_BODY = 10 * MAX_BODY
+LOCAL_MAX_BODY = 10 * MAX_BODY  # Historical local default, independent of the opt-in maximum.
+MAX_BENCH_BODY = 40 * MAX_BODY
 PAYLOAD_MODES = ("inline", "outlined", "merkle")
+TIMING_PROFILES = ("production", "wan", "wan_fast")
 MIN_PAYLOAD_LEAF = 32 * 1024
 MAX_PAYLOAD_LEAF = 1024 * 1024
 LOCAL_NOTE = ("Local shared-host process comparison, not WAN performance. Each validator is a separate "
@@ -81,6 +83,7 @@ PROFILES = {"baseline": {"poll_ms": 25, "status_ms": 100, "receive_budget": 32, 
 RUN_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{15,95}\Z")
 NOTES = [
     "One chain: body/payload bytes are counted once per all-online ACKed height, not once per validator.",
+    "workers is the Tokio executor thread count per validator process, not machine vCPUs or all process threads.",
     "Controller receipt latency and cycle use controller monotonic time; node latency uses each node's own clock.",
     "All-online TCP ACK barrier is experimental network overhead, not a production protocol timer.",
     "TX is summed once across machines, never TX+RX. VM interface counters include TCP control, SSH and other activity.",
@@ -201,7 +204,7 @@ def validate_config(config):
         raise ValueError("config must be an object")
     bounds = {"node": (0, 31), "nodes": (1, 32), "offline": (0, 31),
               "headers": (0, 2048), "solution_bytes": (0, 1344), "heights": (1, 200),
-              "warmup": (0, 20), "timeout_secs": (1, 1800), "workers": (1, 1),
+              "warmup": (0, 20), "timeout_secs": (1, 1800), "workers": (1, 4),
               "body_bytes": (0, MAX_BENCH_BODY), "max_body": (1, MAX_BENCH_BODY), "chatter_secs": (0, 30),
               "poll_ms": (5, 100), "status_ms": (25, 100), "receive_budget": (32, 128),
               "max_requests": (1, 2), "max_outgoing": (2, 2)}
@@ -211,8 +214,8 @@ def validate_config(config):
     for key, (low, high) in bounds.items():
         integer(config.get(key, 0), low, high, key)
     payload_settings(config)
-    if config.get("timing_profile", "production") not in ("production", "wan"):
-        raise ValueError("timing_profile must be production or wan")
+    if config.get("timing_profile", "production") not in TIMING_PROFILES:
+        raise ValueError("timing_profile must be " + ", ".join(TIMING_PROFILES))
     if config.get("body_bytes", 0):
         if config["headers"] != 32 or config.get("solution_bytes", 0) != 0:
             raise ValueError("body_bytes requires headers=32 and solution_bytes=0")
@@ -685,11 +688,12 @@ def aggregate(trials):
         config = trial["config"]
         key = (config["nodes"], config["offline"], config["headers"], config.get("solution_bytes", 0), trial["profile"],
                config.get("body_bytes", 0), config["max_body"], config.get("timing_profile", "production"),
-               *payload_settings(config), trial.get("environment", "distributed"))
+               *payload_settings(config), trial.get("environment", "distributed"), config["workers"])
         group = groups.setdefault(key, {"nodes": key[0], "offline": key[1], "headers": key[2],
                                        "solution_bytes": key[3], "profile": key[4], "trials": 0,
                                        "target_body_bytes": key[5], "max_body": key[6], "timing_profile": key[7],
                                        "payload_mode": key[8], "payload_leaf_bytes": key[9], "environment": key[10],
+                                       "workers": key[11],
                                        "complete_trials": 0, "duration_seconds": 0, "completed_heights": 0,
                                        "body_bytes": 0, "payload_bytes": 0, "body_sizes": set(),
                                        "receipt_ms": {c: [] for c in ("first", "quorum", "all")},
@@ -1238,7 +1242,8 @@ def validate_roster(roster):
 
 def schedule(headers, profiles, repetitions, seed, *, body_bytes=None, max_body=MAX_BODY,
              timing_profile="production", payload_modes=("inline",), payload_leaf_bytes=(102400,),
-             interleave_payload_modes=False):
+             interleave_payload_modes=False, workers=1):
+    integer(workers, 1, 4, "workers")
     targets = headers if body_bytes is None else body_bytes
     arms = [(mode, leaf) for mode in payload_modes
             for leaf in (payload_leaf_bytes if mode == "merkle" else (0,))]
@@ -1257,7 +1262,7 @@ def schedule(headers, profiles, repetitions, seed, *, body_bytes=None, max_body=
             for profile, mode, leaf in paired:
                 trials.append({"repetition": repetition, "headers": size if body_bytes is None else 32,
                                "body_bytes": 0 if body_bytes is None else size, "max_body": max_body,
-                               "timing_profile": timing_profile, "profile": profile,
+                               "timing_profile": timing_profile, "profile": profile, "workers": workers,
                                "payload_mode": mode, "payload_leaf_bytes": leaf})
     if interleave_payload_modes:
         return trials  # Keep the seeded complete block of arms in each repetition.
@@ -1275,6 +1280,8 @@ def trial_name(index, case):
         size += f"-cap{cap}"
     timing = case.get("timing_profile", "production")
     suffix = "" if timing == "production" else "-" + timing
+    if case.get("workers", 1) != 1:
+        suffix += f"-workers{case['workers']}"
     mode, leaf = payload_settings(case)
     if "payload_mode" in case:
         suffix += f"-{mode}-leaf{leaf}"
@@ -1289,14 +1296,14 @@ def campaign_cases(args):
     return schedule(args.headers, args.profiles, args.repetitions, args.seed,
                     body_bytes=args.body_bytes, max_body=args.max_body, timing_profile=args.timing_profile,
                     payload_modes=args.payload_modes, payload_leaf_bytes=args.payload_leaf_bytes,
-                    interleave_payload_modes=args.interleave_payload_modes)
+                    interleave_payload_modes=args.interleave_payload_modes, workers=args.workers)
 
 
 def trial_config(args, roster, case, identifier):
     config = {"node": 0, "nodes": len(roster["peers"]), "offline": args.offline,
               "headers": case["headers"], "solution_bytes": 0 if case.get("body_bytes", 0) else args.solution_bytes,
               "heights": args.heights, "warmup": args.warmup, "timeout_secs": args.timeout_secs,
-              "workers": 1, "max_body": case.get("max_body", args.max_body), "chatter_secs": args.chatter_secs,
+              "workers": args.workers, "max_body": case.get("max_body", args.max_body), "chatter_secs": args.chatter_secs,
               "peers": roster["peers"], "coordinator": roster["coordinator"],
               "run_id": identifier, "max_requests": 2, "max_outgoing": 2, **PROFILES[case["profile"]]}
     # Old executables/config artifacts remain usable when neither new mode is requested.
@@ -1590,7 +1597,7 @@ def summarize(directory, quiet=False):
         def fmt(value, factor=1):
             return "-" if value is None else f"{value * factor:.3f}"
 
-        print("nodes/offline headers+solution target_body_B max_body_B timing profile payload_mode leaf_B complete/failed local_n local_p50/p95_ms body_KiB/s VM_TX_Mbit/s TX/body evidence/body budget_discards steal_% peak_RSS_MiB")
+        print("nodes/offline tokio_workers headers+solution target_body_B max_body_B timing profile payload_mode leaf_B complete/failed local_n local_p50/p95_ms body_KiB/s VM_TX_Mbit/s TX/body evidence/body budget_discards steal_% peak_RSS_MiB")
         for row in rows:
             measured = row["measured_window"]
             tx = measured["system_delta"]["network.eth0.tx_bytes"]
@@ -1598,7 +1605,7 @@ def summarize(directory, quiet=False):
             discards = measured["application_delta"]["scheduler_budget_discarded.messages"]
             local = row["node_local_ms"]
             latency = local["percentiles"] or {}
-            print(f"{row['nodes']}/{row['offline']}", f"{row['headers']}+{row['solution_bytes']}",
+            print(f"{row['nodes']}/{row['offline']}", row["workers"], f"{row['headers']}+{row['solution_bytes']}",
                   row["target_body_bytes"], row["max_body"], row["timing_profile"], row["profile"],
                   row["payload_mode"], row["payload_leaf_bytes"],
                   f"{row['complete_trials']}/{row['failed_trials']}", local["n"],
@@ -1671,7 +1678,7 @@ def campaign(args):
         "started_at": started_at, "cases_in_order": cases, "seed": args.seed,
         "heights": args.heights, "warmup": args.warmup, "body_bytes": args.body_bytes,
         "solution_bytes": args.solution_bytes, "offline": args.offline, "max_body": args.max_body,
-        "timing_profile": args.timing_profile, "tx_budget": budget_config,
+        "timing_profile": args.timing_profile, "workers": args.workers, "tx_budget": budget_config,
         "payload_modes": args.payload_modes, "payload_leaf_bytes": args.payload_leaf_bytes,
         "interleave_payload_modes": args.interleave_payload_modes,
         "timeout_secs": args.timeout_secs, "lifetime_secs": args.lifetime_secs,
@@ -2114,7 +2121,7 @@ finally:
                 self.assertNotIn("interleave_payload_modes", config)  # Controller-only, not Rust/worker config.
 
     def test_campaign_interleaving_retains_partial_arms_and_cleanup_gate(self):
-        cases = schedule([32], ["economy"], 1, 428, payload_modes=("outlined", "merkle"))
+        cases = schedule([32], ["economy"], 1, 428, payload_modes=("outlined", "merkle"), workers=4)
         self.assertEqual([row["payload_mode"] for row in cases], ["outlined", "merkle"])
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
             root = Path(temporary)
@@ -2125,7 +2132,7 @@ finally:
                 with self.subTest(interleave=interleave, cleanup_unconfirmed=cleanup):
                     output = root / f"out-{interleave}-{cleanup}"
                     argv = ["campaign", "--binary", sys.executable, "--roster", str(root / "roster.json"),
-                            "--token-file", str(root / "token"), "--out", str(output)]
+                            "--token-file", str(root / "token"), "--out", str(output), "--workers", "4"]
                     args = build_parser().parse_args(argv + (["--interleave-payload-modes"] if interleave else []))
 
                     def run_case(_args, _roster, _token, _binary, _metadata, _directory, case, _deadline):
@@ -2148,7 +2155,10 @@ finally:
                     self.assertEqual([row["status"] for row in saved["trials"]], ["partial", "complete"][:expected_calls])
                     self.assertEqual(saved["halt_reason"], "cleanup_unconfirmed" if cleanup else
                                      (None if interleave else "whole_payload_phase_incomplete"))
-                    self.assertEqual(read_json(output / "manifest.json")["interleave_payload_modes"], interleave)
+                    manifest = read_json(output / "manifest.json")
+                    self.assertEqual(manifest["interleave_payload_modes"], interleave)
+                    self.assertEqual(manifest["workers"], 4)
+                    self.assertTrue(all(case["workers"] == 4 for case in manifest["cases_in_order"]))
 
     def test_local_start_failure_closes_workers_and_removes_only_owned_token(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
@@ -3057,7 +3067,7 @@ finally:
         for value in ("[::]:9000", "[2001:4860::1]:9000", "127.0.0.1:9000", "[::1]:80"):
             with self.assertRaises(ValueError):
                 endpoint(value)
-        for change in ({"headers": 5500}, {"workers": 2}, {"max_body": MAX_BENCH_BODY + 1},
+        for change in ({"headers": 5500}, {"workers": 5}, {"max_body": MAX_BENCH_BODY + 1},
                        {"node": True}, {"offline": 2}, {"run_id": "../../escape"},
                        {"binary": "/bin/sh"}, {"poll_ms": 6}):
             with self.assertRaises(ValueError):
@@ -3099,12 +3109,12 @@ finally:
                          ([32, 128, 512, 2048], 0, MAX_BODY, "production"))
         self.assertEqual(trial_name(1, {"repetition": 1, "headers": 32, "profile": "baseline"}),
                          "trial-001-r01-h32-baseline")
-        targets = [131072, 524288, 1048576, 2097152, 4194304, 8388608, 10485760]
+        targets = [131072, 524288, 1048576, 2097152, 4194304, 8388608, 10485760, 20971520, 41943040]
         options = ["--body-bytes", ",".join(map(str, targets)), "--max-body", str(MAX_BENCH_BODY),
                    "--timing-profile", "wan", "--profiles", "baseline,fast"]
         args = parser.parse_args(argv + options)
         cases = campaign_cases(args)
-        self.assertEqual(len(cases), 42)
+        self.assertEqual(len(cases), 54)
         self.assertEqual(cases, campaign_cases(parser.parse_args(argv + options)))
         self.assertNotEqual(cases, campaign_cases(parser.parse_args(argv + options + ["--seed", "429"])))
         for repetition in range(1, 4):
@@ -3127,9 +3137,64 @@ finally:
                 campaign_cases(parser.parse_args(argv + options + conflict))
         with self.assertRaises(ValueError):
             campaign_cases(parser.parse_args(argv + ["--body-bytes", "10485760"]))
-        for value in ("0", "1.0", "-1", "+1", "1_024", "10MiB", " 10000", "10000,", "10000,10000", "10485761"):
+        for value in ("0", "1.0", "-1", "+1", "1_024", "10MiB", " 10000", "10000,", "10000,10000", str(MAX_BENCH_BODY + 1)):
             with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 parser.parse_args(argv + ["--body-bytes", value])
+
+    def test_worker_count_and_wan_fast_are_explicit_fixed_settings(self):
+        parser = build_parser()
+        for command, cap, timing in ((["local"], LOCAL_MAX_BODY, "wan"),
+                (["campaign", "--roster", "unused", "--token-file", "unused"], MAX_BODY, "production")):
+            argv = command + ["--binary", "unused", "--out", "unused"]
+            legacy = parser.parse_args(argv)
+            self.assertEqual((legacy.workers, legacy.max_body, legacy.timing_profile), (1, cap, timing))
+            for workers in range(1, 5):
+                args = parser.parse_args(argv + ["--workers", str(workers), "--timing-profile", "wan_fast",
+                    "--body-bytes", str(MAX_BENCH_BODY), "--max-body", str(MAX_BENCH_BODY),
+                    "--profiles", "balanced", "--payload-modes", "merkle", "--payload-leaf-bytes", "102400"])
+                cases = campaign_cases(args)
+                self.assertEqual(len(cases), args.repetitions)  # No worker Cartesian sweep.
+                self.assertTrue(all(case["workers"] == workers for case in cases))
+                for case in cases:
+                    config = trial_config(args, fixture_config(), case, "fixture-0123456789")
+                    self.assertEqual((config["workers"], config["timing_profile"], config["body_bytes"]),
+                                     (workers, "wan_fast", MAX_BENCH_BODY))
+                    self.assertTrue(configs_match(decode(encode(config)), config))
+                    self.assertFalse(configs_match(dict(config, workers=5 - workers), config))
+                    self.assertIn("wan_fast", trial_name(1, case))
+                    if workers != 1:
+                        self.assertIn(f"workers{workers}", trial_name(1, case))
+            for value in ("0", "5", "-1", "1,2", "1.0"):
+                with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    parser.parse_args(argv + ["--workers", value])
+            with self.assertRaises(ValueError):
+                campaign_cases(parser.parse_args(argv + ["--body-bytes", str(MAX_BENCH_BODY)]))
+        for value in (0, 5, -1, True, 1.5, "2", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_config(fixture_config(workers=value))
+        for field in ("workers", "max_body"):
+            incomplete = fixture_config()
+            incomplete.pop(field)
+            with self.assertRaises(ValueError):
+                validate_config(incomplete)
+        for leaf, count in ((32768, 1280), (102400, 410)):
+            config = fixture_config(body_bytes=MAX_BENCH_BODY, max_body=MAX_BENCH_BODY,
+                                    payload_mode="merkle", payload_leaf_bytes=leaf, timing_profile="wan_fast")
+            self.assertEqual(validate_config(config), config)
+            self.assertEqual(math.ceil(MAX_BENCH_BODY / leaf), count)
+
+    def test_workers_and_wan_fast_do_not_pool(self):
+        trials = []
+        for workers, timing in ((1, "wan"), (2, "wan"), (4, "wan"), (4, "wan_fast")):
+            trial = self.counter_trial(f"trial-workers{workers}-{timing}")
+            trial["config"].update(workers=workers, timing_profile=timing)
+            for node, report in trial["node_reports"].items():
+                report["config"] = dict(trial["config"], node=node)
+            trials.append(trial)
+        rows = aggregate(trials)
+        self.assertEqual({(row["workers"], row["timing_profile"]) for row in rows},
+                         {(1, "wan"), (2, "wan"), (4, "wan"), (4, "wan_fast")})
+        self.assertTrue(all(row["trials"] == 1 for row in rows))
 
     def test_caps_targets_timing_and_chronology_do_not_pool(self):
         trials = []
@@ -3424,8 +3489,8 @@ def build_parser():
     command.add_argument("--body-bytes", type=comma_arg(body_bytes_arg),
                          help="exact serialized body targets, comma-separated decimal bytes; excludes --headers/--solution-bytes")
     command.add_argument("--max-body", type=bounded_arg(1, MAX_BENCH_BODY), default=MAX_BODY,
-                         help="fixed body cap across the sweep, bytes (default 1048576; maximum 10485760)")
-    command.add_argument("--timing-profile", choices=("production", "wan"), default="production",
+                         help="fixed body cap across the sweep, bytes (campaign default 1048576, local 10485760; maximum 41943040)")
+    command.add_argument("--timing-profile", choices=TIMING_PROFILES, default="production",
                          help="benchmark-only protocol timing profile; fixed across the sweep")
     command.add_argument("--profiles", type=comma_arg(profile_arg), default=["baseline"],
                          help="comma-separated " + ",".join(PROFILES) + "; balanced raises baseline receive budget only; economy polls at 100ms; never changes protocol timers")
@@ -3435,6 +3500,8 @@ def build_parser():
                          help="shuffle all payload arms within each repetition; a partial whole-payload arm does not skip merkle")
     command.add_argument("--payload-leaf-bytes", type=comma_arg(bounded_arg(MIN_PAYLOAD_LEAF, MAX_PAYLOAD_LEAF)),
                          default=[102400], help="Merkle-only leaf sizes; no leaf cartesian product in other modes")
+    command.add_argument("--workers", type=bounded_arg(1, 4), default=1,
+                         help="Tokio executor threads per validator process, fixed across campaign; not machine vCPUs")
     command.add_argument("--repetitions", type=bounded_arg(1, 32), default=3)
     command.add_argument("--seed", type=bounded_arg(0, 2**32 - 1), default=428)
     command.add_argument("--heights", type=bounded_arg(1, 200), default=12)
@@ -3457,7 +3524,7 @@ def build_parser():
                                 help="retained loopback-only comparison, one validator process per node; no external tools")
     local.add_argument("--nodes", type=bounded_arg(1, 32), default=7)
     local.set_defaults(profiles=["economy"], timing_profile="wan", heights=7, warmup=1,
-                       body_bytes=[131072, 1048576, 10485760], max_body=MAX_BENCH_BODY,
+                       body_bytes=[131072, 1048576, 10485760], max_body=LOCAL_MAX_BODY,
                        payload_modes=["inline", "outlined"])
     return parser
 

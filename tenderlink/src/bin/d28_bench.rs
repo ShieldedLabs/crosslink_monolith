@@ -14,12 +14,14 @@ exact private IPv6 peer roster and strict JSONL all-online ACK controller;
 configuration comes only from CONFIG.json, not mixed component CLI flags.
 Distributed body_bytes defaults to 0 (legacy headers + solution_bytes 0..1344).
 Positive body_bytes targets the EXACT serialized body including its parent certificate:
-use headers=32, solution_bytes=0, max_body=10485760 for a size sweep through 10 MiB.
-Distributed nodes <=32, byte-mode headers 1..2048; full-roster parent must fit.
+use headers=32, solution_bytes=0 and an explicit fixed max_body (up to 41943040/40 MiB).
+The cap never autogrows; full-roster parent must fit. Distributed nodes <=32,
+workers=1..4 Tokio executor threads (not vCPUs), byte-mode headers 1..2048.
 Mock solution padding uses unchanged parsing/serialization, NOT valid Equihash work.
-Distributed timing_profile defaults to production; explicit wan changes benchmark
-base timers to 10000/5000/7000ms, request timeout10000ms and status expiry15000ms.
-Rho, round increments, production limits and defaults remain unchanged.
+Distributed timing_profile defaults to production; explicit wan uses benchmark
+base timers 10000/5000/7000ms, wan_fast uses 2500/1500/2000ms. Both use request
+ timeout10000ms and status expiry15000ms. Rho, round increments, production limits
+and defaults remain unchanged.
 Payload mode defaults to inline. Config payload_leaf_bytes defaults to 0 and must
 remain 0 outside merkle. Merkle leaves accept 32768..1048576 bytes, including
 102400 (100 KiB). Component CLI merkle defaults to 102400 when leaf size is omitted.
