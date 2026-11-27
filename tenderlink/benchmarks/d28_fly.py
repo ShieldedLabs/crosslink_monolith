@@ -627,7 +627,7 @@ def aggregate_node_windows(trials, window_name="measured_window"):
                         or not configs_match(report.get("config"), dict(trial["config"], node=node))):
                     raise ValueError("node report schema/identity/config mismatch")
                 window = report[window_name]
-                if trial.get("environment") == "local":
+                if trial.get("environment") == "local" and isinstance(window, dict):
                     # Rust records host non-loopback interfaces even for a loopback
                     # trial. Do not multiply unrelated host traffic by node count.
                     window = dict(window, system_delta={key: value for key, value in
@@ -2249,6 +2249,98 @@ finally:
         self.assertEqual(row["body_bytes_per_second"], 100 / 7)
         self.assertEqual((tx["matched_trials"], len(tx["missing"]), tx["controller_duration_seconds"]), (1, 4, 2))
         self.assertIsNone(aggregate_node_windows([partial])["system_delta"]["network.eth0.tx_bytes"]["total"])
+
+    def test_local_missing_or_invalid_windows_preserve_coverage(self):
+        for window_name in ("measured_window", "chatter_window"):
+            for invalid in (None, "missing", [], "invalid", False, 0, {}):
+                with self.subTest(window=window_name, invalid=invalid):
+                    good = self.counter_trial()
+                    partial = self.counter_trial("trial-002", duration=5, body=0, status="partial")
+                    trials = [dict(trial, environment="local") for trial in (good, partial)]
+                    report = partial["node_reports"][0]
+                    if invalid == "missing":
+                        del report[window_name]
+                    else:
+                        report[window_name] = invalid
+                    before = copy.deepcopy(trials)
+                    row = aggregate(trials)[0]
+                    self.assertEqual((row["complete_trials"], row["failed_trials"]), (1, 1))
+                    self.assertEqual((row["duration_seconds"], row["body_bytes_per_second"]), (7, 100 / 7))
+                    window = row[window_name]
+                    self.assertEqual((window["valid_node_windows"], window["expected_node_windows"]), (7, 8))
+                    metric = window["application_delta"]["offered.evidence.bytes"]
+                    self.assertEqual((metric["total"], metric["available_node_windows"]), (1000, 7))
+                    self.assertEqual((metric["matched_trials"], metric["matched_partial_trials"]), (1, 0))
+                    self.assertEqual(metric["excluded_trials"], ["trial-002"])
+                    self.assertEqual([(item["trial"], item["node"]) for item in metric["missing"]], [("trial-002", 0)])
+                    absent = aggregate_node_windows([trials[1]], window_name)["application_delta"]["offered.evidence.bytes"]
+                    self.assertEqual((absent["available_node_windows"], absent["expected_node_windows"]), (3, 4))
+                    self.assertIsNone(absent["total"])
+                    self.assertIsNone(absent["per_second"])
+                    if window_name == "measured_window":
+                        self.assertEqual((metric["controller_duration_seconds"], metric["body_bytes"]), (2, 100))
+                        self.assertIsNone(absent["controller_duration_seconds"])
+                        self.assertIsNone(absent["per_body_byte"])
+                    else:
+                        self.assertEqual([item["duration_seconds"] for item in metric["node_rates"]], [1, 2, 3, 4])
+                        self.assertEqual(absent["node_rates"], [])
+                    self.assertIsNone(window["system_delta"]["network.eth0.tx_bytes"]["total"])
+                    self.assertIsNone(window["cpu_steal"]["percent"])
+                    self.assertEqual(trials, before)
+
+    def test_local_summary_null_windows_retain_partial_denominators(self):
+        good = self.counter_trial()
+        partial = self.counter_trial("trial-002", duration=5, body=0, status="partial")
+        empty = self.counter_trial("trial-003", duration=8, body=0, status="partial")
+        empty["controller"]["heights"] = []  # No warmup decision, like the retained 32-KiB gate.
+        for node, report in empty["node_reports"].items():
+            empty["node_reports"][node] = {key: report[key] for key in ("schema_version", "mode", "status", "config")}
+            empty["node_reports"][node].update(measured_start=None, measured_end=None,
+                                               measured_window=None, chatter_window=None)
+        for report in partial["node_reports"].values():
+            report["chatter_window"] = None  # Warmup completed, measured height did not.
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary)
+            write_json(root / "local.json", {"mode": "d28_local"})
+            campaign = root / "campaign"
+            campaign.mkdir()
+            write_json(campaign / "manifest.json", {"mode": "d28_local_campaign"})
+            for trial in (good, partial, empty):
+                path = campaign / trial["trial"]
+                path.mkdir()
+                write_json(path / "trial.json", {"config": trial["config"], "profile": trial["profile"]})
+                write_json(path / "result.json", {"status": trial["status"]})
+                write_json(path / "controller.json", trial["controller"])
+                for node, report in trial["node_reports"].items():
+                    directory = path / f"node-{node:03d}"
+                    directory.mkdir()
+                    write_json(directory / "report.json", report)
+            before = {p: p.read_bytes() for p in root.glob("**/*") if p.is_file()}
+            summary = summarize(root, quiet=True)
+            self.assertEqual(summary["environment"], "local")
+            self.assertEqual(len(summary["cases"]), 1)
+            row = summary["cases"][0]
+            self.assertEqual((row["trials"], row["complete_trials"], row["failed_trials"]), (3, 1, 2))
+            self.assertEqual((row["duration_seconds"], row["body_bytes_per_second"]), (15, 100 / 15))
+            self.assertEqual((row["completed_heights"], row["observed_measured_heights"]), (1, 1))
+            self.assertEqual([item["rate_duration_seconds"] for item in row["trial_chronology"]], [2, 5, 8])
+            measured = row["measured_window"]
+            self.assertEqual((measured["valid_node_windows"], measured["expected_node_windows"]), (8, 12))
+            metric = measured["application_delta"]["offered.evidence.bytes"]
+            self.assertEqual((metric["matched_trials"], metric["matched_partial_trials"]), (2, 1))
+            self.assertEqual((metric["total"], metric["controller_duration_seconds"], metric["body_bytes"]), (2000, 7, 100))
+            self.assertEqual(metric["per_second"], 2000 / 7)
+            self.assertEqual(metric["excluded_trials"], ["trial-003"])
+            chatter = row["chatter_window"]
+            self.assertEqual((chatter["valid_node_windows"], chatter["expected_node_windows"]), (4, 12))
+            metric = chatter["application_delta"]["offered.evidence.bytes"]
+            self.assertEqual((metric["total"], metric["per_second"], metric["matched_trials"]), (1000, 400, 1))
+            self.assertEqual(metric["excluded_trials"], ["trial-002", "trial-003"])
+            self.assertIsNone(measured["system_delta"]["network.eth0.tx_bytes"]["total"])
+            self.assertIsNone(measured["cpu_steal"]["percent"])
+            self.assertEqual(measured["process_cpu_seconds"]["total"]["total"], 12)
+            self.assertEqual(before, {p: p.read_bytes() for p in root.glob("**/*") if p.is_file()})
+            encode(summary)
 
     def test_cpu_units_steal_and_peak_gauge(self):
         trial = self.counter_trial()
