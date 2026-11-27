@@ -499,12 +499,15 @@ impl HostWork {
     }
     fn schedule<S: Storage>(
         &mut self,
-        engine: &Engine<S>,
+        engine: &mut Engine<S>,
         host: &HostCallbacks,
         events: &mut Events,
         now: u64,
         max_body: usize,
     ) -> io::Result<()> {
+        // Host callbacks can act on retained proposals/decisions without going
+        // through Sink; publish their dependencies before handing them out.
+        engine.publication_checkpoint().map_err(core_error)?;
         let tag = engine.proposal_tag();
         if self
             .acquisition
@@ -1108,12 +1111,17 @@ impl Network {
     }
     fn exchange<S: Storage>(
         &mut self,
-        engine: Option<&Engine<S>>,
+        mut engine: Option<&mut Engine<S>>,
         config: &RuntimeConfig,
         key: &SigningKey,
         events: &mut Events,
         now: u64,
     ) -> io::Result<()> {
+        // Status, evidence and Merkle attestations read Engine directly. Do not
+        // sign/offer them from uncommitted publication state after a failure.
+        if let Some(engine) = engine.as_deref_mut() {
+            engine.publication_checkpoint().map_err(core_error)?;
+        }
         // Accumulate locally so a pre-handoff error never records an offer.
         let mut offered = config.metrics.as_ref().map(|_| OfferedMetrics::default());
         let mut payload_offered = PayloadMetricsSnapshot::default();
@@ -1154,7 +1162,7 @@ impl Network {
                 peer.last_hello = Some(now);
             }
         }
-        if let Some(engine) = engine {
+        if let Some(engine) = engine.as_deref_mut() {
             self.payload.sync(engine, &self.peers, now);
             match config.payload_mode {
                 PayloadMode::Inline => {},
@@ -1403,7 +1411,7 @@ pub async fn run<B: AtomicBlockStore + Send + 'static>(
 ) -> io::Result<()> {
     chain_height(config.initial_height)?;
     let mut store = Some(
-        durable::DurableStore::open(
+        durable::DurableStore::open_buffered(
             backend,
             durable::Limits {
                 max_members: config.max_members,
@@ -1413,7 +1421,7 @@ pub async fn run<B: AtomicBlockStore + Send + 'static>(
         .map_err(core_error)?,
     );
     let mut network = Network::new(&config)?;
-    let mut engine = None;
+    let mut engine: Option<Engine<durable::DurableStore<B>>> = None;
     let mut height = config.initial_height;
     let mut roster = config.initial_roster.clone();
     let mut namespace = config.vote_namespace;
@@ -1422,6 +1430,7 @@ pub async fn run<B: AtomicBlockStore + Send + 'static>(
     let mut events = Events::default();
     let start = Instant::now();
     let mut last_tick = 0;
+    let mut checkpoint_at = 1_000;
     let mut peers_at = 0;
     let mut acknowledged: Option<HostTip> = None;
     eprintln!("D28 bounded engine: starting at height {height}; guided receiver-selected STP");
@@ -1440,7 +1449,8 @@ pub async fn run<B: AtomicBlockStore + Send + 'static>(
                 if successor > height {
                     // Export pending/conflicting evidence with its OLD roster
                     // before trusted INIT retires the bounded height workspace.
-                    if let Some(engine) = &engine {
+                    if let Some(engine) = &mut engine {
+                        engine.publication_checkpoint().map_err(core_error)?;
                         (host.access.0)(
                             &snapshot(
                                 engine,
@@ -1571,6 +1581,13 @@ pub async fn run<B: AtomicBlockStore + Send + 'static>(
             .elapse_coalesced(now.saturating_sub(last_tick), &mut events)
             .map_err(core_error)?;
         last_tick = now;
+        // Fixed-age checkpoint, never reset by shard arrivals. Only countdown
+        // progress can remain dirty across publication fences; a crash may replay
+        // at most this service interval plus scheduling/storage stalls.
+        if now >= checkpoint_at {
+            engine.checkpoint().map_err(core_error)?;
+            checkpoint_at = now.checked_add(1_000).ok_or_else(|| core_error(Error::Exhausted))?;
+        }
         network.receive(engine, &config, &mut events, public_key, now)?;
         work.schedule(engine, &host, &mut events, now, config.max_body)?;
         acknowledged = work.poll(engine, &mut events, now, &config, &host).await?;
@@ -1578,6 +1595,7 @@ pub async fn run<B: AtomicBlockStore + Send + 'static>(
             continue;
         }
         work.schedule(engine, &host, &mut events, now, config.max_body)?;
+        engine.publication_checkpoint().map_err(core_error)?;
         (host.access.0)(
             &snapshot(
                 engine,
@@ -1996,7 +2014,7 @@ mod tests {
             access: AccessD28::default(),
         };
         let mut work = HostWork::default();
-        work.schedule(&engine, &host, &mut events, 0, config.max_body)
+        work.schedule(&mut engine, &host, &mut events, 0, config.max_body)
             .unwrap();
         let writes = engine.storage().writes;
         let acknowledged = tokio::runtime::Builder::new_current_thread()
@@ -2349,7 +2367,7 @@ mod tests {
     #[test]
     fn metrics_offers_count_recipients_only_at_handoff_and_keep_permits() {
         use super::super::VoteContent;
-        let (config, key, engine, mut events, mut network) = metrics_fixture();
+        let (config, key, mut engine, mut events, mut network) = metrics_fixture();
         for (i, peer) in network.peers.iter_mut().enumerate() {
             peer.member = Some(i as u32);
         }
@@ -2383,7 +2401,7 @@ mod tests {
         }
         assert_eq!(budget.in_use(), 2);
         network
-            .exchange(Some(&engine), &config, &key, &mut events, 0)
+            .exchange(Some(&mut engine), &config, &key, &mut events, 0)
             .unwrap();
         assert_eq!(budget.in_use(), 0);
         let offered = config.metrics.as_ref().unwrap().snapshot().offered;
@@ -2425,11 +2443,11 @@ mod tests {
 
     #[test]
     fn metrics_offers_exclude_pre_handoff_failure_but_include_failed_service() {
-        let (config, key, engine, mut events, mut network) = metrics_fixture();
+        let (config, key, mut engine, mut events, mut network) = metrics_fixture();
         network.sequence = u64::MAX;
         assert!(
             network
-                .exchange(Some(&engine), &config, &key, &mut events, 0)
+                .exchange(Some(&mut engine), &config, &key, &mut events, 0)
                 .is_err()
         );
         assert_eq!(
@@ -2487,23 +2505,23 @@ mod tests {
         };
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let mut work = HostWork::default();
-        work.schedule(&engine, &host, &mut events, 0, config.max_body).unwrap();
+        work.schedule(&mut engine, &host, &mut events, 0, config.max_body).unwrap();
         assert_eq!(work.validations.len(), 1);
         let allocation = Arc::downgrade(&work.validations[0].value);
         let tag = work.validations[0].tag;
         rt.block_on(work.poll(&mut engine, &mut events, 0, &config, &host)).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(engine.view().unwrap().step, Step::Propose);
-        work.schedule(&engine, &host, &mut events, 1, config.max_body).unwrap();
+        work.schedule(&mut engine, &host, &mut events, 1, config.max_body).unwrap();
         assert!(work.validations[0].work.is_none(), "no retry without a retry event");
         events.retries[0] = Some(tag);
-        work.schedule(&engine, &host, &mut events, 2, config.max_body).unwrap();
+        work.schedule(&mut engine, &host, &mut events, 2, config.max_body).unwrap();
         assert!(std::ptr::eq(allocation.as_ptr(), Arc::as_ptr(&work.validations[0].value)),
                 "retry reuses the exact immutable allocation");
         rt.block_on(work.poll(&mut engine, &mut events, 2, &config, &host)).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2, "Host verdict is not cached");
         assert_eq!(engine.view().unwrap().step, Step::Decided);
-        work.schedule(&engine, &host, &mut events, 3, config.max_body).unwrap();
+        work.schedule(&mut engine, &host, &mut events, 3, config.max_body).unwrap();
         assert!(work.validations.is_empty());
         assert!(allocation.upgrade().is_none(), "resolved generation drops its cached body");
         work.retire();
