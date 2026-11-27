@@ -133,6 +133,7 @@ pub(super) struct PayloadState {
     scope: Option<(super::Id, u64)>,
     peers: Vec<BodyPeer>,
     pending: Vec<Pending>,
+    pending_cursor: usize,
     token: u64,
     serve_cursor: usize,
 }
@@ -141,6 +142,7 @@ impl PayloadState {
         self.scope = None;
         self.peers.clear();
         self.pending.clear();
+        self.pending_cursor = 0;
         // Tokens never reset within this runtime, even across height retirement.
     }
     pub(super) fn sync<S: Storage>(&mut self, engine: &Engine<S>, peers: &[Peer], now: u64) {
@@ -318,7 +320,14 @@ impl PayloadState {
                     .map(|(member, generation, _)| (member, generation))
             })
             .collect();
-        for pending in &mut self.pending {
+        // Rotate interests independently of their source cursors. Otherwise a
+        // missing first body can reacquire the only peer at every timeout and
+        // prevent a later body from ever getting its own attempt.
+        let interests = self.pending.len();
+        let first_interest = self.pending_cursor;
+        for offset in 0..interests {
+            let index = (first_interest + offset) % interests;
+            let pending = &mut self.pending[index];
             if pending.attempt.is_some() || retained_body(engine, pending.key).is_some() {
                 // Acquisition/another receive path may have filled this since
                 // deferral. The next receive turn materializes it under RX budget.
@@ -368,6 +377,7 @@ impl PayloadState {
                 now.saturating_add(config.request_timeout),
             ));
             pending.cursor = peer.member.saturating_add(1);
+            self.pending_cursor = (index + 1) % interests;
         }
         let n = self.peers.len();
         let mut active = self.peers.iter().filter(|p| p.lease.is_some()).count();
