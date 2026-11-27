@@ -717,3 +717,55 @@ fn two_pending_bodies_can_exchange_sources_after_attempt_deadlines() {
         "old source/key response still useful after cross-key retry"
     );
 }
+
+#[test]
+fn deferred_cached_body_completes_without_new_metadata_or_unnecessary_fetch() {
+    let mut node = Node::new();
+    node.config.max_receive_per_tick = 1;
+    let payload = body(1);
+    assert!(node.inject(1, node.outline(&payload), 0));
+    let (_, proposal) = at_round(node.engine.c(), &payload, 0, false, node.config.limits());
+    assert!(node.inject(1, proposal, 1));
+    assert!(node.engine.view().unwrap().pending.is_none());
+    let (push, counts) = node.poll(2, true);
+    assert!(push.send_unreliable.is_empty());
+    assert_eq!(
+        counts.body_requests, 0,
+        "fetch only if the body is still missing"
+    );
+    // A cached completion consumes the single verification turn, not an
+    // unbounded side loop in addition to the normal receive budget.
+    let discarded = node
+        .config
+        .metrics
+        .as_ref()
+        .unwrap()
+        .snapshot()
+        .scheduler_budget_discarded
+        .messages;
+    assert!(!node.inject(0, vec![0], 3));
+    assert_eq!(
+        node.config
+            .metrics
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .scheduler_budget_discarded
+            .messages,
+        discarded + 1
+    );
+    assert_eq!(node.network.incoming.in_use(), 0);
+    assert!(node.network.payload.pending.is_empty());
+    assert!(node.engine.view().unwrap().pending.is_some());
+    assert_eq!(
+        node.config
+            .metrics
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .payload
+            .body_cache_hits,
+        1
+    );
+    node.finish_validation();
+}

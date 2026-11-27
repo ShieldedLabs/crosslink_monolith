@@ -974,7 +974,8 @@ impl Network {
                 || (bytes.first() == Some(&wire::FRAME_TAG) && bytes.len() > 160);
             inbox[index][usize::from(bulk)].push_back(bytes);
         }
-        for _ in 0..config.max_receive_per_tick {
+        let completed = self.complete_cached_payloads(engine, config, events)?;
+        for _ in completed..config.max_receive_per_tick {
             let n = self.peers.len();
             let Some(index) = (0..n)
                 .map(|i| (self.rx_cursor + i) % n)

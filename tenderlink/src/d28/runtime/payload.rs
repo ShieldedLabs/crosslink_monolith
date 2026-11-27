@@ -23,7 +23,8 @@ pub enum PayloadMode {
 /// Cumulative application offers, not transport delivery or peer custody.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PayloadMetricsSnapshot {
-    /// Retained-body lookups hit per authenticated outline, including repeats.
+    /// Successful retained-body lookups for outlined evidence, including repeated
+    /// outlines and deferred evidence completed after another local path filled it.
     pub body_cache_hits: u64,
     /// Failed lookups per authenticated outline, not distinct/admitted bodies.
     pub body_cache_misses: u64,
@@ -318,7 +319,9 @@ impl PayloadState {
             })
             .collect();
         for pending in &mut self.pending {
-            if pending.attempt.is_some() {
+            if pending.attempt.is_some() || retained_body(engine, pending.key).is_some() {
+                // Acquisition/another receive path may have filled this since
+                // deferral. The next receive turn materializes it under RX budget.
                 continue;
             }
             // Prefer the advertising source on the first attempt. Subsequent
@@ -462,6 +465,41 @@ pub(super) fn complete<S: Storage>(
 }
 
 impl Network {
+    /// Deferred evidence is bounded by K, but completing it still spends the
+    /// same per-tick verification budget and one RX body permit as a new frame.
+    pub(super) fn complete_cached_payloads<S: Storage>(
+        &mut self,
+        engine: &mut Engine<S>,
+        config: &RuntimeConfig,
+        events: &mut Events,
+    ) -> io::Result<usize> {
+        let mut completed = 0;
+        while completed < config.max_receive_per_tick {
+            let Some((index, body)) = self
+                .payload
+                .pending
+                .iter()
+                .enumerate()
+                .find_map(|(i, pending)| retained_body(engine, pending.key).map(|body| (i, body)))
+            else {
+                break;
+            };
+            let Some(_permit) = self.incoming.try_acquire() else {
+                break;
+            };
+            let body = body.to_vec();
+            let pending = self.payload.pending.remove(index);
+            if let Some(metrics) = &config.metrics {
+                metrics.payload.cache(true);
+            }
+            pending.evidence.with_body(&body, |frame| {
+                complete(engine, frame, events, &mut self.conflicts, config)
+            })?;
+            completed += 1;
+        }
+        Ok(completed)
+    }
+
     pub(super) fn receive_payload<S: Storage>(
         &mut self,
         engine: &mut Engine<S>,
