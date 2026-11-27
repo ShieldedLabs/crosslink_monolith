@@ -466,6 +466,9 @@ impl Sink for Events {
 
 struct Validation {
     tag: BodyTag,
+    // Immutable bytes belong to this live generation, not to one Host attempt.
+    // Retrying Host validity must not copy the full body again or cache its verdict.
+    value: Arc<BlockValue>,
     work: Option<Work<(TMStatus, TMStatusReason)>>,
     reason: TMStatusReason,
     ready: bool,
@@ -543,6 +546,7 @@ impl HostWork {
             } else {
                 self.validations.push(Validation {
                     tag,
+                    value: Arc::new(BlockValue(engine.storage().body(slot.index).to_vec())),
                     work: None,
                     reason: TMStatusReason::None,
                     ready: true,
@@ -556,7 +560,7 @@ impl HostWork {
             if validation.work.is_none() && validation.ready {
                 validation.ready = false;
                 let validate = host.validate.clone();
-                let value = BlockValue(engine.storage().body(slot.index).to_vec());
+                let value = validation.value.clone();
                 validation.work = Some(Box::pin(async move { (validate.0)(&value).await }));
             }
         }
@@ -2446,6 +2450,64 @@ mod tests {
                 bytes: 196
             }
         );
+    }
+
+    #[test]
+    fn host_retries_share_immutable_body_but_recheck_validity_and_retire_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (config, key) = fixture();
+        let c = config
+            .chain_config(&config.initial_roster, config.vote_namespace)
+            .unwrap()
+            .unwrap();
+        let mut engine = Engine::boot(super::super::MemoryStore::default(), key, c.clone()).unwrap();
+        let mut events = Events::default();
+        engine.set_emission(Emission::Guided);
+        engine.init(&c, 1, 0, &mut events).unwrap();
+        let bytes = body(1);
+        let packet = decision_packet(&c, &bytes, config.limits());
+        wire::decode_frame(&packet, config.limits()).unwrap().with_frame(|frame| {
+            engine.receive(frame, Status::Indeterminate, &mut events).unwrap()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = calls.clone();
+        let host = HostCallbacks {
+            propose: ClosureToProposeNewBlock(Arc::new(|| Box::pin(std::future::pending()))),
+            validate: ClosureToValidateProposedBlock(Arc::new(move |value| {
+                assert_eq!(value.0, bytes);
+                let call = observed_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    (if call == 0 { TMStatus::Indeterminate } else { TMStatus::Pass }, TMStatusReason::None)
+                })
+            })),
+            push_decided: ClosureToPushDecidedBlock(Arc::new(|_, _, _| Box::pin(std::future::pending()))),
+            read_tip: ClosureToReadDecidedTip(Arc::new(|_| None)),
+            update_peers: ClosureToUpdatePeers(Arc::new(|_| Box::pin(async {}))),
+            access: AccessD28::default(),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut work = HostWork::default();
+        work.schedule(&engine, &host, &mut events, 0, config.max_body).unwrap();
+        assert_eq!(work.validations.len(), 1);
+        let allocation = Arc::downgrade(&work.validations[0].value);
+        let tag = work.validations[0].tag;
+        rt.block_on(work.poll(&mut engine, &mut events, 0, &config, &host)).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.view().unwrap().step, Step::Propose);
+        work.schedule(&engine, &host, &mut events, 1, config.max_body).unwrap();
+        assert!(work.validations[0].work.is_none(), "no retry without a retry event");
+        events.retries[0] = Some(tag);
+        work.schedule(&engine, &host, &mut events, 2, config.max_body).unwrap();
+        assert!(std::ptr::eq(allocation.as_ptr(), Arc::as_ptr(&work.validations[0].value)),
+                "retry reuses the exact immutable allocation");
+        rt.block_on(work.poll(&mut engine, &mut events, 2, &config, &host)).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "Host verdict is not cached");
+        assert_eq!(engine.view().unwrap().step, Step::Decided);
+        work.schedule(&engine, &host, &mut events, 3, config.max_body).unwrap();
+        assert!(work.validations.is_empty());
+        assert!(allocation.upgrade().is_none(), "resolved generation drops its cached body");
+        work.retire();
+        assert!(work.decision.is_none());
     }
 
     #[test]
