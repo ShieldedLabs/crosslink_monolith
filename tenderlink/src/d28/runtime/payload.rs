@@ -23,7 +23,8 @@ pub enum PayloadMode {
 /// Cumulative application offers, not transport delivery or peer custody.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PayloadMetricsSnapshot {
-    /// Retained-body lookups hit per authenticated outline, including repeats.
+    /// Successful retained-body lookups for outlined evidence, including repeated
+    /// outlines and deferred evidence completed after another local path filled it.
     pub body_cache_hits: u64,
     /// Failed lookups per authenticated outline, not distinct/admitted bodies.
     pub body_cache_misses: u64,
@@ -132,6 +133,7 @@ pub(super) struct PayloadState {
     scope: Option<(super::Id, u64)>,
     peers: Vec<BodyPeer>,
     pending: Vec<Pending>,
+    pending_cursor: usize,
     token: u64,
     serve_cursor: usize,
 }
@@ -140,6 +142,7 @@ impl PayloadState {
         self.scope = None;
         self.peers.clear();
         self.pending.clear();
+        self.pending_cursor = 0;
         // Tokens never reset within this runtime, even across height retirement.
     }
     pub(super) fn sync<S: Storage>(&mut self, engine: &Engine<S>, peers: &[Peer], now: u64) {
@@ -317,8 +320,17 @@ impl PayloadState {
                     .map(|(member, generation, _)| (member, generation))
             })
             .collect();
-        for pending in &mut self.pending {
-            if pending.attempt.is_some() {
+        // Rotate interests independently of their source cursors. Otherwise a
+        // missing first body can reacquire the only peer at every timeout and
+        // prevent a later body from ever getting its own attempt.
+        let interests = self.pending.len();
+        let first_interest = self.pending_cursor;
+        for offset in 0..interests {
+            let index = (first_interest + offset) % interests;
+            let pending = &mut self.pending[index];
+            if pending.attempt.is_some() || retained_body(engine, pending.key).is_some() {
+                // Acquisition/another receive path may have filled this since
+                // deferral. The next receive turn materializes it under RX budget.
                 continue;
             }
             // Prefer the advertising source on the first attempt. Subsequent
@@ -365,6 +377,7 @@ impl PayloadState {
                 now.saturating_add(config.request_timeout),
             ));
             pending.cursor = peer.member.saturating_add(1);
+            self.pending_cursor = (index + 1) % interests;
         }
         let n = self.peers.len();
         let mut active = self.peers.iter().filter(|p| p.lease.is_some()).count();
@@ -462,6 +475,41 @@ pub(super) fn complete<S: Storage>(
 }
 
 impl Network {
+    /// Deferred evidence is bounded by K, but completing it still spends the
+    /// same per-tick verification budget and one RX body permit as a new frame.
+    pub(super) fn complete_cached_payloads<S: Storage>(
+        &mut self,
+        engine: &mut Engine<S>,
+        config: &RuntimeConfig,
+        events: &mut Events,
+    ) -> io::Result<usize> {
+        let mut completed = 0;
+        while completed < config.max_receive_per_tick {
+            let Some((index, body)) = self
+                .payload
+                .pending
+                .iter()
+                .enumerate()
+                .find_map(|(i, pending)| retained_body(engine, pending.key).map(|body| (i, body)))
+            else {
+                break;
+            };
+            let Some(_permit) = self.incoming.try_acquire() else {
+                break;
+            };
+            let body = body.to_vec();
+            let pending = self.payload.pending.remove(index);
+            if let Some(metrics) = &config.metrics {
+                metrics.payload.cache(true);
+            }
+            pending.evidence.with_body(&body, |frame| {
+                complete(engine, frame, events, &mut self.conflicts, config)
+            })?;
+            completed += 1;
+        }
+        Ok(completed)
+    }
+
     pub(super) fn receive_payload<S: Storage>(
         &mut self,
         engine: &mut Engine<S>,

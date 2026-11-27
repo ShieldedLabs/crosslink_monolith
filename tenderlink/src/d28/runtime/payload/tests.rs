@@ -717,3 +717,100 @@ fn two_pending_bodies_can_exchange_sources_after_attempt_deadlines() {
         "old source/key response still useful after cross-key retry"
     );
 }
+
+#[test]
+fn deferred_cached_body_completes_without_new_metadata_or_unnecessary_fetch() {
+    let mut node = Node::new();
+    node.config.max_receive_per_tick = 1;
+    let payload = body(1);
+    assert!(node.inject(1, node.outline(&payload), 0));
+    let (_, proposal) = at_round(node.engine.c(), &payload, 0, false, node.config.limits());
+    assert!(node.inject(1, proposal, 1));
+    assert!(node.engine.view().unwrap().pending.is_none());
+    let (push, counts) = node.poll(2, true);
+    assert!(push.send_unreliable.is_empty());
+    assert_eq!(
+        counts.body_requests, 0,
+        "fetch only if the body is still missing"
+    );
+    // A cached completion consumes the single verification turn, not an
+    // unbounded side loop in addition to the normal receive budget.
+    let discarded = node
+        .config
+        .metrics
+        .as_ref()
+        .unwrap()
+        .snapshot()
+        .scheduler_budget_discarded
+        .messages;
+    assert!(!node.inject(0, vec![0], 3));
+    assert_eq!(
+        node.config
+            .metrics
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .scheduler_budget_discarded
+            .messages,
+        discarded + 1
+    );
+    assert_eq!(node.network.incoming.in_use(), 0);
+    assert!(node.network.payload.pending.is_empty());
+    assert!(node.engine.view().unwrap().pending.is_some());
+    assert_eq!(
+        node.config
+            .metrics
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .payload
+            .body_cache_hits,
+        1
+    );
+    node.finish_validation();
+}
+
+#[test]
+fn one_source_rotates_pending_interests_and_repairs_the_body_it_retains() {
+    let mut receiver = Node::new();
+    receiver.network.peers.truncate(1);
+    let mut sender = Node::new();
+    sender.network.peers.truncate(1);
+    let a = body(1);
+    let mut block = super::super::BftBlock::zcash_deserialize(&mut &a[..]).unwrap();
+    block.version = 2;
+    block.do_not_include_until_bc_height = 1;
+    let b = block.zcash_serialize_to_vec().unwrap();
+    assert!(canonical_body(&a, 1, receiver.config.max_body));
+    assert!(canonical_body(&b, 1, receiver.config.max_body));
+    assert_ne!(a, b);
+    assert!(sender.inject(0, sender.inline(&b), 0));
+    assert!(receiver.inject(0, receiver.outline(&a), 0));
+    assert!(receiver.inject(0, receiver.outline(&b), 0));
+    let (push, counts) = receiver.poll(1, true);
+    assert_eq!(counts.body_requests, 1);
+    let first = wire::decode_body_request(&push.send_unreliable[0].1).unwrap();
+    assert_eq!(first.key.id, receiver.engine.c().body_id(&a));
+    assert!(retained_body(&sender.engine, first.key).is_none());
+    assert!(sender.inject(0, push.send_unreliable[0].1.clone(), 1));
+    assert!(sender.poll(1, true).0.send_bulk.is_empty());
+
+    let retry = 1 + receiver.config.request_timeout;
+    let (push, counts) = receiver.poll(retry, true);
+    assert_eq!(counts.body_requests, 1);
+    let second = wire::decode_body_request(&push.send_unreliable[0].1).unwrap();
+    assert_eq!(
+        second.key.id,
+        receiver.engine.c().body_id(&b),
+        "a source retry must not let the first unresolved interest monopolize the peer"
+    );
+    assert!(sender.inject(0, push.send_unreliable[0].1.clone(), retry));
+    let (push, counts) = sender.poll(retry, true);
+    assert_eq!(counts.body_responses, 1);
+    assert!(receiver.inject(0, push.send_bulk[0].1.clone(), retry + 1));
+    assert_eq!(receiver.network.payload.pending.len(), 1);
+    assert_eq!(receiver.network.payload.pending[0].key, first.key);
+    let slot = receiver.engine.view().unwrap().pending.unwrap().proposal;
+    assert_eq!(receiver.engine.storage().body(slot.index), b);
+    receiver.finish_validation();
+}
