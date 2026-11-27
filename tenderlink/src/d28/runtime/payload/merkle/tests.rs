@@ -541,10 +541,7 @@ fn reconnect_and_scope_retirement_fence_old_control_and_leaves() {
         !node.inject(
             peer,
             codec::encode_ack(
-                Ack {
-                    ticket: want.ticket,
-                    index: want.indices[0]
-                },
+                Ack::single(want.ticket, want.indices[0]),
                 node.config.max_body
             )
             .unwrap(),
@@ -612,48 +609,33 @@ fn outgoing_window_credit_precedes_encoding_and_survives_new_tokens() {
     );
     node.inject(
         0,
-        codec::encode_ack(
-            Ack {
-                ticket: want.ticket,
-                index: 0,
-            },
-            node.config.max_body,
-        )
-        .unwrap(),
+        codec::encode_ack(Ack::single(want.ticket, 0), node.config.max_body).unwrap(),
         4,
     );
     assert!(node.poll(5, true).0.send_bulk.is_empty());
-    node.inject(
+    assert!(node.inject(
         0,
-        codec::encode_ack(
-            Ack {
-                ticket: want.ticket,
-                index: 1,
-            },
-            node.config.max_body,
-        )
-        .unwrap(),
+        codec::encode_ack(Ack::single(want.ticket, 0), node.config.max_body).unwrap(),
+        5
+    ));
+    assert_eq!(node.network.payload.merkle.peers[0].lease.unwrap().mask, 2);
+    let mut cumulative = Ack::single(want.ticket, 1); // reordered cumulative receipt
+    assert!(cumulative.add(0));
+    assert!(node.inject(
+        0,
+        codec::encode_ack(cumulative, node.config.max_body).unwrap(),
         6,
-    );
+    ));
     assert!(node.network.payload.merkle.peers[0].requested.is_some());
     assert!(node.poll(7, false).0.send_bulk.is_empty());
     let (push, counts) = node.poll(8, true);
     assert_eq!(push.send_bulk.len(), 2);
     assert_eq!(counts.duplicate_payload_bytes, counts.payload_bytes);
-    assert!(
-        !node.inject(
-            0,
-            codec::encode_ack(
-                Ack {
-                    ticket: want.ticket,
-                    index: 0
-                },
-                node.config.max_body
-            )
-            .unwrap(),
-            9
-        )
-    );
+    assert!(!node.inject(
+        0,
+        codec::encode_ack(Ack::single(want.ticket, 0), node.config.max_body).unwrap(),
+        9
+    ));
     assert_eq!(
         node.network.payload.merkle.peers[0]
             .lease
@@ -1002,4 +984,186 @@ fn receive_budget_alternates_control_and_leaf_classes_behind_bulk() {
         1
     );
     assert_eq!(node.network.incoming.in_use(), 0);
+}
+
+#[test]
+fn dropped_window_receipt_repairs_credit_before_request_timeout() {
+    let mut sender = Node::new(32768);
+    let mut receiver = Node::new(32768);
+    sender.config.max_outgoing = 1;
+    receiver.config.max_requests = 1;
+    let body = body(1800); // more than one eight-leaf window
+    let (_, outline) = sender.outline(&body, 0);
+    wire::decode_outlined(&outline, sender.config.limits())
+        .unwrap()
+        .with_body(&body, |f| {
+            complete(
+                &mut sender.engine,
+                f,
+                &mut sender.events,
+                &mut sender.network.conflicts,
+                &sender.config,
+            )
+        })
+        .unwrap();
+    assert!(receiver.inject(0, outline, 0));
+    let (advertised, _) = sender.poll(0, true);
+    let have = advertised
+        .send_unreliable
+        .iter()
+        .find(|(_, b)| b.first() == Some(&codec::HAVE))
+        .unwrap()
+        .1
+        .clone();
+    assert!(receiver.inject(0, have, 1));
+    let (request, _) = receiver.poll(2, true);
+    let want = request
+        .send_unreliable
+        .iter()
+        .find(|(_, b)| b.first() == Some(&codec::WANT))
+        .unwrap()
+        .1
+        .clone();
+    assert!(sender.inject(0, want, 3));
+    let (sent, _) = sender.poll(4, true);
+    assert_eq!(sent.send_bulk.len(), WINDOW);
+    let old_leaf = sent.send_bulk[0].1.clone();
+    for (_, leaf) in sent.send_bulk {
+        assert!(receiver.inject(0, leaf, 5));
+    }
+    let (reply, _) = receiver.poll(6, true);
+    let ack_frames: Vec<_> = reply
+        .send_unreliable
+        .iter()
+        .filter(|(_, b)| b.first() == Some(&codec::ACK))
+        .collect();
+    assert_eq!(
+        ack_frames.len(),
+        1,
+        "one cumulative frame, not eight control messages"
+    );
+    assert_eq!(
+        codec::decode_ack(&ack_frames[0].1, receiver.config.max_body)
+            .unwrap()
+            .count as usize,
+        WINDOW
+    );
+    let mut lost_receipt = false;
+    for (_, bytes) in reply.send_unreliable {
+        if bytes.first() == Some(&codec::ACK) && !lost_receipt {
+            lost_receipt = true;
+            continue; // a single ordinary best-effort control loss
+        }
+        if matches!(bytes.first(), Some(&codec::ACK | &codec::WANT)) {
+            sender.inject(0, bytes, 7);
+        }
+    }
+    assert!(lost_receipt);
+    assert!(sender.poll(8, true).0.send_bulk.is_empty());
+    // Repeated HAVE or a newer WANT is NOT an ACK. The exact old receipt must
+    // repair its credit on the existing status cadence, not after a 2/10s lease.
+    let (refresh, _) = receiver.poll(106, true);
+    let receipts: Vec<_> = refresh
+        .send_unreliable
+        .into_iter()
+        .filter(|(_, b)| b.first() == Some(&codec::ACK))
+        .collect();
+    assert!(
+        !receipts.is_empty(),
+        "lost transfer receipt has no bounded refresh"
+    );
+    for (_, ack) in receipts {
+        sender.inject(0, ack, 107);
+    }
+    let (next, _) = sender.poll(108, true);
+    assert!(
+        !next.send_bulk.is_empty(),
+        "old unacknowledged window still blocks the newer request"
+    );
+    assert!(108 < sender.config.request_timeout);
+    let next_leaf = next.send_bulk[0].1.clone();
+    let newer_token = codec::decode_leaf(&next_leaf, receiver.config.max_body)
+        .unwrap()
+        .ticket
+        .token;
+    assert!(receiver.inject(0, next_leaf, 109));
+    let current = receiver.network.payload.merkle.peers[0].receipt.unwrap();
+    assert_eq!(current.ack.ticket.token, newer_token);
+    // The previous token still names useful verified data, but cannot evict the
+    // newer cumulative receipt (nor renew its bounded retry lifetime).
+    receiver.inject(0, old_leaf.clone(), 110);
+    let after = receiver.network.payload.merkle.peers[0].receipt.unwrap();
+    assert_eq!(after.ack, current.ack);
+    assert_eq!(after.until, current.until);
+    let (expired, _) = receiver.poll(after.until, true);
+    assert!(
+        expired
+            .send_unreliable
+            .iter()
+            .all(|(_, b)| b.first() != Some(&codec::ACK))
+    );
+    receiver.inject(0, old_leaf, after.until + 1);
+    let watermark = receiver.network.payload.merkle.peers[0].receipt.unwrap();
+    assert_eq!(watermark.ack, current.ack);
+    assert_eq!(watermark.until, current.until);
+    assert!(
+        receiver
+            .poll(after.until + 2, true)
+            .0
+            .send_unreliable
+            .iter()
+            .all(|(_, b)| b.first() != Some(&codec::ACK))
+    );
+    receiver.network.payload.clear();
+    assert!(receiver.network.payload.merkle.peers.is_empty());
+    assert!(
+        receiver
+            .poll(after.until + 3, true)
+            .0
+            .send_unreliable
+            .iter()
+            .all(|(_, b)| b.first() != Some(&codec::ACK))
+    );
+}
+
+#[test]
+fn receipt_merges_reordered_leaves_without_duplicate_refresh_or_expiry_extension() {
+    let mut node = Node::new(32768);
+    node.config.max_requests = 1;
+    let body = body(1800);
+    let (header, outline) = node.outline(&body, 0);
+    let (tree, _, have) = node.advertise(&body, header, None);
+    node.inject(0, outline, 0);
+    node.inject(0, have, 1);
+    let (request, _) = node.poll(2, true);
+    let (peer, want) = node.wants(&request)[0];
+    assert_eq!(want.count as usize, WINDOW);
+    let mut until = None;
+    for (offset, index) in [7, 0, 7, 3].into_iter().enumerate() {
+        let now = 3 + offset as u64 * 2;
+        assert!(node.inject(peer, packet(&tree, &body, want, index), now));
+        let receipt = node.network.payload.merkle.peers[peer].receipt.unwrap();
+        assert_eq!(receipt.until, *until.get_or_insert(receipt.until));
+        let (reply, _) = node.poll(now + 1, true);
+        let acks: Vec<_> = reply
+            .send_unreliable
+            .iter()
+            .filter(|(_, b)| b.first() == Some(&codec::ACK))
+            .map(|(_, b)| codec::decode_ack(b, node.config.max_body).unwrap())
+            .collect();
+        if offset == 2 {
+            assert!(
+                acks.is_empty(),
+                "duplicate leaf must not advance periodic receipt refresh"
+            );
+        } else {
+            assert_eq!(acks.len(), 1);
+            let expected: &[u32] = match offset {
+                0 => &[7],
+                1 => &[7, 0],
+                _ => &[7, 0, 3],
+            };
+            assert_eq!(acks[0].indices(), expected);
+        }
+    }
 }

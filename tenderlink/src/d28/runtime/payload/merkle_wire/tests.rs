@@ -148,25 +148,26 @@ fn leaf_exact_tail_proof_depth_and_no_trailing_or_truncated_data() {
 #[test]
 fn acknowledgements_and_geometry_limits_are_exact() {
     let (body, _, _, _, ticket) = fixture();
-    let ack = Ack { ticket, index: 8 };
+    let mut ack = Ack::single(ticket, 8);
+    assert!(ack.add(1));
+    assert!(!ack.add(1)); // duplicate receipt is not duplicated on the wire
     let bytes = encode_ack(ack, body.len()).unwrap();
     assert_eq!(decode_ack(&bytes, body.len()).unwrap(), ack);
     for end in 0..bytes.len() {
         assert!(decode_ack(&bytes[..end], body.len()).is_err());
     }
+    let mut repeated = bytes.clone();
+    repeated[TICKET_BYTES + 5..TICKET_BYTES + 9].copy_from_slice(&8u32.to_le_bytes());
+    assert!(decode_ack(&repeated, body.len()).is_err());
+    let mut bad_count = bytes.clone();
+    bad_count[TICKET_BYTES] = 0;
+    assert!(decode_ack(&bad_count, body.len()).is_err());
+    bad_count[TICKET_BYTES] = WINDOW as u8 + 1;
+    assert!(decode_ack(&bad_count, body.len()).is_err());
     let mut extra = bytes;
     extra.push(0);
     assert!(decode_ack(&extra, body.len()).is_err());
-    assert!(
-        encode_ack(
-            Ack {
-                ticket: Ticket { token: 0, ..ticket },
-                index: 0
-            },
-            body.len()
-        )
-        .is_err()
-    );
+    assert!(encode_ack(Ack::single(Ticket { token: 0, ..ticket }, 0), body.len()).is_err());
     for size in [32768, 102400, 262144, 1048576] {
         assert!(max_frame_bytes(10 << 20, size).is_ok());
     }
