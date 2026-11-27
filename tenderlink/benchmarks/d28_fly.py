@@ -1877,7 +1877,7 @@ try:
     send({'type':'ready','run_id':config['run_id'],'node':node,
           'payload_mode':config.get('payload_mode','inline'),'payload_leaf_bytes':config.get('payload_leaf_bytes',0)})
     assert receive()=={'type':'start'}
-    if config['headers']==0: time.sleep(10)
+    if config['headers']==0 or config.get('body_bytes')==131073: time.sleep(10)
     for height in range(1,config['heights']+config['warmup']+1):
         identifier=('b' if config['headers']==128 and node==1 else 'a')*64
         decision={'type':'decision','run_id':config['run_id'],'node':node,'height':height,
@@ -1981,6 +1981,24 @@ finally:
                 with self.assertRaises(FileExistsError):
                     local_campaign(local_args)
                 self.assertEqual((local_root / "local.json").read_bytes(), before)
+                # Two offline identities retain full-roster quorum. Whole-payload
+                # failures stay partial and gate Merkle; no automatic successful rerun.
+                failed_args = argparse.Namespace(**dict(vars(local_args), out=root / "local-failure",
+                    body_bytes=[131073], offline=2, timeout_secs=1, warmup=0, payload_modes=list(PAYLOAD_MODES)))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(local_campaign(failed_args), 1)
+                failed_root = root / "local-failure"
+                failed = read_json(failed_root / "campaign" / "run.json")
+                self.assertEqual((failed["planned_trials"], failed["started_trials"]), (3, 2))
+                self.assertEqual(failed["halt_reason"], "whole_payload_phase_incomplete")
+                self.assertTrue(all(row["status"] == "partial" for row in failed["trials"]))
+                for row in summarize(failed_root, quiet=True)["cases"]:
+                    self.assertEqual((row["completed_heights"], row["complete_trials"]), (0, 0))
+                    self.assertGreaterEqual(row["duration_seconds"], 1)
+                    self.assertNotEqual(row["payload_mode"], "merkle")
+                receipt = read_json(failed_root / "local-result.json")
+                self.assertTrue(receipt["cleanup_confirmed"] and receipt["token_removed"])
+                self.assertEqual(len(receipt["workers"]), 8)  # four workers * two attempts, no retries
             finally:
                 for server in servers:
                     server.shutdown(); server.server_close()
@@ -2191,6 +2209,16 @@ finally:
         self.assertEqual((tx["body_bytes"], tx["controller_duration_seconds"]), (400, 10))
         self.assertEqual(measured["application_delta"]["offered.evidence.bytes"]["per_body_byte"], 10)
         self.assertEqual(measured["application_delta"]["received.messages"]["total"], 40)
+        for key in ("payload.payload_bytes", "payload.duplicate_payload_bytes", "payload.outlined_evidence_bytes"):
+            metric = measured["application_delta"][key]
+            self.assertEqual((metric["total"], metric["per_second"], metric["per_body_byte"]), (40, 4, 0.1))
+        legacy = self.counter_trial()
+        for report in legacy["node_reports"].values():
+            for window_name in ("measured_window", "chatter_window"):
+                window = report[window_name]
+                window["application_delta"] = {key: value for key, value in window["application_delta"].items()
+                                               if not key.startswith("payload.")}
+        self.assertIsNone(aggregate([legacy])[0]["measured_window"]["application_delta"]["payload.payload_bytes"]["per_body_byte"])
         self.assertEqual(measured["transport_delta"]["ring_receive_dropped_full"]["total"], 0)
         self.assertNotIn("network.eth0.rx_bytes", measured["system_delta"])
         self.assertEqual(measured["store_replacements"]["total"], 40)
