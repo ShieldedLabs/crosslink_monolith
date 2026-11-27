@@ -1236,7 +1236,8 @@ def validate_roster(roster):
 
 
 def schedule(headers, profiles, repetitions, seed, *, body_bytes=None, max_body=MAX_BODY,
-             timing_profile="production", payload_modes=("inline",), payload_leaf_bytes=(102400,)):
+             timing_profile="production", payload_modes=("inline",), payload_leaf_bytes=(102400,),
+             interleave_payload_modes=False):
     targets = headers if body_bytes is None else body_bytes
     arms = [(mode, leaf) for mode in payload_modes
             for leaf in (payload_leaf_bytes if mode == "merkle" else (0,))]
@@ -1257,7 +1258,9 @@ def schedule(headers, profiles, repetitions, seed, *, body_bytes=None, max_body=
                                "body_bytes": 0 if body_bytes is None else size, "max_body": max_body,
                                "timing_profile": timing_profile, "profile": profile,
                                "payload_mode": mode, "payload_leaf_bytes": leaf})
-    # Stable partition: whole-payload comparison completes before leaf exchange.
+    if interleave_payload_modes:
+        return trials  # Keep the seeded complete block of arms in each repetition.
+    # Default staged workflow: whole-payload comparison completes before leaf exchange.
     return [case for case in trials if case["payload_mode"] != "merkle"] + [
         case for case in trials if case["payload_mode"] == "merkle"]
 
@@ -1284,7 +1287,8 @@ def campaign_cases(args):
         raise ValueError("--body-bytes targets must fit --max-body; no implicit cap increase")
     return schedule(args.headers, args.profiles, args.repetitions, args.seed,
                     body_bytes=args.body_bytes, max_body=args.max_body, timing_profile=args.timing_profile,
-                    payload_modes=args.payload_modes, payload_leaf_bytes=args.payload_leaf_bytes)
+                    payload_modes=args.payload_modes, payload_leaf_bytes=args.payload_leaf_bytes,
+                    interleave_payload_modes=args.interleave_payload_modes)
 
 
 def trial_config(args, roster, case, identifier):
@@ -1668,6 +1672,7 @@ def campaign(args):
         "solution_bytes": args.solution_bytes, "offline": args.offline, "max_body": args.max_body,
         "timing_profile": args.timing_profile, "tx_budget": budget_config,
         "payload_modes": args.payload_modes, "payload_leaf_bytes": args.payload_leaf_bytes,
+        "interleave_payload_modes": args.interleave_payload_modes,
         "timeout_secs": args.timeout_secs, "lifetime_secs": args.lifetime_secs,
         "profiles": PROFILES, "notes": NOTES,
         "node_latency_scope": "node-local ACK/tip publication to push_decided callback, not exact INIT timing",
@@ -1691,7 +1696,7 @@ def campaign(args):
         if time.monotonic() >= deadline:
             halt_reason = "campaign_deadline"
             break
-        if case["payload_mode"] == "merkle" and any(
+        if not args.interleave_payload_modes and case["payload_mode"] == "merkle" and any(
                 row["payload_mode"] != "merkle" and row["status"] != "complete" for row in results):
             halt_reason = "whole_payload_phase_incomplete"
             break
@@ -2057,6 +2062,92 @@ finally:
         self.assertIsNone(row["measured_window"]["cpu_steal"]["percent"])
         self.assertIsNotNone(row["measured_window"]["process_cpu_seconds"]["total"]["total"])
         self.assertIsNotNone(aggregate([trial])[0]["measured_window"]["system_delta"]["network.eth0.tx_bytes"]["total"])
+
+    def test_interleaved_payload_schedule_balanced_reproducible(self):
+        options = dict(body_bytes=[MAX_BENCH_BODY], max_body=MAX_BENCH_BODY, timing_profile="wan",
+                       payload_modes=("outlined", "merkle"),
+                       payload_leaf_bytes=(32768, 102400, 262144, 1048576),
+                       interleave_payload_modes=True)
+        first = schedule([32], ["economy"], 3, 428, **options)
+        expected = [
+            [("merkle", 262144), ("merkle", 32768), ("merkle", 1048576), ("outlined", 0), ("merkle", 102400)],
+            [("merkle", 262144), ("merkle", 1048576), ("merkle", 32768), ("merkle", 102400), ("outlined", 0)],
+            [("merkle", 1048576), ("merkle", 32768), ("outlined", 0), ("merkle", 262144), ("merkle", 102400)],
+        ]
+        self.assertEqual([(row["repetition"], row["payload_mode"], row["payload_leaf_bytes"]) for row in first],
+                         [(rep, mode, leaf) for rep, arms in enumerate(expected, 1) for mode, leaf in arms])
+        self.assertEqual(first, schedule([32], ["economy"], 3, 428, **options))
+        self.assertNotEqual(first, schedule([32], ["economy"], 3, 429, **options))
+        sizes, profiles = [131072, MAX_BENCH_BODY], ["baseline", "economy"]
+        cases = schedule([32], profiles, 3, 428, **dict(options, body_bytes=sizes))
+        self.assertEqual(len(cases), 60)
+        self.assertEqual([row["repetition"] for row in cases], [rep for rep in range(1, 4) for _ in range(20)])
+        arms = {("outlined", 0), *(("merkle", leaf) for leaf in options["payload_leaf_bytes"])}
+        for rep in range(1, 4):
+            rows = [row for row in cases if row["repetition"] == rep]
+            for size in sizes:
+                for profile in profiles:
+                    paired = [row for row in rows if row["body_bytes"] == size and row["profile"] == profile]
+                    self.assertEqual(len(paired), len(arms))
+                    self.assertEqual({(row["payload_mode"], row["payload_leaf_bytes"]) for row in paired}, arms)
+
+    def test_interleaved_payload_cli_and_legacy_default(self):
+        parser = build_parser()
+        options = ["--binary", sys.executable, "--out", "unused", "--body-bytes", str(MAX_BENCH_BODY),
+                   "--max-body", str(MAX_BENCH_BODY), "--profiles", "economy", "--repetitions", "3",
+                   "--payload-modes", "outlined,merkle", "--payload-leaf-bytes", "32768,102400,262144,1048576"]
+        for command in (["local"], ["campaign", "--roster", "unused", "--token-file", "unused"]):
+            legacy = parser.parse_args(command + options)
+            self.assertFalse(legacy.interleave_payload_modes)
+            staged = campaign_cases(legacy)
+            self.assertEqual([row["payload_mode"] for row in staged[:3]], ["outlined"] * 3)
+            self.assertTrue(all(row["payload_mode"] == "merkle" for row in staged[3:]))
+            interleaved = parser.parse_args(command + options + ["--interleave-payload-modes"])
+            self.assertTrue(interleaved.interleave_payload_modes)
+            cases = campaign_cases(interleaved)
+            self.assertNotEqual(cases, staged)
+            self.assertEqual(sorted(cases, key=lambda row: (row["repetition"], row["payload_mode"], row["payload_leaf_bytes"])),
+                             sorted(staged, key=lambda row: (row["repetition"], row["payload_mode"], row["payload_leaf_bytes"])))
+            for case in cases:
+                config = trial_config(interleaved, fixture_config(), case, "fixture-0123456789")
+                self.assertNotIn("interleave_payload_modes", config)  # Controller-only, not Rust/worker config.
+
+    def test_campaign_interleaving_retains_partial_arms_and_cleanup_gate(self):
+        cases = schedule([32], ["economy"], 1, 428, payload_modes=("outlined", "merkle"))
+        self.assertEqual([row["payload_mode"] for row in cases], ["outlined", "merkle"])
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary)
+            create_token(root / "token")
+            write_json(root / "roster.json", {"peers": ["[::1]:20000"], "workers": [None],
+                                              "coordinator": "[::1]:21000"})
+            for interleave, cleanup in ((False, False), (True, False), (True, True)):
+                with self.subTest(interleave=interleave, cleanup_unconfirmed=cleanup):
+                    output = root / f"out-{interleave}-{cleanup}"
+                    argv = ["campaign", "--binary", sys.executable, "--roster", str(root / "roster.json"),
+                            "--token-file", str(root / "token"), "--out", str(output)]
+                    args = build_parser().parse_args(argv + (["--interleave-payload-modes"] if interleave else []))
+
+                    def run_case(_args, _roster, _token, _binary, _metadata, _directory, case, _deadline):
+                        return {"status": "partial" if case["payload_mode"] == "outlined" else "complete",
+                                "interrupted": False, "cleanup_unconfirmed_nodes": [0] if cleanup else []}
+
+                    with mock.patch(__name__ + ".campaign_cases", return_value=cases), \
+                            mock.patch(__name__ + ".machine_metadata", return_value={"binary_sha256": "a" * 64}), \
+                            mock.patch(__name__ + ".worker_request") as worker, \
+                            mock.patch(__name__ + ".run_trial", side_effect=run_case) as trial, \
+                            mock.patch(__name__ + ".summarize", return_value={}), contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(campaign(args), 1)  # The retained partial arm never becomes success.
+                    worker.assert_not_called()
+                    expected_calls = 2 if interleave and not cleanup else 1
+                    self.assertEqual(trial.call_count, expected_calls)
+                    saved = read_json(output / "run.json")
+                    self.assertEqual((saved["planned_trials"], saved["started_trials"], saved["complete_trials"]),
+                                     (2, expected_calls, expected_calls - 1))
+                    self.assertEqual(saved["status"], "partial")
+                    self.assertEqual([row["status"] for row in saved["trials"]], ["partial", "complete"][:expected_calls])
+                    self.assertEqual(saved["halt_reason"], "cleanup_unconfirmed" if cleanup else
+                                     (None if interleave else "whole_payload_phase_incomplete"))
+                    self.assertEqual(read_json(output / "manifest.json")["interleave_payload_modes"], interleave)
 
     def test_local_start_failure_closes_workers_and_removes_only_owned_token(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
@@ -3337,7 +3428,9 @@ def build_parser():
     command.add_argument("--profiles", type=comma_arg(profile_arg), default=["baseline"],
                          help="comma-separated baseline,fast,fast_k1,economy; economy polls at 100ms; never changes protocol timers")
     command.add_argument("--payload-modes", type=comma_arg(payload_mode_arg), default=["inline"],
-                         help="comma-separated inline,outlined,merkle; whole-payload arms run before merkle")
+                         help="comma-separated inline,outlined,merkle; whole-payload arms run before merkle by default")
+    command.add_argument("--interleave-payload-modes", action="store_true",
+                         help="shuffle all payload arms within each repetition; a partial whole-payload arm does not skip merkle")
     command.add_argument("--payload-leaf-bytes", type=comma_arg(bounded_arg(MIN_PAYLOAD_LEAF, MAX_PAYLOAD_LEAF)),
                          default=[102400], help="Merkle-only leaf sizes; no leaf cartesian product in other modes")
     command.add_argument("--repetitions", type=bounded_arg(1, 32), default=3)
