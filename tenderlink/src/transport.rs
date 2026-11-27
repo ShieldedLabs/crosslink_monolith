@@ -57,6 +57,29 @@ use shielded_transport_pigeon::stp::{
     new_pump_with_options,
 };
 
+/// Advisory send capacity for one connected peer and channel.
+///
+/// `backlog_bytes` includes local outbox bytes and STP's remaining planned-send
+/// payload bytes, not receiver custody or all native/FEC/rescue allocations.
+/// `outbox_slots` counts only LOCAL outbox slots: STP has a separate native
+/// message bound and does not expose its outstanding message count.
+/// Subtract every message staged since this observation before encoding more.
+/// This is not a reservation against another producer on the shared channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendCapacity {
+    pub backlog_bytes: u64,
+    pub available_bytes: u64,
+    pub outbox_slots: usize,
+}
+
+/// Capacity observations for every connected transport peer, including peers
+/// not admitted by a particular consumer. The aggregate uses saturating sums.
+#[derive(Debug, Default)]
+pub struct SendCapacitySnapshot {
+    pub backlog_bytes: u64,
+    pub peers: Vec<(ConnectionKey, SendCapacity)>,
+}
+
 /// Which STP send queue of a connection a message travels on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
@@ -616,6 +639,25 @@ impl ConsumerHandle {
         lock(&self.hub).handle.send_budget(peer, channel)
     }
 
+    /// See [`NetworkThreadHandle::send_capacity`].
+    pub fn send_capacity(&self, peer: ConnectionKey, channel: Channel) -> Option<SendCapacity> {
+        let hub = lock(&self.hub);
+        if hub.consumers[self.consumer as usize].generation != self.generation || hub.handle.is_finished() {
+            return None;
+        }
+        hub.handle.send_capacity(peer, channel)
+    }
+
+    /// Observe all peers under one hub lock. Another consumer can enqueue after
+    /// the lock is released; this is advisory admission, not reserved capacity.
+    pub fn send_capacity_snapshot(&self, channel: Channel) -> SendCapacitySnapshot {
+        let hub = lock(&self.hub);
+        if hub.consumers[self.consumer as usize].generation != self.generation || hub.handle.is_finished() {
+            return SendCapacitySnapshot::default();
+        }
+        hub.handle.send_capacity_snapshot(channel)
+    }
+
     pub fn stats(&self) -> TransportStats {
         lock(&self.hub).handle.stats()
     }
@@ -817,14 +859,39 @@ impl NetworkThreadHandle {
     /// How many more bytes may be queued to `peer` on `channel` now without risking an
     /// outbox drop. Ask before building a large message; 0 means wait for the backlog.
     pub fn send_budget(&self, peer: ConnectionKey, channel: Channel) -> u64 {
-        let Some(state) = self.peers.get(&peer).filter(|s| s.is_connected()) else {
-            return 0;
-        };
-        if state.outboxes[channel as usize].messages.len() >= self.limits.peer_outbox_messages {
-            return 0;
+        self.send_capacity(peer, channel).map_or(0, |capacity| capacity.available_bytes)
+    }
+
+    /// Observe byte headroom and local outbox slots without allocating a payload.
+    /// A staged batch must debit both fields before constructing each message.
+    /// Neither observation is a delivery acknowledgement or a reservation.
+    pub fn send_capacity(&self, peer: ConnectionKey, channel: Channel) -> Option<SendCapacity> {
+        let state = self.peers.get(&peer).filter(|s| s.is_connected())?;
+        let outbox = &state.outboxes[channel as usize];
+        let backlog_bytes = (outbox.bytes as u64)
+            .saturating_add(self.endpoint.queued_send_bytes(peer, channel.queue()));
+        let outbox_slots = self.limits.peer_outbox_messages.saturating_sub(outbox.messages.len());
+        Some(SendCapacity {
+            backlog_bytes,
+            available_bytes: if outbox_slots == 0 { 0 } else {
+                (self.limits.peer_outbox_bytes as u64).saturating_sub(backlog_bytes)
+            },
+            outbox_slots,
+        })
+    }
+
+    /// Include all connected peers, not merely a consumer's authenticated subset.
+    /// Native planned work can drain while observed; native memory/count bounds
+    /// remain independent of this advisory payload-byte snapshot.
+    pub fn send_capacity_snapshot(&self, channel: Channel) -> SendCapacitySnapshot {
+        let mut snapshot = SendCapacitySnapshot::default();
+        for peer in self.peers.keys().copied() {
+            if let Some(capacity) = self.send_capacity(peer, channel) {
+                snapshot.backlog_bytes = snapshot.backlog_bytes.saturating_add(capacity.backlog_bytes);
+                snapshot.peers.push((peer, capacity));
+            }
         }
-        let backlog = self.send_backlog_bytes(peer, channel).unwrap_or(u64::MAX);
-        (self.limits.peer_outbox_bytes as u64).saturating_sub(backlog)
+        snapshot
     }
 
     pub fn stats(&self) -> TransportStats {
@@ -1250,6 +1317,55 @@ mod tests {
         }, &mut received, now);
         assert!(!handle.is_connected(peer));
         (handle, pump, address)
+    }
+
+    #[test]
+    fn send_capacity_snapshot_counts_all_connected_peers_and_local_slots() {
+        use shielded_transport_pigeon::pump::DisconnectReason;
+
+        let (mut a, _pump, address) = reconnecting_node();
+        let peer = address.connection_key();
+        assert_eq!(a.send_capacity(peer, Channel::Bulk), None);
+        assert!(a.send_capacity_snapshot(Channel::Bulk).peers.is_empty());
+        a.limits.peer_outbox_bytes = 16;
+        a.limits.peer_outbox_messages = 2;
+        a.limits.max_inbound_connections = 2;
+        a.handle_event(Event::Connected {
+            peer, address, handshake_hash: [2; 64],
+        }, &mut VecDeque::new(), Instant::now());
+        let other_key = new_keypair_from_connect_magic1(
+            CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b,
+        ).unwrap();
+        let other_address = STPAddress::from(Ipv6Addr::LOCALHOST, free_port(), &other_key);
+        let other = other_address.connection_key();
+        a.handle_event(Event::Connected {
+            peer: other, address: other_address, handshake_hash: [3; 64],
+        }, &mut VecDeque::new(), Instant::now());
+        // No consumer or BFT authentication filter: a base-only peer counts too.
+        a.enqueue(peer, Channel::Bulk, vec![1; 6]);
+        a.enqueue(peer, Channel::Bulk, vec![2; 4]);
+        a.enqueue(other, Channel::Bulk, vec![3; 3]);
+        a.enqueue(peer, Channel::BftLive, vec![4; 2]);
+        assert_eq!(a.send_capacity(peer, Channel::Bulk), Some(SendCapacity {
+            backlog_bytes: 10, available_bytes: 0, outbox_slots: 0,
+        }));
+        assert_eq!(a.send_budget(peer, Channel::Bulk), 0);
+        assert_eq!(a.send_capacity(other, Channel::Bulk), Some(SendCapacity {
+            backlog_bytes: 3, available_bytes: 13, outbox_slots: 1,
+        }));
+        let snapshot = a.send_capacity_snapshot(Channel::Bulk);
+        assert_eq!(snapshot.peers.len(), 2);
+        assert_eq!(snapshot.backlog_bytes, 13);
+        assert_eq!(a.send_capacity_snapshot(Channel::BftLive).backlog_bytes, 2);
+        // Repeated observations do not reserve slots or mutate queues.
+        assert_eq!(a.send_capacity_snapshot(Channel::Bulk).backlog_bytes, 13);
+        a.handle_event(Event::Disconnected {
+            peer, reason: DisconnectReason::NetworkChanged,
+        }, &mut VecDeque::new(), Instant::now());
+        assert_eq!(a.send_capacity(peer, Channel::Bulk), None);
+        let snapshot = a.send_capacity_snapshot(Channel::Bulk);
+        assert_eq!(snapshot.peers.len(), 1);
+        assert_eq!(snapshot.backlog_bytes, 3);
     }
 
     #[test]
