@@ -4,7 +4,7 @@ use tenderlink::d28::merkle;
 use ed25519_zebra::{SigningKey, VerificationKeyBytes};
 use merkle::{
     Bitmap, DEFAULT_LEAF_BYTES, Error, Hash, HolderAttestation, HolderContext, MAX_LEAF_BYTES,
-    MIN_LEAF_BYTES, Manifest, PartialTree, Tree, verify_leaf,
+    MIN_LEAF_BYTES, Manifest, PartialTree, ProposerAttestation, Tree, verify_leaf,
 };
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -573,6 +573,201 @@ fn odd_leaf_tree_uses_canonical_padding_not_duplication() {
 }
 
 #[test]
+fn proposer_attestation_binds_every_manifest_and_bft_context_field() {
+    let (_, _, manifest) = fixture(2 * DEFAULT_LEAF_BYTES + 1, DEFAULT_LEAF_BYTES);
+    let context = HolderContext {
+        domain: [31; 32],
+        config: [32; 32],
+        height: 33,
+    };
+    let key = SigningKey::from([34; 32]);
+    let public = VerificationKeyBytes::from(&key).into();
+    let attestation = ProposerAttestation::sign(&context, &manifest, &key, MAX_BODY).unwrap();
+    assert_eq!(attestation.proposer, public);
+    attestation
+        .verify(&context, &manifest, &public, MAX_BODY)
+        .unwrap();
+    for field in 0..5 {
+        let mut other = manifest;
+        match field {
+            0 => other.body_id[0] ^= 1,
+            1 => other.signed_header_identity[0] ^= 1,
+            2 => other.root[0] ^= 1,
+            3 => other.body_len += 1,
+            _ => other.leaf_bytes += 1,
+        }
+        assert_eq!(
+            attestation.verify(&context, &other, &public, MAX_BODY),
+            Err(Error::Signature),
+            "manifest field {field} was not bound"
+        );
+    }
+    for field in 0..3 {
+        let mut other = context;
+        match field {
+            0 => other.domain[0] ^= 1,
+            1 => other.config[0] ^= 1,
+            _ => other.height += 1,
+        }
+        assert_eq!(
+            attestation.verify(&other, &manifest, &public, MAX_BODY),
+            Err(Error::Signature),
+            "context field {field} was not bound"
+        );
+    }
+    let other_key = SigningKey::from([35; 32]);
+    let other_public = VerificationKeyBytes::from(&other_key).into();
+    assert_eq!(
+        attestation.verify(&context, &manifest, &other_public, MAX_BODY),
+        Err(Error::Proposer)
+    );
+    let mut wrong_proposer = attestation;
+    wrong_proposer.proposer = other_public;
+    assert_eq!(
+        wrong_proposer.verify(&context, &manifest, &public, MAX_BODY),
+        Err(Error::Proposer)
+    );
+    assert_eq!(
+        wrong_proposer.verify(&context, &manifest, &other_public, MAX_BODY),
+        Err(Error::Signature)
+    );
+    let mut bad_signature = attestation;
+    bad_signature.signature[0] ^= 1;
+    assert_eq!(
+        bad_signature.verify(&context, &manifest, &public, MAX_BODY),
+        Err(Error::Signature)
+    );
+}
+
+#[test]
+fn proposer_attestation_message_has_pinned_field_order_and_encoding() {
+    let context = HolderContext {
+        domain: [41; 32],
+        config: [42; 32],
+        height: 0x0807_0605_0403_0201,
+    };
+    let manifest = Manifest {
+        body_id: [43; 32],
+        signed_header_identity: [44; 32],
+        body_len: 0x01_0203,
+        leaf_bytes: DEFAULT_LEAF_BYTES as u32,
+        root: [45; 32],
+    };
+    let key = SigningKey::from([46; 32]);
+    let proposer = ProposerAttestation::sign(&context, &manifest, &key, MAX_BODY).unwrap();
+    let holder = HolderAttestation::sign(&context, &manifest, &key, MAX_BODY).unwrap();
+    // Independent concatenation pins both domains and the legacy holder format.
+    for (domain, public, signature) in [
+        (
+            b"tenderlink/D28/BFT/merkle/proposer/v1".as_slice(),
+            proposer.proposer,
+            proposer.signature,
+        ),
+        (
+            b"tenderlink/D28/BFT/merkle/holder/v1".as_slice(),
+            holder.holder,
+            holder.signature,
+        ),
+    ] {
+        let mut input = domain.to_vec();
+        input.extend_from_slice(&context.domain);
+        input.extend_from_slice(&context.config);
+        input.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // height: u64 LE
+        input.extend_from_slice(&public);
+        input.extend_from_slice(&manifest.signed_header_identity);
+        input.extend_from_slice(&manifest.body_id);
+        input.extend_from_slice(&[3, 2, 1, 0, 0, 0, 0, 0]); // body length: u64 LE
+        input.extend_from_slice(&[0, 144, 1, 0]); // 100 KiB leaf size: u32 LE
+        input.extend_from_slice(&manifest.root);
+        let expected: [u8; 64] = key.sign(blake3::hash(&input).as_bytes()).into();
+        assert_eq!(signature, expected);
+    }
+}
+
+#[test]
+fn proposer_attestation_cannot_be_replaced_by_legacy_holder_signature() {
+    let (_, _, manifest) = fixture(DEFAULT_LEAF_BYTES + 17, DEFAULT_LEAF_BYTES);
+    let context = HolderContext {
+        domain: [51; 32],
+        config: [52; 32],
+        height: 53,
+    };
+    let key = SigningKey::from([54; 32]);
+    let public = VerificationKeyBytes::from(&key).into();
+    let holder = HolderAttestation::sign(&context, &manifest, &key, MAX_BODY).unwrap();
+    let proposer = ProposerAttestation::sign(&context, &manifest, &key, MAX_BODY).unwrap();
+    holder.verify(&context, &manifest, &public, MAX_BODY).unwrap();
+    proposer.verify(&context, &manifest, &public, MAX_BODY).unwrap();
+    assert_ne!(holder.signature, proposer.signature);
+    let holder_as_proposer = ProposerAttestation {
+        proposer: holder.holder,
+        signature: holder.signature,
+    };
+    assert_eq!(
+        holder_as_proposer.verify(&context, &manifest, &public, MAX_BODY),
+        Err(Error::Signature)
+    );
+    let proposer_as_holder = HolderAttestation {
+        holder: proposer.proposer,
+        signature: proposer.signature,
+    };
+    assert_eq!(
+        proposer_as_holder.verify(&context, &manifest, &public, MAX_BODY),
+        Err(Error::Signature)
+    );
+}
+
+#[test]
+fn proposer_attestation_rejects_malformed_geometry_before_key_or_signature_checks() {
+    let manifest = Manifest {
+        body_id: [61; 32],
+        signed_header_identity: [62; 32],
+        body_len: DEFAULT_LEAF_BYTES as u64 + 1,
+        leaf_bytes: DEFAULT_LEAF_BYTES as u32,
+        root: [63; 32],
+    };
+    let context = HolderContext {
+        domain: [64; 32],
+        config: [65; 32],
+        height: 66,
+    };
+    let key = SigningKey::from([67; 32]);
+    let public = VerificationKeyBytes::from(&key).into();
+    let attestation = ProposerAttestation::sign(&context, &manifest, &key, MAX_BODY).unwrap();
+    let assert_rejected = |bad: &Manifest, max_body: usize, error| {
+        assert_eq!(
+            ProposerAttestation::sign(&context, bad, &key, max_body),
+            Err(error)
+        );
+        assert_eq!(
+            attestation.verify(&context, bad, &public, max_body),
+            Err(error)
+        );
+        // Geometry errors take precedence even over a wrong expected proposer;
+        // no tree, bitmap or body is constructed on either path.
+        assert_eq!(
+            attestation.verify(&context, bad, &[0; 32], max_body),
+            Err(error)
+        );
+    };
+    for body_len in [0, MAX_BODY as u64 + 1, u64::MAX] {
+        assert_rejected(&Manifest { body_len, ..manifest }, MAX_BODY, Error::BodyLength);
+    }
+    for leaf_bytes in [
+        0,
+        (MIN_LEAF_BYTES - 1) as u32,
+        (MAX_LEAF_BYTES + 1) as u32,
+        u32::MAX,
+    ] {
+        assert_rejected(&Manifest { leaf_bytes, ..manifest }, MAX_BODY, Error::LeafSize);
+    }
+    for max_body in [0, usize::MAX] {
+        assert_rejected(&manifest, max_body, Error::Bounds);
+    }
+    assert_rejected(&manifest, DEFAULT_LEAF_BYTES, Error::BodyLength);
+}
+
+#[test]
 fn holder_attestation_binds_every_manifest_and_bft_context_field() {
     let (_, _, manifest) = fixture(2 * MIN_LEAF_BYTES + 1, MIN_LEAF_BYTES);
     let context = HolderContext {
@@ -645,7 +840,7 @@ fn holder_attestation_binds_every_manifest_and_bft_context_field() {
 }
 
 #[test]
-fn valid_root_and_holder_signature_do_not_replace_existing_keyed_chain_id() {
+fn valid_root_and_attestations_do_not_replace_existing_keyed_chain_id() {
     let block = BftBlock {
         version: 1,
         height: 9,
@@ -665,8 +860,8 @@ fn valid_root_and_holder_signature_do_not_replace_existing_keyed_chain_id() {
     assert_eq!(manifest.body_id, original_chain_id);
     let mut wrong_id = manifest;
     wrong_id.body_id[0] ^= 1;
-    // Membership correctly remains valid under identical root/geometry. A
-    // holder may sign this false relation; only final chain checks reject it.
+    // Membership correctly remains valid under identical root/geometry. Even a
+    // proposer may sign this false relation; only final chain checks reject it.
     verify_leaf(&wrong_id, 0, &body, &proof, MAX_BODY).unwrap();
     let context = HolderContext {
         domain: [24; 32],
@@ -676,6 +871,10 @@ fn valid_root_and_holder_signature_do_not_replace_existing_keyed_chain_id() {
     let key = SigningKey::from([26; 32]);
     let public = VerificationKeyBytes::from(&key).into();
     HolderAttestation::sign(&context, &wrong_id, &key, MAX_BODY)
+        .unwrap()
+        .verify(&context, &wrong_id, &public, MAX_BODY)
+        .unwrap();
+    ProposerAttestation::sign(&context, &wrong_id, &key, MAX_BODY)
         .unwrap()
         .verify(&context, &wrong_id, &public, MAX_BODY)
         .unwrap();
