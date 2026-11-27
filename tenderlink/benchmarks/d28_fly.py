@@ -77,6 +77,7 @@ MAX_LOG = 256 * 1024
 MAX_LINE = 4096
 PROFILES = {"baseline": {"poll_ms": 25, "status_ms": 100, "receive_budget": 32, "max_requests": 2},
             "balanced": {"poll_ms": 25, "status_ms": 100, "receive_budget": 128, "max_requests": 2},
+            "fast_poll": {"poll_ms": 5, "status_ms": 100, "receive_budget": 128, "max_requests": 2},
             "fast": {"poll_ms": 5, "status_ms": 25, "receive_budget": 128, "max_requests": 2},
             "fast_k1": {"poll_ms": 5, "status_ms": 25, "receive_budget": 128, "max_requests": 1},
             "economy": {"poll_ms": 100, "status_ms": 100, "receive_budget": 32, "max_requests": 2}}
@@ -2538,6 +2539,7 @@ finally:
 
     def test_fast_k1_exact_profile_and_default(self):
         self.assertEqual(PROFILES["balanced"], dict(PROFILES["baseline"], receive_budget=128))
+        self.assertEqual(PROFILES["fast_poll"], dict(PROFILES["balanced"], poll_ms=5))
         for profile, knobs in PROFILES.items():
             self.assertEqual(validate_config(fixture_config(**knobs))["max_requests"], knobs["max_requests"])
             self.assertEqual(profile_arg(profile), profile)
