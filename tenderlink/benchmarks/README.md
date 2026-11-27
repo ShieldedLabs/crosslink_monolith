@@ -782,12 +782,21 @@ All 517 original file hashes were unchanged when the derived
 `campaign/summary.json` was added. Its SHA-256 is
 `5bdc600be26006484f7fe770371e2ff32bbf2d1ab373f0659b2697b9f2305621`.
 
-## Merkle leaf-size component comparison — 2026-11-27
+## Historical ACK-gated Merkle comparison — 2026-11-27
 
-**Outlining saved bandwidth; Merkle leaves did not improve throughput in this
-configuration.** The 1-MiB leaf arm completed and offered fewer bytes than its
-fresh outlined control. Smaller-leaf arms were substantially slower and partial.
-This is a seven-process **localhost** experiment, not a distributed/WAN result.
+**These measurements do not isolate the effect of Merkle leaf size.** The old
+application protocol held two eight-leaf batches until every leaf was acknowledged
+or the batch timed out. That allowed only 512 KiB of leased leaf data at 32-KiB
+leaves, versus 16 MiB at 1-MiB leaves: a **32-fold difference in byte allowance**.
+It also coupled unrelated unordered messages to batch-wide completion. The
+results below are retained as measurements of that implementation, not evidence
+against 100-KiB leaves or a properly paced unordered shard design.
+
+Outlining saved bandwidth; the ACK-gated Merkle implementation did not improve
+throughput in this configuration. The 1-MiB leaf arm completed and offered fewer
+bytes than its fresh outlined control. Smaller-leaf arms were substantially
+slower and partial. This is a seven-process **localhost** experiment, not a
+distributed/WAN result.
 
 ### Frozen primary results
 
