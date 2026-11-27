@@ -513,11 +513,17 @@ fn body_leases_survive_handoff_are_global_and_prevent_duplicate_queued_offers() 
 }
 
 #[test]
-fn production_default_stays_inline_and_merkle_is_explicitly_rejected() {
+fn production_default_stays_inline_and_merkle_checks_leaf_geometry() {
     let (mut config, _) = crate::d28::runtime::tests::fixture();
     assert_eq!(config.payload_mode, PayloadMode::Inline);
-    config.payload_mode = PayloadMode::Merkle { leaf_bytes: 102400 };
-    assert!(Network::new(&config).is_err());
+    for leaf_bytes in [32768, 102400, 262144, 1048576] {
+        config.payload_mode = PayloadMode::Merkle { leaf_bytes };
+        assert!(Network::new(&config).is_ok());
+    }
+    for leaf_bytes in [0, 32767, 1048577, usize::MAX] {
+        config.payload_mode = PayloadMode::Merkle { leaf_bytes };
+        assert!(Network::new(&config).is_err());
+    }
     config.payload_mode = PayloadMode::Outlined;
     assert!(Network::new(&config).is_ok());
 }

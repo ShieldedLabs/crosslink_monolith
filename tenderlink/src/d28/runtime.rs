@@ -799,13 +799,13 @@ struct Network {
 }
 impl Network {
     fn new(config: &RuntimeConfig) -> io::Result<Self> {
-        if matches!(config.payload_mode, PayloadMode::Merkle { .. }) {
-            return Err(invalid("Merkle payload transport is not installed"));
-        }
         let handle = config.transport.attach(Consumer::Bft);
         let transport = handle.limits();
-        let max_frame = config.limits().max_frame_bytes().map_err(core_error)?
+        let mut max_frame = config.limits().max_frame_bytes().map_err(core_error)?
             .max(config.limits().max_outlined_bytes().map_err(core_error)?);
+        if let PayloadMode::Merkle { leaf_bytes } = config.payload_mode {
+            max_frame = max_frame.max(payload::merkle_wire::max_frame_bytes(config.max_body, leaf_bytes).map_err(core_error)?);
+        }
         if config.max_connections == 0
             || config.max_connections > u32::MAX as usize
             || config.max_connections < config.max_members
@@ -947,6 +947,9 @@ impl Network {
         now: u64,
     ) -> io::Result<()> {
         self.payload.sync(engine, &self.peers, now);
+        if matches!(config.payload_mode, PayloadMode::Merkle { .. }) {
+            self.payload.sync_merkle(engine, &self.peers, now);
+        }
         let scope = engine.view().map(|d| (d.height, d.round));
         if self.conflict_scope != scope {
             self.conflicts.clear();
@@ -971,6 +974,7 @@ impl Network {
                 continue;
             };
             let bulk = bytes.first() == Some(&wire::BODY_RESPONSE_TAG)
+                || bytes.first() == Some(&payload::merkle_wire::LEAF)
                 || (bytes.first() == Some(&wire::FRAME_TAG) && bytes.len() > 160);
             inbox[index][usize::from(bulk)].push_back(bytes);
         }
@@ -1077,7 +1081,8 @@ impl Network {
                         payload::complete(engine, frame, events, &mut self.conflicts, config)
                     })?;
                 }
-                Some(&wire::OUTLINED_TAG | &wire::BODY_REQUEST_TAG | &wire::BODY_RESPONSE_TAG | &wire::BODY_ACK_TAG) => {
+                Some(&wire::OUTLINED_TAG | &wire::BODY_REQUEST_TAG | &wire::BODY_RESPONSE_TAG | &wire::BODY_ACK_TAG
+                    | &payload::merkle_wire::HAVE | &payload::merkle_wire::WANT | &payload::merkle_wire::LEAF | &payload::merkle_wire::ACK) => {
                     let generation = peer.generation;
                     let Some(_permit) = self.incoming.try_acquire() else { continue };
                     outcome.processed = self.receive_payload(engine, config, events, member, generation, &bytes, now)?;
@@ -1146,8 +1151,10 @@ impl Network {
         }
         if let Some(engine) = engine {
             self.payload.sync(engine, &self.peers, now);
-            if config.payload_mode != PayloadMode::Inline {
-                self.payload.offer(engine, &self.peers, |connection| self.handle.send_backlog_bytes(connection, Channel::Bulk) == Some(0), config, now, &mut push, &mut payload_offered)?;
+            match config.payload_mode {
+                PayloadMode::Inline => {},
+                PayloadMode::Outlined => self.payload.offer(engine, &self.peers, |connection| self.handle.send_backlog_bytes(connection, Channel::Bulk) == Some(0), config, now, &mut push, &mut payload_offered)?,
+                PayloadMode::Merkle { leaf_bytes } => self.payload.offer_merkle(engine, &self.peers, key, |connection| self.handle.send_backlog_bytes(connection, Channel::Bulk) == Some(0), config, now, &mut push, &mut payload_offered, leaf_bytes)?,
             }
             let status = engine.status();
             if status != self.last_status || now >= self.status_at {

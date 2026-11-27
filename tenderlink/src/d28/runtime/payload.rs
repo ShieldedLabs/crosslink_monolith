@@ -8,13 +8,16 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use wire::{BodyKey, BodyRequest, DecodedOutlined};
 
+mod merkle;
+pub(super) mod merkle_wire;
+
 /// Payload transport is opt-in; ledger bytes, body IDs and signatures do not change.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PayloadMode {
     #[default]
     Inline,
     Outlined,
-    /// Reserved for the separately validated chunked transport implementation.
+    /// Verified, independently relayable Merkle leaves with bounded windows.
     Merkle {
         leaf_bytes: usize,
     },
@@ -34,14 +37,27 @@ pub struct PayloadMetricsSnapshot {
     /// A subset of encoded evidence/data bytes; never add it to total wire bytes.
     pub payload_bytes: u64,
     /// Locally known repeat raw-byte offers of the most recently offered body to
-    /// that peer in the current height/session. Bounded one-ID history per peer;
-    /// not a count of global duplicates, received duplicates, or delivery.
+    /// that peer in the current height/session. Merkle counts repeats of the SAME
+    /// leaf, not successive different leaves; bounded one-body/geometry bitmap
+    /// history per peer. Not global duplicates, received duplicates, or delivery.
     pub duplicate_payload_bytes: u64,
     /// Subset of `offered.evidence.bytes`, never additional wire bytes.
     pub outlined_evidence_bytes: u64,
-    /// Body request/ACK application records, separate from evidence and status.
+    /// Missing leaf indices offered in WANT records (not WANT frame count).
+    pub leaf_requests: u64,
+    /// Leaf frames offered, including retries.
+    pub leaf_responses: u64,
+    /// Sibling hash bytes offered, a subset of offered_data.bytes.
+    pub leaf_proof_bytes: u64,
+    /// Entire HAVE records offered, a subset of offered_control.bytes; not just bits.
+    pub availability_bytes: u64,
+    /// Newly verified leaf bytes received; duplicates earn no credit.
+    pub verified_leaf_bytes: u64,
+    /// Assemblies passing canonical-height and keyed-body-ID checks. NOT Host Valid.
+    pub assembly_completions: u64,
+    /// Body/leaf request, ACK and HAVE records, separate from evidence and status.
     pub offered_control: MessageCounts,
-    /// Encoded body responses, separate from evidence and status.
+    /// Encoded body/leaf responses, separate from evidence and status.
     pub offered_data: MessageCounts,
 }
 
@@ -54,6 +70,12 @@ pub(super) struct AtomicPayloadMetrics {
     payload_bytes: AtomicU64,
     duplicate_payload_bytes: AtomicU64,
     outlined_evidence_bytes: AtomicU64,
+    leaf_requests: AtomicU64,
+    leaf_responses: AtomicU64,
+    leaf_proof_bytes: AtomicU64,
+    availability_bytes: AtomicU64,
+    verified_leaf_bytes: AtomicU64,
+    assembly_completions: AtomicU64,
     offered_control: AtomicMessageCounts,
     offered_data: AtomicMessageCounts,
 }
@@ -80,6 +102,12 @@ impl AtomicPayloadMetrics {
             &self.outlined_evidence_bytes,
             counts.outlined_evidence_bytes,
         );
+        saturating_add(&self.leaf_requests, counts.leaf_requests);
+        saturating_add(&self.leaf_responses, counts.leaf_responses);
+        saturating_add(&self.leaf_proof_bytes, counts.leaf_proof_bytes);
+        saturating_add(&self.availability_bytes, counts.availability_bytes);
+        saturating_add(&self.verified_leaf_bytes, counts.verified_leaf_bytes);
+        saturating_add(&self.assembly_completions, counts.assembly_completions);
         self.offered_control.add(counts.offered_control);
         self.offered_data.add(counts.offered_data);
     }
@@ -92,6 +120,12 @@ impl AtomicPayloadMetrics {
             payload_bytes: self.payload_bytes.load(Ordering::Relaxed),
             duplicate_payload_bytes: self.duplicate_payload_bytes.load(Ordering::Relaxed),
             outlined_evidence_bytes: self.outlined_evidence_bytes.load(Ordering::Relaxed),
+            leaf_requests: self.leaf_requests.load(Ordering::Relaxed),
+            leaf_responses: self.leaf_responses.load(Ordering::Relaxed),
+            leaf_proof_bytes: self.leaf_proof_bytes.load(Ordering::Relaxed),
+            availability_bytes: self.availability_bytes.load(Ordering::Relaxed),
+            verified_leaf_bytes: self.verified_leaf_bytes.load(Ordering::Relaxed),
+            assembly_completions: self.assembly_completions.load(Ordering::Relaxed),
             offered_control: self.offered_control.snapshot(),
             offered_data: self.offered_data.snapshot(),
         }
@@ -133,6 +167,7 @@ pub(super) struct PayloadState {
     scope: Option<(super::Id, u64)>,
     peers: Vec<BodyPeer>,
     pending: Vec<Pending>,
+    merkle: merkle::MerkleState,
     pending_cursor: usize,
     token: u64,
     serve_cursor: usize,
@@ -142,6 +177,7 @@ impl PayloadState {
         self.scope = None;
         self.peers.clear();
         self.pending.clear();
+        self.merkle.clear();
         self.pending_cursor = 0;
         // Tokens never reset within this runtime, even across height retirement.
     }
@@ -557,6 +593,13 @@ impl Network {
     ) -> io::Result<bool> {
         if config.payload_mode == PayloadMode::Inline {
             return Ok(false);
+        }
+        if matches!(bytes.first(), Some(&merkle_wire::HAVE | &merkle_wire::WANT | &merkle_wire::LEAF | &merkle_wire::ACK)) {
+            return self.receive_merkle(engine, config, events, member, generation, bytes, now);
+        }
+        if matches!(config.payload_mode, PayloadMode::Merkle { .. })
+            && matches!(bytes.first(), Some(&wire::BODY_REQUEST_TAG | &wire::BODY_RESPONSE_TAG | &wire::BODY_ACK_TAG)) {
+            return Ok(false); // Never silently fall back to whole-body transport.
         }
         match bytes.first() {
             Some(&wire::OUTLINED_TAG) => {
