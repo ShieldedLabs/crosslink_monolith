@@ -41,6 +41,38 @@ const NAMESPACE: [u8; 32] = [0x28; 32];
 
 /// Opt-in benchmark geometry only; production `PROPOSAL_MAX_SIZE` stays 1 MiB.
 pub const BENCH_MAX_BODY: usize = 10 * 1024 * 1024;
+pub const MIN_PAYLOAD_LEAF_BYTES: usize = 32 * 1024;
+pub const MAX_PAYLOAD_LEAF_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_PAYLOAD_LEAF_BYTES: usize = 102400;
+
+fn default_payload_mode() -> String {
+    "inline".into()
+}
+
+fn runtime_payload_mode(mode: &str, leaf_bytes: usize) -> io::Result<runtime::PayloadMode> {
+    match (mode, leaf_bytes) {
+        ("inline", 0) => Ok(runtime::PayloadMode::Inline),
+        ("outlined", 0) => Ok(runtime::PayloadMode::Outlined),
+        ("merkle", MIN_PAYLOAD_LEAF_BYTES..=MAX_PAYLOAD_LEAF_BYTES) => {
+            Ok(runtime::PayloadMode::Merkle { leaf_bytes })
+        }
+        _ => Err(invalid("payload_mode must be inline/outlined with payload_leaf_bytes=0, or merkle with payload_leaf_bytes=32768..1048576")),
+    }
+}
+
+/// Isolate benchmark wire/signature domains without changing any body/ledger
+/// format. Preserve the historical inline domain for legacy fixtures/reports.
+fn payload_namespace(mode: &str, leaf_bytes: usize) -> [u8; 32] {
+    if mode == "inline" && leaf_bytes == 0 {
+        return NAMESPACE;
+    }
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"D28 benchmark payload mode v1");
+    hash.update(&NAMESPACE);
+    hash.update(mode.as_bytes());
+    hash.update(&(leaf_bytes as u64).to_le_bytes());
+    *hash.finalize().as_bytes()
+}
 
 /// Admit a bounded complete evidence frame, not just its body. Keep the wrapper's
 /// existing defaults for legacy 1 MiB runs; no production transport limit changes.
@@ -83,6 +115,9 @@ pub struct BenchConfig {
     /// Explicit override only: default is the production runtime's 1 MiB.
     pub max_body: usize,
     pub chatter_secs: u64,
+    pub payload_mode: String,
+    /// Zero outside Merkle mode; Merkle permits non-power-of-two 100 KiB leaves.
+    pub payload_leaf_bytes: usize,
 }
 impl Default for BenchConfig {
     fn default() -> Self {
@@ -98,11 +133,17 @@ impl Default for BenchConfig {
             store_delay_ms: 0,
             max_body: crate::PROPOSAL_MAX_SIZE,
             chatter_secs: 0,
+            payload_mode: default_payload_mode(),
+            payload_leaf_bytes: 0,
         }
     }
 }
 impl BenchConfig {
+    fn namespace(&self) -> [u8; 32] {
+        payload_namespace(&self.payload_mode, self.payload_leaf_bytes)
+    }
     pub fn validate(&self) -> io::Result<()> {
+        runtime_payload_mode(&self.payload_mode, self.payload_leaf_bytes)?;
         if !(1..=128).contains(&self.nodes)
             || self.offline >= self.nodes
             || 3 * (self.nodes - self.offline) <= 2 * self.nodes
@@ -342,6 +383,7 @@ pub struct BenchReport {
     pub status: &'static str,
     pub failure: Option<String>,
     pub config: BenchConfig,
+    pub benchmark_namespace: String,
     pub quorum_nodes: usize,
     pub online_nodes: Vec<usize>,
     pub offline_nodes: Vec<usize>,
@@ -421,6 +463,7 @@ fn verify_pointer(
     members: &[SortedRosterMember],
     height: u64,
     id: ValueId,
+    namespace: &[u8; 32],
 ) -> bool {
     let vote = pointer.get_vote_template();
     if vote.height != height || vote.value.0 != id.0 || !vote.typ {
@@ -439,7 +482,7 @@ fn verify_pointer(
         stake += members[index].stake;
     }
     stake >= crate::decision_threshold(members.len() as u64, true)
-        && pointer.validate_signatures(&NAMESPACE)
+        && pointer.validate_signatures(namespace)
 }
 fn validate_body(
     value: &BlockValue,
@@ -478,6 +521,7 @@ fn validate_body(
             members,
             height - 1,
             parent_id,
+            &config.namespace(),
         )
     }
 }
@@ -684,6 +728,8 @@ impl Sampler {
                 ("offered.status", snapshot.offered.status),
                 ("offered.bare_votes", snapshot.offered.bare_votes),
                 ("offered.evidence", snapshot.offered.evidence),
+                ("payload.offered_control", snapshot.payload.offered_control),
+                ("payload.offered_data", snapshot.payload.offered_data),
                 ("received", snapshot.received),
                 ("processed", snapshot.processed),
                 ("rejected", snapshot.rejected),
@@ -697,6 +743,19 @@ impl Sampler {
             }
             *out.entry("offered.status_request_messages".into())
                 .or_default() += snapshot.offered.status_request_messages;
+            // Subset metrics, not additional traffic: raw bodies are already in
+            // inline evidence or outlined data; outlined metadata is in evidence.
+            for (name, value) in [
+                ("body_cache_hits", snapshot.payload.body_cache_hits),
+                ("body_cache_misses", snapshot.payload.body_cache_misses),
+                ("body_requests", snapshot.payload.body_requests),
+                ("body_responses", snapshot.payload.body_responses),
+                ("payload_bytes", snapshot.payload.payload_bytes),
+                ("duplicate_payload_bytes", snapshot.payload.duplicate_payload_bytes),
+                ("outlined_evidence_bytes", snapshot.payload.outlined_evidence_bytes),
+            ] {
+                *out.entry(format!("payload.{name}")).or_default() += value;
+            }
         }
         out
     }
@@ -839,7 +898,7 @@ impl Cohort {
             height: self.committed,
             block_id: self.committed_id,
             next_roster: self.members.clone(),
-            next_vote_namespace: NAMESPACE,
+            next_vote_namespace: self.config.namespace(),
             next_strict_quorum: true,
         }
     }
@@ -886,7 +945,7 @@ impl Cohort {
                 &self.config,
                 &self.members,
             )
-            || !verify_pointer(&pointer, &self.members, height, id)
+            || !verify_pointer(&pointer, &self.members, height, id, &self.config.namespace())
         {
             self.failure = Some(format!(
                 "node {node} exported an invalid mock body or chain certificate at height {height}"
@@ -1207,7 +1266,7 @@ async fn run_inner(
         let mut runtime = RuntimeConfig::new(
             1,
             members.clone(),
-            NAMESPACE,
+            config.namespace(),
             config.nodes,
             transport,
             addresses
@@ -1218,6 +1277,7 @@ async fn run_inner(
                 .collect(),
         );
         runtime.max_body = config.max_body;
+        runtime.payload_mode = runtime_payload_mode(&config.payload_mode, config.payload_leaf_bytes)?;
         runtime.metrics = Some(metrics[i].clone());
         if i == 0 {
             macro_rules! settings { ($($field:ident),*) => { $(runtime_settings.insert(stringify!($field).into(), runtime.$field as u64);)* }; }
@@ -1393,6 +1453,7 @@ async fn run_inner(
         },
         failure,
         config: config.clone(),
+        benchmark_namespace: hex::encode(config.namespace()),
         quorum_nodes: 2 * config.nodes / 3 + 1,
         online_nodes: (0..online).collect(),
         offline_nodes: (online..config.nodes).collect(),
@@ -1451,6 +1512,7 @@ async fn run_inner(
             "Counter boundaries are sampled serially under cohort lock after callback entry/validation; sampling_duration_ms exposes observer skew and next-height perturbation. STP pump threads continue concurrently; counters are not an atomic system snapshot.",
             "Measured counters exclude warmup; success ends at final cohort before shutdown/drain. Final in-flight tail excluded. Optional chatter window keeps final ACK/tip unpublished and measures continued final-height protocol traffic separately, not a quiescent post-commit network.",
             "TransportStats gathered with Base.stats only: no Base service and no second BFT attachment. Ring/message counters are not UDP packet/byte counters. Outside marked isolated netns network counters are null.",
+            "Payload counters are application offers, not delivery/wire bytes. payload.payload_bytes is raw body bytes offered (including embedded inline bodies); payload.outlined_evidence_bytes is a subset of offered.evidence.bytes. Separate payload.offered_control/data are not in offered.evidence; do not sum subset metrics twice. Duplicate payload bytes alone are not total wasted network traffic.",
             "Production RuntimeConfig timer defaults unchanged; max_body differs only when explicitly configured. workers is CLI executor size; library caller owns executor sizing. Debug builds are not production-throughput evidence.",
         ],
     })
@@ -1461,6 +1523,11 @@ mod tests {
     use super::*;
     use zcash_primitives::bft::{Blake3Hash, FatPointerSignature, Vote};
     pub(super) fn pointer(n: usize, signers: &[usize], height: u64, id: ValueId) -> FatPointerToBftBlock {
+        pointer_with_namespace(n, signers, height, id, &NAMESPACE)
+    }
+    pub(super) fn pointer_with_namespace(
+        n: usize, signers: &[usize], height: u64, id: ValueId, namespace: &[u8; 32],
+    ) -> FatPointerToBftBlock {
         let signatures: Vec<_> = signers
             .iter()
             .map(|&i| {
@@ -1476,12 +1543,53 @@ mod tests {
                     vote_signature: crate::sign_with_namespace(
                         &key(i),
                         &vote.to_bytes(),
-                        &NAMESPACE,
+                        namespace,
                     ),
                 }
             })
             .collect();
         FatPointerToBftBlock::from_parts(Blake3Hash(id.0), height, 0, &signatures)
+    }
+    #[test]
+    fn payload_modes_bind_namespace_and_parent_certificates() {
+        let mut namespaces = std::collections::BTreeSet::new();
+        for (mode, leaf) in [("inline", 0), ("outlined", 0), ("merkle", 32768),
+                             ("merkle", 102400), ("merkle", 1048576)] {
+            let c = BenchConfig {
+                payload_mode: mode.into(), payload_leaf_bytes: leaf, ..Default::default()
+            };
+            c.validate().unwrap();
+            assert!(namespaces.insert(c.namespace()));
+            let json = serde_json::to_value(&c).unwrap();
+            assert_eq!(json["payload_mode"], mode);
+            assert_eq!(json["payload_leaf_bytes"], leaf);
+            let id = ValueId([7; 32]);
+            let parent = pointer_with_namespace(4, &[0, 1, 2], 1, id, &c.namespace());
+            assert!(verify_pointer(&parent, &roster(4), 1, id, &c.namespace()));
+            let value = mock_body(2, parent, c.headers).unwrap();
+            assert!(validate_body(&value, 2, id, &c, &roster(4)));
+            if mode != "inline" {
+                assert!(!validate_body(&value, 2, id, &BenchConfig::default(), &roster(4)));
+            }
+        }
+        assert_eq!(BenchConfig::default().namespace(), NAMESPACE);
+        for (mode, leaf) in [("bad", 0), ("inline", 102400), ("outlined", 1),
+                             ("merkle", 0), ("merkle", 32767), ("merkle", 1048577)] {
+            assert!(BenchConfig { payload_mode: mode.into(), payload_leaf_bytes: leaf,
+                                  ..Default::default() }.validate().is_err());
+        }
+    }
+    #[test]
+    fn payload_snapshot_retains_all_counters_without_combining_subsets() {
+        let sampler = Sampler { observers: vec![], stores: vec![], scope: None,
+            deadline: Instant::now(), metrics: vec![Arc::new(runtime::RuntimeMetrics::default())] };
+        let snapshot = sampler.application_snapshot();
+        for key in ["body_cache_hits", "body_cache_misses", "body_requests", "body_responses",
+                    "payload_bytes", "duplicate_payload_bytes", "outlined_evidence_bytes",
+                    "offered_control.messages", "offered_control.bytes", "offered_data.messages",
+                    "offered_data.bytes"] {
+            assert_eq!(snapshot.get(&format!("payload.{key}")), Some(&0));
+        }
     }
     #[test]
     fn benchmark_body_and_transport_caps_leave_production_defaults_unchanged() {
@@ -1545,10 +1653,10 @@ mod tests {
             assert!(!validate_body(&body, 2, ValueId([8; 32]), &c, &members));
         }
         let short = pointer(4, &[0, 1], 1, id);
-        assert!(!verify_pointer(&short, &members, 1, id));
+        assert!(!verify_pointer(&short, &members, 1, id, &NAMESPACE));
         let mut bad = pointer(4, &[0, 1, 2], 1, id);
         bad.signatures[0].vote_signature[0] ^= 1;
-        assert!(!verify_pointer(&bad, &members, 1, id));
+        assert!(!verify_pointer(&bad, &members, 1, id, &NAMESPACE));
         let body = mock_body(1, FatPointerToBftBlock::null(), 1).unwrap();
         assert!(validate_body(&body, 1, ValueId::NIL, &c, &members));
     }

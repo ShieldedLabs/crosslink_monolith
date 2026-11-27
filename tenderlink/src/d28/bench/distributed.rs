@@ -38,6 +38,10 @@ pub struct DistributedConfig {
     /// Explicit benchmark-only fallback timers; omitted means unchanged production.
     #[serde(default = "default_timing_profile")]
     pub timing_profile: String,
+    #[serde(default = "default_payload_mode")]
+    pub payload_mode: String,
+    #[serde(default)]
+    pub payload_leaf_bytes: usize,
     #[serde(default = "default_poll")]
     pub poll_ms: u64,
     #[serde(default = "default_status")]
@@ -67,6 +71,9 @@ fn default_timing_profile() -> String {
 }
 
 impl DistributedConfig {
+    fn namespace(&self) -> [u8; 32] {
+        payload_namespace(&self.payload_mode, self.payload_leaf_bytes)
+    }
     fn validate_body_shape(&self) -> io::Result<()> {
         if !(1..=32).contains(&self.nodes)
             || !(1..=BENCH_MAX_BODY).contains(&self.max_body)
@@ -105,6 +112,8 @@ impl DistributedConfig {
             workers: self.workers,
             max_body: self.max_body,
             chatter_secs: self.chatter_secs,
+            payload_mode: self.payload_mode.clone(),
+            payload_leaf_bytes: self.payload_leaf_bytes,
             ..BenchConfig::default()
         }
     }
@@ -342,7 +351,7 @@ fn checked_body_payload(
     let valid_parent = if height == 1 {
         block.previous_block_fat_ptr == FatPointerToBftBlock::null()
     } else {
-        verify_pointer(&block.previous_block_fat_ptr, members, height - 1, parent)
+        verify_pointer(&block.previous_block_fat_ptr, members, height - 1, parent, &c.namespace())
     };
     valid_parent.then(|| payload_bytes(&block).ok()).flatten()
 }
@@ -555,6 +564,7 @@ pub struct DistributedReport {
     pub schema_version: u32,
     pub mode: &'static str,
     pub config: DistributedConfig,
+    pub benchmark_namespace: String,
     pub status: &'static str,
     pub failure: Option<String>,
     pub total_run_seconds: f64,
@@ -595,7 +605,7 @@ impl LocalState {
             height: self.committed,
             block_id: self.id,
             next_roster: self.members.clone(),
-            next_vote_namespace: NAMESPACE,
+            next_vote_namespace: self.config.namespace(),
             next_strict_quorum: true,
         }
     }
@@ -635,7 +645,7 @@ fn host(state: Arc<Mutex<LocalState>>) -> HostCallbacks {
             if c.pending.is_some()
                 || !chunks.is_empty()
                 || payload.is_none()
-                || !verify_pointer(&pointer, &c.members, height, id)
+                || !verify_pointer(&pointer, &c.members, height, id, &c.config.namespace())
             {
                 c.failure = Some(format!(
                     "invalid or duplicate local body/certificate at height {height}"
@@ -801,9 +811,10 @@ pub async fn run(config: DistributedConfig) -> io::Result<DistributedReport> {
         sampler.observers.push(transport.attach(Consumer::Base));
         sampler.stores.push(counts.clone());
         sampler.metrics.push(metrics.clone());
-        let mut rt = RuntimeConfig::new(1, roster(config.nodes), NAMESPACE, config.nodes, transport,
+        let mut rt = RuntimeConfig::new(1, roster(config.nodes), config.namespace(), config.nodes, transport,
             addresses.into_iter().enumerate().filter_map(|(i, a)| (i != config.node).then_some(a)).collect());
         rt.max_body = config.max_body;
+        rt.payload_mode = runtime_payload_mode(&config.payload_mode, config.payload_leaf_bytes)?;
         config.apply_timing(&mut rt.timeouts, &mut rt.request_timeout, &mut rt.status_ttl);
         rt.poll_interval = Duration::from_millis(config.poll_ms);
         rt.status_interval = Duration::from_millis(config.status_ms);
@@ -823,7 +834,8 @@ pub async fn run(config: DistributedConfig) -> io::Result<DistributedReport> {
         let stream = bounded(deadline, TcpStream::connect(config.coordinator)).await?;
         stream.set_nodelay(true)?;
         let mut stream = BufReader::new(stream);
-        send(&mut stream, serde_json::json!({"type":"ready", "run_id":config.run_id, "node":config.node}), deadline).await?;
+        send(&mut stream, serde_json::json!({"type":"ready", "run_id":config.run_id, "node":config.node,
+            "payload_mode":config.payload_mode, "payload_leaf_bytes":config.payload_leaf_bytes}), deadline).await?;
         if !matches!(read_control(&mut stream, deadline).await?, Control::Start {}) {
             return Err(invalid("expected start before any ACK"));
         }
@@ -931,6 +943,7 @@ pub async fn run(config: DistributedConfig) -> io::Result<DistributedReport> {
     Ok(DistributedReport {
         schema_version: 1,
         mode: "distributed",
+        benchmark_namespace: hex::encode(config.namespace()),
         config,
         status: if complete { "complete" } else { "partial" },
         failure,
@@ -950,6 +963,8 @@ pub async fn run(config: DistributedConfig) -> io::Result<DistributedReport> {
         runtime_settings,
         transport_settings,
         methodology: vec![
+            "Payload mode/leaf size bind readiness and the benchmark signature/wire namespace; HostTip and parent/export certificate validation use that same namespace at every height. Body, PoW and ledger serialization are unchanged.",
+            "Payload metrics are application offers, not delivery or wire bytes. Raw payload_bytes includes embedded inline bodies or outlined data and is a subset, not extra offered traffic. outlined_evidence_bytes is already in offered.evidence.bytes. payload.offered_control/data are separate offers; duplicate_payload_bytes is not total wasted network traffic.",
             "One real D28/STP validator per process; fixed full equal-stake roster, predictable isolated benchmark keys/namespace; no PoW, ledger or transaction/TPS claim.",
             "All-online controller ACK barrier is intentional benchmark overhead: both callback return and trusted read_tip wait for ACK. Bodies and certificates come only from local D28 export and unchanged production parsing/signature checks, never from controller.",
             "Node latency uses one local monotonic clock: START to push_decided entry at height1, prior ACK/tip-publication to push_decided entry thereafter. Includes INIT, storage and host polling; excludes local export checks and ACK wait. Never subtract clocks across machines; controller receipt/cycle metrics are separate.",
@@ -971,6 +986,47 @@ mod tests {
             "headers":32,"heights":2,"warmup":1,"timeout_secs":10,"workers":1,
             "max_body":1048576,"chatter_secs":0,"peers":["[::1]:9000","[::1]:9001","[::1]:9002","[::1]:9003"],
             "coordinator":"[::1]:9100","run_id":"unit-test"})).unwrap()
+    }
+    #[test]
+    fn payload_config_defaults_strict_bounds_and_host_namespace() {
+        let legacy = config();
+        assert_eq!(legacy.payload_mode, "inline");
+        assert_eq!(legacy.payload_leaf_bytes, 0);
+        assert_eq!(legacy.namespace(), NAMESPACE);
+        for (mode, leaf) in [("inline", 0), ("outlined", 0), ("merkle", 102400)] {
+            let mut c = config();
+            c.payload_mode = mode.into();
+            c.payload_leaf_bytes = leaf;
+            c.validate().unwrap();
+            let json = serde_json::to_value(&c).unwrap();
+            let decoded: DistributedConfig = serde_json::from_value(json).unwrap();
+            assert_eq!(decoded.namespace(), c.namespace());
+            let id = ValueId([7; 32]);
+            let parent = super::super::tests::pointer_with_namespace(4, &[0, 1, 2], 1, id, &c.namespace());
+            let value = body(2, parent.clone(), &c).unwrap();
+            assert!(valid_body(&value, 2, id, &c, &roster(4)));
+            let state = LocalState { config: c.clone(), members: roster(4), committed: 1, id, parent,
+                origin: Instant::now(), height_start: Instant::now(), reports: vec![], pending: None, failure: None };
+            assert_eq!(state.tip().next_vote_namespace, c.namespace());
+            assert_eq!(c.base().namespace(), c.namespace());
+            if mode != "inline" {
+                assert!(!valid_body(&value, 2, id, &legacy, &roster(4)));
+            }
+        }
+        for (mode, leaf) in [("unknown", 0), ("inline", 102400), ("outlined", 1),
+                             ("merkle", 0), ("merkle", 32767), ("merkle", 1048577)] {
+            let mut c = config();
+            c.payload_mode = mode.into();
+            c.payload_leaf_bytes = leaf;
+            assert!(c.validate().is_err());
+        }
+        for (key, value) in [("leaf_bytes", serde_json::json!(102400)),
+                             ("payload_leaf_bytes", serde_json::json!(true)),
+                             ("payload_mode", serde_json::json!(1))] {
+            let mut json = serde_json::to_value(config()).unwrap();
+            json[key] = value;
+            assert!(serde_json::from_value::<DistributedConfig>(json).is_err());
+        }
     }
     #[test]
     fn shape_and_private_topology_bounds() {

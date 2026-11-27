@@ -5,6 +5,7 @@ use tenderlink::d28::bench::{self, BenchConfig, distributed};
 const HELP: &str = "d28_bench --nodes N --offline N --heights N --warmup N --headers N
   --timeout-secs N --workers N --host-delay-ms N --store-delay-ms N
   [--max-body BYTES] [--chatter-secs N] [--json PATH]
+  [--payload-mode inline|outlined|merkle] [--payload-leaf-bytes BYTES]
 OR d28_bench --distributed CONFIG.json [--json REPORT.json]
 
 Real D28/STP/crypto/durable-image mock-chain benchmark.
@@ -19,6 +20,10 @@ Mock solution padding uses unchanged parsing/serialization, NOT valid Equihash w
 Distributed timing_profile defaults to production; explicit wan changes benchmark
 base timers to 10000/5000/7000ms, request timeout10000ms and status expiry15000ms.
 Rho, round increments, production limits and defaults remain unchanged.
+Payload mode defaults to inline. Config payload_leaf_bytes defaults to 0 and must
+remain 0 outside merkle. Merkle leaves accept 32768..1048576 bytes, including
+102400 (100 KiB). Component CLI merkle defaults to 102400 when leaf size is omitted.
+The selected mode/leaf size isolate the benchmark namespace, not the ledger format.
 No PoW, ledger, physical persistence, transactions, or TPS claims.
 Component defaults: 4 nodes, 0 offline, 30 measured heights + 3 warmup, 32 headers,
 180 second whole-run deadline, 4 executor workers, zero artificial delays,
@@ -41,6 +46,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, Stri
     let mut json = None;
     let mut distributed = None;
     let mut component_flags = false;
+    let mut explicit_leaf = false;
     let mut args = args.into_iter();
     while let Some(option) = args.next() {
         if option == "--help" || option == "-h" {
@@ -68,6 +74,14 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, Stri
             "--host-delay-ms" => number!(host_delay_ms),
             "--store-delay-ms" => number!(store_delay_ms),
             "--max-body" => number!(max_body),
+            "--payload-mode" => {
+                component_flags = true;
+                config.payload_mode = value;
+            }
+            "--payload-leaf-bytes" => {
+                explicit_leaf = true;
+                number!(payload_leaf_bytes);
+            }
             "--chatter-secs" => number!(chatter_secs),
             "--json" => {
                 if json.replace(PathBuf::from(value)).is_some() {
@@ -86,6 +100,9 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, Stri
         return Err("--distributed cannot be mixed with component configuration flags".into());
     }
     if distributed.is_none() {
+        if config.payload_mode == "merkle" && !explicit_leaf {
+            config.payload_leaf_bytes = bench::DEFAULT_PAYLOAD_LEAF_BYTES;
+        }
         config.validate().map_err(|e| e.to_string())?;
     }
     Ok(Some(Options {
@@ -292,6 +309,23 @@ mod tests {
         assert!(!failed.exists());
         assert_eq!(std::fs::read(&stale).unwrap(), b"preexisting temporary");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn payload_cli_modes_and_explicit_leaf_bounds() {
+        for (text, mode, leaf) in [("", "inline", 0), ("--payload-mode outlined", "outlined", 0),
+            ("--payload-mode merkle", "merkle", 102400),
+            ("--payload-mode merkle --payload-leaf-bytes 32768", "merkle", 32768),
+            ("--payload-mode merkle --payload-leaf-bytes 1048576", "merkle", 1048576)] {
+            let parsed = parse(args(text)).unwrap().unwrap();
+            assert_eq!(parsed.config.payload_mode, mode);
+            assert_eq!(parsed.config.payload_leaf_bytes, leaf);
+        }
+        for text in ["--payload-mode unknown", "--payload-mode inline --payload-leaf-bytes 102400",
+            "--payload-mode outlined --payload-leaf-bytes 1", "--payload-mode merkle --payload-leaf-bytes 0",
+            "--payload-mode merkle --payload-leaf-bytes 32767", "--payload-mode merkle --payload-leaf-bytes 1048577",
+            "--distributed n.json --payload-mode inline", "--distributed n.json --payload-leaf-bytes 0"] {
+            assert!(parse(args(text)).is_err(), "{text}");
+        }
     }
     #[test]
     fn parser_and_safety_bounds() {
