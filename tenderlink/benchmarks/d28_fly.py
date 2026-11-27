@@ -74,6 +74,7 @@ MAX_JSON = 8 * 1024 * 1024
 MAX_LOG = 256 * 1024
 MAX_LINE = 4096
 PROFILES = {"baseline": {"poll_ms": 25, "status_ms": 100, "receive_budget": 32, "max_requests": 2},
+            "balanced": {"poll_ms": 25, "status_ms": 100, "receive_budget": 128, "max_requests": 2},
             "fast": {"poll_ms": 5, "status_ms": 25, "receive_budget": 128, "max_requests": 2},
             "fast_k1": {"poll_ms": 5, "status_ms": 25, "receive_budget": 128, "max_requests": 1},
             "economy": {"poll_ms": 100, "status_ms": 100, "receive_budget": 32, "max_requests": 2}}
@@ -2526,6 +2527,7 @@ finally:
             encode(summary)  # Entire exported analysis is strict, finite JSON.
 
     def test_fast_k1_exact_profile_and_default(self):
+        self.assertEqual(PROFILES["balanced"], dict(PROFILES["baseline"], receive_budget=128))
         for profile, knobs in PROFILES.items():
             self.assertEqual(validate_config(fixture_config(**knobs))["max_requests"], knobs["max_requests"])
             self.assertEqual(profile_arg(profile), profile)
@@ -3426,7 +3428,7 @@ def build_parser():
     command.add_argument("--timing-profile", choices=("production", "wan"), default="production",
                          help="benchmark-only protocol timing profile; fixed across the sweep")
     command.add_argument("--profiles", type=comma_arg(profile_arg), default=["baseline"],
-                         help="comma-separated baseline,fast,fast_k1,economy; economy polls at 100ms; never changes protocol timers")
+                         help="comma-separated " + ",".join(PROFILES) + "; balanced raises baseline receive budget only; economy polls at 100ms; never changes protocol timers")
     command.add_argument("--payload-modes", type=comma_arg(payload_mode_arg), default=["inline"],
                          help="comma-separated inline,outlined,merkle; whole-payload arms run before merkle by default")
     command.add_argument("--interleave-payload-modes", action="store_true",
