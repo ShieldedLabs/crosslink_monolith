@@ -804,6 +804,7 @@ impl Network {
         let mut max_frame = config.limits().max_frame_bytes().map_err(core_error)?
             .max(config.limits().max_outlined_bytes().map_err(core_error)?);
         if let PayloadMode::Merkle { leaf_bytes } = config.payload_mode {
+            payload::merkle_wire::encoded_byte_limit(config.max_body, config.max_outgoing).map_err(core_error)?;
             max_frame = max_frame.max(payload::merkle_wire::max_frame_bytes(config.max_body, leaf_bytes).map_err(core_error)?);
         }
         if config.max_connections == 0
@@ -1082,7 +1083,7 @@ impl Network {
                     })?;
                 }
                 Some(&wire::OUTLINED_TAG | &wire::BODY_REQUEST_TAG | &wire::BODY_RESPONSE_TAG | &wire::BODY_ACK_TAG
-                    | &payload::merkle_wire::HAVE | &payload::merkle_wire::WANT | &payload::merkle_wire::LEAF | &payload::merkle_wire::ACK) => {
+                    | &payload::merkle_wire::HAVE | &payload::merkle_wire::WANT | &payload::merkle_wire::LEAF) => {
                     let generation = peer.generation;
                     let Some(_permit) = self.incoming.try_acquire() else { continue };
                     outcome.processed = self.receive_payload(engine, config, events, member, generation, &bytes, now)?;
@@ -1154,7 +1155,7 @@ impl Network {
             match config.payload_mode {
                 PayloadMode::Inline => {},
                 PayloadMode::Outlined => self.payload.offer(engine, &self.peers, |connection| self.handle.send_backlog_bytes(connection, Channel::Bulk) == Some(0), config, now, &mut push, &mut payload_offered)?,
-                PayloadMode::Merkle { leaf_bytes } => self.payload.offer_merkle(engine, &self.peers, key, |connection| self.handle.send_backlog_bytes(connection, Channel::Bulk) == Some(0), config, now, &mut push, &mut payload_offered, leaf_bytes)?,
+                PayloadMode::Merkle { .. } => {}, // Shards reserve after all other staged offers below.
             }
             let status = engine.status();
             if status != self.last_status || now >= self.status_at {
@@ -1257,6 +1258,10 @@ impl Network {
                 else { push.send_bulk.push((peer.address.connection_key(), bytes)); }
                 handoff_permits.push(permit);
             }
+        }
+        if let (Some(engine), PayloadMode::Merkle { leaf_bytes }) = (engine, config.payload_mode) {
+            let capacity = [self.handle.send_capacity_snapshot(Channel::BftLive), self.handle.send_capacity_snapshot(Channel::Bulk)];
+            self.payload.offer_merkle(engine, &self.peers, key, &capacity, config, now, &mut push, &mut payload_offered, leaf_bytes)?;
         }
         if let (Some(metrics), Some(counts)) = (&config.metrics, offered) {
             metrics.offer(counts);
@@ -1594,18 +1599,17 @@ pub async fn run<B: AtomicBlockStore + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv6Addr, UdpSocket};
+    use std::net::Ipv6Addr;
 
     pub(super) fn fixture() -> (RuntimeConfig, SigningKey) {
         let identity = crate::stp::new_keypair_from_connect_magic1(
             crate::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b,
         )
         .unwrap();
-        let socket = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
-        let port = socket.local_addr().unwrap().port();
-        drop(socket);
+        // These tests inject synthetic sessions and never advertise our port.
+        // Let STP choose it atomically; probe/drop/rebind races other fixtures.
         let transport =
-            SharedTransport::new(vec![identity], port, None, (1_000_000, 512 * 1024, 8 << 20));
+            SharedTransport::new(vec![identity], 0, None, (1_000_000, 512 * 1024, 8 << 20));
         let roster = (1..=2)
             .map(|i| SortedRosterMember {
                 pub_key: PubKeyID(VerificationKeyBytes::from(&SigningKey::from([i; 32])).into()),

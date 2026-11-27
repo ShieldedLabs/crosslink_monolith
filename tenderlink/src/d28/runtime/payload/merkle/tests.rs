@@ -2,9 +2,10 @@ use super::*;
 use crate::d28::runtime::PayloadMode;
 use crate::d28::wire;
 use crate::d28::{
-    BodyTag, CertKind, Emission, Frame, Group, MemoryStore, Message, Proposal, ProposalContent,
-    Status, Step, Vote, VoteContent, VoteKind, Votes,
+    BodyTag, CertKind, Emission, Group, MemoryStore, ProposalContent, Status, Step, Vote,
+    VoteContent, VoteKind, Votes,
 };
+use std::collections::{HashMap, HashSet};
 
 struct Node {
     config: RuntimeConfig,
@@ -26,11 +27,12 @@ impl Node {
         let mut events = Events::default();
         engine.init(&c, 1, 0, &mut events).unwrap();
         engine.set_emission(Emission::Guided);
-        for (i, peer) in network.peers.iter_mut().enumerate() {
-            peer.member = Some(i as u32);
+        for (i, p) in network.peers.iter_mut().enumerate() {
+            p.member = Some(i as u32);
         }
         network.payload.sync(&engine, &network.peers, 0);
         network.payload.sync_merkle(&engine, &network.peers, 0);
+        network.payload.merkle.rng = ChaCha20Rng::from_seed([37; 32]);
         Self {
             config,
             key,
@@ -39,56 +41,110 @@ impl Node {
             network,
         }
     }
-    fn outline(&self, body: &[u8], round: u64) -> (Header, Vec<u8>) {
+    fn proposer(leaf_bytes: usize) -> Self {
+        let mut n = Self::new(leaf_bytes);
+        n.key = SigningKey::from([2; 32]); // height 1, round 0 proposer in this fixture
+        let c = n.engine.c().clone();
+        n.engine = Engine::boot(MemoryStore::default(), n.key.clone(), c.clone()).unwrap();
+        n.engine.init(&c, 1, 0, &mut n.events).unwrap();
+        n.engine.set_emission(Emission::Guided);
+        n
+    }
+    fn header(&self, body: &[u8], round: u64) -> Header {
         let c = self.engine.c();
         let signer = c.proposer(1, round) as u32;
-        let id = c.body_id(body);
-        let header = Header::sign(
+        Header::sign(
             c,
             &SigningKey::from([signer as u8 + 1; 32]),
             ProposalContent {
                 height: 1,
                 round,
                 valid_round: None,
-                id,
+                id: c.body_id(body),
                 signer,
             },
-        );
+        )
+    }
+    fn outline(&self, body: &[u8], round: u64) -> (Header, Vec<u8>) {
+        let h = self.header(body, round);
         let votes: Vec<_> = (0..2)
             .map(|signer| {
                 Vote::sign(
-                    c,
+                    self.engine.c(),
                     &SigningKey::from([signer as u8 + 1; 32]),
                     VoteContent {
                         height: 1,
                         round,
                         kind: VoteKind::Precommit,
-                        id: Some(id),
+                        id: Some(h.content.id),
                         signer,
                     },
                 )
             })
             .collect();
         let groups = [Group {
-            kind: CertKind::Decision { round, id },
+            kind: CertKind::Decision {
+                round,
+                id: h.content.id,
+            },
             votes: Votes::Dense(&votes),
         }];
         let bytes = wire::encode_outlined(
             Frame {
                 message: Message::Dec,
                 outer: None,
-                proposal: Some(Proposal {
-                    header: &header,
-                    body,
-                }),
+                proposal: Some(Proposal { header: &h, body }),
                 groups: &groups,
             },
-            Some(71),
-            c.hash(),
+            None,
+            self.engine.c().hash(),
             self.config.limits(),
         )
         .unwrap();
-        (header, bytes)
+        (h, bytes)
+    }
+    fn source(
+        &self,
+        body: &[u8],
+        header: Header,
+        leaves: Option<&[usize]>,
+    ) -> (Tree, Authentication, Vec<u8>) {
+        let PayloadMode::Merkle { leaf_bytes } = self.config.payload_mode else {
+            unreachable!()
+        };
+        let tree = Tree::new(body, leaf_bytes, self.config.max_body).unwrap();
+        let reference = Reference {
+            config: self.engine.c().hash(),
+            height: 1,
+            manifest: tree.manifest(header.content.id, header.identity(self.engine.c())),
+        };
+        let proposer = ProposerAttestation::sign(
+            &context(&self.engine, 1),
+            &reference.manifest,
+            &SigningKey::from([header.content.signer as u8 + 1; 32]),
+            self.config.max_body,
+        )
+        .unwrap();
+        let auth = Authentication {
+            header,
+            reference,
+            proposer,
+        };
+        let mut bitmap = Bitmap::new(&reference.manifest, self.config.max_body).unwrap();
+        for i in 0..tree.leaf_count() {
+            if leaves.is_none_or(|l| l.contains(&i)) {
+                bitmap.set(i).unwrap();
+            }
+        }
+        let have = codec::encode_have(
+            Have {
+                auth,
+                bitmap: bitmap.as_bytes(),
+            },
+            self.config.max_body,
+        )
+        .unwrap();
+        (tree, auth, have)
     }
     fn inject(&mut self, source: usize, bytes: Vec<u8>, now: u64) -> bool {
         let before = self
@@ -121,11 +177,39 @@ impl Node {
             .messages
             > before
     }
-    fn poll(&mut self, now: u64, ready: bool) -> (NetworkThreadPush, PayloadMetricsSnapshot) {
+    fn capacity(&self, bytes: u64, slots: usize, backlog: u64) -> [SendCapacitySnapshot; 2] {
+        std::array::from_fn(|lane| SendCapacitySnapshot {
+            backlog_bytes: if lane == 1 { backlog } else { 0 },
+            peers: self
+                .network
+                .peers
+                .iter()
+                .map(|p| {
+                    (
+                        p.address.connection_key(),
+                        SendCapacity {
+                            backlog_bytes: 0,
+                            available_bytes: bytes,
+                            outbox_slots: slots,
+                        },
+                    )
+                })
+                .collect(),
+        })
+    }
+    fn poll(&mut self, now: u64) -> (NetworkThreadPush, PayloadMetricsSnapshot) {
+        let capacity = self.capacity(u64::MAX, usize::MAX, 0);
+        self.poll_with(now, &capacity, NetworkThreadPush::default())
+    }
+    fn poll_with(
+        &mut self,
+        now: u64,
+        capacity: &[SendCapacitySnapshot; 2],
+        mut push: NetworkThreadPush,
+    ) -> (NetworkThreadPush, PayloadMetricsSnapshot) {
         self.network
             .payload
             .sync(&self.engine, &self.network.peers, now);
-        let mut push = NetworkThreadPush::default();
         let mut counts = PayloadMetricsSnapshot::default();
         let PayloadMode::Merkle { leaf_bytes } = self.config.payload_mode else {
             unreachable!()
@@ -136,7 +220,7 @@ impl Node {
                 &self.engine,
                 &self.network.peers,
                 &self.key,
-                |_| ready,
+                capacity,
                 &self.config,
                 now,
                 &mut push,
@@ -146,58 +230,47 @@ impl Node {
             .unwrap();
         (push, counts)
     }
-    fn advertise(
-        &self,
-        body: &[u8],
-        header: Header,
-        leaves: Option<&[usize]>,
-    ) -> (Tree, Reference, Vec<u8>) {
-        let PayloadMode::Merkle { leaf_bytes } = self.config.payload_mode else {
-            unreachable!()
-        };
-        let tree = Tree::new(body, leaf_bytes, self.config.max_body).unwrap();
-        let reference = Reference {
-            config: self.engine.c().hash(),
-            height: 1,
-            manifest: tree.manifest(header.content.id, header.identity(self.engine.c())),
-        };
-        let holder = HolderAttestation::sign(
-            &context(&self.engine, 1),
-            &reference.manifest,
-            &SigningKey::from([2; 32]),
-            self.config.max_body,
-        )
-        .unwrap();
-        let mut bitmap = Bitmap::new(&reference.manifest, self.config.max_body).unwrap();
-        for index in 0..tree.leaf_count() {
-            if leaves.is_none_or(|l| l.contains(&index)) {
-                bitmap.set(index).unwrap();
-            }
-        }
-        let bytes = codec::encode_have(
-            Have {
-                reference,
-                holder,
-                bitmap: bitmap.as_bytes(),
-            },
-            self.config.max_body,
-        )
-        .unwrap();
-        (tree, reference, bytes)
-    }
     fn wants(&self, push: &NetworkThreadPush) -> Vec<(usize, Want)> {
         push.send_unreliable
             .iter()
             .filter_map(|(address, bytes)| {
-                let want = codec::decode_want(bytes, self.config.max_body).ok()?;
-                let peer = self
+                let w = codec::decode_want(bytes, self.config.max_body).ok()?;
+                let pi = self
                     .network
                     .peers
                     .iter()
                     .position(|p| p.address.connection_key() == *address)?;
-                Some((peer, want))
+                Some((pi, w))
             })
             .collect()
+    }
+    fn retain_proposal(&mut self, body: &[u8], header: Header) {
+        self.engine
+            .receive(
+                Frame {
+                    message: Message::Ordinary,
+                    outer: None,
+                    proposal: Some(Proposal {
+                        header: &header,
+                        body,
+                    }),
+                    groups: &[],
+                },
+                Status::Indeterminate,
+                &mut self.events,
+            )
+            .unwrap();
+        assert!(
+            retained_body(
+                &self.engine,
+                BodyKey {
+                    config: self.engine.c().hash(),
+                    height: 1,
+                    id: header.content.id
+                }
+            )
+            .is_some()
+        );
     }
     fn finish(&mut self) {
         let d = self.engine.view().unwrap();
@@ -220,7 +293,7 @@ fn body(headers: usize) -> Vec<u8> {
         bft::{BftBlock, FatPointerToBftBlock},
         block::{BlockHash, BlockHeaderData},
     };
-    let template = BlockHeaderData {
+    let h = BlockHeaderData {
         version: 4,
         prev_block: BlockHash([9; 32]),
         merkle_root: [8; 32],
@@ -228,942 +301,657 @@ fn body(headers: usize) -> Vec<u8> {
         time: 1,
         bits: 0,
         nonce: [7; 32],
-        solution: vec![],
+        solution: vec![0; (headers / 1500).saturating_sub(1) * 144],
         fat_pointer_to_bft_block: FatPointerToBftBlock::null(),
     };
     BftBlock {
         version: 2,
         height: 1,
         previous_block_fat_ptr: FatPointerToBftBlock::null(),
-        headers: vec![template; headers],
+        headers: vec![h; headers.min(1500)],
         slashforks: vec![],
         do_not_include_until_bc_height: 0,
     }
     .zcash_serialize_to_vec()
     .unwrap()
 }
-fn packet(tree: &Tree, body: &[u8], want: Want, leaf: u32) -> Vec<u8> {
+fn packet(tree: &Tree, body: &[u8], auth: Authentication, index: u32) -> Vec<u8> {
     codec::encode_leaf(
-        want.ticket,
-        leaf,
-        &body[tree.layout().leaf_range(leaf as usize).unwrap()],
-        &tree.proof(leaf as usize).unwrap(),
+        auth,
+        index,
+        &body[tree.layout().leaf_range(index as usize).unwrap()],
+        &tree.proof(index as usize).unwrap(),
         body.len(),
     )
     .unwrap()
 }
-#[test]
-fn header_first_and_roster_authenticated_relayed_holder_before_allocation() {
-    let mut node = Node::new(32768);
-    let body = body(400);
-    let (header, outline) = node.outline(&body, 0);
-    let (_, reference, have) = node.advertise(&body, header, None);
-    assert!(!node.inject(0, have.clone(), 0));
-    let unknown = Want {
-        ticket: Ticket {
-            reference,
-            generation: 9,
-            token: 1,
-        },
-        indices: [0; WINDOW],
-        count: 1,
-    };
-    assert!(!node.inject(
-        0,
-        codec::encode_want(unknown, node.config.max_body).unwrap(),
-        0
-    ));
-    assert!(node.network.payload.merkle.peers[0].requested.is_none());
-    node.poll(1, true);
-    assert!(node.network.payload.merkle.assemblies.is_empty());
-    assert!(node.inject(0, outline, 2));
-    let mut wrong_holder = have.clone();
-    wrong_holder[150] ^= 1;
-    assert!(!node.inject(0, wrong_holder, 3));
-    // Source member 0 relays member 1's attestation: verify the roster key of
-    // the original holder, NOT the authenticated STP sender's different key.
-    assert!(node.inject(0, have, 4));
-    let (push, counts) = node.poll(5, true);
-    assert!(!node.wants(&push).is_empty());
-    assert!(counts.leaf_requests > 0);
-    assert_eq!(node.network.payload.merkle.assemblies.len(), 1);
-    assert!(node.engine.view().unwrap().pending.is_none());
+fn total(push: &NetworkThreadPush) -> usize {
+    [&push.send_bulk, &push.send_unreliable, &push.send_bft_live]
+        .into_iter()
+        .flatten()
+        .map(|(_, b)| b.len())
+        .sum()
 }
 #[test]
-fn complete_all_leaf_geometries_preserves_normal_host_validation_gate() {
-    for leaf_bytes in [32768, 102400, 262144, 1048576] {
-        let mut node = Node::new(leaf_bytes);
-        let body = body(500);
-        let (header, outline) = node.outline(&body, 0);
-        let (tree, _, have) = node.advertise(&body, header, None);
-        assert!(node.inject(0, outline, 0));
-        assert!(node.inject(0, have, 1));
-        let (push, _) = node.poll(2, true);
-        for (peer, want) in node.wants(&push) {
-            for &index in want.indices() {
-                assert!(node.inject(peer, packet(&tree, &body, want, index), 3));
-            }
-        }
-        assert!(node.network.payload.pending.is_empty());
-        assert!(node.network.payload.merkle.assemblies.is_empty());
-        let snapshot = node.config.metrics.as_ref().unwrap().snapshot().payload;
-        assert_eq!(snapshot.verified_leaf_bytes, body.len() as u64);
-        assert_eq!(snapshot.assembly_completions, 1);
-        node.finish();
+fn independent_shuffled_push_discovers_without_outline_and_keeps_normal_host_gate() {
+    let mut n = Node::new(102400);
+    let b = body(3000);
+    let h = n.header(&b, 0);
+    let (tree, auth, _) = n.source(&b, h, None);
+    let mut order: Vec<_> = (0..tree.leaf_count() as u32).collect();
+    order.shuffle(&mut ChaCha20Rng::from_seed([15; 32]));
+    assert!(order.len() > 1);
+    for (i, leaf) in order.iter().enumerate() {
+        assert!(n.inject(0, packet(&tree, &b, auth, *leaf), i as u64));
     }
-}
-#[test]
-fn disjoint_multi_source_windows_and_partial_onward_relay() {
-    let mut node = Node::new(32768);
-    let body = body(3500);
-    let (header, outline) = node.outline(&body, 0);
-    let (tree, reference, have) = node.advertise(&body, header, None);
-    assert!(node.inject(0, outline, 0));
-    assert!(node.inject(0, have.clone(), 1));
-    assert!(node.inject(1, have, 1));
-    let (push, counts) = node.poll(2, true);
-    let wants = node.wants(&push);
-    assert_eq!(wants.len(), 2);
-    assert_eq!(counts.leaf_requests, 16);
-    assert!(
-        wants[0]
-            .1
-            .indices()
-            .iter()
-            .all(|i| !wants[1].1.indices().contains(i))
+    assert!(n.network.payload.pending.is_empty());
+    assert_eq!(
+        n.network.payload.merkle.body(auth.reference.key()),
+        Some(b.as_slice())
     );
-    for &(peer, want) in &wants {
-        assert!(node.inject(peer, packet(&tree, &body, want, want.indices[0]), 3));
-    }
-    let assembly = &node.network.payload.merkle.assemblies[0];
-    assert_eq!(assembly.tree.bitmap().count(), 2);
-    assert_eq!(assembly.body.len(), body.len());
-    assert!(node.engine.view().unwrap().pending.is_none());
-    let leaf = wants[0].1.indices[0];
-    let onward = Want {
-        ticket: Ticket {
-            reference,
-            generation: 888,
-            token: 12,
-        },
-        indices: [leaf, 0, 0, 0, 0, 0, 0, 0],
-        count: 1,
-    };
-    assert!(node.inject(
-        1,
-        codec::encode_want(onward, node.config.max_body).unwrap(),
-        4
-    ));
-    let (push, counts) = node.poll(102, true);
-    assert_eq!(counts.leaf_responses, 1);
-    assert_eq!(counts.duplicate_payload_bytes, 0);
-    assert!(counts.availability_bytes > 2); // full framing/signature, not bitmap bytes
-    let forwarded = codec::decode_leaf(&push.send_bulk[0].1, node.config.max_body).unwrap();
-    let (proof, count) = forwarded.proof_array();
-    crate::d28::merkle::verify_leaf(
-        &reference.manifest,
-        leaf as usize,
-        forwarded.data,
-        &proof[..count],
-        node.config.max_body,
+    let d = n.engine.view().unwrap();
+    let slot = d.slot.unwrap();
+    assert_eq!(d.statuses[slot.index], Status::Indeterminate);
+    let old_identity = slot.header;
+    let (fresh, outline) = n.outline(&b, 1);
+    assert!(n.inject(1, outline, 100));
+    let d = n.engine.view().unwrap();
+    let fresh_slot = d.pending.unwrap().proposal;
+    assert_eq!(n.engine.storage().header(fresh_slot.index), Some(&fresh));
+    assert_ne!(fresh_slot.header, old_identity);
+    assert_eq!(d.statuses[fresh_slot.index], Status::Indeterminate);
+    n.finish();
+}
+#[test]
+fn authentication_and_index_tampering_rejected_before_ownership_allocation() {
+    let mut n = Node::new(32768);
+    let b = body(700);
+    let (tree, auth, _) = n.source(&b, n.header(&b, 0), None);
+    let mut wrong = auth;
+    wrong.proposer = ProposerAttestation::sign(
+        &context(&n.engine, 1),
+        &auth.reference.manifest,
+        &SigningKey::from([1; 32]),
+        n.config.max_body,
     )
     .unwrap();
-    assert_eq!(
-        node.network.payload.merkle.assemblies[0]
-            .tree
-            .bitmap()
-            .count(),
-        2
-    );
-    let bitmap = node.network.payload.merkle.assemblies[0]
-        .tree
-        .bitmap()
-        .as_bytes()
-        .to_vec();
-    let expires = node.network.payload.merkle.assemblies[0].expires;
-    let duplicate = packet(&tree, &body, wants[0].1, leaf);
-    assert!(node.inject(wants[0].0, duplicate, 103));
-    assert_eq!(
-        node.network.payload.merkle.assemblies[0]
-            .tree
-            .bitmap()
-            .as_bytes(),
-        bitmap
-    );
-    assert_eq!(node.network.payload.merkle.assemblies[0].expires, expires);
-    let mut corrupt = packet(&tree, &body, wants[0].1, wants[0].1.indices[1]);
-    *corrupt.last_mut().unwrap() ^= 1;
-    assert!(!node.inject(wants[0].0, corrupt, 104));
-    assert_eq!(
-        node.network.payload.merkle.assemblies[0]
-            .tree
-            .bitmap()
-            .as_bytes(),
-        bitmap
-    );
+    assert!(!n.inject(0, packet(&tree, &b, wrong, 0), 0));
+    let mut bad = packet(&tree, &b, auth, 0);
+    bad[2..6].copy_from_slice(&1u32.to_le_bytes());
+    assert!(!n.inject(0, bad, 1));
+    let mut bad = packet(&tree, &b, auth, 0);
+    *bad.last_mut().unwrap() ^= 1;
+    assert!(!n.inject(0, bad, 2));
+    let mut wrong = auth;
+    wrong.reference.config[0] ^= 1;
+    assert!(!n.inject(0, packet(&tree, &b, wrong, 0), 3));
+    assert!(n.network.payload.merkle.owned.is_empty());
+    assert!(n.inject(0, packet(&tree, &b, auth, 1), 4)); // sender need not be proposer
+    assert_eq!(n.network.payload.merkle.owned[0].bitmap().count(), 1);
 }
 #[test]
-fn missing_only_retry_rotates_source_and_accepts_late_existing_leaf() {
-    let mut node = Node::new(32768);
-    node.config.max_requests = 1;
-    let body = body(1800);
-    let (header, outline) = node.outline(&body, 0);
-    let (tree, _, have) = node.advertise(&body, header, None);
-    node.inject(0, outline, 0);
-    node.inject(0, have.clone(), 1);
-    node.inject(1, have, 1);
-    let (push, _) = node.poll(2, true);
-    let (first_peer, first) = node.wants(&push)[0];
-    for &index in first.indices().iter().filter(|&&i| i != first.indices[3]) {
-        assert!(node.inject(first_peer, packet(&tree, &body, first, index), 3));
+fn every_geometry_duplicate_drop_reorder_and_no_ack_needed() {
+    for size in [32768, 102400, 262144, 1048576] {
+        let mut n = Node::new(size);
+        let b = body(3000);
+        let (h, outline) = n.outline(&b, 0);
+        let (tree, auth, have) = n.source(&b, h, None);
+        assert!(n.inject(0, outline, 0));
+        assert!(n.inject(0, have.clone(), 1));
+        assert!(n.inject(1, have, 1));
+        for leaf in (1..tree.leaf_count()).rev() {
+            assert!(n.inject(0, packet(&tree, &b, auth, leaf as u32), 2));
+            assert!(n.inject(1, packet(&tree, &b, auth, leaf as u32), 3));
+        }
+        let (early, _) = n.poll(100);
+        assert!(n.wants(&early).is_empty()); // initial progress grace
+        let (repair, counts) = n.poll(300);
+        assert_eq!(counts.leaf_requests, 1);
+        let wants = n.wants(&repair);
+        assert_eq!(wants.len(), 1);
+        assert_eq!(wants[0].1.indices(), &[0]);
+        assert!(n.inject(wants[0].0, packet(&tree, &b, auth, 0), 301));
+        let (push, _) = n.poll(302);
+        assert!(push.send_bulk.is_empty()); // non-proposer never broadcasts
+        assert!(
+            push.send_unreliable
+                .iter()
+                .all(|(_, b)| matches!(b[0], codec::HAVE | codec::WANT))
+        );
+        assert!(!n.inject(0, vec![0xBA, 2], 303));
+        let m = n.config.metrics.as_ref().unwrap().snapshot().payload;
+        assert_eq!(m.verified_leaf_bytes, b.len() as u64);
+        assert_eq!(m.assembly_completions, 1);
+        n.finish();
     }
-    let (waiting, _) = node.poll(4, true);
-    assert!(node.wants(&waiting).is_empty());
-    let (push, counts) = node.poll(node.config.request_timeout + 3, true);
-    let (second_peer, second) = node.wants(&push)[0];
-    assert_ne!(first_peer, second_peer);
-    assert!(second.indices().contains(&first.indices[3]));
-    assert!(
-        second
-            .indices()
-            .iter()
-            .all(|i| !first.indices().contains(i) || *i == first.indices[3])
-    );
-    assert_eq!(counts.leaf_requests as usize, tree.leaf_count() - 7);
-    assert!(node.inject(
-        first_peer,
-        packet(&tree, &body, first, first.indices[3]),
-        node.config.request_timeout + 4
-    ));
-    for &index in second.indices().iter().filter(|&&i| i != first.indices[3]) {
-        assert!(node.inject(
-            second_peer,
-            packet(&tree, &body, second, index),
-            node.config.request_timeout + 5
+}
+#[test]
+fn nonresponsive_advertiser_does_not_pin_body_and_late_shards_remain_useful() {
+    let mut n = Node::new(102400);
+    let b = body(3000);
+    let (h, outline) = n.outline(&b, 0);
+    let (tree, auth, have) = n.source(&b, h, None);
+    assert!(n.inject(0, outline, 0));
+    assert!(n.inject(0, have.clone(), 1));
+    assert!(n.inject(1, have, 1));
+    let (first, _) = n.poll(201);
+    let mut missing = HashMap::new();
+    for (peer, w) in n.wants(&first) {
+        for &i in w.indices() {
+            missing.insert(i, peer);
+            if peer == 1 {
+                assert!(n.inject(1, packet(&tree, &b, auth, i), 202));
+            }
+        }
+    }
+    assert!(missing.values().any(|&p| p == 0));
+    let (early, _) = n.poll(220);
+    assert!(n.wants(&early).is_empty());
+    let (retry, _) = n.poll(702);
+    for (peer, w) in n.wants(&retry) {
+        for &i in w.indices() {
+            assert_eq!(missing[&i], 0);
+            assert_eq!(peer, 1);
+            assert!(n.inject(peer, packet(&tree, &b, auth, i), 703));
+        }
+    }
+    assert!(n.network.payload.merkle.owned[0].complete);
+    // Unsolicited old replies need no request token/ACK fence and are idempotent.
+    assert!(n.inject(0, packet(&tree, &b, auth, 0), 704));
+    n.finish();
+}
+#[test]
+fn unrelated_trickle_progress_cannot_postpone_an_existing_leaf_retry() {
+    let mut n = Node::new(32768);
+    let b = body(3000);
+    let (tree, auth, have) = n.source(&b, n.header(&b, 0), None);
+    assert!(n.inject(0, have.clone(), 0));
+    assert!(n.inject(1, have, 0));
+    let (first, _) = n.poll(200);
+    let (source, w) = n.wants(&first).into_iter().next().unwrap();
+    let missing = w.indices()[0];
+    let mut retries = Vec::new();
+    let mut others = (0..tree.leaf_count() as u32).filter(|&i| i != missing);
+    for now in [300, 400, 500, 600, 700] {
+        assert!(n.inject(0, packet(&tree, &b, auth, others.next().unwrap()), now));
+        let (p, _) = n.poll(now);
+        for (pi, w) in n.wants(&p) {
+            if w.indices().contains(&missing) {
+                retries.push((now, pi));
+            }
+        }
+    }
+    assert!(!retries.is_empty());
+    assert!(retries[0].0 <= 700);
+    assert_ne!(retries[0].1, source);
+    assert!(retries.windows(2).all(|w| w[1].0 - w[0].0 >= RETRY_MIN_MS));
+}
+#[test]
+fn verified_partial_relay_preserves_original_proposer_proof_and_never_pushes() {
+    let mut n = Node::new(32768);
+    let b = body(1500);
+    let (tree, auth, _) = n.source(&b, n.header(&b, 0), None);
+    assert!(n.inject(0, packet(&tree, &b, auth, 2), 0));
+    let (p, _) = n.poll(1);
+    assert!(p.send_bulk.is_empty());
+    let want = Want::single(auth.reference, 2);
+    assert!(n.inject(1, codec::encode_want(want, n.config.max_body).unwrap(), 2));
+    let (p, m) = n.poll(3);
+    assert_eq!(p.send_bulk.len(), 1);
+    assert_eq!(m.leaf_responses, 1);
+    let leaf = codec::decode_leaf(&p.send_bulk[0].1, n.config.max_body).unwrap();
+    assert_eq!(leaf.auth, auth);
+    assert_eq!(leaf.index, 2);
+    let (proof, count) = leaf.proof_array();
+    verify_leaf(
+        &auth.reference.manifest,
+        2,
+        leaf.data,
+        &proof[..count],
+        n.config.max_body,
+    )
+    .unwrap();
+    assert_eq!(m.payload_bytes, leaf.data.len() as u64);
+    assert_eq!(m.leaf_proof_bytes, (count * 32) as u64);
+    assert_eq!(m.offered_data.bytes, p.send_bulk[0].1.len() as u64);
+    let (p, _) = n.poll(4);
+    assert!(p.send_bulk.is_empty()); // local work released immediately, no repeat
+}
+#[test]
+fn proposer_initial_pass_covers_all_peers_without_replacement_or_receipts() {
+    let mut n = Node::proposer(32768);
+    let b = body(5000);
+    let h = n.header(&b, 0);
+    n.retain_proposal(&b, h);
+    let count = Tree::new(&b, 32768, n.config.max_body)
+        .unwrap()
+        .leaf_count();
+    let mut seen: HashMap<_, Vec<_>> = HashMap::new();
+    for tick in 0..20 {
+        let (push, m) = n.poll(tick * 10);
+        assert_eq!(m.leaf_responses, push.send_bulk.len() as u64);
+        for (peer, bytes) in push.send_bulk {
+            let leaf = codec::decode_leaf(&bytes, n.config.max_body).unwrap();
+            assert!(!seen.entry(peer).or_default().contains(&leaf.index));
+            seen.entry(peer).or_default().push(leaf.index);
+        }
+    }
+    assert_eq!(seen.len(), 2);
+    for order in seen.values() {
+        assert_eq!(order.len(), count);
+        assert_ne!(order, &(0..count as u32).collect::<Vec<_>>());
+    }
+    assert!(n.poll(1000).0.send_bulk.is_empty());
+}
+#[test]
+fn repeated_old_pulls_cannot_starve_initial_coverage() {
+    let mut n = Node::proposer(32768);
+    let b = body(5000);
+    let h = n.header(&b, 0);
+    n.retain_proposal(&b, h);
+    let (tree, auth, _) = n.source(&b, h, None);
+    let mut seen = HashSet::new();
+    for tick in 0..30 {
+        if tick != 0 {
+            let mut want = Want::single(auth.reference, 0);
+            for i in 1..tree.leaf_count().min(MAX_WANT) {
+                want.add(i as u32);
+            }
+            assert!(n.inject(
+                0,
+                codec::encode_want(want, n.config.max_body).unwrap(),
+                tick * 10
+            ));
+        }
+        let (push, _) = n.poll(tick * 10 + 1);
+        for (peer, bytes) in push.send_bulk {
+            if peer == n.network.peers[0].address.connection_key() {
+                seen.insert(codec::decode_leaf(&bytes, n.config.max_body).unwrap().index);
+            }
+        }
+    }
+    assert_eq!(seen.len(), tree.leaf_count());
+}
+#[test]
+fn global_encoded_budget_is_fixed_across_geometries_counts_pending_and_non_bft_backlog() {
+    let mut limits = HashSet::new();
+    for leaf_bytes in [32768, 102400, 262144, 1048576] {
+        let mut n = Node::proposer(leaf_bytes);
+        let b = body(3000);
+        let h = n.header(&b, 0);
+        n.retain_proposal(&b, h);
+        let limit = codec::encoded_byte_limit(n.config.max_body, n.config.max_outgoing).unwrap();
+        limits.insert(limit);
+        let existing = 1234;
+        let capacity = n.capacity(limit as u64, 2, (limit - 200_000) as u64);
+        let mut staged = NetworkThreadPush::default();
+        staged.send_bulk.push((
+            n.network.peers[0].address.connection_key(),
+            vec![0; existing],
         ));
+        let (push, _) = n.poll_with(0, &capacity, staged);
+        assert!(total(&push) + limit - 200_000 <= limit);
+        for peer in &n.network.peers {
+            assert!(
+                push.send_bulk
+                    .iter()
+                    .filter(|(p, _)| *p == peer.address.connection_key())
+                    .count()
+                    <= 2
+            );
+        }
+        let blocked = n.capacity(u64::MAX, usize::MAX, limit as u64); // includes Base-only peer work in total
+        assert!(
+            n.poll_with(1, &blocked, NetworkThreadPush::default())
+                .0
+                .send_bulk
+                .is_empty()
+        );
+        assert!(
+            n.network
+                .payload
+                .merkle
+                .peers
+                .iter()
+                .any(|p| !p.bodies[0].pushed.complete())
+        );
     }
-    node.finish();
+    assert_eq!(limits.len(), 1);
 }
 #[test]
-fn invalid_attested_root_cannot_pass_final_keyed_hash_and_releases_attempt() {
-    let mut node = Node::new(32768);
-    let body = body(0);
-    let (header, outline) = node.outline(&body, 0);
-    let mut wrong = body.clone();
-    wrong[0] ^= 1;
-    let (bad_tree, bad_reference, bad_have) = node.advertise(&wrong, header, None);
-    let (good_tree, _, good_have) = node.advertise(&body, header, None);
-    node.inject(0, outline, 0);
-    node.inject(0, bad_have.clone(), 1);
-    node.inject(1, good_have, 1);
-    let (push, _) = node.poll(2, true);
-    let (peer, want) = node.wants(&push)[0];
-    assert_eq!(want.ticket.reference, bad_reference);
-    assert!(!node.inject(peer, packet(&bad_tree, &wrong, want, 0), 3));
-    assert!(node.network.payload.merkle.assemblies.is_empty());
-    assert!(node.engine.view().unwrap().pending.is_none());
-    assert_eq!(
-        node.config
+fn full_size_leaf_outgoing_one_and_nonzero_backlog_still_admits() {
+    let mut n = Node::proposer(1048576);
+    n.config.max_outgoing = 1;
+    let b = vec![19; 1 << 20]; // synthetic sender fixture for the exact size boundary
+    let (tree, auth, _) = n.source(&b, n.header(&b, 0), None);
+    let ai = n
+        .network
+        .payload
+        .merkle
+        .admit(auth, &[], &n.config, 0)
+        .unwrap()
+        .unwrap();
+    let mut bitmap = Bitmap::new(&auth.reference.manifest, n.config.max_body).unwrap();
+    bitmap.set(0).unwrap();
+    let a = &mut n.network.payload.merkle.owned[ai];
+    a.inventory = Inventory::Full(tree, bitmap);
+    a.complete = true;
+    a.body = b;
+    a.local_proposer = true;
+    let capacity = n.capacity(u64::MAX, usize::MAX, 100);
+    let (push, _) = n.poll_with(0, &capacity, NetworkThreadPush::default());
+    assert_eq!(push.send_bulk.len(), 1);
+    assert!(total(&push) + 100 <= codec::encoded_byte_limit(n.config.max_body, 1).unwrap());
+}
+#[test]
+fn partial_and_complete_ownership_survive_expiry_round_rebind_and_fresh_host_tags() {
+    let mut n = Node::new(32768);
+    let b = body(1500);
+    let (h, outline) = n.outline(&b, 0);
+    let (tree, auth, _) = n.source(&b, h, None);
+    assert!(n.inject(0, outline, 0));
+    assert!(n.inject(0, packet(&tree, &b, auth, 0), 1));
+    let expires = n.network.payload.pending[0].expires;
+    n.poll(expires + 1);
+    assert!(n.network.payload.pending.is_empty());
+    assert_eq!(n.network.payload.merkle.owned[0].bitmap().count(), 1);
+    let (fresh, outline) = n.outline(&b, 1);
+    let (_, new_auth, have) = n.source(&b, fresh, None);
+    assert!(n.inject(1, outline, expires + 2));
+    assert!(n.inject(1, have, expires + 3));
+    assert_eq!(n.network.payload.merkle.owned[0].auth, new_auth);
+    for i in 1..tree.leaf_count() {
+        assert!(n.inject(0, packet(&tree, &b, auth, i as u32), expires + 4));
+    }
+    assert_eq!(n.network.payload.merkle.owned.len(), 1);
+    let d = n.engine.view().unwrap();
+    let slot = d.pending.unwrap().proposal;
+    assert_eq!(n.engine.storage().header(slot.index), Some(&fresh));
+    assert_eq!(d.statuses[slot.index], Status::Indeterminate);
+    let old_tag = BodyTag {
+        height: 1,
+        header: slot.header,
+        generation: d.body_generations[slot.index],
+    };
+    let (_, outline) = n.outline(&b, 2);
+    assert!(n.inject(1, outline, expires + 5));
+    let d = n.engine.view().unwrap();
+    let slot = d.pending.unwrap().proposal;
+    // Core deliberately keeps the first pinned DEC. Cache reuse must not
+    // override that rule or mark its existing Host tag Valid.
+    assert_eq!(n.engine.storage().header(slot.index), Some(&fresh));
+    assert_eq!(slot.header, old_tag.header);
+    assert_eq!(d.statuses[slot.index], Status::Indeterminate);
+    assert!(
+        n.config
             .metrics
             .as_ref()
             .unwrap()
             .snapshot()
             .payload
-            .assembly_completions,
-        0
+            .body_cache_hits
+            >= 1
     );
-    assert!(!node.inject(0, bad_have, 4));
-    let (push, _) = node.poll(5, true);
-    let (peer, want) = node.wants(&push)[0];
-    assert_eq!(peer, 1);
-    assert!(node.inject(peer, packet(&good_tree, &body, want, 0), 6));
-    node.finish();
+    n.finish();
 }
 #[test]
-fn canonical_height_and_encoding_gate_rejects_even_matching_keyed_hash() {
-    for malformed in [false, true] {
-        let mut node = Node::new(32768);
-        let mut bytes = if malformed {
-            body(0)
-        } else {
-            crate::d28::runtime::tests::body(2)
-        };
-        if malformed {
-            bytes.push(0);
-        }
-        let (header, outline) = node.outline(&bytes, 0);
-        let (tree, _, have) = node.advertise(&bytes, header, None);
-        node.inject(0, outline, 0);
-        node.inject(0, have, 1);
-        let (push, _) = node.poll(2, true);
-        let (peer, want) = node.wants(&push)[0];
-        assert!(!node.inject(peer, packet(&tree, &bytes, want, 0), 3));
-        assert!(node.engine.view().unwrap().pending.is_none());
-        assert!(node.network.payload.merkle.assemblies.is_empty());
+fn rebind_clears_old_proposer_push_authority_and_cached_have_completes_fresh_header() {
+    let mut n = Node::proposer(32768);
+    let b = body(1500);
+    let h = n.header(&b, 0);
+    n.retain_proposal(&b, h);
+    n.poll(0);
+    assert!(n.network.payload.merkle.owned[0].local_proposer);
+    let fresh = n.header(&b, 1);
+    let (_, auth, have) = n.source(&b, fresh, None);
+    assert!(n.inject(0, have, 1));
+    assert_eq!(n.network.payload.merkle.owned[0].auth, auth);
+    assert!(!n.network.payload.merkle.owned[0].local_proposer);
+    n.poll(2);
+    assert!(!n.network.payload.merkle.owned[0].local_proposer); // old core header cannot downgrade
+    let (_, _, old_have) = n.source(&b, h, None);
+    let delivered = n.network.payload.merkle.completed_deliveries;
+    assert_eq!(delivered, 1);
+    for now in 3..20 {
+        assert!(n.inject(0, old_have.clone(), now));
+    }
+    assert_eq!(n.network.payload.merkle.completed_deliveries, delivered);
+}
+#[test]
+fn retained_background_source_cannot_evict_needed_partial_with_one_slot() {
+    let mut n = Node::proposer(32768);
+    n.config.max_requests = 1;
+    let a = body(200);
+    let ha = n.header(&a, 0);
+    n.retain_proposal(&a, ha);
+    n.poll(0);
+    let b = body(1500);
+    let (hb, outline) = n.outline(&b, 0);
+    let (tree, auth, _) = n.source(&b, hb, None);
+    assert!(n.inject(0, outline, 1));
+    for i in 0..tree.leaf_count() {
+        assert!(n.inject(0, packet(&tree, &b, auth, i as u32), 2 + i as u64));
+        n.poll(2 + i as u64);
+        assert_eq!(n.network.payload.merkle.owned.len(), 1);
+        assert_eq!(
+            n.network.payload.merkle.owned[0].auth.reference.key(),
+            auth.reference.key()
+        );
+        assert_eq!(n.network.payload.merkle.owned[0].bitmap().count(), i + 1);
     }
 }
 #[test]
-fn new_signed_header_never_reuses_old_validity_during_assembly() {
-    let mut node = Node::new(32768);
-    let body = body(400);
-    let (old, outline) = node.outline(&body, 0);
-    let (tree, _, have) = node.advertise(&body, old, None);
-    node.inject(0, outline, 0);
-    node.inject(0, have, 1);
-    let (push, _) = node.poll(2, true);
-    let (new, outline) = node.outline(&body, 3);
-    assert_ne!(old.identity(node.engine.c()), new.identity(node.engine.c()));
-    node.inject(0, outline, 3);
-    for (peer, want) in node.wants(&push) {
-        for &index in want.indices() {
-            assert!(node.inject(peer, packet(&tree, &body, want, index), 4));
-        }
-    }
-    let d = node.engine.view().unwrap();
-    let slot = d.pending.unwrap().proposal;
-    assert_eq!(node.engine.storage().header(slot.index), Some(&new));
-    node.finish();
+fn matching_partial_is_upgraded_in_place_when_core_has_local_body() {
+    let mut n = Node::proposer(32768);
+    let b = body(1500);
+    let h = n.header(&b, 0);
+    let (tree, auth, _) = n.source(&b, h, None);
+    assert!(n.inject(0, packet(&tree, &b, auth, 0), 0));
+    n.retain_proposal(&b, h);
+    n.poll(1);
+    assert_eq!(n.network.payload.merkle.owned.len(), 1);
+    assert!(n.network.payload.merkle.owned[0].complete);
 }
 #[test]
-fn reconnect_and_scope_retirement_fence_old_control_and_leaves() {
-    let mut node = Node::new(32768);
-    let body = body(400);
-    let (header, outline) = node.outline(&body, 0);
-    let (tree, _, have) = node.advertise(&body, header, None);
-    node.inject(0, outline.clone(), 0);
-    node.inject(0, have.clone(), 1);
-    let (push, _) = node.poll(2, true);
-    let (peer, want) = node.wants(&push)[0];
-    node.network.peers[peer].generation += 1;
-    assert!(!node.inject(peer, packet(&tree, &body, want, want.indices[0]), 3));
-    node.network.payload.clear();
+fn completed_cache_eviction_and_scope_retirement_are_bounded() {
+    let mut n = Node::new(32768);
+    n.config.max_requests = 1;
+    for headers in [50, 60, 70] {
+        let b = body(headers);
+        let (tree, auth, _) = n.source(&b, n.header(&b, 0), None);
+        assert!(n.inject(0, packet(&tree, &b, auth, 0), headers as u64));
+        assert_eq!(n.network.payload.merkle.owned.len(), 1);
+        assert_eq!(
+            n.network.payload.merkle.body(auth.reference.key()),
+            Some(b.as_slice())
+        );
+    }
+    let b = body(70);
+    let (tree, auth, _) = n.source(&b, n.header(&b, 0), None);
+    let c = n.engine.c().clone();
+    n.engine.init(&c, 2, 0, &mut n.events).unwrap();
+    assert!(!n.inject(0, packet(&tree, &b, auth, 0), 100));
+    assert!(n.network.payload.merkle.owned.is_empty());
+    n.network.reset_scope();
+    assert!(n.network.payload.merkle.peers.is_empty());
+}
+#[test]
+fn retired_connection_generation_cannot_allocate_but_current_session_can_relay_old_leaf() {
+    let mut n = Node::new(32768);
+    let b = body(400);
+    let (tree, auth, _) = n.source(&b, n.header(&b, 0), None);
+    let generation = n.network.peers[0].generation;
+    n.network.peers[0].generation += 1;
+    n.poll(0);
+    let bytes = packet(&tree, &b, auth, 0);
     assert!(
-        !node.inject(
-            peer,
-            codec::encode_ack(
-                Ack::single(want.ticket, want.indices[0]),
-                node.config.max_body
+        !n.network
+            .receive_merkle(
+                &mut n.engine,
+                &n.config,
+                &mut n.events,
+                0,
+                generation,
+                &bytes,
+                1
             )
-            .unwrap(),
-            4
-        )
-    );
-    assert!(!node.inject(peer, have, 4));
-    assert!(!node.inject(peer, packet(&tree, &body, want, want.indices[0]), 4));
-    assert!(node.network.payload.merkle.assemblies.is_empty());
-    assert!(node.inject(peer, outline, 5));
-    assert!(node.network.payload.merkle.assemblies.is_empty());
-}
-#[test]
-fn outgoing_window_credit_precedes_encoding_and_survives_new_tokens() {
-    let mut node = Node::new(32768);
-    node.config.max_outgoing = 1;
-    let body = body(500);
-    let (header, outline) = node.outline(&body, 0);
-    let decoded = wire::decode_outlined(&outline, node.config.limits()).unwrap();
-    decoded
-        .with_body(&body, |frame| {
-            complete(
-                &mut node.engine,
-                frame,
-                &mut node.events,
-                &mut node.network.conflicts,
-                &node.config,
-            )
-        })
-        .unwrap();
-    let (_, reference, _) = node.advertise(&body, header, None);
-    node.poll(0, true); // build/cache the retained tree once
-    let want = Want {
-        ticket: Ticket {
-            reference,
-            generation: 99,
-            token: 1,
-        },
-        indices: [0, 1, 0, 0, 0, 0, 0, 0],
-        count: 2,
-    };
-    node.inject(
-        0,
-        codec::encode_want(want, node.config.max_body).unwrap(),
-        1,
-    );
-    let (blocked, counts) = node.poll(2, false);
-    assert!(blocked.send_bulk.is_empty());
-    assert_eq!(counts.payload_bytes, 0);
-    assert!(node.network.payload.merkle.peers[0].lease.is_none());
-    let (push, counts) = node.poll(3, true);
-    assert_eq!(push.send_bulk.len(), 2);
-    assert_eq!(counts.duplicate_payload_bytes, 0); // distinct leaves are not duplicates
-    let next = Want {
-        ticket: Ticket {
-            token: 2,
-            ..want.ticket
-        },
-        ..want
-    };
-    node.inject(
-        0,
-        codec::encode_want(next, node.config.max_body).unwrap(),
-        4,
-    );
-    node.inject(
-        0,
-        codec::encode_ack(Ack::single(want.ticket, 0), node.config.max_body).unwrap(),
-        4,
-    );
-    assert!(node.poll(5, true).0.send_bulk.is_empty());
-    assert!(node.inject(
-        0,
-        codec::encode_ack(Ack::single(want.ticket, 0), node.config.max_body).unwrap(),
-        5
-    ));
-    assert_eq!(node.network.payload.merkle.peers[0].lease.unwrap().mask, 2);
-    let mut cumulative = Ack::single(want.ticket, 1); // reordered cumulative receipt
-    assert!(cumulative.add(0));
-    assert!(node.inject(
-        0,
-        codec::encode_ack(cumulative, node.config.max_body).unwrap(),
-        6,
-    ));
-    assert!(node.network.payload.merkle.peers[0].requested.is_some());
-    assert!(node.poll(7, false).0.send_bulk.is_empty());
-    let (push, counts) = node.poll(8, true);
-    assert_eq!(push.send_bulk.len(), 2);
-    assert_eq!(counts.duplicate_payload_bytes, counts.payload_bytes);
-    assert!(!node.inject(
-        0,
-        codec::encode_ack(Ack::single(want.ticket, 0), node.config.max_body).unwrap(),
-        9
-    ));
-    assert_eq!(
-        node.network.payload.merkle.peers[0]
-            .lease
             .unwrap()
-            .want
-            .ticket,
-        next.ticket
     );
-    assert_eq!(node.network.payload.merkle.cached.len(), 1);
+    assert!(n.network.payload.merkle.owned.is_empty());
+    assert!(n.inject(0, bytes, 2));
 }
-
 #[test]
-fn unrelated_cached_haves_cannot_overwrite_missing_body_discovery() {
-    let mut node = Node::new(32768);
-    let missing = body(400);
-    let held = body(0);
-    let (held_header, held_outline) = node.outline(&held, 0);
-    wire::decode_outlined(&held_outline, node.config.limits())
-        .unwrap()
-        .with_body(&held, |f| {
-            complete(
-                &mut node.engine,
-                f,
-                &mut node.events,
-                &mut node.network.conflicts,
-                &node.config,
-            )
-        })
-        .unwrap();
-    let (header, outline) = node.outline(&missing, 3);
-    let (_, reference, have_missing) = node.advertise(&missing, header, None);
-    let (_, _, have_held) = node.advertise(&held, held_header, None);
-    node.inject(0, outline, 0);
-    // Model a single receive batch: matching HAVE then unrelated held HAVE.
-    let address = node.network.peers[0].address.connection_key();
-    node.network
-        .pull
-        .received_unreliable_messages
-        .push_back((address, have_missing));
-    assert!(node.inject(0, have_held, 1));
-    let (push, _) = node.poll(2, true);
-    assert_eq!(node.wants(&push)[0].1.ticket.reference, reference);
-    assert_eq!(node.network.payload.merkle.assemblies.len(), 1);
-}
-
-#[test]
-fn partial_header_rebinding_preserves_verified_leaves_and_keeps_requesting() {
-    let mut node = Node::new(32768);
-    node.config.max_requests = 1;
-    let body = body(1800);
-    let (old, outline) = node.outline(&body, 0);
-    let (tree, _, have) = node.advertise(&body, old, None);
-    node.inject(0, outline, 0);
-    node.inject(0, have, 1);
-    let (push, _) = node.poll(2, true);
-    let (peer, first) = node.wants(&push)[0];
-    for &index in first.indices() {
-        node.inject(peer, packet(&tree, &body, first, index), 3);
-    }
-    assert_eq!(
-        node.network.payload.merkle.assemblies[0]
-            .tree
-            .bitmap()
-            .count(),
-        8
-    );
-    let body_address = node.network.payload.merkle.assemblies[0].body.as_ptr();
-    let (new, outline) = node.outline(&body, 3);
-    let (_, reference, new_have) = node.advertise(&body, new, None);
-    node.inject(peer, outline, 4);
-    node.inject(peer, new_have, 5);
-    assert_eq!(
-        node.network.payload.merkle.assemblies[0].body.as_ptr(),
-        body_address
-    );
-    assert_eq!(
-        node.network.payload.merkle.assemblies[0]
-            .tree
-            .bitmap()
-            .count(),
-        8
-    );
-    let (push, _) = node.poll(6, true);
-    let (peer, second) = node.wants(&push)[0];
-    assert_eq!(second.ticket.reference, reference);
-    assert!(
-        second
-            .indices()
-            .iter()
-            .all(|i| !first.indices().contains(i))
-    );
-    for &index in second.indices() {
-        assert!(node.inject(peer, packet(&tree, &body, second, index), 7));
-    }
-    let slot = node.engine.view().unwrap().pending.unwrap().proposal;
-    assert_eq!(node.engine.storage().header(slot.index), Some(&new));
-    node.finish();
-}
-
-#[test]
-fn orphan_wrong_root_yields_to_another_holder_before_pending_expiry() {
-    for corrupt in [false, true] {
-        let mut node = Node::new(32768);
-        let body = body(400);
-        let (header, outline) = node.outline(&body, 0);
-        let mut wrong = body.clone();
-        wrong[0] ^= 1;
-        let (bad_tree, _, bad_have) = node.advertise(&wrong, header, None);
-        let (_, good_reference, good_have) = node.advertise(&body, header, None);
-        node.inject(0, outline, 0);
-        node.inject(0, bad_have, 1);
-        let (push, _) = node.poll(2, true);
-        let (peer, want) = node.wants(&push)[0];
-        let expiry = node.network.payload.pending[0].expires;
-        node.inject(1, good_have, 3);
-        if corrupt {
-            let mut bytes = packet(&bad_tree, &wrong, want, 0);
-            *bytes.last_mut().unwrap() ^= 1;
-            assert!(!node.inject(peer, bytes, 4));
-        }
-        let at = if corrupt {
-            5
+fn wrong_body_identity_and_noncanonical_complete_content_never_gain_core_roles() {
+    for bad_hash in [false, true] {
+        let mut n = Node::new(32768);
+        let b = vec![7; 50000];
+        let h = if bad_hash {
+            n.header(&body(400), 0)
         } else {
-            node.config.request_timeout + 3
+            n.header(&b, 0)
         };
-        let (push, _) = node.poll(at, true);
-        assert!(at < expiry);
-        assert_eq!(node.wants(&push)[0].1.ticket.reference, good_reference);
-        assert_eq!(node.network.payload.merkle.assemblies.len(), 1);
-        assert_eq!(node.network.payload.pending[0].expires, expiry);
+        let (tree, auth, _) = n.source(&b, h, None);
+        for i in 0..tree.leaf_count() - 1 {
+            assert!(n.inject(0, packet(&tree, &b, auth, i as u32), 0));
+        }
+        assert!(!n.inject(0, packet(&tree, &b, auth, tree.leaf_count() as u32 - 1), 1));
+        assert!(n.network.payload.merkle.owned.is_empty());
+        assert!(n.engine.view().unwrap().slot.is_none());
     }
 }
 
 #[test]
-fn one_source_rotates_pending_interests_without_periodic_cursor_aliasing() {
-    let mut node = Node::new(32768);
-    node.network.peers.truncate(1);
-    let a = body(400);
-    let b = body(500);
-    let (ah, outline_a) = node.outline(&a, 0);
-    let (bh, outline_b) = node.outline(&b, 1);
-    let (_, ar, have_a) = node.advertise(&a, ah, None);
-    let (_, br, have_b) = node.advertise(&b, bh, None);
-    node.inject(0, outline_a, 0);
-    node.inject(0, outline_b, 0);
-    node.inject(0, have_a.clone(), 1);
-    node.inject(0, have_b.clone(), 1);
-    let (push, _) = node.poll(2, true);
-    assert_eq!(node.wants(&push)[0].1.ticket.reference, ar);
-    // Four offer ticks before the next periodic availability batch used to
-    // return a modulo-two unconditional cursor to the same starving priority.
-    for time in [25, 50, 75, 100] {
-        node.poll(time, true);
-    }
-    node.inject(0, have_a, 101);
-    node.inject(0, have_b, 101);
-    node.poll(102, true);
-    assert_eq!(node.network.payload.merkle.assemblies.len(), 2);
-    let (push, _) = node.poll(node.config.request_timeout + 3, true);
-    assert_eq!(node.wants(&push)[0].1.ticket.reference, br);
-    assert_eq!(
-        node.network
+fn staged_message_cap_and_preexisting_over_budget_work_refuse_new_allocations() {
+    let mut n = Node::proposer(102400);
+    let b = body(1500);
+    let h = n.header(&b, 0);
+    n.retain_proposal(&b, h);
+    let cap = n.capacity(u64::MAX, usize::MAX, 0);
+    let address = n.network.peers[0].address.connection_key();
+    let mut staged = NetworkThreadPush::default();
+    staged.send_unreliable = (0..MAX_PUSH_MESSAGES).map(|_| (address, vec![1])).collect();
+    let (push, counts) = n.poll_with(0, &cap, staged);
+    assert!(push.send_bulk.is_empty());
+    assert_eq!(push.send_unreliable.len(), MAX_PUSH_MESSAGES);
+    assert_eq!(counts, PayloadMetricsSnapshot::default());
+    let limit = codec::encoded_byte_limit(n.config.max_body, n.config.max_outgoing).unwrap();
+    let mut staged = NetworkThreadPush::default();
+    staged.send_bulk.push((address, vec![0; limit + 1]));
+    let (push, counts) = n.poll_with(1, &cap, staged);
+    assert_eq!(push.send_bulk.len(), 1);
+    assert!(push.send_unreliable.is_empty());
+    assert_eq!(counts, PayloadMetricsSnapshot::default());
+    assert!(
+        n.network
             .payload
             .merkle
             .peers
             .iter()
-            .filter(|p| p.receive.is_some())
-            .count(),
-        1
+            .all(|p| p.bodies[0].pushed.count() == 0)
     );
-    assert_eq!(
-        node.network.payload.merkle.assemblies.len(),
-        node.config.max_requests
-    );
-    let (_, extra) = node.outline(&body(600), 2);
-    node.inject(0, extra, node.config.request_timeout + 4);
-    assert_eq!(node.network.payload.pending.len(), node.config.max_requests);
 }
 
 #[test]
-fn expiry_is_not_renewed_by_reordered_duplicates_or_have_refresh() {
-    let mut node = Node::new(32768);
-    let body = body(500);
-    let (header, outline) = node.outline(&body, 0);
-    let (tree, _, have) = node.advertise(&body, header, None);
-    node.inject(0, outline.clone(), 0);
-    node.inject(0, have.clone(), 1);
-    let (push, _) = node.poll(2, true);
-    let (peer, want) = node.wants(&push)[0];
-    let leaf = *want.indices().last().unwrap();
-    node.inject(peer, packet(&tree, &body, want, leaf), 3);
-    let expiry = node.network.payload.merkle.assemblies[0].expires;
-    let retry = node.network.payload.merkle.assemblies[0].retry_at;
-    node.inject(peer, packet(&tree, &body, want, leaf), 4);
-    node.inject(peer, have, 5);
-    node.inject(peer, outline, 6);
-    assert_eq!(node.network.payload.merkle.assemblies[0].expires, expiry);
-    assert_eq!(node.network.payload.merkle.assemblies[0].retry_at, retry);
-    node.poll(expiry, true);
-    assert!(node.network.payload.pending.is_empty());
-    assert!(node.network.payload.merkle.assemblies.is_empty());
-    assert!(!node.inject(peer, packet(&tree, &body, want, leaf), expiry + 1));
-    assert!(node.network.payload.merkle.assemblies.is_empty());
-}
-
-#[test]
-fn global_send_window_limit_survives_timeout_and_independent_stp_backlog() {
-    let mut node = Node::new(32768);
-    node.config.max_outgoing = 1;
-    let body = body(500);
-    let (header, outline) = node.outline(&body, 0);
-    wire::decode_outlined(&outline, node.config.limits())
+fn trusted_config_change_retires_owners_even_at_same_synthetic_height() {
+    let mut n = Node::new(32768);
+    let b = body(400);
+    let (tree, auth, _) = n.source(&b, n.header(&b, 0), None);
+    assert!(n.inject(0, packet(&tree, &b, auth, 0), 0));
+    let c = n
+        .config
+        .chain_config(&n.config.initial_roster, [42; 32])
         .unwrap()
-        .with_body(&body, |f| {
-            complete(
-                &mut node.engine,
-                f,
-                &mut node.events,
-                &mut node.network.conflicts,
-                &node.config,
-            )
+        .unwrap();
+    assert_ne!(c.hash(), n.engine.c().hash());
+    n.engine = Engine::boot(MemoryStore::default(), n.key.clone(), c.clone()).unwrap();
+    n.engine.init(&c, 1, 0, &mut n.events).unwrap();
+    n.poll(1);
+    assert!(n.network.payload.merkle.owned.is_empty());
+    assert!(!n.inject(0, packet(&tree, &b, auth, 1), 2));
+}
+
+#[test]
+fn newer_local_source_replaces_expired_partial_but_same_round_refresh_does_not_churn() {
+    let mut n = Node::proposer(32768);
+    for count in [400, 500] {
+        let b = body(count);
+        let (h, outline) = n.outline(&b, 0);
+        let (tree, auth, _) = n.source(&b, h, None);
+        assert!(n.inject(0, outline, 0));
+        assert!(n.inject(0, packet(&tree, &b, auth, 0), 1));
+    }
+    assert_eq!(n.network.payload.merkle.owned.len(), n.config.max_requests);
+    let expiry = n
+        .network
+        .payload
+        .pending
+        .iter()
+        .map(|p| p.expires)
+        .max()
+        .unwrap();
+    n.poll(expiry + 1);
+    assert!(n.network.payload.pending.is_empty());
+    let old_keys: Vec<_> = n
+        .network
+        .payload
+        .merkle
+        .owned
+        .iter()
+        .map(|a| a.auth.reference.key())
+        .collect();
+    let same = body(600);
+    let same_header = n.header(&same, 0);
+    n.retain_proposal(&same, same_header);
+    assert!(n.poll(expiry + 2).0.send_bulk.is_empty());
+    assert_eq!(
+        n.network
+            .payload
+            .merkle
+            .owned
+            .iter()
+            .map(|a| a.auth.reference.key())
+            .collect::<Vec<_>>(),
+        old_keys
+    );
+    let newer = body(700);
+    let (header, outline) = n.outline(&newer, 2);
+    let metadata = wire::decode_outlined(&outline, n.config.limits()).unwrap();
+    metadata
+        .with_body(&newer, |frame| {
+            n.engine
+                .receive(frame, Status::Indeterminate, &mut n.events)
         })
         .unwrap();
-    let (_, reference, _) = node.advertise(&body, header, None);
-    node.poll(0, true);
-    for peer in 0..2 {
-        let want = Want {
-            ticket: Ticket {
-                reference,
-                generation: 17 + peer as u64,
-                token: 1,
-            },
-            indices: [0, 1, 0, 0, 0, 0, 0, 0],
-            count: 2,
-        };
-        assert!(node.inject(
-            peer,
-            codec::encode_want(want, node.config.max_body).unwrap(),
-            1
-        ));
-    }
-    let (push, _) = node.poll(2, true);
-    assert_eq!(push.send_bulk.len(), 2);
+    let (first, _) = n.poll(expiry + 3);
+    assert!(!first.send_bulk.is_empty());
+    assert_eq!(n.network.payload.merkle.owned.len(), n.config.max_requests);
     assert!(
-        push.send_bulk
-            .iter()
-            .all(|(address, _)| *address == node.network.peers[0].address.connection_key())
-    );
-    assert_eq!(
-        node.network
+        n.network
             .payload
             .merkle
-            .peers
+            .owned
             .iter()
-            .filter(|p| p.lease.is_some())
-            .count(),
-        1
+            .any(|a| a.auth.header == header && a.complete)
     );
-    assert!(node.poll(3, true).0.send_bulk.is_empty());
-    let at = node.config.request_timeout + 3;
-    assert!(node.poll(at, false).0.send_bulk.is_empty());
-    assert!(
-        node.network
+    let before = n
+        .network
+        .payload
+        .merkle
+        .owned
+        .iter()
+        .map(|a| a.auth.reference.key())
+        .collect::<Vec<_>>();
+    for now in expiry + 4..expiry + 9 {
+        assert!(n.poll(now).0.send_bulk.is_empty());
+    }
+    assert_eq!(
+        n.network
             .payload
             .merkle
-            .peers
+            .owned
             .iter()
-            .all(|p| p.lease.is_none())
+            .map(|a| a.auth.reference.key())
+            .collect::<Vec<_>>(),
+        before
     );
-    let (push, _) = node.poll(at + 1, true);
-    assert_eq!(push.send_bulk.len(), 2);
-    assert!(
-        push.send_bulk
-            .iter()
-            .all(|(address, _)| *address == node.network.peers[1].address.connection_key())
-    );
-    assert_eq!(
-        node.network
-            .payload
-            .merkle
-            .peers
-            .iter()
-            .filter(|p| p.lease.is_some())
-            .count(),
-        1
-    );
-}
-
-#[test]
-fn receive_budget_alternates_control_and_leaf_classes_behind_bulk() {
-    let mut node = Node::new(32768);
-    let body = body(500);
-    let (header, outline) = node.outline(&body, 0);
-    let (tree, reference, have) = node.advertise(&body, header, None);
-    node.inject(0, outline, 0);
-    node.inject(0, have, 1);
-    let (push, _) = node.poll(2, true);
-    let (peer, want) = node.wants(&push)[0];
-    node.config.max_receive_per_tick = 1;
-    node.network.peers[peer].next_control = true;
-    let connection = node.network.peers[peer].address.connection_key();
-    node.network
-        .pull
-        .received_unreliable_messages
-        .push_back((connection, packet(&tree, &body, want, 0)));
-    let control = Want {
-        ticket: Ticket {
-            reference,
-            generation: 88,
-            token: 123,
-        },
-        indices: [0; WINDOW],
-        count: 1,
-    };
-    assert!(node.inject(
-        peer,
-        codec::encode_want(control, node.config.max_body).unwrap(),
-        3
-    ));
-    assert_eq!(node.network.payload.merkle.peers[peer].remote_token, 123);
-    assert_eq!(
-        node.network.payload.merkle.assemblies[0]
-            .tree
-            .bitmap()
-            .count(),
-        0
-    );
-    let newer = Want {
-        ticket: Ticket {
-            token: 124,
-            ..control.ticket
-        },
-        ..control
-    };
-    node.network.pull.received_unreliable_messages.push_back((
-        connection,
-        codec::encode_want(newer, node.config.max_body).unwrap(),
-    ));
-    assert!(node.inject(peer, packet(&tree, &body, want, 0), 4));
-    assert_eq!(node.network.payload.merkle.peers[peer].remote_token, 123);
-    assert_eq!(
-        node.network.payload.merkle.assemblies[0]
-            .tree
-            .bitmap()
-            .count(),
-        1
-    );
-    assert_eq!(node.network.incoming.in_use(), 0);
-}
-
-#[test]
-fn dropped_window_receipt_repairs_credit_before_request_timeout() {
-    let mut sender = Node::new(32768);
-    let mut receiver = Node::new(32768);
-    sender.config.max_outgoing = 1;
-    receiver.config.max_requests = 1;
-    let body = body(1800); // more than one eight-leaf window
-    let (_, outline) = sender.outline(&body, 0);
-    wire::decode_outlined(&outline, sender.config.limits())
-        .unwrap()
-        .with_body(&body, |f| {
-            complete(
-                &mut sender.engine,
-                f,
-                &mut sender.events,
-                &mut sender.network.conflicts,
-                &sender.config,
-            )
-        })
-        .unwrap();
-    assert!(receiver.inject(0, outline, 0));
-    let (advertised, _) = sender.poll(0, true);
-    let have = advertised
-        .send_unreliable
-        .iter()
-        .find(|(_, b)| b.first() == Some(&codec::HAVE))
-        .unwrap()
-        .1
-        .clone();
-    assert!(receiver.inject(0, have, 1));
-    let (request, _) = receiver.poll(2, true);
-    let want = request
-        .send_unreliable
-        .iter()
-        .find(|(_, b)| b.first() == Some(&codec::WANT))
-        .unwrap()
-        .1
-        .clone();
-    assert!(sender.inject(0, want, 3));
-    let (sent, _) = sender.poll(4, true);
-    assert_eq!(sent.send_bulk.len(), WINDOW);
-    let old_leaf = sent.send_bulk[0].1.clone();
-    for (_, leaf) in sent.send_bulk {
-        assert!(receiver.inject(0, leaf, 5));
-    }
-    let (reply, _) = receiver.poll(6, true);
-    let ack_frames: Vec<_> = reply
-        .send_unreliable
-        .iter()
-        .filter(|(_, b)| b.first() == Some(&codec::ACK))
-        .collect();
-    assert_eq!(
-        ack_frames.len(),
-        1,
-        "one cumulative frame, not eight control messages"
-    );
-    assert_eq!(
-        codec::decode_ack(&ack_frames[0].1, receiver.config.max_body)
-            .unwrap()
-            .count as usize,
-        WINDOW
-    );
-    let mut lost_receipt = false;
-    for (_, bytes) in reply.send_unreliable {
-        if bytes.first() == Some(&codec::ACK) && !lost_receipt {
-            lost_receipt = true;
-            continue; // a single ordinary best-effort control loss
-        }
-        if matches!(bytes.first(), Some(&codec::ACK | &codec::WANT)) {
-            sender.inject(0, bytes, 7);
-        }
-    }
-    assert!(lost_receipt);
-    assert!(sender.poll(8, true).0.send_bulk.is_empty());
-    // Repeated HAVE or a newer WANT is NOT an ACK. The exact old receipt must
-    // repair its credit on the existing status cadence, not after a 2/10s lease.
-    let (refresh, _) = receiver.poll(106, true);
-    let receipts: Vec<_> = refresh
-        .send_unreliable
-        .into_iter()
-        .filter(|(_, b)| b.first() == Some(&codec::ACK))
-        .collect();
-    assert!(
-        !receipts.is_empty(),
-        "lost transfer receipt has no bounded refresh"
-    );
-    for (_, ack) in receipts {
-        sender.inject(0, ack, 107);
-    }
-    let (next, _) = sender.poll(108, true);
-    assert!(
-        !next.send_bulk.is_empty(),
-        "old unacknowledged window still blocks the newer request"
-    );
-    assert!(108 < sender.config.request_timeout);
-    let next_leaf = next.send_bulk[0].1.clone();
-    let newer_token = codec::decode_leaf(&next_leaf, receiver.config.max_body)
-        .unwrap()
-        .ticket
-        .token;
-    assert!(receiver.inject(0, next_leaf, 109));
-    let current = receiver.network.payload.merkle.peers[0].receipt.unwrap();
-    assert_eq!(current.ack.ticket.token, newer_token);
-    // The previous token still names useful verified data, but cannot evict the
-    // newer cumulative receipt (nor renew its bounded retry lifetime).
-    receiver.inject(0, old_leaf.clone(), 110);
-    let after = receiver.network.payload.merkle.peers[0].receipt.unwrap();
-    assert_eq!(after.ack, current.ack);
-    assert_eq!(after.until, current.until);
-    let (expired, _) = receiver.poll(after.until, true);
-    assert!(
-        expired
-            .send_unreliable
-            .iter()
-            .all(|(_, b)| b.first() != Some(&codec::ACK))
-    );
-    receiver.inject(0, old_leaf, after.until + 1);
-    let watermark = receiver.network.payload.merkle.peers[0].receipt.unwrap();
-    assert_eq!(watermark.ack, current.ack);
-    assert_eq!(watermark.until, current.until);
-    assert!(
-        receiver
-            .poll(after.until + 2, true)
-            .0
-            .send_unreliable
-            .iter()
-            .all(|(_, b)| b.first() != Some(&codec::ACK))
-    );
-    receiver.network.payload.clear();
-    assert!(receiver.network.payload.merkle.peers.is_empty());
-    assert!(
-        receiver
-            .poll(after.until + 3, true)
-            .0
-            .send_unreliable
-            .iter()
-            .all(|(_, b)| b.first() != Some(&codec::ACK))
-    );
-}
-
-#[test]
-fn receipt_merges_reordered_leaves_without_duplicate_refresh_or_expiry_extension() {
-    let mut node = Node::new(32768);
-    node.config.max_requests = 1;
-    let body = body(1800);
-    let (header, outline) = node.outline(&body, 0);
-    let (tree, _, have) = node.advertise(&body, header, None);
-    node.inject(0, outline, 0);
-    node.inject(0, have, 1);
-    let (request, _) = node.poll(2, true);
-    let (peer, want) = node.wants(&request)[0];
-    assert_eq!(want.count as usize, WINDOW);
-    let mut until = None;
-    for (offset, index) in [7, 0, 7, 3].into_iter().enumerate() {
-        let now = 3 + offset as u64 * 2;
-        assert!(node.inject(peer, packet(&tree, &body, want, index), now));
-        let receipt = node.network.payload.merkle.peers[peer].receipt.unwrap();
-        assert_eq!(receipt.until, *until.get_or_insert(receipt.until));
-        let (reply, _) = node.poll(now + 1, true);
-        let acks: Vec<_> = reply
-            .send_unreliable
-            .iter()
-            .filter(|(_, b)| b.first() == Some(&codec::ACK))
-            .map(|(_, b)| codec::decode_ack(b, node.config.max_body).unwrap())
-            .collect();
-        if offset == 2 {
-            assert!(
-                acks.is_empty(),
-                "duplicate leaf must not advance periodic receipt refresh"
-            );
-        } else {
-            assert_eq!(acks.len(), 1);
-            let expected: &[u32] = match offset {
-                0 => &[7],
-                1 => &[7, 0],
-                _ => &[7, 0, 3],
-            };
-            assert_eq!(acks[0].indices(), expected);
-        }
-    }
 }
