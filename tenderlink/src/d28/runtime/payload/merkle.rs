@@ -7,7 +7,7 @@
 use super::merkle_wire::{self as codec, Authentication, Have, MAX_WANT, Reference, Want};
 use super::{
     BodyKey, Engine, Events, Network, NetworkThreadPush, PayloadMetricsSnapshot, PayloadState,
-    Peer, Pending, RuntimeConfig, Storage, canonical_body, complete, core_error, retained_body,
+    Peer, Pending, RuntimeConfig, Storage, VerifiedBody, complete_verified, core_error, retained_body,
 };
 use crate::d28::{
     Frame, Header, Message, Proposal,
@@ -257,8 +257,10 @@ impl Inventory {
 struct Owned {
     auth: Authentication,
     inventory: Inventory,
+    // Mutable assembly only; its allocation moves into verified on completion.
+    // A complete owner has no second body buffer or persistent temporary copy.
     body: Vec<u8>,
-    complete: bool,
+    verified: Option<VerifiedBody>,
     local_proposer: bool,
     retries: Vec<Retry>,
     repair_after: u64,
@@ -267,6 +269,12 @@ struct Owned {
 impl Owned {
     fn bitmap(&self) -> &Bitmap {
         self.inventory.bitmap()
+    }
+    fn complete(&self) -> bool {
+        self.verified.is_some()
+    }
+    fn bytes(&self) -> &[u8] {
+        self.verified.as_ref().map_or(self.body.as_slice(), VerifiedBody::bytes)
     }
 }
 pub(super) struct MerkleState {
@@ -298,11 +306,15 @@ impl MerkleState {
         self.peers.clear();
         self.owned.clear();
     }
-    pub(super) fn body(&self, key: BodyKey) -> Option<&[u8]> {
+    pub(super) fn verified(&self, key: BodyKey) -> Option<&VerifiedBody> {
         self.owned
             .iter()
-            .find(|a| a.auth.reference.key() == key && a.complete)
-            .map(|a| a.body.as_slice())
+            .find(|a| a.auth.reference.key() == key && a.complete())
+            .and_then(|a| a.verified.as_ref())
+    }
+    #[cfg(test)]
+    pub(super) fn body(&self, key: BodyKey) -> Option<&[u8]> {
+        self.verified(key).map(VerifiedBody::bytes)
     }
     pub(super) fn sync<S: Storage>(
         &mut self,
@@ -431,7 +443,7 @@ impl MerkleState {
             auth,
             inventory: Inventory::Empty(bitmap),
             body: Vec::new(),
-            complete: false,
+            verified: None,
             local_proposer: false,
             retries: vec![Retry::default(); count],
             repair_after: now.saturating_add(REPAIR_GRACE_MS),
@@ -463,7 +475,7 @@ impl MerkleState {
             if let Some(a) = self
                 .owned
                 .iter_mut()
-                .find(|a| a.auth.reference.key() == body_key && a.complete)
+                .find(|a| a.auth.reference.key() == body_key && a.complete())
             {
                 if a.auth.header == header || a.auth.header.content.round > header.content.round {
                     continue;
@@ -509,12 +521,38 @@ impl MerkleState {
                         .retain(|b| !same_payload(b.reference, reference));
                 }
             }
-            let tree = Tree::new(body, leaf_bytes, config.max_body).map_err(error)?;
+            // Detach the old partial before snapshotting a retained source: its
+            // assembly allocation is the candidate's body budget, not an extra B.
+            // On validation failure no emptied owner/bitmap can remain usable.
+            let old = matching.map(|i| self.owned.remove(i));
+            let old_reference = old.as_ref().map(|a| a.auth.reference);
+            let mut bytes = old.map_or_else(Vec::new, |a| a.body);
+            if bytes.capacity() < body.len() {
+                bytes = Vec::new(); // release the old allocation before growing
+            }
+            bytes.clear();
+            bytes.extend_from_slice(body);
+            let Some(verified) = VerifiedBody::new(
+                engine.c(), body_key, bytes, config.max_body,
+            ) else {
+                if let Some(old) = old_reference {
+                    for peer in &mut self.peers {
+                        peer.bodies.retain(|b| !same_payload(b.reference, old));
+                    }
+                }
+                continue;
+            };
+            let tree = Tree::new(verified.bytes(), leaf_bytes, config.max_body).map_err(error)?;
             let reference = Reference {
                 config: body_key.config,
                 height: body_key.height,
                 manifest: tree.manifest(body_key.id, header.identity(engine.c())),
             };
+            if let Some(old) = old_reference.filter(|old| !same_payload(*old, reference)) {
+                for peer in &mut self.peers {
+                    peer.bodies.retain(|b| !same_payload(b.reference, old));
+                }
+            }
             let proposer = ProposerAttestation::sign(
                 &context(engine, body_key.height),
                 &reference.manifest,
@@ -539,9 +577,8 @@ impl MerkleState {
                     proposer,
                 };
                 a.inventory = Inventory::Full(tree, bitmap);
-                a.body.clear();
-                a.body.extend_from_slice(body);
-                a.complete = true;
+                a.body = Vec::new();
+                a.verified = Some(verified);
                 a.local_proposer = true;
                 a.touched = now;
                 continue;
@@ -564,8 +601,8 @@ impl MerkleState {
                     proposer,
                 },
                 inventory: Inventory::Full(tree, bitmap),
-                body: body.to_vec(),
-                complete: true,
+                body: Vec::new(),
+                verified: Some(verified),
                 local_proposer: true,
                 retries,
                 repair_after: 0,
@@ -636,7 +673,7 @@ impl MerkleState {
         // receipt holds unrelated shards or the complete body behind a barrier.
         for oi in 0..owned_count {
             let ai = (self.interest_cursor + oi) % owned_count;
-            if self.owned[ai].complete {
+            if self.owned[ai].complete() {
                 continue;
             }
             let reference = self.owned[ai].auth.reference;
@@ -763,7 +800,7 @@ impl MerkleState {
                 .manifest
                 .validate(config.max_body)
                 .map_err(error)?;
-            let data = &a.body[layout.leaf_range(leaf).map_err(error)?];
+            let data = &a.bytes()[layout.leaf_range(leaf).map_err(error)?];
             let bytes = codec::encode_leaf(a.auth, leaf as u32, data, &proof, config.max_body)
                 .map_err(core_error)?;
             self.peers[pi].initial_turn = !self.peers[pi].initial_turn;
@@ -851,22 +888,24 @@ impl Network {
             .position(|p| p.key == key)
             .map(|i| self.payload.pending.remove(i));
         let a = &self.payload.merkle.owned[ai];
+        let body = a.verified.as_ref().expect("completed owner");
         if let Some(pending) = pending {
-            pending.evidence.with_body(&a.body, |frame| {
-                complete(engine, frame, events, &mut self.conflicts, config)
+            pending.evidence.with_body(body.bytes(), |frame| {
+                complete_verified(engine, frame, body, events, &mut self.conflicts, config)
             })
         } else {
-            complete(
+            complete_verified(
                 engine,
                 Frame {
                     message: Message::Ordinary,
                     outer: None,
                     proposal: Some(Proposal {
                         header: &a.auth.header,
-                        body: &a.body,
+                        body: body.bytes(),
                     }),
                     groups: &[],
                 },
+                body,
                 events,
                 &mut self.conflicts,
                 config,
@@ -1003,7 +1042,7 @@ impl Network {
                         bitmap,
                         until: now.saturating_add(config.status_ttl),
                     });
-                    if (rebound || interested) && self.payload.merkle.owned[ai].complete {
+                    if (rebound || interested) && self.payload.merkle.owned[ai].complete() {
                         return self.complete_merkle_owned(engine, config, events, ai);
                     }
                     return Ok(true);
@@ -1011,7 +1050,7 @@ impl Network {
                 let leaf = leaf.expect("leaf branch");
                 let a = &mut self.payload.merkle.owned[ai];
                 if a.bitmap().have(leaf.index as usize).map_err(error)? {
-                    if (rebound || interested) && a.complete {
+                    if (rebound || interested) && a.complete() {
                         return self.complete_merkle_owned(engine, config, events, ai);
                     }
                     return Ok(true);
@@ -1049,9 +1088,12 @@ impl Network {
                 if !a.bitmap().complete() {
                     return Ok(true);
                 }
-                if !canonical_body(&a.body, auth.reference.height, config.max_body)
-                    || engine.c().body_id(&a.body) != auth.reference.manifest.body_id
-                {
+                let Some(verified) = VerifiedBody::new(
+                    engine.c(),
+                    a.auth.reference.key(),
+                    std::mem::take(&mut a.body),
+                    config.max_body,
+                ) else {
                     let reference = a.auth.reference;
                     self.payload.merkle.owned.remove(ai);
                     for peer in &mut self.payload.merkle.peers {
@@ -1059,8 +1101,8 @@ impl Network {
                             .retain(|b| !same_payload(b.reference, reference));
                     }
                     return Ok(false);
-                }
-                a.complete = true;
+                };
+                a.verified = Some(verified);
                 if let Some(metrics) = &config.metrics {
                     super::saturating_add(&metrics.payload.assembly_completions, 1);
                 }

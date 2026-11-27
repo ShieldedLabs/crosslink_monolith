@@ -893,3 +893,39 @@ fn one_source_rotates_pending_interests_and_repairs_the_body_it_retains() {
     assert_eq!(receiver.engine.storage().body(slot.index), b);
     receiver.finish_validation();
 }
+
+#[test]
+fn retained_core_only_cache_hits_still_copy_and_fully_validate() {
+    use crate::d28::checked_body::hash_work;
+    let mut node = Node::new();
+    let payload = body(1);
+    let inline = node.inline(&payload);
+    let outline = node.outline(&payload);
+    assert!(node.inject(1, inline, 0));
+    let hashes = hash_work();
+    let canonical = CANONICAL_BYTES.with(std::cell::Cell::get);
+    assert!(node.inject(1, outline, 1));
+    assert_eq!(hash_work(), (hashes.0 + 1, hashes.1 + payload.len()));
+    assert_eq!(CANONICAL_BYTES.with(std::cell::Cell::get), canonical + payload.len());
+    assert_eq!(node.network.payload.pending.len(), 0);
+}
+
+#[test]
+fn canonical_wrapper_does_not_confuse_a_matching_hash_with_chain_encoding() {
+    let node = Node::new();
+    let c = node.engine.c();
+    for bytes in [body(2), vec![7; 100], {
+        let mut bytes = body(1);
+        bytes.push(0);
+        bytes
+    }] {
+        let key = BodyKey { config: c.hash(), height: 1, id: c.body_id(&bytes) };
+        assert!(VerifiedBody::new(c, key, bytes, node.config.max_body).is_none());
+    }
+    let bytes = body(1);
+    let key = BodyKey { config: c.hash(), height: 1, id: c.body_id(&bytes) };
+    assert!(VerifiedBody::new(c, key, bytes.clone(), bytes.len() - 1).is_none());
+    assert!(VerifiedBody::new(c, BodyKey { config: [0; 32], ..key }, bytes.clone(),
+        node.config.max_body).is_none());
+    assert!(VerifiedBody::new(c, key, bytes, node.config.max_body).is_some());
+}
