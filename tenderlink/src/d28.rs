@@ -1663,6 +1663,7 @@ pub mod wire;
 pub use atomic::AtomicBlockStore;
 mod checked_body;
 mod core;
+mod metrics;
 mod recovery;
 #[cfg(test)]
 mod tests;

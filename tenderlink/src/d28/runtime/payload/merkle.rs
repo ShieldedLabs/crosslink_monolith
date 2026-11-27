@@ -532,9 +532,9 @@ impl MerkleState {
             }
             bytes.clear();
             bytes.extend_from_slice(body);
-            let Some(verified) = VerifiedBody::new(
-                engine.c(), body_key, bytes, config.max_body,
-            ) else {
+            let Some(verified) = super::measure(config.metrics.as_ref().map(|m| &m.body_check), || {
+                VerifiedBody::new(engine.c(), body_key, bytes, config.max_body)
+            }) else {
                 if let Some(old) = old_reference {
                     for peer in &mut self.peers {
                         peer.bodies.retain(|b| !same_payload(b.reference, old));
@@ -1088,12 +1088,11 @@ impl Network {
                 if !a.bitmap().complete() {
                     return Ok(true);
                 }
-                let Some(verified) = VerifiedBody::new(
-                    engine.c(),
-                    a.auth.reference.key(),
-                    std::mem::take(&mut a.body),
-                    config.max_body,
-                ) else {
+                let Some(verified) = super::measure(config.metrics.as_ref().map(|m| &m.body_check), || {
+                    VerifiedBody::new(
+                        engine.c(), a.auth.reference.key(), std::mem::take(&mut a.body), config.max_body,
+                    )
+                }) else {
                     let reference = a.auth.reference;
                     self.payload.merkle.owned.remove(ai);
                     for peer in &mut self.payload.merkle.peers {

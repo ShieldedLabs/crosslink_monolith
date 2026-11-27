@@ -46,6 +46,9 @@ use std::{
 };
 use zcash_primitives::bft::{BftBlock, PubKeyID};
 
+use super::metrics::{AtomicWallTime, measure};
+pub use super::metrics::WallTimeSnapshot;
+
 mod payload;
 pub use payload::{PayloadMetricsSnapshot, PayloadMode};
 
@@ -99,6 +102,45 @@ pub struct OfferedMetrics {
     pub status_request_messages: u64,
 }
 
+/// Inclusive synchronous phase timings, not CPU time or disjoint costs. Receive
+/// includes payload/body/core work; exchange includes payload offers and service;
+/// Host poll includes callback polling and core completion. Core calls include
+/// their durable fences, and encode includes checksum. Do not sum these phases.
+/// Counts include failed attempts and no-op calls. Synchronous phases exclude
+/// runtime sleep; the explicitly named completed-callback latencies include waits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PhaseMetricsSnapshot {
+    pub network_receive: WallTimeSnapshot,
+    pub network_exchange: WallTimeSnapshot,
+    /// Only the synchronous ConsumerHandle::service call, not STP pump threads
+    /// or time spent waiting for delivery. Includes lock wait and failed calls.
+    pub transport_service: WallTimeSnapshot,
+    /// Outlined/Merkle handler, excluding ordinary inline frame handling.
+    pub payload_receive: WallTimeSnapshot,
+    /// Outlined/Merkle offer construction, including immutable body/tree work.
+    pub payload_offer: WallTimeSnapshot,
+    /// Runtime canonical-body checks, including configured content hashing when
+    /// constructing a VerifiedBody. Excludes leaf proof work and core-internal
+    /// ordinary-frame hashing (which is in core_receive).
+    pub body_check: WallTimeSnapshot,
+    pub host_schedule: WallTimeSnapshot,
+    /// One nonblocking poll of owned Host futures plus completion handling.
+    pub host_poll: WallTimeSnapshot,
+    /// Callback invocation through ready result, including waits BETWEEN polls.
+    /// Only completed callbacks count (None/Indeterminate included); cancelled
+    /// futures have no sample. Not active work; may cross sample/height windows.
+    pub host_propose_completed: WallTimeSnapshot,
+    /// Same semantics as host_propose_completed; includes own-body validation.
+    pub host_validate_completed: WallTimeSnapshot,
+    pub core_receive: WallTimeSnapshot,
+    pub core_timer: WallTimeSnapshot,
+    /// supply_proposal / validity after the trusted-tip completion fence.
+    pub core_host_completion: WallTimeSnapshot,
+    /// Explicit runtime checkpoint/publication opportunities (including clean or
+    /// not-yet-due calls), not internal core fences. Boot/INIT is not timed.
+    pub core_checkpoint: WallTimeSnapshot,
+}
+
 /// A cheap, nontransactional view of optional runtime counters.
 ///
 /// All counters saturate at `u64::MAX`, never wrap or reset. Each field is read
@@ -107,6 +149,8 @@ pub struct OfferedMetrics {
 /// runtimes using it; use a fresh object for a new measurement interval.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MetricsSnapshot {
+    pub phases: PhaseMetricsSnapshot,
+    pub durable: durable::MetricsSnapshot,
     pub offered: OfferedMetrics,
     pub payload: PayloadMetricsSnapshot,
     /// Raw BFT application inbox returned by transport service, before runtime
@@ -124,7 +168,8 @@ pub struct MetricsSnapshot {
     pub scheduler_budget_discarded: MessageCounts,
 }
 
-/// Opt-in observational counters. No timers, signatures or codec work are added.
+/// Opt-in observational counters. No protocol timers, signatures or codec work
+/// are added. Monotonic timing reads occur only when metrics are configured.
 ///
 /// Outgoing counts are recorded immediately before `ConsumerHandle::service`,
 /// even if that call fails. Incoming counts are recorded when service returns;
@@ -134,6 +179,21 @@ pub struct MetricsSnapshot {
 /// message has exactly one outcome, until counter saturation.
 #[derive(Debug, Default)]
 pub struct RuntimeMetrics {
+    durable: Arc<durable::Metrics>,
+    network_receive: AtomicWallTime,
+    network_exchange: AtomicWallTime,
+    transport_service: AtomicWallTime,
+    payload_receive: AtomicWallTime,
+    payload_offer: AtomicWallTime,
+    body_check: AtomicWallTime,
+    host_schedule: AtomicWallTime,
+    host_poll: AtomicWallTime,
+    host_propose_completed: AtomicWallTime,
+    host_validate_completed: AtomicWallTime,
+    core_receive: AtomicWallTime,
+    core_timer: AtomicWallTime,
+    core_host_completion: AtomicWallTime,
+    core_checkpoint: AtomicWallTime,
     payload: payload::AtomicPayloadMetrics,
     hello: AtomicMessageCounts,
     status: AtomicMessageCounts,
@@ -148,6 +208,23 @@ pub struct RuntimeMetrics {
 impl RuntimeMetrics {
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
+            phases: PhaseMetricsSnapshot {
+                network_receive: self.network_receive.snapshot(),
+                network_exchange: self.network_exchange.snapshot(),
+                transport_service: self.transport_service.snapshot(),
+                payload_receive: self.payload_receive.snapshot(),
+                payload_offer: self.payload_offer.snapshot(),
+                body_check: self.body_check.snapshot(),
+                host_schedule: self.host_schedule.snapshot(),
+                host_poll: self.host_poll.snapshot(),
+                host_propose_completed: self.host_propose_completed.snapshot(),
+                host_validate_completed: self.host_validate_completed.snapshot(),
+                core_receive: self.core_receive.snapshot(),
+                core_timer: self.core_timer.snapshot(),
+                core_host_completion: self.core_host_completion.snapshot(),
+                core_checkpoint: self.core_checkpoint.snapshot(),
+            },
+            durable: self.durable.snapshot(),
             payload: self.payload.snapshot(),
             offered: OfferedMetrics {
                 hello: self.hello.snapshot(),
@@ -429,6 +506,16 @@ fn status_of(status: TMStatus) -> Status {
         TMStatus::Indeterminate => Status::Indeterminate,
     }
 }
+// Completed callback latency includes pending intervals; cancellation records
+// nothing. The callback is invoked inside the supplied future, after this start.
+async fn observe_completion<T>(counter: Option<&AtomicWallTime>, work: impl Future<Output = T>) -> T {
+    let start = counter.map(|_| Instant::now());
+    let value = work.await;
+    if let (Some(counter), Some(start)) = (counter, start) {
+        counter.record(start.elapsed());
+    }
+    value
+}
 fn poll_work<T>(work: &mut Option<Work<T>>, cx: &mut Context<'_>) -> Option<T> {
     let ready = match work.as_mut()?.as_mut().poll(cx) {
         Poll::Ready(value) => Some(value),
@@ -503,11 +590,15 @@ impl HostWork {
         host: &HostCallbacks,
         events: &mut Events,
         now: u64,
-        max_body: usize,
+        config: &RuntimeConfig,
     ) -> io::Result<()> {
+        let _timer = config.metrics.as_ref().map(|m| m.host_schedule.start());
+        let max_body = config.max_body;
         // Host callbacks can act on retained proposals/decisions without going
         // through Sink; publish their dependencies before handing them out.
-        engine.publication_checkpoint().map_err(core_error)?;
+        measure(config.metrics.as_ref().map(|m| &m.core_checkpoint), || {
+            engine.publication_checkpoint()
+        }).map_err(core_error)?;
         let tag = engine.proposal_tag();
         if self
             .acquisition
@@ -520,14 +611,23 @@ impl HostWork {
             if let Some(tag) = tag {
                 let propose = host.propose.clone();
                 let validate = host.validate.clone();
+                let metrics = config.metrics.clone();
                 self.acquisition = Some(Acquisition {
                     tag,
                     work: Some(Box::pin(async move {
-                        let body = (propose.0)().await?;
-                        if !canonical_body(&body.0, tag.height, max_body) {
+                        let body = observe_completion(
+                            metrics.as_ref().map(|m| &m.host_propose_completed),
+                            async { (propose.0)().await },
+                        ).await?;
+                        if !measure(metrics.as_ref().map(|m| &m.body_check), || {
+                            canonical_body(&body.0, tag.height, max_body)
+                        }) {
                             return None;
                         }
-                        let (status, _) = (validate.0)(&body).await;
+                        let (status, _) = observe_completion(
+                            metrics.as_ref().map(|m| &m.host_validate_completed),
+                            async { (validate.0)(&body).await },
+                        ).await;
                         Some((body, status))
                     })),
                 });
@@ -564,7 +664,13 @@ impl HostWork {
                 validation.ready = false;
                 let validate = host.validate.clone();
                 let value = validation.value.clone();
-                validation.work = Some(Box::pin(async move { (validate.0)(&value).await }));
+                let metrics = config.metrics.clone();
+                validation.work = Some(Box::pin(async move {
+                    observe_completion(
+                        metrics.as_ref().map(|m| &m.host_validate_completed),
+                        async { (validate.0)(&value).await },
+                    ).await
+                }));
             }
         }
         events.retries = [None; 2];
@@ -593,6 +699,7 @@ impl HostWork {
         host: &HostCallbacks,
     ) -> io::Result<Option<HostTip>> {
         poll_fn(|cx| {
+            let _timer = config.metrics.as_ref().map(|m| m.host_poll.start());
             let result = (|| {
                 if let Some(acquire) = &mut self.acquisition {
                     if let Some(body) = poll_work(&mut acquire.work, cx) {
@@ -603,11 +710,9 @@ impl HostWork {
                         }
                         if engine.proposal_tag() == Some(acquire.tag) {
                             if let Some((body, status)) = body {
-                                tolerate_stale(engine.supply_proposal(
-                                    acquire.tag,
-                                    &body.0,
-                                    status_of(status),
-                                    events,
+                                tolerate_stale(measure(
+                                    config.metrics.as_ref().map(|m| &m.core_host_completion),
+                                    || engine.supply_proposal(acquire.tag, &body.0, status_of(status), events),
                                 ))?;
                             }
                         }
@@ -623,7 +728,10 @@ impl HostWork {
                         if let Some(tip) = completion_tip(engine, config, host)? {
                             return Ok(Some(tip));
                         }
-                        tolerate_stale(engine.validity(validation.tag, status_of(status), events))?;
+                        tolerate_stale(measure(
+                            config.metrics.as_ref().map(|m| &m.core_host_completion),
+                            || engine.validity(validation.tag, status_of(status), events),
+                        ))?;
                     }
                 }
                 let tip = poll_work(&mut self.decision, cx);
@@ -954,6 +1062,7 @@ impl Network {
         local: PubKeyID,
         now: u64,
     ) -> io::Result<()> {
+        let _timer = config.metrics.as_ref().map(|m| m.network_receive.start());
         self.payload.sync(engine, &self.peers, now);
         if matches!(config.payload_mode, PayloadMode::Merkle { .. }) {
             self.payload.sync_merkle(engine, &self.peers, now);
@@ -1117,10 +1226,13 @@ impl Network {
         events: &mut Events,
         now: u64,
     ) -> io::Result<()> {
+        let _timer = config.metrics.as_ref().map(|m| m.network_exchange.start());
         // Status, evidence and Merkle attestations read Engine directly. Do not
         // sign/offer them from uncommitted publication state after a failure.
         if let Some(engine) = engine.as_deref_mut() {
-            engine.publication_checkpoint().map_err(core_error)?;
+            measure(config.metrics.as_ref().map(|m| &m.core_checkpoint), || {
+                engine.publication_checkpoint()
+            }).map_err(core_error)?;
         }
         // Accumulate locally so a pre-handoff error never records an offer.
         let mut offered = config.metrics.as_ref().map(|_| OfferedMetrics::default());
@@ -1166,7 +1278,9 @@ impl Network {
             self.payload.sync(engine, &self.peers, now);
             match config.payload_mode {
                 PayloadMode::Inline => {},
-                PayloadMode::Outlined => self.payload.offer(engine, &self.peers, |connection| self.handle.send_backlog_bytes(connection, Channel::Bulk) == Some(0), config, now, &mut push, &mut payload_offered)?,
+                PayloadMode::Outlined => measure(config.metrics.as_ref().map(|m| &m.payload_offer), || {
+                    self.payload.offer(engine, &self.peers, |connection| self.handle.send_backlog_bytes(connection, Channel::Bulk) == Some(0), config, now, &mut push, &mut payload_offered)
+                })?,
                 PayloadMode::Merkle { .. } => {}, // Shards reserve after all other staged offers below.
             }
             let status = engine.status();
@@ -1273,16 +1387,17 @@ impl Network {
         }
         if let (Some(engine), PayloadMode::Merkle { leaf_bytes }) = (engine, config.payload_mode) {
             let capacity = [self.handle.send_capacity_snapshot(Channel::BftLive), self.handle.send_capacity_snapshot(Channel::Bulk)];
-            self.payload.offer_merkle(engine, &self.peers, key, &capacity, config, now, &mut push, &mut payload_offered, leaf_bytes)?;
+            measure(config.metrics.as_ref().map(|m| &m.payload_offer), || {
+                self.payload.offer_merkle(engine, &self.peers, key, &capacity, config, now, &mut push, &mut payload_offered, leaf_bytes)
+            })?;
         }
         if let (Some(metrics), Some(counts)) = (&config.metrics, offered) {
             metrics.offer(counts);
             metrics.payload.offer(payload_offered);
         }
-        self.pull = self
-            .handle
-            .service(push)
-            .ok_or_else(|| io::Error::other("D28 shared transport stopped"))?;
+        self.pull = measure(config.metrics.as_ref().map(|m| &m.transport_service), || {
+            self.handle.service(push)
+        }).ok_or_else(|| io::Error::other("D28 shared transport stopped"))?;
         // App buffers were MOVED, not cloned, into the separately bounded
         // transport owner. Keep permits through the handoff, not a fake ACK.
         drop(handoff_permits);
@@ -1431,6 +1546,9 @@ pub async fn run<B: AtomicBlockStore + Send + 'static>(
         )
         .map_err(core_error)?,
     );
+    if let Some(metrics) = &config.metrics {
+        store = store.map(|store| store.with_metrics(metrics.durable.clone()));
+    }
     let mut network = Network::new(&config)?;
     let mut engine: Option<Engine<durable::DurableStore<B>>> = None;
     let mut height = config.initial_height;
@@ -1461,7 +1579,9 @@ pub async fn run<B: AtomicBlockStore + Send + 'static>(
                     // Export pending/conflicting evidence with its OLD roster
                     // before trusted INIT retires the bounded height workspace.
                     if let Some(engine) = &mut engine {
-                        engine.publication_checkpoint().map_err(core_error)?;
+                        measure(config.metrics.as_ref().map(|m| &m.core_checkpoint), || {
+                            engine.publication_checkpoint()
+                        }).map_err(core_error)?;
                         (host.access.0)(
                             &snapshot(
                                 engine,
@@ -1588,19 +1708,23 @@ pub async fn run<B: AtomicBlockStore + Send + 'static>(
         }
         // Consume the elapsed interval before this tick's inputs can arm new
         // timers. Keep the tick-start timestamp so processing time is not lost.
-        engine
-            .elapse_coalesced(now.saturating_sub(last_tick), &mut events)
-            .map_err(core_error)?;
+        measure(config.metrics.as_ref().map(|m| &m.core_timer), || {
+            engine.elapse_coalesced(now.saturating_sub(last_tick), &mut events)
+        }).map_err(core_error)?;
         last_tick = now;
-        checkpoint_progress(engine, now, &mut checkpoint_at)?;
+        measure(config.metrics.as_ref().map(|m| &m.core_checkpoint), || {
+            checkpoint_progress(engine, now, &mut checkpoint_at)
+        })?;
         network.receive(engine, &config, &mut events, public_key, now)?;
-        work.schedule(engine, &host, &mut events, now, config.max_body)?;
+        work.schedule(engine, &host, &mut events, now, &config)?;
         acknowledged = work.poll(engine, &mut events, now, &config, &host).await?;
         if acknowledged.is_some() {
             continue;
         }
-        work.schedule(engine, &host, &mut events, now, config.max_body)?;
-        engine.publication_checkpoint().map_err(core_error)?;
+        work.schedule(engine, &host, &mut events, now, &config)?;
+        measure(config.metrics.as_ref().map(|m| &m.core_checkpoint), || {
+            engine.publication_checkpoint()
+        }).map_err(core_error)?;
         (host.access.0)(
             &snapshot(
                 engine,
@@ -2019,7 +2143,7 @@ mod tests {
             access: AccessD28::default(),
         };
         let mut work = HostWork::default();
-        work.schedule(&mut engine, &host, &mut events, 0, config.max_body)
+        work.schedule(&mut engine, &host, &mut events, 0, &config)
             .unwrap();
         let writes = engine.storage().writes;
         let acknowledged = tokio::runtime::Builder::new_current_thread()
@@ -2092,6 +2216,46 @@ mod tests {
             }
         );
         assert_eq!(metrics.snapshot().offered.status_request_messages, u64::MAX);
+    }
+
+    #[test]
+    fn metrics_host_completion_excludes_pending_and_cancelled_futures() {
+        use std::{cell::Cell, task::Waker};
+        let metrics = RuntimeMetrics::default();
+        let ready = Cell::new(false);
+        let mut work = Box::pin(observe_completion(Some(&metrics.host_propose_completed), poll_fn(|_| {
+            if ready.get() { Poll::Ready(None::<BlockValue>) } else { Poll::Pending }
+        })));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(work.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(metrics.snapshot().phases.host_propose_completed.calls, 0);
+        ready.set(true);
+        assert!(matches!(work.as_mut().poll(&mut cx), Poll::Ready(None)));
+        let before = metrics.snapshot();
+        assert_eq!(before.phases.host_propose_completed.calls, 1, "None is a completed proposal attempt");
+        let mut cancelled = Box::pin(observe_completion(
+            Some(&metrics.host_propose_completed), std::future::pending::<()>(),
+        ));
+        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+        drop(cancelled);
+        assert_eq!(metrics.snapshot(), before);
+    }
+
+    #[test]
+    fn metrics_body_check_precedes_core_receive_and_deltas_remain_separate() {
+        let (config, _, mut engine, mut events, mut network) = metrics_fixture();
+        let c = engine.c().clone();
+        for height in [2, 1] {
+            let packet = decision_packet(&c, &body(height), config.limits());
+            let processed = wire::decode_frame(&packet, config.limits()).unwrap().with_frame(|frame| {
+                payload::complete(&mut engine, frame, &mut events, &mut network.conflicts, &config).unwrap()
+            });
+            assert_eq!(processed, height == 1);
+            let phases = config.metrics.as_ref().unwrap().snapshot().phases;
+            assert_eq!(phases.body_check.calls, if height == 2 { 1 } else { 2 });
+            assert_eq!(phases.core_receive.calls, u64::from(height == 1));
+            assert_eq!(phases.network_receive.calls, 0, "this test bypasses network.receive");
+        }
     }
 
     #[test]
@@ -2456,9 +2620,12 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            config.metrics.as_ref().unwrap().snapshot(),
-            MetricsSnapshot::default()
+            config.metrics.as_ref().unwrap().snapshot().offered,
+            OfferedMetrics::default()
         );
+        let phases = config.metrics.as_ref().unwrap().snapshot().phases;
+        assert_eq!(phases.network_exchange.calls, 1);
+        assert_eq!(phases.transport_service.calls, 0);
         // Replacing this BFT handle causes service to fail after the offer boundary.
         let _replacement = config.transport.attach(Consumer::Bft);
         assert!(
@@ -2473,6 +2640,10 @@ mod tests {
                 bytes: 196
             }
         );
+        let phases = config.metrics.as_ref().unwrap().snapshot().phases;
+        assert_eq!(phases.network_exchange.calls, 2);
+        assert_eq!(phases.transport_service.calls, 1, "failed service is still timed");
+        assert!(phases.network_exchange.wall_ns >= phases.transport_service.wall_ns);
     }
 
     #[test]
@@ -2535,7 +2706,8 @@ mod tests {
     #[test]
     fn host_retries_share_immutable_body_but_recheck_validity_and_retire_it() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let (config, key) = fixture();
+        let (mut config, key) = fixture();
+        config.metrics = Some(Arc::new(RuntimeMetrics::default()));
         let c = config
             .chain_config(&config.initial_roster, config.vote_namespace)
             .unwrap()
@@ -2567,27 +2739,34 @@ mod tests {
         };
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let mut work = HostWork::default();
-        work.schedule(&mut engine, &host, &mut events, 0, config.max_body).unwrap();
+        work.schedule(&mut engine, &host, &mut events, 0, &config).unwrap();
         assert_eq!(work.validations.len(), 1);
         let allocation = Arc::downgrade(&work.validations[0].value);
         let tag = work.validations[0].tag;
         rt.block_on(work.poll(&mut engine, &mut events, 0, &config, &host)).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(engine.view().unwrap().step, Step::Propose);
-        work.schedule(&mut engine, &host, &mut events, 1, config.max_body).unwrap();
+        work.schedule(&mut engine, &host, &mut events, 1, &config).unwrap();
         assert!(work.validations[0].work.is_none(), "no retry without a retry event");
         events.retries[0] = Some(tag);
-        work.schedule(&mut engine, &host, &mut events, 2, config.max_body).unwrap();
+        work.schedule(&mut engine, &host, &mut events, 2, &config).unwrap();
         assert!(std::ptr::eq(allocation.as_ptr(), Arc::as_ptr(&work.validations[0].value)),
                 "retry reuses the exact immutable allocation");
         rt.block_on(work.poll(&mut engine, &mut events, 2, &config, &host)).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2, "Host verdict is not cached");
         assert_eq!(engine.view().unwrap().step, Step::Decided);
-        work.schedule(&mut engine, &host, &mut events, 3, config.max_body).unwrap();
+        work.schedule(&mut engine, &host, &mut events, 3, &config).unwrap();
         assert!(work.validations.is_empty());
         assert!(allocation.upgrade().is_none(), "resolved generation drops its cached body");
         work.retire();
         assert!(work.decision.is_none());
+        let phases = config.metrics.as_ref().unwrap().snapshot().phases;
+        assert_eq!(phases.host_schedule.calls, 4);
+        assert_eq!(phases.host_poll.calls, 2);
+        assert_eq!(phases.host_validate_completed.calls, 2);
+        assert_eq!(phases.core_host_completion.calls, 2);
+        assert_eq!(phases.host_propose_completed.calls, 0);
+        assert!(phases.host_poll.wall_ns >= phases.core_host_completion.wall_ns);
     }
 
     #[test]

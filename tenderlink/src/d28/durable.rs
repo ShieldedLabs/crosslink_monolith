@@ -13,6 +13,38 @@
 //! records. The configured bounds are immutable across roster changes. One image
 //! buffer is reused; backend copies and the engine's volatile workspace are separate.
 use super::*;
+use super::metrics::AtomicWallTime;
+pub use super::metrics::WallTimeSnapshot;
+use std::sync::Arc;
+
+/// Optional persistence observations; fixed-size and cumulative. No reads of the
+/// monotonic clock are added unless attached with `DurableStore::with_metrics`.
+#[derive(Debug, Default)]
+pub struct Metrics {
+    image_encode: AtomicWallTime,
+    image_checksum: AtomicWallTime,
+    backend_replace: AtomicWallTime,
+}
+
+/// Counts attempted phases, including errors. Clean/poisoned fences do no work
+/// and add no samples. Encode includes checksum; checksum is a subset, NOT an
+/// additional cost. Backend replacement excludes encode and includes any backend
+/// blocking/delay. These are wall nanoseconds, never process/thread CPU time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub image_encode: WallTimeSnapshot,
+    pub image_checksum: WallTimeSnapshot,
+    pub backend_replace: WallTimeSnapshot,
+}
+impl Metrics {
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            image_encode: self.image_encode.snapshot(),
+            image_checksum: self.image_checksum.snapshot(),
+            backend_replace: self.backend_replace.snapshot(),
+        }
+    }
+}
 
 const MAGIC: &[u8; 8] = b"D28IMG01";
 const VERSION: u32 = 1;
@@ -66,6 +98,7 @@ pub struct DurableStore<B: AtomicBlockStore> {
     dirty: bool,
     publication_dirty: bool,
     poisoned: bool,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl<B: AtomicBlockStore> DurableStore<B> {
@@ -107,7 +140,16 @@ impl<B: AtomicBlockStore> DurableStore<B> {
             dirty: false,
             publication_dirty: false,
             poisoned: false,
+            metrics: None,
         })
+    }
+
+    /// Observe future persistence attempts only. Opening/loading/recovery decoding
+    /// is not measured. Sharing the handle aggregates stores without retaining
+    /// any image, height or message history.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     pub fn limits(&self) -> Limits {
@@ -177,8 +219,12 @@ impl<B: AtomicBlockStore> Storage for DurableStore<B> {
     fn flush(&mut self) -> Result<()> {
         self.ready()?;
         if self.dirty {
-            let result = encode(&self.memory, self.limits, &mut self.image)
-                .and_then(|()| self.backend.replace(&self.image));
+            let result = encode_observed(
+                &self.memory, self.limits, &mut self.image, self.metrics.as_deref(),
+            ).and_then(|()| {
+                let _timer = self.metrics.as_ref().map(|m| m.backend_replace.start());
+                self.backend.replace(&self.image)
+            });
             self.mutation_result(result)?;
             self.dirty = false;
             self.publication_dirty = false;
@@ -745,7 +791,14 @@ fn read_region_header(r: &mut Reader<'_>, limits: Limits) -> Result<RegionHeader
     })
 }
 
+#[cfg(test)]
 fn encode(m: &MemoryStore, limits: Limits, image: &mut [u8]) -> Result<()> {
+    encode_observed(m, limits, image, None)
+}
+fn encode_observed(
+    m: &MemoryStore, limits: Limits, image: &mut [u8], metrics: Option<&Metrics>,
+) -> Result<()> {
+    let _timer = metrics.map(|m| m.image_encode.start());
     if image.len() != image_size(limits)? {
         return Err(Error::Corrupt);
     }
@@ -807,7 +860,10 @@ fn encode(m: &MemoryStore, limits: Limits, image: &mut [u8]) -> Result<()> {
     w.bytes[w.at..].fill(0);
     let payload = u64::try_from(w.at - PREFIX).map_err(|_| Error::Corrupt)?;
     image[PREFIX - 8..PREFIX].copy_from_slice(&payload.to_le_bytes());
-    let checksum = blake3::hash(&image[..checksum_at]);
+    let checksum = {
+        let _timer = metrics.map(|m| m.image_checksum.start());
+        blake3::hash(&image[..checksum_at])
+    };
     image[checksum_at..].copy_from_slice(checksum.as_bytes());
     Ok(())
 }
@@ -1297,6 +1353,80 @@ mod tests {
             limits,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn metrics_count_encode_checksum_and_replace_in_order() {
+        struct ObservedBlock { block: Block, metrics: Arc<Metrics> }
+        impl AtomicBlockStore for ObservedBlock {
+            fn block_size(&self) -> usize { self.block.block_size() }
+            fn load(&mut self, bytes: &mut [u8]) -> Result<bool> { self.block.load(bytes) }
+            fn replace(&mut self, bytes: &[u8]) -> Result<()> {
+                let snapshot = self.metrics.snapshot();
+                assert_eq!(snapshot.image_encode.calls, self.block.replacements as u64 + 1);
+                assert_eq!(snapshot.image_checksum.calls, snapshot.image_encode.calls);
+                assert_eq!(snapshot.backend_replace.calls, self.block.replacements as u64);
+                self.block.replace(bytes)
+            }
+        }
+        let unobserved = buffered();
+        assert!(unobserved.metrics.is_none());
+        let limits = unobserved.limits;
+        let metrics = Arc::new(Metrics::default());
+        let backend = ObservedBlock { block: unobserved.into_backend(), metrics: metrics.clone() };
+        let mut store = DurableStore::open_buffered(backend, limits).unwrap().with_metrics(metrics.clone());
+        assert_eq!(metrics.snapshot(), MetricsSnapshot::default());
+        store.write_body(0, b"first").unwrap();
+        assert_eq!(metrics.snapshot(), MetricsSnapshot::default(), "staging is not encoding");
+        store.flush_publication().unwrap();
+        let first = metrics.snapshot();
+        assert_eq!(first.image_encode.calls, 1);
+        assert_eq!(first.image_checksum.calls, 1);
+        assert_eq!(first.backend_replace.calls, 1);
+        assert!(first.image_encode.wall_ns >= first.image_checksum.wall_ns);
+        store.flush().unwrap();
+        store.flush_publication().unwrap();
+        assert_eq!(metrics.snapshot(), first, "clean fences do no measured work");
+        store.write_body(0, b"second").unwrap();
+        store.flush().unwrap();
+        let second = metrics.snapshot();
+        assert_eq!(second.image_encode.calls - first.image_encode.calls, 1);
+        assert_eq!(second.image_checksum.calls - first.image_checksum.calls, 1);
+        assert_eq!(second.backend_replace.calls - first.backend_replace.calls, 1);
+        assert!(second.image_encode.wall_ns >= first.image_encode.wall_ns);
+        assert!(second.image_checksum.wall_ns >= first.image_checksum.wall_ns);
+        assert!(second.backend_replace.wall_ns >= first.backend_replace.wall_ns);
+        store.write_body(0, b"discard").unwrap();
+        drop(store);
+        assert_eq!(metrics.snapshot(), second, "drop does not persist or measure");
+    }
+
+    #[test]
+    fn metrics_failed_encode_skips_checksum_and_replace_and_failed_replace_counts() {
+        let metrics = Arc::new(Metrics::default());
+        let mut store = buffered().with_metrics(metrics.clone());
+        store.update(|m| { m.bodies[0].resize(129, 0); Ok(()) }).unwrap();
+        assert_eq!(store.flush(), Err(Error::Storage));
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.image_encode.calls, 1);
+        assert_eq!(snapshot.image_checksum.calls, 0);
+        assert_eq!(snapshot.backend_replace.calls, 0);
+        assert_eq!(store.flush(), Err(Error::Storage));
+        assert_eq!(metrics.snapshot(), snapshot, "poisoned store does not retry");
+        for applied in [false, true] {
+            let metrics = Arc::new(Metrics::default());
+            let mut store = buffered().with_metrics(metrics.clone());
+            store.write_body(0, b"ambiguous").unwrap();
+            store.backend.fail = Some(applied);
+            assert_eq!(store.flush(), Err(Error::Storage));
+            let snapshot = metrics.snapshot();
+            assert_eq!(snapshot.image_encode.calls, 1);
+            assert_eq!(snapshot.image_checksum.calls, 1);
+            assert_eq!(snapshot.backend_replace.calls, 1);
+            assert!(store.is_poisoned());
+            assert_eq!(store.flush(), Err(Error::Storage));
+            assert_eq!(metrics.snapshot(), snapshot);
+        }
     }
 
     #[test]
