@@ -4,8 +4,9 @@
 //! chain's existing keyed body ID or to a signed header. Authenticate a manifest
 //! in its BFT context before using it, retain that exact manifest during assembly,
 //! and check the reconstructed body's existing keyed ID and canonical/host
-//! validity before admitting it to consensus. Even a valid holder attestation
-//! does not prove that its root and claimed chain body ID describe the same body.
+//! validity before admitting it to consensus. Even a valid proposer or holder
+//! attestation does not prove that its root and claimed chain body ID describe
+//! the same body.
 //!
 //! Leaves are ordered by byte offset. The final leaf has its exact remaining
 //! length; it is never zero-filled. The tree pads to the next power of two with
@@ -28,6 +29,7 @@ const LEAF_DOMAIN: &[u8] = b"tenderlink/D28/merkle/leaf/v1";
 const NODE_DOMAIN: &[u8] = b"tenderlink/D28/merkle/node/v1";
 const PADDING_DOMAIN: &[u8] = b"tenderlink/D28/merkle/padding/v1";
 const HOLDER_DOMAIN: &[u8] = b"tenderlink/D28/BFT/merkle/holder/v1";
+const PROPOSER_DOMAIN: &[u8] = b"tenderlink/D28/BFT/merkle/proposer/v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -46,6 +48,7 @@ pub enum Error {
     Unavailable,
     Holder,
     Signature,
+    Proposer,
 }
 
 impl fmt::Display for Error {
@@ -556,6 +559,7 @@ impl PartialTree {
 }
 
 /// The externally established BFT context, not a peer-selected claim to accept.
+/// Shared by holder claims and proposer commitments; their signature domains differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HolderContext {
     pub domain: Hash,
@@ -619,6 +623,86 @@ impl HolderAttestation {
         key.verify(
             &Signature::from(self.signature),
             &holder_message(context, manifest, &self.holder),
+        )
+        .map_err(|_| Error::Signature)
+    }
+}
+
+/// A transport-only commitment by the expected proposer to the entire manifest
+/// and BFT context. This signature is independent of the chain's signed header:
+/// it changes no chain-facing format and cannot substitute for header validation.
+///
+/// The runtime must authenticate the genuine exact signed header identified by
+/// `manifest.signed_header_identity`, check its body ID and BFT context against
+/// the manifest/context, and select the expected proposer from the trusted active
+/// configuration and that header's round, not from this attestation's key.
+/// Each independently relayable shard needs this commitment and a Merkle proof
+/// checked with `verify_leaf`, which authenticates its index and exact length.
+/// Retain the exact authenticated manifest throughout assembly.
+///
+/// Success authenticates only the proposer's commitment. It does not prove that
+/// the root and claimed body ID describe the same bytes, nor that the body is
+/// canonical or host-valid. Reconstructed bytes still require the existing keyed
+/// chain body-ID check and canonical/host validation before consensus admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProposerAttestation {
+    pub proposer: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+fn proposer_message(context: &HolderContext, manifest: &Manifest, proposer: &[u8; 32]) -> Hash {
+    let mut h = blake3::Hasher::new();
+    h.update(PROPOSER_DOMAIN);
+    h.update(&context.domain);
+    h.update(&context.config);
+    h.update(&context.height.to_le_bytes());
+    h.update(proposer);
+    h.update(&manifest.signed_header_identity);
+    h.update(&manifest.body_id);
+    h.update(&manifest.body_len.to_le_bytes());
+    h.update(&manifest.leaf_bytes.to_le_bytes());
+    h.update(&manifest.root);
+    *h.finalize().as_bytes()
+}
+
+impl ProposerAttestation {
+    /// Sign bounded geometry without allocating a tree or body. The caller must
+    /// establish the exact header, proposer role and manifest/body relationship.
+    pub fn sign(
+        context: &HolderContext,
+        manifest: &Manifest,
+        key: &SigningKey,
+        max_body: usize,
+    ) -> Result<Self> {
+        manifest.validate(max_body)?;
+        let proposer = VerificationKeyBytes::from(key).into();
+        let signature = key.sign(&proposer_message(context, manifest, &proposer)).into();
+        Ok(Self {
+            proposer,
+            signature,
+        })
+    }
+
+    /// `expected_proposer` must come from the runtime's trusted configuration and
+    /// independently authenticated exact header, never this untrusted claim.
+    /// Geometry is checked before cryptographic work; verification allocates no
+    /// tree, bitmap or body. It does not itself authenticate a header or a shard.
+    pub fn verify(
+        &self,
+        context: &HolderContext,
+        manifest: &Manifest,
+        expected_proposer: &[u8; 32],
+        max_body: usize,
+    ) -> Result<()> {
+        manifest.validate(max_body)?;
+        if &self.proposer != expected_proposer {
+            return Err(Error::Proposer);
+        }
+        let key = VerificationKey::try_from(VerificationKeyBytes::from(self.proposer))
+            .map_err(|_| Error::Proposer)?;
+        key.verify(
+            &Signature::from(self.signature),
+            &proposer_message(context, manifest, &self.proposer),
         )
         .map_err(|_| Error::Signature)
     }
