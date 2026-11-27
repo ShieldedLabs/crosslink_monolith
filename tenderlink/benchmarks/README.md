@@ -740,3 +740,44 @@ The later certificate-admission hardening in `b3023b31` is not retroactively
 included in these measurements. A Merkle comparison must use a fresh outlined
 control on the **same final executable** as its leaf-size arms; comparing only
 against this earlier stage would also confound code version and time order.
+
+### Merkle functional gate and retained failures
+
+The first seven-process Merkle gate used a 10-MiB body/cap, one warmup height and
+one measured height, the same economy/WAN settings for every arm, and a
+300-second whole-trial deadline. This is a functional gate, **not** the primary
+leaf-size comparison. No Fly machines were provisioned.
+
+| Transport | Warmup | Measured height | Outcome |
+|---|---|---|---|
+| Outlined whole body | Complete | Complete, 26.77-s all-node cycle | Complete |
+| Merkle, 32-KiB leaves | Did not complete | Not reached | Partial at deadline |
+| Merkle, 100-KiB leaves | Complete, round 6 | No decision | Partial at deadline |
+| Merkle, 256-KiB leaves | Complete, round 5 | No decision | Partial at deadline |
+| Merkle, 1-MiB leaves | Complete, round 1 | Complete, 32.06-s all-node cycle | Complete |
+
+This was not a blanket proof-verification failure: during the undecided measured
+height the 100-KiB arm completed nine full assemblies across seven nodes and
+verified 188,887,040 leaf bytes; the 256-KiB arm completed 27 assemblies and
+verified 310,640,640 bytes. The 32-KiB reports contain no measured application
+window: its counters are **unavailable, not zero**. Its full stalled duration
+still belongs in chain-rate accounting.
+
+Source review identified two interacting risks, not a trace-proven attribution
+of these runs: one-shot leaf acknowledgements could leave an eight-leaf sender
+window occupied until its ten-second lease expired, and completed/partial
+acquisition can be discarded at round or ownership boundaries. STP is best
+effort; its send-backlog count retires planned send work, not reliably
+acknowledged message delivery. The gate did not record individual ACK-loss or
+lease-expiry events.
+
+All original failures are retained under
+`/var/tmp/d28-payload-20261127/merkle-seven-node-gate/`. The pinned executable is
+`d28_bench-merkle-e365a1a0`, SHA-256
+`fafef8158e088f201a9d9661893d43cd70acd05a4f397d8ffabf34cc5b793c30`.
+An independent summary failure on null counter windows was repaired in
+`eb33e41d3`; the repaired summarizer reconstructs five cases, two complete and
+three partial, without fabricating counters or removing failed durations.
+All 517 original file hashes were unchanged when the derived
+`campaign/summary.json` was added. Its SHA-256 is
+`5bdc600be26006484f7fe770371e2ff32bbf2d1ab373f0659b2697b9f2305621`.
