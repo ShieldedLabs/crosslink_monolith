@@ -18,6 +18,57 @@ use crate::d28::{
 use ed25519_zebra::SigningKey;
 use std::io;
 
+// Opt-in component diagnosis only: no payload/key material, at most 4096 lines
+// per process. Disabled in ordinary builds and unless explicitly requested.
+#[cfg(feature = "bench")]
+fn trace<S: Storage>(
+    engine: &Engine<S>,
+    pending: &[Pending],
+    now: u64,
+    event: &str,
+    reference: Reference,
+    details: std::fmt::Arguments<'_>,
+) {
+    use std::sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    };
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static LINES: AtomicUsize = AtomicUsize::new(0);
+    if !*ENABLED.get_or_init(|| std::env::var("D28_LEAF_TRACE").is_ok_and(|s| s == "1"))
+        || LINES.fetch_add(1, Ordering::Relaxed) >= 4096
+    {
+        return;
+    }
+    let round = engine.view().map(|d| d.round);
+    let header_round = pending
+        .iter()
+        .filter_map(|p| p.evidence.header())
+        .find(|h| h.identity(engine.c()) == reference.manifest.signed_header_identity)
+        .map(|h| h.content.round)
+        .or_else(|| {
+            retained_headers(engine)
+                .into_iter()
+                .find(|(_, h)| h.identity(engine.c()) == reference.manifest.signed_header_identity)
+                .map(|(_, h)| h.content.round)
+        });
+    eprintln!(
+        "D28_LEAF ms={now} event={event} height={} current={round:?} header={header_round:?} id={:02x?} {details}",
+        reference.height, reference.manifest.body_id
+    );
+}
+#[cfg(not(feature = "bench"))]
+#[inline]
+fn trace<S: Storage>(
+    _: &Engine<S>,
+    _: &[Pending],
+    _: u64,
+    _: &str,
+    _: Reference,
+    _: std::fmt::Arguments<'_>,
+) {
+}
+
 fn error(error: crate::d28::merkle::Error) -> io::Error {
     io::Error::other(error)
 }
@@ -66,6 +117,12 @@ struct Window {
     until: u64,
     mask: u8,
 }
+#[derive(Clone, Copy)]
+struct Receipt {
+    ack: Ack,
+    until: u64,
+    next_offer: u64,
+}
 struct LeafPeer {
     member: u32,
     generation: u64,
@@ -76,7 +133,9 @@ struct LeafPeer {
     lease: Option<Window>,
     remote_generation: Option<u64>,
     remote_token: u64,
-    acks: [Option<Ack>; WINDOW],
+    // One cumulative receipt; keep its token watermark after retries expire so
+    // late old leaves cannot replace a newer receipt. STP is best effort.
+    receipt: Option<Receipt>,
     // One body/geometry history per peer, not one body-sized allocation per peer.
     offered: Option<(Reference, Bitmap)>,
     failed: Option<(Reference, u64)>,
@@ -152,14 +211,31 @@ impl MerkleState {
                     lease: None,
                     remote_generation: None,
                     remote_token: 0,
-                    acks: [None; WINDOW],
+                    receipt: None,
                     offered: None,
                     failed: None,
                 });
             }
         }
-        self.assemblies
-            .retain(|a| now < a.expires && pending.iter().any(|p| p.key == a.reference.key()));
+        self.assemblies.retain(|a| {
+            let keep = now < a.expires && pending.iter().any(|p| p.key == a.reference.key());
+            if !keep {
+                trace(
+                    engine,
+                    pending,
+                    now,
+                    "assembly_retire",
+                    a.reference,
+                    format_args!(
+                        "verified={} leaves={} expires={}",
+                        a.tree.bitmap().count(),
+                        a.tree.layout().leaf_count(),
+                        a.expires
+                    ),
+                );
+            }
+            keep
+        });
         self.cached
             .retain(|c| retained_body(engine, c.key).is_some());
         // A different attested root for the same interest gets a bounded turn.
@@ -195,16 +271,44 @@ impl MerkleState {
             if peer.requested.is_some_and(|w| now >= w.until) {
                 peer.requested = None;
             }
-            if peer.lease.is_some_and(|w| now >= w.until) {
+            if let Some(w) = peer.lease.filter(|w| now >= w.until) {
+                trace(
+                    engine,
+                    pending,
+                    now,
+                    "send_timeout",
+                    w.want.ticket.reference,
+                    format_args!(
+                        "peer={} token={} mask={} indices={:?}",
+                        peer.member,
+                        w.want.ticket.token,
+                        w.mask,
+                        w.want.indices()
+                    ),
+                );
                 peer.lease = None;
             }
-            if peer.receive.is_some_and(|w| {
+            if let Some(w) = peer.receive.filter(|w| {
                 now >= w.until
                     || !self
                         .assemblies
                         .iter()
                         .any(|a| same_payload(a.reference, w.want.ticket.reference))
             }) {
+                trace(
+                    engine,
+                    pending,
+                    now,
+                    "receive_retire",
+                    w.want.ticket.reference,
+                    format_args!(
+                        "peer={} token={} mask={} timeout={}",
+                        peer.member,
+                        w.want.ticket.token,
+                        w.mask,
+                        now >= w.until
+                    ),
+                );
                 peer.receive = None;
             }
         }
@@ -420,10 +524,28 @@ impl MerkleState {
             else {
                 continue;
             };
-            for ack in peer.acks.iter_mut().filter_map(Option::take) {
-                let bytes = codec::encode_ack(ack, config.max_body).map_err(core_error)?;
-                counts.offered_control.record(bytes.len());
-                push.send_unreliable.push((address, bytes));
+            if let Some(receipt) = &mut peer.receipt {
+                if now < receipt.until && now >= receipt.next_offer {
+                    let bytes =
+                        codec::encode_ack(receipt.ack, config.max_body).map_err(core_error)?;
+                    trace(
+                        engine,
+                        pending,
+                        now,
+                        "ack_out",
+                        receipt.ack.ticket.reference,
+                        format_args!(
+                            "peer={} token={} indices={:?}",
+                            peer.member,
+                            receipt.ack.ticket.token,
+                            receipt.ack.indices()
+                        ),
+                    );
+                    counts.offered_control.record(bytes.len());
+                    push.send_unreliable.push((address, bytes));
+                    receipt.next_offer =
+                        now.saturating_add(super::super::millis(config.status_interval)?);
+                }
             }
         }
         self.start_assemblies(pending, config, now)?;
@@ -493,6 +615,20 @@ impl MerkleState {
                 count: count as u8,
             };
             let bytes = codec::encode_want(want, config.max_body).map_err(core_error)?;
+            trace(
+                engine,
+                pending,
+                now,
+                "want_out",
+                want.ticket.reference,
+                format_args!(
+                    "peer={} token={} indices={:?} verified={}",
+                    peer.member,
+                    want.ticket.token,
+                    want.indices(),
+                    a.tree.bitmap().count()
+                ),
+            );
             // Acquire a fixed receive window before handing off a request.
             self.peers[index].receive = Some(Window {
                 want,
@@ -585,6 +721,20 @@ impl MerkleState {
                 push.send_bulk.push((address, bytes));
                 sent |= 1 << position;
             }
+            trace(
+                engine,
+                pending,
+                now,
+                "leaf_send",
+                reference,
+                format_args!(
+                    "peer={} token={} mask={} indices={:?}",
+                    self.peers[index].member,
+                    wanted.want.ticket.token,
+                    sent,
+                    wanted.want.indices()
+                ),
+            );
             if sent == 0 {
                 self.peers[index].lease = None;
             } else {
@@ -789,6 +939,20 @@ impl Network {
                 {
                     return Ok(false);
                 }
+                trace(
+                    engine,
+                    &self.payload.pending,
+                    now,
+                    "want_in",
+                    reference,
+                    format_args!(
+                        "peer={} token={} indices={:?} held_token={:?}",
+                        peer.member,
+                        want.ticket.token,
+                        want.indices(),
+                        peer.lease.map(|w| w.want.ticket.token)
+                    ),
+                );
                 peer.remote_generation = Some(want.ticket.generation);
                 peer.remote_token = want.ticket.token;
                 // New scheduling metadata cannot release the older send window.
@@ -813,13 +977,27 @@ impl Network {
                 if lease.want.ticket != ack.ticket {
                     return Ok(false);
                 }
-                let Some(position) = lease.want.position(ack.index) else {
-                    return Ok(false);
-                };
-                if lease.mask & (1 << position) == 0 {
-                    return Ok(false);
+                let mut received = 0;
+                for &index in ack.indices() {
+                    let Some(position) = lease.want.position(index) else {
+                        return Ok(false);
+                    };
+                    received |= 1 << position;
                 }
-                lease.mask &= !(1 << position);
+                // Cumulative repeats are idempotent, but an old ticket cannot
+                // free any part of a newer lease. No new WANT releases credit.
+                lease.mask &= !received;
+                trace(
+                    engine,
+                    &self.payload.pending,
+                    now,
+                    "ack_in",
+                    ack.ticket.reference,
+                    format_args!(
+                        "peer={} token={} remaining={}",
+                        peer.member, ack.ticket.token, lease.mask
+                    ),
+                );
                 if lease.mask == 0 {
                     peer.lease = None;
                 }
@@ -881,13 +1059,19 @@ impl Network {
                 // A duplicate never overwrites bytes, renews interest, or earns
                 // verified-byte credit. ACK is only transfer credit, not validity.
                 let peer = &mut state.peers[peer_index];
-                let ack = Ack {
-                    ticket: leaf.ticket,
-                    index: leaf.index,
-                };
-                if !peer.acks.contains(&Some(ack)) {
-                    if let Some(slot) = peer.acks.iter_mut().find(|a| a.is_none()) {
-                        *slot = Some(ack);
+                match &mut peer.receipt {
+                    Some(receipt) if receipt.ack.ticket == leaf.ticket => {
+                        if receipt.ack.add(leaf.index) {
+                            receipt.next_offer = 0;
+                        }
+                    }
+                    Some(receipt) if leaf.ticket.token <= receipt.ack.ticket.token => {}
+                    slot => {
+                        *slot = Some(Receipt {
+                            ack: Ack::single(leaf.ticket, leaf.index),
+                            until: now.saturating_add(config.request_timeout),
+                            next_offer: 0,
+                        });
                     }
                 }
                 if let Some(window) = &mut peer.receive {
@@ -896,6 +1080,19 @@ impl Network {
                             window.mask |= 1 << position;
                         }
                         if window.mask.count_ones() == u32::from(window.want.count) {
+                            trace(
+                                engine,
+                                &self.payload.pending,
+                                now,
+                                "window_received",
+                                reference,
+                                format_args!(
+                                    "peer={} token={} verified={}",
+                                    peer.member,
+                                    leaf.ticket.token,
+                                    a.tree.bitmap().count()
+                                ),
+                            );
                             peer.receive = None;
                         }
                     }
@@ -932,9 +1129,21 @@ impl Network {
                 }
                 // Neither the root nor this structural/hash completion grants
                 // Valid. Exact header/certificates and the ordinary Host gate run.
-                pending.evidence.with_body(&a.body, |frame| {
+                let result = pending.evidence.with_body(&a.body, |frame| {
                     complete(engine, frame, events, &mut self.conflicts, config)
-                })
+                });
+                trace(
+                    engine,
+                    std::slice::from_ref(&pending),
+                    now,
+                    "assembly_complete",
+                    a.reference,
+                    format_args!(
+                        "result={result:?} retained={}",
+                        retained_body(engine, a.reference.key()).is_some()
+                    ),
+                );
+                result
             }
             _ => Ok(false),
         }

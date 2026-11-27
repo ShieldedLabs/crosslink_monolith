@@ -50,6 +50,23 @@ impl Want {
     pub fn position(&self, index: u32) -> Option<usize> {
         self.indices().iter().position(|&i| i == index)
     }
+    pub fn single(ticket: Ticket, index: u32) -> Self {
+        let mut indices = [0; WINDOW];
+        indices[0] = index;
+        Self {
+            ticket,
+            indices,
+            count: 1,
+        }
+    }
+    pub fn add(&mut self, index: u32) -> bool {
+        if self.position(index).is_some() || usize::from(self.count) == WINDOW {
+            return false;
+        }
+        self.indices[usize::from(self.count)] = index;
+        self.count += 1;
+        true
+    }
 }
 pub(super) struct Have<'a> {
     pub reference: Reference,
@@ -72,11 +89,9 @@ impl Leaf<'_> {
         (hashes, count)
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Ack {
-    pub ticket: Ticket,
-    pub index: u32,
-}
+/// Cumulative receipt of up to one fixed window's indices, not body validity.
+/// Uses the same bounded index-list representation, but a distinct wire tag.
+pub(super) type Ack = Want;
 
 fn layout(reference: Reference, max_body: usize) -> Result<Layout> {
     reference
@@ -168,9 +183,12 @@ fn valid_want(want: &Want, max_body: usize) -> Result<()> {
     Ok(())
 }
 pub(super) fn encode_want(want: Want, max_body: usize) -> Result<Vec<u8>> {
+    encode_indices(want, WANT, max_body)
+}
+fn encode_indices(want: Want, tag: u8, max_body: usize) -> Result<Vec<u8>> {
     valid_want(&want, max_body)?;
     let mut out = reserved(TICKET_BYTES + 1 + usize::from(want.count) * 4)?;
-    put_ticket(&mut out, WANT, want.ticket)?;
+    put_ticket(&mut out, tag, want.ticket)?;
     out.push(want.count);
     for index in want.indices() {
         out.extend_from_slice(&index.to_le_bytes());
@@ -178,7 +196,10 @@ pub(super) fn encode_want(want: Want, max_body: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 pub(super) fn decode_want(bytes: &[u8], max_body: usize) -> Result<Want> {
-    let mut r = Reader::new(bytes, WANT)?;
+    decode_indices(bytes, WANT, max_body)
+}
+fn decode_indices(bytes: &[u8], tag: u8, max_body: usize) -> Result<Want> {
+    let mut r = Reader::new(bytes, tag)?;
     let ticket = r.ticket()?;
     let count = r.array::<1>()?[0];
     if count == 0 || usize::from(count) > WINDOW {
@@ -247,23 +268,10 @@ pub(super) fn decode_leaf(bytes: &[u8], max_body: usize) -> Result<Leaf<'_>> {
     })
 }
 pub(super) fn encode_ack(ack: Ack, max_body: usize) -> Result<Vec<u8>> {
-    layout(ack.ticket.reference, max_body)?
-        .leaf_range(ack.index as usize)
-        .map_err(|_| Error::Invalid)?;
-    let mut out = reserved(TICKET_BYTES + 4)?;
-    put_ticket(&mut out, ACK, ack.ticket)?;
-    out.extend_from_slice(&ack.index.to_le_bytes());
-    Ok(out)
+    encode_indices(ack, ACK, max_body)
 }
 pub(super) fn decode_ack(bytes: &[u8], max_body: usize) -> Result<Ack> {
-    let mut r = Reader::new(bytes, ACK)?;
-    let ticket = r.ticket()?;
-    let index = u32::from_le_bytes(r.array()?);
-    r.end()?;
-    layout(ticket.reference, max_body)?
-        .leaf_range(index as usize)
-        .map_err(|_| Error::Invalid)?;
-    Ok(Ack { ticket, index })
+    decode_indices(bytes, ACK, max_body)
 }
 pub(in crate::d28::runtime) fn max_frame_bytes(
     max_body: usize,
