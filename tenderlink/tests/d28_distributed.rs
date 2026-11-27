@@ -305,6 +305,16 @@ fn cohort(nodes: usize, headers: usize, solution: usize, body_bytes: usize,
                 .unwrap()
                 > 0
         );
+        let protocol = &r["protocol"][0];
+        assert_eq!(protocol["sample_period_ms"], 200);
+        assert_eq!(protocol["sample_capacity"], 128);
+        assert_eq!(protocol["peer_sample_capacity"], 512);
+        assert!(protocol["ready_samples"].as_u64().unwrap() > 0);
+        assert!(protocol["samples"].as_array().unwrap().iter().any(|s| s["data"]["peers"]
+            .as_array().is_some_and(|peers| !peers.is_empty())));
+        assert!(protocol["snapshot_at_ms"].as_f64().unwrap() >= protocol["last_collected_at_ms"].as_f64().unwrap());
+        assert!(r["measured_window"]["end"].get("protocol").is_none(), "trace must not be duplicated at boundaries");
+        assert!(serde_json::to_vec_pretty(&r).unwrap().len() < 8 * 1024 * 1024);
         assert!(r["summary"]["elapsed_seconds"].as_f64().unwrap() > 0.3);
         assert!(
             r["process_end"]["counters"]["process.max_rss_bytes"]

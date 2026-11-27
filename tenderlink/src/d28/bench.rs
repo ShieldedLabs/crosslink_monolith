@@ -16,7 +16,7 @@ use crate::{
     BlockValue, ClosureToProposeNewBlock, ClosureToPushDecidedBlock, ClosureToReadDecidedTip,
     ClosureToUpdatePeers, ClosureToValidateProposedBlock, HostTip, STPAddress, SortedRosterMember,
     TMStatus, TMStatusReason, ValueId,
-    transport::{Consumer, ConsumerHandle, SharedTransport, TransportStats},
+    transport::{Consumer, SharedTransport, TransportStats, protocol::{ProtocolHistory, ProtocolObserver}},
 };
 use ed25519_zebra::{SigningKey, VerificationKeyBytes};
 use serde::Serialize;
@@ -399,6 +399,8 @@ pub struct BenchReport {
     pub summary: Summary,
     pub runtime_settings: BTreeMap<String, u64>,
     pub transport_settings: String,
+    /// One bounded final tail per online_nodes entry, not boundary duplicates.
+    pub protocol: Vec<ProtocolHistory>,
     pub measured_window: Option<CounterWindow>,
     pub network: Option<NetworkWindow>,
     pub chatter_window: Option<CounterWindow>,
@@ -746,13 +748,16 @@ fn bounded_output(_: &mut std::process::Command, _: Instant) -> io::Result<std::
     ))
 }
 struct Sampler {
-    observers: Vec<ConsumerHandle>,
+    observers: Vec<ProtocolObserver>,
     stores: Vec<Arc<StoreCounts>>,
     scope: Option<String>,
     deadline: Instant,
     metrics: Vec<Arc<runtime::RuntimeMetrics>>,
 }
 impl Sampler {
+    fn protocol_snapshot(&self) -> Vec<ProtocolHistory> {
+        self.observers.iter().map(ProtocolObserver::snapshot).collect()
+    }
     fn application_snapshot(&self) -> BTreeMap<String, u64> {
         let mut out = BTreeMap::new();
         for metrics in &self.metrics {
@@ -1309,7 +1314,7 @@ async fn run_inner(
     let sampler = Sampler {
         observers: transports
             .iter()
-            .map(|t| t.attach(Consumer::Base))
+            .map(|t| ProtocolObserver::new(t.attach(Consumer::Base), origin, deadline, online))
             .collect(),
         stores: stores.clone(),
         scope,
@@ -1549,6 +1554,7 @@ async fn run_inner(
             latency_ms,
             latency_samples,
         },
+        protocol: c.sampler.protocol_snapshot(),
         measured_window,
         network,
         chatter_window,
@@ -1590,6 +1596,7 @@ async fn run_inner(
             "In-memory fixed image reused by copy_from_slice; full durable adapter serialization/hash/write workload. Artificial synchronous replacement delay, no fsync or crash-durability claim. Image bytes=4096+556*Nmax+3*Bmax, not whole-process memory.",
             "Counter boundaries are sampled serially under cohort lock after callback entry/validation; sampling_duration_ms exposes observer skew and next-height perturbation. STP pump threads continue concurrently; counters are not an atomic system snapshot.",
             "Measured counters exclude warmup; success ends at final cohort before shutdown/drain. Final in-flight tail excluded. Optional chatter window keeps final ACK/tip unpublished and measures continued final-height protocol traffic separately, not a quiescent post-commit network.",
+            crate::transport::protocol::SEMANTICS,
             "TransportStats gathered with Base.stats only: no Base service and no second BFT attachment. Ring/message counters are not UDP packet/byte counters. Outside marked isolated netns network counters are null.",
             "Payload counters are application offers, not delivery/wire bytes. payload.payload_bytes is raw body bytes offered (including embedded inline bodies); payload.outlined_evidence_bytes is a subset of offered.evidence.bytes. Separate payload.offered_control/data are not in offered.evidence; do not sum subset metrics twice. Duplicate payload bytes alone are not total wasted network traffic.",
             "Production RuntimeConfig timer defaults unchanged; max_body differs only when explicitly configured. workers is CLI executor size; library caller owns executor sizing. Debug builds are not production-throughput evidence.",
