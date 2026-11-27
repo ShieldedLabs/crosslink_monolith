@@ -255,11 +255,17 @@ fn header_signature_scope_and_actual_body_are_checked_before_core_mutation() {
         b.push(0);
         b
     }] {
+        let before = node.config.metrics.as_ref().unwrap().snapshot().phases.body_check.calls;
         assert!(!node.inject(
             1,
             wire::encode_body_response(request, &wrong, node.config.limits()).unwrap(),
             2
         ));
+        assert_eq!(
+            node.config.metrics.as_ref().unwrap().snapshot().phases.body_check.calls,
+            before + 1,
+            "rejected outlined bodies still contribute their validation work"
+        );
     }
     for wrong in [
         BodyRequest {

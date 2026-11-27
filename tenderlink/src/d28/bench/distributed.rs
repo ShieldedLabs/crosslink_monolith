@@ -402,6 +402,9 @@ pub struct Window {
     pub end: Snapshot,
     pub application_delta: BTreeMap<String, u64>,
     pub transport_delta: BTreeMap<String, u64>,
+    /// VM-global UDP6 counters observed at both boundaries without a reset.
+    /// Missing observations stay absent; this is not STP-only traffic.
+    pub kernel_udp6_delta: Option<BTreeMap<String, u64>>,
     /// Only monotonic counters present at both boundaries; RSS gauges excluded.
     pub system_delta: BTreeMap<String, u64>,
     pub store_replacements: u64,
@@ -426,6 +429,7 @@ fn window(start: &Snapshot, end: &Snapshot) -> Window {
         end: end.clone(),
         application_delta: base.application_delta,
         transport_delta: base.transport_delta,
+        kernel_udp6_delta: base.kernel_udp6_delta,
         system_delta,
         store_replacements: base.store_replacements,
         store_replacement_bytes: base.store_replacement_bytes,
@@ -992,6 +996,53 @@ pub async fn run(config: DistributedConfig) -> io::Result<DistributedReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn udp_window_serializes_only_observed_nonreset_fields() {
+        let snapshot = |udp| Snapshot {
+            counters: CounterSnapshot {
+                at_ms: 0.0,
+                sampling_duration_ms: 0.0,
+                application: BTreeMap::new(),
+                transport: BTreeMap::new(),
+                store_replacements: 0,
+                store_replacement_bytes: 0,
+                kernel_udp6: udp,
+                kernel_udp6_error: None,
+                loopback: None,
+                tc: None,
+                tc_error: None,
+                tc_timed_out: false,
+            },
+            system: SystemSnapshot {
+                at_ms: 0.0,
+                sampling_duration_ms: 0.0,
+                counters: BTreeMap::new(),
+                errors: Vec::new(),
+            },
+        };
+        let start = snapshot(Some(BTreeMap::from([
+            ("Udp6InDatagrams".into(), 8),
+            ("Udp6OutDatagrams".into(), 9),
+            ("Udp6RcvbufErrors".into(), 2),
+        ])));
+        let end = snapshot(Some(BTreeMap::from([
+            ("Udp6InDatagrams".into(), 11),
+            ("Udp6OutDatagrams".into(), 1),
+            ("Udp6RcvbufErrors".into(), 2),
+            ("Udp6SndbufErrors".into(), 4),
+        ])));
+        let observed = window(&start, &end);
+        assert_eq!(observed.kernel_udp6_delta, Some(BTreeMap::from([
+            ("Udp6InDatagrams".into(), 3),
+            ("Udp6RcvbufErrors".into(), 0),
+        ])));
+        let json = serde_json::to_value(&observed).unwrap();
+        assert_eq!(json["kernel_udp6_delta"], serde_json::json!({
+            "Udp6InDatagrams": 3, "Udp6RcvbufErrors": 0
+        }));
+        assert!(window(&snapshot(None), &end).kernel_udp6_delta.is_none());
+        assert!(window(&start, &snapshot(None)).kernel_udp6_delta.is_none());
+    }
     fn config() -> DistributedConfig {
         serde_json::from_value(serde_json::json!({"node":0,"nodes":4,"offline":0,
             "headers":32,"heights":2,"warmup":1,"timeout_secs":10,"workers":1,

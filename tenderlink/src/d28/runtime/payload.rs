@@ -807,9 +807,10 @@ impl Network {
                 if pending_index.is_none() && !recent {
                     return Ok(false);
                 }
-                if !canonical_body(body, request.key.height, config.max_body)
-                    || engine.c().body_id(body) != request.key.id
-                {
+                if !measure(config.metrics.as_ref().map(|m| &m.body_check), || {
+                    canonical_body(body, request.key.height, config.max_body)
+                        && engine.c().body_id(body) == request.key.id
+                }) {
                     if let Some(pending) = self
                         .payload
                         .pending
