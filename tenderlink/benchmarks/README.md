@@ -1313,3 +1313,15 @@ created. These are separate localhost processes with a memory backend that still
 executes real encoding/hashing and required atomic replacement barriers. They do
 **not** establish physical disk throughput, worldwide performance, STP/UDP/IP byte
 amplification or operation at the nodes' network-bandwidth limit.
+
+The independent raw-artifact audit completed **29,089 checks with zero errors**:
+61 node reports, 52 retained worker-original copies, 488 node-height records
+including warmup, and 9,882 endpoint counter deltas. It independently reconstructed
+controller latency/throughput and measured CPU, image work and application-byte
+results, and checked provenance and cleanup receipts without importing the runner.
+All **967 input hashes** were reverified unchanged afterward. No reported result
+needed correction. This is an accounting/artifact audit, not new execution,
+physical-durability or cryptographic certification. Receipt:
+`sparse-independent-audit-399.json`, SHA-256
+`3115230fc0c004a07e56eadab990803850cbae4c5f206510fc8b8da0f2106da8`;
+its input manifest is `sparse-independent-audit-399-inputs.json`.
