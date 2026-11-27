@@ -781,3 +781,157 @@ three partial, without fabricating counters or removing failed durations.
 All 517 original file hashes were unchanged when the derived
 `campaign/summary.json` was added. Its SHA-256 is
 `5bdc600be26006484f7fe770371e2ff32bbf2d1ab373f0659b2697b9f2305621`.
+
+## Merkle leaf-size component comparison — 2026-11-27
+
+**Outlining saved bandwidth; Merkle leaves did not improve throughput in this
+configuration.** The 1-MiB leaf arm completed and offered fewer bytes than its
+fresh outlined control. Smaller-leaf arms were substantially slower and partial.
+This is a seven-process **localhost** experiment, not a distributed/WAN result.
+
+### Frozen primary results
+
+All five arms used the same final executable, 10-MiB serialized bodies and body
+capacity, economy polling/status at 100 ms, WAN benchmark timers, receive budget
+32, and two incoming/outgoing payload windows. Merkle windows contain at most
+eight leaves. Each trial planned one warmup plus seven measured heights with a
+600-second **whole-trial** deadline. There were no concurrent builds/tests or
+other task benchmarks. The diagnostic trace was disabled. No settings were tuned
+between arms, and no failed arm was replaced by a successful retry.
+
+| Transport | Measured heights | First receipt p50 / maximum, s | Chain KiB/s | Raw payload/body | Total offered application/body |
+|---|---:|---:|---:|---:|---:|
+| Outlined whole body | 7/7 | 25.332 / 46.529 | 318.932 | 13.714x | 13.919x |
+| Merkle, 1-MiB leaves | 7/7 | 27.908 / 30.069 | 291.100 | 11.414x | 11.776x |
+| Merkle, 256-KiB leaves | 3/7 | 139.162 / 179.689 | 65.593 | 31.600x | 33.673x |
+| Merkle, 100-KiB leaves | 2/7 | 209.623 / 247.293 | 37.773 | 36.483x | 41.451x |
+| Merkle, 32-KiB leaves | 0/7 | unavailable | 0.000 | undefined | undefined |
+
+All **five planned trials ran**: two complete, three partial; **19/35 measured
+heights** completed, plus all five warmup heights. Exit status 1 reports partial
+trials, not a runner exception. The 32-KiB arm reached its all-node warmup barrier
+only after approximately 521 seconds, leaving 78.733 seconds of measured time
+without a decision. It did **not** produce zero blocks during the entire trial.
+
+Latency is controller first receipt on a single monotonic clock, nearest-rank
+p50 and observed maximum, with only 7/7/3/2/0 samples in table order. Partial-arm
+latencies describe **successful heights only**; they do not represent unfinished
+heights. Throughput waits for all seven validators and includes the remaining
+stalled measured time. Post-warmup rate durations in table order are
+224.750/246.238/468.339/542.193/78.733 seconds. These tiny samples do not establish
+reliable tail latencies or a sustained optimum.
+
+The 1-MiB arm reduced raw payload offers by **16.8%** and total application offers
+by **15.4%**, but chain throughput was **8.7% lower** than the fresh outlined
+control. Its first-receipt maximum was smaller, yet all-node cycles remained
+slower. This is not a demonstrated latency/throughput win. The earlier inline
+versus outlined profile is a separate experiment and is not pooled here.
+
+All six disjoint application-byte categories have complete 7/7-node coverage in
+every primary arm. Ratios include work on unfinished heights, not just committed
+bodies. The zero-decision arm still offered **50,711,659 application bytes** in
+its measured interval; dividing by zero committed bytes is undefined, not zero.
+Raw payload, proofs, availability and known duplicates remain subset counters.
+Actual network byte ratios are unavailable on this shared-host run.
+
+The separate final-height holds offered **46.435 KiB/s** of aggregate application
+traffic for outlining and **158.336 KiB/s** for 1-MiB leaves, with zero raw payload
+bytes in either hold and complete 7/7-node counter coverage. These rates sum each
+node's bytes over its actual local hold duration; they are not network-byte rates
+or quiescent-idle chatter. Partial arms did not reach a hold window.
+
+### Leaf geometry versus implementation costs
+
+For a 10-MiB body the implemented geometry is:
+
+| Leaf size | Leaves | Availability bitmap | Merkle proof per leaf | Full signed HAVE record |
+|---|---:|---:|---:|---:|
+| 32 KiB | 320 | 40 B | 288 B | 286 B |
+| 100 KiB | 103 | 13 B | 224 B | 259 B |
+| 256 KiB | 40 | 5 B | 192 B | 251 B |
+| 1 MiB | 10 | 2 B | 128 B | 248 B |
+
+The bitmap is small as intended, and leaf size is independent of STP packet
+size. HAVE also carries the reference and holder attestation, so the full record
+is larger than the bitmap. A transport Merkle root never replaces the existing
+chain body ID: complete reconstruction, canonical encoding, keyed body-ID,
+proposal/certificate and Host validation remain mandatory. Neither a bitmap nor
+an ACK grants consensus validity. Production defaults still use inline transfer;
+no PoW/ledger formats changed.
+
+The measured inefficiency is not explained by large Merkle proofs. In the
+100-KiB arm, proof offers were 1,680,672 bytes versus 765,112,320 raw payload
+bytes. Its measured interval completed 48 assemblies but only two chain heights.
+The 256-KiB arm completed 87 assemblies for three heights; the 1-MiB arm completed
+75 for seven. These counters are not a global duplicate detector, but show
+substantial acquisition work beyond one copy per recipient.
+
+### Repair and separate diagnostic evidence
+
+Before this primary sweep, `f850f396` replaced one-shot leaf acknowledgements with
+one bounded, cumulative eight-index receipt per peer, refreshed on the existing
+status cadence. An actual dropped-message regression failed before the repair
+and passed afterward. Exact-ticket fencing, receipt expiry, old-token watermarks,
+reordered/duplicate leaves and scope retirement have regression coverage. There
+were no timer, budget, window-size or body-retention changes.
+
+The separate 100-KiB diagnostic completed one height in 59.450 seconds. Its
+traces stayed below their caps (5,074 events total; each process below 4,096) and showed:
+
+- 153 source windows fully acknowledged in 386–1,360 ms on each source's clock.
+- One send timeout, with two leaves missing at the receiver despite repeated
+  cumulative ACK arrivals—not the original all-leaves-received/ACK-lost pattern.
+- Nine WANTs without an accepted-request trace; loss versus rejection is unknown.
+- Four accepted requests that offered zero leaves after an old reference became
+  unserviceable at a round change; three cost a full receive timeout.
+- Four nodes successfully retained a full body in round 1, then reacquired that
+  same body from zero in round 2. Retention at completion is not retention across
+  rounds. The precise later eviction/handoff event was not instrumented.
+
+These observations identify request/ownership and round-transition limitations;
+they are not per-event causal proof for the later untraced primary trials. The
+primary 1-MiB arm still discarded 4,735 messages at the runtime receive budget on
+localhost. No claim of a complete acquisition-liveness or whole-node memory proof
+is made. The original failed gate and diagnostic are retained separately.
+
+### Reproduction, verification and artifacts
+
+```sh
+cargo build --offline --locked --release --features bench \
+  --manifest-path tenderlink/Cargo.toml --bin d28_bench
+unset D28_LEAF_TRACE
+python3 -B tenderlink/benchmarks/d28_fly.py local \
+  --binary "$PWD/tenderlink/target/release/d28_bench" \
+  --out /var/tmp/d28-merkle-new --nodes 7 \
+  --body-bytes 10485760 --max-body 10485760 \
+  --payload-modes outlined,merkle \
+  --payload-leaf-bytes 32768,102400,262144,1048576 \
+  --profiles economy --timing-profile wan --repetitions 1 \
+  --heights 7 --warmup 1 --timeout-secs 600 --chatter-secs 2 \
+  --lifetime-secs 4200 --seed 428
+```
+
+Source `fcbb2f635ad405eb82ca119d8c006e6e00dc31d9` passed **350 optimized Rust tests**
+with `CROSSLINK_FUZZ_SEED=428`, five existing ignored tests and unbounded legacy
+`single_rt` excluded; the non-benchmark release library check; the optimized
+benchmark build; and **43 Python checks including real-process tests**. An initial
+existing transport test encountered an address-in-use error. Its unchanged
+focused retry and the subsequent full suite passed; both logs are retained.
+
+Root: `/var/tmp/d28-payload-20261127/`.
+
+- Primary originals and derived summary: `merkle-primary/campaign/`.
+- Frozen plan and preflight: `merkle-primary-plan.json`,
+  `merkle-primary-preflight.json`.
+- Pinned executable: `d28_bench-merkle-f850f396`, SHA-256
+  `6bdfdf6abf5512f79f5eee41f0535d4f3c44376a8de40c78b75ea501afb3cf46`.
+- Runner SHA-256:
+  `5e2c8a24a28d64c5fcf66ec2dcd4179160c816ff037f540b3c172fd3f7ea6bda`.
+- ACK diagnostic: `merkle-ack-diagnostic/`, including its separate binary/patch,
+  original reports, bounded traces and `trace-reduction.json`.
+- Verification: `merkle-final-verification-retry.log`; initial bind failure and
+  focused retry in `merkle-final-verification.log` and `merkle-port-bind-retry.log`.
+
+The local cleanup receipt confirms all owned children/worker threads stopped and
+the temporary token removed. No benchmark processes remain and no Fly resources
+were created for either payload comparison.
