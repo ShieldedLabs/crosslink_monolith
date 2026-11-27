@@ -6,6 +6,22 @@
 use super::{Config, Error, Id, Result};
 use std::sync::Arc;
 
+#[cfg(test)]
+std::thread_local! {
+    static HASH_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+#[cfg(test)]
+pub(super) fn record_hash(bytes: usize) {
+    HASH_WORK.with(|count| {
+        let (calls, total) = count.get();
+        count.set((calls + 1, total + bytes));
+    });
+}
+#[cfg(test)]
+pub(super) fn hash_work() -> (usize, usize) {
+    HASH_WORK.with(std::cell::Cell::get)
+}
+
 #[derive(Clone)]
 pub(super) struct CheckedBody {
     config: Id,
@@ -17,7 +33,12 @@ pub(super) struct CheckedBody {
 }
 impl CheckedBody {
     pub(super) fn new(config: &Config, height: u64, id: Id, bytes: Vec<u8>) -> Result<Self> {
-        if bytes.len() > config.max_body() || config.body_id(&bytes) != id {
+        if bytes.len() > config.max_body() {
+            return Err(Error::Invalid);
+        }
+        #[cfg(test)]
+        record_hash(bytes.len());
+        if config.body_id(&bytes) != id {
             return Err(Error::Invalid);
         }
         Ok(Self {
