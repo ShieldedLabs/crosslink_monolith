@@ -981,13 +981,13 @@ impl<S: Storage> Engine<S> {
             Ok(())
         }
     }
-    /// Persist every staged write, including elapsed-time bookkeeping. This
-    /// performs no work after a failure; reopen the backend before recovery.
+    /// Persist every staged write, including elapsed-time bookkeeping. Any error
+    /// deactivates the engine; reopen the backend before recovery (never retry).
     pub fn checkpoint(&mut self) -> Result<()> {
         if !self.active {
             return Err(Error::Inactive);
         }
-        let r = self.store.flush();
+        let r = self.store.flush().map_err(|_| Error::Storage);
         self.finish(r)
     }
     /// Fence host/network publication from borrowed views. Unlike `checkpoint`,
@@ -996,7 +996,7 @@ impl<S: Storage> Engine<S> {
         if !self.active {
             return Err(Error::Inactive);
         }
-        let r = self.store.flush_publication();
+        let r = self.store.flush_publication().map_err(|_| Error::Storage);
         self.finish(r)
     }
     fn commit(&mut self, d: Descriptor) -> Result<()> {
@@ -1095,7 +1095,7 @@ impl<S: Storage> Engine<S> {
         }
         self.drive(sink)?;
         // INIT retires old signing authority even with tau > 0 or no local key.
-        self.store.flush()?;
+        self.checkpoint()?;
         Ok(true)
     }
     fn clear_volatile(&mut self) {
@@ -1173,7 +1173,7 @@ impl<S: Storage> Engine<S> {
     fn materialize(&mut self, k: VoteKind) -> Result<()> {
         if self.me == usize::MAX {
             // Observers also retain entry/lock transitions without signer output.
-            return self.store.flush_publication();
+            return self.publication_checkpoint();
         }
         let Some(intent) = self.d().intents[k.index()] else {
             return Ok(());
@@ -1192,7 +1192,7 @@ impl<S: Storage> Engine<S> {
             None => {
                 // The complete intent/lock/evidence image must precede signing,
                 // not merely precede emission of the resulting OWN record.
-                self.store.flush()?;
+                self.checkpoint()?;
                 let v = Vote::try_sign(self.c(), &self.key, intent)?;
                 self.store.write_own(k, v)?;
                 v
@@ -1565,7 +1565,7 @@ impl<S: Storage> Engine<S> {
             }
             _ => {
                 // The body and proposal intent must be durable before signing.
-                self.store.flush()?;
+                self.checkpoint()?;
                 let h = Header::try_sign(self.c(), &self.key, content)?;
                 self.store.write_own_header(h)?;
                 h
@@ -1598,7 +1598,7 @@ impl<S: Storage> Engine<S> {
         self.commit(d)?;
         // Guided emission is a no-op, but retained headers can be attested by
         // the transport and body tags can escape through host validation.
-        self.store.flush_publication()?;
+        self.publication_checkpoint()?;
         self.acquiring = false;
         Ok(())
     }
