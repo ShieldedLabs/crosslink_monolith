@@ -202,7 +202,7 @@ impl ClosureToPushDecidedBlock {
         Self(Arc::new(move |_, fat_pointer, _| {
             let tip = HostTip {
                 height: fat_pointer.get_vote_template().height,
-                block_id: ValueId(fat_pointer.points_at_block_hash().0),
+                certificate: fat_pointer,
                 next_roster: next_roster.clone(),
                 next_vote_namespace,
                 next_strict_quorum,
@@ -240,9 +240,9 @@ impl std::fmt::Debug for ClosureToFetchDecidedRound {
 #[derive(Clone, Debug)]
 pub struct HostTip {
     pub height: u64,
-    /// The decided block's id: an engine that decided `height` itself keeps its own round only if
-    /// it decided this block.
-    pub block_id: ValueId,
+    /// The certificate the host stored. Matching only the block id would let an engine retain
+    /// rejected signatures after a peer supplied a valid certificate for the same block.
+    pub certificate: FatPointerToBftBlock,
     pub next_roster: Vec<SortedRosterMember>,
     pub next_vote_namespace: [u8; 32],
     pub next_strict_quorum: bool,
@@ -1325,15 +1325,14 @@ impl TMState {
         self.fetched_decided_rounds.push((height, round, std::time::Instant::now()));
     }
 
-    /// Moves to the height after `tip`, the host's newest decided height, with the roster, vote
-    /// namespace and quorum rule the host gave for it. `own_round` is the round that decided a
-    /// height here, when this engine decided one; it is kept as decided only if it decided the
-    /// block the host stored at `tip.height`. Otherwise (the engine was behind and jumps, the host
-    /// had decided past the engine's height, or stored another block there) it keeps no round of
-    /// a height it passed and reads the tip's round back from the host, so a peer one height behind
-    /// is still served the host's decision from memory; older ones are read when a peer needs them
-    /// (`fetch_decided_round`). The caller then takes the next height's WAL record and starts its
-    /// round.
+    /// Advances to `tip.height + 1` using the host's next roster, vote namespace and quorum rule.
+    ///
+    /// `own_round` is the decision this engine submitted, if any. Cache it for sharing with peers
+    /// only if its height and entire certificate match the host's tip. Otherwise, clear the recent
+    /// cache and load the host's stored round for `tip.height`, if available. Matching the block
+    /// hash alone is not enough: our signatures may have been rejected.
+    ///
+    /// The caller then restores the new height's WAL record and starts its round.
     fn enter_height_after(&mut self, roster: &mut Vec<SortedRosterMember>, tip: &HostTip, own_round: Option<RoundData>) {
         *roster = tip.next_roster.clone();
         self.height = tip.height + 1;
@@ -1341,7 +1340,9 @@ impl TMState {
         // roster by the host).
         self.vote_namespace = tip.next_vote_namespace;
         self.strict_quorum = tip.next_strict_quorum;
-        match own_round.filter(|round| round.height == tip.height && round.proposal_id == tip.block_id) {
+        match own_round.filter(|round| {
+            round.height == tip.height && round_data_to_fat_pointer(round, &round.roster) == tip.certificate
+        }) {
             Some(round) => self.recent_commit_round_cache.push(round),
             None => {
                 self.recent_commit_round_cache.clear();
@@ -2296,12 +2297,11 @@ async fn instance(
             let roster2 = roster2.clone();
             Box::pin(async move {
                 let height = fat_pointer.get_vote_template().height;
-                let block_id = ValueId(fat_pointer.points_at_block_hash().0);
-                decisions.lock().unwrap().push((block, fat_pointer));
+                decisions.lock().unwrap().push((block, fat_pointer.clone()));
                 let mut ret = roster2.clone();
                 ret.truncate(3 + decisions.lock().unwrap().len() % 2);
                 // Sim/test has no slashforks → nil namespace (backwards-compatible no-op).
-                HostTip { height, block_id, next_roster: ret, next_vote_namespace: [0u8; 32], next_strict_quorum: false }
+                HostTip { height, certificate: fat_pointer, next_roster: ret, next_vote_namespace: [0u8; 32], next_strict_quorum: false }
             })
         })),
         ClosureToUpdatePeers(Arc::new(move |_all_peers| { Box::pin(async move {
@@ -6356,14 +6356,14 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let mut engine_roster = roster.to_vec();
 
-        let behind = HostTip { height: 3, block_id: stored[3].proposal_id, next_roster: roster.to_vec(), next_vote_namespace: [0; 32], next_strict_quorum: false };
+        let behind = HostTip { height: 3, certificate: round_data_to_fat_pointer(&stored[3], &roster), next_roster: roster.to_vec(), next_vote_namespace: [0; 32], next_strict_quorum: false };
         node.read_tip_closure = ClosureToReadDecidedTip(Arc::new(move |_| Some(behind.clone())));
         rt.block_on(node.take_decided_tip(&mut engine_roster));
         assert_eq!((node.height, node.recent_commit_round_cache.len()), (7, 7), "a tip below the engine moves nothing");
 
         // The host decided up to 6 the same way; its tip is 6, so the engine at 7 is level and
         // jumps to 7 again, keeping only 6's round.
-        let tip = HostTip { height: 6, block_id: stored[6].proposal_id, next_roster: roster.to_vec(), next_vote_namespace: [0; 32], next_strict_quorum: false };
+        let tip = HostTip { height: 6, certificate: round_data_to_fat_pointer(&stored[6], &roster), next_roster: roster.to_vec(), next_vote_namespace: [0; 32], next_strict_quorum: false };
         node.height = 6;
         node.read_tip_closure = ClosureToReadDecidedTip(Arc::new(move |_| Some(tip.clone())));
         rt.block_on(node.take_decided_tip(&mut engine_roster));
@@ -6376,12 +6376,67 @@ mod tests {
         assert_eq!(reads.load(Ordering::Relaxed), 2, "an older height is read from the host");
     }
 
+    /// The host refuses a damaged certificate, then publishes a peer's valid certificate for
+    /// exactly the same block and height. The engine must gossip the accepted votes afterwards.
+    #[test]
+    fn recovery_at_the_same_height_gossips_the_hosts_accepted_certificate() {
+        let (keys, roster) = sim_finalizers(4);
+        let (_, stored) = recent_decisions(&keys, &roster, 8, 1);
+        let accepted = stored[0].clone();
+        let mut rejected = accepted.clone();
+        rejected.msg_val_sigs[0][1].1.0[0] ^= 1;
+        assert!(!round_data_to_fat_pointer(&rejected, &roster).validate_signatures(&accepted.vote_namespace));
+
+        // An observer does not add its own votes while submitting the fault-injected round.
+        let mut node = engine_with_key(&SigningKey::from([99; 32]), &roster, accepted.height, accepted.vote_namespace, false);
+        node.rounds_data.push(rejected);
+        let tip = HostTip {
+            height: accepted.height, certificate: round_data_to_fat_pointer(&accepted, &roster), next_roster: roster.clone(),
+            next_vote_namespace: accepted.vote_namespace, next_strict_quorum: false,
+        };
+        let namespace = accepted.vote_namespace;
+        node.push_block_closure = ClosureToPushDecidedBlock(Arc::new(move |_, candidate, _| {
+            assert!(!candidate.validate_signatures(&namespace), "the host refuses the candidate");
+            assert_eq!(candidate.get_vote_template().height, tip.height);
+            assert_eq!(candidate.points_at_block_hash(), tip.certificate.points_at_block_hash());
+            let published = tip.clone();
+            Box::pin(async move { published })
+        }));
+        let stored_round = accepted.clone();
+        node.fetch_decided_round_closure = ClosureToFetchDecidedRound(Arc::new(move |_| Some(stored_round.clone())));
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(node.bft_update(&mut roster.clone()));
+        assert_eq!(node.height, accepted.height + 1);
+
+        let mut peer = Peer { have_height_round: Some((accepted.height, accepted.round)), ..Peer::default() };
+        let rounds = gossip_rounds_of(&node);
+        let mut packets = Vec::new();
+        gossip_to_peer(&mut node, &roster, &rounds, &mut peer, roster[1].pub_key, "recovered", 0, 0, &mut packets);
+        let mut votes_seen = 0;
+        for packet in packets {
+            let mut bytes = &packet[..];
+            let header = PacketHeader::read_from(&mut bytes).unwrap();
+            if header.has_status() { PacketStatus::read_from(&mut bytes).unwrap(); }
+            if header.type_() != PACKET_TYPE_PRECOMMIT_SIGNATURES { continue; }
+            let votes = PacketVotes::read_from(&mut bytes).unwrap();
+            assert_eq!((votes.height, votes.round, votes.value_id), (accepted.height, accepted.round, accepted.proposal_id));
+            assert_eq!(votes.no_votes_n, 0);
+            for vote in &votes.votes[..usize::from(votes.no_votes_n + votes.yes_votes_n)] {
+                let key = roster[usize::from(vote.roster_i)].pub_key;
+                let data = make_vote_sign_datas(key, true, votes.height, votes.round, votes.value_id)[1];
+                assert!(vote.sig.verify_with_namespace(key, &data, &namespace).is_ok(), "gossiped a rejected signature");
+                assert_eq!(vote.sig, accepted.msg_val_sigs[usize::from(vote.roster_i)][1].1);
+                votes_seen += 1;
+            }
+        }
+        assert_eq!(votes_seen, accepted.msg_val_sigs.len());
+    }
+
     /// An engine that decided a height keeps its own round as that height's decision only when the
-    /// host stored the same block there. When the host stored another (finalizers equivocated) or
+    /// host stored the same certificate there. When the host stored another certificate or
     /// had decided past it, the engine reads the host's round back instead, so it never serves a
     /// peer a decision the host's chain does not hold.
     #[test]
-    fn an_own_decision_is_kept_only_if_the_host_stored_that_block() {
+    fn an_own_decision_is_kept_only_if_the_host_stored_that_certificate() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let (keys, roster) = sim_finalizers(4);
         let (mut node, stored) = recent_decisions(&keys, &roster, 8, 7);
@@ -6393,7 +6448,7 @@ mod tests {
         }));
         let mut engine_roster = roster.to_vec();
         let tip_at = |height: usize| HostTip {
-            height: height as u64, block_id: stored[height].proposal_id, next_roster: roster.to_vec(), next_vote_namespace: [0; 32], next_strict_quorum: false,
+            height: height as u64, certificate: round_data_to_fat_pointer(&stored[height], &roster), next_roster: roster.to_vec(), next_vote_namespace: [0; 32], next_strict_quorum: false,
         };
         let deciding = |node: &mut TMState, height: u64| {
             node.height = height;
@@ -7363,10 +7418,9 @@ mod tests {
         let decisions = Arc::clone(store);
         node.push_block_closure = ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer, _| {
             let height = u64::from_le_bytes(fat_pointer.vote_for_block_without_finalizer_public_key[32..40].try_into().unwrap());
-            let block_id = ValueId(fat_pointer.points_at_block_hash().0);
             decisions.lock().unwrap().decided.push((height, block.id_from_value(&HashKeys::default())));
             let roster = decided_roster.clone();
-            Box::pin(async move { HostTip { height, block_id, next_roster: roster, next_vote_namespace: [0; 32], next_strict_quorum: strict_quorum } })
+            Box::pin(async move { HostTip { height, certificate: fat_pointer, next_roster: roster, next_vote_namespace: [0; 32], next_strict_quorum: strict_quorum } })
         }));
         let records = Arc::clone(store);
         node.write_wal_closure = ClosureToWriteWal(Arc::new(move |height, record| {

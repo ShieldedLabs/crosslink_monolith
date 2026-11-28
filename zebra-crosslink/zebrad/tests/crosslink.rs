@@ -5517,6 +5517,58 @@ fn crosslink_bft_own_candidate_failing_the_block_rules_is_refused_without_a_cras
     test_bytes(tf.write_to_bytes());
 }
 
+/// A failed signature check on tenderlink's own candidate must not store it or kill the node.
+/// A valid decision from a peer at the same height can still advance BFT afterwards.
+#[test]
+fn crosslink_bft_own_candidate_with_a_bad_signature_is_refused_without_a_crash() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    let mut scene = bft_rounds_scene(&mut tf, &[false]);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    let decisions = bft_rounds_decisions(&scene, 20, 1);
+
+    let (_, block, fat_ptr, sigs) = &decisions[0];
+    assert!(fat_ptr.validate_signatures(&[0; 32]));
+    let mut bad = fat_ptr.clone();
+    bad.signatures[0].vote_signature[0] ^= 1;
+    assert!(!bad.validate_signatures(&[0; 32]));
+    let candidate = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block: block.clone(), fat_ptr: bad });
+    tf.push_instr_bft_push_candidate(&candidate, sigs, 0);
+    tf.push_instr_expect_pos_chain_length(1, 0);
+    tf.push_instr_expect_bft_step(1, 0, None, 0);
+    tf.push_instr_expect_bft_dropped(false, None, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    let pow = scene.gen.next_block(&scene.miner);
+    tf.push_instr_load_pow(&pow, 0);
+    tf.push_instr_expect_pow_tip(&pow.hash(), 0);
+    tf.push_instr_expect_pos_chain_length(1, 0);
+
+    let packet = zebra_state::new_network::bft_sync::bft_decisions_packet(
+        decisions.iter().map(|(height, block, fat_ptr, sigs)| (*height, block, fat_ptr, sigs.as_slice())),
+    );
+    tf.push_instr_recv_stp_packet(&packet, 7, 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+    tf.push_instr_expect_bft_step(2, 0, None, 0);
+    tf.push_instr_expect_bft_dropped(false, None, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    // A late candidate for another block at an already-decided height gets certificate
+    // validation against that height's historical roster, and must not crash either.
+    let other = bft_rounds_decisions(&scene, 30, 1);
+    let (_, block, fat_ptr, sigs) = &other[0];
+    let mut bad = fat_ptr.clone();
+    bad.signatures[0].vote_signature[0] ^= 1;
+    let candidate = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block: block.clone(), fat_ptr: bad });
+    tf.push_instr_bft_push_candidate(&candidate, sigs, 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+    tf.push_instr_expect_bft_dropped(false, None, 0);
+    tf.push_instr_expect_node_alive(0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 /// A finalizer that crashes after precommitting a value at 1.0 and restarts must not vote anything
 /// else at 1.0: it replays the votes its WAL holds instead of voting afresh. Time then runs past
 /// the round's timeouts, where a node that had forgotten its votes would prevote nil at 1.0. The
@@ -6617,8 +6669,8 @@ fn crosslink_load_pos_refuses_a_decision_with_no_signatures() {
     test_bytes(tf.write_to_bytes());
 }
 
-/// A certificate carrying a signature that does not verify is refused. `decide` treats one as
-/// impossible and stops the node, so a fed decision must be turned away before it gets there.
+/// An imported certificate carrying a signature that does not verify is refused without
+/// changing the decided chain.
 #[test]
 fn crosslink_load_pos_refuses_a_certificate_with_a_bad_signature() {
     set_test_name(function_name!());
