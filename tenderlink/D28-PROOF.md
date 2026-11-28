@@ -1286,28 +1286,56 @@ planned-send backlog retirement is not proof of delivery or memory reclamation.
 
 ## Persistence and memory are separate contracts
 
-`AtomicBlockStore` is the unchanged fixed-size atomic replacement API. Its
-bounded codec contains two configuration banks, three bodies, four certificate
-regions and fixed signing/publication records. The image size remains
-`4096 + 3*Bmax + 556*Nmax` bytes, and the old-or-new backend contract is unchanged.
-Private durable-image version 2 places metadata and its checksum in the first
+`AtomicBlockStore` retains a fixed-size logical image and an old-or-new atomic
+replacement contract. Its bounded codec contains two configuration banks, three
+bodies, four certificate regions and fixed signing/publication records. The
+logical image size remains `4096 + 3*Bmax + 556*Nmax` bytes. Optional
+`replace_regions(next, changed)` commits all changed regions as **one atomic
+transaction**, not independent atomic writes to each region. The single owner
+supplies the complete next image, unchanged outside the declared regions.
+Backends validate ordered, nonempty, disjoint, in-bounds ranges before mutation;
+first initialization establishes the complete image. The default implementation
+safely falls back to whole-image replacement.
+
+Private durable-image version 2 is unchanged: metadata and its checksum occupy
 `4096 + 556*Nmax` bytes, followed by three fixed `Bmax` body regions. Metadata
 binds each body's length and digest. Three volatile cache entries let metadata-only
 updates reuse unchanged body bytes and digests; they confer no signing or Host
-validity authority. Cold loading checks the actual bytes of every body, all
-canonical zero padding and the metadata checksum before seeding those caches.
+validity authority. The durable adapter captures metadata plus changed body
+regions before encoding clears cache dirt; body regions include their padding.
+First encoding/v1 conversion selects all four regions. Cold loading checks the
+actual bytes of every body, all canonical zero padding and the metadata checksum
+before seeding those caches.
 
 Version 1 images remain readable and are converted only at the next already-required
 atomic replacement, not on open or drop. Failed conversion can leave either a
-complete v1 or complete v2 image. Older executables reject v2; this is not downgrade
-compatibility. PoW/ledger formats, chain-facing BFT encodings and signatures are
-unchanged. The backend still replaces the entire image: the cache reduces local
-encoding/checksum work, not physical write volume per replacement.
+complete v1 or complete v2 image. PoW/ledger formats, chain-facing BFT encodings,
+signatures and consensus rules are unchanged.
+
+Zebra stores the metadata and three bodies under four fixed D28-only keys, outside
+the legacy four-byte height-key range. The existing monolith key becomes the
+metadata root with a new `D28KEY02` envelope and the same 40-byte signer-identity
+prefix. A consistent RocksDB snapshot reads the four rows, checking pinned
+value lengths against trusted limits before making application-owned copies.
+This does not bound RocksDB's internal cache/decompression allocations. Missing,
+mixed, orphaned, wrong-size or wrong-identity state is an error, not fresh storage.
+Presence detection includes every D28 key without copying its value, and read
+errors cannot authorize bootstrap. Existing `D28KEY01` monoliths load without a write, provided no split
+body rows coexist. The first required split commit writes metadata and **all
+three bodies**, even when a legacy v2 image has clean body caches. Later commits
+write metadata plus only changed full body rows, in one synced `WriteBatch`.
+
+The new root envelope makes older executables fail closed rather than recover a
+stale monolith or mistake its absence for permission to start fresh. This is not
+downgrade compatibility. Split storage changes private backend representation,
+not the logical v2 image. It adds no body history or independently committed
+intermediate signing state. Reduced submitted row bytes are not a claim about
+RocksDB's physical WAL, SST, compaction or device write amplification.
 
 `DurableStore::open` retains eager per-mutation durability and its reference crash
 cuts. Explicit `open_buffered`, used by the runtime, stages logical writes in the
 same bounded workspace and commits at barriers instead. Neither mode adds an
-append-only WAL, another image, extra body history or fragment history.
+append-only application WAL, another image, extra body history or fragment history.
 
 The engine commits the full body/evidence/intent state before invoking either
 consensus signer, and commits publication state before callbacks, explicit
@@ -1320,13 +1348,14 @@ authority, reference, activation, context or increasing countdown change.
 Completed-body hash/canonical checks and Host validity remain separate.
 
 A failed mutation, encoding or replacement poisons the adapter; a failed barrier
-halts the engine before further output. Dirty flags clear only on successful
-replacement. Drop does not flush: recovery discards the working copy and reloads
-the backend, checking limits, identity, checksum and semantic publication
-invariants before signing. Zebra's existing backend still adds its 40-byte
-signer-identity envelope and commits via synced RocksDB separately from decided
-chain rows. `MemoryStore` remains a logical test fixture, not durable storage;
-physical power-loss guarantees depend on RocksDB and the filesystem/device.
+halts the engine before further output. Pending logical/publication dirt clears
+only after successful replacement. Encoder-cache updates made while preparing
+an unsuccessful commit cannot be reused: recovery discards the working copy and
+reloads the backend, checking limits, identity, checksum and semantic publication
+invariants before signing. Drop does not flush. D28's synced batches remain
+separate from decided-chain rows. `MemoryStore` and the benchmark's RAM-backed
+region copies do not implement physical durability; power-loss guarantees depend
+on RocksDB and the filesystem/device.
 
 Core roles are bounded independently of the number of elapsed rounds. The runtime
 separates bounded application frame permits, per-tick receive work, queued host
