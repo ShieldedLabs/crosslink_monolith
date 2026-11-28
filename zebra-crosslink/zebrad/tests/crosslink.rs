@@ -4358,6 +4358,75 @@ fn crosslink_chain_prefix_trusted_loads() {
     chain_prefix_of_scene_2_loads(zebra_state::BftCutoff::Cited, true);
 }
 
+/// A chain prefix carrying a decision of height 1 that was decided on a re-proposal: round 1's
+/// proposer re-proposed the value locked in round 0, so its chunk signatures cover valid round 0.
+/// The database does not store the valid round, so the exporter reads it back from the signatures
+/// (`BftDecision::recover_valid_round`, as `chain_prefix` in zebra-state's read service does) and
+/// writes the decision as `export-chain` does (`push_decision`: LOAD_POS with those signatures and
+/// that valid round). `proposer_signs_certificate` picks whether round 1's proposer is among the
+/// precommit signatures of the certificate; the other signers are a two-thirds quorum either way.
+fn exported_reproposal_scene(proposer_signs_certificate: bool) -> TF {
+    let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
+    // A synthetic finalizer proposes both rounds, so the test can sign as either.
+    let scene = bft_rounds_scene(&mut tf, &[false, false]);
+    let proposer = scene.proposer(1, 1);
+    assert_ne!(proposer, TF_BFT_THE_NODE, "the scene puts a synthetic finalizer at 1.1");
+    // Waits for BFT to have started, so height 1 is the one being decided.
+    tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
+
+    let block = scene.height_1_proposal(20);
+    let proposer_seed = synthetic_finalizer_seed(proposer);
+    let other_seeds: Vec<String> = scene
+        .finalizers
+        .iter()
+        .map(|&k| u64::from(k))
+        .filter(|&k| k != proposer)
+        .map(synthetic_finalizer_seed)
+        .collect();
+    let mut signer_seeds: Vec<&[u8]> = std::iter::once(TEST_NODE_FINALIZER_SEED.as_bytes())
+        .chain(other_seeds.iter().map(|seed| seed.as_bytes()))
+        .collect();
+    if proposer_signs_certificate {
+        signer_seeds.push(proposer_seed.as_bytes());
+    }
+    // The node and the two other synthetic finalizers hold more than two-thirds of the stake: the
+    // node's is at least each synthetic finalizer's (`bft_rounds_scene`).
+    let fat_pointer = signed_fat_pointer(&block, 1, 1, &signer_seeds, &[0; 32]);
+    let proposer_key = zebra_crosslink::rng_private_public_key_from_address(proposer_seed.as_bytes()).0;
+    let proposal_sigs = bft_proposal_sigs(&proposer_key, &block, 1, 0, &[0; 32]);
+
+    // What the exporter writes: the valid round it can recover, else -1 (and a warning).
+    let mut decision = zebra_state::BftDecision { block, fat_pointer, proposal_sigs, valid_round: -1 };
+    if let Some(valid_round) = decision.recover_valid_round(&[]) {
+        decision.valid_round = valid_round;
+    }
+    let zebra_state::BftDecision { block, fat_pointer, proposal_sigs, valid_round } = decision;
+    let data = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block, fat_ptr: fat_pointer });
+    tf.push_instr_load_pos_signed(&data, &proposal_sigs, valid_round, 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
+    tf
+}
+
+/// A re-proposed decision whose proposer also signed the certificate survives export and import:
+/// the exporter finds the valid round under the proposer's key among the signers.
+#[test]
+fn crosslink_chain_prefix_keeps_a_reproposal_its_proposer_certified() {
+    set_test_name(function_name!());
+    test_bytes(exported_reproposal_scene(true).write_to_bytes());
+}
+
+/// A re-proposed decision whose proposer did not sign the certificate must survive export and
+/// import too: the network decided it, and its certificate is a quorum. The exporter tries only
+/// the certificate's signers as the proposer, so it cannot recover valid round 0 and writes -1,
+/// and the import refuses the proposer's signatures ("proposal chunk 0 is not signed by …").
+/// After that refusal every later PoW block of a real prefix waits behind the missing decision.
+/// Seen on the featurenet at BFT height 2272, decided in round 5.
+#[test]
+fn crosslink_chain_prefix_keeps_a_reproposal_its_proposer_did_not_certify() {
+    set_test_name(function_name!());
+    test_bytes(exported_reproposal_scene(false).write_to_bytes());
+}
+
 // TODO:
 // - reject signatures from outside the roster
 // - reject pos block with < 2/3rds roster stake
