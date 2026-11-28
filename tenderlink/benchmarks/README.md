@@ -1325,3 +1325,162 @@ physical-durability or cryptographic certification. Receipt:
 `sparse-independent-audit-399.json`, SHA-256
 `3115230fc0c004a07e56eadab990803850cbae4c5f206510fc8b8da0f2106da8`;
 its input manifest is `sparse-independent-audit-399-inputs.json`.
+
+## Worldwide dedicated-CPU and throughput experiments — 2026-11-27/28
+
+Seven private Fly machines ran in **IAD, SJC, GRU, FRA, JNB, SIN and SYD**.
+RAM stayed at **8192 MiB per machine** while dedicated performance CPUs changed
+from one to two to four. Every reported trial used **one Tokio executor thread
+per validator**, with STP's separate native threads; a two-executor-thread arm was
+planned but **not run**. Shards stayed at **100 KiB** throughout. These are real
+D28/signature/Merkle/STP executions with mock bodies and memory-backed atomic
+images, not Zcash transaction validation or physical disk/fsync benchmarks.
+PoW/ledger formats and consensus rules were not changed by these experiments.
+
+All D28 chain-throughput rates below count unique serialized body bytes **once
+per chain**, divided by controller measured-start through final ACK. The benchmark
+still waits for **all online validators** before advancing. First/quorum/all latency means the first,
+fifth and seventh controller decision receipts, not exact certificate formation
+or synchronized cross-machine timestamps. With two validators offline, quorum is
+still five of seven, so quorum and all-online receipt times coincide. Percentiles
+are nearest rank; **p95 is the observed maximum for both 7- and 14-height samples**.
+Warmup, terminal holds and whole-child budget counters are kept separate.
+
+### CPU sizing and block size
+
+The same executable and runner were used for the hardware comparison: executable
+SHA-256 `62f766c07683bc1587873835577cf825cac25208762e7349c35fec85e82147a3`,
+runner `e7ca55ab9b99a97200b7a28d49f800a1c8723de6ee3047d52bb4ae6305593305`.
+Each row has two trials, each with one warmup and seven measured 10-MiB blocks;
+body cap is also 10 MiB. `balanced` uses 25-ms polling and 100-ms status cadence.
+
+| Dedicated CPUs | Kernel ordinary buffer ceilings | Chain MiB/s | First receipt p50/p95, s | All receipt p50/p95, s | App offers/body | Measured VM TX/body |
+|---|---|---:|---:|---:|---:|---:|
+| 1, initial control | 208 KiB | 1.523 | 4.098 / 8.061 | 6.699 / 10.155 | 8.100× | 13.031× |
+| 1, matched sizing control | 16 MiB | 1.569 | 4.351 / 7.970 | 6.525 / 9.127 | 8.180× | 13.110× |
+| 2 | 16 MiB | 1.538 | 4.195 / 8.737 | 6.275 / 10.695 | 8.128× | 13.105× |
+| 4 | 16 MiB | 1.566 | 4.237 / 8.593 | 6.014 / 10.478 | 7.847× | 12.717× |
+
+**More CPUs did not demonstrate higher throughput in this configuration.** This
+is not proof that CPU work or a serial critical path cannot matter. CPU seconds
+summed over seven processes per committed block were 14.68, 14.35 and 13.92 for
+the matched 1/2/4-CPU rows. Full-image replacement volume was 2.899, 2.912 and
+2.886 GiB/block respectively; it is memory work, not disk traffic.
+
+The original 212,992-byte (208-KiB) sysctl observation was **not an effective STP
+socket-buffer measurement**. STP first tries `SO_RCVBUFFORCE`/`SO_SNDBUFFORCE`; these root VMs
+could bypass the ordinary ceiling. An owned disposable socket successfully
+forced 32 MiB above the ceiling on every VM (Linux reported 64 MiB). No baseline
+undersized-buffer warnings appeared. Therefore the roughly 3% difference between
+the first two rows is **not an attributed socket-buffer optimization**.
+
+An instrumented four-CPU 10-MiB/cap-10 control reached 1.598 MiB/s. Its image
+checksum span was 1.410 seconds/block summed across seven nodes, about 0.201 per
+node, versus an all-node median receipt of 6.291 seconds. Phase spans nest and
+must not be added as disjoint CPU costs. The instrumented control is not pooled
+with the uninstrumented hardware rows.
+
+The following separate sweep fixes the **body cap at 40 MiB**, keeping code,
+hardware, shard size and timers identical within that sweep. Each row again has
+two trials and fourteen measured heights. A 10-MiB body under a 40-MiB cap is not
+the same storage workload as a 10-MiB/cap-10 case: the atomic image is about
+120 MiB instead of 30 MiB.
+
+| Body MiB | Chain MiB/s | First receipt p50/p95, s | Quorum receipt p50/p95, s | All receipt p50/p95, s | App offers/body | VM TX/body | Nonzero-round heights |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 1.343 | 4.916 / 8.820 | 5.110 / 9.132 | 7.532 / 11.113 | 10.458× | 17.268× | 0/14 |
+| 20 | 2.105 | 6.610 / 24.967 | 6.883 / 25.228 | 7.276 / 25.300 | 10.479× | 16.422× | 1/14 |
+| 40 | 2.800 | 11.161 / 26.487 | 11.415 / 26.694 | 11.663 / 26.883 | 9.158× | 13.150× | 3/14 |
+
+Larger blocks increased throughput and latency together. These short, warming
+runs are not evidence of unlimited scaling or stable tail latency. Raw payload
+offers are already included in application offers; VM `eth0` TX includes control
+and management traffic and is summed once, **never TX+RX**. None of these ratios
+is an isolated D28 UDP/IP-wire amplification measurement.
+
+### Polling and bounded receive retention: retained negative results
+
+A separate matched 10-MiB/cap-10 experiment changed **only polling cadence** from
+25 to 5 ms (`balanced` versus `fast_poll`), leaving status cadence and consensus
+timers unchanged. Across two trials per arm, throughput was 1.646 versus
+1.714 MiB/s, but all-receipt p95 worsened from 8.952 to 9.883 seconds and CPU cost
+rose from 13.901 to 14.754 CPU-seconds/block. This small observed difference does
+not establish a general speedup; `balanced` remained selected.
+
+Runtime commit `ec333b702` retains bounded receive surplus for later service
+rather than discarding it at each tick's work limit. Fairness/overflow tests cover
+the new queue. The warmed comparison uses **14 warmup plus 14 measured 40-MiB
+blocks**, one trial per arm, with the same four CPUs, 8 GiB, one executor worker,
+100-KiB shards, 40-MiB cap and `balanced`/`wan` settings.
+
+| Runtime | Chain MiB/s | First receipt p50/p95, s | All receipt p50/p95, s | App offers/body | VM TX/body | Scheduler discarded messages/bytes | Nonzero-round heights |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Old drop-surplus control | 2.905 | 10.034 / 31.999 | 11.378 / 33.559 | 7.524× | 9.240× | 860 / 13,688,388 | 2/14 |
+| Bounded receive retention | 2.633 | 10.616 / 35.520 | 11.479 / 38.735 | 8.250× | 10.214× | 0 / 0 | 3/14 |
+
+**No demonstrated speedup:** the candidate was 9.34% slower overall. The eleven
+same-height observations that stayed in round zero in both runs totaled
+120.066245 seconds before and 118.877741 after. The other three heights added
+21.046495 seconds, accounting for the net slowdown. This localizes the difference
+to round-changing heights but does **not identify which phase expired** or prove
+that the queue change caused a regression. Queue occupancy/high-water/residence
+counters were not captured; missing retention telemetry is not zero. Two measured
+proposer rotations and final bounded STP telemetry tails do not certify steady
+state or whole-run network utilization.
+
+### Short timers and unavailable proposers
+
+Four separate, sequential eight-height trials use the receive-retention runtime,
+10-MiB body/cap and one warmup. `wan` has proposal/prevote/precommit bases of
+10/5/7 seconds; benchmark-only `wan_fast` uses 2.5/1.5/2 seconds. Request timeout
+remains 10 seconds and status TTL 15 seconds. Offline identities 5/SIN and 6/SYD
+stay in the seven-member roster; this is absence, not an adversarial-node test.
+
+| Online / timers | Chain MiB/s | First receipt p50/p95, s | All-online receipt p50/p95, s | App offers/body | VM TX/body | Final round indices, measured heights 2–8 |
+|---|---:|---:|---:|---:|---:|---|
+| 7 / wan | 1.666 | 3.985 / 8.022 | 6.351 / 8.692 | 8.685× | 13.757× | 0,0,0,0,0,0,0 |
+| 7 / wan_fast | 1.131 | 7.620 / 16.273 | 7.785 / 17.001 | 15.042× | 23.460× | 1,0,1,2,1,0,1 |
+| 5 / wan | 0.796 | 7.843 / 39.654 | 8.087 / 39.858 | 5.674× | 9.188× | 0,0,0,2,1,0,0 |
+| 5 / wan_fast | 1.045 | 7.893 / 22.590 | 8.110 / 22.783 | 7.469× | 12.094× | 1,1,3,2,1,0,0 |
+
+All four trials completed. Shorter timers reduced healthy throughput by 32.14%
+and increased measured VM TX by 70.53%. With two offline validators, throughput
+rose 31.34% but TX also rose 31.64%; the median did not improve. The missing
+round-zero proposer heights 5/6 changed from 39.858/20.359-second cycles to
+14.324/7.680 seconds, while another height worsened from 8.922 to 22.783 seconds
+and became the worst stall. This is **not a recommended production default**.
+Measured and hold windows had zero receive-budget discards and UDP6 receive-buffer
+errors; nonzero UDP6 send-buffer errors remain recorded. Native lifetime counters
+in final telemetry tails are not whole-measurement deltas.
+
+### Transport-only diagnostic, not chain capacity
+
+A separately bounded, unmodified pinned STP 4.0.0 sender on IAD sent 8192 messages
+of 100 KiB to GRU. The receiver confirmed **8187/8192, 799.5117 MiB**, zero corrupt;
+five messages were missing and the client correctly exited 1. Five FEC decode
+timeouts were also recorded, but retained counters do not prove matching IDs or
+CPU-saturated decoding. The server's outer timeout exit 124 was expected.
+
+Verified goodput was **21.3284 MiB/s** over first submission to mapped last
+verified receive (37.485734 s). Including terminal idle/status waiting to the
+actual 40.297394-second stop gives **19.8403 MiB/s**. These denominators differ;
+there is no per-second receiver-delivery series. After startup ramp and a loss
+backoff, the sender had sixteen continuously fed seconds at the configured
+**32,000-pps cap**, averaging 39.9485 MiB/s of attempted UDP payload. That is
+neither delivered throughput nor NIC saturation. Terminal depletion followed.
+
+D28 uses native queue bounds of 512 KiB–8 MiB and no explicit packet-rate cap;
+the diagnostic uses 4–64 MiB and 32,000 pps, one association and no consensus.
+D28 also distributes each body to six remote validators. Therefore the ratio of
+single-path goodput to chain throughput is **not a same-factor headroom claim**.
+The diagnostic's combined endpoint interface TX was 1,034,802,368 bytes. Both
+endpoints had zero UDP6 send/receive-buffer error deltas during this diagnostic;
+that does not erase send errors observed in the separate D28 trials.
+
+Artifacts for this entire worldwide campaign are under
+`/var/tmp/d28-wan-speed-20261127-2256/`. Earlier-stage results above have independent
+raw-data checks in `summary-check-567.json` (22 unique trials/154 node reports),
+`pair-audit-555.json`, `timing-audit-562.json` (four trials/24 reports/20 remote
+originals), and `headroom-audit-564.json`. Their input hashes were reverified by the
+parent. Sequential stage order, host replacement during CPU resizing, small
+samples, all-online barriers and RAM-backed durability remain limitations.
