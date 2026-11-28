@@ -1289,11 +1289,25 @@ planned-send backlog retirement is not proof of delivery or memory reclamation.
 `AtomicBlockStore` is the unchanged fixed-size atomic replacement API. Its
 bounded codec contains two configuration banks, three bodies, four certificate
 regions and fixed signing/publication records. The image size remains
-`4096 + 3*Bmax + 556*Nmax` bytes; the byte format and old-or-new backend contract
-are unchanged. `DurableStore::open` retains eager per-mutation durability and
-its reference crash cuts. Explicit `open_buffered`, used by the runtime, stages
-logical writes in the same bounded workspace and commits at barriers instead.
-It does not add an append-only WAL, another image, or fragment history.
+`4096 + 3*Bmax + 556*Nmax` bytes, and the old-or-new backend contract is unchanged.
+Private durable-image version 2 places metadata and its checksum in the first
+`4096 + 556*Nmax` bytes, followed by three fixed `Bmax` body regions. Metadata
+binds each body's length and digest. Three volatile cache entries let metadata-only
+updates reuse unchanged body bytes and digests; they confer no signing or Host
+validity authority. Cold loading checks the actual bytes of every body, all
+canonical zero padding and the metadata checksum before seeding those caches.
+
+Version 1 images remain readable and are converted only at the next already-required
+atomic replacement, not on open or drop. Failed conversion can leave either a
+complete v1 or complete v2 image. Older executables reject v2; this is not downgrade
+compatibility. PoW/ledger formats, chain-facing BFT encodings and signatures are
+unchanged. The backend still replaces the entire image: the cache reduces local
+encoding/checksum work, not physical write volume per replacement.
+
+`DurableStore::open` retains eager per-mutation durability and its reference crash
+cuts. Explicit `open_buffered`, used by the runtime, stages logical writes in the
+same bounded workspace and commits at barriers instead. Neither mode adds an
+append-only WAL, another image, extra body history or fragment history.
 
 The engine commits the full body/evidence/intent state before invoking either
 consensus signer, and commits publication state before callbacks, explicit
