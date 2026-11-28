@@ -1656,7 +1656,7 @@ mod tests {
         );
     }
 
-    fn assert_cached_image(store: &mut DurableStore<Block>) {
+    fn assert_cached_image<B: AtomicBlockStore>(store: &mut DurableStore<B>) {
         store.flush().unwrap();
         let mut cold = vec![0x97; image_size(store.limits).unwrap()];
         encode_reference(&store.memory, store.limits, &mut cold, true).unwrap();
@@ -1664,7 +1664,9 @@ mod tests {
             store.image, cold,
             "cached v2 differs from independent cold encoder"
         );
-        assert_eq!(store.backend.image, cold);
+        let mut committed = vec![0; cold.len()];
+        assert!(store.backend.load(&mut committed).unwrap());
+        assert_eq!(committed, cold);
         // Compare every private field through the independent canonical v1
         // encoding, not merely bodies or references visible to the protocol.
         let reopened = decode(&cold, store.limits).unwrap();
@@ -2111,6 +2113,294 @@ mod tests {
             limits,
         )
         .unwrap()
+    }
+
+    // Deterministic atomic-batch model: one abstract old/new transition, with
+    // failures only before the whole transaction or after it. The model checks
+    // omitted bytes against the committed image; it is NOT a claim that a loop
+    // of physical writes or RAM copies has power-loss atomicity.
+    struct RegionBlock {
+        block: Block,
+        initialized: bool,
+        changed: [std::ops::Range<usize>; 4],
+        count: usize,
+    }
+    impl RegionBlock {
+        fn new(block: Block, initialized: bool) -> Self {
+            Self {
+                block,
+                initialized,
+                changed: std::array::from_fn(|_| 0..0),
+                count: 0,
+            }
+        }
+        fn selected(&self) -> &[std::ops::Range<usize>] {
+            &self.changed[..self.count]
+        }
+    }
+    impl AtomicBlockStore for RegionBlock {
+        fn block_size(&self) -> usize {
+            self.block.block_size()
+        }
+        fn load(&mut self, bytes: &mut [u8]) -> Result<bool> {
+            if bytes.len() != self.block_size() {
+                return Err(Error::Storage);
+            }
+            if self.initialized {
+                self.block.load(bytes)
+            } else {
+                bytes.fill(0xa5); // false does not promise clean scratch bytes
+                Ok(false)
+            }
+        }
+        fn replace(&mut self, next: &[u8]) -> Result<()> {
+            self.replace_regions(next, &[0..next.len()])
+        }
+        fn replace_regions(
+            &mut self,
+            next: &[u8],
+            changed: &[std::ops::Range<usize>],
+        ) -> Result<()> {
+            atomic::validate_regions(self.block_size(), next, changed)?;
+            assert!(changed.len() <= 4, "DurableStore's fixed region budget");
+            if self.initialized {
+                let mut end = 0;
+                for range in changed {
+                    assert_eq!(&self.block.image[end..range.start], &next[end..range.start]);
+                    end = range.end;
+                }
+                assert_eq!(&self.block.image[end..], &next[end..]);
+            }
+            self.count = changed.len();
+            self.changed[..self.count].clone_from_slice(changed);
+            // Block supplies the single abstract all-or-none transition. It
+            // intentionally may report an error after installing ALL new bytes.
+            let result = self.block.replace(next);
+            if self.block.fail != Some(false) {
+                self.initialized = true;
+            }
+            result
+        }
+    }
+    fn region_buffered() -> DurableStore<RegionBlock> {
+        let store = buffered();
+        let limits = store.limits;
+        DurableStore::open_buffered(RegionBlock::new(store.into_backend(), true), limits).unwrap()
+    }
+    fn assert_regions(store: &mut DurableStore<RegionBlock>, indices: &[usize]) {
+        assert_cached_image(store);
+        let layout = image_regions(store.limits).unwrap();
+        let expected: Vec<_> = indices.iter().map(|&index| layout[index].clone()).collect();
+        assert_eq!(store.backend.selected(), expected);
+    }
+
+    #[test]
+    fn region_batches_preserve_same_length_copy_shrink_clear_and_eager_barriers() {
+        for eager in [false, true] {
+            let mut store = region_buffered();
+            store.buffered = !eager;
+            for body in [vec![81; 128], vec![82; 128], vec![83; 1], vec![], vec![84; 128]] {
+                let before = store.backend.block.replacements;
+                store.write_body(0, &body).unwrap();
+                assert_eq!(store.backend.block.replacements - before, usize::from(eager));
+                assert_regions(&mut store, &[0, 1]);
+                store.copy_body(0, 1).unwrap();
+                assert_regions(&mut store, &[0, 2]);
+                store.copy_body(1, 2).unwrap();
+                assert_regions(&mut store, &[0, 3]);
+            }
+            let mut d = store.descriptor().unwrap().clone();
+            d.height += 1;
+            d.slot = None;
+            d.vc = None;
+            d.pending = None;
+            d.entry = None;
+            store.write_descriptor(&d).unwrap();
+            assert_regions(&mut store, &[0, 1, 2, 3]);
+            for slot in 0..3 {
+                assert!(store.body(slot).is_empty());
+                assert!(store.header(slot).is_none());
+            }
+            let before = store.backend.block.replacements;
+            store.flush().unwrap();
+            store.flush_publication().unwrap();
+            assert_eq!(store.backend.block.replacements, before);
+        }
+    }
+
+    #[test]
+    fn region_batches_track_transitive_dirty_copy_and_preserve_publication_dirt() {
+        let mut store = region_buffered();
+        let old = store.backend.block.image.clone();
+        store.write_body(0, &[17; 128]).unwrap();
+        store.copy_body(0, 1).unwrap();
+        store.copy_body(1, 2).unwrap();
+        store.write_body(0, &[18; 128]).unwrap();
+        store.copy_body(2, 1).unwrap();
+        let mut d = store.descriptor().unwrap().clone();
+        d.height_remaining -= 1;
+        store.write_progress_descriptor(&d).unwrap();
+        assert_eq!(store.backend.block.image, old);
+        store.flush_publication().unwrap();
+        assert_eq!(store.backend.block.replacements, 1);
+        assert_regions(&mut store, &[0, 1, 2, 3]);
+        assert_eq!(store.body(0), &[18; 128]);
+        assert_eq!(store.body(1), &[17; 128]);
+        assert_eq!(store.body(2), &[17; 128]);
+        d.height_remaining -= 1;
+        store.write_progress_descriptor(&d).unwrap();
+        store.flush_publication().unwrap();
+        assert_eq!(store.backend.block.replacements, 1, "countdown waits for checkpoint");
+        assert_regions(&mut store, &[0]);
+        assert_eq!(store.backend.block.replacements, 2);
+        let committed = store.backend.block.image.clone();
+        store.write_body(0, b"discard on drop").unwrap();
+        let backend = store.into_backend();
+        assert_eq!(backend.block.replacements, 2);
+        assert_eq!(backend.block.image, committed);
+    }
+
+    #[test]
+    fn region_batches_initialize_all_regions_and_reopen_after_old_or_new_failure() {
+        let limits = Limits { max_members: 4, max_body: 128 };
+        for fail in [None, Some(false), Some(true)] {
+            let backend = RegionBlock::new(Block {
+                image: vec![0xa5; image_size(limits).unwrap()],
+                replacements: 0,
+                fail,
+            }, false);
+            let mut store = DurableStore::open_buffered(backend, limits).unwrap();
+            store.seal_config(&config(4, 128, false)).unwrap();
+            store.write_body(2, b"first body").unwrap();
+            let mut next = vec![0; store.image.len()];
+            encode_reference(&store.memory, limits, &mut next, true).unwrap();
+            let result = store.flush_publication();
+            assert_eq!(result, if fail.is_none() { Ok(()) } else { Err(Error::Storage) });
+            assert_eq!(store.backend.selected(), image_regions(limits).unwrap());
+            assert_eq!(store.backend.block.replacements, 1);
+            assert_eq!(store.is_poisoned(), fail.is_some());
+            let installed = fail != Some(false);
+            assert_eq!(store.backend.initialized, installed);
+            if installed {
+                assert_eq!(store.backend.block.image, next);
+            } else {
+                assert_eq!(store.backend.block.image, vec![0xa5; next.len()]);
+            }
+            if fail.is_some() {
+                assert_eq!(store.flush(), Err(Error::Storage));
+                assert_eq!(store.write_body(0, b"forbidden"), Err(Error::Storage));
+            }
+            let mut backend = store.into_backend();
+            backend.block.fail = None;
+            let mut reopened = DurableStore::open_buffered(backend, limits).unwrap();
+            assert!(!reopened.is_poisoned());
+            assert_eq!(reopened.config().is_some(), installed);
+            assert_eq!(reopened.body(2), if installed { &b"first body"[..] } else { &[] });
+            reopened.flush().unwrap();
+            assert_eq!(reopened.backend.block.replacements, 1);
+        }
+    }
+
+    #[test]
+    fn region_batches_all_dirty_masks_fail_as_one_old_or_new_transaction() {
+        for mask in 0..8 {
+            for applied in [false, true] {
+                let mut store = region_buffered();
+                let limits = store.limits;
+                let old = store.backend.block.image.clone();
+                let mut d = store.descriptor().unwrap().clone();
+                d.height_remaining -= 1;
+                store.write_progress_descriptor(&d).unwrap();
+                for slot in 0..3 {
+                    if mask & (1 << slot) != 0 {
+                        store.write_body(slot, &[slot as u8 + 31; 128]).unwrap();
+                    }
+                }
+                let mut next = vec![0; old.len()];
+                encode_reference(&store.memory, limits, &mut next, true).unwrap();
+                store.backend.block.fail = Some(applied);
+                assert_eq!(store.flush(), Err(Error::Storage));
+                let layout = image_regions(limits).unwrap();
+                let expected: Vec<_> = layout.into_iter().enumerate()
+                    .filter(|(i, _)| *i == 0 || mask & (1 << (i - 1)) != 0)
+                    .map(|(_, range)| range).collect();
+                assert_eq!(store.backend.selected(), expected, "body mask {mask}");
+                assert_eq!(store.backend.block.image, if applied { next } else { old });
+                assert!(store.is_poisoned());
+                assert_eq!(store.flush(), Err(Error::Storage));
+                assert_eq!(store.flush_publication(), Err(Error::Storage));
+                assert_eq!(store.write_body(0, b"no retry"), Err(Error::Storage));
+                assert_eq!(store.write_descriptor(&d), Err(Error::Storage));
+                assert_eq!(store.backend.block.replacements, 1);
+                let committed = store.backend.block.image.clone();
+                let mut backend = store.into_backend();
+                backend.block.fail = None;
+                let mut reopened = DurableStore::open_buffered(backend, limits).unwrap();
+                assert!(!reopened.is_poisoned());
+                assert_eq!(reopened.image, committed);
+                assert_cached_image(&mut reopened);
+                assert_eq!(reopened.backend.block.replacements, 1);
+                // A post-reopen metadata fence must not inherit dirty bodies or
+                // stale cache commitments from the abandoned working copy.
+                let vote = *reopened.own(VoteKind::Prevote).unwrap();
+                reopened.write_own(VoteKind::Prevote, vote).unwrap();
+                assert_regions(&mut reopened, &[0]);
+                assert_eq!(reopened.backend.block.replacements, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn region_batches_v1_conversion_and_v2_match_legacy_whole_image_fallback() {
+        let limits = Limits { max_members: 4, max_body: 128 };
+        for v2 in [false, true] {
+            for fail in [None, Some(false), Some(true)] {
+                let mut memory = populated(limits);
+                memory.descriptor.as_mut().unwrap().grid_remaining = 10;
+                memory.bodies[0].truncate(5);
+                let mut old = vec![0xa9; image_size(limits).unwrap()];
+                encode_reference(&memory, limits, &mut old, v2).unwrap();
+                let mut whole = DurableStore::open_buffered(Block {
+                    image: old.clone(), replacements: 0, fail,
+                }, limits).unwrap();
+                let mut split = DurableStore::open_buffered(RegionBlock::new(Block {
+                    image: old.clone(), replacements: 0, fail,
+                }, true), limits).unwrap();
+                assert_eq!(split.cache.canonical, v2);
+                let mut d = split.descriptor().unwrap().clone();
+                d.height_remaining -= 1;
+                whole.write_progress_descriptor(&d).unwrap();
+                split.write_progress_descriptor(&d).unwrap();
+                split.flush_publication().unwrap();
+                assert_eq!(split.backend.block.replacements, 0, "no eager conversion");
+                assert_eq!(split.backend.block.image, old);
+                let result = split.flush();
+                assert_eq!(result, whole.flush());
+                assert_eq!(result, if fail.is_none() { Ok(()) } else { Err(Error::Storage) });
+                let layout = image_regions(limits).unwrap();
+                assert_eq!(split.backend.selected(), &layout[..if v2 { 1 } else { 4 }]);
+                assert_eq!(split.backend.block.image, whole.backend.image);
+                assert_eq!(split.is_poisoned(), fail.is_some());
+                if fail.is_some() {
+                    assert_eq!(split.flush(), Err(Error::Storage));
+                    assert_eq!(split.write_body(0, b"forbidden"), Err(Error::Storage));
+                }
+                let installed = fail != Some(false);
+                assert_eq!(&split.backend.block.image[..8],
+                    if v2 || installed { MAGIC } else { V1_MAGIC });
+                let committed = split.backend.block.image.clone();
+                let mut backend = split.into_backend();
+                backend.block.fail = None;
+                let mut reopened = DurableStore::open_buffered(backend, limits).unwrap();
+                assert_eq!(reopened.cache.canonical, v2 || installed);
+                assert_eq!(reopened.body(0), memory.body(0));
+                assert_eq!(reopened.descriptor().unwrap().height_remaining,
+                    d.height_remaining + u64::from(!installed));
+                reopened.flush().unwrap();
+                assert_eq!(reopened.backend.block.replacements, 1);
+                assert_eq!(reopened.backend.block.image, committed);
+            }
+        }
     }
 
     #[test]
