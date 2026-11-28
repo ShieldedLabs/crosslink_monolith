@@ -117,6 +117,22 @@ pub fn image_size(limits: Limits) -> Result<usize> {
     Ok(size)
 }
 
+/// The v2 image's fixed physical regions: metadata (including its checksum),
+/// followed by three full `max_body` body regions (including zero padding).
+/// These ordered, adjacent regions cover exactly [`image_size`]. Bounds and
+/// arithmetic are checked identically to `image_size`; no allocation is needed.
+/// Version 1 uses a different layout and must be replaced in full on conversion.
+pub fn image_regions(limits: Limits) -> Result<[std::ops::Range<usize>; 4]> {
+    let size = image_size(limits)?;
+    let metadata = size - 3 * limits.max_body;
+    Ok([
+        0..metadata,
+        metadata..metadata + limits.max_body,
+        metadata + limits.max_body..metadata + 2 * limits.max_body,
+        metadata + 2 * limits.max_body..size,
+    ])
+}
+
 /// Single-owner durable adapter. It is intentionally neither `Clone` nor a
 /// source of a mutable backend reference: replacement errors require reopening.
 pub struct DurableStore<B: AtomicBlockStore> {
@@ -1248,6 +1264,31 @@ fn decode_cached(image: &[u8], limits: Limits) -> Result<(MemoryStore, ImageCach
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_regions_cover_fixed_v2_layout_and_reject_invalid_bounds() {
+        for limits in [
+            Limits { max_members: 1, max_body: 1 },
+            Limits { max_members: 19, max_body: 40 << 20 },
+        ] {
+            let regions = image_regions(limits).unwrap();
+            assert_eq!(regions[0], 0..SCALAR_BYTES + 556 * limits.max_members);
+            for slot in 1..4 {
+                assert_eq!(regions[slot].len(), limits.max_body);
+                assert_eq!(regions[slot].start, regions[slot - 1].end);
+            }
+            assert_eq!(regions[3].end, image_size(limits).unwrap());
+        }
+        for limits in [
+            Limits { max_members: 0, max_body: 1 },
+            Limits { max_members: 1, max_body: 0 },
+            Limits { max_members: usize::MAX, max_body: 1 },
+            Limits { max_members: 1, max_body: usize::MAX },
+            Limits { max_members: 1, max_body: isize::MAX as usize / 3 },
+        ] {
+            assert_eq!(image_regions(limits), Err(Error::Config));
+        }
+    }
 
     // Independent cold encoder: no cache, full-image clear, then serialize all
     // physical state. Preserve the original v1 grammar/differential coverage;
