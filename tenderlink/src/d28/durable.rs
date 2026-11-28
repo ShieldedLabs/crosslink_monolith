@@ -12,10 +12,16 @@
 //! three bodies, four certificate regions, and constant-sized signing/publication
 //! records. The configured bounds are immutable across roster changes. One image
 //! buffer is reused; backend copies and the engine's volatile workspace are separate.
-use super::*;
 use super::metrics::AtomicWallTime;
 pub use super::metrics::WallTimeSnapshot;
-use std::sync::Arc;
+use super::*;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 /// Optional persistence observations; fixed-size and cumulative. No reads of the
 /// monotonic clock are added unless attached with `DurableStore::with_metrics`.
@@ -24,17 +30,34 @@ pub struct Metrics {
     image_encode: AtomicWallTime,
     image_checksum: AtomicWallTime,
     backend_replace: AtomicWallTime,
+    body_bytes_copied: AtomicU64,
+    body_bytes_hashed: AtomicU64,
+    metadata_bytes_hashed: AtomicU64,
+    body_bytes_zeroed: AtomicU64,
+    metadata_bytes_zeroed: AtomicU64,
+    body_slots_reused: AtomicU64,
 }
 
 /// Counts attempted phases, including errors. Clean/poisoned fences do no work
 /// and add no samples. Encode includes checksum; checksum is a subset, NOT an
 /// additional cost. Backend replacement excludes encode and includes any backend
 /// blocking/delay. These are wall nanoseconds, never process/thread CPU time.
+/// `image_checksum` has one sample per encoding attempt that hashes anything;
+/// its duration sums only body-digest and metadata-checksum hashing, not copying.
+/// Work counters count actual encoder bytes/slots, including failed attempts,
+/// not staging copies, load validation, allocation initialization or backend I/O.
+/// In particular they do NOT imply less physical replacement traffic.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub image_encode: WallTimeSnapshot,
     pub image_checksum: WallTimeSnapshot,
     pub backend_replace: WallTimeSnapshot,
+    pub body_bytes_copied: u64,
+    pub body_bytes_hashed: u64,
+    pub metadata_bytes_hashed: u64,
+    pub body_bytes_zeroed: u64,
+    pub metadata_bytes_zeroed: u64,
+    pub body_slots_reused: u64,
 }
 impl Metrics {
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -42,12 +65,19 @@ impl Metrics {
             image_encode: self.image_encode.snapshot(),
             image_checksum: self.image_checksum.snapshot(),
             backend_replace: self.backend_replace.snapshot(),
+            body_bytes_copied: self.body_bytes_copied.load(Ordering::Relaxed),
+            body_bytes_hashed: self.body_bytes_hashed.load(Ordering::Relaxed),
+            metadata_bytes_hashed: self.metadata_bytes_hashed.load(Ordering::Relaxed),
+            body_bytes_zeroed: self.body_bytes_zeroed.load(Ordering::Relaxed),
+            metadata_bytes_zeroed: self.metadata_bytes_zeroed.load(Ordering::Relaxed),
+            body_slots_reused: self.body_slots_reused.load(Ordering::Relaxed),
         }
     }
 }
 
-const MAGIC: &[u8; 8] = b"D28IMG01";
-const VERSION: u32 = 1;
+const V1_MAGIC: &[u8; 8] = b"D28IMG01";
+const MAGIC: &[u8; 8] = b"D28IMG02";
+const VERSION: u32 = 2;
 const PREFIX: usize = 36; // magic, version, Nmax, Bmax, payload length
 const CHECKSUM: usize = 32;
 // All scalar records, option tags, length words, and headers fit below this
@@ -94,6 +124,7 @@ pub struct DurableStore<B: AtomicBlockStore> {
     limits: Limits,
     memory: MemoryStore,
     image: Vec<u8>,
+    cache: ImageCache,
     buffered: bool,
     dirty: bool,
     publication_dirty: bool,
@@ -126,16 +157,17 @@ impl<B: AtomicBlockStore> DurableStore<B> {
         }
         let mut image = capacity(size)?;
         image.resize(size, 0);
-        let memory = if backend.load(&mut image)? {
-            decode(&image, limits)?
+        let (memory, cache) = if backend.load(&mut image)? {
+            decode_cached(&image, limits)?
         } else {
-            MemoryStore::default()
+            (MemoryStore::default(), ImageCache::default())
         };
         Ok(Self {
             backend,
             limits,
             memory,
             image,
+            cache,
             buffered,
             dirty: false,
             publication_dirty: false,
@@ -185,7 +217,10 @@ impl<B: AtomicBlockStore> DurableStore<B> {
         }
     }
 
-    fn update(&mut self, mutate: impl FnOnce(&mut MemoryStore) -> Result<()>) -> Result<()> {
+    fn update_metadata(
+        &mut self,
+        mutate: impl FnOnce(&mut MemoryStore) -> Result<()>,
+    ) -> Result<()> {
         self.stage(mutate)?;
         self.publication_dirty = true;
         if !self.buffered {
@@ -194,12 +229,27 @@ impl<B: AtomicBlockStore> DurableStore<B> {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn update(&mut self, mutate: impl FnOnce(&mut MemoryStore) -> Result<()>) -> Result<()> {
+        self.cache.bodies.iter_mut().for_each(|b| b.dirty = true);
+        self.update_metadata(mutate)
+    }
+
     fn stage(&mut self, mutate: impl FnOnce(&mut MemoryStore) -> Result<()>) -> Result<()> {
         self.ready()?;
         // The reference fault counter is not durable state and must not grow.
         self.memory.writes = 0;
+        let lengths = self.memory.bodies.each_ref().map(Vec::len);
         let result = mutate(&mut self.memory);
         self.memory.writes = 0;
+        // Descriptor publication can evict all physical bodies on a height change.
+        // Track lengths across every mutation, including implicit clears. Explicit
+        // body writes/copies also invalidate before staging (even at equal length).
+        for (slot, before) in lengths.into_iter().enumerate() {
+            if self.memory.bodies[slot].len() != before {
+                self.cache.bodies[slot].dirty = true;
+            }
+        }
         self.mutation_result(result)?;
         self.dirty = true;
         Ok(())
@@ -220,8 +270,13 @@ impl<B: AtomicBlockStore> Storage for DurableStore<B> {
         self.ready()?;
         if self.dirty {
             let result = encode_observed(
-                &self.memory, self.limits, &mut self.image, self.metrics.as_deref(),
-            ).and_then(|()| {
+                &self.memory,
+                self.limits,
+                &mut self.image,
+                &mut self.cache,
+                self.metrics.as_deref(),
+            )
+            .and_then(|()| {
                 let _timer = self.metrics.as_ref().map(|m| m.backend_replace.start());
                 self.backend.replace(&self.image)
             });
@@ -291,7 +346,7 @@ impl<B: AtomicBlockStore> Storage for DurableStore<B> {
         {
             return Err(Error::Corrupt);
         }
-        self.update(|m| m.begin_config(bank, meta))
+        self.update_metadata(|m| m.begin_config(bank, meta))
     }
     fn write_config_member(&mut self, bank: usize, row: usize, member: Member) -> Result<()> {
         self.index(bank, 2)?;
@@ -304,11 +359,11 @@ impl<B: AtomicBlockStore> Storage for DurableStore<B> {
         if self.memory.sealed[bank] {
             return Err(Error::Corrupt);
         }
-        self.update(|m| m.write_config_member(bank, row, member))
+        self.update_metadata(|m| m.write_config_member(bank, row, member))
     }
     fn seal_config_bank(&mut self, bank: usize, hash: Id) -> Result<()> {
         self.index(bank, 2)?;
-        self.update(|m| m.seal_config_bank(bank, hash))
+        self.update_metadata(|m| m.seal_config_bank(bank, hash))
     }
     fn seal_config(&mut self, c: &Config) -> Result<()> {
         self.ready()?;
@@ -352,7 +407,7 @@ impl<B: AtomicBlockStore> Storage for DurableStore<B> {
         if self.buffered && self.memory.descriptor() == Some(d) {
             return Ok(());
         }
-        self.update(|m| m.write_descriptor(d))
+        self.update_metadata(|m| m.write_descriptor(d))
     }
     fn body(&self, slot: usize) -> &[u8] {
         self.memory.bodies.get(slot).map_or(&[], Vec::as_slice)
@@ -366,7 +421,10 @@ impl<B: AtomicBlockStore> Storage for DurableStore<B> {
         if body.len() > max || body.len() > self.limits.max_body {
             return Err(Error::Invalid);
         }
-        self.update(|m| m.write_body(slot, body))
+        self.cache.bodies[slot].dirty = true;
+        let result = reserve_body(&mut self.memory.bodies[slot], body.len());
+        self.mutation_result(result)?;
+        self.update_metadata(|m| m.write_body(slot, body))
     }
     fn copy_body(&mut self, from: usize, to: usize) -> Result<()> {
         self.index(from, 3)?;
@@ -374,11 +432,17 @@ impl<B: AtomicBlockStore> Storage for DurableStore<B> {
         if from == to {
             return Err(Error::Corrupt);
         }
-        self.update(|m| m.copy_body(from, to))
+        // A staged source may have a stale cached digest, including after a
+        // transitive copy. Rehash the destination's current bytes at the fence.
+        self.cache.bodies[to].dirty = true;
+        let size = self.memory.bodies[from].len();
+        let result = reserve_body(&mut self.memory.bodies[to], size);
+        self.mutation_result(result)?;
+        self.update_metadata(|m| m.copy_body(from, to))
     }
     fn write_header(&mut self, slot: usize, header: Header) -> Result<()> {
         self.index(slot, 3)?;
-        self.update(|m| m.write_header(slot, header))
+        self.update_metadata(|m| m.write_header(slot, header))
     }
     fn region_header(&self, region: usize) -> Option<RegionHeader> {
         self.memory.region_headers.get(region).copied().flatten()
@@ -392,27 +456,32 @@ impl<B: AtomicBlockStore> Storage for DurableStore<B> {
     fn write_region_row(&mut self, region: usize, row: usize, vote: Option<Vote>) -> Result<()> {
         self.index(region, 4)?;
         self.index(row, self.config().ok_or(Error::Config)?.members.len())?;
-        self.update(|m| m.write_region_row(region, row, vote))
+        self.update_metadata(|m| m.write_region_row(region, row, vote))
     }
     fn write_region_header(&mut self, region: usize, header: RegionHeader) -> Result<()> {
         self.index(region, 4)?;
         if header.count > self.limits.max_members {
             return Err(Error::Corrupt);
         }
-        self.update(|m| m.write_region_header(region, header))
+        self.update_metadata(|m| m.write_region_header(region, header))
     }
     fn own(&self, kind: VoteKind) -> Option<&Vote> {
         self.memory.own(kind)
     }
     fn write_own(&mut self, kind: VoteKind, vote: Vote) -> Result<()> {
-        self.update(|m| m.write_own(kind, vote))
+        self.update_metadata(|m| m.write_own(kind, vote))
     }
     fn own_header(&self) -> Option<&Header> {
         self.memory.own_header()
     }
     fn write_own_header(&mut self, header: Header) -> Result<()> {
-        self.update(|m| m.write_own_header(header))
+        self.update_metadata(|m| m.write_own_header(header))
     }
+}
+
+fn reserve_body(body: &mut Vec<u8>, size: usize) -> Result<()> {
+    body.try_reserve_exact(size.saturating_sub(body.len()))
+        .map_err(|_| Error::Exhausted)
 }
 
 fn capacity<T>(size: usize) -> Result<Vec<T>> {
@@ -791,14 +860,179 @@ fn read_region_header(r: &mut Reader<'_>, limits: Limits) -> Result<RegionHeader
     })
 }
 
+// V2 keeps the exact deployment image size. The first image_size - 3*Bmax
+// bytes hold the v1 metadata grammar, except each body is length + BLAKE3 digest
+// (not inline bytes). The final 32 metadata bytes checksum the entire preceding
+// metadata area, including magic/version, bounds, payload length and zero tail.
+// Three fixed Bmax body regions follow it. Their unused tails must be zero.
+// Layout and lengths are thus bound by the metadata checksum. These checksums
+// detect corruption, not adversarial rewriting of both data and commitments.
+#[derive(Clone, Copy, Debug, Default)]
+struct BodyCache {
+    len: usize,
+    digest: Id,
+    dirty: bool,
+}
+#[derive(Debug, Default)]
+struct ImageCache {
+    // True only after validation of an entire v2 image or successful encoding.
+    canonical: bool,
+    bodies: [BodyCache; 3],
+}
+fn metadata_size(limits: Limits) -> Result<usize> {
+    Ok(image_size(limits)? - 3 * limits.max_body)
+}
+fn add_work(counter: &AtomicU64, bytes: usize) {
+    let amount = u64::try_from(bytes).unwrap_or(u64::MAX);
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        Some(old.saturating_add(amount))
+    });
+}
+struct ChecksumWork<'a> {
+    metrics: Option<&'a Metrics>,
+    elapsed: Duration,
+    used: bool,
+}
+impl ChecksumWork<'_> {
+    fn hash(&mut self, bytes: &[u8], body: bool) -> Id {
+        let start = self.metrics.map(|_| Instant::now());
+        let digest = *blake3::hash(bytes).as_bytes();
+        if let (Some(start), Some(metrics)) = (start, self.metrics) {
+            self.elapsed = self.elapsed.saturating_add(start.elapsed());
+            add_work(
+                if body {
+                    &metrics.body_bytes_hashed
+                } else {
+                    &metrics.metadata_bytes_hashed
+                },
+                bytes.len(),
+            );
+        }
+        self.used = true;
+        digest
+    }
+}
+impl Drop for ChecksumWork<'_> {
+    fn drop(&mut self) {
+        if self.used {
+            if let Some(metrics) = self.metrics {
+                metrics.image_checksum.record(self.elapsed);
+            }
+        }
+    }
+}
 #[cfg(test)]
 fn encode(m: &MemoryStore, limits: Limits, image: &mut [u8]) -> Result<()> {
-    encode_observed(m, limits, image, None)
+    encode_observed(m, limits, image, &mut ImageCache::default(), None)
 }
 fn encode_observed(
-    m: &MemoryStore, limits: Limits, image: &mut [u8], metrics: Option<&Metrics>,
+    m: &MemoryStore,
+    limits: Limits,
+    image: &mut [u8],
+    cache: &mut ImageCache,
+    metrics: Option<&Metrics>,
 ) -> Result<()> {
     let _timer = metrics.map(|m| m.image_encode.start());
+    if image.len() != image_size(limits)?
+        || m.bodies.iter().any(|b| b.len() > limits.max_body)
+        || m.regions.iter().any(|r| r.len() > limits.max_members)
+        || m.configs
+            .iter()
+            .flatten()
+            .any(|c| c.members.len() > limits.max_members || c.max_body > limits.max_body)
+    {
+        return Err(Error::Corrupt);
+    }
+    let metadata_end = metadata_size(limits)?;
+    let checksum_at = metadata_end - CHECKSUM;
+    let (metadata, bodies) = image.split_at_mut(metadata_end);
+    let mut checksums = ChecksumWork {
+        metrics,
+        elapsed: Duration::ZERO,
+        used: false,
+    };
+    for (slot, bytes) in bodies.chunks_exact_mut(limits.max_body).enumerate() {
+        let body = &m.bodies[slot];
+        let cached = &mut cache.bodies[slot];
+        if !cache.canonical || cached.dirty || cached.len != body.len() {
+            bytes[..body.len()].copy_from_slice(body);
+            // A canonical image already has zero bytes beyond the old length.
+            // Migration/first use must scrub the entire unused region once.
+            let zero_end = if cache.canonical {
+                cached.len.max(body.len())
+            } else {
+                bytes.len()
+            };
+            bytes[body.len()..zero_end].fill(0);
+            if let Some(metrics) = metrics {
+                add_work(&metrics.body_bytes_copied, body.len());
+                add_work(&metrics.body_bytes_zeroed, zero_end - body.len());
+            }
+            cached.digest = checksums.hash(body, true);
+            cached.len = body.len();
+            cached.dirty = false;
+        } else if let Some(metrics) = metrics {
+            add_work(&metrics.body_slots_reused, 1);
+        }
+    }
+    let mut w = Writer {
+        bytes: &mut metadata[..checksum_at],
+        at: 0,
+    };
+    w.put(MAGIC)?;
+    w.put(&VERSION.to_le_bytes())?;
+    w.usize(limits.max_members)?;
+    w.usize(limits.max_body)?;
+    w.u64(0)?;
+    for bank in 0..2 {
+        w.flag(m.sealed[bank])?;
+        w.optional(&m.configs[bank], |w, c| {
+            w.put(&c.domain)?;
+            w.u64(c.total)?;
+            w.usize(c.max_body)?;
+            w.u64(c.rho)?;
+            write_timeouts(w, c.timeouts)?;
+            w.flag(c.crosslink)?;
+            w.put(&c.hash)?;
+            w.usize(c.members.len())?;
+            for member in &c.members {
+                w.put(&member.public_key)?;
+                w.u64(member.weight)?;
+            }
+            Ok(())
+        })?;
+    }
+    w.optional(&m.descriptor, write_descriptor)?;
+    for (slot, cached) in cache.bodies.iter().enumerate() {
+        w.usize(cached.len)?;
+        w.put(&cached.digest)?;
+        w.optional(&m.headers[slot], write_header)?;
+    }
+    for region in 0..4 {
+        w.usize(m.regions[region].len())?;
+        for vote in &m.regions[region] {
+            w.optional(vote, write_vote)?;
+        }
+        w.optional(&m.region_headers[region], write_region_header)?;
+    }
+    for own in &m.own {
+        w.optional(own, write_vote)?;
+    }
+    w.optional(&m.own_header, write_header)?;
+    w.bytes[w.at..].fill(0);
+    if let Some(metrics) = metrics {
+        add_work(&metrics.metadata_bytes_zeroed, w.bytes.len() - w.at);
+    }
+    let payload = u64::try_from(w.at - PREFIX).map_err(|_| Error::Corrupt)?;
+    metadata[PREFIX - 8..PREFIX].copy_from_slice(&payload.to_le_bytes());
+    let digest = checksums.hash(&metadata[..checksum_at], false);
+    metadata[checksum_at..].copy_from_slice(&digest);
+    cache.canonical = true;
+    Ok(())
+}
+
+#[cfg(test)]
+fn encode_v1(m: &MemoryStore, limits: Limits, image: &mut [u8]) -> Result<()> {
     if image.len() != image_size(limits)? {
         return Err(Error::Corrupt);
     }
@@ -807,8 +1041,8 @@ fn encode_observed(
         bytes: &mut image[..checksum_at],
         at: 0,
     };
-    w.put(MAGIC)?;
-    w.put(&VERSION.to_le_bytes())?;
+    w.put(V1_MAGIC)?;
+    w.put(&1u32.to_le_bytes())?;
     w.usize(limits.max_members)?;
     w.usize(limits.max_body)?;
     w.u64(0)?; // Filled with the actual bounded payload length below.
@@ -860,29 +1094,42 @@ fn encode_observed(
     w.bytes[w.at..].fill(0);
     let payload = u64::try_from(w.at - PREFIX).map_err(|_| Error::Corrupt)?;
     image[PREFIX - 8..PREFIX].copy_from_slice(&payload.to_le_bytes());
-    let checksum = {
-        let _timer = metrics.map(|m| m.image_checksum.start());
-        blake3::hash(&image[..checksum_at])
-    };
+    let checksum = { blake3::hash(&image[..checksum_at]) };
     image[checksum_at..].copy_from_slice(checksum.as_bytes());
     Ok(())
 }
 
+#[cfg(test)]
 fn decode(image: &[u8], limits: Limits) -> Result<MemoryStore> {
+    decode_cached(image, limits).map(|(memory, _)| memory)
+}
+fn decode_cached(image: &[u8], limits: Limits) -> Result<(MemoryStore, ImageCache)> {
     if image.len() != image_size(limits)? {
         return Err(Error::Corrupt);
     }
-    let checksum_at = image.len() - CHECKSUM;
-    if blake3::hash(&image[..checksum_at]).as_bytes() != &image[checksum_at..] {
+    let version = match (
+        &image[..8],
+        u32::from_le_bytes(image[8..12].try_into().map_err(|_| Error::Corrupt)?),
+    ) {
+        (magic, 1) if magic == V1_MAGIC => 1,
+        (magic, VERSION) if magic == MAGIC => VERSION,
+        _ => return Err(Error::Corrupt),
+    };
+    let metadata_end = if version == 1 {
+        image.len()
+    } else {
+        metadata_size(limits)?
+    };
+    let checksum_at = metadata_end - CHECKSUM;
+    if blake3::hash(&image[..checksum_at]).as_bytes() != &image[checksum_at..metadata_end] {
         return Err(Error::Corrupt);
     }
     let mut prefix = Reader {
         bytes: &image[..PREFIX],
         at: 0,
     };
-    if prefix.take(8)? != MAGIC
-        || u32::from_le_bytes(prefix.array()?) != VERSION
-        || prefix.usize(limits.max_members)? != limits.max_members
+    prefix.take(12)?;
+    if prefix.usize(limits.max_members)? != limits.max_members
         || prefix.usize(limits.max_body)? != limits.max_body
     {
         return Err(Error::Corrupt);
@@ -948,9 +1195,28 @@ fn decode(image: &[u8], limits: Limits) -> Result<MemoryStore> {
     if m.descriptor.is_some() && m.config().is_none() {
         return Err(Error::Corrupt);
     }
+    let mut cache = ImageCache::default();
     for slot in 0..3 {
         let size = r.usize(limits.max_body)?;
-        let bytes = r.take(size)?;
+        let bytes = if version == 1 {
+            r.take(size)?
+        } else {
+            let digest: Id = r.array()?;
+            let start = metadata_end + slot * limits.max_body;
+            let region = &image[start..start + limits.max_body];
+            let bytes = &region[..size];
+            // Validate every physical body, even if the descriptor does not
+            // reference it. Neither saved nor cached digests are trusted on load.
+            if blake3::hash(bytes).as_bytes() != &digest || region[size..].iter().any(|b| *b != 0) {
+                return Err(Error::Corrupt);
+            }
+            cache.bodies[slot] = BodyCache {
+                len: size,
+                digest,
+                dirty: false,
+            };
+            bytes
+        };
         let mut body = capacity(size)?;
         body.extend_from_slice(bytes);
         m.bodies[slot] = body;
@@ -975,27 +1241,36 @@ fn decode(image: &[u8], limits: Limits) -> Result<MemoryStore> {
     if r.remaining() != 0 {
         return Err(Error::Corrupt);
     }
-    Ok(m)
+    cache.canonical = version == VERSION;
+    Ok((m, cache))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // The original encoder: clear the entire image before writing its payload.
-    // Keep this test-only copy independent of encode's tail-zeroing optimization.
+    // Independent cold encoder: no cache, full-image clear, then serialize all
+    // physical state. Preserve the original v1 grammar/differential coverage;
+    // v2 is independently written using its fixed-region layout.
     fn encode_original(m: &MemoryStore, limits: Limits, image: &mut [u8]) -> Result<()> {
+        encode_reference(m, limits, image, false)
+    }
+    fn encode_reference(m: &MemoryStore, limits: Limits, image: &mut [u8], v2: bool) -> Result<()> {
         if image.len() != image_size(limits)? {
             return Err(Error::Corrupt);
         }
         image.fill(0);
-        let checksum_at = image.len() - CHECKSUM;
+        let checksum_at = if v2 {
+            image.len() - 3 * limits.max_body - CHECKSUM
+        } else {
+            image.len() - CHECKSUM
+        };
         let mut w = Writer {
             bytes: &mut image[..checksum_at],
             at: 0,
         };
-        w.put(MAGIC)?;
-        w.put(&VERSION.to_le_bytes())?;
+        w.put(if v2 { MAGIC } else { V1_MAGIC })?;
+        w.put(&(if v2 { VERSION } else { 1u32 }).to_le_bytes())?;
         w.usize(limits.max_members)?;
         w.usize(limits.max_body)?;
         w.u64(0)?;
@@ -1026,7 +1301,11 @@ mod tests {
                 return Err(Error::Corrupt);
             }
             w.usize(m.bodies[slot].len())?;
-            w.put(&m.bodies[slot])?;
+            if v2 {
+                w.put(blake3::hash(&m.bodies[slot]).as_bytes())?;
+            } else {
+                w.put(&m.bodies[slot])?;
+            }
             w.optional(&m.headers[slot], write_header)?;
         }
         for region in 0..4 {
@@ -1046,7 +1325,13 @@ mod tests {
         let payload = u64::try_from(w.at - PREFIX).map_err(|_| Error::Corrupt)?;
         image[PREFIX - 8..PREFIX].copy_from_slice(&payload.to_le_bytes());
         let checksum = blake3::hash(&image[..checksum_at]);
-        image[checksum_at..].copy_from_slice(checksum.as_bytes());
+        image[checksum_at..checksum_at + CHECKSUM].copy_from_slice(checksum.as_bytes());
+        if v2 {
+            for slot in 0..3 {
+                let start = checksum_at + CHECKSUM + slot * limits.max_body;
+                image[start..start + m.bodies[slot].len()].copy_from_slice(&m.bodies[slot]);
+            }
+        }
         Ok(())
     }
 
@@ -1182,7 +1467,7 @@ mod tests {
     fn assert_original_image(m: &MemoryStore, limits: Limits, image: &mut [u8]) -> usize {
         let mut original = vec![0xa5; image_size(limits).unwrap()];
         encode_original(m, limits, &mut original).unwrap();
-        encode(m, limits, image).unwrap();
+        encode_v1(m, limits, image).unwrap();
         assert!(
             image == original,
             "image differs from the original full-clear encoder"
@@ -1200,7 +1485,7 @@ mod tests {
         );
         // The independently decoded image must also re-encode identically.
         let reopened = decode(image, limits).unwrap();
-        encode(&reopened, limits, &mut original).unwrap();
+        encode_v1(&reopened, limits, &mut original).unwrap();
         assert!(image == original, "reopened image changed");
         end
     }
@@ -1310,6 +1595,418 @@ mod tests {
         );
     }
 
+    fn assert_cached_image(store: &mut DurableStore<Block>) {
+        store.flush().unwrap();
+        let mut cold = vec![0x97; image_size(store.limits).unwrap()];
+        encode_reference(&store.memory, store.limits, &mut cold, true).unwrap();
+        assert_eq!(
+            store.image, cold,
+            "cached v2 differs from independent cold encoder"
+        );
+        assert_eq!(store.backend.image, cold);
+        // Compare every private field through the independent canonical v1
+        // encoding, not merely bodies or references visible to the protocol.
+        let reopened = decode(&cold, store.limits).unwrap();
+        let mut expected = vec![0; cold.len()];
+        encode_original(&store.memory, store.limits, &mut expected).unwrap();
+        encode_original(&reopened, store.limits, &mut cold).unwrap();
+        assert_eq!(cold, expected, "v2 recovery changed physical state");
+    }
+
+    #[test]
+    fn v2_cold_roundtrip_matches_independent_encoder_at_tiny_and_full_bounds() {
+        for (max_members, max_body) in [(1, 1), (4, 128), (7, 100 * 1024), (4, 10 * 1024 * 1024)] {
+            let limits = Limits {
+                max_members,
+                max_body,
+            };
+            for mut m in [MemoryStore::default(), populated(limits)] {
+                let mut image = vec![0xa7; image_size(limits).unwrap()];
+                let mut expected = vec![0xd3; image.len()];
+                for state in 0..4 {
+                    match state {
+                        1 => {
+                            m.bodies[0].truncate(max_body / 2);
+                            m.bodies[1].clear();
+                        }
+                        2 => {
+                            m.bodies[0] = vec![99; max_body];
+                            m.bodies[2].clear();
+                        }
+                        3 => m = MemoryStore::default(),
+                        _ => {}
+                    }
+                    encode(&m, limits, &mut image).unwrap();
+                    encode_reference(&m, limits, &mut expected, true).unwrap();
+                    assert_eq!(image, expected);
+                    let decoded = decode(&image, limits).unwrap();
+                    encode_original(&decoded, limits, &mut image).unwrap();
+                    encode_original(&m, limits, &mut expected).unwrap();
+                    assert_eq!(image, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v2_cached_matches_independent_cold_after_every_mutation_category() {
+        for eager in [false, true] {
+            let mut store = buffered();
+            store.buffered = !eager;
+            let small = config(2, 64, true);
+            store
+                .begin_config(
+                    1,
+                    ConfigMeta {
+                        domain: small.domain,
+                        total: small.total,
+                        count: small.members.len(),
+                        max_body: small.max_body,
+                        rho: small.rho,
+                        timeouts: small.timeouts,
+                        crosslink: small.crosslink,
+                    },
+                )
+                .unwrap();
+            assert_cached_image(&mut store); // legal unsealed/unfinished bank
+            for (row, member) in small.members.iter().enumerate() {
+                store.write_config_member(1, row, member.clone()).unwrap();
+                assert_cached_image(&mut store);
+            }
+            store.seal_config_bank(1, small.hash).unwrap();
+            assert_cached_image(&mut store);
+            store.seal_config(&small).unwrap();
+            assert_cached_image(&mut store);
+            let mut h = *store.header(0).unwrap();
+            h.content.round += 1; // legal unreferenced/stale header
+            store.write_header(0, h).unwrap();
+            assert_cached_image(&mut store);
+            for kind in [VoteKind::Enter, VoteKind::Prevote, VoteKind::Precommit] {
+                let mut vote = *store.own(kind).unwrap();
+                vote.content.round += 1;
+                store.write_own(kind, vote).unwrap();
+                assert_cached_image(&mut store);
+                store.write_region_row(kind.index(), 1, Some(vote)).unwrap();
+                assert_cached_image(&mut store);
+                store.write_region_row(kind.index(), 1, None).unwrap();
+                assert_cached_image(&mut store);
+            }
+            store.write_own_header(h).unwrap();
+            assert_cached_image(&mut store);
+            for region in 0..4 {
+                store
+                    .write_region_header(
+                        region,
+                        RegionHeader {
+                            kind: CertKind::Row {
+                                round: 8,
+                                kind: VoteKind::Prevote,
+                            },
+                            count: 1,
+                            digest: [region as u8; 32],
+                        },
+                    )
+                    .unwrap();
+                assert_cached_image(&mut store);
+            }
+            let mut d = store.descriptor().unwrap().clone();
+            d.height_remaining -= 1;
+            store.write_descriptor(&d).unwrap();
+            assert_cached_image(&mut store);
+            d.height_remaining -= 1;
+            d.timers[0].remaining -= 1;
+            d.grid_remaining = 0;
+            store.write_progress_descriptor(&d).unwrap();
+            assert_cached_image(&mut store);
+            for body in [
+                vec![81; 128],
+                vec![82; 128],
+                vec![83; 1],
+                vec![],
+                vec![84; 128],
+            ] {
+                store.write_body(0, &body).unwrap();
+                assert_cached_image(&mut store);
+                store.copy_body(0, 1).unwrap();
+                assert_cached_image(&mut store);
+                store.copy_body(1, 2).unwrap();
+                assert_cached_image(&mut store);
+            }
+            // Descriptor-driven physical eviction must invalidate all body caches.
+            d.height += 1;
+            d.slot = None;
+            d.vc = None;
+            d.pending = None;
+            d.entry = None;
+            store.write_descriptor(&d).unwrap();
+            assert_cached_image(&mut store);
+            for slot in 0..3 {
+                assert!(store.body(slot).is_empty());
+                assert!(store.header(slot).is_none());
+            }
+            store.write_body(2, b"after eviction").unwrap();
+            assert_cached_image(&mut store);
+            store
+                .update(|m| {
+                    m.bodies[2][0] ^= 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert_cached_image(&mut store); // arbitrary private test mutation
+        }
+    }
+
+    #[test]
+    fn v2_dirty_copy_chains_and_source_rewrites_use_current_bytes_not_cached_digest() {
+        let mut store = buffered();
+        let old_digest = store.cache.bodies[0].digest;
+        store.write_body(0, &[17; 128]).unwrap();
+        assert_eq!(store.cache.bodies[0].digest, old_digest);
+        store.copy_body(0, 1).unwrap();
+        store.copy_body(1, 2).unwrap();
+        store.write_body(0, &[18; 128]).unwrap();
+        store.copy_body(2, 1).unwrap();
+        assert_eq!(store.backend.replacements, 0);
+        assert_cached_image(&mut store);
+        assert_eq!(store.body(0), &[18; 128]);
+        assert_eq!(store.body(1), &[17; 128]);
+        assert_eq!(store.body(2), &[17; 128]);
+    }
+
+    #[test]
+    fn v2_metadata_fences_reuse_body_bytes_and_only_zero_shrunk_spans() {
+        let metrics = Arc::new(Metrics::default());
+        let mut store = buffered().with_metrics(metrics.clone());
+        for slot in 0..3 {
+            store.write_body(slot, b"installed body").unwrap();
+        }
+        store.flush().unwrap();
+        let installed = metrics.snapshot();
+        assert_eq!(installed.body_bytes_copied, 3 * 14);
+        assert_eq!(installed.body_bytes_hashed, 3 * 14);
+        assert_eq!(installed.body_bytes_zeroed, 3 * (128 - 14));
+        let image_pointer = store.image.as_ptr();
+        for _ in 0..20 {
+            let mut d = store.descriptor().unwrap().clone();
+            d.height_remaining -= 1;
+            d.timers[0].remaining -= 1;
+            store.write_progress_descriptor(&d).unwrap();
+            store.flush().unwrap();
+            let vote = *store.own(VoteKind::Prevote).unwrap();
+            store.write_region_row(0, 0, Some(vote)).unwrap();
+            store.write_own(VoteKind::Prevote, vote).unwrap();
+            store.write_header(1, *store.header(1).unwrap()).unwrap();
+            store.flush_publication().unwrap();
+        }
+        let metadata = metrics.snapshot();
+        assert_eq!(metadata.body_bytes_copied, installed.body_bytes_copied);
+        assert_eq!(metadata.body_bytes_hashed, installed.body_bytes_hashed);
+        assert_eq!(metadata.body_bytes_zeroed, installed.body_bytes_zeroed);
+        assert_eq!(
+            metadata.body_slots_reused - installed.body_slots_reused,
+            40 * 3
+        );
+        assert_eq!(
+            metadata.metadata_bytes_hashed - installed.metadata_bytes_hashed,
+            40 * (metadata_size(store.limits).unwrap() - CHECKSUM) as u64
+        );
+        assert_eq!(
+            metadata.image_checksum.calls - installed.image_checksum.calls,
+            40
+        );
+        assert!(metadata.image_encode.wall_ns >= metadata.image_checksum.wall_ns);
+        assert_eq!(
+            store.image.as_ptr(),
+            image_pointer,
+            "one image allocation is reused"
+        );
+        store.write_body(0, b"x").unwrap();
+        store.flush().unwrap();
+        let shrunk = metrics.snapshot();
+        assert_eq!(shrunk.body_bytes_zeroed - metadata.body_bytes_zeroed, 13);
+        store.write_body(0, b"regrown").unwrap();
+        store.flush().unwrap();
+        let grown = metrics.snapshot();
+        assert_eq!(grown.body_bytes_zeroed, shrunk.body_bytes_zeroed);
+        store.write_body(0, b"").unwrap();
+        store.flush().unwrap();
+        let cleared = metrics.snapshot();
+        assert_eq!(cleared.body_bytes_zeroed - grown.body_bytes_zeroed, 7);
+        assert_cached_image(&mut store);
+    }
+
+    #[test]
+    fn v1_migrates_only_at_required_fence_and_failed_migration_recovers_old_or_new() {
+        for fail in [None, Some(false), Some(true)] {
+            let limits = Limits {
+                max_members: 4,
+                max_body: 128,
+            };
+            let mut memory = populated(limits);
+            memory.descriptor.as_mut().unwrap().grid_remaining = 10;
+            // Packed v1 bytes overlap what becomes v2 body padding.
+            memory.bodies[0].truncate(5);
+            let mut old = vec![0xa9; image_size(limits).unwrap()];
+            encode_original(&memory, limits, &mut old).unwrap();
+            let mut store = DurableStore::open_buffered(
+                Block {
+                    image: old.clone(),
+                    replacements: 0,
+                    fail,
+                },
+                limits,
+            )
+            .unwrap();
+            assert!(!store.cache.canonical);
+            store.flush().unwrap();
+            store.flush_publication().unwrap();
+            let mut d = store.descriptor().unwrap().clone();
+            d.height_remaining -= 1;
+            store.write_progress_descriptor(&d).unwrap();
+            store.flush_publication().unwrap();
+            assert_eq!(store.backend.replacements, 0);
+            assert_eq!(store.backend.image, old);
+            let result = store.flush();
+            assert_eq!(
+                result,
+                if fail.is_none() {
+                    Ok(())
+                } else {
+                    Err(Error::Storage)
+                }
+            );
+            assert_eq!(store.is_poisoned(), fail.is_some());
+            assert_eq!(store.backend.replacements, 1);
+            if fail.is_some() {
+                assert_eq!(store.flush(), Err(Error::Storage));
+                assert_eq!(store.write_body(0, b"forbidden"), Err(Error::Storage));
+            }
+            let backend = store.into_backend();
+            assert_eq!(backend.replacements, 1);
+            let mut reopened = DurableStore::open_buffered(backend, limits).unwrap();
+            assert_eq!(reopened.cache.canonical, fail != Some(false));
+            assert_eq!(
+                &reopened.image[..8],
+                if fail == Some(false) { V1_MAGIC } else { MAGIC }
+            );
+            assert_eq!(reopened.body(0), memory.body(0));
+            assert_eq!(
+                reopened.descriptor().unwrap().height_remaining,
+                if fail == Some(false) {
+                    d.height_remaining + 1
+                } else {
+                    d.height_remaining
+                }
+            );
+            reopened.flush().unwrap();
+            assert_eq!(reopened.backend.replacements, 1);
+        }
+        // Eager opening is also read-only, but its next acknowledged write migrates.
+        let limits = Limits {
+            max_members: 1,
+            max_body: 1,
+        };
+        let memory = populated(limits);
+        let mut image = vec![0; image_size(limits).unwrap()];
+        encode_original(&memory, limits, &mut image).unwrap();
+        let mut store = DurableStore::open(
+            Block {
+                image,
+                replacements: 0,
+                fail: None,
+            },
+            limits,
+        )
+        .unwrap();
+        assert_eq!(store.backend.replacements, 0);
+        store.write_body(0, b"a").unwrap();
+        assert_eq!(store.backend.replacements, 1);
+        assert_cached_image(&mut store);
+    }
+
+    #[test]
+    fn v1_remains_strict_with_resealed_corruption_and_unknown_versions() {
+        let limits = Limits {
+            max_members: 1,
+            max_body: 1,
+        };
+        let mut image = vec![0; image_size(limits).unwrap()];
+        encode_original(&MemoryStore::default(), limits, &mut image).unwrap();
+        for offset in [0, 8, 12, 20, 28, 36, 37, 40, 41, 68, 111] {
+            let mut corrupt = image.clone();
+            corrupt[offset] = 0xff;
+            let at = corrupt.len() - CHECKSUM;
+            let hash = blake3::hash(&corrupt[..at]);
+            corrupt[at..].copy_from_slice(hash.as_bytes());
+            assert!(
+                matches!(decode(&corrupt, limits), Err(Error::Corrupt)),
+                "v1 offset {offset}"
+            );
+        }
+        for size in [0, 1, image.len() - 1] {
+            assert!(matches!(
+                decode(&image[..size], limits),
+                Err(Error::Corrupt)
+            ));
+        }
+        image.push(0);
+        assert!(matches!(decode(&image, limits), Err(Error::Corrupt)));
+    }
+
+    #[test]
+    fn v2_uninitialized_dirty_load_is_canonicalized_and_optional_metrics_are_identical() {
+        struct EmptyBlock(usize);
+        impl AtomicBlockStore for EmptyBlock {
+            fn block_size(&self) -> usize {
+                self.0
+            }
+            fn load(&mut self, bytes: &mut [u8]) -> Result<bool> {
+                bytes.fill(0xff);
+                Ok(false)
+            }
+            fn replace(&mut self, _: &[u8]) -> Result<()> {
+                Ok(())
+            }
+        }
+        let limits = Limits {
+            max_members: 1,
+            max_body: 128,
+        };
+        let mut store =
+            DurableStore::open_buffered(EmptyBlock(image_size(limits).unwrap()), limits).unwrap();
+        let c = config(1, 128, false);
+        store.seal_config(&c).unwrap();
+        store.write_body(0, b"x").unwrap();
+        store.flush().unwrap();
+        assert!(store.metrics.is_none());
+        let metrics = Metrics::default();
+        let mut observed = vec![0x86; store.image.len()];
+        encode_observed(
+            &store.memory,
+            limits,
+            &mut observed,
+            &mut ImageCache::default(),
+            Some(&metrics),
+        )
+        .unwrap();
+        assert_eq!(observed, store.image);
+        assert_eq!(metrics.snapshot().body_bytes_copied, 1);
+        assert_eq!(metrics.snapshot().body_bytes_hashed, 1);
+        assert_eq!(metrics.snapshot().body_bytes_zeroed, 3 * 128 - 1);
+        assert_eq!(
+            metrics.snapshot().metadata_bytes_hashed,
+            (metadata_size(limits).unwrap() - CHECKSUM) as u64
+        );
+        let decoded = decode(&observed, limits).unwrap();
+        assert_eq!(decoded.body(0), b"x");
+        // Fixed-size cache: no body/image allocation or history is stored here.
+        assert!(!std::mem::needs_drop::<ImageCache>());
+        assert!(std::mem::size_of::<ImageCache>() <= 3 * 64);
+        let counter = AtomicU64::new(u64::MAX - 1);
+        add_work(&counter, 10);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
     struct Block {
         image: Vec<u8>,
         replacements: usize,
@@ -1357,15 +2054,28 @@ mod tests {
 
     #[test]
     fn metrics_count_encode_checksum_and_replace_in_order() {
-        struct ObservedBlock { block: Block, metrics: Arc<Metrics> }
+        struct ObservedBlock {
+            block: Block,
+            metrics: Arc<Metrics>,
+        }
         impl AtomicBlockStore for ObservedBlock {
-            fn block_size(&self) -> usize { self.block.block_size() }
-            fn load(&mut self, bytes: &mut [u8]) -> Result<bool> { self.block.load(bytes) }
+            fn block_size(&self) -> usize {
+                self.block.block_size()
+            }
+            fn load(&mut self, bytes: &mut [u8]) -> Result<bool> {
+                self.block.load(bytes)
+            }
             fn replace(&mut self, bytes: &[u8]) -> Result<()> {
                 let snapshot = self.metrics.snapshot();
-                assert_eq!(snapshot.image_encode.calls, self.block.replacements as u64 + 1);
+                assert_eq!(
+                    snapshot.image_encode.calls,
+                    self.block.replacements as u64 + 1
+                );
                 assert_eq!(snapshot.image_checksum.calls, snapshot.image_encode.calls);
-                assert_eq!(snapshot.backend_replace.calls, self.block.replacements as u64);
+                assert_eq!(
+                    snapshot.backend_replace.calls,
+                    self.block.replacements as u64
+                );
                 self.block.replace(bytes)
             }
         }
@@ -1373,11 +2083,20 @@ mod tests {
         assert!(unobserved.metrics.is_none());
         let limits = unobserved.limits;
         let metrics = Arc::new(Metrics::default());
-        let backend = ObservedBlock { block: unobserved.into_backend(), metrics: metrics.clone() };
-        let mut store = DurableStore::open_buffered(backend, limits).unwrap().with_metrics(metrics.clone());
+        let backend = ObservedBlock {
+            block: unobserved.into_backend(),
+            metrics: metrics.clone(),
+        };
+        let mut store = DurableStore::open_buffered(backend, limits)
+            .unwrap()
+            .with_metrics(metrics.clone());
         assert_eq!(metrics.snapshot(), MetricsSnapshot::default());
         store.write_body(0, b"first").unwrap();
-        assert_eq!(metrics.snapshot(), MetricsSnapshot::default(), "staging is not encoding");
+        assert_eq!(
+            metrics.snapshot(),
+            MetricsSnapshot::default(),
+            "staging is not encoding"
+        );
         store.flush_publication().unwrap();
         let first = metrics.snapshot();
         assert_eq!(first.image_encode.calls, 1);
@@ -1386,33 +2105,53 @@ mod tests {
         assert!(first.image_encode.wall_ns >= first.image_checksum.wall_ns);
         store.flush().unwrap();
         store.flush_publication().unwrap();
-        assert_eq!(metrics.snapshot(), first, "clean fences do no measured work");
+        assert_eq!(
+            metrics.snapshot(),
+            first,
+            "clean fences do no measured work"
+        );
         store.write_body(0, b"second").unwrap();
         store.flush().unwrap();
         let second = metrics.snapshot();
         assert_eq!(second.image_encode.calls - first.image_encode.calls, 1);
         assert_eq!(second.image_checksum.calls - first.image_checksum.calls, 1);
-        assert_eq!(second.backend_replace.calls - first.backend_replace.calls, 1);
+        assert_eq!(
+            second.backend_replace.calls - first.backend_replace.calls,
+            1
+        );
         assert!(second.image_encode.wall_ns >= first.image_encode.wall_ns);
         assert!(second.image_checksum.wall_ns >= first.image_checksum.wall_ns);
         assert!(second.backend_replace.wall_ns >= first.backend_replace.wall_ns);
         store.write_body(0, b"discard").unwrap();
         drop(store);
-        assert_eq!(metrics.snapshot(), second, "drop does not persist or measure");
+        assert_eq!(
+            metrics.snapshot(),
+            second,
+            "drop does not persist or measure"
+        );
     }
 
     #[test]
     fn metrics_failed_encode_skips_checksum_and_replace_and_failed_replace_counts() {
         let metrics = Arc::new(Metrics::default());
         let mut store = buffered().with_metrics(metrics.clone());
-        store.update(|m| { m.bodies[0].resize(129, 0); Ok(()) }).unwrap();
+        store
+            .update(|m| {
+                m.bodies[0].resize(129, 0);
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(store.flush(), Err(Error::Storage));
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.image_encode.calls, 1);
         assert_eq!(snapshot.image_checksum.calls, 0);
         assert_eq!(snapshot.backend_replace.calls, 0);
         assert_eq!(store.flush(), Err(Error::Storage));
-        assert_eq!(metrics.snapshot(), snapshot, "poisoned store does not retry");
+        assert_eq!(
+            metrics.snapshot(),
+            snapshot,
+            "poisoned store does not retry"
+        );
         for applied in [false, true] {
             let metrics = Arc::new(Metrics::default());
             let mut store = buffered().with_metrics(metrics.clone());

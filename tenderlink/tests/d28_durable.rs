@@ -390,10 +390,14 @@ fn poisoned_store_cannot_acknowledge_even_an_already_sealed_config() {
     assert_eq!(disk.count(), count);
 }
 
+// This helper deliberately knows the v2 root location: resealing a v1-style
+// whole-image tail would only test checksum rejection, not v2 structure.
 fn reseal(bytes: &mut [u8]) {
-    let at = bytes.len() - 32;
+    // LIMITS and this offset are independent of potentially forged prefix data.
+    let end = bytes.len() - 3 * LIMITS.max_body;
+    let at = end - 32;
     let digest = blake3::hash(&bytes[..at]);
-    bytes[at..].copy_from_slice(digest.as_bytes());
+    bytes[at..end].copy_from_slice(digest.as_bytes());
 }
 fn assert_corrupt(bytes: Vec<u8>) {
     assert!(matches!(
@@ -614,10 +618,11 @@ fn corrupt_body_and_region_lengths_are_rejected_before_vector_allocation() {
             },
         )
         .unwrap();
-    // v1: prefix + bank flags + CONFIG scalar bytes/member rows + empty bank
-    // flags + absent DESC. Each empty body then takes length + absent-header.
+    // v2: prefix + bank flags + CONFIG scalar bytes/member rows + empty bank
+    // flags + absent DESC. Each body metadata takes length + digest + absent-header.
+    assert_eq!(&disk.bytes()[..8], b"D28IMG02");
     let first_body = 36 + 2 + 145 + 40 * LIMITS.max_members + 2 + 1;
-    let first_region = first_body + 3 * (8 + 1);
+    let first_region = first_body + 3 * (8 + 32 + 1);
     for offset in [first_body, first_region] {
         let mut bytes = disk.bytes();
         assert_eq!(&bytes[offset..offset + 8], &[0; 8]);
@@ -670,4 +675,58 @@ fn failed_configuration_publication_keeps_exactly_old_or_new_signing_authority()
             assert_eq!(e.storage().config(), Some(&next));
         }
     }
+}
+
+#[test]
+fn v2_checks_actual_unreferenced_bodies_digests_and_all_physical_padding() {
+    let c = config([1; 4], false);
+    let disk = Disk::new(LIMITS);
+    let mut store = DurableStore::open(disk.clone(), LIMITS).unwrap();
+    store.seal_config(&c).unwrap();
+    store.write_body(0, b"ABC").unwrap();
+    // No DESC references any body; physical bytes must still be authenticated.
+    assert!(store.descriptor().is_none());
+    let valid = disk.bytes();
+    assert_eq!(&valid[..8], b"D28IMG02");
+    let head = valid.len() - 3 * LIMITS.max_body;
+    let first_body = 36 + 2 + 145 + 40 * LIMITS.max_members + 2 + 1;
+    assert_eq!(&valid[first_body..first_body + 8], &3u64.to_le_bytes());
+    for offset in [
+        head,
+        head + 3,
+        head + LIMITS.max_body,
+        valid.len() - 1,
+        first_body + 8,
+        head - 32,
+    ] {
+        let mut corrupt = valid.clone();
+        corrupt[offset] ^= 1;
+        if offset != head - 32 {
+            reseal(&mut corrupt);
+        }
+        assert_corrupt(corrupt);
+    }
+    // A forged, root-checksummed commitment does not stand in for actual bytes.
+    let mut forged = valid.clone();
+    forged[first_body + 8..first_body + 40].copy_from_slice(blake3::hash(b"XYZ").as_bytes());
+    reseal(&mut forged);
+    assert_corrupt(forged);
+    // Even a correct shortened digest cannot hide nonzero trailing old bytes.
+    let mut shortened = valid.clone();
+    shortened[first_body..first_body + 8].copy_from_slice(&1u64.to_le_bytes());
+    shortened[first_body + 8..first_body + 40].copy_from_slice(blake3::hash(b"A").as_bytes());
+    reseal(&mut shortened);
+    assert_corrupt(shortened);
+    let mut longer = valid.clone();
+    longer[first_body..first_body + 8].copy_from_slice(&4u64.to_le_bytes());
+    reseal(&mut longer);
+    assert_corrupt(longer);
+    // Genuine byte+digest agreement is a valid different unreferenced body;
+    // checksums are corruption detection, not secret-key authentication.
+    let mut replaced = valid;
+    replaced[head..head + 3].copy_from_slice(b"XYZ");
+    replaced[first_body + 8..first_body + 40].copy_from_slice(blake3::hash(b"XYZ").as_bytes());
+    reseal(&mut replaced);
+    let reopened = DurableStore::open(Disk::seeded(LIMITS, replaced), LIMITS).unwrap();
+    assert_eq!(reopened.body(0), b"XYZ");
 }

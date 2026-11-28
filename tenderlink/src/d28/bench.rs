@@ -866,7 +866,19 @@ fn add_application_snapshot(out: &mut BTreeMap<String, u64>, snapshot: runtime::
     ] {
         add_counter(out, format!("payload.{name}"), value);
     }
+    // Encoder work, not backend replacement volume or staging/load traffic.
+    for (name, value) in [
+        ("body_bytes_copied", snapshot.durable.body_bytes_copied),
+        ("body_bytes_hashed", snapshot.durable.body_bytes_hashed),
+        ("metadata_bytes_hashed", snapshot.durable.metadata_bytes_hashed),
+        ("body_bytes_zeroed", snapshot.durable.body_bytes_zeroed),
+        ("metadata_bytes_zeroed", snapshot.durable.metadata_bytes_zeroed),
+        ("body_slots_reused", snapshot.durable.body_slots_reused),
+    ] {
+        add_counter(out, format!("durable.{name}"), value);
+    }
     // Inclusive monotonic wall samples, not CPU and not additive phase costs.
+    // image_checksum sums body-digest + metadata hashing only, within encode.
     for (name, phase) in [
         ("runtime.network_receive", snapshot.phases.network_receive),
         ("runtime.network_exchange", snapshot.phases.network_exchange),
@@ -1673,12 +1685,24 @@ mod tests {
             assert_eq!(before.get(&format!("{name}.calls")), Some(&0));
             assert_eq!(before.get(&format!("{name}.wall_ns")), Some(&0));
         }
+        for name in ["body_bytes_copied", "body_bytes_hashed", "metadata_bytes_hashed", "body_bytes_zeroed", "metadata_bytes_zeroed", "body_slots_reused"] {
+            assert_eq!(before.get(&format!("durable.{name}")), Some(&0));
+        }
         let mut sample = runtime::MetricsSnapshot::default();
         sample.phases.network_receive = runtime::WallTimeSnapshot { calls: 2, wall_ns: 31 };
         sample.phases.core_receive = runtime::WallTimeSnapshot { calls: 1, wall_ns: 17 };
         sample.durable.image_encode = runtime::WallTimeSnapshot { calls: 1, wall_ns: 11 };
         sample.durable.image_checksum = runtime::WallTimeSnapshot { calls: 1, wall_ns: 7 };
         sample.durable.backend_replace = runtime::WallTimeSnapshot { calls: 1, wall_ns: 3 };
+        sample.durable.body_bytes_copied = 1024;
+        sample.durable.body_bytes_hashed = 1024;
+        sample.durable.metadata_bytes_hashed = 6288;
+        sample.durable.body_bytes_zeroed = 512;
+        sample.durable.metadata_bytes_zeroed = 4000;
+        sample.durable.body_slots_reused = 2;
+        let work = [("body_bytes_copied", 1024), ("body_bytes_hashed", 1024),
+                    ("metadata_bytes_hashed", 6288), ("body_bytes_zeroed", 512),
+                    ("metadata_bytes_zeroed", 4000), ("body_slots_reused", 2)];
         let mut after = before.clone();
         add_application_snapshot(&mut after, sample);
         let delta = map_delta(&after, &before);
@@ -1688,13 +1712,21 @@ mod tests {
         assert_eq!(delta["durable.image_encode.wall_ns"], 11);
         assert_eq!(delta["durable.image_checksum.wall_ns"], 7);
         assert_eq!(delta["durable.backend_replace.wall_ns"], 3);
+        for (name, value) in work {
+            assert_eq!(delta[&format!("durable.{name}")], value);
+        }
         add_application_snapshot(&mut after, sample);
-        assert_eq!(map_delta(&after, &before)["durable.backend_replace.calls"], 2);
+        let repeated = map_delta(&after, &before);
+        assert_eq!(repeated["durable.backend_replace.calls"], 2);
+        for (name, value) in work {
+            assert_eq!(repeated[&format!("durable.{name}")], 2 * value);
+        }
         sample.phases.network_receive = runtime::WallTimeSnapshot { calls: u64::MAX, wall_ns: u64::MAX };
         sample.received = runtime::MessageCounts { messages: u64::MAX, bytes: u64::MAX };
+        sample.durable.body_bytes_copied = u64::MAX;
         add_application_snapshot(&mut after, sample);
         add_application_snapshot(&mut after, sample);
-        for name in ["runtime.network_receive.calls", "runtime.network_receive.wall_ns", "received.messages", "received.bytes"] {
+        for name in ["runtime.network_receive.calls", "runtime.network_receive.wall_ns", "received.messages", "received.bytes", "durable.body_bytes_copied"] {
             assert_eq!(after[name], u64::MAX);
         }
     }
