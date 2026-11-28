@@ -285,17 +285,32 @@ impl<B: AtomicBlockStore> Storage for DurableStore<B> {
     fn flush(&mut self) -> Result<()> {
         self.ready()?;
         if self.dirty {
-            let result = encode_observed(
-                &self.memory,
-                self.limits,
-                &mut self.image,
-                &mut self.cache,
-                self.metrics.as_deref(),
-            )
-            .and_then(|()| {
+            let result = (|| {
+                // Snapshot dirt before encoding updates the cache. Metadata is
+                // always rewritten; first use and v1 conversion select all four
+                // regions. Keep the list bounded without another allocation.
+                let layout = image_regions(self.limits)?;
+                let mut changed: [_; 4] = std::array::from_fn(|_| 0..0);
+                changed[0] = layout[0].clone();
+                let mut count = 1;
+                for slot in 0..3 {
+                    if self.cache.bodies[slot]
+                        .needs_update(self.cache.canonical, self.memory.bodies[slot].len())
+                    {
+                        changed[count] = layout[slot + 1].clone();
+                        count += 1;
+                    }
+                }
+                encode_observed(
+                    &self.memory,
+                    self.limits,
+                    &mut self.image,
+                    &mut self.cache,
+                    self.metrics.as_deref(),
+                )?;
                 let _timer = self.metrics.as_ref().map(|m| m.backend_replace.start());
-                self.backend.replace(&self.image)
-            });
+                self.backend.replace_regions(&self.image, &changed[..count])
+            })();
             self.mutation_result(result)?;
             self.dirty = false;
             self.publication_dirty = false;
@@ -889,6 +904,11 @@ struct BodyCache {
     digest: Id,
     dirty: bool,
 }
+impl BodyCache {
+    fn needs_update(&self, canonical: bool, len: usize) -> bool {
+        !canonical || self.dirty || self.len != len
+    }
+}
 #[derive(Debug, Default)]
 struct ImageCache {
     // True only after validation of an entire v2 image or successful encoding.
@@ -970,7 +990,7 @@ fn encode_observed(
     for (slot, bytes) in bodies.chunks_exact_mut(limits.max_body).enumerate() {
         let body = &m.bodies[slot];
         let cached = &mut cache.bodies[slot];
-        if !cache.canonical || cached.dirty || cached.len != body.len() {
+        if cached.needs_update(cache.canonical, body.len()) {
             bytes[..body.len()].copy_from_slice(body);
             // A canonical image already has zero bytes beyond the old length.
             // Migration/first use must scrub the entire unused region once.

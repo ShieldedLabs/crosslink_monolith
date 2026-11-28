@@ -540,8 +540,10 @@ struct StoreCounts {
     writes: AtomicU64,
     bytes: AtomicU64,
 }
-/// One allocation reused for every replacement. This deliberately does not
-/// implement physical persistence or claim AtomicBlockStore crash durability.
+/// One allocation reused for whole-image or selected-region replacement. The
+/// single owner sees one batch; all validation/delay/deadline errors occur before
+/// any copy, with no failure point between parts. Sequential RAM copies are NOT
+/// physical atomic persistence and do not claim AtomicBlockStore crash durability.
 struct MemoryBackend {
     image: Vec<u8>,
     initialized: bool,
@@ -563,7 +565,15 @@ impl AtomicBlockStore for MemoryBackend {
         Ok(self.initialized)
     }
     fn replace(&mut self, block: &[u8]) -> super::Result<()> {
-        if block.len() != self.image.len() || Instant::now() >= self.deadline {
+        self.replace_regions(block, &[0..block.len()])
+    }
+    fn replace_regions(
+        &mut self,
+        next: &[u8],
+        changed: &[std::ops::Range<usize>],
+    ) -> super::Result<()> {
+        super::atomic::validate_regions(self.image.len(), next, changed)?;
+        if Instant::now() >= self.deadline {
             return Err(super::Error::Storage);
         }
         if !self.delay.is_zero() {
@@ -575,12 +585,20 @@ impl AtomicBlockStore for MemoryBackend {
         if Instant::now() >= self.deadline {
             return Err(super::Error::Storage);
         }
-        self.image.copy_from_slice(block);
-        self.initialized = true;
+        let bytes = if self.initialized {
+            for range in changed {
+                self.image[range.clone()].copy_from_slice(&next[range.clone()]);
+            }
+            changed.iter().map(|range| range.len()).sum::<usize>()
+        } else {
+            // There is no old image on first use, so even a subset request must
+            // install the complete image before any later partial replacement.
+            self.image.copy_from_slice(next);
+            self.initialized = true;
+            next.len()
+        };
         self.counts.writes.fetch_add(1, Ordering::Relaxed);
-        self.counts
-            .bytes
-            .fetch_add(block.len() as u64, Ordering::Relaxed);
+        self.counts.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -1605,7 +1623,7 @@ async fn run_inner(
             "Every local callback already exports a full signed quorum certificate. Quorum latency means a quorum of nodes independently exported, not the first certificate. Extra export_host_check_ms is benchmark validation overhead after that node's entry; callback_lock_wait_ms measures coordinator contention.",
             "Application offered.* counts encoded app bytes/messages per recipient at transport handoff, not delivery or UDP. status_request_messages is a subset of status.messages, not additive. RX outcome counters and offered counters are cumulative relaxed independent reads.",
             "Serialized body/payload throughput counts one chain copy per committed height, not per-node replication. Payload is exact serialized synthetic header bytes, no transactions or TPS; parent certificate sizes can vary.",
-            "In-memory fixed image reused by copy_from_slice; full durable adapter serialization/hash/write workload. Artificial synchronous replacement delay, no fsync or crash-durability claim. Image bytes=4096+556*Nmax+3*Bmax, not whole-process memory.",
+            "In-memory fixed image reused by region copy_from_slice with the real durable adapter codec/cache/barriers. store_replacements counts successful batches once, not regions; store_replacement_bytes counts actual backend RAM bytes copied (full first initialization, then metadata plus selected full Bmax body regions), NOT disk bytes or encoder/staging/load work. Artificial synchronous delay/deadline is checked before the batch, never between regions. No fsync or crash-durability claim. Image bytes=4096+556*Nmax+3*Bmax, not whole-process memory.",
             "Counter boundaries are sampled serially under cohort lock after callback entry/validation; sampling_duration_ms exposes observer skew and next-height perturbation. STP pump threads continue concurrently; counters are not an atomic system snapshot.",
             "Measured counters exclude warmup; success ends at final cohort before shutdown/drain. Final in-flight tail excluded. Optional chatter window keeps final ACK/tip unpublished and measures continued final-height protocol traffic separately, not a quiescent post-commit network.",
             crate::transport::protocol::SEMANTICS,
@@ -1855,6 +1873,143 @@ mod tests {
         assert_eq!(address, store.image.as_ptr());
         assert_eq!(store.counts.writes.load(Ordering::Relaxed), 1);
     }
+    #[test]
+    fn memory_regions_validate_all_before_mutation_and_initialize_complete_image() {
+        let mut store = MemoryBackend {
+            image: vec![0xa5; 8],
+            initialized: false,
+            delay: Duration::ZERO,
+            deadline: Instant::now() + Duration::from_secs(30),
+            counts: Arc::default(),
+        };
+        let address = store.image.as_ptr();
+        for initialized in [false, true] {
+            store.initialized = initialized;
+            let old = store.image.clone();
+            for bad in [
+                vec![], vec![0..0], vec![4..3], vec![0..9],
+                vec![0..3, 2..4], vec![5..7, 1..3], vec![0..2, 4..4],
+                vec![0..2, 3..9], vec![0..2, usize::MAX..usize::MAX],
+            ] {
+                assert!(store.replace_regions(&[1; 8], &bad).is_err());
+                assert_eq!(store.image, old);
+                assert_eq!(store.initialized, initialized);
+            }
+            assert!(store.replace_regions(&[1; 7], &[0..2]).is_err());
+            assert!(store.replace_regions(&[1; 9], &[0..2]).is_err());
+            assert_eq!(store.image, old);
+            assert_eq!(store.counts.writes.load(Ordering::Relaxed), 0);
+            assert_eq!(store.counts.bytes.load(Ordering::Relaxed), 0);
+        }
+        store.initialized = false;
+        // A subset on first use still initializes every byte, not just 0..2.
+        store.replace_regions(&[1; 8], &[0..2]).unwrap();
+        assert_eq!(store.image, [1; 8]);
+        assert_eq!(store.counts.bytes.load(Ordering::Relaxed), 8);
+        let next = [2, 2, 1, 1, 1, 3, 3, 3];
+        store.replace_regions(&next, &[0..2, 5..8]).unwrap();
+        assert_eq!(store.image, next);
+        assert_eq!(store.counts.writes.load(Ordering::Relaxed), 2);
+        assert_eq!(store.counts.bytes.load(Ordering::Relaxed), 8 + 5);
+        assert_eq!(store.image.as_ptr(), address);
+    }
+
+    #[test]
+    fn memory_regions_deadline_errors_precede_the_entire_batch() {
+        for delay in [Duration::ZERO, Duration::from_millis(10)] {
+            let mut store = MemoryBackend {
+                image: vec![1; 8],
+                initialized: true,
+                delay,
+                deadline: Instant::now() + delay / 2,
+                counts: Arc::default(),
+            };
+            assert!(store.replace_regions(&[2; 8], &[0..2, 2..8]).is_err());
+            assert_eq!(store.image, [1; 8]);
+            assert_eq!(store.counts.writes.load(Ordering::Relaxed), 0);
+            assert_eq!(store.counts.bytes.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn memory_regions_count_only_metadata_for_forty_vote_and_countdown_fences() {
+        use crate::d28::{
+            Config, Descriptor, Member, Status, Step, Storage, Timer, Timeouts,
+            Vote, VoteContent, VoteKind,
+        };
+        let limits = durable::Limits { max_members: 4, max_body: 1 << 20 };
+        let layout = durable::image_regions(limits).unwrap();
+        let size = durable::image_size(limits).unwrap();
+        let counts = Arc::new(StoreCounts::default());
+        let backend = MemoryBackend {
+            image: vec![0xa5; size],
+            initialized: false,
+            delay: Duration::ZERO,
+            deadline: Instant::now() + Duration::from_secs(30),
+            counts: counts.clone(),
+        };
+        let config = Config::new(
+            [42; 32],
+            (0..4).map(|i| Member {
+                public_key: VerificationKeyBytes::from(&key(i)).into(),
+                weight: 1,
+            }).collect(),
+            limits.max_body,
+            10,
+            Timeouts { propose: 100, prevote: 100, precommit: 100,
+                inc_propose: 3, inc_prevote: 1, inc_precommit: 2 },
+        ).unwrap();
+        let mut descriptor = Descriptor {
+            height: 1, config: config.hash(), round: 0, step: Step::Propose,
+            locked_round: None, locked_id: None, valid_round: None, slot: None,
+            justified: false, vc: None, entry: None, pending: None,
+            statuses: [Status::Indeterminate; 3], body_generations: [0; 3],
+            next_generation: 1,
+            timers: [Timer { active: true, remaining: 100, height: 1, round: 0 }; 4],
+            height_remaining: 100, grid_remaining: 10,
+            intents: [None; 3], proposal_intent: None, proposal_published: false,
+        };
+        let vote = Vote::sign(&config, &key(0), VoteContent {
+            height: 1, round: 0, kind: VoteKind::Prevote,
+            id: Some([7; 32]), signer: 0,
+        });
+        let mut store = durable::DurableStore::open_buffered(backend, limits).unwrap();
+        store.seal_config(&config).unwrap();
+        store.write_descriptor(&descriptor).unwrap();
+        for slot in 0..3 {
+            store.write_body(slot, b"body").unwrap();
+        }
+        store.flush_publication().unwrap();
+        assert_eq!(counts.writes.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.bytes.load(Ordering::Relaxed), size as u64);
+        for _ in 0..20 {
+            descriptor.height_remaining -= 1;
+            descriptor.timers[0].remaining -= 1;
+            store.write_progress_descriptor(&descriptor).unwrap();
+            store.flush().unwrap();
+            store.write_region_row(0, 0, Some(vote)).unwrap();
+            store.write_own(VoteKind::Prevote, vote).unwrap();
+            store.flush_publication().unwrap();
+        }
+        assert_eq!(counts.writes.load(Ordering::Relaxed), 1 + 40);
+        assert_eq!(counts.bytes.load(Ordering::Relaxed), (size + 40 * layout[0].len()) as u64);
+        // Same-length rewrite is still one full body region plus metadata.
+        store.write_body(1, b"next").unwrap();
+        store.flush().unwrap();
+        let copied = size + 41 * layout[0].len() + limits.max_body;
+        assert_eq!(counts.bytes.load(Ordering::Relaxed), copied as u64);
+        assert_eq!(counts.writes.load(Ordering::Relaxed), 42);
+        store.flush().unwrap();
+        store.flush_publication().unwrap();
+        let reopened = durable::DurableStore::open_buffered(store.into_backend(), limits).unwrap();
+        assert_eq!(reopened.body(0), b"body");
+        assert_eq!(reopened.body(1), b"next");
+        assert_eq!(reopened.body(2), b"body");
+        assert_eq!(reopened.descriptor(), Some(&descriptor));
+        assert_eq!(counts.writes.load(Ordering::Relaxed), 42);
+        assert_eq!(counts.bytes.load(Ordering::Relaxed), copied as u64);
+    }
+
     #[test]
     fn counters_and_nearest_rank_have_explicit_units() {
         assert_eq!(percentiles(&[]), None);
