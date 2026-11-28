@@ -1866,42 +1866,104 @@ fn stored_tenderlink_wal(from: u64) -> Vec<(u64, Vec<u8>)> {
 }
 
 /// Single-writer D28 storage. The node's one BFT task owns this (it is not Clone).
-/// RocksDB's synced atomic replacement is wrapped in an identity-bound envelope:
-/// changing the finalizer key must not reinterpret an old signing authority.
+/// One synced batch replaces identity-bound metadata and changed full body rows.
+/// The complete logical v2 image, including all padding, is validated by DurableStore.
 struct D28BlockStore {
     db: ZebraDb,
-    size: usize,
+    regions: [std::ops::Range<usize>; 4],
     public_key: [u8; 32],
+    split: bool,
+}
+
+impl D28BlockStore {
+    fn new(db: ZebraDb, limits: tenderlink::d28::durable::Limits, public_key: [u8; 32]) -> tenderlink::d28::Result<Self> {
+        Ok(Self { db, regions: tenderlink::d28::durable::image_regions(limits)?, public_key, split: false })
+    }
 }
 
 impl tenderlink::d28::AtomicBlockStore for D28BlockStore {
-    fn block_size(&self) -> usize { self.size }
+    fn block_size(&self) -> usize { self.regions[3].end }
 
     fn load(&mut self, block: &mut [u8]) -> tenderlink::d28::Result<bool> {
         use tenderlink::d28::Error;
-        if block.len() != self.size { return Err(Error::Storage); }
-        let Some(image) = self.db.d28_atomic_block() else { return Ok(false); };
-        if image.len() != self.size.checked_add(40).ok_or(Error::Storage)?
-            || &image[..8] != b"D28KEY01"
-            || image[8..40] != self.public_key
-        {
-            return Err(Error::Corrupt);
+        if block.len() != self.block_size() { return Err(Error::Storage); }
+        self.split = false;
+        let max_sizes = [
+            self.block_size().checked_add(40).ok_or(Error::Storage)?,
+            self.regions[1].len(), self.regions[2].len(), self.regions[3].len(),
+        ];
+        let [root, body0, body1, body2] = self.db.d28_atomic_parts(max_sizes).map_err(|err| {
+            use crate::service::finalized_state::bft::SnapshotReadError;
+            match err {
+                SnapshotReadError::Oversized => Error::Corrupt,
+                SnapshotReadError::Database(err) => {
+                    tracing::error!("D28 durable signing image read failed; signing stops: {err}");
+                    Error::Storage
+                }
+            }
+        })?;
+        let bodies = [body0, body1, body2];
+        let Some(root) = root else {
+            return if bodies.iter().all(Option::is_none) { Ok(false) } else { Err(Error::Corrupt) };
+        };
+        if root.len() < 40 || root[8..40] != self.public_key { return Err(Error::Corrupt); }
+        match &root[..8] {
+            b"D28KEY01" => {
+                if root.len() != self.block_size().checked_add(40).ok_or(Error::Storage)?
+                    || bodies.iter().any(Option::is_some)
+                {
+                    return Err(Error::Corrupt);
+                }
+                // The core owns v1/v2 decoding and lazy conversion. Opening never writes.
+                block.copy_from_slice(&root[40..]);
+            }
+            b"D28KEY02" => {
+                if root.len() != self.regions[0].len().checked_add(40).ok_or(Error::Storage)?
+                    || bodies.iter().zip(&self.regions[1..]).any(|(body, region)| {
+                        body.as_ref().is_none_or(|body| body.len() != region.len())
+                    })
+                {
+                    return Err(Error::Corrupt);
+                }
+                block[self.regions[0].clone()].copy_from_slice(&root[40..]);
+                for (body, region) in bodies.iter().zip(&self.regions[1..]) {
+                    block[region.clone()].copy_from_slice(body.as_ref().expect("all three bodies were checked"));
+                }
+                // Only the canonical logical v2 codec has this split layout.
+                if &block[..8] != b"D28IMG02" { return Err(Error::Corrupt); }
+                self.split = true;
+            }
+            _ => return Err(Error::Corrupt),
         }
-        block.copy_from_slice(&image[40..]);
         Ok(true)
     }
 
     fn replace(&mut self, next: &[u8]) -> tenderlink::d28::Result<()> {
+        self.replace_regions(next, &self.regions.clone())
+    }
+
+    fn replace_regions(&mut self, next: &[u8], changed: &[std::ops::Range<usize>]) -> tenderlink::d28::Result<()> {
         use tenderlink::d28::Error;
-        if next.len() != self.size { return Err(Error::Storage); }
-        let mut image = Vec::with_capacity(self.size.checked_add(40).ok_or(Error::Storage)?);
-        image.extend_from_slice(b"D28KEY01");
-        image.extend_from_slice(&self.public_key);
-        image.extend_from_slice(next);
-        self.db.write_d28_atomic_block(image).map_err(|err| {
+        tenderlink::d28::atomic::validate_regions(self.block_size(), next, changed)?;
+        if &next[..8] != b"D28IMG02" { return Err(Error::Corrupt); }
+        let mut root = Vec::with_capacity(self.regions[0].len().checked_add(40).ok_or(Error::Storage)?);
+        root.extend_from_slice(b"D28KEY02");
+        root.extend_from_slice(&self.public_key);
+        root.extend_from_slice(&next[self.regions[0].clone()]);
+        let bodies = std::array::from_fn(|i| {
+            let region = &self.regions[i + 1];
+            // Fresh/monolithic storage has no body rows, even if the core already
+            // cached canonical v2 bytes and reports only metadata as changed.
+            (!self.split || changed.iter().any(|range| range.start < region.end && region.start < range.end))
+                .then(|| &next[region.clone()])
+        });
+        self.db.write_d28_atomic_parts(&root, bodies).map_err(|err| {
             tracing::error!("D28 durable signing image replacement failed; signing stops: {err}");
             Error::Storage
-        })
+        })?;
+        // An ambiguous failed commit must never advance the backend's migration state.
+        self.split = true;
+        Ok(())
     }
 }
 
@@ -1948,10 +2010,14 @@ impl BftRunner {
         metrics::gauge!("state.crosslink.bft_dropped").set(0.0);
         *BFT_DB.write().unwrap() = Some(block_writer.finalized_state.db.clone());
         crate::new_network::fin::load(&block_writer.finalized_state.db);
-        // Both engines retain their newest signing authority. D28's fixed image
-        // must count as signed state even though it is not a legacy height WAL row.
-        runner.has_wal = block_writer.finalized_state.db.d28_atomic_block().is_some()
-            || !block_writer.finalized_state.db.tenderlink_wal(0).is_empty();
+        // Every D28 key counts, including orphan bodies. Neither corruption nor
+        // a failed read may grant permission to bootstrap fresh signing authority.
+        let has_d28 = block_writer.finalized_state.db.has_d28_state().unwrap_or_else(|err| {
+            tracing::error!("D28 signer-state detection failed; BFT was not started: {err}");
+            runner.launch = None;
+            true
+        });
+        runner.has_wal = has_d28 || !block_writer.finalized_state.db.tenderlink_wal(0).is_empty();
         if runner.launch.is_some() {
             // A chain-bootstrapped node restarting with a stored chain and no WAL holds tenderlink
             // back until the sync loop has heard from peers whether it is behind
@@ -3243,19 +3309,18 @@ impl BftRunner {
             initial_height, roster, vote_namespace, self.params.active_roster_max_n,
             network.transport, network.seeds,
         );
-        let size = match tenderlink::d28::durable::image_size(tenderlink::d28::durable::Limits {
-            max_members: config.max_members, max_body: config.max_body,
-        }) {
-            Ok(size) => size,
+        let backend = match D28BlockStore::new(
+            db,
+            tenderlink::d28::durable::Limits { max_members: config.max_members, max_body: config.max_body },
+            ed25519_zebra::VerificationKeyBytes::from(&launch.signing_key).into(),
+        ) {
+            Ok(backend) => backend,
             Err(error) => {
                 tracing::error!("D28 signing image limits are invalid: {error:?}");
                 return;
             }
         };
-        let backend = D28BlockStore {
-            db, size,
-            public_key: ed25519_zebra::VerificationKeyBytes::from(&launch.signing_key).into(),
-        };
+        let size = tenderlink::d28::AtomicBlockStore::block_size(&backend);
         publish_tenderlink_held(false);
         tracing::info!("starting D28 bounded engine at BFT height {initial_height} (durable image {size} bytes)");
         BFT_CHAIN.write().unwrap().is_activated = true;
@@ -3572,6 +3637,7 @@ mod tests {
     #[test]
     fn d28_block_store_checks_size_identity_and_corruption() {
         use tenderlink::d28::{AtomicBlockStore, Error};
+        use tenderlink::d28::durable::Limits;
         let _init_guard = zebra_test::init();
         let state = crate::service::finalized_state::FinalizedState::new(
             &crate::Config::ephemeral(),
@@ -3579,27 +3645,357 @@ mod tests {
             #[cfg(feature = "elasticsearch")]
             false,
         ).expect("an ephemeral database opens");
-        let mut backend = D28BlockStore { db: state.db.clone(), size: 64, public_key: [1; 32] };
-        let mut loaded = [0; 64];
+        let limits = Limits { max_members: 4, max_body: 128 };
+        let mut backend = D28BlockStore::new(state.db.clone(), limits, [1; 32]).unwrap();
+        let mut image = vec![7; backend.block_size()];
+        image[..8].copy_from_slice(b"D28IMG02");
+        let mut loaded = vec![0; image.len()];
         assert_eq!(backend.load(&mut loaded), Ok(false));
-        assert_eq!(backend.load(&mut [0; 63]), Err(Error::Storage));
+        assert_eq!(backend.load(&mut loaded[..63]), Err(Error::Storage));
         assert_eq!(backend.replace(&[3; 65]), Err(Error::Storage));
-        assert!(state.db.d28_atomic_block().is_none());
-        backend.replace(&[7; 64]).unwrap();
+        assert!(!state.db.has_d28_state().unwrap());
+        // First initialization must persist all rows even for a metadata-only mask.
+        backend.replace_regions(&image, &[backend.regions[0].clone()]).unwrap();
         assert_eq!(backend.load(&mut loaded), Ok(true));
-        assert_eq!(loaded, [7; 64]);
+        assert_eq!(loaded, image);
+        let before = state.db.d28_test_parts();
         drop(backend);
-        let mut reopened = D28BlockStore { db: state.db.clone(), size: 64, public_key: [1; 32] };
+        let mut reopened = D28BlockStore::new(state.db.clone(), limits, [1; 32]).unwrap();
         assert_eq!(reopened.load(&mut loaded), Ok(true));
         assert_eq!(reopened.replace(&[3; 63]), Err(Error::Storage));
+        for invalid in [vec![], vec![0..0], vec![4..3], vec![0..image.len() + 1], vec![0..3, 2..4], vec![4..6, 1..2]] {
+            assert_eq!(reopened.replace_regions(&image, &invalid), Err(Error::Storage));
+            assert_eq!(state.db.d28_test_parts(), before);
+        }
         assert_eq!(reopened.load(&mut loaded), Ok(true));
-        assert_eq!(loaded, [7; 64]);
-        let mut wrong_key = D28BlockStore { db: state.db.clone(), size: 64, public_key: [2; 32] };
+        assert_eq!(loaded, image);
+        let mut wrong_key = D28BlockStore::new(state.db.clone(), limits, [2; 32]).unwrap();
         assert_eq!(wrong_key.load(&mut loaded), Err(Error::Corrupt));
-        let mut wrong_size = D28BlockStore { db: state.db.clone(), size: 65, public_key: [1; 32] };
-        assert_eq!(wrong_size.load(&mut [0; 65]), Err(Error::Corrupt));
-        state.db.write_d28_atomic_block(vec![0; 4]).unwrap();
+        let mut wrong_size = D28BlockStore::new(state.db.clone(), Limits { max_body: 129, ..limits }, [1; 32]).unwrap();
+        let mut wrong_image = vec![0; wrong_size.block_size()];
+        assert_eq!(wrong_size.load(&mut wrong_image), Err(Error::Corrupt));
+        state.db.set_d28_test_parts([Some(&[0; 4]), None, None, None]);
         assert_eq!(reopened.load(&mut loaded), Err(Error::Corrupt));
+    }
+
+    fn d28_test_state() -> crate::service::finalized_state::FinalizedState {
+        crate::service::finalized_state::FinalizedState::new(
+            &crate::Config::ephemeral(),
+            &Network::Mainnet,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        ).expect("an ephemeral database opens")
+    }
+
+    fn d28_test_config(max_body: usize, domain: u8) -> tenderlink::d28::Config {
+        use tenderlink::d28::{Config, Member, Timeouts};
+        Config::new(
+            [domain; 32],
+            vec![Member {
+                public_key: ed25519_zebra::VerificationKeyBytes::from(&ed25519_zebra::SigningKey::from([1; 32])).into(),
+                weight: 1,
+            }],
+            max_body,
+            10,
+            Timeouts { propose: 30, prevote: 5, precommit: 10, inc_propose: 3, inc_prevote: 1, inc_precommit: 2 },
+        ).unwrap()
+    }
+
+    const D28_TEST_BODIES: [&[u8]; 3] = [b"alpha", b"bravo", b"charlie"];
+
+    fn d28_test_v2_image(db: &ZebraDb, limits: tenderlink::d28::durable::Limits) -> Vec<u8> {
+        use tenderlink::d28::{AtomicBlockStore, Storage, durable::DurableStore};
+        let backend = D28BlockStore::new(db.clone(), limits, [1; 32]).unwrap();
+        let mut store = DurableStore::open_buffered(backend, limits).unwrap();
+        store.seal_config(&d28_test_config(limits.max_body, 42)).unwrap();
+        for (slot, body) in D28_TEST_BODIES.into_iter().enumerate() {
+            store.write_body(slot, body).unwrap();
+        }
+        store.flush().unwrap();
+        let mut backend = store.into_backend();
+        let mut image = vec![0; backend.block_size()];
+        assert_eq!(backend.load(&mut image), Ok(true));
+        image
+    }
+
+    /// Independent legacy-v1 fixture: two absent config banks, no descriptor,
+    /// three unreferenced physical bodies, four empty cert regions, no OWN rows.
+    /// The real DurableStore decoder, not an opaque backend-only load, accepts it.
+    fn d28_test_v1_image(limits: tenderlink::d28::durable::Limits) -> Vec<u8> {
+        let mut payload = vec![0; 5];
+        for body in D28_TEST_BODIES {
+            payload.extend_from_slice(&u64::try_from(body.len()).unwrap().to_le_bytes());
+            payload.extend_from_slice(body);
+            payload.push(0); // absent body header
+        }
+        payload.extend_from_slice(&[0; 4 * 9 + 4]); // regions and OWN option tags
+        let mut image = vec![0; tenderlink::d28::durable::image_size(limits).unwrap()];
+        image[..8].copy_from_slice(b"D28IMG01");
+        image[8..12].copy_from_slice(&1u32.to_le_bytes());
+        image[12..20].copy_from_slice(&u64::try_from(limits.max_members).unwrap().to_le_bytes());
+        image[20..28].copy_from_slice(&u64::try_from(limits.max_body).unwrap().to_le_bytes());
+        image[28..36].copy_from_slice(&u64::try_from(payload.len()).unwrap().to_le_bytes());
+        image[36..36 + payload.len()].copy_from_slice(&payload);
+        let checksum_at = image.len() - 32;
+        let checksum = blake3::hash(&image[..checksum_at]);
+        image[checksum_at..].copy_from_slice(checksum.as_bytes());
+        image
+    }
+
+    #[test]
+    fn d28_split_backend_writes_only_intersected_full_rows() {
+        use tenderlink::d28::{AtomicBlockStore, durable::Limits};
+        let _init_guard = zebra_test::init();
+        let state = d28_test_state();
+        let db = &state.db;
+        let limits = Limits { max_members: 4, max_body: 128 };
+        let mut backend = D28BlockStore::new(db.clone(), limits, [1; 32]).unwrap();
+        let regions = backend.regions.clone();
+        let mut image = vec![7; backend.block_size()];
+        image[..8].copy_from_slice(b"D28IMG02");
+        let start = db.d28_test_sequence_number();
+        backend.replace_regions(&image, &[100..101]).unwrap();
+        assert_eq!(db.d28_test_sequence_number() - start, 4);
+        let first = db.d28_test_parts();
+        assert_eq!(first[0].as_ref().unwrap().len(), 40 + regions[0].len());
+        for body in &first[1..] { assert_eq!(body.as_ref().unwrap().len(), limits.max_body); }
+
+        image[100] = 8;
+        let start = db.d28_test_sequence_number();
+        backend.replace_regions(&image, &[100..101]).unwrap();
+        assert_eq!(db.d28_test_sequence_number() - start, 1);
+        let metadata_only = db.d28_test_parts();
+        assert_ne!(metadata_only[0], first[0]);
+        assert_eq!(metadata_only[1..], first[1..]);
+
+        let changed = regions[2].start + 3..regions[2].start + 5;
+        image[changed.clone()].fill(9);
+        let start = db.d28_test_sequence_number();
+        backend.replace_regions(&image, &[changed]).unwrap();
+        assert_eq!(db.d28_test_sequence_number() - start, 2);
+        let body_only = db.d28_test_parts();
+        assert_eq!(body_only[1], first[1]);
+        assert_eq!(body_only[2].as_deref(), Some(&image[regions[2].clone()]));
+        assert_eq!(body_only[3], first[3]);
+
+        let crossing = regions[2].end - 1..regions[3].start + 1;
+        image[crossing.clone()].fill(10);
+        let start = db.d28_test_sequence_number();
+        backend.replace_regions(&image, &[crossing]).unwrap();
+        assert_eq!(db.d28_test_sequence_number() - start, 3);
+        let mut loaded = vec![0; image.len()];
+        assert_eq!(backend.load(&mut loaded), Ok(true));
+        assert_eq!(loaded, image);
+
+        image[8..].fill(11);
+        let start = db.d28_test_sequence_number();
+        backend.replace(&image).unwrap();
+        assert_eq!(db.d28_test_sequence_number() - start, 4);
+        drop(backend);
+        let start = db.d28_test_sequence_number();
+        let mut reopened = D28BlockStore::new(db.clone(), limits, [1; 32]).unwrap();
+        assert_eq!(reopened.load(&mut loaded), Ok(true));
+        assert_eq!(loaded, image);
+        drop(reopened);
+        assert_eq!(db.d28_test_sequence_number(), start);
+    }
+
+    #[test]
+    fn d28_real_v1_and_v2_monoliths_migrate_only_on_required_commit() {
+        use tenderlink::d28::{AtomicBlockStore, Storage, durable::{DurableStore, Limits}};
+        let _init_guard = zebra_test::init();
+        let limits = Limits { max_members: 4, max_body: 128 };
+        for version in [1, 2] {
+            let state = d28_test_state();
+            let db = &state.db;
+            let image = if version == 1 { d28_test_v1_image(limits) } else { d28_test_v2_image(db, limits) };
+            let mut root = b"D28KEY01".to_vec();
+            root.extend_from_slice(&[1; 32]);
+            root.extend_from_slice(&image);
+            db.set_d28_test_parts([Some(&root), None, None, None]);
+            let legacy = db.d28_test_parts();
+            let start = db.d28_test_sequence_number();
+            for buffered in [false, true] {
+                let backend = D28BlockStore::new(db.clone(), limits, [1; 32]).unwrap();
+                let mut store = if buffered { DurableStore::open_buffered(backend, limits) } else { DurableStore::open(backend, limits) }.unwrap();
+                for (slot, body) in D28_TEST_BODIES.into_iter().enumerate() { assert_eq!(store.body(slot), body); }
+                store.flush().unwrap(); // a clean flush is not migration
+                drop(store);
+                assert_eq!(db.d28_test_parts(), legacy);
+                assert_eq!(db.d28_test_sequence_number(), start);
+            }
+            let backend = D28BlockStore::new(db.clone(), limits, [1; 32]).unwrap();
+            let mut store = DurableStore::open_buffered(backend, limits).unwrap();
+            // Metadata only. For v2 the core has already cached canonical body bytes.
+            store.seal_config(&d28_test_config(limits.max_body, 43)).unwrap();
+            assert_eq!(db.d28_test_sequence_number(), start);
+            store.flush().unwrap();
+            assert_eq!(db.d28_test_sequence_number() - start, 4, "v{version} first split commit");
+            let migrated = db.d28_test_parts();
+            let new_root = migrated[0].as_ref().unwrap();
+            assert_eq!(&new_root[..8], b"D28KEY02");
+            // The exact former reader's length/magic guard rejects, never returns fresh.
+            assert!(new_root.len() != image.len() + 40 || &new_root[..8] != b"D28KEY01");
+            assert!(db.has_d28_state().unwrap());
+            let mut backend = store.into_backend();
+            assert!(backend.split);
+            let mut next = vec![0; image.len()];
+            assert_eq!(backend.load(&mut next), Ok(true));
+            assert_eq!(&next[..8], b"D28IMG02");
+            let reopened = DurableStore::open_buffered(backend, limits).unwrap();
+            for (slot, body) in D28_TEST_BODIES.into_iter().enumerate() { assert_eq!(reopened.body(slot), body); }
+            drop(reopened);
+            assert_eq!(db.d28_test_parts(), migrated);
+        }
+    }
+
+    fn d28_assert_corrupt_parts(
+        db: &ZebraDb,
+        limits: tenderlink::d28::durable::Limits,
+        parts: [Option<Vec<u8>>; 4],
+    ) {
+        use tenderlink::d28::{Error, durable::DurableStore};
+        db.set_d28_test_parts(parts.each_ref().map(|part| part.as_deref()));
+        let sequence = db.d28_test_sequence_number();
+        assert!(db.has_d28_state().unwrap());
+        let backend = D28BlockStore::new(db.clone(), limits, [1; 32]).unwrap();
+        assert!(matches!(DurableStore::open_buffered(backend, limits), Err(Error::Corrupt)));
+        assert_eq!(db.d28_test_sequence_number(), sequence);
+        assert_eq!(db.d28_test_parts(), parts);
+    }
+
+    #[test]
+    fn d28_split_corruption_missing_mixed_orphan_and_oversized_rows_fail_closed() {
+        use tenderlink::d28::durable::Limits;
+        let _init_guard = zebra_test::init();
+        let state = d28_test_state();
+        let db = &state.db;
+        let limits = Limits { max_members: 4, max_body: 128 };
+        let image = d28_test_v2_image(db, limits);
+        let good = db.d28_test_parts();
+        for slot in 0..4 {
+            let mut parts = good.clone();
+            parts[slot] = None;
+            d28_assert_corrupt_parts(db, limits, parts);
+            let mut parts = [None, None, None, None];
+            parts[slot] = good[slot].clone();
+            d28_assert_corrupt_parts(db, limits, parts);
+            for grow in [false, true] {
+                let mut parts = good.clone();
+                let bytes = parts[slot].as_mut().unwrap();
+                if grow { bytes.push(0); } else { bytes.pop(); }
+                d28_assert_corrupt_parts(db, limits, parts);
+            }
+        }
+        for logical in [image.clone(), d28_test_v1_image(limits)] {
+            let mut legacy = b"D28KEY01".to_vec();
+            legacy.extend_from_slice(&[1; 32]);
+            legacy.extend_from_slice(&logical);
+            let mut parts = good.clone();
+            parts[0] = Some(legacy); // valid old root cannot coexist with any split bodies
+            d28_assert_corrupt_parts(db, limits, parts);
+        }
+        let mut parts = good.clone();
+        parts[0] = Some(vec![0; image.len() + 41]); // above even the legacy envelope bound
+        d28_assert_corrupt_parts(db, limits, parts);
+        for offset in [0, 8, 39, 40, 48, 76] {
+            let mut parts = good.clone();
+            parts[0].as_mut().unwrap()[offset] ^= 1;
+            d28_assert_corrupt_parts(db, limits, parts);
+        }
+        // Re-seal the checksum: strict logical validation, not just a checksum,
+        // rejects mismatched trusted geometry, versions, and nonzero metadata padding.
+        for offset in [8, 12, 20, good[0].as_ref().unwrap().len() - 40 - 33] {
+            let mut parts = good.clone();
+            let metadata = &mut parts[0].as_mut().unwrap()[40..];
+            metadata[offset] ^= 1;
+            let checksum_at = metadata.len() - 32;
+            let checksum = blake3::hash(&metadata[..checksum_at]);
+            metadata[checksum_at..].copy_from_slice(checksum.as_bytes());
+            d28_assert_corrupt_parts(db, limits, parts);
+        }
+        // All physical bodies are validated, even though none has a live descriptor.
+        for slot in 1..4 {
+            for offset in [0, limits.max_body - 1] {
+                let mut parts = good.clone();
+                parts[slot].as_mut().unwrap()[offset] ^= 1; // occupied bytes or zero padding
+                d28_assert_corrupt_parts(db, limits, parts);
+            }
+        }
+        let mut parts = good.clone();
+        parts.swap(1, 2);
+        d28_assert_corrupt_parts(db, limits, parts);
+        db.set_d28_test_parts(good.each_ref().map(|part| part.as_deref()));
+        let wrong_limits = Limits { max_members: 5, ..limits };
+        let backend = D28BlockStore::new(db.clone(), wrong_limits, [1; 32]).unwrap();
+        assert!(matches!(tenderlink::d28::durable::DurableStore::open(backend, wrong_limits), Err(tenderlink::d28::Error::Corrupt)));
+    }
+
+    #[test]
+    fn d28_durable_store_uses_split_rows_and_never_flushes_on_open_or_drop() {
+        use tenderlink::d28::{Storage, durable::{DurableStore, Limits}};
+        let _init_guard = zebra_test::init();
+        let state = d28_test_state();
+        let db = &state.db;
+        let limits = Limits { max_members: 4, max_body: 128 };
+        let start = db.d28_test_sequence_number();
+        let backend = D28BlockStore::new(db.clone(), limits, [1; 32]).unwrap();
+        let mut store = DurableStore::open_buffered(backend, limits).unwrap();
+        store.flush().unwrap();
+        store.seal_config(&d28_test_config(limits.max_body, 42)).unwrap();
+        drop(store); // even staged initialization is not persisted on drop
+        assert_eq!(db.d28_test_sequence_number(), start);
+        assert!(!db.has_d28_state().unwrap());
+
+        d28_test_v2_image(db, limits);
+        assert_eq!(db.d28_test_sequence_number() - start, 4);
+        let first = db.d28_test_parts();
+        let backend = D28BlockStore::new(db.clone(), limits, [1; 32]).unwrap();
+        let mut store = DurableStore::open_buffered(backend, limits).unwrap();
+        let start = db.d28_test_sequence_number();
+        // Repeated metadata-only publications must not write any Bmax body row.
+        for domain in 43..83 {
+            store.seal_config(&d28_test_config(limits.max_body, domain)).unwrap();
+            store.flush().unwrap();
+        }
+        assert_eq!(db.d28_test_sequence_number() - start, 40);
+        assert_eq!(db.d28_test_parts()[1..], first[1..]);
+
+        let start = db.d28_test_sequence_number();
+        store.write_body(0, b"x").unwrap();
+        store.flush().unwrap();
+        assert_eq!(db.d28_test_sequence_number() - start, 2);
+        let changed = db.d28_test_parts();
+        assert_eq!(changed[2..], first[2..]);
+        assert_eq!(changed[1].as_ref().unwrap()[0], b'x');
+        assert!(changed[1].as_ref().unwrap()[1..].iter().all(|byte| *byte == 0));
+
+        let start = db.d28_test_sequence_number();
+        store.copy_body(0, 2).unwrap();
+        store.flush().unwrap();
+        assert_eq!(db.d28_test_sequence_number() - start, 2);
+        let copied = db.d28_test_parts();
+        assert_eq!(copied[1], copied[3]);
+        assert_eq!(copied[2], first[2]);
+
+        let start = db.d28_test_sequence_number();
+        store.write_body(0, b"one").unwrap();
+        store.write_body(1, b"two").unwrap();
+        store.flush().unwrap();
+        assert_eq!(db.d28_test_sequence_number() - start, 3);
+        let committed = db.d28_test_parts();
+        let start = db.d28_test_sequence_number();
+        store.write_body(2, b"not committed").unwrap();
+        drop(store);
+        let backend = D28BlockStore::new(db.clone(), limits, [1; 32]).unwrap();
+        let mut reopened = DurableStore::open(backend, limits).unwrap();
+        assert_eq!(reopened.body(0), b"one");
+        assert_eq!(reopened.body(1), b"two");
+        assert_eq!(reopened.body(2), b"x");
+        assert_eq!(db.d28_test_parts(), committed);
+        assert_eq!(db.d28_test_sequence_number(), start);
+        reopened.write_body(0, b"eager").unwrap();
+        assert_eq!(db.d28_test_sequence_number() - start, 2);
     }
 
     fn test_block(version: u32) -> BftBlock {

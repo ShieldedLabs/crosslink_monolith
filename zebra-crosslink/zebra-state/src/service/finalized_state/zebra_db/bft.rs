@@ -1,5 +1,7 @@
 //! Decided BFT chain database access and write methods.
 
+pub(crate) use super::super::disk_db::SnapshotReadError;
+
 use zcash_primitives::bft::{BftBlock, FatPointerToBftBlock, TMSig};
 
 use zebra_chain::block::{self, Height};
@@ -39,21 +41,42 @@ pub const TENDERLINK_WAL_HEIGHTS_KEPT: u32 = 64;
 /// The type for reading this node's tenderlink WAL records.
 pub type TenderlinkWalByHeightCf<'cf> = TypedColumnFamily<'cf, BftHeight, TenderlinkWalRecord>;
 
-/// One local signer image, outside the entire four-byte BFT-height key space.
-/// This is private finalizer state, not a change to any ledger or decided-block encoding.
+/// Private signer metadata and three full body regions, strictly after every
+/// four-byte BFT height. The root is also the old monolithic image key: replacing
+/// its envelope makes old executables reject the split state, not bootstrap.
 /// All legacy-height scans must remain bounded by `BftHeight(u32::MAX)`.
+const D28_BLOCK_KEYS: [&[u8]; 4] = [
+    &[0xff; 8],
+    &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1],
+    &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 2],
+    &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 3],
+];
+
 #[derive(Debug)]
-struct D28BlockKey;
+struct D28BlockKey(usize);
 
 impl crate::service::finalized_state::disk_format::IntoDisk for D28BlockKey {
-    type Bytes = [u8; 8];
-    fn as_bytes(&self) -> Self::Bytes { [0xff; 8] }
+    type Bytes = &'static [u8];
+    fn as_bytes(&self) -> Self::Bytes { D28_BLOCK_KEYS[self.0] }
 }
 
 impl crate::service::finalized_state::disk_format::FromDisk for D28BlockKey {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        assert_eq!(bytes.as_ref(), &[0xff; 8], "D28 block key is eight FF bytes");
-        Self
+        Self(D28_BLOCK_KEYS.iter().position(|key| *key == bytes.as_ref()).expect("one of four D28 keys"))
+    }
+}
+
+/// Borrow changed regions until RocksDB copies them into the one write batch.
+struct D28Part<'a>(std::borrow::Cow<'a, [u8]>);
+
+impl<'a> crate::service::finalized_state::disk_format::IntoDisk for D28Part<'a> {
+    type Bytes = std::borrow::Cow<'a, [u8]>;
+    fn as_bytes(&self) -> Self::Bytes { self.0.clone() }
+}
+
+impl crate::service::finalized_state::disk_format::FromDisk for D28Part<'_> {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        Self(std::borrow::Cow::Owned(bytes.as_ref().to_vec()))
     }
 }
 
@@ -147,23 +170,63 @@ impl ZebraDb {
         records
     }
 
-    /// Read D28's opaque local signer image. The adapter validates its fixed length and identity.
-    pub fn d28_atomic_block(&self) -> Option<Vec<u8>> {
-        TypedColumnFamily::<D28BlockKey, TenderlinkWalRecord>::new(&self.db, TENDERLINK_WAL_BY_HEIGHT)
-            .expect("column family was created when database was created")
-            .zs_get(&D28BlockKey)
-            .map(|record| record.0)
+    /// Read all four D28 keys at one RocksDB snapshot, never a mix of commits.
+    /// The trusted maximum sizes bound copying; the adapter checks exact lengths,
+    /// envelope and identity. DurableStore validates the reassembled logical image.
+    pub(crate) fn d28_atomic_parts(&self, max_sizes: [usize; 4]) -> Result<[Option<Vec<u8>>; 4], super::super::disk_db::SnapshotReadError> {
+        self.db.snapshot_get_cf(TENDERLINK_WAL_BY_HEIGHT, D28_BLOCK_KEYS, max_sizes)
     }
 
-    /// Atomically replace D28's local signer image and sync it before acknowledging success.
-    /// Unlike the legacy height WAL writer, this never prunes height records.
-    pub fn write_d28_atomic_block(&self, image: Vec<u8>) -> Result<(), rocksdb::Error> {
+    /// Any D28 row is signer state, including a corrupt orphan body without a root.
+    /// Presence does not copy the potentially malformed rows.
+    pub(crate) fn has_d28_state(&self) -> Result<bool, rocksdb::Error> {
+        self.db.snapshot_contains_any_cf(TENDERLINK_WAL_BY_HEIGHT, D28_BLOCK_KEYS)
+    }
+
+    /// All test fixtures are smaller than this fixed bound.
+    #[cfg(test)]
+    pub(crate) fn d28_test_parts(&self) -> [Option<Vec<u8>>; 4] {
+        self.d28_atomic_parts([64 * 1024; 4]).unwrap()
+    }
+
+    /// Atomically replace the root and selected full body rows, then sync once.
+    /// No row is deleted, and unlike the legacy WAL writer this never prunes heights.
+    /// The single-writer adapter must supply all bodies on its first split commit.
+    pub(crate) fn write_d28_atomic_parts(&self, root: &[u8], bodies: [Option<&[u8]>; 3]) -> Result<(), rocksdb::Error> {
         let mut batch = DiskWriteBatch::new();
-        let _ = TypedColumnFamily::<D28BlockKey, TenderlinkWalRecord>::new(&self.db, TENDERLINK_WAL_BY_HEIGHT)
-            .expect("column family was created when database was created")
-            .with_batch_for_writing(&mut batch)
-            .zs_insert(&D28BlockKey, &TenderlinkWalRecord(image));
+        let cf = TypedColumnFamily::<D28BlockKey, D28Part<'_>>::new(&self.db, TENDERLINK_WAL_BY_HEIGHT)
+            .expect("column family was created when database was created");
+        let mut writer = cf.with_batch_for_writing(&mut batch)
+            .zs_insert(&D28BlockKey(0), &D28Part(std::borrow::Cow::Borrowed(root)));
+        for (slot, body) in bodies.into_iter().enumerate() {
+            if let Some(body) = body {
+                writer = writer.zs_insert(&D28BlockKey(slot + 1), &D28Part(std::borrow::Cow::Borrowed(body)));
+            }
+        }
+        drop(writer);
         self.db.write_synced(batch)
+    }
+
+    /// Row-operation counter for isolated single-writer tests, not disk traffic.
+    #[cfg(test)]
+    pub(crate) fn d28_test_sequence_number(&self) -> u64 {
+        self.db.test_sequence_number()
+    }
+
+    /// Test-only corruption and legacy fixtures; never used by the live signer.
+    #[cfg(test)]
+    pub(crate) fn set_d28_test_parts(&self, parts: [Option<&[u8]>; 4]) {
+        let mut batch = DiskWriteBatch::new();
+        let cf = TypedColumnFamily::<D28BlockKey, D28Part<'_>>::new(&self.db, TENDERLINK_WAL_BY_HEIGHT).unwrap();
+        let mut writer = cf.with_batch_for_writing(&mut batch);
+        for (slot, part) in parts.into_iter().enumerate() {
+            writer = match part {
+                Some(part) => writer.zs_insert(&D28BlockKey(slot), &D28Part(std::borrow::Cow::Borrowed(part))),
+                None => writer.zs_delete(&D28BlockKey(slot)),
+            };
+        }
+        drop(writer);
+        self.db.write_synced(batch).unwrap();
     }
 
     /// Store this node's tenderlink WAL record for `height`, replacing the one stored before, and
@@ -314,7 +377,7 @@ mod tests {
     use crate::{service::finalized_state::FinalizedState, Config};
 
     #[test]
-    fn d28_atomic_block_is_separate_from_all_legacy_wal_heights() {
+    fn d28_atomic_parts_are_separate_from_all_legacy_wal_heights() {
         let _init_guard = zebra_test::init();
         let state = FinalizedState::new(
             &Config::ephemeral(),
@@ -323,21 +386,84 @@ mod tests {
             false,
         ).expect("an ephemeral database opens");
         let db = &state.db;
-        assert_eq!(db.d28_atomic_block(), None);
+        assert_eq!(db.d28_test_parts(), [None, None, None, None]);
+        assert!(!db.has_d28_state().unwrap());
+        for key in super::D28_BLOCK_KEYS {
+            assert!(key > u32::MAX.to_be_bytes().as_slice());
+        }
         let first = vec![0xa5; 4096];
-        db.write_d28_atomic_block(first.clone()).unwrap();
+        db.write_d28_atomic_parts(&first, [Some(&first); 3]).unwrap();
+        let committed = db.d28_test_parts();
+        assert!(db.has_d28_state().unwrap());
         assert!(db.tenderlink_wal(0).is_empty());
-        // A D28-only database must also be safe to inspect/write through the legacy API.
+        // Both the pruning scan and the max-height read must ignore all four keys.
         db.write_tenderlink_wal(0, vec![1]).unwrap();
         assert_eq!(db.tenderlink_wal(0), vec![(0, vec![1])]);
-        assert_eq!(db.d28_atomic_block(), Some(first.clone()));
+        assert_eq!(db.d28_test_parts(), committed);
+        db.write_tenderlink_wal(u32::MAX - TENDERLINK_WAL_HEIGHTS_KEPT, vec![3]).unwrap();
         db.write_tenderlink_wal(u32::MAX, vec![2]).unwrap();
         assert_eq!(db.tenderlink_wal(u32::MAX), vec![(u32::MAX, vec![2])]);
-        assert_eq!(db.d28_atomic_block(), Some(first));
+        assert_eq!(db.d28_test_parts(), committed);
         let second = vec![0x5a; 4096];
-        db.write_d28_atomic_block(second.clone()).unwrap();
-        assert_eq!(db.clone().d28_atomic_block(), Some(second));
-        assert_eq!(db.tenderlink_wal(0), vec![(u32::MAX, vec![2])]);
+        db.write_d28_atomic_parts(&second, [None, Some(&second), None]).unwrap();
+        assert_eq!(db.clone().d28_test_parts(), [
+            Some(second.clone()), Some(first.clone()), Some(second), Some(first),
+        ]);
+        assert_eq!(db.tenderlink_wal(0), vec![
+            (u32::MAX - TENDERLINK_WAL_HEIGHTS_KEPT, vec![3]), (u32::MAX, vec![2]),
+        ]);
+    }
+
+    #[test]
+    fn d28_presence_counts_every_orphan_part_without_needing_valid_bytes() {
+        let _init_guard = zebra_test::init();
+        let state = FinalizedState::new(
+            &Config::ephemeral(),
+            &Network::Mainnet,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        ).unwrap();
+        for slot in 0..4 {
+            let mut parts = [None; 4];
+            parts[slot] = Some(&b""[..]); // even an empty row is state, never fresh
+            state.db.set_d28_test_parts(parts);
+            assert!(state.db.has_d28_state().unwrap(), "part {slot}");
+        }
+        state.db.set_d28_test_parts([None; 4]);
+        assert!(!state.db.has_d28_state().unwrap());
+    }
+
+    #[test]
+    fn d28_snapshot_never_mixes_concurrent_atomic_batches() {
+        let _init_guard = zebra_test::init();
+        let state = FinalizedState::new(
+            &Config::ephemeral(),
+            &Network::Mainnet,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        ).unwrap();
+        let db = &state.db;
+        let first = [0; 2048];
+        db.write_d28_atomic_parts(&first, [Some(&first); 3]).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                barrier.wait();
+                for generation in 1u8..=128 {
+                    let next = [generation; 2048];
+                    db.write_d28_atomic_parts(&next, [Some(&next); 3]).unwrap();
+                    std::thread::yield_now();
+                }
+            });
+            barrier.wait();
+            for _ in 0..512 {
+                let parts = db.d28_atomic_parts([2048; 4]).unwrap();
+                assert!(parts.iter().all(|part| part == &parts[0]));
+                std::thread::yield_now();
+            }
+            writer.join().unwrap();
+        });
+        assert_eq!(db.d28_test_parts(), std::array::from_fn(|_| Some(vec![128; 2048])));
     }
 
     /// Tenderlink's WAL records read back as last written, from any height up, and a record is
