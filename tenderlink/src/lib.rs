@@ -1325,15 +1325,14 @@ impl TMState {
         self.fetched_decided_rounds.push((height, round, std::time::Instant::now()));
     }
 
-    /// Moves to the height after `tip`, the host's newest decided height, with the roster, vote
-    /// namespace and quorum rule the host gave for it. `own_round` is the round that decided a
-    /// height here, when this engine decided one; it is kept only if its certificate is exactly
-    /// the one the host stored at `tip.height`. Otherwise (the engine was behind and jumps, the host
-    /// had decided past the engine's height, or stored another certificate there) it keeps no round of
-    /// a height it passed and reads the tip's round back from the host, so a peer one height behind
-    /// is still served the host's decision from memory; older ones are read when a peer needs them
-    /// (`fetch_decided_round`). The caller then takes the next height's WAL record and starts its
-    /// round.
+    /// Advances to `tip.height + 1` using the host's next roster, vote namespace and quorum rule.
+    ///
+    /// `own_round` is the decision this engine submitted, if any. Cache it for sharing with peers
+    /// only if its height and entire certificate match the host's tip. Otherwise, clear the recent
+    /// cache and load the host's stored round for `tip.height`, if available. Matching the block
+    /// hash alone is not enough: our signatures may have been rejected.
+    ///
+    /// The caller then restores the new height's WAL record and starts its round.
     fn enter_height_after(&mut self, roster: &mut Vec<SortedRosterMember>, tip: &HostTip, own_round: Option<RoundData>) {
         *roster = tip.next_roster.clone();
         self.height = tip.height + 1;
