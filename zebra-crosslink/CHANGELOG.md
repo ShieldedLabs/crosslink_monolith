@@ -45,7 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 - Crosslink refuses a tenderlink decision whose certificate signatures fail verification
   instead of crashing the node. The failed certificate and local verification context are
-  logged, and BFT can resume when a valid decision arrives from peers
+  logged, and BFT can resume when a valid decision arrives from peers. Recovery uses the
+  accepted certificate rather than retaining rejected signatures for the same block
   ([#441](https://github.com/ShieldedLabs/crosslink_monolith/issues/441)).
 - Crosslink node shutdown now stops new work, drains in-flight database writes, and
   joins node, wallet, lightwallet server, and GUI workers before exiting. Ctrl-C and

@@ -5525,7 +5525,7 @@ fn crosslink_bft_own_candidate_with_a_bad_signature_is_refused_without_a_crash()
     let mut tf = TF::new(&BFT_ROUNDS_PARAMETERS);
     let mut scene = bft_rounds_scene(&mut tf, &[false]);
     tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
-    let decisions = bft_rounds_decisions(&scene, 20, 2);
+    let decisions = bft_rounds_decisions(&scene, 20, 1);
 
     let (_, block, fat_ptr, sigs) = &decisions[0];
     assert!(fat_ptr.validate_signatures(&[0; 32]));
@@ -5548,9 +5548,9 @@ fn crosslink_bft_own_candidate_with_a_bad_signature_is_refused_without_a_crash()
         decisions.iter().map(|(height, block, fat_ptr, sigs)| (*height, block, fat_ptr, sigs.as_slice())),
     );
     tf.push_instr_recv_stp_packet(&packet, 7, 0);
-    tf.push_instr_expect_pos_chain_length(3, 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
     tf.push_instr_advance_time(BFT_TICK_MILLIS, 0);
-    tf.push_instr_expect_bft_step(3, 0, None, 0);
+    tf.push_instr_expect_bft_step(2, 0, None, 0);
     tf.push_instr_expect_bft_dropped(false, None, 0);
     tf.push_instr_expect_node_alive(0);
 
@@ -5562,7 +5562,7 @@ fn crosslink_bft_own_candidate_with_a_bad_signature_is_refused_without_a_crash()
     bad.signatures[0].vote_signature[0] ^= 1;
     let candidate = BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt { block: block.clone(), fat_ptr: bad });
     tf.push_instr_bft_push_candidate(&candidate, sigs, 0);
-    tf.push_instr_expect_pos_chain_length(3, 0);
+    tf.push_instr_expect_pos_chain_length(2, 0);
     tf.push_instr_expect_bft_dropped(false, None, 0);
     tf.push_instr_expect_node_alive(0);
 

@@ -1577,7 +1577,7 @@ fn publish_tip(tip: &Arc<DecidedTip>) {
 fn host_tip_of(tip: &DecidedTip) -> tenderlink::HostTip {
     tenderlink::HostTip {
         height: tip.height,
-        block_id: tenderlink::ValueId(tip.block_hash.0),
+        certificate: tip.certificate.clone(),
         next_roster: tip.next_roster.clone(),
         next_vote_namespace: tip.next_voting.vote_namespace,
         next_strict_quorum: tip.next_voting.strict_quorum,
