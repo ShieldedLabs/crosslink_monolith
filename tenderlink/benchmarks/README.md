@@ -1737,3 +1737,165 @@ execution of the correctness suite.
 All seven campaign cleanup receipts confirm stopped workers and removed tokens;
 a subsequent owned-process check found no remaining benchmark children.
 `cleanup-receipt.json` retains this evidence. **No Fly resources were created.**
+
+## Split atomic body storage — 2026-11-28
+
+Implementation and integration are committed through `62ffe8973`, building on
+cached-body baseline `2d9d555df`. The next experiment removes full-image backend
+replacement when only small consensus metadata changes. It retains the same
+bounded logical v2 image, three body slots, consensus rules, required durable
+signing/publication barriers, Host checks, and all-online progress requirement.
+PoW/ledger encodings, exported BFT signatures, transport and production timers
+are unchanged.
+
+### What is split, and what remains atomic
+
+`AtomicBlockStore::replace_regions` takes the complete next logical image and
+an ordered set of changed regions. Backends commit **all selected regions as
+one old-or-new transaction**; independent per-region writes are not sufficient.
+Existing backends can safely fall back to whole-image replacement. The durable
+adapter selects metadata plus changed complete body slots before encoding
+updates its cache. First initialization and v1 conversion select everything.
+
+The real Zebra adapter stores metadata and three bodies under four fixed,
+BFT-private RocksDB keys and uses **one synced WriteBatch**. For seven members,
+metadata is `M = 4096 + 556*7 = 7,988` bytes. With a 40-MiB body cap, a normal
+metadata-only update no longer submits the entire **125,837,108-byte** logical
+image. It submits metadata; a changed body adds one full 40-MiB slot, including
+padding. Zebra additionally writes the metadata root's 40-byte identity envelope.
+
+Existing monolithic v1/v2 storage loads without a write. Its first required
+split commit establishes all three body rows, even when a v2 encoder cache says
+only metadata changed. Snapshot reads reject missing, mixed, orphaned, oversized,
+wrong-identity and corrupt state; value lengths are checked before application
+copies, and presence checks do not copy body bytes. The `D28KEY02` envelope makes
+older executables fail closed, rather than recover stale state or bootstrap
+fresh. **This private storage migration is not downgrade-compatible.**
+
+The benchmark uses the same core/codec/barriers with a RAM backend. It now copies
+selected regions and counts one successful batch, not one transaction per region.
+The new byte metric is **actual backend RAM-copy volume**, not the former
+whole-image-equivalent count, individual changed-byte count, or physical disk
+traffic. RocksDB WAL/SST/compaction/device amplification is not measured.
+
+### Matched seven-process results
+
+Seven independent local validator processes, real STP/signatures/Merkle proofs,
+100-KiB shards, mock bodies and RAM-backed persistence. Body caps match the 10-
+or 40-MiB body size; both use `balanced`, `wan_bulk`, and one executor worker.
+Every height still waits for **all seven validators**. No builds or test suites
+ran during measurements; unrelated shared-host activity was not controlled.
+
+After all verification and a separate 40-MiB gate, the prospective primary order
+was old/new/new/old at 10 MiB, then new/old/old/new at 40 MiB. Each invocation had
+seven warmup and seven measured heights. All eight primary trials completed:
+**56/56 measured heights, all round zero, zero receive-budget discards**. The gate
+(one warmup, two measured heights) passed and is excluded from pooled comparisons.
+
+| Metric | Old, 10 MiB | Split, 10 MiB | Old, 40 MiB | Split, 40 MiB |
+|---|---:|---:|---:|---:|
+| Chain throughput, MiB/s | 4.750 | **5.415** | 5.148 | **5.749** |
+| First receipt p50 / p95, s | 1.924 / 2.316 | 1.747 / 1.811 | 7.426 / 7.844 | 6.588 / 7.367 |
+| All-online receipt p50 / p95, s | 2.023 / 2.497 | 1.840 / 1.983 | 7.721 / 8.178 | 6.856 / 7.535 |
+| Process CPU-seconds/block, seven nodes summed | 9.464 | **7.648** | 38.652 | **31.281** |
+| Backend RAM-copy GiB/block, seven nodes summed | 2.022 | **0.137** | 11.401 | **0.548** |
+| Atomic batches/block, seven nodes summed | 69.000 | 68.143 | 97.286 | 97.286 |
+| Application offers / unique chain bytes | 6.066× | 6.065× | 6.062× | 6.061× |
+| Peak single-process RSS, MiB | 149.418 | 154.719 | 489.777 | 486.309 |
+
+Observed pooled throughput rose **14.00% at 10 MiB** and **11.67% at 40 MiB**.
+CPU work per block fell **19.19%** and **19.07%**, respectively. Backend copy
+volume fell **93.21%** and **95.20%**. The 40-MiB arms have exactly the same pooled
+batch count: the reduction is not from omitting required checkpoints.
+
+Per-trial throughput, in measurement order:
+
+| Body | Old/new order | Throughput, MiB/s |
+|---|---|---|
+| 10 MiB | old / split / split / old | 5.061 / 5.357 / 5.474 / 4.474 |
+| 40 MiB | split / old / old / split | 5.616 / 5.203 / 5.095 / 5.888 |
+
+Both split trials beat both baseline trials at each size. Nevertheless, baseline
+movement and the small sequential sample prevent treating the percentage gains
+as precise, repeatable causal estimates. Throughput pools unique chain bytes over
+controller durations; latency pools fourteen measured heights per arm. Nearest-
+rank p95 is their maximum, not a stable production-tail estimate. RSS is a
+single-process lifetime high-water mark and can include warmup.
+
+### Where the saved work went
+
+Wall-span seconds/block below are **summed over seven processes**. Checksum is
+inside encoding; spans can overlap across nodes and nest inside runtime phases.
+They are not additive CPU costs or critical-path latency measurements.
+
+| Durable phase | Old, 10 MiB | Split, 10 MiB | Old, 40 MiB | Split, 40 MiB |
+|---|---:|---:|---:|---:|
+| Image encoding, including checksums | 0.097 | 0.072 | 0.431 | 0.458 |
+| Checksum subset | 0.048 | 0.041 | 0.206 | 0.228 |
+| Backend replacement | 1.138 | **0.043** | 6.726 | **0.363** |
+
+Backend replacement spans fell **96.19%** and **94.61%**. Encoding was already
+cached in the baseline and did not improve consistently; its 40-MiB span grew
+slightly. Both versions still report seven body-lengths copied, hashed and zeroed
+by the encoder per unique block, each separately summed across seven validators.
+The split backend copies fourteen full body slots per unique block in these runs
+(new bodies and cleared slots), plus metadata. This is about **140 MiB** of body
+regions per 10-MiB block or **560 MiB** per 40-MiB block, not zero body work.
+
+The targeted backend cost is now small, but total 40-MiB CPU work remains about
+31.3 CPU-seconds/block across seven processes. Candidate body-check, Host-schedule
+and payload-receive spans remain substantial (4.25, 8.77 and 4.66 summed wall
+seconds/block); those scopes overlap and do not identify an additive remaining
+budget or prove a new principal bottleneck. This experiment does not establish
+network saturation, worldwide performance, physical-disk durability performance
+or full Zcash transaction-validation throughput. Application offers are not
+STP/UDP/IP wire bytes.
+
+### Verification, provenance and reproduction
+
+**433 Rust tests, 50 Python checks, ten Zebra D28 adapter tests and one seeded
+legacy-WAL property test passed**, along with the non-benchmark library check and
+release build. Five existing ignored Rust tests and unbounded legacy `single_rt`
+remain excluded. Tests cover all eight dirty-body masks under before-error and
+commit-then-error outcomes, poisoning/reload, first initialization, v1/v2 lazy
+migration, padding, same-length/copy/shrink/clear updates, forty metadata-only
+fences, malformed ranges, row-operation counts and concurrent RocksDB snapshots.
+The region-mask fixture is an omitted-byte equivalence oracle; actual partial
+copies are separately exercised by MemoryBackend tests. Native process-kill,
+physical power-loss and injected RocksDB I/O failures were **not** tested.
+
+Baseline binary SHA-256:
+`f069bad208630fd9bdc0f33c55a59f36af20881a68656fb667f029de6ea2d843`.
+Candidate binary SHA-256:
+`7ed611b4d22d7c1efe122f84d2d367df09f5be8013d07446833f175f3f86fcc4`.
+The runner is unchanged:
+`4c55a0d177fcc78e75f847dde71579c18d0e039452155ddf9bd05d218f7232f0`.
+
+For each primary invocation, use the earlier reproduction command with
+`--repetitions 1 --heights 7 --warmup 7 --timeout-secs 600 --lifetime-secs 900`,
+the selected frozen binary, and a new output directory. Preserve the complete
+old/new ordering above rather than selecting only the best runs. The gate instead
+uses `--heights 2 --warmup 1` and stays outside primary pooling. Group by explicit
+binary arm and body size: the runner's generic workload key omits executable
+identity and would otherwise mix old/new results.
+
+An independent raw-boundary audit passed **112,501 checks with zero errors**:
+nine campaigns, 63 node reports, 805 node-height records and 54 retained
+worker-original report copies. It independently reproduced all trial/cohort
+figures and relative changes. The parent reverified **649 input-file hashes and
+ten Git-blob hashes**, plus the audit script and receipts. `audit-split.py`,
+`audit-split.json`, `audit-split-inputs.json` and `audit-parent-verification.json`
+retain the checks and coverage. The audit receipt SHA-256 is
+`69853969a0aa679156e3d1bb56dd567ada7f53cce3a839a6bfa2bda22591033c`.
+This is an artifact/accounting audit, not another benchmark or correctness-test
+run. Raw reports contain decision IDs and rounds, not certificate bytes; matching
+them does not constitute fresh offline cryptographic certificate verification.
+
+Raw reports, commands, source/binary pins, prospective plans, verification logs
+and calculations are retained in `/var/tmp/d28-split-storage-20261128/`:
+`measurement-plan.json`, `candidate-preflight.json`, `source-review.json`,
+`comparison-analysis.json`, `comparison-aggregates.json`,
+`measurements-completed.json` and `cleanup-receipt.json`. All nine campaign
+cleanup receipts confirm stopped workers, stopped HTTP threads and removed
+tokens; an exact frozen-binary process check found no remaining benchmark
+children. **No Fly resources were created.**
