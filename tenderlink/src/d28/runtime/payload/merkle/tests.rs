@@ -779,7 +779,7 @@ fn completed_cache_eviction_and_scope_retirement_are_bounded() {
     n.engine.init(&c, 2, 0, &mut n.events).unwrap();
     assert!(!n.inject(0, packet(&tree, &b, auth, 0), 100));
     assert!(n.network.payload.merkle.owned.is_empty());
-    n.network.reset_scope();
+    n.network.reset_scope(&n.config);
     assert!(n.network.payload.merkle.peers.is_empty());
 }
 #[test]

@@ -395,7 +395,7 @@ fn retired_height_reset_and_reconnect_cannot_resurrect_old_body_requests() {
         ),
         4
     ));
-    node.network.reset_scope();
+    node.network.reset_scope(&node.config);
     assert!(node.network.payload.peers.is_empty());
     assert!(node.network.payload.pending.is_empty());
 }
@@ -690,6 +690,7 @@ fn four_nodes_route_outline_requests_bodies_and_acks_with_bounded_leases() {
                     last_height: 1,
                     last_packet_utc: 0,
                     next_control: true,
+                    pending: Default::default(),
                 })
                 .collect();
             config.metrics = Some(std::sync::Arc::new(RuntimeMetrics::default()));
@@ -820,25 +821,15 @@ fn deferred_cached_body_completes_without_new_metadata_or_unnecessary_fetch() {
     );
     // A cached completion consumes the single verification turn, not an
     // unbounded side loop in addition to the normal receive budget.
-    let discarded = node
-        .config
-        .metrics
-        .as_ref()
-        .unwrap()
-        .snapshot()
-        .scheduler_budget_discarded
-        .messages;
+    let before = node.config.metrics.as_ref().unwrap().snapshot();
     assert!(!node.inject(0, vec![0], 3));
-    assert_eq!(
-        node.config
-            .metrics
-            .as_ref()
-            .unwrap()
-            .snapshot()
-            .scheduler_budget_discarded
-            .messages,
-        discarded + 1
-    );
+    let after = node.config.metrics.as_ref().unwrap().snapshot();
+    assert_eq!(after.scheduler_budget_discarded, before.scheduler_budget_discarded);
+    assert_eq!(after.rejected, before.rejected, "cached completion consumed the turn");
+    assert_eq!(node.network.rx_usage[0].messages, 1);
+    node.network.receive(&mut node.engine, &node.config, &mut node.events, node.config.initial_roster[0].pub_key, 4).unwrap();
+    assert_eq!(node.network.rx_usage[0].messages, 0);
+    assert_eq!(node.config.metrics.as_ref().unwrap().snapshot().rejected.messages, before.rejected.messages + 1);
     assert_eq!(node.network.incoming.in_use(), 0);
     assert!(node.network.payload.pending.is_empty());
     assert!(node.engine.view().unwrap().pending.is_some());

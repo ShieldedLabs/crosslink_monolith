@@ -163,8 +163,9 @@ pub struct MetricsSnapshot {
     /// Runtime-filtered messages (including unknown peers, inactive host scope,
     /// malformed input and stale status) or frames returning a core error.
     pub rejected: MessageCounts,
-    /// Known-peer messages left after the per-tick scheduler processing budget.
-    /// These are dropped without decoding, separately from transport drops.
+    /// Known-peer messages dropped without decoding when bounded receive carry
+    /// overflows (including reclaimed class reservations), not merely because a
+    /// per-tick processing budget expires. Separate from transport-internal drops.
     pub scheduler_budget_discarded: MessageCounts,
 }
 
@@ -814,6 +815,69 @@ fn verify_hello(bytes: &[u8], handshake: &[u8; 64], local: PubKeyID) -> Option<P
     Some(PubKeyID(public))
 }
 
+// Runtime carry has the same global AND per-peer byte/message bounds as one
+// transport pull. These are raw encoded buffers, moved without payload copies.
+// A fresh pull can coexist with carry and a refilling consumer hub: at defaults
+// carry <= 64 MiB/8192 messages (peer <= 8 MiB/1024), runtime carry + pull <=
+// 128 MiB/16384 (peer <= 16 MiB/2048), and with the hub <= 192 MiB/24576
+// (peer <= 24 MiB/3072). STP reassembly/rings and decoded/core owners remain
+// independently bounded. Queue metadata is bounded by message counts and the
+// max_connections peer table, not by N times max_body.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct ReceiveUsage {
+    messages: usize,
+    bytes: usize,
+}
+impl ReceiveUsage {
+    fn plus(self, other: Self) -> Self {
+        Self { messages: self.messages + other.messages, bytes: self.bytes + other.bytes }
+    }
+    fn fits(self, bytes: usize, limit: Self) -> bool {
+        self.messages < limit.messages && bytes <= limit.bytes.saturating_sub(self.bytes)
+    }
+    fn add(&mut self, bytes: usize) {
+        self.messages += 1;
+        self.bytes += bytes;
+    }
+    fn remove(&mut self, bytes: usize) {
+        self.messages -= 1;
+        self.bytes -= bytes;
+    }
+    fn pressure(self, bytes: usize, limit: Self) -> (bool, bool) {
+        (self.messages >= limit.messages, bytes > limit.bytes.saturating_sub(self.bytes))
+    }
+    fn reservation(self, class: usize) -> Self {
+        // Elastic half-reservations: borrow unused room, including for a single
+        // whole-body frame larger than half the cap. Ceil + floor == cap, even
+        // for tiny custom limits; never round both classes up to one.
+        Self {
+            messages: self.messages / 2 + usize::from(class == 0) * (self.messages % 2),
+            bytes: self.bytes / 2 + usize::from(class == 0) * (self.bytes % 2),
+        }
+    }
+    fn can_release(self, bytes: usize, reserve: Self, pressure: (bool, bool)) -> bool {
+        (!pressure.0 || self.messages > reserve.messages)
+            && (!pressure.1 || self.bytes - bytes >= reserve.bytes)
+    }
+}
+#[derive(Default)]
+struct ReceiveQueue {
+    messages: VecDeque<Vec<u8>>,
+    usage: ReceiveUsage,
+}
+impl ReceiveQueue {
+    fn push(&mut self, bytes: Vec<u8>) {
+        self.usage.add(bytes.len());
+        self.messages.push_back(bytes);
+    }
+    fn pop(&mut self, tail: bool) -> Vec<u8> {
+        let bytes = if tail { self.messages.pop_back() } else { self.messages.pop_front() }
+            .expect("nonempty receive class");
+        self.usage.remove(bytes.len());
+        bytes
+    }
+}
+
 struct Peer {
     address: STPAddress,
     handshake: [u8; 64],
@@ -825,6 +889,24 @@ struct Peer {
     last_height: u64,
     last_packet_utc: i64,
     next_control: bool,
+    // Owned by this exact connection hash/generation, never inherited by a
+    // replacement session or authenticated before its processing turn.
+    pending: [ReceiveQueue; 2],
+}
+impl Peer {
+    fn discard_pending(&mut self, usage: &mut [ReceiveUsage; 2], metrics: Option<&RuntimeMetrics>) {
+        for (queue, total) in self.pending.iter_mut().zip(usage) {
+            if let Some(metrics) = metrics {
+                metrics.rejected.add(MessageCounts {
+                    messages: queue.usage.messages as u64,
+                    bytes: queue.usage.bytes as u64,
+                });
+            }
+            total.messages -= queue.usage.messages;
+            total.bytes -= queue.usage.bytes;
+            *queue = ReceiveQueue::default();
+        }
+    }
 }
 struct Outgoing {
     key: RequestKey,
@@ -899,6 +981,10 @@ struct Network {
     candidate_cursor: Option<ConnectionKey>,
     rotate_at: u64,
     rx_cursor: usize,
+    rx_evict_cursor: usize,
+    rx_usage: [ReceiveUsage; 2],
+    rx_limit: ReceiveUsage,
+    rx_peer_limit: ReceiveUsage,
     receiver: Receiver,
     responder: Responder,
     payload: payload::PayloadState,
@@ -963,6 +1049,10 @@ impl Network {
             candidate_cursor: None,
             rotate_at: 0,
             rx_cursor: 0,
+            rx_evict_cursor: 0,
+            rx_usage: Default::default(),
+            rx_limit: ReceiveUsage { messages: transport.consumer_inbox_messages, bytes: transport.consumer_inbox_bytes },
+            rx_peer_limit: ReceiveUsage { messages: transport.consumer_inbox_peer_messages, bytes: transport.consumer_inbox_peer_bytes },
             receiver,
             responder,
             payload: payload::PayloadState::default(),
@@ -977,7 +1067,8 @@ impl Network {
             conflict_scope: None,
         })
     }
-    fn reset_scope(&mut self) {
+    fn reset_scope(&mut self, config: &RuntimeConfig) {
+        self.discard_inactive_inbox(config);
         self.payload.clear();
         // Keep schedulers and their budgets; remove only retired roster metadata.
         for peer in &mut self.peers {
@@ -1000,13 +1091,17 @@ impl Network {
         // get a finite hello window, then rotate without closing the shared STP
         // connection. A stable key cursor prevents the first base peers winning
         // every window when the transport has more sessions than our BFT bound.
-        self.peers.retain(|peer| {
-            self.pull.current_connections.iter().any(|(address, hash)| {
-                address.connection_key() == peer.address.connection_key() && *hash == peer.handshake
-            })
+        self.peers.retain_mut(|peer| {
+            let keep = (now < self.rotate_at || peer.member.is_some())
+                && self.pull.current_connections.iter().any(|(address, hash)| {
+                    address.connection_key() == peer.address.connection_key() && *hash == peer.handshake
+                });
+            if !keep {
+                peer.discard_pending(&mut self.rx_usage, config.metrics.as_deref());
+            }
+            keep
         });
         if now >= self.rotate_at {
-            self.peers.retain(|peer| peer.member.is_some());
             self.rotate_at = now
                 .checked_add(2_000)
                 .ok_or_else(|| core_error(Error::Exhausted))?;
@@ -1042,11 +1137,82 @@ impl Network {
                 last_height: 0,
                 last_packet_utc: 0,
                 next_control: true,
+                pending: Default::default(),
             });
         }
         Ok(())
     }
+    fn retain_received(&mut self, index: usize, bytes: Vec<u8>, config: &RuntimeConfig) {
+        let bulk = bytes.first() == Some(&wire::BODY_RESPONSE_TAG)
+            || bytes.first() == Some(&payload::merkle_wire::LEAF)
+            || (bytes.first() == Some(&wire::FRAME_TAG) && bytes.len() > 160);
+        let class = usize::from(bulk);
+        if !self.make_receive_room(index, class, bytes.len(), config) {
+            if let Some(metrics) = &config.metrics {
+                metrics.scheduler_budget_discarded.record(bytes.len());
+            }
+            return;
+        }
+        self.rx_usage[class].add(bytes.len());
+        self.peers[index].pending[class].push(bytes);
+    }
+    fn make_receive_room(&mut self, index: usize, class: usize, bytes: usize, config: &RuntimeConfig) -> bool {
+        let total = self.rx_usage[0].plus(self.rx_usage[1]);
+        let peer_total = self.peers[index].pending[0].usage.plus(self.peers[index].pending[1].usage);
+        if total.fits(bytes, self.rx_limit) && peer_total.fits(bytes, self.rx_peer_limit) {
+            return true;
+        }
+        let pressure = total.pressure(bytes, self.rx_limit);
+        let peer_pressure = peer_total.pressure(bytes, self.rx_peer_limit);
+        let opposite = 1 - class;
+        let reserve = self.rx_limit.reservation(opposite);
+        let peer_reserve = self.rx_peer_limit.reservation(opposite);
+        // Conservative overflow policy: reclaim ONE sufficient whole tail from
+        // the opposite class, never a FIFO head while a later tail exists. Its
+        // removal must preserve both global and donor-peer reservations in each
+        // pressured resource (count/bytes independently). No suitable tail means
+        // reject incoming unchanged, even if several evictions could make room.
+        // This scans only bounded peer metadata, never all messages, and cannot
+        // partially evict traffic then reject the incoming frame anyway.
+        let n = self.peers.len();
+        let victim = (0..n).map(|i| (self.rx_evict_cursor + i) % n).find(|&i| {
+            if peer_pressure != (false, false) && i != index {
+                return false;
+            }
+            let queue = &self.peers[i].pending[opposite];
+            let Some(tail) = queue.messages.back() else { return false };
+            let mut after = total;
+            after.remove(tail.len());
+            if !after.fits(bytes, self.rx_limit) {
+                return false;
+            }
+            let donor_pressure = if i == index {
+                let mut after = peer_total;
+                after.remove(tail.len());
+                if !after.fits(bytes, self.rx_peer_limit) {
+                    return false;
+                }
+                (pressure.0 || peer_pressure.0, pressure.1 || peer_pressure.1)
+            } else { pressure };
+            queue.usage.can_release(tail.len(), peer_reserve, donor_pressure)
+                && self.rx_usage[opposite].can_release(tail.len(), reserve, pressure)
+        });
+        let Some(victim) = victim else { return false };
+        self.discard_received_tail(victim, opposite, config);
+        self.rx_evict_cursor = (victim + 1) % n;
+        true
+    }
+    fn discard_received_tail(&mut self, index: usize, class: usize, config: &RuntimeConfig) {
+        let bytes = self.peers[index].pending[class].pop(true);
+        self.rx_usage[class].remove(bytes.len());
+        if let Some(metrics) = &config.metrics {
+            metrics.scheduler_budget_discarded.record(bytes.len());
+        }
+    }
     fn discard_inactive_inbox(&mut self, config: &RuntimeConfig) {
+        for peer in &mut self.peers {
+            peer.discard_pending(&mut self.rx_usage, config.metrics.as_deref());
+        }
         if let Some(metrics) = &config.metrics {
             for (_, bytes) in &self.pull.received_unreliable_messages {
                 metrics.rejected.record(bytes.len());
@@ -1072,47 +1238,38 @@ impl Network {
             self.conflicts.clear();
             self.conflict_scope = scope;
         }
-        // Only move the independently byte/count-bounded pulled inbox; no body
-        // is copied. Cheap classification is bounded by those transport caps.
-        // Expensive parsing/signature work has an additional PER-TICK cap, fair
-        // across sources and between control/live votes and complete bodies.
-        let mut inbox: Vec<[VecDeque<Vec<u8>>; 2]> = (0..self.peers.len())
-            .map(|_| [VecDeque::new(), VecDeque::new()])
-            .collect();
-        for (connection, bytes) in self.pull.received_unreliable_messages.drain(..) {
-            let Some(index) = self
-                .peers
-                .iter()
-                .position(|p| p.address.connection_key() == connection)
-            else {
+        // Only classify the independently byte/count-bounded transport handoff.
+        // Move, never copy, bytes into a bounded session-owned carry queue. All
+        // decoding, authentication and core work still happen below, at service
+        // time, under the same per-tick budget (including cached completions).
+        while let Some((connection, bytes)) = self.pull.received_unreliable_messages.pop_front() {
+            let Some(index) = self.peers.iter().position(|p| p.address.connection_key() == connection) else {
                 if let Some(metrics) = &config.metrics {
                     metrics.rejected.record(bytes.len());
                 }
                 continue;
             };
-            let bulk = bytes.first() == Some(&wire::BODY_RESPONSE_TAG)
-                || bytes.first() == Some(&payload::merkle_wire::LEAF)
-                || (bytes.first() == Some(&wire::FRAME_TAG) && bytes.len() > 160);
-            inbox[index][usize::from(bulk)].push_back(bytes);
+            self.retain_received(index, bytes, config);
         }
         let completed = self.complete_cached_payloads(engine, config, events)?;
         for _ in completed..config.max_receive_per_tick {
             let n = self.peers.len();
             let Some(index) = (0..n)
                 .map(|i| (self.rx_cursor + i) % n)
-                .find(|&i| inbox[i].iter().any(|q| !q.is_empty()))
+                .find(|&i| self.peers[i].pending.iter().any(|q| !q.messages.is_empty()))
             else {
                 break;
             };
             self.rx_cursor = (index + 1) % n;
             let preferred = usize::from(!self.peers[index].next_control);
-            let class = if inbox[index][preferred].is_empty() {
+            let class = if self.peers[index].pending[preferred].messages.is_empty() {
                 1 - preferred
             } else {
                 preferred
             };
             self.peers[index].next_control = class != 0;
-            let bytes = inbox[index][class].pop_front().expect("nonempty source");
+            let bytes = self.peers[index].pending[class].pop(false);
+            self.rx_usage[class].remove(bytes.len());
             let mut outcome = ReceiveOutcome {
                 metrics: config.metrics.as_deref(),
                 bytes: bytes.len(),
@@ -1205,15 +1362,6 @@ impl Network {
                     outcome.processed = self.receive_payload(engine, config, events, member, generation, &bytes, now)?;
                 }
                 _ => {}
-            }
-        }
-        // STP is best effort. Excess frames are dropped rather than building a
-        // second unbounded backlog; guided requests/status and hello retry them.
-        // The source/class cursor survives this drop so saturation cannot keep
-        // choosing the first peer or control class forever.
-        if let Some(metrics) = &config.metrics {
-            for bytes in inbox.iter().flat_map(|queues| queues.iter().flatten()) {
-                metrics.scheduler_budget_discarded.record(bytes.len());
             }
         }
         Ok(())
@@ -1700,7 +1848,7 @@ pub async fn run<B: AtomicBlockStore + Send + 'static>(
             };
             work.retire();
             events = Events::default();
-            network.reset_scope();
+            network.reset_scope(&config);
             engine
                 .init(agreed, height, 0, &mut events)
                 .map_err(core_error)?;
@@ -2367,6 +2515,294 @@ mod tests {
         (config, key, engine, events, network)
     }
 
+    fn assert_receive_bounds(network: &Network) -> ReceiveUsage {
+        let mut actual = [ReceiveUsage::default(); 2];
+        for peer in &network.peers {
+            let mut peer_total = ReceiveUsage::default();
+            for (class, queue) in peer.pending.iter().enumerate() {
+                let usage = ReceiveUsage {
+                    messages: queue.messages.len(),
+                    bytes: queue.messages.iter().map(Vec::len).sum(),
+                };
+                assert_eq!(queue.usage, usage);
+                actual[class] = actual[class].plus(usage);
+                peer_total = peer_total.plus(usage);
+            }
+            assert!(peer_total.messages <= network.rx_peer_limit.messages);
+            assert!(peer_total.bytes <= network.rx_peer_limit.bytes);
+        }
+        assert_eq!(actual, network.rx_usage);
+        let total = actual[0].plus(actual[1]);
+        assert!(total.messages <= network.rx_limit.messages);
+        assert!(total.bytes <= network.rx_limit.bytes);
+        total
+    }
+
+    #[test]
+    fn receive_carry_survives_multiple_full_processing_budgets_without_scheduler_loss() {
+        let (mut config, _, mut engine, mut events, mut network) = metrics_fixture();
+        config.max_receive_per_tick = 128; // unchanged balanced benchmark budget
+        network.peers[0].member = Some(1);
+        let connection = network.peers[0].address.connection_key();
+        for sequence in 1..=257 {
+            let bytes = wire::encode_status(wire::WireStatus {
+                sequence, request: None, snapshot: engine.status().unwrap(),
+            }).unwrap();
+            network.pull.received_unreliable_messages.push_back((connection, bytes));
+        }
+        for (tick, served) in [128, 256, 257].into_iter().enumerate() {
+            network.sessions(&config, tick as u64).unwrap();
+            network.receive(&mut engine, &config, &mut events, config.initial_roster[0].pub_key, tick as u64).unwrap();
+            assert_eq!(network.peers[0].last_sequence, Some(served));
+            assert_eq!(assert_receive_bounds(&network).messages, 257 - served as usize);
+            let m = config.metrics.as_ref().unwrap().snapshot();
+            assert_eq!(m.processed.messages, served);
+            assert_eq!(m.processed.bytes, served * wire::STATUS_BYTES as u64);
+            assert_eq!(m.rejected, MessageCounts::default());
+            assert_eq!(m.scheduler_budget_discarded, MessageCounts::default());
+            assert_eq!(m.received, MessageCounts::default(), "carry is not another transport handoff");
+        }
+    }
+
+    #[test]
+    fn receive_carry_count_and_byte_caps_reclaim_both_classes_without_copying_fifo_heads() {
+        for byte_bound in [false, true] {
+            for peer_bound in [false, true] {
+                for class in 0..2 {
+                    let (config, _, _, _, mut network) = metrics_fixture();
+                    let limit = ReceiveUsage {
+                        messages: if byte_bound { 100 } else { 4 },
+                        bytes: if byte_bound { 400 } else { 10_000 },
+                    };
+                    network.rx_limit = if peer_bound { ReceiveUsage { messages: 200, bytes: 20_000 } } else { limit };
+                    network.rx_peer_limit = if peer_bound { limit } else { network.rx_limit };
+                    let tag = if class == 0 { wire::STATUS_TAG } else { wire::BODY_RESPONSE_TAG };
+                    let head = vec![tag; 100];
+                    let pointer = head.as_ptr();
+                    network.retain_received(0, head, &config);
+                    for i in 1..4 {
+                        network.retain_received(if peer_bound { 0 } else { usize::from(i == 3) }, vec![tag; 100], &config);
+                    }
+                    assert_eq!(assert_receive_bounds(&network).messages, 4);
+                    // The same class cannot grow past either cap, even by one.
+                    network.retain_received(0, vec![tag; 1], &config);
+                    assert_eq!(assert_receive_bounds(&network).messages, 4);
+                    // Fresh opposite-class traffic reclaims a borrowed tail.
+                    let opposite = if class == 0 { wire::BODY_RESPONSE_TAG } else { wire::STATUS_TAG };
+                    network.retain_received(0, vec![opposite; 100], &config);
+                    assert_eq!(assert_receive_bounds(&network).messages, 4);
+                    assert_eq!(network.peers[0].pending[1 - class].usage.messages, 1);
+                    assert_eq!(network.peers[0].pending[class].messages.front().unwrap().as_ptr(), pointer);
+                    let dropped = config.metrics.as_ref().unwrap().snapshot().scheduler_budget_discarded;
+                    assert_eq!(dropped, MessageCounts { messages: 2, bytes: 101 });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn receive_carry_tiny_limits_never_round_up_or_accumulate_uncharged_bytes() {
+        for messages in 1..=3 {
+            for bytes in 1..=3 {
+                let (config, _, _, _, mut network) = metrics_fixture();
+                network.rx_limit = ReceiveUsage { messages, bytes };
+                network.rx_peer_limit = network.rx_limit;
+                let mut offered = MessageCounts::default();
+                for i in 0..96 {
+                    let tag = if i % 2 == 0 { wire::STATUS_TAG } else { wire::BODY_RESPONSE_TAG };
+                    let packet = vec![tag; i % 5];
+                    offered.record(packet.len());
+                    network.retain_received(i % 2, packet, &config);
+                    let total = assert_receive_bounds(&network);
+                    let dropped = config.metrics.as_ref().unwrap().snapshot().scheduler_budget_discarded;
+                    assert_eq!(offered.messages, dropped.messages + total.messages as u64);
+                    assert_eq!(offered.bytes, dropped.bytes + total.bytes as u64);
+                }
+                network.discard_inactive_inbox(&config);
+                assert_eq!(assert_receive_bounds(&network), ReceiveUsage::default());
+                let m = config.metrics.as_ref().unwrap().snapshot();
+                assert_eq!(offered.messages, m.scheduler_budget_discarded.messages + m.rejected.messages);
+                assert_eq!(offered.bytes, m.scheduler_budget_discarded.bytes + m.rejected.bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn receive_carry_global_reclaim_skips_protected_peers_and_rotates_donors() {
+        for byte_bound in [false, true] {
+            for class in 0..2 {
+                let (mut config, _, _, _, mut network) = metrics_fixture();
+                config.max_connections = 3;
+                network.pull.current_connections.push((address(40_003), [3; 64]));
+                network.sessions(&config, 1).unwrap();
+                network.rx_limit = ReceiveUsage {
+                    messages: if byte_bound { 100 } else { 10 },
+                    bytes: if byte_bound { 1_000 } else { 10_000 },
+                };
+                network.rx_peer_limit = ReceiveUsage {
+                    messages: if byte_bound { 100 } else { 4 },
+                    bytes: if byte_bound { 400 } else { 1_000 },
+                };
+                let tag = if class == 0 { wire::STATUS_TAG } else { wire::BODY_RESPONSE_TAG };
+                let opposite = if class == 0 { wire::BODY_RESPONSE_TAG } else { wire::STATUS_TAG };
+                for (peer, messages) in [(0, 2), (1, 4), (2, 4)] {
+                    for _ in 0..messages {
+                        network.retain_received(peer, vec![tag; 100], &config);
+                    }
+                }
+                assert_eq!(assert_receive_bounds(&network).messages, 10);
+                for cursor in [2, 0] {
+                    network.retain_received(0, vec![opposite; 100], &config);
+                    assert_eq!(network.rx_evict_cursor, cursor);
+                    assert_eq!(network.rx_cursor, 0, "eviction does not move processing cursor");
+                    assert_eq!(network.peers[0].pending[class].usage.messages, 2);
+                    assert_eq!(assert_receive_bounds(&network).messages, 10);
+                }
+                for peer in &network.peers[1..] {
+                    assert_eq!(peer.pending[class].usage.messages, 3);
+                }
+                // Now the incoming peer is full. Its protected opposite class
+                // cannot be evicted, nor can another peer pay its local deficit.
+                let before = network.rx_usage;
+                network.retain_received(0, vec![opposite; 100], &config);
+                assert_eq!(network.rx_usage, before);
+                assert_eq!(config.metrics.as_ref().unwrap().snapshot().scheduler_budget_discarded.messages, 3);
+            }
+        }
+    }
+
+    #[test]
+    fn receive_carry_whole_tail_granularity_rejects_without_partial_evictions() {
+        let (config, _, _, _, mut network) = metrics_fixture();
+        for cap in [3, 400] {
+            network.rx_limit = ReceiveUsage { messages: 20, bytes: cap };
+            network.rx_peer_limit = network.rx_limit;
+            let packet = vec![wire::BODY_RESPONSE_TAG; cap];
+            let pointer = packet.as_ptr();
+            network.retain_received(0, packet, &config);
+            network.retain_received(0, vec![wire::STATUS_TAG], &config);
+            assert_eq!(assert_receive_bounds(&network).bytes, cap);
+            assert_eq!(network.peers[0].pending[1].messages.front().unwrap().as_ptr(), pointer);
+            network.discard_inactive_inbox(&config);
+        }
+        // Several small borrowed tails could cover the deficit, but no ONE
+        // tail suffices. Do not pop any of them before rejecting the newcomer.
+        for bytes in [200, 50, 50, 50, 50] {
+            network.retain_received(0, vec![wire::BODY_RESPONSE_TAG; bytes], &config);
+        }
+        let before = network.rx_usage;
+        let dropped = config.metrics.as_ref().unwrap().snapshot().scheduler_budget_discarded;
+        network.retain_received(0, vec![wire::STATUS_TAG; 100], &config);
+        assert_eq!(network.rx_usage, before);
+        assert_eq!(assert_receive_bounds(&network), ReceiveUsage { messages: 5, bytes: 400 });
+        let after = config.metrics.as_ref().unwrap().snapshot().scheduler_budget_discarded;
+        assert_eq!(after.messages, dropped.messages + 1);
+        assert_eq!(after.bytes, dropped.bytes + 100);
+    }
+
+    #[test]
+    fn receive_carry_borrows_byte_reservations_for_large_whole_frames() {
+        let (config, _, _, _, mut network) = metrics_fixture();
+        // Same geometry as bench_transport_limits: 10/40 MiB bodies get
+        // 16/64 MiB peer queues. Retention must not impose an 8/32 MiB max frame.
+        for max_body in [10 << 20, 40 << 20] {
+            let limits = wire::Limits { max_members: 7, max_body };
+            let frame = limits.max_frame_bytes().unwrap();
+            let cap = frame.next_power_of_two();
+            network.rx_limit.bytes = (64 << 20).max(cap);
+            network.rx_peer_limit.bytes = (8 << 20).max(cap);
+            for tag in [wire::FRAME_TAG, wire::BODY_RESPONSE_TAG, wire::OUTLINED_TAG] {
+                let packet = vec![tag; frame];
+                let pointer = packet.as_ptr();
+                network.retain_received(0, packet, &config);
+                assert_eq!(assert_receive_bounds(&network).bytes, frame);
+                let class = usize::from(tag != wire::OUTLINED_TAG);
+                assert_eq!(network.peers[0].pending[class].messages.front().unwrap().as_ptr(), pointer);
+                network.discard_inactive_inbox(&config);
+            }
+            // The original full bound, not a per-class half, is the boundary.
+            network.retain_received(0, vec![wire::BODY_RESPONSE_TAG; cap], &config);
+            assert_eq!(assert_receive_bounds(&network).bytes, cap);
+            network.retain_received(0, vec![wire::BODY_RESPONSE_TAG], &config);
+            assert_eq!(assert_receive_bounds(&network).bytes, cap);
+            network.discard_inactive_inbox(&config);
+            network.retain_received(0, vec![wire::BODY_RESPONSE_TAG; cap + 1], &config);
+            assert_eq!(assert_receive_bounds(&network), ReceiveUsage::default());
+        }
+    }
+
+    #[test]
+    fn receive_carry_releases_on_replacement_retirement_rotation_and_scope_reset() {
+        let (config, _, mut engine, mut events, mut network) = metrics_fixture();
+        let connection = network.peers[0].address.connection_key();
+        let old_generation = network.peers[0].generation;
+        network.retain_received(0, vec![wire::STATUS_TAG; 144], &config);
+        network.pull.current_connections[0].1 = [99; 64];
+        network.sessions(&config, 1).unwrap();
+        assert_eq!(assert_receive_bounds(&network), ReceiveUsage::default());
+        let index = network.peers.iter().position(|p| p.address.connection_key() == connection).unwrap();
+        assert_ne!(network.peers[index].generation, old_generation);
+        network.retain_received(index, vec![wire::STATUS_TAG; 144], &config);
+        network.pull.current_connections.retain(|(address, _)| address.connection_key() != connection);
+        network.sessions(&config, 2).unwrap();
+        assert_eq!(assert_receive_bounds(&network), ReceiveUsage::default());
+        network.retain_received(0, vec![wire::STATUS_TAG; 144], &config);
+        network.sessions(&config, 2_000).unwrap(); // unauthenticated hello-window rotation
+        assert_eq!(assert_receive_bounds(&network), ReceiveUsage::default());
+        for inactive in [false, true] {
+            network.retain_received(0, vec![wire::BODY_RESPONSE_TAG; 200], &config);
+            network.pull.received_unreliable_messages.push_back((network.peers[0].address.connection_key(), vec![wire::STATUS_TAG; 144]));
+            if inactive { network.discard_inactive_inbox(&config); }
+            else { network.reset_scope(&config); }
+            assert_eq!(assert_receive_bounds(&network), ReceiveUsage::default());
+            assert!(network.pull.received_unreliable_messages.is_empty());
+        }
+        let c = engine.c().clone();
+        engine.init(&c, 2, 0, &mut events).unwrap();
+        network.receive(&mut engine, &config, &mut events, config.initial_roster[0].pub_key, 2_001).unwrap();
+        let m = config.metrics.as_ref().unwrap().snapshot();
+        assert_eq!(m.rejected, MessageCounts { messages: 7, bytes: 3 * 144 + 2 * (200 + 144) });
+        assert_eq!(m.processed, MessageCounts::default());
+        assert_eq!(m.scheduler_budget_discarded, MessageCounts::default());
+    }
+
+    #[test]
+    fn receive_carry_does_not_pre_authenticate_stale_or_invalid_input() {
+        let (mut config, _, mut engine, mut events, mut network) = metrics_fixture();
+        config.max_receive_per_tick = 1;
+        let old_hash = network.peers[0].handshake;
+        network.pull.current_connections[0].1 = [99; 64];
+        network.sessions(&config, 1).unwrap();
+        let index = network.peers.iter().position(|p| p.handshake == [99; 64]).unwrap();
+        let connection = network.peers[index].address.connection_key();
+        let status = wire::encode_status(wire::WireStatus {
+            sequence: 1, request: None, snapshot: engine.status().unwrap(),
+        }).unwrap();
+        network.pull.received_unreliable_messages.extend([
+            (connection, hello_packet(&SigningKey::from([2; 32]), &old_hash)),
+            (connection, status.clone()),
+            (address(40_099).connection_key(), status.clone()),
+        ]);
+        for tick in 1..=2 {
+            network.receive(&mut engine, &config, &mut events, config.initial_roster[0].pub_key, tick).unwrap();
+        }
+        assert!(network.peers[index].member.is_none());
+        assert_eq!(config.metrics.as_ref().unwrap().snapshot().rejected.messages, 3);
+        assert_eq!(assert_receive_bounds(&network), ReceiveUsage::default());
+        network.peers[index].member = Some(1);
+        network.pull.received_unreliable_messages.extend([
+            (connection, status.clone()), (connection, status), (connection, vec![wire::FRAME_TAG; 200]),
+        ]);
+        for tick in 3..=5 {
+            network.receive(&mut engine, &config, &mut events, config.initial_roster[0].pub_key, tick).unwrap();
+            assert_eq!(assert_receive_bounds(&network).messages, 5 - tick as usize);
+        }
+        let m = config.metrics.as_ref().unwrap().snapshot();
+        assert_eq!(m.processed.messages, 1);
+        assert_eq!(m.rejected.messages, 5);
+        assert_eq!(m.scheduler_budget_discarded, MessageCounts::default());
+    }
+
     #[test]
     fn metrics_receive_outcomes_include_zero_length_rejection_and_budget_surplus() {
         let (mut config, _, mut engine, mut events, mut network) = metrics_fixture();
@@ -2411,34 +2847,17 @@ mod tests {
                 bytes: 0
             }
         );
-        assert_eq!(
-            snapshot.scheduler_budget_discarded,
-            MessageCounts {
-                messages: 2,
-                bytes: 200
-            }
-        );
+        assert_eq!(snapshot.scheduler_budget_discarded, MessageCounts::default());
+        assert_eq!(network.rx_usage[0].plus(network.rx_usage[1]), ReceiveUsage { messages: 2, bytes: 200 });
         assert!(network.pull.received_unreliable_messages.is_empty());
         assert_eq!(network.incoming.in_use(), 0);
-        network
-            .pull
-            .received_unreliable_messages
-            .push_back((connection, vec![]));
-        network
-            .receive(
-                &mut engine,
-                &config,
-                &mut events,
-                config.initial_roster[0].pub_key,
-                1,
-            )
-            .unwrap();
+        for tick in 1..=2 {
+            network.receive(&mut engine, &config, &mut events, config.initial_roster[0].pub_key, tick).unwrap();
+        }
+        assert_eq!(network.rx_usage, [ReceiveUsage::default(); 2]);
         assert_eq!(
             config.metrics.as_ref().unwrap().snapshot().rejected,
-            MessageCounts {
-                messages: 2,
-                bytes: 0
-            }
+            MessageCounts { messages: 3, bytes: 200 }
         );
         network
             .pull
@@ -2447,10 +2866,7 @@ mod tests {
         network.discard_inactive_inbox(&config);
         assert_eq!(
             config.metrics.as_ref().unwrap().snapshot().rejected,
-            MessageCounts {
-                messages: 4,
-                bytes: 3
-            }
+            MessageCounts { messages: 5, bytes: 203 }
         );
         // These fixtures bypass service; raw arrival counts are tested over STP.
         assert_eq!(
