@@ -1784,7 +1784,8 @@ Seven independent local validator processes, real STP/signatures/Merkle proofs,
 100-KiB shards, mock bodies and RAM-backed persistence. Body caps match the 10-
 or 40-MiB body size; both use `balanced`, `wan_bulk`, and one executor worker.
 Every height still waits for **all seven validators**. No builds or test suites
-ran during measurements; unrelated shared-host activity was not controlled.
+from this experiment ran during measurements; unrelated shared-host activity,
+including other projects' builds, was not controlled or excluded.
 
 After all verification and a separate 40-MiB gate, the prospective primary order
 was old/new/new/old at 10 MiB, then new/old/old/new at 40 MiB. Each invocation had
