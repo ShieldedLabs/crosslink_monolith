@@ -1911,3 +1911,168 @@ and calculations are retained in `/var/tmp/d28-split-storage-20261128/`:
 cleanup receipts confirm stopped workers, stopped HTTP threads and removed
 tokens; an exact frozen-binary process check found no remaining benchmark
 children. **No Fly resources were created.**
+
+## Worldwide matched storage-optimization rerun — 2026-11-28
+
+**The local-processing improvements also improved worldwide all-node throughput.**
+At 40 MiB, the optimized version sustained **4.171 MiB/s**, versus **3.611 MiB/s**
+for the last worldwide-tested implementation on the same machines: **15.49% higher**.
+Median all-node receipt fell **11.343 to 9.598 seconds**. The 10-MiB gain was
+smaller, **4.12%**. Both candidate trials beat both baseline trials at each size,
+but two trials per version/size do not establish a precise repeatable effect or
+production latency tails.
+
+### Matched design and scope
+
+Seven fresh private Fly machines ran in **IAD, SJC, GRU, FRA, JNB, SIN and SYD**,
+each with **four dedicated performance CPUs and 8192 MiB RAM**. Both binaries ran
+on the same seven machine identities. Each validator used one Tokio executor
+worker plus STP's native threads. Both versions used 100-KiB Merkle shards,
+`balanced` scheduling, and `wan_bulk` timings: proposal/prevote/precommit bases
+20/5/7 seconds. Body caps matched the tested body sizes, 10 or 40 MiB. Production
+timers, D28 rules, shard transport and PoW/ledger formats were not changed.
+
+The baseline is the **last worldwide-tested version**, not the more recent
+cached-encoder local baseline. Thus this measures the **combined cached durable
+encoding and split-backend changes**, not the isolated contribution of splitting.
+
+Each primary trial had fourteen warmup and fourteen measured heights. Invocation
+order was old/new/new/old at 10 MiB, then new/old/old/new at 40 MiB. A separate
+candidate 40-MiB deployment gate (one warmup, two measured heights) completed and
+is excluded from primary pooling. All eight primary trials completed; no failed,
+partial or unstarted primary attempts were excluded. All **112 measured primary
+heights completed in round zero**, with all seven validators progressing. Every
+primary warmup covered every successful proposer: twice each at 10 MiB; at
+40 MiB, the first warmup height changed round, giving SJC one and GRU three
+successful proposals, with two each for the other regions. Warmup was not extended
+or retuned in response.
+
+The controller ran on IAD, not the laptop. Both fixed-binary private worker
+services were present symmetrically on each of the other six machines. Uploads,
+package installation, socket configuration and deployment checks finished before
+measurement; no additional benchmark or management probes were launched during
+the primary sequence. Ordinary socket-buffer ceilings were held at 16 MiB,
+matching the prior final WAN configuration. This is not a new STP buffer-tuning
+experiment. Guest steal fractions were about 0.20–0.22%; that observation does
+not prove absence of host contention or WAN variability.
+
+### Throughput and latency
+
+Throughput counts each serialized body once per chain and uses summed controller
+measured-start through final-ACK durations. **All seven validators must progress
+before the next height**; that is the intended performance requirement here.
+Receipt times are controller observations, not synchronized certificate-formation
+timestamps. Each pooled row has two trials and 28 measured heights. Pooled
+nearest-rank p95 is the second-largest observation; per-trial p95 is the maximum.
+
+| Body / version | Chain MiB/s | First receipt p50 / p95, s | All-node receipt p50 / p95, s | App offers / body | Measured VM TX / body |
+|---|---:|---:|---:|---:|---:|
+| 10 MiB, last WAN version | 2.791 | 3.202 / 3.752 | 3.486 / 4.622 | 6.589× | 8.895× |
+| 10 MiB, cached + split | **2.906** | 3.032 / 3.463 | **3.315 / 4.697** | 6.514× | 8.833× |
+| 40 MiB, last WAN version | 3.611 | 10.088 / 11.216 | 11.343 / 12.110 | 7.367× | 8.983× |
+| 40 MiB, cached + split | **4.171** | 9.033 / 10.088 | **9.598 / 10.536** | 7.240× | 8.853× |
+
+Per-trial rates, in the frozen execution order:
+
+| Body | Version order | Chain MiB/s |
+|---|---|---|
+| 10 MiB | old / new / new / old | 2.763 / 2.899 / 2.913 / 2.819 |
+| 40 MiB | new / old / old / new | 4.142 / 3.565 / 3.658 / 4.200 |
+
+The 10-MiB p95 did **not** improve, despite its modest throughput and median
+improvement. At 40 MiB, both candidate trials also had lower worst observed
+all-node receipt than either baseline trial. The pooled 40-MiB numerator is
+1,174,405,120 bytes per version; denominators are 310.130578034 seconds old and
+268.537012601 seconds new. All measured heights stayed in round zero, so this
+result is not the earlier effect of avoiding premature proposal timeouts.
+The second measured seven-height rotation was faster than the first in every
+trial: about 4.9–9.4% at 10 MiB and 0.9–4.0% at 40 MiB. Thus fourteen warmups did
+not establish stationary throughput. Those rotations are descriptive segments,
+not extra independent trials; the matched ordering reduces, but cannot remove,
+time variation.
+Compare against these contemporaneous controls, not against differently warmed
+10-MiB trials from an earlier campaign.
+
+Application offers are not STP wire bytes. VM TX sums each node's measured
+`eth0` counter and includes control traffic. At 40 MiB, application offers fell
+only 1.73% and VM TX/body 1.46%; this is principally a local-processing comparison,
+not a new dissemination-traffic optimization. UDP6 send-buffer errors remained:
+159,065 old versus 177,664 new across the two measured 40-MiB trials. These counters
+do not establish a principal bottleneck or justify attributing the gain to a
+transport repair. No transport settings changed.
+
+### Local work on the worldwide machines
+
+Values below are per committed block, summed across seven validator processes.
+Phase spans are inclusive wall time, not additive CPU or critical-path latency;
+checksumming is nested inside encoding.
+
+| Work / body | Last WAN version | Cached + split |
+|---|---:|---:|
+| Process CPU-seconds, 10 MiB | 8.913 | 7.557 |
+| Backend RAM-copy GiB, 10 MiB | 2.367 | 0.137 |
+| Process CPU-seconds, 40 MiB | 35.897 | **27.276** |
+| Backend RAM-copy GiB, 40 MiB | 14.804 | **0.548** |
+| Image-encoding wall seconds, 40 MiB | 7.110 | 0.152 |
+| Nested image-checksum wall seconds, 40 MiB | 6.146 | 0.114 |
+| Backend-replacement wall seconds, 40 MiB | 1.123 | 0.042 |
+
+At 40 MiB, process CPU work fell **24.02%** and actual backend copy volume fell
+**96.30%**. The old byte counter means full-image copies; the new counter means
+metadata plus changed full body regions. The transaction-count counter still
+counts successful atomic batches, not individual regions. Six new encoder-work
+counters are absent in the old
+version and are treated as unavailable, not zero. Peak single-process RSS was
+597.379 MiB old and 587.941 MiB new; this is a lifetime high-water gauge and can
+include warmup.
+
+The large reductions in targeted work, alongside smaller end-to-end gains, show
+that storage preparation/copying was a real cost but not the whole throughput
+budget. They do not identify the next dominant bottleneck. These are real D28,
+signature, Merkle and STP executions with **mock bodies and a RAM-backed atomic
+backend**. They do not measure physical-disk/fsync performance or full Zcash
+transaction validation, and do not demonstrate bandwidth saturation or unlimited
+throughput scalability.
+
+### Provenance, audit and teardown
+
+No implementation changes or fresh correctness-suite runs were needed for this
+retest; it used the already tested frozen binaries:
+
+- Baseline source `5be09b14c3f9e1a253d919e44233bd46bc5d5db7`, executable SHA-256
+  `41162b623f461ee62976efccb0f5e5aba1c04c486f5191b84d904c5aea945fbb`.
+- Candidate source `62ffe8973cad9a802ed8d42081d1dde531092617`, executable SHA-256
+  `7ed611b4d22d7c1efe122f84d2d367df09f5be8013d07446833f175f3f86fcc4`.
+- Unchanged runner SHA-256
+  `4c55a0d177fcc78e75f847dde71579c18d0e039452155ddf9bd05d218f7232f0`.
+
+The independent raw-boundary audit passed **35,593 checks with zero errors**,
+covering nine campaigns, 63 node reports and **378 byte-exact worker-original
+file comparisons** (54 remote reports and their companion files). The parent
+reverified all **867 input-file hashes and sixteen source Git blobs**. Core rates,
+receipt quantiles, CPU ticks, counter deltas, storage geometry, all-node progress,
+rounds, proposer coverage, version grouping and cumulative transfer accounting
+were checked. Raw IDs and rounds are not a fresh offline cryptographic
+certificate verification.
+
+Whole-child VM TX, including the gate, warmup and shutdown, totaled
+**69,429,459,553 bytes**: 65,747,476,789 from the eight primary invocations plus
+3,681,982,764 from the gate. The primary driver receipt already includes the gate
+in its cumulative total; do not add it again. This is not the measured-window
+numerator or a billing receipt. The prospective soft allowance was 120 GB, with
+4-GiB sampled per-node
+trial guards, a 22-GB post-trial invocation threshold, bounded worker lifetimes
+and a three-hour absolute machine stop. Sampled byte guards can overshoot.
+
+Artifacts live in `/var/tmp/d28-wan-storage-20261128-1216/`: `plan.json`,
+`run-plan.py`, exact command/driver receipts, seven checksum-verified
+`final-REGION.tar.gz` archives and extracted originals, `audit/audit-wan.py`,
+`audit/audit-wan.json`, `audit/audit-wan-inputs.json`,
+`audit-parent-verification.json` and `cleanup-receipt.json`.
+Audit receipt SHA-256:
+`ae95c716e49daf82b88395aaf1b153d68e9f8ebc743232d8ee8e0cea41557621`.
+
+**All seven experiment machines and the temporary Fly app were deleted** after
+archive verification; a fresh app inventory confirmed absence. Owned worker
+services and benchmark children stopped before archiving, and the local worker
+token was removed. Other Fly applications were untouched.
