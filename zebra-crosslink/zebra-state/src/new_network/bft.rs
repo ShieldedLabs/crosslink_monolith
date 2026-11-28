@@ -2549,8 +2549,8 @@ impl BftRunner {
     /// is not finalized here: a decision only moves the final snapshot (FINALITY.md §4.3). Only an
     /// import has a `reply`, answered here whatever happens: `Ok`, or why it was refused.
     /// Tenderlink follows the published tip instead. Tenderlink's own decision can still panic
-    /// here on a fact only a bug could break; a conflict or a block rule that now refuses it is
-    /// reported, never a halt or a crash.
+    /// here on a broken internal invariant; a conflict, block-rule failure or signature failure
+    /// is reported, never a halt or a crash.
     fn store_decision(
         &mut self,
         source: Source,
@@ -2636,8 +2636,19 @@ impl BftRunner {
             // conflicting quorum: finalizers equivocated, which is reported, never a halt.
             if does(CHECK_DECIDED_HEIGHT) && height < decided_len() {
                 match self.check_decided_height(block, fat_pointer, seen_as) {
-                    DecidedCheck::Invalid { why } if does(FAULTS_ARE_BUGS) => panic!("{why}"),
-                    DecidedCheck::Invalid { why } => break 'admit Err(Refusal::refused(why)),
+                    DecidedCheck::Invalid { why } => {
+                        if does(FAULTS_ARE_BUGS) {
+                            tracing::error!(
+                                height,
+                                %block_hash,
+                                %why,
+                                certificate = %hex::encode(fat_pointer.to_bytes()),
+                                "crosslink: this node's tenderlink decision has an invalid certificate for an \
+                                 already-decided height. It is not stored; the decided chain is unchanged.",
+                            );
+                        }
+                        break 'admit Err(Refusal::refused(why));
+                    }
                     DecidedCheck::Conflict if does(CONFLICT_REFUSES) => break 'admit Err(Refusal::refused(format!(
                         "BFT height {height} is decided already with another block; this one's certificate is valid, \
                          so it is reported as a conflicting quorum",
@@ -2779,7 +2790,18 @@ impl BftRunner {
                 }
             } else if does(CHECK_SIGNATURES) && !fat_pointer.validate_signatures(&voting.vote_namespace) {
                 if does(FAULTS_ARE_BUGS) {
-                    panic!("Signatures are not valid. Rejecting block.");
+                    // Preserve the certificate and local context without accepting the decision.
+                    // Tenderlink waits for a valid decided tip, as on a block-rule refusal.
+                    tracing::error!(
+                        height,
+                        %block_hash,
+                        vote_namespace = %hex::encode(voting.vote_namespace),
+                        strict_quorum = voting.strict_quorum,
+                        roster = ?voting.roster.iter().map(|member| (hex::encode(member.pub_key.0), member.stake)).collect::<Vec<_>>(),
+                        certificate = %hex::encode(fat_pointer.to_bytes()),
+                        "crosslink: this node's tenderlink decision has invalid certificate signatures. \
+                         It is not stored; tenderlink waits until that height is decided from peers.",
+                    );
                 }
                 break 'admit Err(Refusal::refused(format!(
                     "the fat pointer for BFT height {height} carries a signature that does not verify",
