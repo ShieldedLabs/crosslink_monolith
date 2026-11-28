@@ -1816,12 +1816,23 @@ Per-trial throughput, in measurement order:
 | 10 MiB | old / split / split / old | 5.061 / 5.357 / 5.474 / 4.474 |
 | 40 MiB | split / old / old / split | 5.616 / 5.203 / 5.095 / 5.888 |
 
-Both split trials beat both baseline trials at each size. Nevertheless, baseline
-movement and the small sequential sample prevent treating the percentage gains
-as precise, repeatable causal estimates. Throughput pools unique chain bytes over
-controller durations; latency pools fourteen measured heights per arm. Nearest-
-rank p95 is their maximum, not a stable production-tail estimate. RSS is a
-single-process lifetime high-water mark and can include warmup.
+Both split trials beat both baseline trials at each size, but **known concurrent
+compiler activity confounds this timing comparison**. After reporting, another
+local project supplied receipt-based compiler intervals of approximately
+10:56:24.578–11:00:24.6 and 11:00:52.567–11:01:38.294 UTC on 2026-11-28. These
+overlap all four 10-MiB trial invocations and the first 40-MiB split invocation.
+This is not a complete host-activity inventory; it does not establish that the
+remaining trials were quiet. The 14.00% / 11.67% throughput gains are observed
+figures, **not an isolated causal speedup measurement**; CPU and wall-time changes
+also need that qualification. The independently checked reduction in copied
+bytes and unchanged 40-MiB batch count remain valid. Post-hoc overlap evidence
+is retained separately in `host-activity-addendum.json` under the artifact root.
+
+Throughput pools unique chain bytes over controller durations; latency pools
+fourteen measured heights per arm. The small sequential sample and baseline
+movement add further uncertainty. Nearest-rank p95 is their maximum, not a stable
+production-tail estimate. RSS is a single-process lifetime high-water mark and
+can include warmup.
 
 ### Where the saved work went
 
