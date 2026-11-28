@@ -54,6 +54,13 @@ pub type DBThreadMode = rocksdb::SingleThreaded;
 /// Also the [`rocksdb::DBAccess`] used by database iterators.
 pub type DB = rocksdb::DBWithThreadMode<DBThreadMode>;
 
+/// Bounded snapshot reads distinguish malformed row sizes from I/O failures.
+#[derive(Debug)]
+pub(crate) enum SnapshotReadError {
+    Database(rocksdb::Error),
+    Oversized,
+}
+
 /// Wrapper struct to ensure low-level database access goes through the correct API.
 ///
 /// `rocksdb` allows concurrent writes through a shared reference,
@@ -1146,6 +1153,48 @@ impl DiskDb {
     }
 
     // Read methods are located in the ReadDisk trait
+
+    /// Read related rows at one committed sequence number. Check pinned lengths
+    /// against trusted bounds before copying into application-owned buffers.
+    pub(crate) fn snapshot_get_cf<const N: usize>(
+        &self,
+        cf_name: &str,
+        keys: [&[u8]; N],
+        max_sizes: [usize; N],
+    ) -> Result<[Option<Vec<u8>>; N], SnapshotReadError> {
+        let cf = self.db.cf_handle(cf_name).expect("column family was created when database was created");
+        let snapshot = self.db.snapshot();
+        let mut values = std::array::from_fn(|_| None);
+        for ((value, key), max_size) in values.iter_mut().zip(keys).zip(max_sizes) {
+            if let Some(bytes) = snapshot.get_pinned_cf(&cf, key).map_err(SnapshotReadError::Database)? {
+                if bytes.len() > max_size { return Err(SnapshotReadError::Oversized); }
+                *value = Some(bytes.to_vec());
+            }
+        }
+        Ok(values)
+    }
+
+    /// Presence only, without copying arbitrary persisted values into a Vec.
+    /// All keys share a snapshot and every read error is propagated.
+    pub(crate) fn snapshot_contains_any_cf<const N: usize>(
+        &self,
+        cf_name: &str,
+        keys: [&[u8]; N],
+    ) -> Result<bool, rocksdb::Error> {
+        let cf = self.db.cf_handle(cf_name).expect("column family was created when database was created");
+        let snapshot = self.db.snapshot();
+        let mut present = false;
+        for key in keys {
+            present |= snapshot.get_pinned_cf(&cf, key)?.is_some();
+        }
+        Ok(present)
+    }
+
+    /// Count row operations in isolated D28 tests, not physical disk bytes.
+    #[cfg(test)]
+    pub(crate) fn test_sequence_number(&self) -> u64 {
+        self.db.latest_sequence_number()
+    }
 
     // Write methods
     // Low-level write methods are located in the WriteDisk trait
