@@ -1599,3 +1599,141 @@ is not the measured-rate numerator, and omits some setup/upload/archive/idle
 traffic. It is **not a Fly bill**. The revised 100-GB soft experiment allowance and
 original machine deadline are recorded in the prospective design. All benchmark
 processes are stopped; unrelated repository files were left untouched.
+
+## Cached durable-body processing — 2026-11-28
+
+Implementation `678de7bbe`, with migration documentation `1c4d71d2a`, optimizes
+local preparation of the private D28 atomic image. Version 2 puts metadata and
+its checksum before three fixed body regions, caching each unchanged region's
+length and digest. Metadata-only commits no longer recopy, rehash or clear those
+body regions. The image size, `AtomicBlockStore` replacement API and required
+signing/publication barriers are unchanged. Cold recovery verifies actual body
+bytes and canonical padding before trusting the cache. Version 1 opens without a
+write and migrates at the next required replacement; **older executables reject
+version 2**. This is not downgrade compatibility. PoW/ledger encodings, exported
+BFT signatures, consensus rules and production timers are unchanged.
+
+This comparison is **localhost, not a new Fly or worldwide result**. Seven
+independent validator processes share one host, with one executor worker each,
+real STP/signatures/Merkle proofs, mock bodies and RAM-backed atomic replacement.
+The controller still requires **all seven validators to progress**. Body caps
+match the 10- or 40-MiB body size; both use 100-KiB shards, `balanced` scheduling
+and `wan_bulk` timing. Each trial has seven warmup and seven measured heights.
+No builds or test suites ran during measurements; unrelated host activity was
+not excluded.
+
+The prospective order was one old-version trial at each size, implementation
+and verification, two new-version trials at each size, then another old-version
+trial at each size. All eight primary trials completed, with **56/56 measured
+heights in round zero** and zero receive-budget discards. A separate seven-node
+40-MiB gate (one warmup, two measured heights) also passed and is excluded below.
+Rates pool unique chain bytes over controller measured durations; latency
+percentiles pool fourteen observations per arm. P95 is the observed maximum,
+not an estimate of stable production tails.
+
+| Metric | Old, 10 MiB | New, 10 MiB | Old, 40 MiB | New, 40 MiB |
+|---|---:|---:|---:|---:|
+| Chain throughput, MiB/s | 4.260 | 4.619 | 4.009 | **4.855** |
+| First receipt p50 / p95, s | 2.205 / 2.535 | 1.961 / 2.168 | 9.028 / 10.552 | 7.630 / 8.870 |
+| All-online receipt p50 / p95, s | 2.264 / 2.655 | 2.104 / 2.514 | 9.461 / 10.908 | 8.067 / 9.297 |
+| Process CPU-seconds/block, seven nodes summed | 11.293 | 9.641 | 55.184 | **40.892** |
+| Full-image replacement GiB/block, seven nodes summed | 2.087 | 2.064 | 12.607 | 11.719 |
+| Application offers / chain bytes | 6.069× | 6.068× | 6.064× | 6.064× |
+| Peak single-process RSS, MiB | 149.777 | 148.734 | 487.473 | 490.738 |
+
+The observed pooled 40-MiB throughput improvement is **21.10%**, with **25.90%
+less process CPU time/block**. However, the old-version before/after rates were
+4.301/3.754 MiB/s, while the two candidate trials were 5.066/4.661 MiB/s. Both
+candidate trials beat both old trials, but baseline drift and this small,
+nonrandomized sample prevent a precise causal speedup estimate.
+
+At 10 MiB, the pooled improvement is 8.43%, but old-version before/after rates
+were 4.651/3.930 MiB/s and candidate rates were 4.800/4.452 MiB/s. The pooled
+candidate is 0.68% slower than the earlier baseline, and its observed all-receipt
+p95 is 11.06% worse than that earlier baseline (2.514 versus 2.264 seconds).
+**A robust 10-MiB throughput improvement is not established**; the reduction in
+encoder work is much clearer.
+
+### Local work removed, and work that remains
+
+The following are measured wall-span seconds/block **summed over seven nodes**.
+Checksum is contained within encoding; spans can overlap across nodes and nest
+inside runtime phases. They are neither additive CPU costs nor critical-path
+latency measurements.
+
+| Durable phase | Old, 10 MiB | New, 10 MiB | Old, 40 MiB | New, 40 MiB |
+|---|---:|---:|---:|---:|
+| Image encoding, including checksums | 2.110 | 0.087 | 13.818 | 0.426 |
+| Checksum subset | 1.646 | 0.045 | 10.559 | 0.213 |
+| Backend full-image replacement | 0.793 | 0.992 | 5.710 | 6.424 |
+
+Encoding spans fell about 96–97%, and checksum spans about 97–98%. New encoder
+counters report exactly **70 MiB per 10-MiB block** and **280 MiB per 40-MiB
+block** of body copying, hashing and zeroing, each separately summed over seven
+nodes. Those counters exclude staging copies, initial allocation, recovery and
+backend traffic; they do not measure all copies in the process. The old binary
+does not export these counters, so its missing entries are not zeros.
+
+The fixed regression also verifies forty metadata/countdown/vote fences with
+zero additional body-copy/hash/zero bytes, 120 reused body slots and exactly
+`40*(M-32)` metadata bytes hashed, where `M = 4096 + 556*Nmax`.
+
+**Full-image backend replacement is still expensive and has not been removed.**
+The candidate 40-MiB run still replaces 11.72 GiB/block across seven nodes, with
+6.42 summed wall seconds/block inside the memory-backed replacement calls. Its
+per-replacement image is unchanged; total volume varies with checkpoint count.
+This experiment demonstrates less local encoding work, not lower physical disk
+write volume, worldwide throughput, network saturation or full Zcash validation.
+Application offers are not STP/UDP/IP wire bytes. Host network/UDP counters are
+shared on localhost and are not summed as independent per-validator traffic.
+
+### Verification and reproduction
+
+The integrated release suite passed **422 Rust tests**, with five existing
+ignored tests and unbounded legacy `single_rt` excluded. The non-benchmark
+library check, release executable build, **50 Python checks** including real
+process tests, and **four Zebra D28 adapter checks** also passed. Migration,
+old/new replacement failures, cache invalidation, canonical corruption and
+metric export are covered; physical power-loss/fsync behavior is not certified.
+
+Baseline source is `ba3791d27`; baseline executable SHA-256 is
+`41162b623f461ee62976efccb0f5e5aba1c04c486f5191b84d904c5aea945fbb`.
+Candidate executable SHA-256 is
+`f069bad208630fd9bdc0f33c55a59f36af20881a68656fb667f029de6ea2d843`.
+The unchanged runner SHA-256 is
+`4c55a0d177fcc78e75f847dde71579c18d0e039452155ddf9bd05d218f7232f0`.
+
+After building/freezing the desired executable, a two-trial candidate arm is:
+
+```sh
+python3 -B tenderlink/benchmarks/d28_fly.py local \
+  --binary /absolute/path/to/frozen/d28_bench --out /absolute/path/to/NEW/results \
+  --nodes 7 --body-bytes 41943040 --max-body 41943040 \
+  --payload-modes merkle --payload-leaf-bytes 102400 \
+  --profiles balanced --timing-profile wan_bulk --workers 1 \
+  --repetitions 2 --heights 7 --warmup 7 --seed 428 \
+  --timeout-secs 600 --chatter-secs 2 --lifetime-secs 1800
+```
+
+Use 10485760 for both body and cap in the 10-MiB arm. Preserve the full
+before/candidate/after order for a matched comparison, not just the fastest
+trial. Exact commands, prospective plan, raw reports, source/binary pins,
+verification logs and aggregate calculations are retained under
+`/var/tmp/d28-local-processing-20261128/`, notably `plan.json`,
+`candidate-measurement-plan.json`, `candidate-preflight.json`,
+`comparison-analysis.json` and `comparison-aggregates.json`.
+
+The independent raw-boundary audit passed **38,156 checks with zero errors**:
+nine trials including the gate, 63 node reports, 54 retained worker-original
+report copies and 805 node-height decisions. All **1,060 physical input hashes
+and 21 Git-blob hashes** were reverified unchanged by the parent, along with the
+audit script. `audit-local-v2.json`, `audit-local-v2-inputs.json` and
+`audit-parent-verification.json` retain the findings, limitations and input set.
+The audit receipt SHA-256 is
+`265f1a019b1a1ef7b332030afaee3d6984881db7c0824970533dea638f713921`.
+This is an artifact/accounting audit, not a new benchmark repetition or a fresh
+execution of the correctness suite.
+
+All seven campaign cleanup receipts confirm stopped workers and removed tokens;
+a subsequent owned-process check found no remaining benchmark children.
+`cleanup-receipt.json` retains this evidence. **No Fly resources were created.**
