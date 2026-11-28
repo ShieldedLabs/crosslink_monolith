@@ -1484,3 +1484,118 @@ raw-data checks in `summary-check-567.json` (22 unique trials/154 node reports),
 originals), and `headroom-audit-564.json`. Their input hashes were reverified by the
 parent. Sequential stage order, host replacement during CPU resizing, small
 samples, all-online barriers and RAM-backed durability remain limitations.
+
+### Final large-block deadline experiment
+
+Benchmark source `5be09b14c` adds opt-in **`wan_bulk`**. Relative to `wan`, only the
+proposal base increases, **10 to 20 seconds**. Prevote/precommit stay 5/7 seconds,
+request timeout 10 seconds, status TTL 15 seconds; round increments and all
+production defaults remain unchanged. The control is the **same receive-retention
+runtime**, not the earlier drop-surplus implementation. Both arms use seven
+four-CPU/8-GiB machines, one executor worker, 40-MiB bodies/cap, 100-KiB shards,
+`balanced` scheduling, fourteen warmups and fourteen measured heights. One
+sequential trial per arm completed; no failed durations were filtered away.
+
+| Metric | `wan`, proposal 10 s | `wan_bulk`, proposal 20 s |
+|---|---:|---:|
+| Chain throughput, MiB/s | 2.633 | **3.512** |
+| First receipt p50 / p95, s | 10.616 / 35.520 | **10.222 / 12.335** |
+| Quorum receipt p50 / p95, s | 10.911 / 35.816 | **10.517 / 12.629** |
+| All-online receipt p50 / p95, s | 11.479 / 38.735 | **11.032 / 15.421** |
+| App offers / chain bytes | 8.250× | 7.152× |
+| Raw payload offers / chain bytes | 8.127× | 7.061× |
+| Measured VM TX / chain bytes | 10.214× | 8.717× |
+| Process CPU-seconds / block, seven nodes summed | 48.268 | 38.494 |
+| Image replacement GiB / block, seven nodes summed | 19.647 | 14.967 |
+| Peak single-process RSS, MiB | 636.605 | 565.727 |
+| Nonzero-round measured heights | 3/14 | **0/14** |
+
+Throughput increased **33.37%** in this comparison. The measured numerator is
+587,202,560 bytes in each arm; rate durations are 212.647615080 and 159.441476360
+seconds. Of the approximately 53.21-second reduction, 50.73 seconds occurs in the
+three heights that previously changed round. The other eleven round-zero heights
+improve by only 2.47 seconds in total. This supports the overly-short large-block
+proposal-deadline hypothesis, not a claim that every transfer became 33% faster.
+The first warmup height still changed round. Measured rotation rates are 3.596
+and 3.433 MiB/s; two rotations do not establish steady state. The observed p95 is
+still the maximum of fourteen heights, not a reliable production tail estimate.
+
+This is the highest complete arm observed in this campaign, **not proof of an
+optimal setting or unlimited throughput scalability**. A longer deadline also
+waits longer for a genuinely unavailable proposer; the 40-MiB/two-offline case
+was not run. It is not a new production timer recommendation. Shortening all
+timers globally had the opposite healthy-network effect in the separate tests.
+
+Remaining costs are visible even in this faster arm:
+
+- **72,770 UDP6 send-buffer errors**, versus 78,625 in the matched control, spread
+  across the seven machines. This is local send pressure, not attribution of the
+  principal bottleneck. Zero scheduler discards, exposed transport overflow/drop
+  counters and UDP receive errors do **not** mean zero packet loss or errors.
+- **14.97 GiB of full-image replacement work per 40-MiB block**, still RAM-backed.
+  Inclusive image checksumming takes 7.229 seconds/block summed across validators
+  (about 1.033 seconds per validator); image encoding is 8.266 seconds/block and
+  includes checksum work. These spans must not be added as independent costs.
+- Application offers are 7.152× unique body bytes versus the six-copy replication
+  minimum; this is about 19.2% above that payload minimum, including metadata.
+  VM TX is 8.717×, not an isolated STP-wire measurement or a NIC-utilization proof.
+- The all-online benchmark barrier, proposer fanout, repeated small-message work
+  and bounded final-only native telemetry prevent a pure-bandwidth-limit claim.
+  There is no full-run per-link capacity or phase-critical-path measurement.
+
+### Final verification, reproduction and shutdown
+
+The final executable SHA-256 is
+`41162b623f461ee62976efccb0f5e5aba1c04c486f5191b84d904c5aea945fbb`;
+runner SHA-256 is
+`4c55a0d177fcc78e75f847dde71579c18d0e039452155ddf9bd05d218f7232f0`.
+The integrated release suite passes **414 Rust tests**, with five existing ignored
+tests and unbounded legacy `single_rt` excluded. The non-benchmark library check,
+release benchmark build, **50 Python checks** including real-process tests, and
+seven-process 40-MiB `wan_bulk` gate pass. The first full-suite attempt hit an
+existing localhost-port reservation/wildcard-bind collision; its log is retained.
+The focused unchanged test and entire unchanged suite then passed. This is not a
+hidden D28 trial failure (`phase4-initial-suite-failure.json`). No physical fsync
+or new full-Zebra integration certification is implied.
+
+The final on-node0 invocation, after preparing matching private workers with the
+same executable and 4-GiB per-node guard, was:
+
+```sh
+python3 -B /app/d28_fly-phase4.py campaign \
+  --roster /data/roster-phase4.json --token-file /run/d28-token \
+  --binary /app/d28_bench-phase4 --out /data/cpu4-warmed-bulk \
+  --body-bytes 41943040 --max-body 41943040 \
+  --payload-modes merkle --payload-leaf-bytes 102400 \
+  --profiles balanced --timing-profile wan_bulk --workers 1 \
+  --repetitions 1 --heights 14 --warmup 14 --seed 428 \
+  --timeout-secs 900 --chatter-secs 2 --lifetime-secs 1000 \
+  --max-trial-tx-bytes 4294967296 --max-campaign-tx-bytes 22000000000
+```
+
+A fresh deployment and new output directories are required to repeat it; the
+original temporary app no longer exists. Exact prospective designs, admissions,
+source/binary pins and inventories remain in `bulk-timeout-design.json` and
+`phase4-*.json`. Raw final reports are in `final-iad/cpu4-warmed-bulk/`; remote
+originals are in `final-{sjc,gru,fra,jnb,sin,syd}/phase4-worker/`. Complete final VM
+artifact archives are `final-*.tar.gz`, pinned by `final-archives-verified.json`.
+
+The independent final audit verified **27 unique D28 trials and 185 node reports**,
+all complete; both warmed arms' seven-node/28-height agreement; seven final archives
+and all **3,279 regular members**; and **3,398 unchanged input hashes**. Its primary
+receipt is `bulk-audit-580.json`, SHA-256
+`4c3814108a676a4b6f8fa80eb44280516e7341b97f72d01a9417d5dfde237cd7`;
+`bulk-audit-580-inputmanifest.json` and `bulk-audit-580-supplement.json` retain the
+input set and phase/hold limitations. This is an artifact/accounting check, not
+an additional performance repetition or security/durability certification.
+
+**The temporary `d28-speed-20261127-2256` application and all seven machines were
+deleted**, after artifact hashes and benchmark-child cleanup were verified. A
+successful Fly application inventory confirmed absence; no public services or
+persistent volumes were created. `cleanup-receipt.json`, `pre-delete-validation.json`
+and `fly-destroy.log` retain the evidence. Accounted D28 whole-child plus separate
+transport-diagnostic TX is **89,361,636,231 bytes**; it includes warmup/hold/shutdown,
+is not the measured-rate numerator, and omits some setup/upload/archive/idle
+traffic. It is **not a Fly bill**. The revised 100-GB soft experiment allowance and
+original machine deadline are recorded in the prospective design. All benchmark
+processes are stopped; unrelated repository files were left untouched.
