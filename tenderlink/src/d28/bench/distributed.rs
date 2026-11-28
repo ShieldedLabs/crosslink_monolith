@@ -97,6 +97,7 @@ impl DistributedConfig {
         let bases = match self.timing_profile.as_str() {
             "wan" => (10_000, 5_000, 7_000),
             "wan_fast" => (2_500, 1_500, 2_000),
+            "wan_bulk" => (20_000, 5_000, 7_000),
             _ => return,
         };
         (timeouts.propose, timeouts.prevote, timeouts.precommit) = bases;
@@ -121,8 +122,8 @@ impl DistributedConfig {
     }
     pub fn validate(&self) -> io::Result<()> {
         self.validate_body_shape()?;
-        if !matches!(self.timing_profile.as_str(), "production" | "wan" | "wan_fast") {
-            return Err(invalid("timing_profile must be production, wan or wan_fast"));
+        if !matches!(self.timing_profile.as_str(), "production" | "wan" | "wan_fast" | "wan_bulk") {
+            return Err(invalid("timing_profile must be production, wan, wan_fast or wan_bulk"));
         }
         if !(1..=4).contains(&self.workers) {
             return Err(invalid("distributed workers must be 1..4 Tokio executor threads"));
@@ -993,7 +994,7 @@ pub async fn run(config: DistributedConfig) -> io::Result<DistributedReport> {
             "Application offered bytes are not wire bytes; transport ring messages are not UDP packets. /proc/net/dev includes TX/RX of every non-lo interface and all VM traffic, including controller/management; not isolated D28 amplification. Serial snapshots have sampling skew.",
             "Host CPU/steal/cgroup counters include other VM processes. Process CPU is in reported clock ticks; RSS/maxRSS are gauges (not deltas). Missing system metrics carry errors, never fabricated zeros. In-memory atomic image is not fsync/crash-durable storage.",
             "Synthetic solution padding uses unchanged BftBlock/header Vector serialization; it is NOT valid Equihash work or a production-valid ledger body. body_bytes targets the exact whole serialized body; payload_bytes counts only actual serialized headers and can vary with parent certificate length.",
-            "Production defaults and core formats unchanged. Explicit benchmark timing_profile=wan/wan_fast changes only base consensus/request/status-expiry timers (wan_fast uses 2500/1500/2000ms consensus bases with WAN request/status TTL); rho and round increments stay unchanged. Scheduling knobs, body cap and benchmark transport/ring overrides are recorded. Memory bounds here are not a whole-process RSS guarantee.",
+            "Production defaults and core formats unchanged. Explicit benchmark timing_profile=wan/wan_fast/wan_bulk changes only base consensus/request/status-expiry timers (wan_fast uses 2500/1500/2000ms consensus bases with WAN request/status TTL); wan_bulk changes only wan propose from 10000 to 20000ms, keeping prevote/precommit 5000/7000ms, request 10000ms and status TTL 15000ms. wan_bulk is a longer-propose-wait experiment, not a recommended default; offline-proposer fallback is slower. Rho and round increments stay unchanged. Scheduling knobs, body cap and benchmark transport/ring overrides are recorded. Memory bounds here are not a whole-process RSS guarantee.",
         ],
     })
 }
@@ -1340,22 +1341,35 @@ mod tests {
             propose: 10000, prevote: 5000, precommit: 7000, ..original
         });
         assert_eq!((request, ttl), (10000, 15000));
+        let wan = timeouts;
         let namespace = c.namespace();
-        c.timing_profile = "wan_fast".into();
-        c.validate().unwrap();
-        c.apply_timing(&mut timeouts, &mut request, &mut ttl);
-        assert_eq!(timeouts, super::super::super::Timeouts {
-            propose: 2500, prevote: 1500, precommit: 2000, ..original
-        });
-        assert_eq!((request, ttl), (10000, 15000));
-        assert_eq!(c.namespace(), namespace); // Timer choice is not a payload/signature domain.
-        let json = serde_json::to_value(&c).unwrap();
-        assert_eq!(json["timing_profile"], "wan_fast");
-        let decoded: DistributedConfig = serde_json::from_value(json).unwrap();
-        decoded.validate().unwrap();
-        assert_eq!(decoded.timing_profile, "wan_fast");
-        c.timing_profile = "other".into();
-        assert!(c.validate().is_err());
+        for (profile, expected) in [
+            ("wan_fast", super::super::super::Timeouts {
+                propose: 2500, prevote: 1500, precommit: 2000, ..original
+            }),
+            ("wan_bulk", super::super::super::Timeouts { propose: 20000, ..wan }),
+        ] {
+            c.timing_profile = profile.into();
+            c.validate().unwrap();
+            c.apply_timing(&mut timeouts, &mut request, &mut ttl);
+            assert_eq!(timeouts, expected);
+            assert_eq!((request, ttl), (10000, 15000));
+            assert_eq!(c.namespace(), namespace); // Timer choice is not a payload/signature domain.
+            let json = serde_json::to_value(&c).unwrap();
+            assert_eq!(json["timing_profile"], profile);
+            let decoded: DistributedConfig = serde_json::from_value(json).unwrap();
+            decoded.validate().unwrap();
+            assert_eq!(decoded.timing_profile, profile);
+        }
+        for unsupported in ["other", "WAN_BULK", "wan_bulk ", "20000/5000/7000"] {
+            c.timing_profile = unsupported.into();
+            assert!(c.validate().is_err());
+        }
+        for field in ["propose_timeout", "timeouts", "request_timeout", "status_ttl", "rho"] {
+            let mut json = serde_json::to_value(config()).unwrap();
+            json[field] = serde_json::json!(20000);
+            assert!(serde_json::from_value::<DistributedConfig>(json).is_err());
+        }
     }
     #[test]
     fn runtime_exit_reports_deadline_context_only_at_or_after_deadline() {

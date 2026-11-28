@@ -58,7 +58,7 @@ MAX_BODY = 1048576  # Legacy default; never silently raised for a byte-target sw
 LOCAL_MAX_BODY = 10 * MAX_BODY  # Historical local default, independent of the opt-in maximum.
 MAX_BENCH_BODY = 40 * MAX_BODY
 PAYLOAD_MODES = ("inline", "outlined", "merkle")
-TIMING_PROFILES = ("production", "wan", "wan_fast")
+TIMING_PROFILES = ("production", "wan", "wan_fast", "wan_bulk")
 MIN_PAYLOAD_LEAF = 32 * 1024
 MAX_PAYLOAD_LEAF = 1024 * 1024
 LOCAL_NOTE = ("Local shared-host process comparison, not WAN performance. Each validator is a separate "
@@ -3185,9 +3185,41 @@ finally:
             self.assertEqual(validate_config(config), config)
             self.assertEqual(math.ceil(MAX_BENCH_BODY / leaf), count)
 
-    def test_workers_and_wan_fast_do_not_pool(self):
+    def test_wan_bulk_is_explicit_fixed_and_roundtrips(self):
+        parser = build_parser()
+        for command in (["local"], ["campaign", "--roster", "unused", "--token-file", "unused"]):
+            argv = command + ["--binary", "unused", "--out", "unused", "--body-bytes", str(MAX_BENCH_BODY),
+                              "--max-body", str(MAX_BENCH_BODY), "--payload-modes", "merkle",
+                              "--payload-leaf-bytes", "102400"]
+            configs, names = {}, {}
+            for timing in TIMING_PROFILES:
+                args = parser.parse_args(argv + ["--timing-profile", timing])
+                cases = campaign_cases(args)
+                self.assertTrue(all(case["timing_profile"] == timing for case in cases))
+                configs[timing] = trial_config(args, fixture_config(), cases[0], "fixture-0123456789")
+                self.assertTrue(configs_match(decode(encode(configs[timing])), configs[timing]))
+                names[timing] = trial_name(1, cases[0])
+            bulk = configs["wan_bulk"]
+            self.assertEqual(bulk, dict(configs["wan"], timing_profile="wan_bulk"))
+            self.assertIn("wan_bulk", names["wan_bulk"])
+            self.assertEqual(len(set(names.values())), len(TIMING_PROFILES))
+            for timing in ("production", "wan", "wan_fast"):
+                self.assertFalse(configs_match(bulk, configs[timing]))
+                self.assertFalse(configs_match(configs[timing], bulk))
+            for unsupported in ("adaptive", "WAN_BULK", "wan_bulk ", "20000/5000/7000"):
+                with self.subTest(unsupported=unsupported):
+                    with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                        parser.parse_args(argv + ["--timing-profile", unsupported])
+                    with self.assertRaises(ValueError):
+                        validate_config(dict(bulk, timing_profile=unsupported))
+            for field in ("propose_timeout", "timeouts", "request_timeout", "status_ttl", "rho"):
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    validate_config(dict(bulk, **{field: 20000}))
+
+    def test_workers_and_timing_profiles_do_not_pool(self):
         trials = []
-        for workers, timing in ((1, "wan"), (2, "wan"), (4, "wan"), (4, "wan_fast")):
+        settings = ((1, "wan"), (2, "wan"), (4, "production"), (4, "wan"), (4, "wan_fast"), (4, "wan_bulk"))
+        for workers, timing in settings:
             trial = self.counter_trial(f"trial-workers{workers}-{timing}")
             trial["config"].update(workers=workers, timing_profile=timing)
             for node, report in trial["node_reports"].items():
@@ -3195,7 +3227,7 @@ finally:
             trials.append(trial)
         rows = aggregate(trials)
         self.assertEqual({(row["workers"], row["timing_profile"]) for row in rows},
-                         {(1, "wan"), (2, "wan"), (4, "wan"), (4, "wan_fast")})
+                         set(settings))
         self.assertTrue(all(row["trials"] == 1 for row in rows))
 
     def test_caps_targets_timing_and_chronology_do_not_pool(self):
@@ -3348,6 +3380,11 @@ class RealTests(unittest.TestCase):
         self.run_local_nodes(7, ["--body-bytes", "10485760", "--max-body", "10485760",
                                  "--timing-profile", "wan", "--heights", "2", "--timeout-secs", "240"])
 
+    def test_four_real_nodes_wan_bulk_merkle(self):
+        self.run_local_nodes(4, ["--body-bytes", "65536", "--payload-modes", "merkle",
+                                 "--payload-leaf-bytes", "102400", "--timing-profile", "wan_bulk",
+                                 "--heights", "3", "--timeout-secs", "60"])
+
     def run_local_nodes(self, nodes, options):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
             root = Path(temporary)
@@ -3394,7 +3431,7 @@ class RealTests(unittest.TestCase):
                         if args.body_bytes:
                             self.assertEqual(summary["body_sizes"], args.body_bytes)
                             self.assertEqual(summary["body_bytes"], args.heights * args.body_bytes[0])
-                            self.assertEqual(summary["timing_profile"], "wan")
+                            self.assertEqual(summary["timing_profile"], args.timing_profile)
                             self.assertEqual(summary["measured_window"]["valid_node_windows"], nodes)
                 for trial in (root / "smoke").glob("trial-*"):
                     profile = read_json(trial / "trial.json")["profile"]
@@ -3405,6 +3442,13 @@ class RealTests(unittest.TestCase):
                         config = report["config"]
                         self.assertEqual(config["max_requests"], PROFILES[profile]["max_requests"])
                         self.assertEqual(config["max_outgoing"], 2)
+                        self.assertEqual(config["timing_profile"], args.timing_profile)
+                        if args.timing_profile == "wan_bulk":
+                            expected = {"timeouts.propose_ms": 20000, "timeouts.prevote_ms": 5000,
+                                        "timeouts.precommit_ms": 7000, "timeouts.inc_propose_ms": 900,
+                                        "timeouts.inc_prevote_ms": 300, "timeouts.inc_precommit_ms": 600,
+                                        "request_timeout": 10000, "status_ttl": 15000, "rho": 500}
+                            self.assertEqual({key: report["runtime_settings"][key] for key in expected}, expected)
                         if args.body_bytes:
                             self.assertEqual(config["body_bytes"], args.body_bytes[0])
                             self.assertEqual({row["body_bytes"] for row in report["heights"]}, set(args.body_bytes))
@@ -3493,7 +3537,9 @@ def build_parser():
     command.add_argument("--max-body", type=bounded_arg(1, MAX_BENCH_BODY), default=MAX_BODY,
                          help="fixed body cap across the sweep, bytes (campaign default 1048576, local 10485760; maximum 41943040)")
     command.add_argument("--timing-profile", choices=TIMING_PROFILES, default="production",
-                         help="benchmark-only protocol timing profile; fixed across the sweep")
+                         help="benchmark-only protocol timing, fixed across sweep; wan_bulk changes only wan propose "
+                              "10000->20000ms (prevote/precommit 5000/7000ms, request 10000ms, status TTL 15000ms unchanged); "
+                              "longer-propose-wait experiment, not a recommended default; slower offline-proposer fallback")
     command.add_argument("--profiles", type=comma_arg(profile_arg), default=["baseline"],
                          help="comma-separated " + ",".join(PROFILES) + "; balanced raises baseline receive budget only; economy polls at 100ms; never changes protocol timers")
     command.add_argument("--payload-modes", type=comma_arg(payload_mode_arg), default=["inline"],

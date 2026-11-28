@@ -19,9 +19,11 @@ The cap never autogrows; full-roster parent must fit. Distributed nodes <=32,
 workers=1..4 Tokio executor threads (not vCPUs), byte-mode headers 1..2048.
 Mock solution padding uses unchanged parsing/serialization, NOT valid Equihash work.
 Distributed timing_profile defaults to production; explicit wan uses benchmark
-base timers 10000/5000/7000ms, wan_fast uses 2500/1500/2000ms. Both use request
- timeout10000ms and status expiry15000ms. Rho, round increments, production limits
-and defaults remain unchanged.
+propose/prevote/precommit bases 10000/5000/7000ms, wan_fast uses 2500/1500/2000ms,
+wan_bulk uses 20000/5000/7000ms. All three use request timeout10000ms and status
+expiry15000ms. wan_bulk is a benchmark-only longer-propose-wait experiment, not a
+recommended default; offline-proposer fallback is slower. Rho, round increments,
+production limits and defaults remain unchanged.
 Payload mode defaults to inline. Config payload_leaf_bytes defaults to 0 and must
 remain 0 outside merkle. Merkle leaves accept 32768..1048576 bytes, including
 102400 (100 KiB). Component CLI merkle defaults to 102400 when leaf size is omitted.
